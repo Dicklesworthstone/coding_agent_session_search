@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use super::ProjectionFingerprint;
 use super::super::canary::exact::PublishedSnapshot;
 use super::super::{CanonicalProjection, LexicalReconcileCheckpoint};
+use super::ProjectionFingerprint;
 use crate::search::tantivy::TantivyIndex;
 
 const VERSION: u32 = 1;
@@ -245,7 +245,10 @@ fn load(path: &Path) -> Result<Option<Progress>> {
         "repair progress exceeded its read budget"
     );
     let progress: Progress = serde_json::from_slice(&bytes).with_context(|| {
-        format!("parsing repair progress {}; receipt retained", path.display())
+        format!(
+            "parsing repair progress {}; receipt retained",
+            path.display()
+        )
     })?;
     progress.validate()?;
     Ok(Some(progress))
@@ -460,10 +463,10 @@ pub(in crate::indexer::lexical_reconcile) fn clear(checkpoint_path: &Path) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::bail;
     use crate::indexer::LexicalRebuildPacketProvenance;
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::storage::sqlite::{FrankenStorage, LexicalRebuildConversationRow};
+    use anyhow::bail;
     use frankensearch::quill::cass::CassDocument;
     use std::collections::HashMap;
 
@@ -520,8 +523,10 @@ mod tests {
                 .into_iter()
                 .next()
                 .context("missing fixture conversation")?;
-            let (provenance, _) =
-                crate::indexer::lexical_rebuild_packet_provenance_from_canonical(&row, &HashMap::new());
+            let (provenance, _) = crate::indexer::lexical_rebuild_packet_provenance_from_canonical(
+                &row,
+                &HashMap::new(),
+            );
             Ok(Self {
                 temp,
                 storage,
@@ -605,9 +610,10 @@ mod tests {
         for missing in [false, true] {
             for pass in [Pass::Publish, Pass::Replay] {
                 for completed in [2, docs.len()] {
-                    let index_path = fixture.temp.path().join(format!(
-                        "stale-{missing}-{pass:?}-{completed}"
-                    ));
+                    let index_path = fixture
+                        .temp
+                        .path()
+                        .join(format!("stale-{missing}-{pass:?}-{completed}"));
                     let checkpoint_path = index_path.join(".lexical-reconcile-1.json");
                     let path = progress_path(&checkpoint_path);
                     let mut actual = docs.clone();
@@ -627,9 +633,7 @@ mod tests {
                     drop(before);
                     crate::indexer::write_json_pretty_atomically(&checkpoint_path, &binding)?;
                     let recovery = std::fs::read(&checkpoint_path)?;
-                    claimed_cursor(
-                        &binding, &docs, &index, &index_path, &path, pass, completed,
-                    )?;
+                    claimed_cursor(&binding, &docs, &index, &index_path, &path, pass, completed)?;
                     // Establish that all OLD resume guards accept this receipt.
                     // Only the native content witness can reject its skip.
                     assert_eq!(
@@ -694,7 +698,13 @@ mod tests {
         index.add_prebuilt_documents_slice(&actual)?;
         index.commit()?;
         let mut progress = claimed_cursor(
-            &binding, &docs, &index, &index_path, &path, Pass::Replay, docs.len(),
+            &binding,
+            &docs,
+            &index,
+            &index_path,
+            &path,
+            Pass::Replay,
+            docs.len(),
         )?;
         progress.prefix_blake3 = "0".repeat(64);
         progress.save(&path)?;
@@ -728,7 +738,13 @@ mod tests {
         index.add_prebuilt_documents_slice(&docs)?;
         index.commit()?;
         claimed_cursor(
-            &binding, &docs, &index, &index_path, &path, Pass::Replay, docs.len(),
+            &binding,
+            &docs,
+            &index,
+            &index_path,
+            &path,
+            Pass::Replay,
+            docs.len(),
         )?;
         let receipt = std::fs::read(&path)?;
         let corrupt = b"invalid native manifest";
@@ -764,9 +780,20 @@ mod tests {
         index.add_prebuilt_documents_slice(&docs[4..])?;
         index.commit()?;
         let mut progress = Progress::fresh(&binding);
-        let error = publish_pass(&fixture.projection(2), &mut index, &mut progress, &index_path, &path,
-            &mut || bail!("interrupted after durable cursor")).unwrap_err();
-        assert!(error.to_string().contains("interrupted after durable cursor"));
+        let error = publish_pass(
+            &fixture.projection(2),
+            &mut index,
+            &mut progress,
+            &index_path,
+            &path,
+            &mut || bail!("interrupted after durable cursor"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted after durable cursor")
+        );
         assert_eq!(load(&path)?.context("saved cursor")?.completed_docs, 2);
         drop(index);
 
@@ -774,15 +801,28 @@ mod tests {
         let mut resumed = resume(&path, &index_path, &index, &binding)?;
         assert_eq!(resumed.completed_docs, 2);
         // Cursor 2 is INSIDE the new three-row batch, not on a batch boundary.
-        let written = publish_pass(&fixture.projection(3), &mut index, &mut resumed, &index_path, &path,
-            &mut || Ok(()))?;
-        assert_eq!(written, 5, "already published prefix must not be resubmitted");
+        let written = publish_pass(
+            &fixture.projection(3),
+            &mut index,
+            &mut resumed,
+            &index_path,
+            &path,
+            &mut || Ok(()),
+        )?;
+        assert_eq!(
+            written, 5,
+            "already published prefix must not be resubmitted"
+        );
         assert_eq!(index.doc_count()?, 7);
         assert_eq!(load(&path)?.context("completed cursor")?.completed_docs, 7);
         assert_eq!(std::fs::read(&checkpoint_path)?, checkpoint_bytes);
         let reader = index.reader()?;
         for doc in &docs {
-            assert!(super::super::super::canary::verify(&reader, doc, Some("meridian"))?);
+            assert!(super::super::super::canary::verify(
+                &reader,
+                doc,
+                Some("meridian")
+            )?);
         }
         Ok(())
     }
@@ -797,19 +837,44 @@ mod tests {
         let path = progress_path(&checkpoint_path);
         let mut index = TantivyIndex::open_or_create(&index_path)?;
         let mut progress = Progress::fresh(&binding);
-        publish_pass(&fixture.projection(2), &mut index, &mut progress, &index_path, &path, &mut || Ok(()))?;
+        publish_pass(
+            &fixture.projection(2),
+            &mut index,
+            &mut progress,
+            &index_path,
+            &path,
+            &mut || Ok(()),
+        )?;
         progress.pass = Pass::Replay;
         progress.completed_docs = 0;
         progress.prefix_blake3 = prefix_digest(&ProjectionFingerprint::new(binding.expected_docs));
         progress.first_pass_live_docs = Some(index.doc_count()?);
         progress.save(&path)?;
-        assert!(publish_pass(&fixture.projection(2), &mut index, &mut progress, &index_path, &path,
-            &mut || bail!("replay interrupted")).is_err());
+        assert!(
+            publish_pass(
+                &fixture.projection(2),
+                &mut index,
+                &mut progress,
+                &index_path,
+                &path,
+                &mut || bail!("replay interrupted")
+            )
+            .is_err()
+        );
         drop(index);
 
         let mut index = TantivyIndex::open_or_create(&index_path)?;
-        let outcome = publish(&fixture.projection(3), &mut index, &binding, &index_path, &checkpoint_path)?;
-        assert_eq!(outcome.upserted_docs, 0, "completed first pass must stay completed");
+        let outcome = publish(
+            &fixture.projection(3),
+            &mut index,
+            &binding,
+            &index_path,
+            &checkpoint_path,
+        )?;
+        assert_eq!(
+            outcome.upserted_docs, 0,
+            "completed first pass must stay completed"
+        );
         assert_eq!(outcome.first_pass_live_docs, 7);
         assert_eq!(index.doc_count()?, 7);
         let finished = load(&path)?.context("finished replay")?;
@@ -819,7 +884,13 @@ mod tests {
         // Re-entering it must make no publication or progress-file changes.
         let before = Publication::read(&index_path, &index)?;
         let progress_bytes = std::fs::read(&path)?;
-        publish(&fixture.projection(1), &mut index, &binding, &index_path, &checkpoint_path)?;
+        publish(
+            &fixture.projection(1),
+            &mut index,
+            &binding,
+            &index_path,
+            &checkpoint_path,
+        )?;
         assert_eq!(Publication::read(&index_path, &index)?, before);
         assert_eq!(std::fs::read(&path)?, progress_bytes);
         clear(&checkpoint_path)?;
@@ -836,8 +907,17 @@ mod tests {
         let path = index_path.join("cursor.json");
         let mut index = TantivyIndex::open_or_create(&index_path)?;
         let mut progress = Progress::fresh(&binding);
-        assert!(publish_pass(&fixture.projection(2), &mut index, &mut progress, &index_path, &path,
-            &mut || bail!("stop")).is_err());
+        assert!(
+            publish_pass(
+                &fixture.projection(2),
+                &mut index,
+                &mut progress,
+                &index_path,
+                &path,
+                &mut || bail!("stop")
+            )
+            .is_err()
+        );
         let saved = std::fs::read(&path)?;
         // Simulate a durable next batch whose receipt was not written.
         index.upsert_prebuilt_documents_slice(&docs[2..4])?;
@@ -848,10 +928,17 @@ mod tests {
         assert_eq!(fresh.pass, Pass::Publish);
         assert_eq!(fresh.completed_docs, 0);
         assert!(fresh.publication.is_none());
-        assert_eq!(std::fs::read(&path)?, saved, "inspection does not rewrite evidence");
+        assert_eq!(
+            std::fs::read(&path)?,
+            saved,
+            "inspection does not rewrite evidence"
+        );
         let mut changed_binding = binding.clone();
         changed_binding.projection_blake3 = Some("f".repeat(64));
-        assert_eq!(resume(&path, &index_path, &index, &changed_binding)?.completed_docs, 0);
+        assert_eq!(
+            resume(&path, &index_path, &index, &changed_binding)?.completed_docs,
+            0
+        );
         Ok(())
     }
 
@@ -864,15 +951,31 @@ mod tests {
         let path = index_path.join("cursor.json");
         let mut index = TantivyIndex::open_or_create(&index_path)?;
         let mut progress = Progress::fresh(&binding);
-        assert!(publish_pass(&fixture.projection(2), &mut index, &mut progress, &index_path, &path,
-            &mut || bail!("stop")).is_err());
+        assert!(
+            publish_pass(
+                &fixture.projection(2),
+                &mut index,
+                &mut progress,
+                &index_path,
+                &path,
+                &mut || bail!("stop")
+            )
+            .is_err()
+        );
         progress.prefix_blake3 = "0".repeat(64);
         progress.save(&path)?;
         let before = Publication::read(&index_path, &index)?;
         let saved = std::fs::read(&path)?;
         let mut resumed = resume(&path, &index_path, &index, &binding)?;
-        let error = publish_pass(&fixture.projection(3), &mut index, &mut resumed, &index_path, &path,
-            &mut || Ok(())).unwrap_err();
+        let error = publish_pass(
+            &fixture.projection(3),
+            &mut index,
+            &mut resumed,
+            &index_path,
+            &path,
+            &mut || Ok(()),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("prefix differs"));
         assert_eq!(Publication::read(&index_path, &index)?, before);
         assert_eq!(std::fs::read(&path)?, saved);
@@ -889,13 +992,26 @@ mod tests {
         let mut index = TantivyIndex::open_or_create(&index_path)?;
         std::fs::create_dir(&path)?;
         let mut progress = Progress::fresh(&binding);
-        let result = publish_pass(&fixture.projection(2), &mut index, &mut progress, &index_path, &path,
-            &mut || bail!("must not observe an unpersisted cursor"));
+        let result = publish_pass(
+            &fixture.projection(2),
+            &mut index,
+            &mut progress,
+            &index_path,
+            &path,
+            &mut || bail!("must not observe an unpersisted cursor"),
+        );
         assert!(result.is_err());
-        assert_eq!(index.doc_count()?, 2, "commit precedes the failed progress write");
+        assert_eq!(
+            index.doc_count()?,
+            2,
+            "commit precedes the failed progress write"
+        );
         assert!(path.is_dir());
         std::fs::rename(&path, index_path.join("retained-obstruction"))?;
-        assert_eq!(resume(&path, &index_path, &index, &binding)?.completed_docs, 0);
+        assert_eq!(
+            resume(&path, &index_path, &index, &binding)?.completed_docs,
+            0
+        );
         Ok(())
     }
 
@@ -903,7 +1019,10 @@ mod tests {
     fn malformed_progress_and_nonregular_state_are_retained() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("cursor.json");
-        for bytes in [b"{incomplete".to_vec(), vec![b' '; MAX_PROGRESS_BYTES as usize + 1]] {
+        for bytes in [
+            b"{incomplete".to_vec(),
+            vec![b' '; MAX_PROGRESS_BYTES as usize + 1],
+        ] {
             std::fs::write(&path, &bytes)?;
             assert!(load(&path).is_err());
             assert_eq!(std::fs::read(&path)?, bytes);
@@ -928,8 +1047,17 @@ mod tests {
         let path = index_path.join("cursor.json");
         let mut index = TantivyIndex::open_or_create(&index_path)?;
         let mut good = Progress::fresh(&binding);
-        assert!(publish_pass(&fixture.projection(2), &mut index, &mut good, &index_path, &path,
-            &mut || bail!("stop")).is_err());
+        assert!(
+            publish_pass(
+                &fixture.projection(2),
+                &mut index,
+                &mut good,
+                &index_path,
+                &path,
+                &mut || bail!("stop")
+            )
+            .is_err()
+        );
         for case in 0..7 {
             let mut bad = good.clone();
             match case {

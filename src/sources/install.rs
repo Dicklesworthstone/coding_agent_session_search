@@ -6,11 +6,13 @@
 //!
 //! # Installation Methods (Priority Order)
 //!
-//! 1. **Cargo Binstall** (fastest if available) - downloads pre-built binary via
-//!    cargo, may fall back to a source build
-//! 2. **Pre-built Binary** - direct binary download from GitHub releases with checksum verification
-//! 3. **Cargo Install** - compile from source (most reliable fallback)
-//! 4. **Full Bootstrap** - install rustup first, then compile
+//! 1. **Pre-built Binary** - direct binary download from GitHub releases with checksum verification
+//! 2. **Cargo Install** - build the release tag's source with the toolchain it pins
+//! 3. **Full Bootstrap** - install rustup first, then build as in 2
+//!
+//! Source builds use the tag's source archive, not crates.io: crates.io stops
+//! at 0.7.0 (bead zztql), and cass builds only with the nightly its
+//! `rust-toolchain.toml` pins, which a registry or `--git` install never reads.
 //!
 //! # Example
 //!
@@ -42,20 +44,37 @@ use super::{
 // Constants
 // =============================================================================
 
-/// Default SSH connection timeout for installation commands.
-pub const DEFAULT_INSTALL_TIMEOUT_SECS: u64 = 600; // 10 minutes for cargo install
+/// How long the wizard polls a source build before reporting a timeout. A
+/// release build is fat LTO with one codegen unit, so it takes far longer than
+/// the 10 minutes this used to allow, and the build keeps running after the
+/// wizard stops waiting. Failures end the wait earlier through the log markers.
+pub const DEFAULT_INSTALL_TIMEOUT_SECS: u64 = 3 * 60 * 60;
 
 /// Minimum disk space required for installation (MB).
 pub const MIN_DISK_MB: u64 = ResourceInfo::MIN_DISK_MB;
 
-/// Minimum memory recommended for compilation (MB).
+/// Minimum disk space required for a source build (MB).
+pub const MIN_COMPILE_DISK_MB: u64 = ResourceInfo::MIN_COMPILE_DISK_MB;
+
+/// Minimum memory required for a source build (MB).
 pub const MIN_MEMORY_MB: u64 = ResourceInfo::MIN_MEMORY_MB;
 
 /// Current cass version for installation.
 pub const CASS_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Package name on crates.io.
+/// Package name (crates.io and the release tag's Cargo.toml).
 pub const CRATE_NAME: &str = "coding-agent-search";
+
+/// Repository the release tags, source archives and binaries come from.
+pub const REPO_URL: &str = "https://github.com/Dicklesworthstone/coding_agent_session_search";
+
+/// Installs rustup without a default toolchain: the source build installs the
+/// one the release tag pins, and a stable default cannot compile cass
+/// (frankentorch-kernel-cpu uses `#![feature(portable_simd)]`).
+const RUSTUP_BOOTSTRAP_SCRIPT: &str = r#"
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
+source ~/.cargo/env
+"#;
 
 // =============================================================================
 // Error Types
@@ -106,16 +125,14 @@ pub enum InstallError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum InstallMethod {
-    /// Install via cargo-binstall (fastest, may fall back to a source build).
-    CargoBinstall,
-
     /// Download pre-built binary directly from GitHub releases.
     PrebuiltBinary {
         url: String,
         checksum: Option<String>,
     },
 
-    /// Compile from source via cargo install.
+    /// Build the release tag's source with `cargo install --locked --path .`
+    /// under the toolchain the tag pins (needs rustup).
     CargoInstall,
 
     /// Full bootstrap: install rustup first, then compile.
@@ -126,7 +143,6 @@ impl InstallMethod {
     /// Get display name for the method.
     pub fn display_name(&self) -> &'static str {
         match self {
-            InstallMethod::CargoBinstall => "cargo-binstall",
             InstallMethod::PrebuiltBinary { .. } => "pre-built binary",
             InstallMethod::CargoInstall => "cargo install",
             InstallMethod::FullBootstrap => "full bootstrap (rustup + cargo)",
@@ -136,7 +152,6 @@ impl InstallMethod {
     /// Estimated time for this method.
     pub fn estimated_time(&self) -> Duration {
         match self {
-            InstallMethod::CargoBinstall => Duration::from_secs(30),
             InstallMethod::PrebuiltBinary { .. } => Duration::from_secs(10),
             InstallMethod::CargoInstall => Duration::from_secs(300), // 5 minutes
             InstallMethod::FullBootstrap => Duration::from_secs(600), // 10 minutes
@@ -147,9 +162,7 @@ impl InstallMethod {
     pub fn requires_compilation(&self) -> bool {
         matches!(
             self,
-            InstallMethod::CargoBinstall
-                | InstallMethod::CargoInstall
-                | InstallMethod::FullBootstrap
+            InstallMethod::CargoInstall | InstallMethod::FullBootstrap
         )
     }
 }
@@ -352,6 +365,12 @@ impl RemoteInstaller {
     /// Check if resources are sufficient for compilation specifically.
     pub fn can_compile(&self) -> Result<(), InstallError> {
         self.check_resources()?;
+        if self.resources.disk_available_mb < MIN_COMPILE_DISK_MB {
+            return Err(InstallError::InsufficientDisk {
+                available_mb: self.resources.disk_available_mb,
+                required_mb: MIN_COMPILE_DISK_MB,
+            });
+        }
         if self.resources.memory_total_mb < MIN_MEMORY_MB {
             return Err(InstallError::InsufficientMemory {
                 available_mb: self.resources.memory_total_mb,
@@ -369,18 +388,12 @@ impl RemoteInstaller {
     /// `cargo-binstall` used to end the whole install).
     pub fn candidate_methods(&self) -> Vec<InstallMethod> {
         let mut methods = Vec::new();
-        // 1. Try cargo-binstall first when source fallback is safe and the
-        // binary fast path is compatible with the remote. On known old glibc
-        // Linux distros, binstall can fetch the same incompatible release
-        // asset that direct prebuilt installs use, so prefer source there.
-        if self.system_info.has_cargo_binstall
-            && self.can_compile().is_ok()
-            && self.prebuilt_binary_fast_path_is_safe()
-        {
-            methods.push(InstallMethod::CargoBinstall);
-        }
+        // cargo-binstall is not a method: it resolves the crate on crates.io,
+        // which has no version after 0.7.0, and cass's release assets do not
+        // follow its naming, so it could only fall back to a stable-toolchain
+        // build that cannot compile cass.
 
-        // 2. Try pre-built binary if available, compatible, and backed by
+        // 1. Try pre-built binary if available, compatible, and backed by
         // release checksum evidence. Remote installs should fail closed rather
         // than copying an unverified binary onto a user's machine.
         if let Some(url) = self.get_prebuilt_url() {
@@ -390,12 +403,16 @@ impl RemoteInstaller {
             }
         }
 
-        // 3. Try cargo install if cargo is available and we have resources
-        if self.system_info.has_cargo && self.can_compile().is_ok() {
+        // 2. Build the release tag's source if cargo is available, the tag's
+        // source archive can be downloaded, and we have resources.
+        if self.system_info.has_cargo
+            && (self.system_info.has_curl || self.system_info.has_wget)
+            && self.can_compile().is_ok()
+        {
             methods.push(InstallMethod::CargoInstall);
         }
 
-        // 4. Full bootstrap installs rustup and then compiles from source, so
+        // 3. Full bootstrap installs rustup and then compiles from source, so
         // it needs the same compile resources as cargo install. Check before
         // mutating the remote with a new toolchain.
         if self.system_info.has_curl && self.can_compile().is_ok() {
@@ -465,6 +482,14 @@ impl RemoteInstaller {
         })
     }
 
+    /// Whether the release's Linux binary loads on this distro. The binaries
+    /// are cross-built against glibc 2.28 (install.sh `MIN_GLIBC`): v0.10.0's
+    /// linux/amd64 and linux/arm64 binaries need GLIBC_2.28 at most, and the
+    /// amd64 one runs on Rocky 8 (2.28), Debian 11 and Ubuntu 20.04 (2.31),
+    /// Amazon Linux 2023 (2.34), Ubuntu 22.04 (2.35) and Debian 12 (2.36), but
+    /// not on Ubuntu 18.04 (2.27) or Amazon Linux 2 (2.26). Each cutoff below
+    /// is the first release of that distro shipping glibc 2.28 or later.
+    /// musl and non-FHS distros have no usable binary.
     fn linux_prebuilt_binary_supported_by_distro(distro: Option<&str>) -> bool {
         let Some(raw_distro) = distro else {
             return true;
@@ -475,25 +500,27 @@ impl RemoteInstaller {
             return false;
         }
         if distro.contains("ubuntu") || distro.contains("pop!_os") || distro.contains("pop os") {
-            return first_version_components(&distro).is_none_or(|version| version >= (24, 4));
+            return first_version_components(&distro).is_none_or(|version| version >= (18, 10));
         }
         if distro.contains("linux mint") {
-            return first_version_components(&distro).is_none_or(|version| version.0 >= 22);
+            return first_version_components(&distro).is_none_or(|version| version.0 >= 20);
         }
         if distro.contains("elementary os") {
-            return first_version_components(&distro).is_none_or(|version| version.0 >= 8);
+            return first_version_components(&distro).is_none_or(|version| version.0 >= 6);
         }
         if distro.contains("zorin os") {
-            return first_version_components(&distro).is_none_or(|version| version.0 >= 18);
+            return first_version_components(&distro).is_none_or(|version| version.0 >= 16);
         }
         if distro.contains("debian") {
-            return first_version_components(&distro).is_none_or(|version| version.0 >= 13);
+            return first_version_components(&distro).is_none_or(|version| version.0 >= 10);
         }
         if distro.contains("fedora") {
-            return first_version_components(&distro).is_none_or(|version| version.0 >= 39);
+            return first_version_components(&distro).is_none_or(|version| version.0 >= 29);
         }
         if distro.contains("amazon linux") {
-            return false;
+            // Amazon Linux 2 (2.26) and the 2018.03 AMI (2.17) are too old;
+            // 2023 ships 2.34. An unversioned name stays on the source path.
+            return first_version_components(&distro).is_some_and(|version| version.0 >= 2022);
         }
         if distro.contains("centos")
             || distro.contains("red hat")
@@ -502,7 +529,7 @@ impl RemoteInstaller {
             || distro.contains("alma")
             || distro.contains("oracle linux")
         {
-            return first_version_components(&distro).is_none_or(|version| version.0 >= 10);
+            return first_version_components(&distro).is_none_or(|version| version.0 >= 8);
         }
 
         true
@@ -643,7 +670,7 @@ impl RemoteInstaller {
         self.check_resources()?;
 
         // Walk the documented chain: every viable method, fastest first, and
-        // fall through when one fails (WS-G.1). A failed cargo-binstall on a
+        // fall through when one fails (WS-G.1). A failed binary install on a
         // host that can compile is a slow install, not a failed setup.
         let methods = self.candidate_methods();
         if methods.is_empty() {
@@ -670,7 +697,6 @@ impl RemoteInstaller {
             });
 
             let result = match &method {
-                InstallMethod::CargoBinstall => self.install_via_binstall(&on_progress, start),
                 InstallMethod::PrebuiltBinary { url, checksum } => {
                     self.install_via_binary(url, checksum.as_deref(), &on_progress, start)
                 }
@@ -725,42 +751,6 @@ impl RemoteInstaller {
             elapsed: start.elapsed(),
         });
         Err(error)
-    }
-
-    /// Install via cargo-binstall.
-    fn install_via_binstall<F>(
-        &self,
-        on_progress: &F,
-        start: Instant,
-    ) -> Result<InstallResult, InstallError>
-    where
-        F: Fn(InstallProgress),
-    {
-        self.can_compile()?;
-
-        on_progress(InstallProgress {
-            stage: InstallStage::Downloading,
-            message: "Running cargo binstall...".into(),
-            percent: Some(10),
-            elapsed: start.elapsed(),
-        });
-
-        let script = format!(
-            r#"cargo binstall --no-confirm {}@{}"#,
-            CRATE_NAME, self.target_version
-        );
-
-        self.run_ssh_command(&script, Duration::from_secs(120))?;
-
-        // Verify installation
-        self.verify_installation(on_progress, start)?;
-
-        Ok(InstallResult {
-            method: InstallMethod::CargoBinstall,
-            version: self.target_version.clone(),
-            duration: start.elapsed(),
-            install_path: Some("~/.cargo/bin/cass".into()),
-        })
     }
 
     /// Install via pre-built binary download.
@@ -934,7 +924,10 @@ fi
             stage: InstallStage::Compiling {
                 crate_name: CRATE_NAME.into(),
             },
-            message: "Starting cargo install (this may take 2-5 minutes)...".into(),
+            message: format!(
+                "Building cass {} from the release tag's source (a release build takes a long time on a small host)...",
+                self.target_version
+            ),
             percent: Some(10),
             elapsed: start.elapsed(),
         });
@@ -966,6 +959,24 @@ fi
         })
     }
 
+    /// GitHub's source archive of the release tag `v<target_version>`.
+    fn source_archive_url(&self) -> String {
+        format!(
+            "{REPO_URL}/archive/refs/tags/v{}.tar.gz",
+            self.target_version
+        )
+    }
+
+    /// Background script that builds the release tag from source, the way
+    /// install.sh's `--from-source` path does: unpack the tag's source
+    /// archive under `$HOME` (the disk the probe measured), install the
+    /// toolchain its rust-toolchain.toml pins (rustup reads that file because
+    /// the build runs inside the checkout), and `cargo install --locked --path
+    /// . --bin cass` there, so the tag's Cargo.lock and .cargo/config.toml
+    /// apply. The release profile's fat LTO with one codegen unit peaked at
+    /// 10.9 GB of rustc RSS building v0.10.0, so this fallback builds with thin
+    /// LTO and 16 codegen units to fit the hosts that need it. The unpacked
+    /// tree, including its target directory, is removed afterwards.
     fn build_cargo_install_script(&self) -> String {
         format!(
             r#"
@@ -977,7 +988,31 @@ nohup bash -c '
 # Source cargo env in case this is called after bootstrap rustup install
 set -o pipefail
 source "$HOME/.cargo/env" 2>/dev/null || true
-cargo install {}@{} 2>&1 | tee "$HOME/.cass_install.log"
+unset RUSTUP_TOOLCHAIN
+build() {{
+    if ! command -v rustup >/dev/null 2>&1; then
+        echo "error: rustup not found; cass {version} builds with the Rust toolchain its rust-toolchain.toml pins"
+        return 1
+    fi
+    work=$(mktemp -d "$HOME/.cass-src.XXXXXX") || return 1
+    if command -v curl >/dev/null 2>&1; then
+        fetch="curl -fsSL"
+    else
+        fetch="wget -qO-"
+    fi
+    echo "Downloading {archive}"
+    $fetch "{archive}" | tar -xzf - -C "$work" --strip-components=1 &&
+        cd "$work" &&
+        echo "Installing the Rust toolchain pinned by rust-toolchain.toml" &&
+        {{ rustup toolchain install >/dev/null 2>&1 || true; }} &&
+        CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+        cargo install --locked --path . --bin cass
+    status=$?
+    cd "$HOME" || true
+    rm -rf "$work"
+    return "$status"
+}}
+build 2>&1 | tee "$HOME/.cass_install.log"
 status=${{PIPESTATUS[0]}}
 if [ "$status" -eq 0 ]; then
     echo "===INSTALL_COMPLETE===" >> "$HOME/.cass_install.log"
@@ -989,7 +1024,8 @@ exit "$status"
 
 echo "INSTALL_PID=$!"
 "#,
-            CRATE_NAME, self.target_version
+            version = self.target_version,
+            archive = self.source_archive_url(),
         )
     }
 
@@ -1011,13 +1047,7 @@ echo "INSTALL_PID=$!"
             elapsed: start.elapsed(),
         });
 
-        // Install rustup
-        let rustup_script = r#"
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source ~/.cargo/env
-"#;
-
-        self.run_ssh_command(rustup_script, Duration::from_secs(300))?;
+        self.run_ssh_command(RUSTUP_BOOTSTRAP_SCRIPT, Duration::from_secs(300))?;
 
         on_progress(InstallProgress {
             stage: InstallStage::Compiling {
@@ -1063,13 +1093,14 @@ else
 fi
 "#;
 
-        let max_wait = Duration::from_secs(600); // 10 minutes max
+        let max_wait = Duration::from_secs(DEFAULT_INSTALL_TIMEOUT_SECS);
+        let poll_start = Instant::now();
         let poll_interval = Duration::from_secs(5);
         let mut last_crate = String::new();
         let mut progress_pct: u8 = 15;
 
         loop {
-            if start.elapsed() > max_wait {
+            if poll_start.elapsed() > max_wait {
                 return Err(InstallError::Timeout(max_wait.as_secs()));
             }
 
@@ -1266,18 +1297,14 @@ mod tests {
     fn fixture_resources() -> ResourceInfo {
         ResourceInfo {
             disk_available_mb: 10000,
-            memory_total_mb: 8000,
-            memory_available_mb: 4000,
+            memory_total_mb: 16000,
+            memory_available_mb: 8000,
             can_compile: true,
         }
     }
 
     #[test]
     fn test_install_method_display() {
-        assert_eq!(
-            InstallMethod::CargoBinstall.display_name(),
-            "cargo-binstall"
-        );
         assert_eq!(InstallMethod::CargoInstall.display_name(), "cargo install");
         assert_eq!(
             InstallMethod::FullBootstrap.display_name(),
@@ -1287,7 +1314,6 @@ mod tests {
 
     #[test]
     fn test_install_method_requires_compilation() {
-        assert!(InstallMethod::CargoBinstall.requires_compilation());
         assert!(
             !InstallMethod::PrebuiltBinary {
                 url: "".into(),
@@ -1302,47 +1328,98 @@ mod tests {
     #[test]
     fn test_install_resource_thresholds_match_probe_thresholds() {
         assert_eq!(MIN_DISK_MB, ResourceInfo::MIN_DISK_MB);
+        assert_eq!(MIN_COMPILE_DISK_MB, ResourceInfo::MIN_COMPILE_DISK_MB);
         assert_eq!(MIN_MEMORY_MB, ResourceInfo::MIN_MEMORY_MB);
     }
 
+    /// The source build needs the measured toolchain + registry + build tree
+    /// (MIN_COMPILE_DISK_MB) and rustc peak (MIN_MEMORY_MB); the pre-built
+    /// binary only MIN_DISK_MB. Planted negatives: a host one MB short of
+    /// either compile floor is offered no source method, while the same host
+    /// still passes the general disk check a binary install needs.
     #[test]
-    fn test_choose_method_prefers_binstall() {
+    fn source_methods_require_the_measured_compile_floors() {
         let mut system = fixture_system_info();
-        system.has_cargo_binstall = true;
-        let resources = fixture_resources();
-
-        let installer = RemoteInstaller::new("test", system, resources);
+        // darwin/x86_64: no release binary, so only source methods can appear.
+        system.os = "darwin".into();
+        system.distro = None;
+        system.has_cargo = true;
+        system.has_curl = true;
+        let floor = ResourceInfo {
+            disk_available_mb: MIN_COMPILE_DISK_MB,
+            memory_total_mb: MIN_MEMORY_MB,
+            memory_available_mb: MIN_MEMORY_MB / 2,
+            can_compile: true,
+        };
+        assert!(ResourceInfo::fits_source_build(
+            floor.disk_available_mb,
+            floor.memory_total_mb
+        ));
+        let installer = RemoteInstaller::new("test", system.clone(), floor.clone());
         assert_eq!(
-            installer.choose_method(),
-            Some(InstallMethod::CargoBinstall)
+            installer.candidate_methods(),
+            vec![InstallMethod::CargoInstall, InstallMethod::FullBootstrap]
         );
+
+        let mut short_disk = floor.clone();
+        short_disk.disk_available_mb = MIN_COMPILE_DISK_MB - 1;
+        let installer = RemoteInstaller::new("test", system.clone(), short_disk);
+        assert!(installer.check_resources().is_ok());
+        assert!(matches!(
+            installer.can_compile(),
+            Err(InstallError::InsufficientDisk { required_mb, .. }) if required_mb == MIN_COMPILE_DISK_MB
+        ));
+        assert!(installer.candidate_methods().is_empty());
+
+        let mut short_memory = floor;
+        short_memory.memory_total_mb = MIN_MEMORY_MB - 1;
+        assert!(!ResourceInfo::fits_source_build(
+            short_memory.disk_available_mb,
+            short_memory.memory_total_mb
+        ));
+        let installer = RemoteInstaller::new("test", system, short_memory);
+        assert!(installer.candidate_methods().is_empty());
     }
 
     /// WS-G.1: `install()` walks every viable method in order instead of
-    /// stopping at the first choice. Positive observable: a host with
-    /// binstall, cargo and curl yields the full chain, fastest first, and
-    /// `choose_method` is exactly its head. Planted negative: a host with no
-    /// viable method yields an empty chain, so `install()` reports
-    /// `NoMethodAvailable` without attempting anything. No-claim: the
-    /// fall-through on a real failed `cargo-binstall` is not executed here.
+    /// stopping at the first choice. Positive observable: an Intel Mac (no
+    /// published binary) with cargo, cargo-binstall and curl yields the source
+    /// build and then the bootstrap, and `choose_method` is exactly its head;
+    /// cargo-binstall on PATH adds nothing, since it can only ask crates.io.
+    /// Planted negatives: cargo without curl or wget cannot download the
+    /// tag's source, and a host with no viable method yields an empty chain,
+    /// so `install()` reports `NoMethodAvailable` without attempting anything.
+    /// No-claim: no method is executed here.
     #[test]
     fn candidate_methods_is_the_ordered_fallback_chain() {
-        // No curl/wget: the prebuilt branch (which would consult the release
-        // checksum over the network) and the bootstrap branch are excluded, so
-        // this stays a pure unit test.
+        // darwin/x86_64 has no release binary, so the prebuilt branch (which
+        // would consult the release checksum over SSH) stays out and this
+        // stays a pure unit test.
         let mut system = fixture_system_info();
+        system.os = "darwin".into();
+        system.distro = None;
         system.has_cargo_binstall = true;
         system.has_cargo = true;
-        system.has_curl = false;
-        system.has_wget = false;
+        system.has_curl = true;
         let installer = RemoteInstaller::new("test", system, fixture_resources());
         let chain = installer.candidate_methods();
         assert_eq!(
             chain,
-            vec![InstallMethod::CargoBinstall, InstallMethod::CargoInstall],
-            "fastest first, and cargo install stays available after a binstall failure"
+            vec![InstallMethod::CargoInstall, InstallMethod::FullBootstrap],
+            "the source build first, and the bootstrap stays available after it fails"
         );
         assert_eq!(chain.first(), installer.choose_method().as_ref());
+
+        let mut no_download = fixture_system_info();
+        no_download.has_cargo = true;
+        no_download.has_cargo_binstall = true;
+        no_download.has_curl = false;
+        no_download.has_wget = false;
+        let installer = RemoteInstaller::new("test", no_download, fixture_resources());
+        assert!(
+            installer.candidate_methods().is_empty(),
+            "cargo alone cannot fetch the tag's source"
+        );
 
         let mut bare = fixture_system_info();
         bare.has_cargo_binstall = false;
@@ -1359,9 +1436,9 @@ mod tests {
     }
 
     #[test]
-    fn test_choose_method_skips_binstall_and_prebuilt_on_known_old_glibc_linux() {
+    fn test_choose_method_builds_from_source_on_pre_2_28_glibc_linux() {
         let mut system = fixture_system_info();
-        system.distro = Some("Ubuntu 22.04.5 LTS".into());
+        system.distro = Some("Ubuntu 18.04.6 LTS".into());
         system.has_cargo_binstall = true;
         system.has_cargo = true;
         system.has_curl = true;
@@ -1372,20 +1449,20 @@ mod tests {
         assert_eq!(
             installer.choose_method(),
             Some(InstallMethod::CargoInstall),
-            "Ubuntu 22.04 is below the documented glibc requirement, so binary fast paths should fall through to source installs"
+            "Ubuntu 18.04 ships glibc 2.27, below the release binary's 2.28, so the chain starts at the source build"
         );
     }
 
     #[test]
     fn test_choose_method_cargo_install() {
         let mut system = fixture_system_info();
-        // Disable curl/wget so pre-built binary is not available
+        // armv7 has no release binary; wget alone can fetch the tag's source.
+        system.arch = "armv7".into();
         system.has_curl = false;
-        system.has_wget = false;
+        system.has_wget = true;
         let resources = fixture_resources();
 
         let installer = RemoteInstaller::new("test", system, resources);
-        // With cargo but no binstall and no download tools, should choose cargo install
         assert_eq!(installer.choose_method(), Some(InstallMethod::CargoInstall));
     }
 
@@ -1488,7 +1565,7 @@ mod tests {
     #[test]
     fn test_choose_method_bootstraps_instead_of_prebuilt_on_known_old_glibc_linux() {
         let mut system = fixture_system_info();
-        system.distro = Some("Debian GNU/Linux 12 (bookworm)".into());
+        system.distro = Some("Debian GNU/Linux 9 (stretch)".into());
         system.has_cargo = false;
         system.has_cargo_binstall = false;
         system.has_curl = true;
@@ -1505,11 +1582,11 @@ mod tests {
     }
 
     #[test]
-    fn test_choose_method_skips_binstall_when_compile_resources_are_insufficient() {
+    fn test_choose_method_skips_source_build_when_compile_resources_are_insufficient() {
         let mut system = fixture_system_info();
         system.has_cargo = true;
         system.has_cargo_binstall = true;
-        system.has_curl = false;
+        system.has_curl = true;
         system.has_wget = false;
         system.arch = "armv7".into();
         let mut resources = fixture_resources();
@@ -1520,12 +1597,12 @@ mod tests {
         assert_eq!(
             installer.choose_method(),
             None,
-            "cargo-binstall may fall back to cargo install, so it must not be selected when source builds are unsafe"
+            "neither source build may be selected below the compile floor"
         );
     }
 
     #[test]
-    fn test_choose_method_skips_low_memory_binstall_and_unverified_prebuilt() {
+    fn test_choose_method_skips_low_memory_source_build_and_unverified_prebuilt() {
         let mut system = fixture_system_info();
         system.has_cargo = true;
         system.has_cargo_binstall = true;
@@ -1539,7 +1616,7 @@ mod tests {
         assert_eq!(
             installer.choose_method(),
             None,
-            "low-memory hosts should not use cargo-binstall's source fallback or an unverified prebuilt install"
+            "low-memory hosts should not use a source build or an unverified prebuilt install"
         );
     }
 
@@ -1605,20 +1682,25 @@ mod tests {
 
     #[test]
     fn test_get_prebuilt_url_skips_known_old_glibc_linux_distros() {
+        // Each is the last release of its distro before glibc 2.28 (the
+        // release binary needs GLIBC_2.28; Ubuntu 18.04 and Amazon Linux 2
+        // refuse to load v0.10.0's), or a musl / non-FHS distro.
         for distro in [
-            "Ubuntu 20.04.6 LTS",
-            "Ubuntu 22.04.5 LTS",
-            "Debian GNU/Linux 12 (bookworm)",
-            "Fedora Linux 38 (Workstation Edition)",
+            "Ubuntu 18.04.6 LTS",
+            "Debian GNU/Linux 9 (stretch)",
+            "Fedora 28 (Twenty Eight)",
             "CentOS Linux 7 (Core)",
-            "Amazon Linux 2023",
+            "Red Hat Enterprise Linux Server 7.9 (Maipo)",
+            "Amazon Linux 2",
+            "Amazon Linux AMI 2018.03",
+            "Amazon Linux",
             "Alpine Linux v3.20",
             "Void Linux",
             "NixOS 24.05 (Uakari)",
-            "Pop!_OS 22.04 LTS",
-            "Linux Mint 21.3 Virginia",
-            "elementary OS 7.1 Horus",
-            "Zorin OS 17.2 Core",
+            "Pop!_OS 18.04 LTS",
+            "Linux Mint 19.3 Tricia",
+            "elementary OS 5.1.7 Hera",
+            "Zorin OS 15.3 Core",
         ] {
             let mut system = fixture_system_info();
             system.distro = Some(distro.into());
@@ -1635,15 +1717,31 @@ mod tests {
 
     #[test]
     fn test_get_prebuilt_url_allows_known_new_enough_linux_distros() {
+        // Ubuntu 20.04/22.04, Debian 11/12, Rocky 8 and Amazon Linux 2023 run
+        // v0.10.0's linux/amd64 binary (glibc 2.31, 2.35, 2.31, 2.36, 2.28,
+        // 2.34); the rest are the first release of their distro on 2.28+.
         for distro in [
+            "Ubuntu 20.04.6 LTS",
+            "Ubuntu 22.04.5 LTS",
             "Ubuntu 24.04.1 LTS",
+            "Debian GNU/Linux 10 (buster)",
+            "Debian GNU/Linux 11 (bullseye)",
+            "Debian GNU/Linux 12 (bookworm)",
             "Debian GNU/Linux 13 (trixie)",
-            "Fedora Linux 39 (Workstation Edition)",
+            "Fedora 29 (Twenty Nine)",
+            "Fedora Linux 38 (Workstation Edition)",
+            "Rocky Linux 8.10 (Green Obsidian)",
+            "Red Hat Enterprise Linux 9.4 (Plow)",
             "Red Hat Enterprise Linux 10.0",
-            "Pop!_OS 24.04 LTS",
-            "Linux Mint 22 Wilma",
-            "elementary OS 8 Circe",
-            "Zorin OS 18 Core",
+            "CentOS Stream 9",
+            "Amazon Linux 2023",
+            "Pop!_OS 22.04 LTS",
+            "Linux Mint 20.3 Una",
+            "Linux Mint 21.3 Virginia",
+            "elementary OS 6.1 Jolnir",
+            "elementary OS 7.1 Horus",
+            "Zorin OS 16.3 Core",
+            "Zorin OS 17.2 Core",
             "Arch Linux",
         ] {
             let mut system = fixture_system_info();
@@ -1742,6 +1840,84 @@ mod tests {
             script.contains("exit \"$status\""),
             "background installer should exit with the cargo status"
         );
+    }
+
+    /// The source build installs the release tag, not a crates.io version.
+    /// Positive: the tag's source archive, the toolchain its checkout pins,
+    /// `cargo install --locked --path .` run inside that checkout, and the
+    /// unpacked tree removed afterwards. Negatives a crates.io-era script
+    /// fails: no `coding-agent-search@<version>` and no bare registry install;
+    /// the rustup bootstrap installs no default (stable) toolchain. The inner
+    /// script is passed through `bash -c '...'`, so it must hold no single
+    /// quote, and both levels must parse (`bash -n`).
+    #[test]
+    fn source_build_script_builds_the_release_tag_with_its_pinned_toolchain() -> Result<(), String>
+    {
+        let installer = RemoteInstaller::with_version(
+            "test",
+            fixture_system_info(),
+            fixture_resources(),
+            "1.2.3",
+        )
+        .map_err(|error| error.to_string())?;
+        let script = installer.build_cargo_install_script();
+
+        let archive = format!("{REPO_URL}/archive/refs/tags/v1.2.3.tar.gz");
+        assert!(
+            script.contains(&format!("$fetch \"{archive}\" | tar -xzf - -C \"$work\"")),
+            "downloads the tag's source archive: {script}"
+        );
+        let position = |needle: &str| {
+            script
+                .find(needle)
+                .ok_or_else(|| format!("script lacks `{needle}`: {script}"))
+        };
+        let unpack = position("tar -xzf")?;
+        let enter = position("cd \"$work\"")?;
+        let toolchain = position("rustup toolchain install")?;
+        let build = position("cargo install --locked --path .")?;
+        assert!(
+            unpack < enter && enter < toolchain && toolchain < build,
+            "rustup and cargo must run inside the unpacked checkout, in that order"
+        );
+        assert!(script.contains("unset RUSTUP_TOOLCHAIN"));
+        assert!(script.contains("rm -rf \"$work\""));
+        assert!(
+            !script.contains(&format!("{CRATE_NAME}@")),
+            "must not ask crates.io for an exact version it does not have"
+        );
+        assert!(
+            !script.contains("cargo install coding-agent-search"),
+            "must not run a registry install"
+        );
+        assert!(RUSTUP_BOOTSTRAP_SCRIPT.contains("--default-toolchain none"));
+
+        let (_, after_open) = script
+            .split_once("nohup bash -c '")
+            .ok_or("inner script does not open")?;
+        let (inner, _) = after_open
+            .split_once("' > /dev/null 2>&1 &")
+            .ok_or("inner script does not close")?;
+        assert!(
+            !inner.contains('\''),
+            "a single quote would end the bash -c argument early"
+        );
+
+        #[cfg(unix)]
+        for (label, text) in [("outer", script.as_str()), ("inner", inner)] {
+            let parsed = Command::new("bash")
+                .arg("-n")
+                .arg("-c")
+                .arg(text)
+                .output()
+                .map_err(|error| format!("run bash -n: {error}"))?;
+            assert!(
+                parsed.status.success(),
+                "{label} script does not parse: {}",
+                String::from_utf8_lossy(&parsed.stderr)
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -2098,8 +2274,7 @@ mod tests {
             disk_available_mb: disk_mb,
             memory_total_mb: mem_total_mb,
             memory_available_mb: mem_avail_mb,
-            can_compile: disk_mb >= ResourceInfo::MIN_DISK_MB
-                && mem_total_mb >= ResourceInfo::MIN_MEMORY_MB,
+            can_compile: ResourceInfo::fits_source_build(disk_mb, mem_total_mb),
         }
     }
 
@@ -2149,7 +2324,7 @@ mod tests {
     #[cfg(not(windows))]
     fn real_resources_can_compile_matches_thresholds() {
         let res = local_resource_info();
-        let expected = res.disk_available_mb >= ResourceInfo::MIN_DISK_MB
+        let expected = res.disk_available_mb >= ResourceInfo::MIN_COMPILE_DISK_MB
             && res.memory_total_mb >= ResourceInfo::MIN_MEMORY_MB;
         assert_eq!(
             res.can_compile, expected,
@@ -2167,9 +2342,8 @@ mod tests {
         let installer = RemoteInstaller::new("localhost", sys, res);
         let compile_safe = installer.can_compile().is_ok();
         let source_install_possible = compile_safe
-            && ((installer.system_info.has_cargo_binstall
-                && installer.prebuilt_binary_fast_path_is_safe())
-                || installer.system_info.has_cargo
+            && ((installer.system_info.has_cargo
+                && (installer.system_info.has_curl || installer.system_info.has_wget))
                 || installer.system_info.has_curl);
         let method = installer.choose_method();
         let method_matches_live_capabilities = if source_install_possible {
@@ -2205,7 +2379,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "environment-dependent: requires >=2GB disk space and >=1GB memory"]
+    #[ignore = "environment-dependent: requires >=6GB free home disk and >=10GB memory"]
     fn real_system_can_compile_ok() {
         let sys = local_system_info();
         let res = local_resource_info();

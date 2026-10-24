@@ -1,5 +1,4 @@
 const CHECKLIST: &str = include_str!("../docs/planning/DOCTOR_V2_RELEASE_CHECKLIST.md");
-const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
 
 #[test]
 fn doctor_v2_release_checklist_records_required_release_gates() {
@@ -64,39 +63,4 @@ fn doctor_v2_release_checklist_records_current_evidence_index() {
             "release checklist evidence index is missing: {required}"
         );
     }
-}
-
-#[test]
-fn release_workflow_keeps_scoop_legacy_windows_asset_compatibility() -> Result<(), String> {
-    let missing = [
-        "coding-agent-search-x86_64-pc-windows-msvc.zip",
-        "Copy-Item $zipName $legacyZipName",
-        "\"$hash  $legacyZipName\" | Out-File -Encoding ASCII \"$legacyZipName.sha256\"",
-    ]
-    .into_iter()
-    .find(|required| !RELEASE_WORKFLOW.contains(required));
-
-    missing
-        .map(|required| {
-            format!("release workflow is missing Scoop compatibility asset handling: {required}")
-        })
-        .map_or(Ok(()), Err)
-}
-
-#[test]
-fn release_workflow_surfaces_manual_package_manager_dispatch_fallbacks() -> Result<(), String> {
-    let missing = [
-        "Manual Homebrew tap update required",
-        "gh workflow run auto-update.yml --repo Dicklesworthstone/homebrew-tap -f tool=cass -f version=${{ needs.release.outputs.version }}",
-        "Manual Scoop bucket update required",
-        "gh workflow run auto-update.yml --repo Dicklesworthstone/scoop-bucket -f tool=cass -f version=${{ needs.release.outputs.version }}",
-    ]
-    .into_iter()
-    .find(|required| !RELEASE_WORKFLOW.contains(required));
-
-    missing
-        .map(|required| {
-            format!("release workflow is missing manual dispatch fallback text: {required}")
-        })
-        .map_or(Ok(()), Err)
 }

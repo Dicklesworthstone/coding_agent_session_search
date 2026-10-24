@@ -8,5 +8,11 @@
   "messages_removed": 0,
   "lexical_rebuilt": false,
   "pairs": [],
+  "misattributed_mirror": {
+    "conversations_removed": 0,
+    "messages_removed": 0,
+    "unmatched": 0,
+    "rows": []
+  },
   "recommended_action": "No database found. Run 'cass index --full' first."
 }

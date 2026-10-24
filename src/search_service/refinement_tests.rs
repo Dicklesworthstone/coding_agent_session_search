@@ -305,7 +305,7 @@ fn native_refinement_reuses_real_model_and_reader_without_global_semantic_assets
 
 #[test]
 fn refinement_obeys_shared_admission_before_loading_and_unload_releases_the_slot() -> Result<()> {
-    use super::super::admission::{Pool, Refusal};
+    use super::super::admission::{Pool, Refusal, acquire_after_release};
 
     let temp = tempfile::tempdir()?;
     let index = temp.path().join("index");
@@ -335,7 +335,7 @@ fn refinement_obeys_shared_admission_before_loading_and_unload_releases_the_slot
     assert!(session.client.is_none());
     assert!(!session.refiner.loaded());
     assert!(session.reader_lease.is_none());
-    let released = pool.acquire()?;
+    let released = acquire_after_release(&pool)?;
     drop(released);
     assert_eq!(session.refiner.load_attempts, 1);
     Ok(())

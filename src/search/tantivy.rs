@@ -940,6 +940,27 @@ pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
     open_validated_lexical_index(index_path).map(|_| ())
 }
 
+/// [`validate_searchable_index_contract`] plus the [`SearchableIndexSummary`]
+/// of the same open. Asking for the summary first and validating afterwards
+/// opened the index twice, and every Quill open hashes every live segment.
+pub fn validated_searchable_index_summary(index_path: &Path) -> Result<SearchableIndexSummary> {
+    let opened = open_validated_lexical_index(index_path)?;
+    if let Some((reader, _)) = opened.reader.as_ref() {
+        return Ok(SearchableIndexSummary {
+            docs: usize::try_from(reader.doc_count()?).unwrap_or(usize::MAX),
+            segments: reader.segment_count()?,
+        });
+    }
+    // A federated bundle validated each shard above; its summary comes from
+    // the bundle manifest without another open.
+    searchable_index_summary(index_path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "validated lexical index has no summary: {}",
+            index_path.display()
+        )
+    })
+}
+
 pub(crate) fn open_validated_lexical_index(index_path: &Path) -> Result<OpenedLexicalIndex> {
     if let Some(readers) = open_federated_search_readers(index_path)? {
         return Ok(OpenedLexicalIndex {
@@ -2674,6 +2695,41 @@ mod tests {
             &conv,
             ConversationPacketProvenance::local(),
         )
+    }
+
+    /// The indexer preflight asked for the summary, then validated the
+    /// contract: two opens, and each Quill open hashes every live segment.
+    #[test]
+    fn validated_summary_takes_its_counts_from_one_index_open() {
+        let dir = TempDir::new().expect("temp dir");
+        {
+            let mut index = TantivyIndex::open_or_create(dir.path()).expect("create");
+            index
+                .add_messages_from_packet(&gh423_lexical_packet(3), None, Some(7), |_| Ok(()))
+                .expect("add messages");
+            index.commit().expect("commit");
+        }
+        let opens = crate::search::quill_bridge::reader_open_count();
+        let summary = searchable_index_summary(dir.path())
+            .expect("summary")
+            .expect("summary present");
+        validate_searchable_index_contract(dir.path()).expect("contract");
+        assert_eq!(crate::search::quill_bridge::reader_open_count() - opens, 2);
+
+        let opens = crate::search::quill_bridge::reader_open_count();
+        let validated = validated_searchable_index_summary(dir.path()).expect("validated");
+        assert_eq!(crate::search::quill_bridge::reader_open_count() - opens, 1);
+        assert_eq!(
+            (validated.docs, validated.segments),
+            (summary.docs, summary.segments)
+        );
+        assert_eq!(validated.docs, 3);
+
+        let empty = TempDir::new().expect("temp dir");
+        assert!(
+            validated_searchable_index_summary(empty.path()).is_err(),
+            "a directory without an index fails validation"
+        );
     }
 
     fn gh423_lexical_hits(index: &TantivyIndex, term: &str) -> BTreeSet<String> {

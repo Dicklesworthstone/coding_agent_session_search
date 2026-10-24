@@ -80,13 +80,13 @@ impl UpdateState {
     }
 
     /// Save state to disk (synchronous)
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn save(&self, path: &Path) -> Result<()> {
         save_update_state_to_path(self, path)
     }
 
     /// Save state to disk (asynchronous)
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn save_async(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             asupersync::fs::create_dir_all(parent)
@@ -728,7 +728,7 @@ fn write_update_state_temp_file_at(path: &Path, contents: &[u8]) -> std::io::Res
     file.sync_all()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn write_update_state_temp_file_async(
     path: &Path,
     contents: &[u8],
@@ -751,7 +751,7 @@ async fn write_update_state_temp_file_async(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn write_update_state_temp_file_at_async(
     path: &Path,
     contents: &[u8],

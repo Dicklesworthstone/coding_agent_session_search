@@ -96,6 +96,11 @@
       "found": false
     },
     {
+      "name": "continue",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
       "name": "antigravity",
       "path": "(not detected)",
       "found": false

@@ -14,6 +14,7 @@ fn header() -> Header {
             .collect(),
         contains_private_data: true,
         omissions: vec!["derived_search_assets".to_owned()],
+        sequences: None,
     }
 }
 
@@ -65,6 +66,111 @@ fn typed_rows_and_child_before_parent_relationships_round_trip() {
         child.get_typed::<f64>(2).unwrap().to_bits(),
         (-1.25_f64).to_bits()
     );
+}
+
+#[test]
+fn v3_restores_absent_zero_negative_and_exhausted_allocation_state() -> Result<()> {
+    for saved in [None, Some(0), Some(-7), Some(9001), Some(i64::MAX)] {
+        let source = fixture();
+        source.execute(
+            "CREATE TABLE allocations (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)",
+        )?;
+        if let Some(value) = saved {
+            source.execute_with_params(
+                "INSERT INTO sqlite_sequence (name, seq) VALUES ('allocations', ?1)",
+                &[SqliteValue::Integer(value)],
+            )?;
+        }
+        let bytes = encoded(&source);
+        let target = fixture();
+        target.execute_batch(
+            "CREATE TABLE allocations (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT);
+             INSERT INTO allocations VALUES (99999, 'PRIVATE-INITIALIZER-ROW');
+             DELETE FROM allocations;",
+        )?;
+        let receipt = replay(&target, &bytes)?;
+        assert_eq!(receipt.0.schema_version, codec::SEQUENCE_VERSION);
+        assert_eq!(
+            receipt.0.sequences,
+            Some(vec![codec::Sequence {
+                table: "allocations".into(),
+                value: saved,
+            }])
+        );
+        assert_eq!(
+            receipt.1,
+            codec::verify(&mut Cursor::new(encoded(&target)))?.1
+        );
+
+        // This is a real engine allocation, after clearing both initializer
+        // rows and their previous high-water mark from private replay.
+        let inserted = target.execute("INSERT INTO allocations (body) VALUES ('after-restore')");
+        if saved == Some(i64::MAX) {
+            assert!(
+                inserted.is_err(),
+                "an exhausted allocator was reset by restore"
+            );
+            assert_eq!(
+                target
+                    .query_row("SELECT COUNT(*) FROM allocations")?
+                    .get_typed::<i64>(0)?,
+                0
+            );
+        } else {
+            inserted?;
+            assert_eq!(
+                target
+                    .query_row("SELECT id FROM allocations")?
+                    .get_typed::<i64>(0)?,
+                saved.unwrap_or(0).max(0) + 1
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn authenticated_v3_missing_allocation_inventory_never_publishes() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let source = root.path().join("source.db");
+    drop(SqliteStorage::open(&source)?);
+    let original = root.path().join("original.jsonl");
+    export::export_file(&source, &original, "restore-test".into())?;
+    let source_before = fs::read(&source)?;
+    let mut reader = BufReader::new(File::open(&original)?);
+    let Some(Record::Header { mut header }) = codec::read_record(&mut reader, 1)? else {
+        bail!("fixture header missing");
+    };
+    assert!(!header.sequences.as_ref().unwrap().is_empty());
+    header.sequences = Some(Vec::new());
+    let mut validator = Validator::new(header.clone())?;
+    let mut changed = codec::encode(&Record::Header { header })?;
+    let mut line = 2;
+    while let Some(record) = codec::read_record(&mut reader, line)? {
+        if matches!(record, Record::Completion { .. }) {
+            break;
+        }
+        validator.prepare(&record)?.write_to(&mut changed)?;
+        line += 1;
+    }
+    let completion = validator.completion();
+    validator
+        .prepare(&Record::Completion { completion })?
+        .write_to(&mut changed)?;
+    // A checksum authenticates the supplied metadata, not its agreement with
+    // this binary's canonical schema. Import must enforce that separately.
+    codec::verify(&mut Cursor::new(&changed))?;
+    let input = root.path().join("omitted-sequences.jsonl");
+    fs::write(&input, &changed)?;
+    let destination = root.path().join("refused.db");
+    let error = import_file(&input, &destination, "restore-test")
+        .expect_err("a complete allocator inventory is required by v3 restoration");
+    assert!(error.to_string().contains("AUTOINCREMENT table inventory"));
+    assert!(!error.to_string().contains("PRIVATE-"));
+    assert!(!destination.exists());
+    assert_eq!(fs::read(&source)?, source_before);
+    assert_eq!(fs::read(&input)?, changed);
+    Ok(())
 }
 
 #[test]
@@ -172,6 +278,201 @@ fn replay_spans_bounded_batches_without_losing_rows() {
         receipt.1,
         codec::verify(&mut Cursor::new(encoded(&target))).unwrap().1
     );
+}
+
+#[test]
+fn late_constraint_failure_keeps_safe_row_coordinates_and_engine_cause() -> Result<()> {
+    let source = fixture();
+    let target = fixture();
+    target.execute("CREATE UNIQUE INDEX private_parent_names ON parents(name)")?;
+    let count = MAX_BATCH_RECORDS * 2 + 1;
+    let insert = source.prepare("INSERT INTO parents VALUES (?, ?)")?;
+    for position in 1..=count {
+        let value = if position == count { 1 } else { position };
+        insert.execute_with_params(&[
+            SqliteValue::Integer(1000 + i64::try_from(position)? * 7),
+            SqliteValue::Text(format!("PRIVATE-RESTORED-PARENT-{value}").into()),
+        ])?;
+    }
+    drop(insert);
+    let bytes = encoded(&source);
+    let error = replay(&target, &bytes).expect_err("duplicate non-key values violate the index");
+    let message = error.to_string();
+    assert!(message.contains("record "), "{message}");
+    assert!(
+        message.contains(&format!(
+            "logical table parents, row {count} (id={})",
+            1000 + count * 7
+        )),
+        "{message}"
+    );
+    assert!(
+        message.contains("canonical row insertion failed"),
+        "{message}"
+    );
+    assert!(message.contains("FrankenSQLite Constraint"), "{message}");
+    assert!(!message.contains("PRIVATE-RESTORED-PARENT"));
+    assert!(!message.contains("private_parent_names"));
+    assert!(error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<FrankenError>(),
+            Some(FrankenError::UniqueViolation { .. })
+        )
+    }));
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (9, "logical-archive-error", false)
+    );
+    // The failure follows committed private batches. Roll back the active
+    // batch, and prove that it neither claimed success nor poisoned replay.
+    target.execute("ROLLBACK")?;
+    let committed = target
+        .query_row("SELECT COUNT(*) FROM parents")?
+        .get_typed::<i64>(0)?;
+    assert!((128..i64::try_from(count)?).contains(&committed));
+    assert_eq!(
+        replay(&fixture(), &bytes)?.1,
+        codec::verify(&mut Cursor::new(&bytes))?.1
+    );
+    Ok(())
+}
+
+#[test]
+fn cancellation_after_reading_a_late_row_retains_the_insert_failure() -> Result<()> {
+    use fsqlite_types::cx::{CancelReason, LocalCancelRelay};
+
+    struct CancelAtRow<'a> {
+        inner: Cursor<&'a [u8]>,
+        cancel_at: u64,
+        relay: Option<LocalCancelRelay>,
+    }
+
+    impl Read for CancelAtRow<'_> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            let available = self.fill_buf()?;
+            let count = bytes.len().min(available.len());
+            bytes[..count].copy_from_slice(&available[..count]);
+            self.consume(count);
+            Ok(count)
+        }
+    }
+
+    impl BufRead for CancelAtRow<'_> {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.inner.fill_buf()
+        }
+
+        fn consume(&mut self, count: usize) {
+            self.inner.consume(count);
+            if self.inner.position() >= self.cancel_at
+                && let Some(relay) = self.relay.take()
+            {
+                assert!(relay.cancel_local(CancelReason::UserInterrupt));
+            }
+        }
+    }
+
+    let source = fixture();
+    let count = MAX_BATCH_RECORDS * 2 + 1;
+    let insert = source.prepare("INSERT INTO parents VALUES (?, ?)")?;
+    for id in 1..=count {
+        insert.execute_with_params(&[
+            SqliteValue::Integer(i64::try_from(id)?),
+            SqliteValue::Text("PRIVATE-CANCELLED-RESTORE".into()),
+        ])?;
+    }
+    drop(insert);
+    let bytes = encoded(&source);
+    let mut cursor = Cursor::new(bytes.as_slice());
+    let mut line = 1;
+    let mut cancel_at = None;
+    while let Some(record) = codec::read_record(&mut cursor, line)? {
+        if matches!(record, Record::Row { ref values } if values.first() == Some(&Cell::Integer(i64::try_from(count)?)))
+        {
+            cancel_at = Some(cursor.position());
+            break;
+        }
+        line += 1;
+    }
+
+    let target = fixture();
+    let (operation, relay) = target
+        .as_async()
+        .root_cx()
+        .create_child_with_local_cancel_relay();
+    let mut input = Input::new(CancelAtRow {
+        inner: Cursor::new(bytes.as_slice()),
+        cancel_at: cancel_at.expect("fixture contains the final parent row"),
+        relay: Some(relay),
+    });
+    let Some(Record::Header { header }) = input.record(1)? else {
+        bail!("fixture lacks its header");
+    };
+    let error = {
+        let _binding = target.as_async().bind_operation_cx(&operation);
+        restore(&target, &mut input, header).expect_err("cancelled INSERT must fail replay")
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("logical table parents, row {count} (id={count})")),
+        "{message}"
+    );
+    assert!(
+        message.contains("canonical row insertion failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains("FrankenSQLite Abort (code 4)"),
+        "{message}"
+    );
+    assert!(!message.contains("PRIVATE-CANCELLED-RESTORE"));
+    assert!(error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<FrankenError>(),
+            Some(FrankenError::Abort)
+        )
+    }));
+    assert!(target.as_async().root_cx().checkpoint().is_ok());
+    target.execute("ROLLBACK")?;
+    assert_eq!(
+        replay(&target, &bytes)?.1,
+        codec::verify(&mut Cursor::new(&bytes))?.1
+    );
+    Ok(())
+}
+
+#[test]
+fn cancelled_database_verification_reports_a_probe_failure_without_private_payload() -> Result<()> {
+    use fsqlite_types::cx::CancelReason;
+
+    let connection = fixture();
+    let (operation, relay) = connection
+        .as_async()
+        .root_cx()
+        .create_child_with_local_cancel_relay();
+    assert!(relay.cancel_local(CancelReason::UserInterrupt));
+    let error = {
+        let _binding = connection.as_async().bind_operation_cx(&operation);
+        verify_database(&connection).expect_err("cancelled relationship probe cannot certify a DB")
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("cannot check restored archive relationships"),
+        "{message}"
+    );
+    assert!(
+        message.contains("FrankenSQLite Abort (code 4)"),
+        "{message}"
+    );
+    assert!(!message.contains("broken canonical relationships"));
+    assert!(error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<FrankenError>(),
+            Some(FrankenError::Abort)
+        )
+    }));
+    verify_database(&connection)?;
+    Ok(())
 }
 
 #[test]

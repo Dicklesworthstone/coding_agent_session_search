@@ -751,7 +751,9 @@ mod gh472 {
         )
         .unwrap();
         let old_time = std::time::UNIX_EPOCH + Duration::from_secs(100);
-        fs::File::open(&old_source)
+        fs::File::options()
+            .write(true)
+            .open(&old_source)
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(old_time))
             .unwrap();
@@ -949,7 +951,9 @@ mod gh472 {
             fs::write(fixture.home.join("retained-original-source.txt"), &raw).unwrap();
             let short = raw.lines().take(2).collect::<Vec<_>>().join("\n") + "\n";
             fs::write(source, short).unwrap();
-            fs::File::open(source)
+            fs::File::options()
+                .write(true)
+                .open(source)
                 .unwrap()
                 .set_times(
                     fs::FileTimes::new()

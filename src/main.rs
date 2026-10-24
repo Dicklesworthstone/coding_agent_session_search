@@ -2,8 +2,12 @@
 // `#[allow(unsafe_code)]` + a SAFETY comment (startup env writes, unavoidable FFI per AGENTS.md).
 #![cfg_attr(not(test), deny(unsafe_code))]
 
+mod codex_layout_cli;
+mod lexical_quarantine_cli;
 mod logical_archive;
+mod raw_mirror_cli;
 mod search_service;
+pub mod semantic_reclaim_cli;
 
 fn env_requests_robot_output() -> bool {
     let cass_output_format = dotenvy::var("CASS_OUTPUT_FORMAT")
@@ -172,8 +176,17 @@ fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
         });
         eprintln!("{payload}");
     } else {
-        // Human-readable output stays on stderr per Unix convention.
+        // Human-readable output stays on stderr per Unix convention. The
+        // remedy goes on its own line: a person needs it as much as a robot
+        // envelope does, and without it a missing index or an exhausted query
+        // budget (GH #518) never named the command that fixes it.
         eprintln!("{}", err.message);
+        if let Some(hint) = err.hint.as_deref().map(str::trim)
+            && !hint.is_empty()
+            && !err.message.contains(hint)
+        {
+            eprintln!("Hint: {hint}");
+        }
     }
     std::process::exit(err.code);
 }
@@ -231,6 +244,25 @@ fn apply_default_fsqlite_read_witness_cap() {
     }
 }
 
+/// Keep serialized archive reads off the CPU-sized outer scheduler pool.
+///
+/// Timeline and sessions execute their SQL through the thread-affine sync
+/// bridge; extra outer workers cannot parallelize those reads. Use the same
+/// current-thread driver as search/health without bypassing normal parsing,
+/// startup, command dispatch, error reporting, or bridge/runtime shutdown.
+/// Indexing and every other command retain the multithreaded runtime.
+fn command_uses_current_thread(command: Option<&coding_agent_search::Commands>) -> bool {
+    matches!(
+        command,
+        Some(
+            coding_agent_search::Commands::Search { .. }
+                | coding_agent_search::Commands::Health { .. }
+                | coding_agent_search::Commands::Timeline { .. }
+                | coding_agent_search::Commands::Sessions { .. }
+        )
+    )
+}
+
 fn main() -> anyhow::Result<()> {
     // (cass #356) Restore the default SIGPIPE disposition so an early-exiting
     // pipe consumer (`cass ... --json | head`) terminates cass quietly with
@@ -241,6 +273,18 @@ fn main() -> anyhow::Result<()> {
     // writes regain the default kill-on-EPIPE behavior.
     #[cfg(unix)]
     sigpipe::reset();
+
+    // Offline recovery must work even when normal startup cannot open the
+    // archive. Use the same handler as the companion, before environment-driven
+    // setup, provider initialization, database probes, or runtime construction.
+    if let Some(args) = semantic_reclaim_cli::cass_args(&std::env::args_os().collect::<Vec<_>>()) {
+        let code = semantic_reclaim_cli::run_cass(args);
+        // The handler has finished and released its locks before process exit.
+        if code != 0 {
+            std::process::exit(i32::from(code));
+        }
+        return Ok(());
+    }
 
     // (cass #308) The semantic stack is now pure-Rust (frankensearch `native`
     // frankentorch embedder + reranker), so there is no prebuilt ONNX Runtime and
@@ -258,17 +302,40 @@ fn main() -> anyhow::Result<()> {
     // this must run before try_run_with_parsed_fast.
     apply_default_fsqlite_read_witness_cap();
 
-    // serve and archive are dispatched below, before the main CLI parses;
+    // Independent commands are dispatched before the main CLI parses;
     // registering their trees lets help, completions, the man page,
     // capabilities and introspect list them. Built only when one of those
     // asks.
     coding_agent_search::register_external_subcommands(|| {
         let mut commands = search_service::clap_commands();
         commands.extend(logical_archive::clap_commands());
+        commands.extend(codex_layout_cli::clap_commands());
+        commands.extend(lexical_quarantine_cli::clap_commands());
+        commands.extend(semantic_reclaim_cli::clap_commands());
         commands
     });
 
     let raw_args: Vec<String> = std::env::args().collect();
+    if raw_command_name(&raw_args) == Some("codex-layout-migrate") {
+        // The proof owns the archive/receipt locks. Do not enter ordinary
+        // startup, automatic maintenance or model initialization on this path.
+        let result = codex_layout_cli::run(raw_args);
+        if !coding_agent_search::shutdown_thread_local_bridge_runtimes() {
+            tracing::warn!("Codex migration bridge teardown exceeded its deadline");
+        }
+        return match result {
+            Ok(()) => Ok(()),
+            Err(error) => handle_fatal_error(error),
+        };
+    }
+    if raw_command_name(&raw_args) == Some("lexical-quarantine")
+        || lexical_quarantine_cli::is_doctor_quarantine(&raw_args)
+    {
+        return match lexical_quarantine_cli::run(raw_args) {
+            Ok(()) => Ok(()),
+            Err(error) => handle_fatal_error(error),
+        };
+    }
     if raw_command_name(&raw_args) == Some("archive") {
         // Explicit interchange stays outside ordinary search/maintenance setup.
         let result = logical_archive::run(raw_args);
@@ -318,15 +385,9 @@ fn main() -> anyhow::Result<()> {
     };
 
     apply_default_tantivy_writer_thread_cap();
+    raw_mirror_cli::maintain(&parsed.cli);
 
-    let use_current_thread = matches!(
-        parsed.cli.command,
-        Some(
-            coding_agent_search::Commands::Search { .. }
-                | coding_agent_search::Commands::Health { .. }
-        )
-    );
-    let runtime = if use_current_thread {
+    let runtime = if command_uses_current_thread(parsed.cli.command.as_ref()) {
         asupersync::runtime::RuntimeBuilder::current_thread().build()?
     } else {
         asupersync::runtime::RuntimeBuilder::multi_thread().build()?
@@ -346,5 +407,66 @@ fn main() -> anyhow::Result<()> {
     match result {
         Ok(()) => Ok(()),
         Err(err) => handle_fatal_error(err),
+    }
+}
+
+#[cfg(test)]
+mod command_runtime_tests {
+    use super::command_uses_current_thread;
+    use clap::Parser;
+    use coding_agent_search::Cli;
+
+    fn current_thread(args: &[&str]) -> bool {
+        let cli = Cli::try_parse_from(args).expect("valid CLI runtime-policy fixture");
+        command_uses_current_thread(cli.command.as_ref())
+    }
+
+    #[test]
+    fn timeline_and_sessions_use_the_serial_read_runtime() {
+        let cases: &[&[&str]] = &[
+            &["cass", "timeline"],
+            &["cass", "timeline", "--today", "--json"],
+            &["cass", "timeline", "--since", "5m", "--json"],
+            &[
+                "cass",
+                "timeline",
+                "--agent",
+                "claude_code",
+                "--source",
+                "local",
+                "--group-by",
+                "hour",
+                "--robot-format",
+                "compact",
+            ],
+            &["cass", "--quiet", "--robot-format", "json", "timeline"],
+            &["cass", "sessions"],
+        ];
+        for args in cases {
+            assert!(current_thread(args), "serialized read: {args:?}");
+        }
+    }
+
+    #[test]
+    fn existing_search_and_health_runtime_policy_is_preserved() {
+        for args in [&["cass", "search", "probe"][..], &["cass", "health"][..]] {
+            assert!(
+                current_thread(args),
+                "existing current-thread path: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexing_watch_and_default_paths_keep_the_parallel_runtime() {
+        for args in [
+            &["cass", "index"][..],
+            &["cass", "index", "--full"][..],
+            &["cass", "index", "--watch"][..],
+            &["cass", "tui", "--once"][..],
+            &["cass"][..],
+        ] {
+            assert!(!current_thread(args), "parallel path: {args:?}");
+        }
     }
 }

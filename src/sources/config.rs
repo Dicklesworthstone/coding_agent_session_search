@@ -421,7 +421,7 @@ pub(crate) fn validate_optional_user_host_shape(host: &str) -> Result<(), String
 }
 
 /// Sync schedule for remote sources.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum SyncSchedule {
     /// Only sync when explicitly requested.
@@ -785,7 +785,7 @@ pub fn discover_fleet_hosts(tailscale: bool) -> (Vec<DiscoveredHost>, Option<Str
     if !tailscale {
         return (hosts, None);
     }
-    let result = (|| -> anyhow::Result<()> {
+    let result = (|| -> anyhow::Result<usize> {
         let mut command = std::process::Command::new("tailscale");
         command
             .args(["status", "--json"])
@@ -809,15 +809,20 @@ pub fn discover_fleet_hosts(tailscale: bool) -> (Vec<DiscoveredHost>, Option<Str
         );
         merge_tailscale_hosts(&mut hosts, &output.stdout)
     })();
-    (
-        hosts,
-        result
-            .err()
-            .map(|error| format!("Tailscale discovery unavailable: {error}")),
-    )
+    let warning = match result {
+        Ok(0) => None,
+        Ok(skipped) => Some(format!(
+            "Tailscale discovery skipped {skipped} peer(s) whose IP addresses conflict with SSH aliases; \
+             configure an unambiguous SSH alias for each intended machine."
+        )),
+        Err(error) => Some(format!("Tailscale discovery unavailable: {error}")),
+    };
+    (hosts, warning)
 }
 
-fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyhow::Result<()> {
+/// Merge status into candidates freshly read from SSH configuration.
+/// Returns the number of peers whose direct IP target conflicts with an alias.
+fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyhow::Result<usize> {
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]
     struct Status {
@@ -848,26 +853,55 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
         status.backend_state == "Running",
         "Tailscale is not running; check local login and daemon status"
     );
-    for peer in status.peer.unwrap_or_default().into_values() {
+    // Removing a candidate does not remove its Host stanza from SSH config.
+    // Reserve the original names before pruning so a peer's numeric address
+    // cannot recreate an excluded alias and be redirected to that provider.
+    let reserved_names: HashSet<_> = hosts.iter().map(|host| host.name.clone()).collect();
+    let mut shadowed_peers = 0;
+    // GH505: Mullvad peers are provider WireGuard endpoints, not SSH hosts.
+    // Tags may be absent/null in status JSON. The provider DNS suffix is
+    // also used by Tailscale itself (cmd/tailscale/cli/status.go and
+    // wgengine/magicsock); match a full label boundary, not a substring.
+    // Location and ExitNode/ExitNodeOption alone do not identify Mullvad:
+    // ordinary tailnet machines can have those fields and still run SSH.
+    let (providers, peers): (Vec<_>, Vec<_>) = status
+        .peer
+        .unwrap_or_default()
+        .into_values()
+        .partition(|peer| {
+            let mullvad_tag = peer
+                .tags
+                .as_ref()
+                .is_some_and(|tags| tags.iter().any(|tag| tag == "tag:mullvad-exit-node"));
+            let mullvad_dns = peer
+                .dns_name
+                .trim_end_matches('.')
+                .to_ascii_lowercase()
+                .ends_with(".mullvad.ts.net");
+            mullvad_tag || mullvad_dns
+        });
+    // SSH-config discovery ran first. Skipping only the peer addition would
+    // leave aliases for the same provider endpoint in the probe set. Prune
+    // all of those aliases before deduplication: their labels must not hide
+    // legitimate peers that happen to sort before the provider in status.
+    for peer in providers {
+        let addresses = peer.addresses.unwrap_or_default();
+        let dns = peer.dns_name.trim_end_matches('.');
+        // Compare configured destinations, not alias labels: an alias named
+        // after a provider may legitimately point somewhere else. Do this
+        // even for offline/shared peers or DNS-only status records.
+        hosts.retain(|host| {
+            let destination = host.hostname.as_deref().unwrap_or(&host.name);
+            let matches_dns =
+                !dns.is_empty() && destination.trim_end_matches('.').eq_ignore_ascii_case(dns);
+            let matches_ip = destination
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| addresses.contains(&ip));
+            !matches_dns && !matches_ip
+        });
+    }
+    for peer in peers {
         if !peer.online || peer.sharee_node {
-            continue;
-        }
-        // GH505: Mullvad peers are provider WireGuard endpoints, not SSH hosts.
-        // Tags may be absent/null in status JSON. The provider DNS suffix is
-        // also used by Tailscale itself (cmd/tailscale/cli/status.go and
-        // wgengine/magicsock); match a full label boundary, not a substring.
-        // Location and ExitNode/ExitNodeOption alone do not identify Mullvad:
-        // ordinary tailnet machines can have those fields and still run SSH.
-        let mullvad_tag = peer
-            .tags
-            .as_ref()
-            .is_some_and(|tags| tags.iter().any(|tag| tag == "tag:mullvad-exit-node"));
-        let mullvad_dns = peer
-            .dns_name
-            .trim_end_matches('.')
-            .to_ascii_lowercase()
-            .ends_with(".mullvad.ts.net");
-        if mullvad_tag || mullvad_dns {
             continue;
         }
         // The existing SSH/rsync source contract accepts IPv4 and DNS names,
@@ -877,31 +911,37 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
             continue;
         };
         let dns = peer.dns_name.trim_end_matches('.');
-        // Preserve explicit aliases, including their User/IdentityFile/ProxyJump.
-        // HostName from Tailscale is not unique and is never a deduplication key.
+        // Preserve aliases for this destination, including their connection
+        // options. A label matching the peer is not equivalent when HostName
+        // explicitly points elsewhere. Tailscale HostName is not unique.
         if hosts.iter().any(|host| {
-            [&host.name, host.hostname.as_ref().unwrap_or(&host.name)]
-                .into_iter()
-                .any(|name| {
-                    (!dns.is_empty() && name.trim_end_matches('.').eq_ignore_ascii_case(dns))
-                        || name
-                            .parse::<std::net::IpAddr>()
-                            .is_ok_and(|ip| addresses.contains(&ip))
-                })
+            let destination = host.hostname.as_deref().unwrap_or(&host.name);
+            (!dns.is_empty() && destination.trim_end_matches('.').eq_ignore_ascii_case(dns))
+                || destination
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| addresses.contains(&ip))
         }) {
+            continue;
+        }
+        let target = address.to_string();
+        if reserved_names.contains(&target) {
+            // A usable alias for the peer would have matched above. Reusing
+            // this name instead would invoke a different configured target.
+            // Do not override SSH configuration or silently guess a DNS route.
+            shadowed_peers += 1;
             continue;
         }
         // Use the assigned address, so --accept-dns=false and disabled MagicDNS
         // do not make an otherwise reachable peer unusable. Downstream SSH uses name.
         hosts.push(DiscoveredHost {
-            name: address.to_string(),
-            hostname: Some(address.to_string()),
+            name: target.clone(),
+            hostname: Some(target),
             user: None,
             port: None,
             identity_file: None,
         });
     }
-    Ok(())
+    Ok(shadowed_peers)
 }
 
 fn discover_ssh_hosts_from_path(path: &Path, home: &Path) -> Vec<DiscoveredHost> {

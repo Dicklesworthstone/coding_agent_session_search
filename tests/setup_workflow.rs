@@ -7,8 +7,8 @@
 //! - SetupResult structure
 //! - SetupError display implementations
 //!
-//! Note: Tests requiring actual SSH connectivity are not included here.
-//! Instead, we use fixture-based probe results from tests/fixtures/sources/probe/.
+//! Saved probe fixtures exercise resume without contacting remote machines.
+//! Linux retry tests use real OpenSSH with a locally refusing ProxyCommand.
 
 // Allow field reassignment in tests - we deliberately test has_progress() by setting individual fields
 #![allow(clippy::field_reassign_with_default)]
@@ -490,4 +490,435 @@ fn setup_state_sync_complete_not_in_has_progress() {
         !state.has_progress(),
         "sync_complete alone should not indicate resumable progress"
     );
+}
+
+#[cfg(target_os = "linux")]
+mod retry {
+    use super::*;
+    use coding_agent_search::sources::config::SourcesConfig;
+    use coding_agent_search::sources::probe::{
+        DetectedAgent, HostProbeResult, ResourceInfo, SystemInfo,
+    };
+    use coding_agent_search::sources::setup::SetupDiscoveryMode;
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
+    use std::process::Output;
+    use std::time::Duration;
+
+    const HOSTS: [&str; 3] = ["100.64.0.1", "100.64.0.2", "100.64.0.3"];
+    const CONFIG: &str = "disabled_agents = [\"openclaw\"]\n\
+        [[sources]]\nname = \"existing\"\ntype = \"ssh\"\nhost = \"operator@existing\"\n\
+        paths = [\"~/.codex/sessions\"]\nsync_schedule = \"daily\"\n";
+
+    struct RetryFixture {
+        root: tempfile::TempDir,
+        initial: SetupState,
+        config_inode: u64,
+    }
+
+    impl RetryFixture {
+        fn new(indexing: bool) -> Self {
+            assert!(
+                std::process::Command::new("/usr/bin/ssh")
+                    .arg("-V")
+                    .output()
+                    .expect("real OpenSSH is required")
+                    .status
+                    .success()
+            );
+            let root = tempfile::tempdir().unwrap();
+            for path in ["home", "cache/cass", "config/cass"] {
+                fs::create_dir_all(root.path().join(path)).unwrap();
+            }
+            let config = root.path().join("config/cass/sources.toml");
+            fs::write(&config, CONFIG).unwrap();
+            let config_inode = fs::symlink_metadata(&config).unwrap().ino();
+            let recorder = root.path().join("refuse-transport.sh");
+            fs::write(
+                &recorder,
+                "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$1\" >> \"$CASS_TEST_TRANSPORTS\"\nexit 1\n",
+            )
+            .unwrap();
+            fs::write(
+                root.path().join("ssh_config"),
+                format!(
+                    "Host *\n ProxyCommand /bin/sh \"{}\" %h\n BatchMode yes\n ConnectionAttempts 1\n",
+                    recorder.display()
+                ),
+            )
+            .unwrap();
+            // These are persisted resume inputs, not replacement implementations
+            // of the installer or indexer. All attempted SSH uses real OpenSSH.
+            let probes = HOSTS
+                .iter()
+                .map(|name| HostProbeResult {
+                    host_name: (*name).into(),
+                    reachable: true,
+                    connection_time_ms: 1,
+                    cass_status: if indexing {
+                        CassStatus::InstalledNotIndexed {
+                            version: "0.10.0".into(),
+                        }
+                    } else {
+                        CassStatus::NotFound
+                    },
+                    detected_agents: vec![DetectedAgent {
+                        agent_type: "claude_code".into(),
+                        path: "~/.claude/projects".into(),
+                        estimated_sessions: Some(1),
+                        estimated_size_mb: Some(1),
+                    }],
+                    system_info: Some(SystemInfo {
+                        os: "linux".into(),
+                        arch: "x86_64".into(),
+                        // glibc 2.27 gets no pre-built binary (no checksum
+                        // request) and wget without curl gets no bootstrap: the
+                        // only install candidate is the source build over the
+                        // refusing SSH.
+                        distro: Some("Ubuntu 18.04".into()),
+                        has_cargo: true,
+                        has_cargo_binstall: false,
+                        has_curl: false,
+                        has_wget: true,
+                        remote_home: "/home/developer".into(),
+                        machine_id: None,
+                    }),
+                    resources: Some(ResourceInfo {
+                        disk_available_mb: 16384,
+                        memory_total_mb: 16384,
+                        memory_available_mb: 8192,
+                        can_compile: true,
+                    }),
+                    error: None,
+                })
+                .collect();
+            let names: Vec<String> = HOSTS.iter().map(|name| (*name).into()).collect();
+            let initial = SetupState {
+                discovery_complete: true,
+                discovered_hosts: names.len(),
+                discovered_host_names: names.clone(),
+                discovery_mode: Some(SetupDiscoveryMode::Tailscale),
+                probing_complete: true,
+                probed_hosts: probes,
+                selection_complete: true,
+                selected_host_names: names.clone(),
+                installation_complete: indexing,
+                completed_installs: if indexing {
+                    names
+                } else {
+                    vec![HOSTS[0].into()]
+                },
+                completed_indexes: vec![HOSTS[0].into()],
+                started_at: Some("2026-10-01T00:00:00Z".into()),
+                ..Default::default()
+            };
+            let fixture = Self {
+                root,
+                initial,
+                config_inode,
+            };
+            fixture.save_initial();
+            fixture
+        }
+
+        fn state_path(&self) -> PathBuf {
+            self.root.path().join("cache/cass/setup_state.json")
+        }
+
+        fn save_initial(&self) {
+            fs::write(
+                self.state_path(),
+                serde_json::to_vec(&self.initial).unwrap(),
+            )
+            .unwrap();
+        }
+
+        fn run(&self, extra: &[&str]) -> Output {
+            let mut command = assert_cmd::Command::new(env!("CARGO_BIN_EXE_cass"));
+            command
+                .env_clear()
+                .current_dir(self.root.path())
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", self.root.path().join("home"))
+                .env("XDG_CONFIG_HOME", self.root.path().join("config"))
+                .env("XDG_CACHE_HOME", self.root.path().join("cache"))
+                .env("XDG_DATA_HOME", self.root.path().join("data"))
+                .env("CASS_DATA_DIR", self.root.path().join("cass-data"))
+                .env("CASS_SSH_CONFIG", self.root.path().join("ssh_config"))
+                .env("CASS_TEST_TRANSPORTS", self.root.path().join("transports"))
+                .args(["sources", "setup", "--resume", "--non-interactive"])
+                .args(extra)
+                .timeout(Duration::from_secs(30))
+                .output()
+                .unwrap()
+        }
+
+        fn transports(&self) -> BTreeSet<String> {
+            match fs::read_to_string(self.root.path().join("transports")) {
+                Ok(log) => log.lines().map(str::to_owned).collect(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
+                Err(error) => panic!("cannot read transport observations: {error}"),
+            }
+        }
+
+        fn assert_paused(&self, output: &Output, phase: &str, transport: bool) {
+            assert!(!output.status.success(), "{output:?}");
+            let diagnostics = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let error_kind = if phase == "Installing" {
+                "Install error:"
+            } else {
+                "Index error:"
+            };
+            assert!(diagnostics.contains(error_kind), "{output:?}");
+            assert!(diagnostics.contains(HOSTS[1]), "{output:?}");
+            assert!(diagnostics.contains("--resume"), "{output:?}");
+            assert!(!diagnostics.contains("Setup Complete"), "{output:?}");
+            let saved: SetupState =
+                serde_json::from_slice(&fs::read(self.state_path()).unwrap()).unwrap();
+            let mut expected = self.initial.clone();
+            expected.current_operation = Some(format!("{phase} on {}", HOSTS[1]));
+            assert_eq!(
+                serde_json::to_value(saved).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            let config = self.root.path().join("config/cass/sources.toml");
+            assert_eq!(fs::read(&config).unwrap(), CONFIG.as_bytes());
+            assert_eq!(
+                fs::symlink_metadata(&config).unwrap().ino(),
+                self.config_inode
+            );
+            assert_eq!(fs::read_dir(config.parent().unwrap()).unwrap().count(), 1);
+            assert_eq!(
+                self.transports(),
+                if transport {
+                    BTreeSet::from([HOSTS[1].into()])
+                } else {
+                    BTreeSet::new()
+                }
+            );
+        }
+
+        fn assert_configured(&self, output: &Output) {
+            assert!(output.status.success(), "{output:?}");
+            assert!(!self.state_path().exists());
+            assert!(self.transports().is_empty());
+            let path = self.root.path().join("config/cass/sources.toml");
+            let config = SourcesConfig::load_from(&path).unwrap();
+            assert_eq!(config.sources.len(), 4);
+            assert_eq!(config.disabled_agents, vec!["openclaw"]);
+            assert_eq!(
+                config.find_source("existing").unwrap().host.as_deref(),
+                Some("operator@existing")
+            );
+            for host in HOSTS {
+                let source = config.find_source(host).unwrap();
+                assert_eq!(source.host.as_deref(), Some(host));
+                assert_eq!(source.paths, vec!["~/.claude/projects"]);
+            }
+            let backups: Vec<_> = fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("sources.toml.backup.")
+                })
+                .collect();
+            assert_eq!(backups.len(), 1);
+            assert_eq!(fs::read(&backups[0]).unwrap(), CONFIG.as_bytes());
+        }
+
+        fn assert_scope_refused(&self, output: &Output, before: &[u8], inode: u64) {
+            assert!(!output.status.success(), "{output:?}");
+            let diagnostics = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for expected in [
+                "Cannot change --hosts",
+                "without --resume",
+                "No remote operations were started",
+                "checkpoint is unchanged",
+            ] {
+                assert!(diagnostics.contains(expected), "{output:?}");
+            }
+            assert!(!diagnostics.contains("Setup Complete"), "{output:?}");
+            assert!(self.transports().is_empty());
+            assert_eq!(fs::read(self.state_path()).unwrap(), before);
+            assert_eq!(
+                fs::symlink_metadata(self.state_path()).unwrap().ino(),
+                inode
+            );
+            assert_eq!(
+                fs::read_dir(self.state_path().parent().unwrap())
+                    .unwrap()
+                    .count(),
+                1
+            );
+            let config = self.root.path().join("config/cass/sources.toml");
+            assert_eq!(fs::read(&config).unwrap(), CONFIG.as_bytes());
+            assert_eq!(
+                fs::symlink_metadata(&config).unwrap().ino(),
+                self.config_inode
+            );
+            assert_eq!(fs::read_dir(config.parent().unwrap()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn setup_install_failure_retains_completed_work_and_can_resume() {
+        for json in [false, true] {
+            for skip_sync in [false, true] {
+                let fixture = RetryFixture::new(false);
+                let mut flags = Vec::new();
+                if json {
+                    flags.push("--json");
+                }
+                if skip_sync {
+                    flags.push("--skip-sync");
+                }
+                for _ in 0..2 {
+                    let output = fixture.run(&flags);
+                    fixture.assert_paused(&output, "Installing", true);
+                }
+                // An explicit skip is different from silently swallowing a
+                // failure. The retained checkpoint permits this caller choice.
+                fs::write(fixture.root.path().join("transports"), "").unwrap();
+                let output =
+                    fixture.run(&["--json", "--skip-install", "--skip-index", "--skip-sync"]);
+                fixture.assert_configured(&output);
+            }
+        }
+    }
+
+    #[test]
+    fn setup_index_failure_retains_completed_work_and_can_resume() {
+        for json in [false, true] {
+            for skip_sync in [false, true] {
+                let fixture = RetryFixture::new(true);
+                let mut flags = vec!["--skip-install"];
+                if json {
+                    flags.push("--json");
+                }
+                if skip_sync {
+                    flags.push("--skip-sync");
+                }
+                for _ in 0..2 {
+                    let output = fixture.run(&flags);
+                    fixture.assert_paused(&output, "Indexing", true);
+                }
+                fs::write(fixture.root.path().join("transports"), "").unwrap();
+                let output = fixture.run(&["--json", "--skip-index", "--skip-sync"]);
+                fixture.assert_configured(&output);
+            }
+        }
+    }
+
+    #[test]
+    fn setup_install_preconditions_keep_checkpoint_without_starting_ssh() {
+        for missing in ["system", "resources", "disk", "method"] {
+            let mut fixture = RetryFixture::new(false);
+            let pending = &mut fixture.initial.probed_hosts[1];
+            match missing {
+                "system" => pending.system_info = None,
+                "resources" => pending.resources = None,
+                "disk" => pending.resources.as_mut().unwrap().disk_available_mb = 0,
+                "method" => pending.system_info.as_mut().unwrap().has_cargo = false,
+                _ => unreachable!(),
+            }
+            fixture.save_initial();
+            for _ in 0..2 {
+                let output = fixture.run(&["--json", "--skip-sync"]);
+                fixture.assert_paused(&output, "Installing", false);
+            }
+        }
+    }
+
+    #[test]
+    fn setup_completed_remote_work_finishes_without_repeating_it() {
+        let mut fixture = RetryFixture::new(false);
+        fixture.initial.completed_installs = HOSTS.iter().map(|host| (*host).into()).collect();
+        fixture.initial.completed_indexes = fixture.initial.completed_installs.clone();
+        // The process exited after the last per-host checkpoint but before
+        // either phase flag. Reconcile those flags without reinstalling or
+        // reindexing hosts whose completed work is already on disk.
+        fixture.save_initial();
+        let output = fixture.run(&["--json", "--skip-sync"]);
+        fixture.assert_configured(&output);
+    }
+
+    #[test]
+    fn setup_resume_changed_host_scope_never_reaches_old_targets() {
+        for (indexing, selection_complete) in [(false, false), (false, true), (true, true)] {
+            for mode in [None, Some("--json"), Some("--dry-run")] {
+                let mut fixture = RetryFixture::new(indexing);
+                if !selection_complete {
+                    fixture.initial.selection_complete = false;
+                    fixture.initial.selected_host_names.clear();
+                    fixture.initial.completed_installs.clear();
+                    fixture.initial.completed_indexes.clear();
+                }
+                fixture.save_initial();
+                let before = fs::read(fixture.state_path()).unwrap();
+                let inode = fs::symlink_metadata(fixture.state_path()).unwrap().ino();
+                let mut flags = vec!["--hosts", HOSTS[2]];
+                flags.extend(mode);
+                for _ in 0..2 {
+                    let output = fixture.run(&flags);
+                    // Previously the new list was ignored after probing; the
+                    // old selection could install/index on .1 or .2 instead.
+                    fixture.assert_scope_refused(&output, &before, inode);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn setup_resume_equivalent_host_scope_preserves_selection_and_successes() {
+        for requested in [
+            vec![HOSTS[2], HOSTS[1], HOSTS[0], HOSTS[2]],
+            vec![HOSTS[1], HOSTS[0], HOSTS[1]],
+        ] {
+            let mut fixture = RetryFixture::new(false);
+            fixture.initial.selected_host_names = vec![HOSTS[0].into(), HOSTS[1].into()];
+            fixture.save_initial();
+            let argument = requested.join(",");
+            let output = fixture.run(&["--json", "--hosts", &argument]);
+            // Accept both the original discovered set and the saved selection.
+            // Neither may expand that selection or repeat completed host .1.
+            fixture.assert_paused(&output, "Installing", true);
+        }
+    }
+
+    #[test]
+    fn setup_resume_scope_refusal_preserves_configuration_retry() {
+        let mut fixture = RetryFixture::new(false);
+        fixture.initial.completed_installs = HOSTS.iter().map(|host| (*host).into()).collect();
+        fixture.initial.completed_indexes = fixture.initial.completed_installs.clone();
+        fixture.save_initial();
+        let before = fs::read(fixture.state_path()).unwrap();
+        let inode = fs::symlink_metadata(fixture.state_path()).unwrap().ino();
+        for requested in [
+            "100.64.0.99",
+            "100.64.0.1,100.64.0.2,100.64.0.3,100.64.0.99",
+            "100.64.0.1,operator@100.64.0.2,100.64.0.3",
+        ] {
+            let output = fixture.run(&["--json", "--hosts", requested, "--skip-sync"]);
+            // Even when no remote install/index is due, do not configure the
+            // old targets, return success or clear their resumable progress.
+            fixture.assert_scope_refused(&output, &before, inode);
+        }
+        let argument = format!("{},{},{},{}", HOSTS[2], HOSTS[0], HOSTS[1], HOSTS[0]);
+        let output = fixture.run(&["--json", "--hosts", &argument, "--skip-sync"]);
+        fixture.assert_configured(&output);
+    }
 }

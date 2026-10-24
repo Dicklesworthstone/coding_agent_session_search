@@ -1,5 +1,5 @@
 # Native Windows indexing acceptance for one cass.exe (beads aegfi / GH #429
-# and 4w0ma / GH #406). Run by .github/workflows/windows-index-acceptance.yml
+# and 4w0ma / GH #406). Run it on a dsr Windows build host (wlap, wsurf)
 # against a published release and against a source build.
 #
 # Proves, in fresh processes on a real NTFS data dir:

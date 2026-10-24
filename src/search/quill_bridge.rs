@@ -32,6 +32,9 @@ use frankensearch::quill::cass::{
 use frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA;
 use frankensearch::quill::{QuillConfig, QuillIndex, QuillSearchIndex, SchemaDocument};
 
+#[path = "quill_bridge/fuel_errors.rs"]
+mod fuel_errors;
+
 /// Filename that marks a directory as a published Quill index.
 ///
 /// Verified empirically rather than assumed: a freshly created CASS index
@@ -46,15 +49,13 @@ pub const QUILL_INDEX_MARKER: &str = "MANIFEST";
 /// knob; the durable fix for fuel exhaustion is a compacted index (#441).
 pub const CASS_QUILL_QUERY_FUEL_BUDGET_ENV: &str = "CASS_QUILL_QUERY_FUEL_BUDGET";
 
-/// Whether `error` is Quill's typed query-fuel refusal (#441), anywhere in
-/// its context chain. The engine reports it as `... query fuel exhausted after
-/// N/M units ...`; callers use this to tell "the lexical engine refused the
-/// work" apart from an index fault.
+/// Whether `error` is a Quill query-fuel refusal, anywhere in its cause chain.
+/// Concrete engine errors take precedence over diagnostic text. Historical
+/// flattened bridge errors are accepted only in the engine's diagnostic format,
+/// not because a query, context or unrelated failure mentions fuel exhaustion.
 #[must_use]
 pub fn is_query_fuel_exhausted(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().contains("query fuel exhausted"))
+    fuel_errors::is_exhausted(error)
 }
 
 /// Whether `error` is Quill's posting-cursor invariant refusal
@@ -313,7 +314,12 @@ pub fn search_paginated(
     let result = drive(|cx| async move {
         reader.search_preparsed_paginated(&cx, query, limit, offset, exact_count)
     })
-    .map_err(|error| anyhow!("executing a Quill lexical query: {error}"))?;
+    .map_err(|error| {
+        // Preserve the engine type for recovery admission, while retaining the
+        // full outer display for CLI callers that do not print the cause chain.
+        let diagnostic = format!("executing a Quill lexical query: {error}");
+        anyhow::Error::new(error).context(diagnostic)
+    })?;
     Ok(QuillLexicalPage {
         hits: result
             .hits
@@ -451,6 +457,31 @@ pub fn open_cass_reader(path: &Path) -> Result<QuillSearchIndex> {
         async move {
             QuillSearchIndex::open_with_schema(&cx, path, CASS_SEMANTIC_SCHEMA, cass_quill_config())
                 .await
+        }
+    })
+    .map_err(|error| anyhow!("opening Quill CASS reader at {}: {error}", path.display()))
+}
+
+/// [`open_cass_reader`] with its own query-fuel ceiling, for tests that need a
+/// query to run out of fuel without a process-wide environment variable.
+#[cfg(test)]
+pub(crate) fn open_cass_reader_with_query_fuel_budget(
+    path: &Path,
+    query_fuel_budget: u64,
+) -> Result<QuillSearchIndex> {
+    drive(|cx| {
+        let path = path.to_path_buf();
+        async move {
+            QuillSearchIndex::open_with_schema(
+                &cx,
+                path,
+                CASS_SEMANTIC_SCHEMA,
+                QuillConfig {
+                    query_fuel_budget,
+                    ..cass_quill_config()
+                },
+            )
+            .await
         }
     })
     .map_err(|error| anyhow!("opening Quill CASS reader at {}: {error}", path.display()))
@@ -770,7 +801,9 @@ const ENGINE_LIVENESS_MIN_CPU_ADVANCE: Duration = Duration::from_millis(100);
 /// dropped.
 struct EngineLivenessProbe {
     armed: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
+    /// Dropping this sender disconnects the sampler's wait, so the probe's
+    /// drop returns at once instead of after the rest of a sample interval.
+    stop: Option<std::sync::mpsc::Sender<()>>,
     heartbeat: EngineHeartbeat,
     sampler: Option<std::thread::JoinHandle<()>>,
 }
@@ -778,20 +811,21 @@ struct EngineLivenessProbe {
 impl EngineLivenessProbe {
     fn spawn(targets: Vec<PathBuf>, heartbeat: EngineHeartbeat) -> Self {
         let armed = Arc::new(AtomicBool::new(false));
-        let stop = Arc::new(AtomicBool::new(false));
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let sampler = {
             let armed = Arc::clone(&armed);
-            let stop = Arc::clone(&stop);
             let heartbeat = Arc::clone(&heartbeat);
             std::thread::Builder::new()
                 .name("cass-quill-liveness".to_string())
                 .spawn(move || {
                     let mut tracker = EngineLivenessTracker::default();
-                    while !stop.load(Ordering::Relaxed) {
-                        std::thread::sleep(ENGINE_LIVENESS_SAMPLE_INTERVAL);
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
+                    // A plain sleep here made every probe drop wait out the
+                    // rest of a whole interval: one second per storage open
+                    // and Quill index drop, two in every `cass index`. The
+                    // probe's drop disconnects the channel, ending the wait.
+                    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                        stopped.recv_timeout(ENGINE_LIVENESS_SAMPLE_INTERVAL)
+                    {
                         if !armed.load(Ordering::Relaxed) {
                             // Forget the previous op's baseline so the first
                             // sample of the next op is a fresh comparison.
@@ -808,7 +842,7 @@ impl EngineLivenessProbe {
         };
         Self {
             armed,
-            stop,
+            stop: Some(stop),
             heartbeat,
             sampler,
         }
@@ -825,11 +859,11 @@ impl EngineLivenessProbe {
 
 impl Drop for EngineLivenessProbe {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        drop(self.stop.take());
         if let Some(sampler) = self.sampler.take() {
-            // The sampler wakes at most one interval later; joining bounds
-            // the thread's lifetime to the index's without blocking a drop
-            // on a stuck heartbeat callback.
+            // The disconnected channel wakes the sampler at once; joining
+            // bounds the thread's lifetime to the index's without blocking a
+            // drop on a stuck heartbeat callback.
             if std::thread::current().id() != sampler.thread().id() {
                 drop(sampler.join());
             }
@@ -1199,19 +1233,26 @@ impl QuillCassIndex {
     ///
     /// Returns an error when the published snapshot cannot be opened.
     pub fn reader(&self) -> Result<QuillSearchIndex> {
-        drive(|cx| {
-            let directory = self.directory.clone();
-            async move {
-                QuillSearchIndex::open_with_schema(
-                    &cx,
-                    directory,
-                    CASS_SEMANTIC_SCHEMA,
-                    cass_quill_config(),
-                )
-                .await
-            }
-        })
-        .map_err(|error| anyhow!("opening the Quill CASS reader: {error}"))
+        #[cfg(test)]
+        READER_OPEN_COUNT.with(|count| count.set(count.get() + 1));
+        let reader = self
+            .with_engine_liveness(|| {
+                drive(|cx| {
+                    let directory = self.directory.clone();
+                    async move {
+                        QuillSearchIndex::open_with_schema(
+                            &cx,
+                            directory,
+                            CASS_SEMANTIC_SCHEMA,
+                            cass_quill_config(),
+                        )
+                        .await
+                    }
+                })
+            })
+            .map_err(|error| anyhow!("opening the Quill CASS reader: {error}"))?;
+        self.tick_heartbeat();
+        Ok(reader)
     }
 
     /// Live document count in the published snapshot.
@@ -1221,7 +1262,21 @@ impl QuillCassIndex {
     /// Returns an error when publication authority cannot prove the snapshot
     /// readable.
     pub fn doc_count(&self) -> Result<u64> {
-        Ok(self.reader()?.doc_count()?)
+        // The writer verified its published snapshot when it opened or
+        // committed it. A new reader would hash every segment again, which
+        // is a full read of the lexical index per call. Reopen only when the
+        // engine says publication may have moved past this writer's view.
+        match self.index.doc_count() {
+            Ok(count) => Ok(count),
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    path = %self.directory.display(),
+                    "writer snapshot cannot vouch for the published count; reopening a reader"
+                );
+                Ok(self.reader()?.doc_count()?)
+            }
+        }
     }
 
     /// Durable directory backing this index.
@@ -2453,6 +2508,25 @@ mod tests {
         );
     }
 
+    /// Dropping a probe ends its sampler at once. It used to sleep out the
+    /// rest of a whole sample interval first, which put a one-second floor
+    /// on every storage open and Quill index drop: an empty `cass index`
+    /// took 2.4 s, all of it in two such waits.
+    #[test]
+    fn dropping_a_liveness_probe_does_not_wait_out_the_sample_interval() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let probe = EngineLivenessProbe::spawn(vec![tmp.path().to_path_buf()], Arc::new(|| {}));
+        // Let the sampler enter its wait.
+        std::thread::sleep(Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        drop(probe);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < ENGINE_LIVENESS_SAMPLE_INTERVAL / 2,
+            "dropping the probe took {elapsed:?}"
+        );
+    }
+
     #[test]
     fn engine_liveness_sample_reads_real_footprint_and_cpu() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -2483,6 +2557,27 @@ mod tests {
                 "getrusage must work on unix"
             );
         }
+    }
+
+    #[test]
+    fn quill_reader_validation_ticks_the_installed_heartbeat() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut index = QuillCassIndex::open_or_create(tmp.path()).expect("open");
+        index
+            .add_cass_documents(&[sample("s1", 0, "verified reader work")])
+            .expect("accumulate");
+        index.commit().expect("commit");
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = Arc::clone(&ticks);
+        index.set_heartbeat(Some(Arc::new(move || {
+            sink.fetch_add(1, Ordering::Relaxed);
+        })));
+        index.reader().expect("validated reader");
+        assert!(ticks.load(Ordering::Relaxed) > 0);
+        index.set_heartbeat(None);
+        let before = ticks.load(Ordering::Relaxed);
+        index.reader().expect("read without heartbeat");
+        assert_eq!(ticks.load(Ordering::Relaxed), before);
     }
 
     /// Real sink work must reach the heartbeat: accumulate and commit each
@@ -2559,6 +2654,37 @@ mod tests {
             .expect("index documents");
         index.commit().expect("commit");
         assert_eq!(index.doc_count().expect("doc count"), 2);
+    }
+
+    /// Counting documents on a writer reads its verified snapshot. A reader
+    /// open re-hashes every segment, so a no-op `cass index` that asked for
+    /// the count several times read the whole lexical index each time.
+    #[test]
+    fn writer_doc_count_tracks_commits_without_opening_a_reader() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+        index
+            .add_cass_documents(&[sample("alpha", 0, "first published document")])
+            .expect("index one document");
+        index.commit().expect("commit");
+        let opens = reader_open_count();
+        assert_eq!(index.doc_count().expect("doc count"), 1);
+        index
+            .add_cass_documents(&[sample("beta", 1, "second published document")])
+            .expect("index another document");
+        assert_eq!(
+            index.doc_count().expect("doc count before commit"),
+            1,
+            "an uncommitted document is not published"
+        );
+        index.commit().expect("commit");
+        assert_eq!(index.doc_count().expect("doc count"), 2);
+        assert_eq!(reader_open_count(), opens, "doc_count opened a reader");
+        // A fresh reader agrees with the writer's count.
+        assert_eq!(
+            index.reader().expect("reader").doc_count().expect("count"),
+            2
+        );
     }
 
     /// A reentrant bridge call must not re-enter `block_on` on one runtime.
@@ -3116,6 +3242,69 @@ mod tests {
         index.force_merge().expect("force merge");
         assert_eq!(published_segment_count(&index), 1);
         assert_eq!(index.doc_count().expect("doc count"), sessions * 2 + 1);
+    }
+
+    /// GH #518 (frankensearch#41): a two-word query's dictionary work grows
+    /// with the segment count, not its square. Quill 0.3.4 (cass 0.10.0)
+    /// re-charged one dictionary unit per segment for every cached term
+    /// statistic, so each segment of each of the query's eight term streams
+    /// (two words x title, content and both prefix fields) paid for every
+    /// segment: about 8 x 120 x 120 = 115,200 units here, and the whole
+    /// 10,000,000 in the report. The budget below sits far under that and far
+    /// over a linear charge.
+    #[test]
+    fn gh518_two_word_query_fuel_is_linear_in_segment_count() {
+        const SEGMENTS: usize = 120;
+        const BUDGET: u64 = 40_000;
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let config = QuillConfig {
+            deterministic_ingest: true,
+            ..cass_quill_config()
+        };
+        let mut index =
+            QuillCassIndex::open_or_create_with_config(directory.path(), &config).expect("open");
+        for session in 0..SEGMENTS {
+            index
+                .add_cass_documents(&[sample(&format!("gh518-{session}"), 0, "git fixture setup")])
+                .expect("index document");
+            index.commit().expect("commit");
+        }
+        assert_eq!(published_segment_count(&index), SEGMENTS);
+
+        let open_with_budget = |query_fuel_budget: u64| {
+            let path = directory.path().to_path_buf();
+            drive(|cx| async move {
+                QuillSearchIndex::open_with_schema(
+                    &cx,
+                    path,
+                    CASS_SEMANTIC_SCHEMA,
+                    QuillConfig {
+                        query_fuel_budget,
+                        ..cass_quill_config()
+                    },
+                )
+                .await
+            })
+            .expect("open reader")
+        };
+        let parser = frankensearch::quill::query::CassQueryParser::new(CASS_SEMANTIC_SCHEMA)
+            .expect("CASS query parser");
+        let query = parser
+            .parse(
+                "git fixture",
+                &frankensearch::quill::query::CassQueryFilters::default(),
+            )
+            .query;
+
+        let page = search_paginated(&open_with_budget(BUDGET), &query, 4, 0, false)
+            .expect("a two-word query over 120 segments fits a linear budget");
+        assert_eq!(page.hits.len(), 4);
+
+        // Control: this reader meters the query, so the pass above is the
+        // budget holding rather than metering being off.
+        let error = search_paginated(&open_with_budget(10), &query, 4, 0, false)
+            .expect_err("ten units cannot cover 120 segments");
+        assert!(is_query_fuel_exhausted(&error), "{error:#}");
     }
 
     /// Fuel exhaustion is recognised by the engine's own error text, anywhere

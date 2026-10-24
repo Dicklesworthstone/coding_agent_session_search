@@ -149,7 +149,11 @@ fn gh511_mixed_typed_failures_keep_independent_paths_and_retry_actions_in_every_
         assert_eq!(report.summary.skipped, 2);
         assert_eq!(report.summary.locked, 1);
         assert_eq!(report.summary.discovered, 0);
-        assert_eq!(report.summary.total(), 4, "no synthetic failed fallback root");
+        assert_eq!(
+            report.summary.total(),
+            4,
+            "no synthetic failed fallback root"
+        );
         let wire = serde_json::to_string(&report).unwrap();
         assert!(!wire.contains("private-payload-sentinel"));
         assert!(!wire.contains("/different/path"));
@@ -230,7 +234,10 @@ fn gh511_structured_samples_stay_bounded_and_do_not_invent_omitted_source_verdic
     assert_eq!(report.summary.with_content(), 0);
     assert_eq!(report.summary.total(), total as u64);
     for (diagnostic, source) in report.diagnostics.iter().zip(&sources) {
-        assert_eq!(Path::new(&diagnostic.source_path), source.source_path.as_path());
+        assert_eq!(
+            Path::new(&diagnostic.source_path),
+            source.source_path.as_path()
+        );
         assert_eq!(diagnostic.failure_kind, IngestFailureKind::UnreadableSource);
     }
 }
@@ -312,11 +319,7 @@ fn gh511_actual_fad_partial_scan_reports_each_bad_transcript_not_its_common_root
         std::fs::write(&path, &bytes).unwrap();
         paths.push((path, bytes));
     }
-    let ctx = ScanContext::with_roots(
-        temp.path().join("data"),
-        vec![ScanRoot::local(root)],
-        None,
-    );
+    let ctx = ScanContext::with_roots(temp.path().join("data"), vec![ScanRoot::local(root)], None);
     let connector = CodebuffConnector::new();
     let inventory = connector.discover_source_files(&ctx).unwrap();
     assert_eq!(inventory.len(), 3);
@@ -342,7 +345,10 @@ fn gh511_actual_fad_partial_scan_reports_each_bad_transcript_not_its_common_root
     assert_eq!(report.diagnostics.len(), 2);
     for (diagnostic, index) in report.diagnostics.iter().zip([0, 2]) {
         assert_eq!(Path::new(&diagnostic.source_path), paths[index].0.as_path());
-        assert_eq!(diagnostic.failure_kind, IngestFailureKind::UnparseableSource);
+        assert_eq!(
+            diagnostic.failure_kind,
+            IngestFailureKind::UnparseableSource
+        );
         assert_eq!(diagnostic.disposition, SourceIngestDisposition::Skipped);
         assert!(!diagnostic.retryable);
     }

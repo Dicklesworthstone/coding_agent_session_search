@@ -61,8 +61,8 @@ fn search_logs_backend_selection() {
         .find(|line| line.contains("search_start"))
         .unwrap_or_else(|| panic!("trace output must contain a `search_start` event; got:\n{out}"));
     assert!(
-        search_start_line.contains("backend=\"tantivy\""),
-        "search_start span must name the tantivy backend; got line:\n{search_start_line}"
+        search_start_line.contains("backend=\"quill\""),
+        "search_start span must name the quill backend; got line:\n{search_start_line}"
     );
     assert!(
         search_start_line.contains("query=") && search_start_line.contains("hello"),

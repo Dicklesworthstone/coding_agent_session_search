@@ -934,15 +934,20 @@
     "full_rebuild_readiness": {
       "status": "ready",
       "enforced": true,
-      "formula": "max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2 - rebuild_staging_bytes)",
+      "formula": "max(512 MiB, lexical_rebuild_basis_bytes * 9 / 4 - rebuild_staging_bytes + db_bundle_bytes / 16 + migration_copy_bytes), where lexical_rebuild_basis_bytes is lexical_index_bytes, or db_bundle_bytes when no live lexical generation exists",
       "required_bytes": 536870912,
       "floor_bytes": 536870912,
       "db_bundle_bytes": 0,
       "lexical_index_bytes": 1069,
+      "lexical_rebuild_basis_bytes": 1069,
       "retired_segment_bytes": 0,
       "retired_segment_files": 0,
       "retained_publish_backup_bytes": 50,
       "rebuild_staging_bytes": 0,
+      "quarantine_bytes": 0,
+      "db_growth_allowance_bytes": 0,
+      "migration_repair_pending": false,
+      "migration_copy_bytes": 0,
       "available_bytes": "[LIVE_BYTES]",
       "shortfall_bytes": 0,
       "probe_path": "[TEST_HOME]/cass-data",
@@ -951,8 +956,8 @@
       ],
       "notes": [
         "A full rebuild (cass index --full / --force-rebuild) needs 536870912 bytes free at [TEST_HOME]/cass-data, and the free space there covers it, so the indexer's headroom preflight would pass.",
-        "Requirement is max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2 - rebuild_staging_bytes): db bundle 0 bytes, lexical index 1069 bytes, floor 536870912 bytes.",
-        "50 bytes of prior lexical generations are retained under index/.lexical-publish-backups/ and are not doubled either; a staged publish prunes them to the retention cap, and `cass doctor cleanup` reclaims them earlier."
+        "Requirement is max(512 MiB, lexical_rebuild_basis_bytes * 9 / 4 - rebuild_staging_bytes + db_bundle_bytes / 16 + migration_copy_bytes), where lexical_rebuild_basis_bytes is lexical_index_bytes, or db_bundle_bytes when no live lexical generation exists: lexical index 1069 bytes, db bundle 0 bytes (growth allowance 0 bytes), floor 536870912 bytes.",
+        "50 bytes of prior lexical generations are retained under index/.lexical-publish-backups/ and are not charged either; a staged publish prunes them to the retention cap, and `cass doctor cleanup` reclaims them earlier."
       ]
     },
     "total_accounted_bytes": 1138,
@@ -3551,6 +3556,32 @@
       "cleanup_dry_run_inspection_required_count": 1,
       "cleanup_dry_run_approval_fingerprint": "cleanup-v1-6ccf4cfcf4dc2e46ee789a8531ea21cf1281cd50840978e797928bf330e31fc7",
       "cleanup_apply_allowed": false
+    },
+    "lexical_rebuild_quarantine": {
+      "schema_version": 1,
+      "complete": true,
+      "cleanup_apply_allowed": false,
+      "repeated_failure_evidence": false,
+      "inventory": {
+        "schema_version": 1,
+        "complete": true,
+        "automatic_retention_enabled": true,
+        "min_age_seconds": 21600,
+        "keep_newest": 1,
+        "total_bytes": 0,
+        "eligible_bytes": 0,
+        "artifacts": [],
+        "warnings": []
+      },
+      "warnings": [],
+      "next_safe_argv": [
+        "cass",
+        "lexical-quarantine",
+        "--data-dir",
+        "[TEST_HOME]/cass-data",
+        "--plan",
+        "--json"
+      ]
     },
     "quarantined_artifacts": [
       {

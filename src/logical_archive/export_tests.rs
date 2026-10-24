@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::BTreeMap;
+use std::io::BufRead as _;
 use std::path::PathBuf;
 
 fn fixture(path: &Path) {
@@ -57,6 +58,130 @@ fn export_preserves_every_source_file_and_verifies_published_bytes() {
             0
         );
     }
+}
+
+#[test]
+fn allocation_declarations_ignore_literals_identifiers_comments_and_expressions() {
+    for sql in [
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY /* allocation */ KEY autoincrement)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY ASC ON CONFLICT REPLACE AUTOINCREMENT)",
+        "CREATE TABLE [AUTOINCREMENT] (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+    ] {
+        assert!(declares_autoincrement(sql), "missed declaration: {sql}");
+    }
+    for sql in [
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY, body TEXT DEFAULT 'AUTOINCREMENT')",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY, body TEXT DEFAULT 'quote '' AUTOINCREMENT')",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY, \"AUTOINCREMENT\" TEXT)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY, `AUTOINCREMENT` TEXT)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY, [AUTOINCREMENT] TEXT)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY /* AUTOINCREMENT */)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY -- AUTOINCREMENT\n)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY CHECK (id != 'AUTOINCREMENT'))",
+        "CREATE TABLE AUTOINCREMENT (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY, prefixAUTOINCREMENT TEXT)",
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY, 雪AUTOINCREMENT TEXT)",
+    ] {
+        assert!(!declares_autoincrement(sql), "invented declaration: {sql}");
+    }
+}
+
+fn allocation_fixture() -> Result<Connection> {
+    let connection = Connection::open(":memory:")?;
+    connection.execute_batch(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO meta VALUES ('schema_version', '9');
+         CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT);
+         INSERT INTO jobs VALUES (100, 'deleted private history');
+         DELETE FROM jobs;
+         INSERT INTO jobs VALUES (2, 'remaining private job');
+         CREATE TABLE never_used (id INTEGER PRIMARY KEY AUTOINCREMENT);
+         CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT DEFAULT 'AUTOINCREMENT');",
+    )?;
+    Ok(connection)
+}
+
+#[test]
+fn export_authenticates_deleted_allocation_history_and_preserves_explicit_state() -> Result<()> {
+    let connection = allocation_fixture()?;
+    let expected = vec![
+        Sequence {
+            table: "jobs".to_owned(),
+            value: Some(100),
+        },
+        Sequence {
+            table: "never_used".to_owned(),
+            value: None,
+        },
+    ];
+    assert_eq!(sequences(&connection, &tables(&connection)?)?, expected);
+    let legacy = snapshot_for_version(
+        &connection,
+        "allocation".to_owned(),
+        codec::CHUNKED_VERSION,
+        &mut io::sink(),
+    )?;
+    assert_eq!(legacy.0.sequences, None);
+    let mut bytes = Vec::new();
+    let original = snapshot(&connection, "allocation".to_owned(), &mut bytes)?;
+    assert_eq!(original.0.schema_version, codec::SEQUENCE_VERSION);
+    assert_eq!(original.0.sequences, Some(expected));
+    assert_eq!(original, codec::verify(&mut bytes.as_slice())?);
+    assert_eq!(original.1.tables["jobs"], 1);
+
+    for value in [0, -7, 200, i64::MIN, i64::MAX] {
+        connection.execute_with_params(
+            "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'jobs'",
+            &[SqliteValue::Integer(value)],
+        )?;
+        let changed = snapshot(&connection, "allocation".to_owned(), &mut io::sink())?;
+        assert_eq!(changed.0.sequences.as_ref().unwrap()[0].value, Some(value));
+        assert_eq!(changed.1.tables, original.1.tables);
+        assert_ne!(changed.1.content_sha256, original.1.content_sha256);
+        assert_eq!(
+            snapshot_for_version(
+                &connection,
+                "allocation".to_owned(),
+                codec::CHUNKED_VERSION,
+                &mut io::sink()
+            )?
+            .1,
+            legacy.1,
+            "old formats keep their explicit historical omission semantics"
+        );
+    }
+    connection.execute("DELETE FROM sqlite_sequence WHERE name = 'jobs'")?;
+    let absent = snapshot(&connection, "allocation".to_owned(), &mut io::sink())?;
+    assert_eq!(absent.0.sequences.as_ref().unwrap()[0].value, None);
+    assert_ne!(absent.1.content_sha256, original.1.content_sha256);
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn malformed_or_ambiguous_allocation_catalog_cannot_emit_a_backup_prefix() -> Result<()> {
+    for sql in [
+        "INSERT INTO sqlite_sequence (name, seq) VALUES ('orphan_private_name', 1)",
+        "INSERT INTO sqlite_sequence (name, seq) VALUES ('jobs', 200)",
+        "UPDATE sqlite_sequence SET seq = 'PRIVATE-SEQUENCE-PAYLOAD' WHERE name = 'jobs'",
+        "UPDATE sqlite_sequence SET seq = NULL WHERE name = 'jobs'",
+        "UPDATE sqlite_sequence SET name = X'50524956415445' WHERE name = 'jobs'",
+    ] {
+        let connection = allocation_fixture()?;
+        connection.execute(sql)?;
+        let mut output = Vec::new();
+        let error = snapshot(&connection, "invalid-allocation".to_owned(), &mut output)
+            .expect_err("unsupported allocation state must not be silently discarded");
+        assert!(
+            output.is_empty(),
+            "allocation admission precedes the header write"
+        );
+        assert!(!error.to_string().contains("PRIVATE-SEQUENCE-PAYLOAD"));
+        assert!(!error.to_string().contains("orphan_private_name"));
+        connection.close()?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -298,5 +423,963 @@ fn verification_refuses_nonregular_inputs_before_decoding() -> Result<()> {
     }
     assert_eq!(fs::read(&target)?, b"PRIVATE-NOT-JSON\n");
     assert_eq!(fs::read_link(&linked)?, target);
+    Ok(())
+}
+
+#[test]
+fn scan_failure_keeps_busy_errors_retryable() {
+    for cause in [FrankenError::Busy, FrankenError::BusyRecovery] {
+        let error = scan_failure("messages", 468_001, cause);
+        assert_eq!(
+            super::super::classify_failure(&error),
+            (7, "logical-archive-busy", true)
+        );
+        assert!(error.downcast_ref::<FrankenError>().is_some());
+        assert!(error.to_string().contains("before row 468001"));
+    }
+}
+
+#[test]
+fn scan_failure_keeps_the_cause_but_redacts_its_message() {
+    let error = scan_failure(
+        "messages",
+        42,
+        FrankenError::Internal("PRIVATE-DATABASE-CONTENT".to_owned()),
+    );
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (9, "logical-archive-error", false)
+    );
+    let public_message = error.to_string();
+    assert!(public_message.contains("messages before row 42"));
+    assert!(public_message.contains("source was not repaired"));
+    assert!(!public_message.contains("PRIVATE-DATABASE-CONTENT"));
+    assert!(matches!(
+        error.downcast_ref::<FrankenError>(),
+        Some(FrankenError::Internal(message)) if message == "PRIVATE-DATABASE-CONTENT"
+    ));
+}
+
+#[test]
+fn exact_physical_limit_row_stays_an_ordinary_verified_record() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let database = root.path().join("source.db");
+    let output = root.path().join("archive.jsonl");
+    let connection = Connection::open(path_text(&database)?)?;
+    let nullable_columns = (0..62)
+        .map(|index| format!("optional_{index} TEXT"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    connection.execute_batch(&format!(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO meta VALUES ('schema_version', '9');
+         CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT, {nullable_columns});"
+    ))?;
+
+    // Determine the wire framing with an independent JSON serializer. The
+    // body contains no escaped bytes, so each added byte grows the line by one.
+    let mut values = vec![Cell::Integer(17), Cell::Text(String::new())];
+    values.extend(std::iter::repeat_n(Cell::Null, 62));
+    let framing = serde_json::to_vec(&Record::Row { values })?.len() + 1;
+    let body_length = codec::MAX_RECORD_BYTES - framing;
+    // An exactly full physical record must remain an ordinary row in v2,
+    // including all NULL cells; continuations begin only above this boundary.
+    connection.execute_with_params(
+        "INSERT INTO messages (id, body) VALUES (17, ?1)",
+        &[SqliteValue::Text("s".repeat(body_length).into())],
+    )?;
+    connection.execute("INSERT INTO messages (id, body) VALUES (19, 'after the large row')")?;
+    connection.close()?;
+
+    let receipt = export_file(&database, &output, "boundary-archive".to_owned())?;
+    assert_eq!(receipt.0.schema_version, codec::SEQUENCE_VERSION);
+    assert_eq!(receipt, verify_file(&output)?);
+    assert_eq!(receipt.1.records, 3);
+    assert_eq!(receipt.1.tables["messages"], 2);
+    let mut input = BufReader::new(File::open(&output)?);
+    let mut line = Vec::new();
+    let mut exact_rows = 0;
+    while input.read_until(b'\n', &mut line)? != 0 {
+        assert!(line.len() <= codec::MAX_RECORD_BYTES);
+        if line.len() == codec::MAX_RECORD_BYTES {
+            let Record::Row { values } = serde_json::from_slice(&line)? else {
+                panic!("the boundary record must be a row"); // ubs:ignore -- intentional unit-test contract assertion.
+            };
+            assert_eq!(values.len(), 64);
+            assert_eq!(values[0], Cell::Integer(17));
+            let Cell::Text(body) = &values[1] else {
+                panic!("the large body must remain text"); // ubs:ignore -- intentional unit-test contract assertion.
+            };
+            assert_eq!(body.len(), body_length);
+            assert!(body.bytes().all(|byte| byte == b's'));
+            assert!(values[2..].iter().all(|value| *value == Cell::Null));
+            exact_rows += 1;
+        }
+        line.clear();
+    }
+    assert_eq!(exact_rows, 1);
+    Ok(())
+}
+
+#[test]
+fn invalid_utf8_text_is_refused_without_lossy_backup_or_private_diagnostic() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let destination = tempfile::tempdir()?;
+    let database = source.path().join("source.db");
+    let output = destination.path().join("archive.jsonl");
+    fixture(&database);
+    let connection = Connection::open(path_text(&database)?)?;
+    let mut raw = b"PRIVATE-INVALID-UTF8".to_vec();
+    raw.extend_from_slice(&[0x80, 0xff]);
+    connection.execute_with_params(
+        "INSERT INTO messages VALUES (47, CAST(?1 AS TEXT), NULL, NULL)",
+        &[SqliteValue::Blob(raw.into())],
+    )?;
+    let row = connection.query_row("SELECT body FROM messages WHERE id = 47")?;
+    assert!(matches!(
+        &row.values()[0],
+        SqliteValue::Text(text) if !text.is_valid_utf8()
+    ));
+    connection.close()?;
+    let before = contents(source.path());
+
+    let error = export_file(&database, &output, "invalid-text".to_owned())
+        .expect_err("a JSON string cannot preserve invalid UTF-8 TEXT bytes");
+    let message = error.to_string();
+    assert!(
+        message.contains("logical table messages, row 3"),
+        "{message}"
+    );
+    assert!(message.contains("id=47"), "{message}");
+    assert!(message.contains("invalid UTF-8"), "{message}");
+    assert!(!message.contains("PRIVATE-INVALID-UTF8"));
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (9, "logical-archive-error", false)
+    );
+    assert!(!output.exists());
+    assert_eq!(before, contents(source.path()));
+    Ok(())
+}
+
+#[test]
+fn cells_preserve_large_text_blob_and_nulls_within_the_v2_bound() -> Result<()> {
+    let length = 9 * 1024 * 1024;
+    let blob: std::sync::Arc<[u8]> = vec![0xff; length].into();
+    let values = [
+        SqliteValue::Integer(17),
+        SqliteValue::Text("x".repeat(length).into()),
+        SqliteValue::Blob(blob.clone()),
+        SqliteValue::Null,
+    ];
+    let actual = cells(&values)?;
+    assert_eq!(actual.len(), values.len());
+    assert_eq!(actual[0], Cell::Integer(17));
+    assert!(matches!(
+        (&actual[1], &values[1]),
+        (Cell::Text(text), SqliteValue::Text(original))
+            if text.as_bytes() == original.as_bytes_direct()
+    ));
+    let Cell::Blob(encoded) = &actual[2] else {
+        return Err(anyhow!("large BLOB changed its storage class"));
+    };
+    assert!(STANDARD.decode(encoded)?.as_slice() == blob.as_ref());
+    assert_eq!(actual[3], Cell::Null);
+    Ok(())
+}
+
+#[test]
+fn cells_refuse_invalid_utf8_without_private_diagnostic() {
+    let text = fsqlite_types::SmallText::from_bytes(b"PRIVATE-INVALID-UTF8\x80\xff");
+    assert!(!text.is_valid_utf8());
+    let error = cells(&[SqliteValue::Text(text)])
+        .expect_err("invalid UTF-8 must not become replacement characters");
+    let message = error.to_string();
+    assert!(message.contains("invalid UTF-8"));
+    assert!(!message.contains("PRIVATE-INVALID-UTF8"));
+}
+
+#[test]
+fn cells_preserve_an_exact_v1_boundary_row_with_many_nulls() -> Result<()> {
+    let mut empty = vec![Cell::Integer(17), Cell::Text(String::new())];
+    empty.extend(std::iter::repeat_n(Cell::Null, 62));
+    let framing = serde_json::to_vec(&Record::Row { values: empty })?.len() + 1;
+    let length = codec::MAX_RECORD_BYTES - framing;
+    let mut values = vec![
+        SqliteValue::Integer(17),
+        SqliteValue::Text("s".repeat(length).into()),
+    ];
+    values.extend(std::iter::repeat_n(SqliteValue::Null, 62));
+    let actual = cells(&values)?;
+    assert_eq!(actual.len(), 64);
+    assert!(actual[2..].iter().all(|value| *value == Cell::Null));
+    assert_eq!(
+        codec::encode(&Record::Row { values: actual })?.len(),
+        codec::MAX_RECORD_BYTES
+    );
+    Ok(())
+}
+
+#[test]
+fn shared_blob_cells_reject_the_256_mib_bound_without_expansion_or_private_diagnostic() {
+    // Cloning SqliteValue::Blob shares its Arc: this fixture retains one
+    // 3 MiB payload, while 64 base64 payloads alone would occupy 256 MiB.
+    // Required JSON framing means the row cannot fit. Refuse it in preflight,
+    // before allocating any of those 64 encoded copies.
+    let private = b"PRIVATE-OVERSIZED-CELL";
+    let mut bytes = vec![0_u8; 3 * 1024 * 1024];
+    bytes[..private.len()].copy_from_slice(private);
+    let blob: std::sync::Arc<[u8]> = bytes.into();
+    let mut values = vec![SqliteValue::Integer(19)];
+    values.extend(std::iter::repeat_n(SqliteValue::Blob(blob.clone()), 64));
+    assert_eq!(
+        (values.len() - 1) * blob.len().div_ceil(3) * 4,
+        codec::MAX_ROW_BYTES
+    );
+    let cause = cells(&values).unwrap_err();
+    let error = row_failure(
+        "logical table messages, row 19".to_owned(),
+        "cell conversion",
+        cause,
+    );
+    let public_message = error.to_string();
+    assert!(public_message.contains("messages, row 19, cell conversion"));
+    assert!(public_message.contains("256 MiB"));
+    assert!(!public_message.contains("PRIVATE-OVERSIZED-CELL"));
+    assert!(!public_message.contains(&STANDARD.encode(private)));
+}
+
+#[test]
+fn json_expansion_beyond_one_frame_is_published_and_verified() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let destination = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    // The raw body fits one physical frame, but JSON's six-byte NUL escapes
+    // require v2 continuations. Export must retain it rather than refuse it.
+    let body = format!(
+        "PRIVATE-ENCODED-ROW{}",
+        "\0".repeat(codec::MAX_RECORD_BYTES / 6 + 1)
+    );
+    assert!(body.len() < codec::MAX_RECORD_BYTES);
+    let connection = Connection::open(path_text(&database)?)?;
+    connection.execute_with_params(
+        "UPDATE messages SET body = ?1 WHERE id = 7",
+        &[SqliteValue::Text(body.clone().into())],
+    )?;
+    connection.close()?;
+    let before = contents(source.path());
+    let output = destination.path().join("archive.jsonl");
+    let receipt = export_file(&database, &output, "encoding-continuation".to_owned())?;
+    assert_eq!(receipt.0.schema_version, codec::SEQUENCE_VERSION);
+    assert_eq!(receipt.1.tables["messages"], 2);
+    assert_eq!(receipt, verify_file(&output)?);
+    let mut input = BufReader::new(File::open(&output)?);
+    let mut line = 1;
+    let mut found = false;
+    while let Some(record) = codec::read_record(&mut input, line)? {
+        if let Record::Row { values } = record
+            && values[0] == Cell::Integer(7)
+        {
+            assert!(matches!(&values[1], Cell::Text(actual) if actual == &body));
+            found = true;
+        }
+        line += 1;
+    }
+    assert!(found, "the continued message must survive byte for byte");
+    assert_eq!(before, contents(source.path()));
+    assert_eq!(
+        fs::read_dir(destination.path())?.count(),
+        2,
+        "only the published archive and persistent destination lock may remain"
+    );
+    Ok(())
+}
+
+#[derive(Default)]
+struct FaultWriter {
+    writes: usize,
+    flushes: usize,
+    fail_at: Option<usize>,
+    fail_flush: bool,
+}
+
+impl Write for FaultWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let position = self.writes;
+        self.writes += 1;
+        if self.fail_at == Some(position) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "PRIVATE-WRITER-DETAIL",
+            ));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flushes += 1;
+        if self.fail_flush {
+            return Err(std::io::Error::other("PRIVATE-FLUSH-DETAIL"));
+        }
+        Ok(())
+    }
+}
+
+/// Exercise Write's real short-write/Interrupted contract. Error payloads
+/// deliberately contain private text that the JSON diagnostic must withhold.
+struct PartialWriter {
+    bytes: Vec<u8>,
+    fail_after: Option<usize>,
+    interrupted_writes: bool,
+    interrupt_next: bool,
+    interruptions: usize,
+    fail_flush: bool,
+    flushes: usize,
+}
+
+impl PartialWriter {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            fail_after: None,
+            interrupted_writes: false,
+            interrupt_next: false,
+            interruptions: 0,
+            fail_flush: false,
+            flushes: 0,
+        }
+    }
+}
+
+impl Write for PartialWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.interrupt_next {
+            self.interrupt_next = false;
+            self.interruptions += 1;
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "PRIVATE-WRITER-DIAGNOSTIC",
+            ));
+        }
+        let remaining = self
+            .fail_after
+            .map_or(usize::MAX, |limit| limit.saturating_sub(self.bytes.len()));
+        if remaining == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "PRIVATE-WRITER-DIAGNOSTIC",
+            ));
+        }
+        let length = bytes.len().min(7).min(remaining);
+        self.bytes.extend_from_slice(&bytes[..length]);
+        self.interrupt_next = self.interrupted_writes;
+        Ok(length)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flushes += 1;
+        if self.fail_flush {
+            Err(io::Error::other("PRIVATE-FLUSH-DIAGNOSTIC"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn row_write_failure_keeps_io_class_and_public_location() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = open_source(&database)?;
+    // Header, messages descriptor, first row, then fail on the second row.
+    let mut writer = FaultWriter {
+        fail_at: Some(3),
+        ..Default::default()
+    };
+    let error = snapshot(&connection, "write-failure".to_owned(), &mut writer).unwrap_err();
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (14, "logical-archive-io", true)
+    );
+    let public_message = error.to_string();
+    assert!(
+        public_message.contains("messages, row 2"),
+        "{public_message}"
+    );
+    assert!(public_message.contains("WriteZero"), "{public_message}");
+    assert!(!public_message.contains("PRIVATE-WRITER-DETAIL"));
+    assert_eq!(writer.writes, 4);
+    assert_eq!(writer.flushes, 0);
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}
+
+#[test]
+fn header_and_completion_write_errors_do_not_echo_writer_details() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = open_source(&database)?;
+    for (fail_at, location) in [(0, "header"), (6, "completion")] {
+        let mut writer = FaultWriter {
+            fail_at: Some(fail_at),
+            ..Default::default()
+        };
+        let error = snapshot(&connection, "write-failure".to_owned(), &mut writer).unwrap_err();
+        assert_eq!(
+            super::super::classify_failure(&error),
+            (14, "logical-archive-io", true)
+        );
+        let public_message = error.to_string();
+        assert!(public_message.contains(location), "{public_message}");
+        assert!(!public_message.contains("PRIVATE-WRITER-DETAIL"));
+    }
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}
+
+#[test]
+fn partial_row_write_preserves_io_cause_and_private_row_location() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let database = root.path().join("source.db");
+    fixture(&database);
+    let connection = open_source(&database)?;
+    let mut complete = Vec::new();
+    snapshot(&connection, "partial-write".to_owned(), &mut complete)?;
+    let mut offset = 0;
+    let mut failure_offset = None;
+    for line in complete.split_inclusive(|byte| *byte == b'\n') {
+        if let Record::Row { values } = serde_json::from_slice(line)?
+            && values[0] == Cell::Integer(7)
+        {
+            failure_offset = Some(offset + line.len() / 2);
+            break;
+        }
+        offset += line.len();
+    }
+    let failure_offset = failure_offset.expect("fixture has a second message");
+    let mut output = PartialWriter::new();
+    output.fail_after = Some(failure_offset);
+    let error = snapshot(&connection, "partial-write".to_owned(), &mut output)
+        .expect_err("an incomplete row must fail the snapshot");
+    let message = error.to_string();
+    assert!(
+        message.contains("logical table messages, row 2"),
+        "{message}"
+    );
+    assert!(message.contains("id=7"), "{message}");
+    assert!(message.contains("BrokenPipe"), "{message}");
+    assert!(!message.contains("PRIVATE-WRITER-DIAGNOSTIC"));
+    assert!(!message.contains("private transcript"));
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (14, "logical-archive-io", true)
+    );
+    assert!(error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+    }));
+    assert_eq!(output.bytes.len(), failure_offset);
+    assert_eq!(output.flushes, 0);
+    assert!(codec::verify(&mut output.bytes.as_slice()).is_err());
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}
+
+#[test]
+fn final_flush_failure_is_not_a_successful_snapshot() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = open_source(&database)?;
+    let mut writer = FaultWriter {
+        fail_flush: true,
+        ..Default::default()
+    };
+    let error = snapshot(&connection, "flush-failure".to_owned(), &mut writer).unwrap_err();
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (14, "logical-archive-io", true)
+    );
+    assert!(error.to_string().contains("cannot flush logical archive"));
+    assert!(!error.to_string().contains("PRIVATE-FLUSH-DETAIL"));
+    assert_eq!(writer.flushes, 1);
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}
+
+#[test]
+fn interrupted_short_writes_resume_without_duplicating_records() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let database = root.path().join("source.db");
+    fixture(&database);
+    let connection = open_source(&database)?;
+    let mut output = PartialWriter::new();
+    output.interrupted_writes = true;
+    output.interrupt_next = true;
+    let receipt = snapshot(&connection, "interrupted-writes".to_owned(), &mut output)?;
+    assert!(output.interruptions > 3);
+    assert_eq!(output.flushes, 1);
+    assert_eq!(receipt, codec::verify(&mut output.bytes.as_slice())?);
+    assert_eq!(receipt.1.tables["messages"], 2);
+    assert_eq!(receipt.1.records, 3);
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: Vec<u8>,
+    writes: usize,
+    flushes: usize,
+    largest_write: usize,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.writes += 1;
+        self.largest_write = self.largest_write.max(bytes.len());
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flushes += 1;
+        Ok(())
+    }
+}
+
+#[test]
+fn flush_failure_reports_stage_and_kind_without_private_writer_payload() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let database = root.path().join("source.db");
+    fixture(&database);
+    let connection = open_source(&database)?;
+    let mut output = PartialWriter::new();
+    output.fail_flush = true;
+    let error = snapshot(&connection, "flush-failure".to_owned(), &mut output)
+        .expect_err("a failed flush must not return a successful backup receipt");
+    let message = error.to_string();
+    assert!(
+        message.contains("cannot flush logical archive"),
+        "{message}"
+    );
+    assert!(message.contains("I/O Other"), "{message}");
+    assert!(!message.contains("PRIVATE-FLUSH-DIAGNOSTIC"));
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (14, "logical-archive-io", true)
+    );
+    assert_eq!(output.flushes, 1);
+    // The error is specifically in the final flush, after complete wire data.
+    assert_eq!(codec::verify(&mut output.bytes.as_slice())?.1.records, 3);
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}
+
+#[test]
+fn database_error_diagnostics_hide_private_payloads_and_preserve_typed_causes() {
+    let context = "cannot read logical table messages after 23 complete rows";
+    let corruption = source_failure(
+        context,
+        FrankenError::DatabaseCorrupt {
+            detail: "PRIVATE-DATABASE-PAYLOAD".to_owned(),
+        },
+    );
+    let message = corruption.to_string();
+    assert!(message.starts_with(context), "{message}");
+    assert!(message.contains("FrankenSQLite Corrupt (code 11)"));
+    assert!(!message.contains("PRIVATE-DATABASE-PAYLOAD"));
+    assert!(matches!(
+        corruption.downcast_ref::<FrankenError>(),
+        Some(FrankenError::DatabaseCorrupt { detail }) if detail == "PRIVATE-DATABASE-PAYLOAD"
+    ));
+
+    let read_error = source_failure(
+        context,
+        FrankenError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "PRIVATE-DATABASE-PATH",
+        )),
+    );
+    let message = read_error.to_string();
+    assert!(message.starts_with(context), "{message}");
+    assert!(message.contains("FrankenSQLite IoErr (code 10)"));
+    assert!(message.contains("I/O PermissionDenied"));
+    assert!(!message.contains("PRIVATE-DATABASE-PATH"));
+    assert!(matches!(
+        read_error.downcast_ref::<FrankenError>(),
+        Some(FrankenError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
+    ));
+    assert!(read_error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+    }));
+    assert_eq!(
+        super::super::classify_failure(&read_error),
+        (14, "logical-archive-io", true)
+    );
+}
+
+/// Observe complete records even if the exporter changes its write chunking.
+/// Used to interleave a real engine event at a known point in a small fixture.
+struct ObservingWriter<F> {
+    bytes: Vec<u8>,
+    next_line: usize,
+    observe: F,
+}
+
+impl<F: FnMut(&Record)> Write for ObservingWriter<F> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        while let Some(end) = self.bytes[self.next_line..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            let end = self.next_line + end + 1;
+            let record = serde_json::from_slice(&self.bytes[self.next_line..end])
+                .map_err(io::Error::other)?;
+            self.next_line = end;
+            (self.observe)(&record);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn buffered_snapshot_coalesces_rows_without_changing_the_verified_digest() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = Connection::open(path_text(&database)?)?;
+    let body = SqliteValue::Text("buffered transcript ".repeat(80).into());
+    connection.execute("BEGIN")?;
+    for id in 100..612 {
+        connection.execute_with_params(
+            "INSERT INTO messages(id, body) VALUES (?1, ?2)",
+            &[SqliteValue::Integer(id), body.clone()],
+        )?;
+    }
+    connection.execute("COMMIT")?;
+    connection.close()?;
+    let connection = open_source(&database)?;
+    let mut direct = CountingWriter::default();
+    let direct_receipt = snapshot(&connection, "buffer-proof".to_owned(), &mut direct)?;
+    let mut buffered = CountingWriter::default();
+    let buffered_receipt =
+        buffered_snapshot(&connection, "buffer-proof".to_owned(), &mut buffered)?;
+    // The timestamp may differ, but canonical rows and their digest must not.
+    assert_eq!(direct_receipt.1, buffered_receipt.1);
+    assert_eq!(
+        codec::verify(&mut BufReader::new(buffered.bytes.as_slice()))?,
+        buffered_receipt
+    );
+    assert_eq!(buffered_receipt.1.tables["messages"], 514);
+    assert!(buffered.bytes.len() > 2 * EXPORT_IO_BUFFER_BYTES);
+    assert!(buffered.writes > 1, "exercise more than one buffer flush");
+    assert!(
+        buffered.writes * 16 < direct.writes,
+        "small records were not coalesced: direct={}, buffered={}",
+        direct.writes,
+        buffered.writes
+    );
+    assert!(buffered.largest_write <= EXPORT_IO_BUFFER_BYTES);
+    assert_eq!(buffered.flushes, 1);
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}
+
+#[test]
+fn buffered_snapshot_preserves_records_larger_than_its_io_buffer() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = Connection::open(path_text(&database)?)?;
+    connection.execute_with_params(
+        "UPDATE messages SET body = ?1 WHERE id = 7",
+        &[SqliteValue::Text(
+            "x".repeat(EXPORT_IO_BUFFER_BYTES * 2).into(),
+        )],
+    )?;
+    connection.close()?;
+    let connection = open_source(&database)?;
+    let mut writer = CountingWriter::default();
+    let receipt = buffered_snapshot(&connection, "large-record".to_owned(), &mut writer)?;
+    assert!(writer.largest_write > EXPORT_IO_BUFFER_BYTES);
+    assert_eq!(
+        codec::verify(&mut BufReader::new(writer.bytes.as_slice()))?,
+        receipt
+    );
+    assert_eq!(receipt.1.tables["messages"], 2);
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}
+
+#[test]
+fn buffered_snapshot_does_not_retry_failed_writes_on_drop() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = open_source(&database)?;
+    // This small fixture reaches the sink on the final explicit flush. A
+    // normal BufWriter drop would retry the still-buffered failed write.
+    let mut writer = FaultWriter {
+        fail_at: Some(0),
+        ..Default::default()
+    };
+    let error = buffered_snapshot(&connection, "failed-buffer".to_owned(), &mut writer)
+        .expect_err("a failed final write must not produce a receipt");
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (14, "logical-archive-io", true)
+    );
+    assert!(error.to_string().contains("cannot flush logical archive"));
+    assert!(!error.to_string().contains("PRIVATE-WRITER-DETAIL"));
+    assert_eq!(
+        writer.writes, 1,
+        "an error must not trigger an implicit retry"
+    );
+    assert_eq!(writer.flushes, 0);
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}
+
+#[test]
+fn buffered_snapshot_propagates_underlying_flush_errors() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = open_source(&database)?;
+    let mut writer = FaultWriter {
+        fail_flush: true,
+        ..Default::default()
+    };
+    let error = buffered_snapshot(&connection, "failed-flush".to_owned(), &mut writer).unwrap_err();
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (14, "logical-archive-io", true)
+    );
+    assert!(error.to_string().contains("cannot flush logical archive"));
+    assert!(!error.to_string().contains("PRIVATE-FLUSH-DETAIL"));
+    assert_eq!(writer.writes, 1);
+    assert_eq!(writer.flushes, 1);
+    connection.execute("ROLLBACK")?;
+    connection.close_without_checkpoint()?;
+    Ok(())
+}
+
+#[test]
+fn engine_cancellation_after_emitted_rows_retains_source_cause_and_progress() -> Result<()> {
+    use fsqlite_types::cx::CancelReason;
+    use std::cell::Cell as Counter;
+
+    let connection = Connection::open(":memory:")?;
+    connection.execute_batch(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO meta VALUES ('schema_version', '9');
+         CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT);",
+    )?;
+    let rows = (1..=2048)
+        .map(|id| format!("({id}, 'PRIVATE-CANCELLED-TRANSCRIPT')"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    connection.execute(&format!("INSERT INTO messages VALUES {rows}"))?;
+    connection.execute("BEGIN")?;
+    let (operation, relay) = connection
+        .as_async()
+        .root_cx()
+        .create_child_with_local_cancel_relay();
+    let rows_seen = Counter::new(0u64);
+    let mut output = ObservingWriter {
+        bytes: Vec::new(),
+        next_line: 0,
+        observe: |record: &Record| {
+            if matches!(record, Record::Row { .. }) {
+                rows_seen.set(rows_seen.get() + 1);
+                if rows_seen.get() == 1 {
+                    assert!(relay.cancel_local(CancelReason::UserInterrupt));
+                }
+            }
+        },
+    };
+    let error = {
+        let _binding = connection.as_async().bind_operation_cx(&operation);
+        snapshot(&connection, "cancelled-source".to_owned(), &mut output)
+            .expect_err("engine cancellation must fail the active table scan")
+    };
+    assert!((1..2048).contains(&rows_seen.get()));
+    let message = error.to_string();
+    assert!(
+        message.contains("cannot stream logical table messages"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("after {} complete rows", rows_seen.get())),
+        "{message}"
+    );
+    assert!(
+        message.contains("FrankenSQLite Abort (code 4)"),
+        "{message}"
+    );
+    assert!(!message.contains("PRIVATE-CANCELLED-TRANSCRIPT"));
+    assert!(error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<FrankenError>(),
+            Some(FrankenError::Abort)
+        )
+    }));
+    assert!(codec::verify(&mut output.bytes.as_slice()).is_err());
+    // The per-operation cancellation must leave rollback and later reads usable.
+    assert!(connection.as_async().root_cx().checkpoint().is_ok());
+    connection.execute("ROLLBACK")?;
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM messages")?
+            .get_typed::<i64>(0)?,
+        2048
+    );
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn wal_writer_committing_during_export_cannot_mix_snapshot_generations() -> Result<()> {
+    use std::cell::Cell as Flag;
+
+    let root = tempfile::tempdir()?;
+    let database = root.path().join("source.db");
+    fixture(&database);
+    let writer = Connection::open(path_text(&database)?)?;
+    writer.execute("PRAGMA journal_mode = WAL")?;
+    writer.execute_batch(
+        "CREATE TABLE z_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT);
+         INSERT INTO z_jobs VALUES (100, 'old allocation generation');",
+    )?;
+    let reader = open_source(&database)?;
+    let changed = Flag::new(false);
+    let mut output = ObservingWriter {
+        bytes: Vec::new(),
+        next_line: 0,
+        observe: |record: &Record| {
+            if let Record::Row { values } = record
+                && values[0] == Cell::Integer(3)
+                && !changed.replace(true)
+            {
+                assert!(reader.as_async().in_transaction());
+                // Commit from another thread, as a real concurrent writer
+                // does. Calling the blocking API here, on the thread whose
+                // own read is suspended in this callback, re-enters the
+                // driver and never completes (m5cob).
+                let (done, committed) = std::sync::mpsc::channel();
+                let database = database.clone();
+                std::thread::spawn(move || {
+                    let commit = || -> Result<()> {
+                        let writer = Connection::open(path_text(&database)?)?;
+                        writer.execute_batch(
+                            "BEGIN;
+                             UPDATE messages SET body = 'PRIVATE-NEW-GENERATION' WHERE id = 7;
+                             INSERT INTO messages VALUES (9, 'PRIVATE-NEW-GENERATION', NULL, NULL);
+                             UPDATE meta SET value = '10' WHERE key = 'schema_version';
+                             INSERT INTO z_jobs VALUES (1000, 'PRIVATE-NEW-GENERATION');
+                             DELETE FROM z_jobs;
+                             COMMIT;",
+                        )?;
+                        Ok(())
+                    };
+                    let _ = done.send(commit().map_err(|err| format!("{err:#}")));
+                });
+                committed
+                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .expect("the independent WAL writer must finish within 60 s")
+                    .expect(
+                        "the independent WAL writer must commit while the read snapshot is held",
+                    );
+            }
+        },
+    };
+    let receipt = snapshot(&reader, "stable-snapshot".to_owned(), &mut output)?;
+    assert!(
+        changed.get(),
+        "the concurrent commit must actually have run"
+    );
+    assert_eq!(receipt.0.storage_schema_version, "9");
+    assert_eq!(receipt.1.tables["messages"], 2);
+    assert_eq!(receipt.1.records, 4);
+    assert_eq!(receipt.1.tables["z_jobs"], 1);
+    assert_eq!(
+        receipt.0.sequences,
+        Some(vec![Sequence {
+            table: "z_jobs".to_owned(),
+            value: Some(100),
+        }])
+    );
+    assert_eq!(receipt, codec::verify(&mut output.bytes.as_slice())?);
+    assert!(reader.as_async().in_transaction());
+    let mut saw_old_body = false;
+    let mut saw_old_meta = false;
+    let mut saw_old_job = false;
+    for line in output.bytes.split_inclusive(|byte| *byte == b'\n') {
+        if let Record::Row { values } = serde_json::from_slice(line)? {
+            if values[0] == Cell::Integer(7) {
+                assert_eq!(values[1], Cell::Text("private transcript".to_owned()));
+                saw_old_body = true;
+            } else if values[0] == Cell::Text("schema_version".to_owned()) {
+                assert_eq!(values[1], Cell::Text("9".to_owned()));
+                saw_old_meta = true;
+            } else if values[0] == Cell::Integer(100) {
+                assert_eq!(
+                    values[1],
+                    Cell::Text("old allocation generation".to_owned())
+                );
+                saw_old_job = true;
+            }
+        }
+    }
+    assert!(saw_old_body && saw_old_meta && saw_old_job);
+    assert!(!String::from_utf8_lossy(&output.bytes).contains("PRIVATE-NEW-GENERATION"));
+    reader.execute("ROLLBACK")?;
+    reader.close_without_checkpoint()?;
+    assert_eq!(
+        writer
+            .query_row("SELECT COUNT(*) FROM messages")?
+            .get_typed::<i64>(0)?,
+        3
+    );
+    assert_eq!(
+        writer
+            .query_row("SELECT value FROM meta WHERE key = 'schema_version'")?
+            .get_typed::<String>(0)?,
+        "10"
+    );
+    assert_eq!(
+        writer
+            .query_row("SELECT COUNT(*) FROM z_jobs")?
+            .get_typed::<i64>(0)?,
+        0
+    );
+    assert_eq!(
+        writer
+            .query_row("SELECT seq FROM sqlite_sequence WHERE name = 'z_jobs'")?
+            .get_typed::<i64>(0)?,
+        1000
+    );
+    writer.close()?;
     Ok(())
 }

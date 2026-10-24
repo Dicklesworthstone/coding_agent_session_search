@@ -413,7 +413,12 @@ pub async fn start_preview_server(config: PreviewConfig) -> Result<(), PreviewEr
         "\x1b[1;32m\u{1F310}\x1b[0m Preview server running at \x1b[1;36mhttp://localhost:{}\x1b[0m",
         config.port
     );
-    eprintln!("   Serving: \x1b[33m{}\x1b[0m", site_dir.display());
+    // The containment root stays std-canonical (request paths are canonicalized
+    // the same way); only the printed spelling drops Windows' \\?\ prefix.
+    eprintln!(
+        "   Serving: \x1b[33m{}\x1b[0m",
+        dunce::simplified(&site_dir).display()
+    );
     eprintln!("   Press \x1b[1mCtrl+C\x1b[0m to stop");
     eprintln!();
 

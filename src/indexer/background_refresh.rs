@@ -1,12 +1,20 @@
 //! Stale-on-read index catch-up: spawn a detached, low-priority incremental
 //! `cass index` when a read path (search, pack, TUI launch, daemon tick)
-//! notices the index is behind the session files on disk.
+//! notices the index is behind, or its last successful source scan is overdue.
 //!
 //! Design constraints:
 //!
 //! * **Never block the read.** The caller serves its current (possibly stale)
 //!   results immediately; the catch-up runs in a separate process that
-//!   outlives the caller. The *next* read is fresh.
+//!   outlives the caller. Later reads see new sessions after it publishes.
+//! * **Source freshness is separate from index health.** A healthy generation
+//!   does not prove that new provider files have been scanned (GH #514). After
+//!   five minutes since `last_indexed_at`, the next eligible read requests an
+//!   incremental scan even when `stale` is false and no pending count is known.
+//!   This is not a timer or a promise to finish indexing within five minutes.
+//!   No provider directory is walked by the read path. Override the interval
+//!   with `CASS_AUTO_REFRESH_SOURCE_SCAN_SECS`; zero disables only this cadence,
+//!   leaving stale/partial/pending catch-up and the global opt-out unchanged.
 //! * **At most one catch-up at a time, machine-wide per data dir.** The
 //!   spawned child takes the normal `index-run.lock`, so it cannot race a
 //!   foreground `cass index`; this module additionally checks that lock
@@ -45,6 +53,11 @@ use tracing::{debug, info, warn};
 
 /// Default minimum spacing between two auto-spawned catch-up runs.
 pub const DEFAULT_COOLDOWN_SECS: u64 = 300;
+
+/// Successful-scan age after which reads request another incremental pass.
+/// Unlike the spawn cooldown, a successful foreground or scheduled run resets
+/// this clock too. It does not change the health surface's stale threshold.
+pub const DEFAULT_SOURCE_SCAN_SECS: u64 = 300;
 
 /// Spacing after an auto-spawned catch-up ended without advancing the index,
 /// indexed by `consecutive_failures - 1`, measured from the moment the failure
@@ -148,8 +161,9 @@ pub struct AutoRefreshState {
     /// `last_indexed_at`. Reset to zero as soon as any run advances it.
     #[serde(default)]
     pub consecutive_failures: u32,
-    /// The spawn (`last_spawn_ms`) whose failure has already been counted, so
-    /// repeated reads between attempts do not inflate the streak.
+    /// The spawn (`last_spawn_ms`) whose outcome has already been acknowledged:
+    /// either its failure was counted or a successful watermark was observed.
+    /// This also prevents a later stale snapshot from failing a completed run.
     #[serde(default)]
     pub failure_counted_for_spawn_ms: i64,
     /// When the most recent failure was detected; the backoff clock starts
@@ -200,17 +214,118 @@ fn rfc3339(ms: i64) -> String {
         .unwrap_or_else(|| ms.to_string())
 }
 
-/// The index watermark carried by a freshness block: `last_indexed_at` is an
-/// RFC 3339 string in `cass status`/`--robot-meta` output; a bare millisecond
-/// integer is accepted too.
-pub fn last_indexed_at_ms_from_freshness(index_freshness: &serde_json::Value) -> Option<i64> {
-    let value = index_freshness.get("last_indexed_at")?;
+fn freshness_timestamp_ms(value: Option<&serde_json::Value>) -> Option<i64> {
+    let value = value?;
     if let Some(ms) = value.as_i64() {
         return Some(ms);
     }
     chrono::DateTime::parse_from_rfc3339(value.as_str()?)
         .ok()
         .map(|t| t.timestamp_millis())
+}
+
+/// Latest successful refresh watermark carried by a freshness block.
+///
+/// `last_indexed_at` proves a lexical publication. `source_scan_completed_at_ms`
+/// proves that source discovery completed even when the scan was a no-op and no
+/// lexical generation needed publication. Treating those as one clock was the
+/// GH #514 blind spot: a clean scan could not reset stale-on-read cadence or the
+/// detached-child breaker.
+pub fn last_indexed_at_ms_from_freshness(index_freshness: &serde_json::Value) -> Option<i64> {
+    [
+        freshness_timestamp_ms(index_freshness.get("last_indexed_at")),
+        freshness_timestamp_ms(index_freshness.get("source_scan_completed_at_ms")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|value| *value > 0)
+    .max()
+}
+
+/// Read the canonical source-scan watermark without mutating the archive.
+/// Missing/unreadable metadata is unknown, never synthesized as epoch zero.
+pub fn source_scan_completed_at_ms_from_db(db_path: &Path) -> Option<i64> {
+    let storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).ok()?;
+    storage
+        .get_last_scan_ts()
+        .ok()
+        .flatten()
+        .filter(|value| *value > 0)
+}
+
+/// Inject `source_scan_completed_at_ms` from the canonical database into a
+/// freshness object when absent so `catch_up_reason` and
+/// `last_indexed_at_ms_from_freshness` honor completed no-op source scans
+/// without altering robot schema outputs.
+pub fn enrich_freshness_with_source_scan_watermark(
+    freshness: &serde_json::Value,
+    db_path: &Path,
+) -> Option<serde_json::Value> {
+    if freshness
+        .get("source_scan_completed_at_ms")
+        .is_some_and(|value| !value.is_null())
+    {
+        return None;
+    }
+    let scan_ms = source_scan_completed_at_ms_from_db(db_path)?;
+    let mut enriched = freshness.clone();
+    if let serde_json::Value::Object(map) = &mut enriched {
+        map.insert(
+            "source_scan_completed_at_ms".to_string(),
+            serde_json::Value::Number(scan_ms.into()),
+        );
+        return Some(enriched);
+    }
+    None
+}
+
+/// Pure source-scan cadence policy. A missing watermark means a scan is due;
+/// zero disables age-triggered scans. Future timestamps are treated as fresh
+/// rather than causing a spawn storm after a wall-clock correction.
+pub fn source_scan_is_due(completed_at_ms: Option<i64>, now_ms: i64, threshold: Duration) -> bool {
+    if threshold.is_zero() {
+        return false;
+    }
+    let Some(completed_at_ms) = completed_at_ms.filter(|value| *value > 0) else {
+        return true;
+    };
+    let Some(elapsed_ms) = now_ms.checked_sub(completed_at_ms) else {
+        return false;
+    };
+    if elapsed_ms < 0 {
+        return false;
+    }
+    Duration::from_millis(u64::try_from(elapsed_ms).unwrap_or(u64::MAX)) >= threshold
+}
+
+/// How recent another source scan must be for the resident daemon to skip a
+/// periodic index tick. The read-path cadence caps it, but the daemon's own
+/// `CASS_DAEMON_INDEX_INTERVAL_SECS` bounds it too: a 60 s interval must not
+/// silently become the 300 s read-path cadence, and
+/// `CASS_AUTO_REFRESH_SOURCE_SCAN_SECS=0`, which disables only the read-path
+/// cadence, must not stop the daemon. Half the interval leaves room for the
+/// daemon's own previous child to finish without its scan making the next
+/// tick look redundant.
+pub fn daemon_source_scan_freshness_window(
+    daemon_interval: Duration,
+    source_scan_interval: Duration,
+) -> Duration {
+    let own = daemon_interval / 2;
+    if source_scan_interval.is_zero() {
+        own
+    } else {
+        source_scan_interval.min(own)
+    }
+}
+
+/// Daemon helper: is a periodic index pass due, given the canonical
+/// source-scan watermark? This is a metadata read only; it performs no scan.
+pub fn source_scan_due_for_daemon(db_path: &Path, daemon_interval: Duration) -> bool {
+    source_scan_is_due(
+        source_scan_completed_at_ms_from_db(db_path),
+        now_ms(),
+        daemon_source_scan_freshness_window(daemon_interval, source_scan_interval_from_env()),
+    )
 }
 
 /// What the breaker says about spawning right now.
@@ -228,7 +343,9 @@ pub enum BreakerVerdict {
 /// OOM-killed, stall-aborted, or crashed before `last_indexed_at` was written.
 /// Each spawn is counted once. Any watermark at or past the spawn — that child
 /// finishing, a foreground `cass index`, the scheduler — resets the streak.
-/// `None` for the watermark means the caller cannot judge; nothing changes.
+/// Missing or sentinel watermarks cannot judge a new outcome or erase a known
+/// failure: preserve the recorded breaker without mutating its evidence.
+/// Once success is observed, older snapshots cannot fail that same spawn.
 pub fn judge_previous_spawn(
     state: &mut AutoRefreshState,
     last_indexed_at_ms: Option<i64>,
@@ -238,11 +355,12 @@ pub fn judge_previous_spawn(
     if state.last_spawn_ms <= 0 {
         return BreakerVerdict::Closed;
     }
-    let Some(watermark) = last_indexed_at_ms else {
-        return BreakerVerdict::Closed;
+    let Some(watermark) = last_indexed_at_ms.filter(|value| *value > 0) else {
+        return recorded_breaker_verdict(state, now_ms);
     };
     if watermark >= state.last_spawn_ms {
         state.consecutive_failures = 0;
+        state.failure_counted_for_spawn_ms = state.last_spawn_ms;
         state.last_failure = None;
         state.last_failure_detected_ms = 0;
         return BreakerVerdict::Closed;
@@ -261,14 +379,23 @@ pub fn judge_previous_spawn(
             child_log.display()
         ));
     }
+    recorded_breaker_verdict(state, now_ms)
+}
+
+/// Evaluate durable failure evidence independently of metadata availability.
+fn recorded_breaker_verdict(state: &AutoRefreshState, now_ms: i64) -> BreakerVerdict {
     if state.consecutive_failures >= FAILURE_TRIP_THRESHOLD {
         return BreakerVerdict::Tripped;
     }
-    let step = usize::try_from(state.consecutive_failures.saturating_sub(1)).unwrap_or(usize::MAX);
-    let backoff_ms = i64::try_from(FAILURE_BACKOFF_SECS[step.min(FAILURE_BACKOFF_SECS.len() - 1)])
-        .unwrap_or(i64::MAX)
-        .saturating_mul(1000);
-    let elapsed_ms = now_ms.saturating_sub(state.last_failure_detected_ms);
+    if state.consecutive_failures == 0 {
+        return BreakerVerdict::Closed;
+    }
+    let step = usize::try_from(state.consecutive_failures - 1).unwrap_or(usize::MAX);
+    let backoff_ms =
+        i128::from(FAILURE_BACKOFF_SECS[step.min(FAILURE_BACKOFF_SECS.len() - 1)]) * 1000;
+    // A backwards clock step can make elapsed time negative. Widen before
+    // subtracting so neither it nor the round-up overflows at i64 boundaries.
+    let elapsed_ms = i128::from(now_ms) - i128::from(state.last_failure_detected_ms);
     if elapsed_ms >= backoff_ms {
         return BreakerVerdict::Closed;
     }
@@ -278,10 +405,54 @@ pub fn judge_previous_spawn(
     }
 }
 
+/// Keep the scheduler's existing no-watermark full-pass exemption explicit.
+/// Unknown metadata on an ordinary catch-up is not that exemption.
+fn spawn_breaker_verdict(
+    state: &mut AutoRefreshState,
+    full: bool,
+    last_indexed_at_ms: Option<i64>,
+    now_ms: i64,
+    child_log: &Path,
+) -> BreakerVerdict {
+    if full && last_indexed_at_ms.is_none() {
+        BreakerVerdict::Closed
+    } else {
+        judge_previous_spawn(state, last_indexed_at_ms, now_ms, child_log)
+    }
+}
+
 /// Decide whether a freshness snapshot (the `index_freshness` block that
 /// `cass search --robot-meta` and `cass status` emit) warrants a catch-up.
 /// Returns the reason string that will be recorded, or `None`.
 pub fn catch_up_reason(index_freshness: &serde_json::Value) -> Option<&'static str> {
+    catch_up_reason_at(index_freshness, now_ms(), source_scan_interval_from_env())
+}
+
+fn parse_source_scan_interval(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+fn source_scan_interval_from_env() -> Duration {
+    let default = Duration::from_secs(DEFAULT_SOURCE_SCAN_SECS);
+    let Ok(value) = dotenvy::var("CASS_AUTO_REFRESH_SOURCE_SCAN_SECS") else {
+        return default;
+    };
+    parse_source_scan_interval(&value).unwrap_or_else(|| {
+        warn!(
+            default_secs = DEFAULT_SOURCE_SCAN_SECS,
+            "invalid CASS_AUTO_REFRESH_SOURCE_SCAN_SECS; expected nonnegative integer seconds, using default"
+        );
+        default
+    })
+}
+
+/// Pure policy: no source traversal, metadata writes, sleeps, or child startup.
+/// The ordinary spawn path still enforces opt-out, locks, cooldown and breaker.
+fn catch_up_reason_at(
+    index_freshness: &serde_json::Value,
+    now: i64,
+    source_scan_interval: Duration,
+) -> Option<&'static str> {
     let flag = |key: &str| {
         index_freshness
             .get(key)
@@ -309,7 +480,18 @@ pub fn catch_up_reason(index_freshness: &serde_json::Value) -> Option<&'static s
     if pending > 0 {
         return Some("pending-sessions");
     }
-    None
+    if source_scan_interval.is_zero() {
+        return None;
+    }
+    // Missing, malformed, sentinel and future watermarks cannot prove age.
+    // Do not replace them with epoch zero and launch on every otherwise
+    // healthy read. Explicit unhealthy flags above keep their existing policy.
+    let last_scan = last_indexed_at_ms_from_freshness(index_freshness)?;
+    if last_scan <= 0 {
+        return None;
+    }
+    let elapsed_ms = u64::try_from(now.checked_sub(last_scan)?).ok()?;
+    (Duration::from_millis(elapsed_ms) >= source_scan_interval).then_some("source-scan-overdue")
 }
 
 /// Cooldown check factored out for tests.
@@ -322,14 +504,42 @@ pub fn cooldown_remaining(
     if last <= 0 {
         return None;
     }
-    let elapsed_ms = now_ms.saturating_sub(last);
-    let cooldown_ms = i64::try_from(cooldown.as_millis()).unwrap_or(i64::MAX);
+    if cooldown.is_zero() {
+        return None;
+    }
+    // A clock correction or an unusually large configured interval must not
+    // overflow while deciding whether launching another process is safe.
+    // Every Duration in milliseconds and every difference of i64 timestamps
+    // fits i128, including the addition used to round remaining seconds up.
+    let elapsed_ms = i128::from(now_ms) - i128::from(last);
+    let cooldown_ms = i128::from(cooldown.as_secs()) * 1000 + i128::from(cooldown.subsec_millis());
     if elapsed_ms >= cooldown_ms {
         None
     } else {
         let remaining_ms = cooldown_ms - elapsed_ms;
-        Some(((remaining_ms + 999) / 1000).max(1) as u64)
+        Some(u64::try_from((remaining_ms + 999) / 1000).unwrap_or(u64::MAX))
     }
+}
+
+/// The absence of index-run.lock immediately after spawn is not proof that
+/// the child exited: another read can arrive before it acquires that lock.
+/// Leave an unjudged spawn alone during its ordinary cooldown. Recognized
+/// failures still report their backoff immediately, and successful watermarks
+/// still reset the breaker during cooldown. Zero keeps its explicit no-wait
+/// meaning; this does not invent a separate liveness or PID-reuse heuristic.
+fn unjudged_spawn_cooldown(
+    state: Option<&AutoRefreshState>,
+    cooldown: Duration,
+    last_indexed_at_ms: Option<i64>,
+    now: i64,
+) -> Option<u64> {
+    let state = state?;
+    if state.failure_counted_for_spawn_ms == state.last_spawn_ms
+        || last_indexed_at_ms.is_some_and(|watermark| watermark >= state.last_spawn_ms)
+    {
+        return None;
+    }
+    cooldown_remaining(Some(state), cooldown, now)
 }
 
 /// The exact argv (after the binary) used for a detached catch-up child.
@@ -494,14 +704,63 @@ pub fn maybe_spawn_background_index_refresh(
     reason: &str,
     last_indexed_at_ms: Option<i64>,
 ) -> AutoRefreshOutcome {
+    refresh_with_watermark_reader(
+        data_dir,
+        db_path,
+        reason,
+        last_indexed_at_ms,
+        AutoRefreshPolicy::from_env(),
+        source_scan_completed_at_ms_from_db,
+    )
+}
+
+/// Check cheap admission before opening the archive. In particular, opting
+/// out must not wait for database recovery, and an active writer must not be
+/// disturbed just to discover that a second index run cannot start.
+fn refresh_with_watermark_reader(
+    data_dir: &Path,
+    db_path: &Path,
+    reason: &str,
+    last_indexed_at_ms: Option<i64>,
+    policy: AutoRefreshPolicy,
+    read_watermark: impl FnOnce(&Path) -> Option<i64>,
+) -> AutoRefreshOutcome {
+    if let Some(outcome) = refresh_admission(data_dir, reason, policy) {
+        return outcome;
+    }
+    // A successful no-op scan is still successful catch-up work. Use the
+    // canonical scan watermark to reset breaker/cooldown judgement even when
+    // no lexical publication advanced `last_indexed_at`.
+    let source_scan_completed_at_ms = read_watermark(db_path);
+    let effective_watermark = [last_indexed_at_ms, source_scan_completed_at_ms]
+        .into_iter()
+        .flatten()
+        .filter(|value| *value > 0)
+        .max();
     maybe_spawn_with_policy(
         data_dir,
         db_path,
         reason,
         false,
-        last_indexed_at_ms,
-        AutoRefreshPolicy::from_env(),
+        effective_watermark,
+        policy,
     )
+}
+
+fn refresh_admission(
+    data_dir: &Path,
+    reason: &str,
+    policy: AutoRefreshPolicy,
+) -> Option<AutoRefreshOutcome> {
+    if !policy.enabled {
+        debug!(reason, "auto-refresh disabled via CASS_AUTO_REFRESH");
+        return Some(AutoRefreshOutcome::Disabled);
+    }
+    if crate::search::asset_state::read_search_maintenance_snapshot(data_dir).active {
+        debug!(reason, "auto-refresh skipped: index run already active");
+        return Some(AutoRefreshOutcome::IndexRunActive);
+    }
+    None
 }
 
 /// Same as [`maybe_spawn_background_index_refresh`] but for a *full* pass
@@ -531,13 +790,8 @@ pub fn maybe_spawn_with_policy(
     last_indexed_at_ms: Option<i64>,
     policy: AutoRefreshPolicy,
 ) -> AutoRefreshOutcome {
-    if !policy.enabled {
-        debug!(reason, "auto-refresh disabled via CASS_AUTO_REFRESH");
-        return AutoRefreshOutcome::Disabled;
-    }
-    if crate::search::asset_state::read_search_maintenance_snapshot(data_dir).active {
-        debug!(reason, "auto-refresh skipped: index run already active");
-        return AutoRefreshOutcome::IndexRunActive;
+    if let Some(outcome) = refresh_admission(data_dir, reason, policy) {
+        return outcome;
     }
     if let Err(error) = std::fs::create_dir_all(data_dir) {
         return AutoRefreshOutcome::SpawnFailed {
@@ -563,12 +817,30 @@ pub fn maybe_spawn_with_policy(
         debug!(reason, "auto-refresh skipped: another process is spawning");
         return AutoRefreshOutcome::GuardBusy;
     }
+    // A foreground indexer can acquire ownership after the first snapshot.
+    // Recheck while serialized with other spawners; the child's own writer
+    // lease remains the final authority if ownership changes again later.
+    if let Some(outcome) = refresh_admission(data_dir, reason, policy) {
+        let _ = FileExt::unlock(&guard);
+        return outcome;
+    }
 
     let now = now_ms();
     let mut state = load_state(data_dir);
+    if let Some(remaining_secs) =
+        unjudged_spawn_cooldown(state.as_ref(), policy.cooldown, last_indexed_at_ms, now)
+    {
+        debug!(
+            reason,
+            remaining_secs, "auto-refresh skipped: previous spawn is still in cooldown"
+        );
+        let _ = FileExt::unlock(&guard);
+        return AutoRefreshOutcome::Cooldown { remaining_secs };
+    }
     if let Some(current) = state.as_mut() {
         let before = current.clone();
-        let verdict = judge_previous_spawn(current, last_indexed_at_ms, now, &log_path(data_dir));
+        let verdict =
+            spawn_breaker_verdict(current, full, last_indexed_at_ms, now, &log_path(data_dir));
         if *current != before
             && let Err(error) = save_state(data_dir, current)
         {
@@ -713,6 +985,15 @@ pub struct BackgroundPriority {
     pub ionice_class: u32,
     pub ionice_applied: bool,
 }
+
+#[cfg(test)]
+mod gh514_tests;
+
+#[cfg(test)]
+mod breaker_policy_tests;
+
+#[cfg(test)]
+mod admission_policy_tests;
 
 #[cfg(test)]
 mod tests {
@@ -978,6 +1259,223 @@ mod tests {
     }
 
     #[test]
+    fn gh514_healthy_generation_requests_an_overdue_source_scan() {
+        let last_scan = 1_800_000_000_000_i64;
+        let freshness = serde_json::json!({
+            "exists": true, "rebuilding": false, "partial": false,
+            "stale": false, "pending_sessions": 0, "last_indexed_at": last_scan,
+        });
+        let before = freshness.clone();
+        let interval = Duration::from_secs(DEFAULT_SOURCE_SCAN_SECS);
+        for (age, expected) in [
+            (0, None),
+            (299_999, None),
+            (300_000, Some("source-scan-overdue")),
+            (29 * 60_000, Some("source-scan-overdue")),
+        ] {
+            assert_eq!(
+                catch_up_reason_at(&freshness, last_scan + age, interval),
+                expected
+            );
+        }
+        // Source-scan admission is not a claim that the indexed generation
+        // became unhealthy, nor a guess that any source has actually changed.
+        assert_eq!(freshness, before);
+    }
+
+    #[test]
+    fn gh514_successful_scan_resets_age_even_without_known_pending_sessions() {
+        let now = 1_800_000_000_000_i64;
+        let interval = Duration::from_secs(DEFAULT_SOURCE_SCAN_SECS);
+        let mut freshness = serde_json::json!({
+            "exists": true, "stale": false, "last_indexed_at": now - 300_000,
+        });
+        assert_eq!(
+            catch_up_reason_at(&freshness, now, interval),
+            Some("source-scan-overdue")
+        );
+        // Foreground, scheduled and no-op successful scans all publish the
+        // same watermark; there is no separate auto-refresh-only age clock.
+        freshness["last_indexed_at"] = serde_json::json!(now);
+        assert_eq!(
+            catch_up_reason_at(&freshness, now + 299_999, interval),
+            None
+        );
+        assert_eq!(
+            catch_up_reason_at(&freshness, now + 300_000, interval),
+            Some("source-scan-overdue")
+        );
+    }
+
+    #[test]
+    fn gh514_scan_age_accepts_real_receipt_timestamps_and_millisecond_boundaries() {
+        let stamp = "2026-10-10T00:00:00.125Z";
+        let last_scan = chrono::DateTime::parse_from_rfc3339(stamp)
+            .unwrap()
+            .timestamp_millis();
+        let interval = Duration::from_secs(60);
+        for value in [serde_json::json!(stamp), serde_json::json!(last_scan)] {
+            let freshness = serde_json::json!({"exists": true, "last_indexed_at": value});
+            assert_eq!(
+                catch_up_reason_at(&freshness, last_scan + 59_999, interval),
+                None
+            );
+            assert_eq!(
+                catch_up_reason_at(&freshness, last_scan + 60_000, interval),
+                Some("source-scan-overdue")
+            );
+        }
+    }
+
+    #[test]
+    fn gh514_scan_cadence_never_overrides_rebuild_or_existing_repair_reasons() {
+        let now = 1_800_000_000_000_i64;
+        let interval = Duration::from_secs(1);
+        for (flags, expected) in [
+            (serde_json::json!({}), None),
+            (serde_json::json!({"exists": false}), None),
+            (
+                serde_json::json!({"exists": true, "rebuilding": true}),
+                None,
+            ),
+            (
+                serde_json::json!({"exists": true, "partial": true, "stale": true}),
+                Some("index-partial"),
+            ),
+            (
+                serde_json::json!({"exists": true, "stale": true, "pending_sessions": 1}),
+                Some("index-stale"),
+            ),
+            (
+                serde_json::json!({"exists": true, "pending_sessions": 1}),
+                Some("pending-sessions"),
+            ),
+        ] {
+            let mut freshness = flags;
+            freshness["last_indexed_at"] = serde_json::json!(now - 300_000);
+            assert_eq!(catch_up_reason_at(&freshness, now, interval), expected);
+            // Zero disables age-based scans, not stale/partial/pending repair.
+            assert_eq!(
+                catch_up_reason_at(&freshness, now, Duration::ZERO),
+                expected
+            );
+        }
+        let healthy = serde_json::json!({"exists": true, "last_indexed_at": 1});
+        assert_eq!(catch_up_reason_at(&healthy, now, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn gh514_unknown_or_future_scan_times_do_not_become_epoch_zero() {
+        let now = 1_800_000_000_000_i64;
+        let interval = Duration::from_secs(DEFAULT_SOURCE_SCAN_SECS);
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("not-a-timestamp"),
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(i64::MIN),
+            serde_json::json!(i64::MAX),
+            serde_json::json!(u64::MAX),
+            serde_json::json!(now + 1),
+            serde_json::json!(false),
+        ] {
+            let freshness = serde_json::json!({"exists": true, "last_indexed_at": value});
+            assert_eq!(
+                catch_up_reason_at(&freshness, now, interval),
+                None,
+                "{freshness}"
+            );
+        }
+        let freshness = serde_json::json!({"exists": true, "last_indexed_at": 1});
+        assert_eq!(catch_up_reason_at(&freshness, i64::MIN, interval), None);
+        assert_eq!(
+            catch_up_reason_at(&freshness, i64::MAX, Duration::from_secs(u64::MAX)),
+            None
+        );
+    }
+
+    #[test]
+    fn gh514_source_scan_interval_is_separate_from_spawn_cooldown() {
+        assert_eq!(
+            parse_source_scan_interval(" 60 "),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(parse_source_scan_interval("0"), Some(Duration::ZERO));
+        assert_eq!(
+            parse_source_scan_interval(&u64::MAX.to_string()),
+            Some(Duration::from_secs(u64::MAX))
+        );
+        for invalid in ["", "-1", "1.5", "false", "18446744073709551616"] {
+            assert_eq!(parse_source_scan_interval(invalid), None);
+        }
+        let now = 1_800_000_000_000_i64;
+        let freshness = serde_json::json!({"exists": true, "last_indexed_at": now - 60_000});
+        assert_eq!(
+            catch_up_reason_at(&freshness, now, Duration::from_secs(60)),
+            Some("source-scan-overdue")
+        );
+        let recent_spawn = AutoRefreshState {
+            last_spawn_ms: now - 1000,
+            ..AutoRefreshState::default()
+        };
+        assert_eq!(
+            cooldown_remaining(
+                Some(&recent_spawn),
+                AutoRefreshPolicy::default().cooldown,
+                now
+            ),
+            Some(299)
+        );
+    }
+
+    #[test]
+    fn gh514_overdue_source_scan_keeps_global_opt_out_and_failed_run_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("disabled");
+        let now = now_ms();
+        let freshness = serde_json::json!({"exists": true, "last_indexed_at": now - 600_000});
+        let reason = catch_up_reason_at(&freshness, now, Duration::from_secs(300)).unwrap();
+        let disabled = maybe_spawn_with_policy(
+            &missing,
+            &missing.join("agent_search.db"),
+            reason,
+            false,
+            last_indexed_at_ms_from_freshness(&freshness),
+            AutoRefreshPolicy {
+                enabled: false,
+                ..AutoRefreshPolicy::default()
+            },
+        );
+        assert_eq!(disabled, AutoRefreshOutcome::Disabled);
+        assert!(!missing.exists());
+
+        let prior = AutoRefreshState {
+            last_spawn_ms: now - 3_600_000,
+            last_pid: 4242,
+            last_reason: reason.into(),
+            ..AutoRefreshState::default()
+        };
+        save_state(dir.path(), &prior).unwrap();
+        let blocked = maybe_spawn_with_policy(
+            dir.path(),
+            &dir.path().join("agent_search.db"),
+            reason,
+            false,
+            Some(prior.last_spawn_ms - 1),
+            AutoRefreshPolicy::default(),
+        );
+        assert!(matches!(
+            blocked,
+            AutoRefreshOutcome::BackedOff {
+                consecutive_failures: 1,
+                ..
+            }
+        ));
+        assert_eq!(load_state(dir.path()).unwrap().last_pid, 4242);
+        assert!(!log_path(dir.path()).exists(), "no child was started");
+    }
+
+    #[test]
     fn cooldown_remaining_rounds_up_and_expires() {
         let cooldown = Duration::from_secs(300);
         assert_eq!(cooldown_remaining(None, cooldown, 1_000_000), None);
@@ -1080,6 +1578,187 @@ mod tests {
             !log_path(data_dir).exists(),
             "no child must have been spawned"
         );
+    }
+
+    #[test]
+    fn launch_cooldown_expires_without_erasing_failure_or_success_evidence() {
+        let mut state = AutoRefreshState {
+            last_spawn_ms: 1_000_000,
+            last_pid: 42,
+            last_reason: "source-scan-overdue".into(),
+            ..AutoRefreshState::default()
+        };
+        let cooldown = Duration::from_secs(300);
+        for watermark in [None, Some(999_999)] {
+            assert_eq!(
+                unjudged_spawn_cooldown(Some(&state), cooldown, watermark, 1_000_000),
+                Some(300)
+            );
+            assert_eq!(
+                unjudged_spawn_cooldown(Some(&state), cooldown, watermark, 1_299_999),
+                Some(1)
+            );
+            assert_eq!(
+                unjudged_spawn_cooldown(Some(&state), cooldown, watermark, 1_300_000),
+                None
+            );
+        }
+        assert_eq!(
+            unjudged_spawn_cooldown(Some(&state), cooldown, Some(1_000_000), 1_000_000),
+            None,
+            "a completed catch-up must reset an earlier failure streak immediately"
+        );
+        assert_eq!(
+            unjudged_spawn_cooldown(Some(&state), Duration::ZERO, Some(1), 1_000_000),
+            None
+        );
+        state.failure_counted_for_spawn_ms = state.last_spawn_ms;
+        state.consecutive_failures = 1;
+        assert_eq!(
+            unjudged_spawn_cooldown(Some(&state), cooldown, Some(1), 1_000_000),
+            None,
+            "a known failure must not be hidden behind launch grace"
+        );
+    }
+
+    #[test]
+    fn recent_unjudged_spawn_is_not_failed_by_a_burst_of_reads_before_its_index_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AutoRefreshState {
+            last_spawn_ms: now_ms(),
+            last_pid: 4242,
+            last_reason: "source-scan-overdue".into(),
+            ..AutoRefreshState::default()
+        };
+        save_state(dir.path(), &state).unwrap();
+        let state_before = std::fs::read(state_path(dir.path())).unwrap();
+        std::fs::write(
+            log_path(dir.path()),
+            b"child has not acquired index-run.lock yet",
+        )
+        .unwrap();
+        let log_before = std::fs::read(log_path(dir.path())).unwrap();
+        // The decisive regression: a real freshness watermark is still older
+        // than this spawn. Older tests used None, which never judged a failure.
+        // File locks serialize parallel callers; none may inflate the streak,
+        // truncate the child's log, or start another process in this window.
+        std::thread::scope(|scope| {
+            let mut threads = Vec::new();
+            for _ in 0..8 {
+                threads.push(scope.spawn(|| {
+                    maybe_spawn_with_policy(
+                        dir.path(),
+                        &dir.path().join("agent_search.db"),
+                        "source-scan-overdue",
+                        false,
+                        Some(state.last_spawn_ms - 300_000),
+                        AutoRefreshPolicy::default(),
+                    )
+                }));
+            }
+            for thread in threads {
+                let outcome = thread.join().unwrap();
+                assert!(
+                    matches!(
+                        outcome,
+                        AutoRefreshOutcome::Cooldown { .. } | AutoRefreshOutcome::GuardBusy
+                    ),
+                    "{outcome:?}"
+                );
+            }
+        });
+        assert_eq!(load_state(dir.path()).unwrap(), state);
+        assert_eq!(std::fs::read(state_path(dir.path())).unwrap(), state_before);
+        assert_eq!(std::fs::read(log_path(dir.path())).unwrap(), log_before);
+    }
+
+    #[test]
+    fn successful_watermark_resets_a_prior_streak_even_inside_launch_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawn = now_ms();
+        save_state(
+            dir.path(),
+            &AutoRefreshState {
+                last_spawn_ms: spawn,
+                last_pid: 42,
+                last_reason: "source-scan-overdue".into(),
+                consecutive_failures: 2,
+                failure_counted_for_spawn_ms: spawn - 86_400_000,
+                last_failure_detected_ms: spawn - 86_000_000,
+                last_failure: Some("prior unsuccessful catch-up".into()),
+            },
+        )
+        .unwrap();
+        let outcome = maybe_spawn_with_policy(
+            dir.path(),
+            &dir.path().join("agent_search.db"),
+            "source-scan-overdue",
+            false,
+            Some(spawn),
+            AutoRefreshPolicy::default(),
+        );
+        assert!(matches!(outcome, AutoRefreshOutcome::Cooldown { .. }));
+        let state = load_state(dir.path()).unwrap();
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.last_failure_detected_ms, 0);
+        assert!(state.last_failure.is_none());
+        assert_eq!(state.last_pid, 42);
+        assert!(!log_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn recognized_failures_keep_backoff_even_with_a_long_launch_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        let state = AutoRefreshState {
+            last_spawn_ms: now - 1000,
+            last_pid: 42,
+            last_reason: "source-scan-overdue".into(),
+            consecutive_failures: 2,
+            failure_counted_for_spawn_ms: now - 1000,
+            last_failure_detected_ms: now,
+            last_failure: Some("recognized failure".into()),
+        };
+        save_state(dir.path(), &state).unwrap();
+        let outcome = maybe_spawn_with_policy(
+            dir.path(),
+            &dir.path().join("agent_search.db"),
+            "source-scan-overdue",
+            false,
+            Some(now - 2000),
+            AutoRefreshPolicy {
+                enabled: true,
+                cooldown: Duration::from_secs(86_400),
+            },
+        );
+        assert!(matches!(
+            outcome,
+            AutoRefreshOutcome::BackedOff {
+                consecutive_failures: 2,
+                ..
+            }
+        ));
+        assert_eq!(load_state(dir.path()).unwrap(), state);
+        assert!(!log_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn cooldown_handles_clock_rollback_and_extreme_intervals_without_overflow() {
+        let state = AutoRefreshState {
+            last_spawn_ms: 1,
+            ..AutoRefreshState::default()
+        };
+        let cooldown = Duration::from_secs(300);
+        assert_eq!(cooldown_remaining(Some(&state), cooldown, 0), Some(301));
+        assert_eq!(
+            cooldown_remaining(Some(&state), Duration::from_secs(u64::MAX), i64::MIN),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            cooldown_remaining(Some(&state), Duration::ZERO, i64::MIN),
+            None
+        );
+        assert_eq!(cooldown_remaining(Some(&state), cooldown, i64::MAX), None);
     }
 
     #[test]

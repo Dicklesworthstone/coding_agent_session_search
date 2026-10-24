@@ -5,12 +5,15 @@
 //! Keep the optimized scorer's width/WAL admission rules unchanged; this lane
 //! handles its unsupported cases rather than falling through to that shortcut.
 
-use super::{FsSearchFilter, FsVectorIndex, Selection, SemanticIndexArtifact, VectorSearchResult,
-    Winner, parse_semantic_doc_id};
+use super::{
+    FsSearchFilter, FsVectorIndex, Selection, SemanticIndexArtifact, VectorSearchResult, Winner,
+    parse_semantic_doc_id,
+};
 use anyhow::{Context, Result, ensure};
+use frankensearch::index::{
+    Quantization, dot_product_f16_bytes_f32, dot_product_f32_bytes_f32, dot_product_f32_f32,
+};
 use rayon::prelude::*;
-use frankensearch::index::{Quantization, dot_product_f16_bytes_f32,
-    dot_product_f32_bytes_f32, dot_product_f32_f32};
 
 #[cfg(test)]
 mod tests;
@@ -32,15 +35,21 @@ impl<'a> ShadowIds<'a> {
 
     fn with_budget(index: &'a FsVectorIndex, budget: usize) -> Result<Self> {
         let count = index.wal_record_count();
-        let bytes = count.checked_mul(std::mem::size_of::<&str>())
+        let bytes = count
+            .checked_mul(std::mem::size_of::<&str>())
             .context("retained semantic WAL shadow-reference size overflow")?;
-        ensure!(bytes <= budget,
-            "retained semantic WAL requires {bytes} bytes of shadow references, exceeding the {budget}-byte query budget; complete 'cass index --semantic' to compact the retained delta, then retry");
+        ensure!(
+            bytes <= budget,
+            "retained semantic WAL requires {bytes} bytes of shadow references, exceeding the {budget}-byte query budget; complete 'cass index --semantic' to compact the retained delta, then retry"
+        );
         let mut ids = Vec::new();
         ids.try_reserve_exact(count)
             .context("cannot reserve bounded retained semantic WAL shadow references")?;
         ids.extend(index.wal_records().map(|(id, _)| id));
-        ensure!(ids.len() == count, "retained semantic WAL changed during admission");
+        ensure!(
+            ids.len() == count,
+            "retained semantic WAL changed during admission"
+        );
         ids.sort_unstable();
         ids.dedup();
         Ok(Self { ids })
@@ -71,22 +80,31 @@ impl RowScorer {
             return Ok(index.dot_query_at(row, query)?);
         }
         let vector = index.vector_at_f32(row)?;
-        ensure!(vector.len() == query.len(), "retained semantic row dimension mismatch");
-        ensure!(vector.iter().all(|value| value.is_finite()),
-            "retained semantic row contains a non-finite vector component");
+        ensure!(
+            vector.len() == query.len(),
+            "retained semantic row dimension mismatch"
+        );
+        ensure!(
+            vector.iter().all(|value| value.is_finite()),
+            "retained semantic row contains a non-finite vector component"
+        );
         let width = match index.quantization() {
             Quantization::F16 => 2,
             Quantization::F32 => 4,
         };
-        let bytes = vector.len().checked_mul(width)
+        let bytes = vector
+            .len()
+            .checked_mul(width)
             .context("retained semantic row byte size overflow")?;
         self.wire.clear();
-        self.wire.try_reserve(bytes)
+        self.wire
+            .try_reserve(bytes)
             .context("cannot reserve retained semantic row scoring scratch")?;
         match index.quantization() {
             Quantization::F16 => {
                 for value in vector {
-                    self.wire.extend_from_slice(&half::f16::from_f32(value).to_le_bytes());
+                    self.wire
+                        .extend_from_slice(&half::f16::from_f32(value).to_le_bytes());
                 }
                 Ok(dot_product_f16_bytes_f32(&self.wire, query)?)
             }
@@ -118,8 +136,7 @@ fn scan_range(
             continue;
         }
         let doc_id = index.doc_id_at(row)?;
-        if shadowed.contains(doc_id)
-            || filter.is_some_and(|filter| !filter.matches(doc_id, None)) {
+        if shadowed.contains(doc_id) || filter.is_some_and(|filter| !filter.matches(doc_id, None)) {
             continue;
         }
         let identity = parse_semantic_doc_id(doc_id)
@@ -153,12 +170,16 @@ pub(super) fn collect(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    ensure!(embedding.iter().all(|value| value.is_finite()),
-        "exact semantic query must be finite");
+    ensure!(
+        embedding.iter().all(|value| value.is_finite()),
+        "exact semantic query must be finite"
+    );
     // Validate the complete cohort before any filter invocation or scoring.
     for artifact in artifacts {
-        ensure!(artifact.index().dimension() == embedding.len(),
-            "exact semantic query dimension mismatch");
+        ensure!(
+            artifact.index().dimension() == embedding.len(),
+            "exact semantic query dimension mismatch"
+        );
     }
     let mut selection = Selection::new(limit);
     let mut max_workers = 1usize;
@@ -177,15 +198,25 @@ pub(super) fn collect(
         };
         max_workers = max_workers.max(workers);
         let partials: Vec<Result<(Vec<Winner>, usize)>> = if workers == 1 {
-            vec![scan_range(index, embedding, filter, &shadowed, 0..rows, limit)]
+            vec![scan_range(
+                index,
+                embedding,
+                filter,
+                &shadowed,
+                0..rows,
+                limit,
+            )]
         } else {
-            (0..workers).into_par_iter().map(|worker| {
-                let width = rows / workers;
-                let extra = rows % workers;
-                let start = worker * width + worker.min(extra);
-                let end = start + width + usize::from(worker < extra);
-                scan_range(index, embedding, filter, &shadowed, start..end, limit)
-            }).collect()
+            (0..workers)
+                .into_par_iter()
+                .map(|worker| {
+                    let width = rows / workers;
+                    let extra = rows % workers;
+                    let start = worker * width + worker.min(extra);
+                    let end = start + width + usize::from(worker < extra);
+                    scan_range(index, embedding, filter, &shadowed, start..end, limit)
+                })
+                .collect()
         };
         // Indexed parallel collection is in physical-range order, regardless
         // of completion order. Tied chunks keep the same winner as serial scan.
@@ -212,10 +243,22 @@ pub(super) fn collect(
             wal_scored = wal_scored.saturating_add(1);
         }
     }
-    let hits: Vec<_> = selection.finish().into_iter().map(|hit| VectorSearchResult {
-        message_id: hit.message_id, chunk_idx: hit.chunk_idx, score: hit.score,
-    }).collect();
-    tracing::debug!(shard_count = artifacts.len(), main_scored, wal_scored, max_workers,
-        returned = hits.len(), "complete retained-WAL exact message selection");
+    let hits: Vec<_> = selection
+        .finish()
+        .into_iter()
+        .map(|hit| VectorSearchResult {
+            message_id: hit.message_id,
+            chunk_idx: hit.chunk_idx,
+            score: hit.score,
+        })
+        .collect();
+    tracing::debug!(
+        shard_count = artifacts.len(),
+        main_scored,
+        wal_scored,
+        max_workers,
+        returned = hits.len(),
+        "complete retained-WAL exact message selection"
+    );
     Ok(hits)
 }

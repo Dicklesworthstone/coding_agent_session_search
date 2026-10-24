@@ -1,5 +1,10 @@
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel as mpsc;
+
+#[path = "query/retry_budget.rs"]
+mod retry_budget;
+pub use retry_budget::LEXICAL_RETRY_QUERY_FUEL_EXHAUSTED;
+
 use frankensearch::quill::query::{
     CassQueryFilters as FsCassQueryFilters, CassSourceFilter as FsCassSourceFilter,
 };
@@ -963,6 +968,7 @@ impl SemanticTierMode {
 mod ann_shards;
 #[cfg(test)]
 mod ann_shards_integration;
+mod message_stream;
 mod message_topk;
 #[cfg(test)]
 mod message_topk_integration;
@@ -2208,20 +2214,53 @@ fn execute_query_with_bounded_exact_count(
     limit: usize,
     offset: usize,
 ) -> Result<CassLexicalSearchResult> {
-    let page = crate::search::quill_bridge::search_paginated(reader, query, limit, offset, false)?;
+    bounded_exact_count_page(limit, offset, exact_total_count_max_docs(), |exact_count| {
+        crate::search::quill_bridge::search_paginated(reader, query, limit, offset, exact_count)
+    })
+}
+
+/// The policy of [`execute_query_with_bounded_exact_count`], with the engine
+/// call passed in as `run(exact_count)`.
+///
+/// The ranked page is the result; the exact total is an optional extra. The
+/// counting pass visits every match (the engine's block-max pruning is off for
+/// it), so on a fragmented or match-heavy index it can exhaust the query fuel
+/// the ranked page fit in. That refusal costs only the total, which is then
+/// reported as unknown exactly as on a large index (GH #518). Every other
+/// failure of the counting pass, cancellation included, still fails the query.
+fn bounded_exact_count_page(
+    limit: usize,
+    offset: usize,
+    exact_count_max_docs: usize,
+    mut run: impl FnMut(bool) -> Result<crate::search::quill_bridge::QuillLexicalPage>,
+) -> Result<CassLexicalSearchResult> {
+    let page = run(false)?;
     // `limit == 0` must not read as saturated: an empty page would equal an
     // empty limit and trigger the expensive exact-count pass for a caller that
     // asked for no rows at all.
     let page_saturated = limit > 0 && page.hits.len() == limit;
     let index_doc_count = page.doc_count;
     let total_count = if page_saturated {
-        if should_collect_exact_total_count(index_doc_count, exact_total_count_max_docs()) {
-            crate::search::quill_bridge::search_paginated(reader, query, limit, offset, true)?
-                .total_count
+        if should_collect_exact_total_count(index_doc_count, exact_count_max_docs) {
+            match run(true) {
+                Ok(counted) => counted.total_count,
+                Err(error) if crate::search::quill_bridge::is_query_fuel_exhausted(&error) => {
+                    tracing::warn!(
+                        index_doc_count,
+                        limit,
+                        offset,
+                        error = %format_args!("{error:#}"),
+                        "exact lexical count ran out of query fuel; keeping the ranked page \
+                         and reporting its total as unknown"
+                    );
+                    None
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             tracing::debug!(
                 index_doc_count,
-                exact_count_max_docs = exact_total_count_max_docs(),
+                exact_count_max_docs,
                 limit,
                 offset,
                 "skipping exact lexical count on large saturated result page"
@@ -3472,6 +3511,11 @@ pub const WILDCARD_FALLBACK_SKIPPED_DISABLED: &str = "automatic_retry_disabled";
 /// longer than the automatic retry accepts.
 pub const WILDCARD_FALLBACK_SKIPPED_LONG_TERM: &str = "long_query_term";
 
+/// `_meta.wildcard_fallback_skipped` value when the automatic retry ran out of
+/// Quill query fuel; the plain query's hits are returned
+/// (coding_agent_session_search-7hvlg).
+pub const WILDCARD_FALLBACK_SKIPPED_QUERY_FUEL_EXHAUSTED: &str = "query_fuel_exhausted";
+
 #[derive(Debug, Clone, Copy)]
 pub struct SearchClientOptions {
     pub enable_reload: bool,
@@ -4667,6 +4711,8 @@ impl SearchClient {
         offset: usize,
         field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
+        // This is per-search diagnostics, never a sticky property of a reader.
+        self.record_lexical_degrade_reason(None);
         // NFC-normalize early so every downstream consumer (Tantivy query
         // builder, sanitizer, FTS5 fallback) sees consistent Unicode form
         // matching the NFC-indexed content.
@@ -4759,10 +4805,10 @@ impl SearchClient {
             target_hits.saturating_mul(3)
         };
 
-        // Tantivy is the primary high-performance engine.
+        // Quill is the primary high-performance engine.
         if let Some((reader, fields)) = self.reader.get() {
             tracing::info!(
-                backend = "tantivy",
+                backend = "quill",
                 query = sanitized,
                 limit = initial_fetch_limit,
                 offset = 0,
@@ -4792,6 +4838,7 @@ impl SearchClient {
                 let needs_retry = deduped_len < target_hits
                     && initial_hit_count == initial_fetch_limit
                     && initial_fetch_limit < fallback_fetch_limit;
+                let mut retry_budget_exhausted = false;
 
                 if needs_retry {
                     tracing::debug!(
@@ -4803,7 +4850,7 @@ impl SearchClient {
                         session_path_filter_active,
                         "retrying lexical fetch due to dedup or session-path shortfall"
                     );
-                    let (retry_hits, retry_total_count) = self.search_tantivy(
+                    let attempt = self.search_tantivy(
                         &reader,
                         &fields,
                         query,
@@ -4812,12 +4859,17 @@ impl SearchClient {
                         fallback_fetch_limit,
                         0,
                         field_mask,
-                    )?;
-                    if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                        *tc = retry_total_count;
-                    }
-                    if !retry_hits.is_empty() {
-                        (deduped_len, paged_hits) = page_hits(retry_hits);
+                    );
+                    match self.settle_lexical_retry(attempt, paged_hits.len())? {
+                        Some((retry_hits, retry_total_count)) => {
+                            if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
+                                *tc = retry_total_count;
+                            }
+                            if !retry_hits.is_empty() {
+                                (deduped_len, paged_hits) = page_hits(retry_hits);
+                            }
+                        }
+                        None => retry_budget_exhausted = true,
                     }
                 }
 
@@ -4829,19 +4881,20 @@ impl SearchClient {
                     "lexical fetch complete"
                 );
 
-                if can_use_cache && offset == 0 {
+                // Never promote a budget-shortened page into a complete cache hit.
+                if can_use_cache && offset == 0 && !retry_budget_exhausted {
                     self.put_cache(query, &filters, field_mask, cache_epoch, &paged_hits);
                 }
                 return Ok(paged_hits);
             }
             tracing::debug!(
                 query = sanitized,
-                "tantivy returned zero hits; skipping sqlite fallback because tantivy is authoritative when available"
+                "quill returned zero hits; skipping sqlite fallback because quill is authoritative when available"
             );
             return Ok(Vec::new());
         } else if let Some(readers) = self.federated_readers() {
             tracing::info!(
-                backend = "tantivy-federated",
+                backend = "quill-federated",
                 query = sanitized,
                 limit = initial_fetch_limit,
                 offset = 0,
@@ -4875,6 +4928,7 @@ impl SearchClient {
                 let needs_retry = deduped_len < target_hits
                     && federated_initial_capacity_reached
                     && initial_fetch_limit < fallback_fetch_limit;
+                let mut retry_budget_exhausted = false;
 
                 if needs_retry {
                     tracing::debug!(
@@ -4887,19 +4941,24 @@ impl SearchClient {
                         session_path_filter_active,
                         "retrying federated lexical fetch due to dedup or session-path shortfall"
                     );
-                    let (retry_hits, retry_total_count) = self.search_tantivy_federated(
+                    let attempt = self.search_tantivy_federated(
                         readers.as_ref(),
                         query,
                         &sanitized,
                         filters.clone(),
                         fallback_fetch_limit,
                         field_mask,
-                    )?;
-                    if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                        *tc = retry_total_count;
-                    }
-                    if !retry_hits.is_empty() {
-                        (deduped_len, paged_hits) = page_hits(retry_hits);
+                    );
+                    match self.settle_lexical_retry(attempt, paged_hits.len())? {
+                        Some((retry_hits, retry_total_count)) => {
+                            if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
+                                *tc = retry_total_count;
+                            }
+                            if !retry_hits.is_empty() {
+                                (deduped_len, paged_hits) = page_hits(retry_hits);
+                            }
+                        }
+                        None => retry_budget_exhausted = true,
                     }
                 }
 
@@ -4912,7 +4971,7 @@ impl SearchClient {
                     "federated lexical fetch complete"
                 );
 
-                if can_use_cache && offset == 0 {
+                if can_use_cache && offset == 0 && !retry_budget_exhausted {
                     self.put_cache(query, &filters, field_mask, cache_epoch, &paged_hits);
                 }
                 return Ok(paged_hits);
@@ -4920,7 +4979,7 @@ impl SearchClient {
             tracing::debug!(
                 query = sanitized,
                 shards = readers.len(),
-                "federated tantivy returned zero hits; skipping sqlite fallback because tantivy is authoritative when available"
+                "federated quill returned zero hits; skipping sqlite fallback because quill is authoritative when available"
             );
             return Ok(Vec::new());
         }
@@ -4942,7 +5001,8 @@ impl SearchClient {
 
         if has_sqlite_backend {
             tracing::info!(
-                backend = "sqlite-fts5",
+                // This lane may use FTS5 or a source-table scan.
+                backend = "frankensqlite",
                 query = sanitized,
                 limit = fallback_fetch_limit,
                 offset = 0,
@@ -5438,6 +5498,25 @@ impl SearchClient {
         fetch_limit: usize,
         fs_filter: Option<&dyn FsSearchFilter>,
     ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
+        Self::search_exact_semantic_indexes_with_refinement(
+            context,
+            embedding,
+            fetch_limit,
+            fs_filter,
+            true,
+        )
+    }
+
+    // Keep the incumbent for unsupported no-WAL widths and same-invocation
+    // comparisons. The pinned backend repairs WAL-shadowed raw windows itself;
+    // a retained delta alone is not a reason to bypass its proven first window.
+    fn search_exact_semantic_indexes_with_refinement(
+        context: &SemanticCandidateContext,
+        embedding: &[f32],
+        fetch_limit: usize,
+        fs_filter: Option<&dyn FsSearchFilter>,
+        streaming: bool,
+    ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
         let (initial, retry) = Self::search_exact_semantic_indexes_initial_window(
             context,
             embedding,
@@ -5453,6 +5532,23 @@ impl SearchClient {
                 .saturating_add(artifact.index().wal_record_count())
         });
         let return_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
+        if streaming
+            && let Some(hits) = message_stream::try_collect_retained_messages(
+                &context.artifacts,
+                embedding,
+                return_limit,
+                fs_filter,
+            )?
+        {
+            let has_more_candidates = hits.len() >= return_limit && return_limit < record_count;
+            return Ok((
+                hits,
+                SemanticCandidateRetryState {
+                    has_more_candidates,
+                    exact_window_may_omit_competitor: false,
+                },
+            ));
+        }
         let mut refills_left = message_topk::MAX_EXACT_MESSAGE_REFILLS;
         let mut rounds = 0usize;
         let mut best_by_message = HashMap::<u64, VectorSearchResult>::new();
@@ -7360,6 +7456,23 @@ impl SearchClient {
             .ok()
             .and_then(|guard| *guard);
 
+        if self.lexical_degrade_reason() == Some(LEXICAL_RETRY_QUERY_FUEL_EXHAUSTED) {
+            // A larger native fetch already spent its budget. Do not turn its
+            // retained short page into another automatic dictionary expansion.
+            self.record_wildcard_fallback_skip(Some(
+                WILDCARD_FALLBACK_SKIPPED_QUERY_FUEL_EXHAUSTED,
+            ));
+            return Ok(SearchResult {
+                hits,
+                wildcard_fallback: false,
+                cache_stats: baseline_stats,
+                suggestions: Vec::new(),
+                ann_stats: None,
+                ann_unavailable_reason: None,
+                total_count: None,
+            });
+        }
+
         // Check if we should try wildcard fallback
         let query_has_wildcards = query.contains('*');
         let has_boolean_or_phrase = fs_cass_has_boolean_operators(query);
@@ -7449,7 +7562,47 @@ impl SearchClient {
         );
 
         let mut fallback_hits =
-            self.search(&wildcard_query, filters.clone(), limit, offset, field_mask)?;
+            match self.search(&wildcard_query, filters.clone(), limit, offset, field_mask) {
+                Ok(fallback_hits) => fallback_hits,
+                // The retry only refines a search that already succeeded. A
+                // `*term*` dictionary walk can exhaust the query fuel the plain
+                // query fit in (GH #518); that refusal must not discard the
+                // plain query's hits (coding_agent_session_search-7hvlg).
+                // Other failures still fail the search.
+                Err(error) if crate::search::quill_bridge::is_query_fuel_exhausted(&error) => {
+                    tracing::warn!(
+                        original_query = query,
+                        wildcard_query,
+                        original_count = hits.len(),
+                        error = %format_args!("{error:#}"),
+                        "wildcard_fallback ran out of query fuel; returning the original results"
+                    );
+                    self.record_wildcard_fallback_skip(Some(
+                        WILDCARD_FALLBACK_SKIPPED_QUERY_FUEL_EXHAUSTED,
+                    ));
+                    // The original page, not the unsuccessful wildcard request,
+                    // owns the diagnostics exposed with this response.
+                    self.record_lexical_degrade_reason(None);
+                    if let Ok(mut total) = self.last_tantivy_total_count.lock() {
+                        *total = tantivy_total;
+                    }
+                    let suggestions = if hits.is_empty() {
+                        self.generate_suggestions(query, &filters)
+                    } else {
+                        Vec::new()
+                    };
+                    return Ok(SearchResult {
+                        hits,
+                        wildcard_fallback: false,
+                        cache_stats: baseline_stats,
+                        suggestions,
+                        ann_stats: None,
+                        ann_unavailable_reason: None,
+                        total_count: tantivy_total,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
         let fallback_stats = self.cache_stats();
         // Re-capture total_count after wildcard search (may have changed)
         let fallback_tantivy_total = self
@@ -7480,7 +7633,12 @@ impl SearchClient {
                 total_count: fallback_tantivy_total,
             })
         } else {
-            // Keep original results even if sparse
+            // Keep original results even if sparse. A shorter wildcard page
+            // must not leave its retry-refusal metadata on the selected page.
+            self.record_lexical_degrade_reason(None);
+            if let Ok(mut total) = self.last_tantivy_total_count.lock() {
+                *total = tantivy_total;
+            }
             // Generate suggestions if zero hits
             let suggestions = if hits.is_empty() {
                 self.generate_suggestions(query, &filters)
@@ -10558,8 +10716,10 @@ impl SearchClient {
         }
     }
 
-    /// Why the most recent hybrid search dropped its lexical leg, if it did.
-    /// See [`LEXICAL_DEGRADE_QUERY_FUEL_EXHAUSTED`] (GH #441).
+    /// Why the most recent lexical request degraded, if it did.
+    /// [`LEXICAL_DEGRADE_QUERY_FUEL_EXHAUSTED`] means a hybrid lexical leg was lost;
+    /// [`LEXICAL_RETRY_QUERY_FUEL_EXHAUSTED`] means a usable but incomplete native
+    /// page survived a larger-fetch refusal. Neither code denotes an exact total.
     #[must_use]
     pub fn lexical_degrade_reason(&self) -> Option<&'static str> {
         self.last_lexical_degrade_reason
@@ -19517,6 +19677,129 @@ mod tests {
         );
     }
 
+    /// coding_agent_session_search-7hvlg (GH #518 follow-up): the automatic
+    /// `*term*` retry only refines a search that already succeeded. Its
+    /// dictionary walk can run out of the query fuel the plain lookup fit in;
+    /// the plain query's hits must come back, with `wildcard_fallback_skipped`
+    /// naming the cause, instead of the whole search failing.
+    #[test]
+    fn search_with_fallback_keeps_exact_hits_when_the_wildcard_retry_runs_out_of_fuel() -> Result<()>
+    {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+        let conversation = |id: usize, content: String| NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some(format!("doc-{id}")),
+            workspace: Some(std::path::PathBuf::from("/ws")),
+            source_path: dir.path().join(format!("{id}.jsonl")),
+            started_at: Some(100),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(100),
+                content,
+                extra: serde_json::json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            }],
+        };
+        // Many distinct terms over a few segments give the retry's
+        // dictionary walk real work; one document holds the needle.
+        for id in 0..400 {
+            let words = (0..16)
+                .map(|word| format!("filler{id}x{word}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            index.add_conversation(&conversation(id, words))?;
+            if id % 100 == 99 {
+                index.commit()?;
+            }
+        }
+        index.add_conversation(&conversation(400, "needleword appears once".into()))?;
+        index.commit()?;
+
+        let client_with_budget = |budget: u64| -> Result<SearchClient> {
+            let reader = crate::search::quill_bridge::open_cass_reader_with_query_fuel_budget(
+                dir.path(),
+                budget,
+            )?;
+            SearchClient::from_opened_lexical_index(
+                crate::search::tantivy::OpenedLexicalIndex {
+                    path: dir.path().to_path_buf(),
+                    reader: Some((
+                        reader,
+                        crate::search::quill_bridge::QuillCassFields::compiled(),
+                    )),
+                    federated_readers: None,
+                },
+                None,
+                SearchClientOptions::default(),
+            )?
+            .context("a reader is present")
+        };
+        let plain = |budget: u64| {
+            client_with_budget(budget)?.search(
+                "needleword",
+                SearchFilters::default(),
+                10,
+                0,
+                FieldMask::FULL,
+            )
+        };
+        let budget = (0..40)
+            .map(|shift| 1_u64 << shift)
+            .find(|budget| plain(*budget).is_ok())
+            .expect("the plain lookup fits some budget");
+        // Precondition: at that budget the retry's walk does not fit.
+        let refused = client_with_budget(budget)?
+            .search(
+                "*needleword*",
+                SearchFilters::default(),
+                10,
+                0,
+                FieldMask::FULL,
+            )
+            .expect_err("`*needleword*` must cost more fuel than the plain lookup");
+        assert!(
+            crate::search::quill_bridge::is_query_fuel_exhausted(&refused),
+            "{refused:#}"
+        );
+
+        let client = client_with_budget(budget)?;
+        let result = client.search_with_fallback(
+            "needleword",
+            SearchFilters::default(),
+            10,
+            0,
+            5,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(result.hits.len(), 1, "budget {budget}: the plain hit");
+        assert!(!result.wildcard_fallback);
+        assert_eq!(
+            client.wildcard_fallback_skipped_reason(),
+            Some(WILDCARD_FALLBACK_SKIPPED_QUERY_FUEL_EXHAUSTED)
+        );
+
+        // Control: with fuel to spare the retry runs and nothing is skipped.
+        let client = client_with_budget(budget.saturating_mul(1 << 20))?;
+        let result = client.search_with_fallback(
+            "needleword",
+            SearchFilters::default(),
+            10,
+            0,
+            5,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(client.wildcard_fallback_skipped_reason(), None);
+        Ok(())
+    }
+
     #[test]
     fn search_with_fallback_skips_when_query_has_wildcards() -> Result<()> {
         let dir = TempDir::new()?;
@@ -21403,8 +21686,7 @@ mod tests {
         for strict_read_only in [false, true] {
             let original_error =
                 open_search_hydration_sqlite(&db_path, Duration::from_secs(1), strict_read_only)
-                    .err()
-                    .expect("a non-SQLite file must fail the actual archive opener");
+                    .expect_err("a non-SQLite file must fail the actual archive opener");
             let original_message = original_error.to_string();
             let original_cause = original_error.root_cause().to_string();
             let client = SearchClient::open_with_options(
@@ -23652,12 +23934,12 @@ mod tests {
 
     #[test]
     fn exact_artifact_contract_invalid_optional_ann_falls_back_exact_read_only() -> Result<()> {
-        let mut modes = vec![
+        let modes = [
             SemanticAnnFixtureMode::CorruptMetadata,
             SemanticAnnFixtureMode::CrossRoleAlias,
+            #[cfg(unix)]
+            SemanticAnnFixtureMode::FinalComponentSymlink,
         ];
-        #[cfg(unix)]
-        modes.push(SemanticAnnFixtureMode::FinalComponentSymlink);
 
         for mode in modes {
             let fixture = build_semantic_test_fixture_with_ann(mode)?;
@@ -24036,6 +24318,247 @@ mod tests {
         assert!(!should_collect_exact_total_count(0, 0));
         assert!(!should_collect_exact_total_count(1, 0));
         assert!(!should_collect_exact_total_count(usize::MAX, 0));
+    }
+
+    fn gh518_page(
+        hits: usize,
+        total_count: Option<usize>,
+        doc_count: usize,
+    ) -> crate::search::quill_bridge::QuillLexicalPage {
+        crate::search::quill_bridge::QuillLexicalPage {
+            hits: (0..hits)
+                .map(|rank| crate::search::quill_bridge::QuillLexicalDocHit {
+                    bm25_score: 1.0,
+                    rank,
+                    global_docid: u32::try_from(rank).expect("fixture rank fits u32"),
+                    document_id: format!("gh518-{rank}"),
+                })
+                .collect(),
+            total_count,
+            doc_count,
+        }
+    }
+
+    /// An error carrying the engine's own Display text, wrapped the way
+    /// `quill_bridge::search_paginated` wraps it.
+    fn gh518_engine_error(error: frankensearch::quill::argus::ArgusError) -> anyhow::Error {
+        anyhow!(
+            "executing a Quill lexical query: {}",
+            frankensearch::quill::QuillIndexError::from(error)
+        )
+    }
+
+    fn gh518_fuel_exhausted() -> anyhow::Error {
+        gh518_engine_error(
+            frankensearch::quill::argus::ArgusError::QueryFuelExhausted {
+                budget: 100,
+                consumed: 100,
+                segments_touched: 1,
+                dictionary_blocks: 2,
+                posting_blocks: 97,
+                position_docs: 0,
+            },
+        )
+    }
+
+    /// GH #518: the exact total is optional. When only the counting pass runs
+    /// out of query fuel, the ranked page is returned and its total is unknown.
+    #[test]
+    fn bounded_exact_count_keeps_the_page_when_only_the_count_runs_out_of_fuel() -> Result<()> {
+        let mut passes = Vec::new();
+        let result = bounded_exact_count_page(4, 0, 1_000, |exact_count| {
+            passes.push(exact_count);
+            if exact_count {
+                Err(gh518_fuel_exhausted())
+            } else {
+                Ok(gh518_page(4, None, 500))
+            }
+        })?;
+        assert_eq!(
+            passes,
+            [false, true],
+            "a saturated page on a small index asks for the exact count"
+        );
+        assert_eq!(result.hits, gh518_page(4, None, 500).hits);
+        assert_eq!(result.total_count, None);
+        Ok(())
+    }
+
+    /// The degrade is keyed to fuel exhaustion of the counting pass alone: a
+    /// cancelled count still fails the query, and the ranked pass is never
+    /// optional (its fuel refusal fails the query before any count is tried).
+    #[test]
+    fn bounded_exact_count_still_fails_on_other_count_errors_and_on_page_fuel() {
+        let cancelled = bounded_exact_count_page(4, 0, 1_000, |exact_count| {
+            if exact_count {
+                Err(gh518_engine_error(
+                    frankensearch::quill::argus::ArgusError::QueryCancelled { phase: "collect" },
+                ))
+            } else {
+                Ok(gh518_page(4, None, 500))
+            }
+        });
+        let error = cancelled
+            .err()
+            .expect("a cancelled counting pass fails the query");
+        assert!(
+            !crate::search::quill_bridge::is_query_fuel_exhausted(&error),
+            "{error:#}"
+        );
+
+        let mut passes = Vec::new();
+        let refused = bounded_exact_count_page(4, 0, 1_000, |exact_count| {
+            passes.push(exact_count);
+            Err(gh518_fuel_exhausted())
+        });
+        let error = refused
+            .err()
+            .expect("a fuel-exhausted ranked pass fails the query");
+        assert!(
+            crate::search::quill_bridge::is_query_fuel_exhausted(&error),
+            "{error:#}"
+        );
+        assert_eq!(passes, [false], "no count is attempted without a page");
+    }
+
+    /// Controls for the unchanged policy: an affordable count is reported, an
+    /// unsaturated page is its own total, and an index over the exact-count
+    /// ceiling is never recounted.
+    #[test]
+    fn bounded_exact_count_reports_affordable_totals_and_skips_unneeded_counts() -> Result<()> {
+        let counted = bounded_exact_count_page(4, 0, 1_000, |exact_count| {
+            Ok(gh518_page(4, exact_count.then_some(37), 500))
+        })?;
+        assert_eq!(counted.total_count, Some(37));
+
+        let mut passes = Vec::new();
+        let unsaturated = bounded_exact_count_page(4, 10, 1_000, |exact_count| {
+            passes.push(exact_count);
+            Ok(gh518_page(3, None, 500))
+        })?;
+        assert_eq!(passes, [false]);
+        assert_eq!(unsaturated.total_count, Some(13));
+
+        let mut passes = Vec::new();
+        let over_ceiling = bounded_exact_count_page(4, 0, 499, |exact_count| {
+            passes.push(exact_count);
+            Ok(gh518_page(4, None, 500))
+        })?;
+        assert_eq!(passes, [false]);
+        assert_eq!(over_ceiling.total_count, None);
+        Ok(())
+    }
+
+    /// GH #518 on the real engine: the ranked page comes from Quill, the
+    /// counting call gets Quill's own typed fuel refusal, and the policy keeps
+    /// the page with an unknown total. With fuel for both, the same call
+    /// reports the exact total and ranks the same page.
+    ///
+    /// The two calls use separate readers, ample fuel for the page and one
+    /// unit for the count, because a count-only refusal under one shared
+    /// budget could not be produced on frankensearch-quill 0.4.1. For CASS's
+    /// parsed queries the counting pass always fit the smallest budget the
+    /// ranked page fit, whether the matches sat in one segment past the first
+    /// 4,096-document scoring window or spread over one segment per ingest
+    /// shard, so no budget fit the page but not the count. The policy stays
+    /// because the total is optional either way; this test pins its wiring to
+    /// real engine errors, and the injected-error tests above pin its
+    /// decisions.
+    #[test]
+    fn bounded_exact_count_survives_a_real_count_fuel_refusal() -> Result<()> {
+        const STRONG: usize = 4;
+        const WEAK: usize = 60;
+        let dir = TempDir::new()?;
+        // Same length, so only the term frequency ranks the strong ones first.
+        let strong = ["needle"; 24].join(" ");
+        let weak = std::iter::once("needle")
+            .chain(std::iter::repeat_n("filler", 23))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut documents = Vec::with_capacity(STRONG + WEAK);
+        for ordinal in 0..STRONG + WEAK {
+            documents.push(frankensearch::quill::cass::CassDocument {
+                agent: "codex".into(),
+                workspace: Some("/ws".into()),
+                workspace_original: None,
+                source_path: format!("/gh518/{ordinal:03}.jsonl"),
+                msg_idx: 0,
+                created_at: Some(100),
+                title: Some("fixture".into()),
+                content: if ordinal < STRONG {
+                    strong.clone()
+                } else {
+                    weak.clone()
+                },
+                source_id: "local".into(),
+                origin_kind: "local".into(),
+                origin_host: None,
+                conversation_id: Some(i64::try_from(ordinal)? + 1),
+            });
+        }
+        let mut writer = crate::search::quill_bridge::QuillCassIndex::open_or_create(dir.path())?;
+        writer.add_cass_documents(&documents)?;
+        writer.commit()?;
+        drop(writer);
+
+        let query = frankensearch::quill::query::CassQueryParser::new(
+            frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+        )
+        .map_err(|error| anyhow!("building the CASS query parser: {error}"))?
+        .parse("needle", &FsCassQueryFilters::default())
+        .query;
+        let open = |budget: u64| {
+            crate::search::quill_bridge::open_cass_reader_with_query_fuel_budget(dir.path(), budget)
+        };
+        let ample = open(crate::search::quill_bridge::cass_quill_config().query_fuel_budget)?;
+        let starved = open(1)?;
+        // Precondition: the starved reader really refuses the counting call
+        // with the engine's typed fuel error, not some other failure.
+        let refusal = match crate::search::quill_bridge::search_paginated(
+            &starved, &query, STRONG, 0, true,
+        ) {
+            Ok(page) => bail!(
+                "a one-unit reader must refuse the count, but it returned {} hits and total {:?}",
+                page.hits.len(),
+                page.total_count
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                refusal.downcast_ref::<frankensearch::quill::QuillIndexError>(),
+                Some(frankensearch::quill::QuillIndexError::QueryFuelExhausted { .. })
+            ),
+            "{refusal:#}"
+        );
+
+        let mut passes = Vec::new();
+        let degraded = bounded_exact_count_page(STRONG, 0, 1_000_000, |exact_count| {
+            passes.push(exact_count);
+            let reader = if exact_count { &starved } else { &ample };
+            crate::search::quill_bridge::search_paginated(reader, &query, STRONG, 0, exact_count)
+        })?;
+        assert_eq!(
+            passes,
+            [false, true],
+            "a saturated small page asks for its count"
+        );
+        assert_eq!(degraded.hits.len(), STRONG, "the ranked page survives");
+        assert_eq!(degraded.total_count, None, "its total is unknown");
+
+        // Control: with fuel for both passes the production entry point
+        // reports the exact total and ranks the same page.
+        let counted = execute_query_with_bounded_exact_count(&ample, &query, STRONG, 0)?;
+        let direct =
+            crate::search::quill_bridge::search_paginated(&ample, &query, STRONG, 0, true)?;
+        assert_eq!(counted.total_count, direct.total_count);
+        assert_eq!(
+            counted.total_count,
+            Some(STRONG + WEAK),
+            "every document matches"
+        );
+        assert_eq!(counted.hits, degraded.hits);
+        Ok(())
     }
 
     #[test]

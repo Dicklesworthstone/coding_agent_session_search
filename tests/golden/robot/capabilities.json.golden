@@ -57,6 +57,7 @@
     "omp",
     "factory",
     "openclaw",
+    "continue",
     "antigravity",
     "pi_durable",
     "prime_agent",
@@ -3523,7 +3524,7 @@
     },
     {
       "name": "serve",
-      "description": "Reuse read-only search readers for a stream of JSON requests. Semantic retrieval and refinement require explicit opt-in. See docs/SEARCH_SERVICE.md",
+      "description": "Reuse read-only search readers, or run one supervised request and exit. Semantic retrieval and refinement require explicit opt-in. See docs/SEARCH_SERVICE.md",
       "arguments": [
         {
           "name": "index",
@@ -3543,11 +3544,105 @@
           "name": "stdio",
           "description": "Use newline-delimited JSON requests and responses on standard I/O",
           "arg_type": "flag",
-          "required": true,
+          "required": false,
           "enum_values": [
             "true",
             "false"
           ]
+        },
+        {
+          "name": "query",
+          "description": "Run one query and exit; emit a bounded JSON reply without reading stdin. Uses the service's read-only readers, fallback consent and resource supervision",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "transcript",
+          "description": "Read one bounded canonical transcript page and exit without reading stdin. JSON selects source_path, source_id, conversation_id, optional cursor and limit. Requires --db; never opens source files, lexical readers or models",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "mode",
+          "description": "Retrieval mode for --query (default lexical). Semantic and hybrid require --semantic-embedder, --data-dir and --db. No models are downloaded",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "lexical",
+            "semantic",
+            "hybrid"
+          ]
+        },
+        {
+          "name": "approximate",
+          "description": "Request approximate retrieval with an explicit semantic/hybrid --mode. The service currently uses exact search and reports ANN as unavailable",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "limit",
+          "description": "Maximum hits for --query (default 10, maximum 100)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "offset",
+          "description": "Result offset for --query (default 0; offset + limit + 1 must be at most 1024)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "agent",
+          "description": "Agent name or supported alias for --query; repeat for multiple agents. Unknown names fail before opening the index or archive",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "workspace",
+          "description": "Exact workspace for --query; repeat for multiple workspaces",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "source-id",
+          "description": "Exact source ID for --query, not the synthetic remote group",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "created-from",
+          "description": "Inclusive lower creation timestamp in epoch milliseconds for --query",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "created-to",
+          "description": "Inclusive upper creation timestamp in epoch milliseconds for --query",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "refine",
+          "description": "Refine one bounded lexical shortlist and exit without reading stdin. JSON selects query, lexical_query, filters, candidate_limit and limit. Requires an installed --reranker-model; never downloads model files",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
         },
         {
           "name": "mcp",
@@ -3561,10 +3656,20 @@
         },
         {
           "name": "db",
-          "description": "Opt in to canonical view requests against this fixed read-only archive. Search, status and startup still never open the database",
+          "description": "Opt in to canonical view requests against this fixed read-only archive. Search stays index-only unless --lexical-fallback is also supplied",
           "arg_type": "option",
           "value_type": "path",
           "required": false
+        },
+        {
+          "name": "lexical-fallback",
+          "description": "Recover Quill fuel refusals using this explicit archive's SQLite lane. Admits at most 64 MiB of database plus WAL; shares the request deadline. Results identify the changed backend and are not Quill-score equivalent",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
           "name": "reranker-model",
@@ -3582,12 +3687,13 @@
           "enum_values": [
             "minilm",
             "multilingual-minilm",
-            "hash"
+            "hash",
+            "external"
           ]
         },
         {
           "name": "request-timeout-ms",
-          "description": "Whole-request deadline, from first frame byte through response flush. Expiry exits the worker with code 124; idle sessions are not timed out",
+          "description": "Whole-request deadline, including setup, search, teardown and one-shot output. For --stdio, starts at the first frame byte; idle sessions are not timed out. Expiry exits the worker with code 124",
           "arg_type": "option",
           "value_type": "string",
           "required": false,
@@ -3639,6 +3745,153 @@
         {
           "name": "json",
           "description": "Receipts are JSON regardless of this compatibility flag",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "codex-layout-migrate",
+      "description": "Prove a same-source flat/dated Codex transition before indexing its second layout. Dry-run by default. --apply registers a receipt without rewriting archive rows",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Explicit CASS directory containing the existing agent_search.db; no custom DB",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "source",
+          "description": "Exact named local source configured in sources.toml and the archive",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": true
+        },
+        {
+          "name": "from",
+          "description": "Existing flat or native dated rollout. Both inputs must remain accessible",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "to",
+          "description": "Matching rollout in the other layout, belonging to the same local source",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "apply",
+          "description": "Register the proven identity before indexing the second layout; default is dry-run",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "json",
+          "description": "Emit the migration report as JSON. Fatal errors use stderr, not stdout",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "lexical-quarantine",
+      "description": "Inspect retained failed lexical rebuilds without opening the database. Read-only by default; --apply requires the exact fingerprint from --plan",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Explicit archive directory; never defaults to another user's archive",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "json",
+          "description": "Emit one complete inventory; complete=false exits with code 8",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "plan",
+          "description": "Preview the complete cleanup policy and its approval fingerprint; no writes",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "apply",
+          "description": "Apply only a matching preview under the indexer lock. Preserves newest/recent evidence",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "semantic-reclaim",
+      "description": "Preview or reclaim unreferenced semantic backfill scratch",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Existing CASS data directory; no default archive is guessed",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "dry-run",
+          "description": "Explicitly preview without deleting artifacts (also the default)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "apply",
+          "description": "Delete only the candidates in a still-current approved preview",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "plan-fingerprint",
+          "description": "Exact plan_fingerprint from a prior preview of this archive",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Emit one JSON result on stdout and structured failures on stderr",
           "arg_type": "flag",
           "required": false,
           "enum_values": [

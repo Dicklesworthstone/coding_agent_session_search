@@ -18,32 +18,9 @@ pub(super) fn run(
     mut check_cancelled: impl FnMut() -> Result<()>,
 ) -> Result<VectorIndex> {
     check_cancelled()?;
-    let destination = vector_index_path(data_dir, indexer.embedder_id());
-    let wal_path = wal_path_for(&destination);
-    let wal_before = ObservedSemanticFile::capture(&wal_path)?;
-    // An empty embedding delta is not proof of unchanged coverage. Admit
-    // a no-op only after comparing every current identity and checking
-    // the stored vectors under a retained native reader. In that case no
-    // generation or recovery sidecar is being replaced or retired.
-    if wal_before.is_none() && embedded_messages.is_empty() {
-        ensure!(
-            !db_fingerprint.trim().is_empty(),
-            "canonical semantic reconciliation requires a DB fingerprint"
-        );
-        if let Some(source) = indexer.retain_unchanged_canonical_index(
-            &destination,
-            current_doc_ids,
-            &mut check_cancelled,
-        )? {
-            tracing::info!(
-                tier = tier.as_str(),
-                retained_docs = source.record_count(),
-                "canonical semantic reconciliation retained unchanged generation"
-            );
-            return Ok(source);
-        }
-    }
-    refuse_publication_sidecars(&destination, true)?;
+    // GH #527: malformed input must not create directories or authorize the
+    // rebuild admission sweep to remove an interrupted operation's scratch.
+    // These checks consume only caller-owned vectors and canonical identities.
     ensure!(
         !db_fingerprint.trim().is_empty(),
         "canonical semantic reconciliation requires a DB fingerprint"
@@ -56,13 +33,58 @@ pub(super) fn run(
         current_doc_ids,
         &mut check_cancelled,
     )?;
+    let complete_replacement = replacements.len() == current_doc_ids.len();
+    let destination = vector_index_path(data_dir, indexer.embedder_id());
+    if !complete_replacement {
+        // This observation can only REFUSE early. It cannot admit a source or
+        // publication: the complete source/WAL checks below run under the lease
+        // again, so disappearance or replacement during admission stays closed.
+        match fs::symlink_metadata(&destination) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::bail!(
+                    "initial canonical reconciliation lacks vectors for {} current documents",
+                    current_doc_ids.len().saturating_sub(replacements.len())
+                );
+            }
+            Err(error) => {
+                return Err(error).context("inspect canonical reconciliation destination");
+            }
+            Ok(_) => {}
+        }
+    }
+    check_cancelled()?;
+    // Hold the lease through authoritative source observations and all writes.
+    // Its scratch borrow also prevents releasing it before TempDir cleanup.
+    let artifacts = super::super::artifacts::BackfillArtifacts::for_rebuild(data_dir)?;
+    check_cancelled()?;
+    let wal_path = wal_path_for(&destination);
+    let wal_before = ObservedSemanticFile::capture(&wal_path)?;
+    // An empty embedding delta is not proof of unchanged coverage. Admit
+    // a no-op only after comparing every current identity and checking
+    // the stored vectors under a retained native reader. In that case no
+    // generation or recovery sidecar is being replaced or retired.
+    if wal_before.is_none()
+        && replacements.is_empty()
+        && let Some(source) = indexer.retain_unchanged_canonical_index(
+            &destination,
+            current_doc_ids,
+            &mut check_cancelled,
+        )?
+    {
+        tracing::info!(
+            tier = tier.as_str(),
+            retained_docs = source.record_count(),
+            "canonical semantic reconciliation retained unchanged generation"
+        );
+        return Ok(source);
+    }
+    refuse_publication_sidecars(&destination, true)?;
 
     // Unlike an unqualified full rebuild, this call has the exact canonical
     // set needed to retire deleted records and retain acknowledged WAL rows.
     refuse_publication_sidecars(&destination, true)?;
     check_cancelled()?;
     let previous = RebuildDestination::capture(&destination)?;
-    let complete_replacement = replacements.len() == current_doc_ids.len();
     // The same reader-owned merge serves both WAL and log-free sources.
     // Even a complete replacement must respect the existing artifact's
     // reader/writer lock and header admission, rather than overwriting an
@@ -97,14 +119,8 @@ pub(super) fn run(
         "incompatible vector space requires a complete canonical replacement"
     );
 
-    let parent = destination
-        .parent()
-        .context("semantic index has no parent")?;
     check_cancelled()?;
-    fs::create_dir_all(parent)?;
-    let scratch = tempfile::Builder::new()
-        .prefix(".semantic-reconcile-")
-        .tempdir_in(parent)?;
+    let scratch = artifacts.scratch()?;
     let candidate_path = scratch.path().join("candidate.fsvi");
     let mut writer = VectorIndex::create_with_revision(
         &candidate_path,
@@ -214,6 +230,13 @@ pub(super) fn run(
             && ObservedSemanticFile::capture(&wal_path)? == wal_before,
         "semantic source changed during canonical reconciliation; retry under the maintenance lock"
     );
+    // Close the source reader and both observations before the rename: each
+    // holds the destination or its WAL open, and Windows refuses to rename
+    // over a file while any handle to it is open ("Access is denied", if17v).
+    let retained_wal_rows = source.as_ref().map_or(0, VectorIndex::wal_record_count);
+    drop(source);
+    drop(previous);
+    drop(wal_before);
     check_cancelled()?;
     let published = VectorIndex::install_replacement(&destination, &candidate_path)
         .context("install complete canonical semantic generation")?;
@@ -221,7 +244,7 @@ pub(super) fn run(
         tier = tier.as_str(),
         published_docs = published.record_count(),
         replaced_docs = replacements.len(),
-        retained_wal_rows = source.as_ref().map_or(0, VectorIndex::wal_record_count),
+        retained_wal_rows,
         "published canonical semantic reconciliation"
     );
     Ok(published)

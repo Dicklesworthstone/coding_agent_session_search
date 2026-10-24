@@ -40,6 +40,17 @@ fn base_cmd(temp_home: &std::path::Path) -> Command {
     cmd.env("XDG_CONFIG_HOME", temp_home.join(".config"));
     // Specific overrides if needed (some might fallback to other paths, but HOME usually covers it)
     cmd.env("CODEX_HOME", temp_home.join(".codex"));
+    // HOME does not isolate Claude Code on Windows (its home comes from the
+    // profile known folder) or under an inherited CLAUDE_CONFIG_DIR; either
+    // way the host's real sessions would be indexed into the test archive.
+    cmd.env("CLAUDE_CONFIG_DIR", temp_home.join(".claude"));
+    // Once the data dir holds agent_search.db, the Aider connector's default
+    // roots are the working directory (depth 5) and HOME. Inheriting the test
+    // runner's cwd, the checkout root, indexed its Aider histories
+    // (tests/fixtures/aider, plus a git-ignored one a checkout may hold) into
+    // every archive here, so exact conversation counts failed. A test that
+    // needs a different working directory still sets its own.
+    cmd.current_dir(temp_home);
     cmd
 }
 
@@ -398,6 +409,9 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
             .env("CODEX_HOME", home.join(".codex"))
+            // On Windows the default ~/.cursor/projects is the profile known
+            // folder, which ignores HOME and USERPROFILE.
+            .env("CASS_CURSOR_PROJECTS_ROOT", home.join(".cursor/projects"))
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
             .env("RUST_MIN_STACK", "134217728");
         cmd
@@ -425,7 +439,9 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
     fs::create_dir_all(&transcript_dir).unwrap();
     let transcript = transcript_dir.join("gh459-session.jsonl");
     fs::write(&transcript, "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"gh459needle retained chat\"}]}}\n").unwrap();
-    fs::File::open(&transcript)
+    fs::File::options()
+        .write(true)
+        .open(&transcript)
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(100)))
         .unwrap();
@@ -635,7 +651,9 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
     assert_eq!(search_count(Some(&correct)), 0);
     let sidecar = project.join(".workspace-trusted");
     fs::write(&sidecar, json!({"workspacePath":correct}).to_string()).unwrap();
-    fs::File::open(&sidecar)
+    fs::File::options()
+        .write(true)
+        .open(&sidecar)
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(100)))
         .unwrap();
@@ -723,7 +741,9 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
         0
     );
     fs::write(&sidecar, "{malformed").unwrap();
-    fs::File::open(&sidecar)
+    fs::File::options()
+        .write(true)
+        .open(&sidecar)
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(100)))
         .unwrap();
@@ -1592,7 +1612,9 @@ fn gh478_watch_once_retains_codex_hint_when_symlink_target_has_no_provider_marke
         "unrequestedneighborneedle",
     );
     for source in [&regular, &real, &neighbor] {
-        fs::File::open(source)
+        fs::File::options()
+            .write(true)
+            .open(source)
             .unwrap()
             .set_times(
                 fs::FileTimes::new()
@@ -4181,10 +4203,24 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
     assert_eq!(timeout["retryable"], true, "{timeout}");
     assert_eq!(timeout["context"], "index run", "{timeout}");
     assert_eq!(timeout["deadline_ms"], 1_000, "{timeout}");
-    assert!(
-        !coding_agent_search::search::asset_state::read_search_maintenance_snapshot(&data_dir)
-            .active,
-        "a reaped checkpoint owner must not retain active indexing admission"
+    let status = base_cmd(home)
+        .current_dir(home)
+        .args(["status", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass status after the reaped checkpoint");
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap_or_else(|err| {
+        panic!(
+            "status --json must print JSON ({err}); stdout={} stderr={}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        )
+    });
+    assert_eq!(
+        status["rebuild"]["active"], false,
+        "a reaped checkpoint owner must not retain active indexing admission: {status}"
     );
     let archive_contents = || {
         use coding_agent_search::franken_sync::compat::{
@@ -4467,8 +4503,13 @@ fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoin
     );
     // 7qirz: mid-rebuild, the lock names the rebuild, not the last preflight
     // step (which is what #483/#497 operators saw for a whole 42-minute pass).
+    // Windows refuses reads of a byte range another process holds locked
+    // (os error 33), so cass mirrors the lock's metadata into
+    // index-run.lock.meta and reads that on a lock conflict
+    // (asset_state::index_run_lock_metadata_sidecar_path). Do the same.
     let lock = fs::read_to_string(data_dir.join("index-run.lock"))
-        .expect("index-run.lock while the rebuild is parked");
+        .or_else(|_| fs::read_to_string(data_dir.join("index-run.lock.meta")))
+        .expect("index-run.lock (or its metadata sidecar) while the rebuild is parked");
     assert!(
         lock.lines().any(|line| line == "phase=lexical:rebuild"),
         "the lock must name the active rebuild: {lock}"
@@ -4825,10 +4866,27 @@ fn gh453_back_to_back_runs_report_retired_segments_and_size_headroom_from_live_b
         "the live figure must exclude the retired files: {snapshot:?}"
     );
     assert_eq!(
+        snapshot.db_growth_allowance_bytes,
+        snapshot.db_bundle_bytes / 16,
+        "{snapshot:?}"
+    );
+    assert!(
+        snapshot.migration_copy_bytes == 0
+            || snapshot.migration_copy_bytes == snapshot.db_bundle_bytes,
+        "the db is copied whole or not at all: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.lexical_rebuild_basis_bytes, snapshot.lexical_index_bytes,
+        "a live index sizes the rebuild: {snapshot:?}"
+    );
+    assert_eq!(
         snapshot.required_bytes,
-        (512_u64 * 1024 * 1024)
-            .max(snapshot.db_bundle_bytes * 2 + snapshot.lexical_index_bytes * 2),
-        "the requirement doubles only live bytes: {snapshot:?}"
+        (512_u64 * 1024 * 1024).max(
+            snapshot.lexical_rebuild_basis_bytes * 9 / 4
+                + snapshot.db_growth_allowance_bytes
+                + snapshot.migration_copy_bytes
+        ),
+        "the requirement charges only live lexical bytes: {snapshot:?}"
     );
     let retired_note = snapshot
         .notes
@@ -5045,8 +5103,11 @@ struct Gh453Snapshot {
     retired_segment_files: u64,
     retired_segment_bytes: u64,
     lexical_index_bytes: u64,
+    lexical_rebuild_basis_bytes: u64,
     recursive_index_bytes: u64,
     db_bundle_bytes: u64,
+    db_growth_allowance_bytes: u64,
+    migration_copy_bytes: u64,
     required_bytes: u64,
     notes: Vec<String>,
 }
@@ -5174,8 +5235,11 @@ fn gh453_snapshot(home: &std::path::Path, data_dir: &std::path::Path) -> Gh453Sn
         retired_segment_files: field("retired_segment_files"),
         retired_segment_bytes: field("retired_segment_bytes"),
         lexical_index_bytes: field("lexical_index_bytes"),
+        lexical_rebuild_basis_bytes: field("lexical_rebuild_basis_bytes"),
         recursive_index_bytes,
         db_bundle_bytes: field("db_bundle_bytes"),
+        db_growth_allowance_bytes: field("db_growth_allowance_bytes"),
+        migration_copy_bytes: field("migration_copy_bytes"),
         required_bytes: field("required_bytes"),
         notes: readiness["notes"]
             .as_array()
@@ -5187,4 +5251,167 @@ fn gh453_snapshot(home: &std::path::Path, data_dir: &std::path::Path) -> Gh453Sn
             })
             .unwrap_or_default(),
     }
+}
+
+/// Rows of `sql` as stock SQLite's CLI reads them, strictly read-only.
+fn stock_sqlite_json(db: &std::path::Path, sql: &str) -> Vec<serde_json::Value> {
+    let output = std::process::Command::new("sqlite3")
+        .args(["-readonly", "-json"])
+        .arg(db)
+        .arg(sql)
+        .output()
+        .expect("run the stock sqlite3 CLI");
+    assert!(
+        output.status.success(),
+        "sqlite3 {sql:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("sqlite3 output is UTF-8");
+    if stdout.trim().is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str(&stdout).expect("sqlite3 -json output parses")
+}
+
+/// Texts in `expected` with no stored copy, and stored texts nobody wrote.
+fn payload_mismatches(expected: &[String], stored: &[String]) -> (usize, usize) {
+    let mut remaining = std::collections::HashMap::<&str, usize>::new();
+    for text in expected {
+        *remaining.entry(text.as_str()).or_default() += 1;
+    }
+    let mut unexpected = 0;
+    for text in stored {
+        match remaining.get_mut(text.as_str()) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => unexpected += 1,
+        }
+    }
+    (remaining.values().sum(), unexpected)
+}
+
+/// gi7k7 (#516): FrankenSQLite's 0.4.10 data-integrity advisory (bd-obwsy)
+/// covers inserts inside an explicit transaction that could corrupt a table
+/// b-tree, which stock SQLite reports as "Rowid N out of order". Every
+/// `cass index` batch writes variable-width rows inside explicit
+/// transactions. This drives the real `cass index --full` over 2,000 messages
+/// 50 to 3,200 characters wide, then has stock SQLite verify the archive:
+/// integrity_check, exact counts, and every message payload.
+#[test]
+fn index_full_variable_width_corpus_passes_stock_sqlite_verification() {
+    let sqlite3_available = std::process::Command::new("sqlite3")
+        .arg("-version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !sqlite3_available {
+        eprintln!(
+            "skipping index_full_variable_width_corpus_passes_stock_sqlite_verification: \
+             the stock verification requires the sqlite3 CLI"
+        );
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let sessions = home.join(".codex/sessions/2026/10/17");
+    fs::create_dir_all(&sessions).unwrap();
+    let data_dir = home.join("cass_data");
+
+    // Deterministic widths and text without a rand dependency (PCG constants).
+    let mut state: u64 = 0x0b5e_0b5e;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        state >> 33
+    };
+    let mut expected = Vec::new();
+    for session in 0..20_u64 {
+        let id = format!("00000000-0000-4000-8000-{session:012}");
+        let mut lines = vec![
+            serde_json::json!({
+                "timestamp": "2026-10-17T10:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-10-17T10:00:00.000Z",
+                    "cwd": format!("/tmp/obwsy/{session}"),
+                    "originator": "codex_cli_rs",
+                    "cli_version": "0.1.0"
+                }
+            })
+            .to_string(),
+        ];
+        for message in 0..100_u64 {
+            let width = 50 + usize::try_from(next() % 3_151).unwrap();
+            let mut text = format!("obwsy s{session} m{message} ");
+            while text.len() < width {
+                text.push(char::from(b'a' + u8::try_from(next() % 26).unwrap()));
+            }
+            let (role, kind) = if message % 2 == 0 {
+                ("user", "input_text")
+            } else {
+                ("assistant", "output_text")
+            };
+            lines.push(
+                serde_json::json!({
+                    "timestamp": format!(
+                        "2026-10-17T10:{:02}:{:02}.000Z",
+                        (message + 1) / 60,
+                        (message + 1) % 60
+                    ),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": role,
+                        "content": [{"type": kind, "text": text}]
+                    }
+                })
+                .to_string(),
+            );
+            expected.push(text);
+        }
+        fs::write(
+            sessions.join(format!("rollout-2026-10-17T10-00-00-{id}.jsonl")),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+    }
+
+    base_cmd(home)
+        .current_dir(home)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let db = data_dir.join("agent_search.db");
+    assert_eq!(
+        stock_sqlite_json(&db, "PRAGMA integrity_check"),
+        vec![serde_json::json!({"integrity_check": "ok"})],
+        "stock SQLite must find the archive intact"
+    );
+    assert_eq!(
+        stock_sqlite_json(
+            &db,
+            "SELECT (SELECT count(*) FROM conversations) AS conversations, \
+             (SELECT count(*) FROM messages) AS messages",
+        ),
+        vec![serde_json::json!({"conversations": 20, "messages": 2000})]
+    );
+    let stored: Vec<String> = stock_sqlite_json(&db, "SELECT content FROM messages")
+        .into_iter()
+        .map(|row| row["content"].as_str().expect("content is text").to_owned())
+        .collect();
+    assert_eq!(
+        payload_mismatches(&expected, &stored),
+        (0, 0),
+        "every written message must be stored exactly once, byte for byte"
+    );
+
+    // The comparison is not vacuous: one altered text is one missing and one
+    // unexpected payload.
+    let mut altered = expected.clone();
+    altered[1_000].push('!');
+    assert_eq!(payload_mismatches(&altered, &stored), (1, 1));
 }

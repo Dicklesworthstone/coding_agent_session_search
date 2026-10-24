@@ -124,7 +124,7 @@ commands:
   cass expand <path> --message-index N [--source ID] [--conversation-id ID] [-C CONTEXT] [--json]  Follow search line_number; --line is for raw JSONL.
   cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.
   cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.
-  cass mirror prune [--older-than 90d] [--max-size 100GB] [--keep-tag important] [--apply] [--json]  Plan or apply raw-mirror retention with an audit log.
+  cass mirror prune [--older-than 90d] [--max-size 100GB] [--keep-latest 1] [--keep-tag important] [--apply] [--json]  Plan or apply raw-mirror retention with an audit log.
   cass context <path> [--json]     Find related sessions for a given source path.
   cass export <path> [--format markdown] [--output FILE]  Export a conversation to markdown / other formats.
   cass export-html <path> [--output-dir DIR] [--json]  Self-contained HTML export (optional encryption).

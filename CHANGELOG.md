@@ -34,6 +34,11 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Added
 
+- **Continue sessions are indexed.** Continue's IDE extension and CLI keep one
+  JSON snapshot per session under `~/.continue/sessions` (or
+  `$CONTINUE_GLOBAL_DIR/sessions`). A full index picks them up. `cass index
+  --watch` and `--watch-once <file>` route changes to the Continue connector.
+  HTML exports label the agent "Continue".
 - **`cass index --rebuild-profile bounded` (#483).** One flag now runs the
   documented single-core, low-memory lexical rebuild for a wedged or
   memory-starved archive: one rebuild worker, one page-prep thread, a
@@ -78,8 +83,294 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   `systemd-run -p MemoryMax=16G` that landed outside the scope looked the
   same as one inside it.
 
+- **`cass mirror prune --keep-latest N` (#522).** Retires every capture of
+  a source file except its newest N, and keeps those N out of reach of
+  `--older-than` and `--max-size`. A size or age rule alone retires the
+  oldest captures first, which can include the only copy of a session whose
+  provider has since deleted it. `--keep-latest 1 --safety-hold-down 6h
+  --apply` is a safe prune to run on a timer. When `cass index` refuses to
+  start because the data dir's filesystem is short of space, the refusal
+  now gives the raw mirror's size and this prune command. Doctor's
+  `raw_mirror_size` finding recommends `--keep-latest 1` instead of
+  `--older-than 90d`.
+
 ### Fixed
 
+- **`cass swarm status` reads Beads with br 0.7.x (#529).** The live Beads
+  reader accepted only br 0.6.x, so with the current br it reported the
+  provider unavailable and left the ready, in-progress and blocked counts
+  unknown. br 0.7.x keeps the JSON shape the reader parses, and it is now
+  accepted. Other versions are still refused.
+- **Keyword search keeps a named local source local (#524).** A configured
+  local source with its own name (anything but `local`) was labelled remote
+  when an incremental index run or `cass index --watch-once` replayed its
+  sessions into the lexical index, so local-only keyword searches missed
+  them. A lexical rebuild labelled them correctly. Both paths now use the
+  source's registered kind. Sessions indexed before the fix keep the remote
+  label until `cass index --full --force-rebuild` rebuilds the lexical index;
+  plain `--full` leaves an up-to-date index as it is.
+- **`cass sources add` accepts a read-only rrsync key (#531).** Its
+  connectivity check ran `echo ok` on the remote. A key whose forced command
+  is `rrsync -ro DIR` refuses everything except rsync and `true`, so `add`
+  failed with exit 12 unless `--no-test` was given. The check now runs `true`,
+  as `cass sources doctor` already did.
+- **A first full index no longer leaves an empty publish backup.** On a fresh
+  install, `cass index --full` kept the placeholder index directory, which
+  held only the rebuild's own progress checkpoint, as a retained lexical
+  publish backup. `cass doctor` and `cass diag --quarantine` counted it, and
+  `cass doctor cleanup` offered to prune it. A placeholder holding only that
+  checkpoint and the archive fingerprint cache is now replaced on first
+  publish. A directory holding anything else is still retained.
+- **`cass mirror prune` reclaims capture staging left by killed captures
+  (#523).** A `cass index` run killed mid-capture (for example by `timeout`)
+  left its `raw-mirror/v1/tmp/capture.*` staging behind, and nothing removed
+  it. One report had 14 GB in 35 such directories. The staging also counted
+  against the capture budget. `cass doctor --cleanup-interrupted-artifacts`
+  only moves these directories into its quarantine, so no space came back. An unscoped prune now lists
+  each one untouched for an hour as a `staging` entry, and `--apply` removes
+  it. The prune holds the mirror lock that every capture holds while staging,
+  so a directory it finds has no live owner.
+- **An appended transcript no longer adds its whole length to the raw
+  mirror on every index run (#522).** Transcripts under 8 MiB were captured
+  as one new blob whenever they changed, so a session appended to between
+  runs was copied in full each time; one report saw the mirror grow 32 GB in
+  75 minutes. Transcript captures are now 256 KiB content-addressed chunks,
+  and an appended file stores only its changed tail chunk and a manifest
+  ([`4c10a2a1`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/4c10a2a1)).
+  The test workload was a 2.9 MB Codex transcript with ten 14.6 KB appends,
+  each followed by `cass index`. The mirror grew 30.1 MB on v0.10.0 and
+  1.3 MB with the fix.
+
+- **`cass index --watch-once <file>` no longer fails on a session under a
+  shared configured source.** When the path alone did not tie the file to an
+  agent (a Codex rollout outside `~/.codex`, for example), every connector
+  whose root contained it scanned it. Shelley and Devin open any explicit
+  file as their database, so their scan failed and the run exited 9. They
+  now get such a file only when it is a SQLite database.
+
+- **A lexical rebuild killed between commits resumes instead of starting
+  over (#523).** A rebuild checkpoints its progress every few seconds. When a
+  run was killed (for example by `timeout`), the next `cass index` read the
+  latest progress as committed, found the staged candidate short of it,
+  moved the candidate aside as a 1 GB `.lexical-rebuild-quarantine-*`
+  directory and rebuilt from zero. On a loaded host that is killed every
+  run, the rebuild never finished and a new quarantine directory appeared
+  each time. A killed rebuild now resumes from its last commit. Checkpoints
+  written by earlier versions are read the same way.
+- **SQLite engine data-integrity fixes: FrankenSQLite 0.4.12 (#516).** The
+  pinned 0.4.9, and the 0.4.6 that v0.10.0 ships, are on the 0.4.10
+  advisory's affected list: inserts inside an explicit transaction could
+  append through a stale retained right-edge leaf and corrupt a table b-tree
+  (stock `integrity_check` then reports `Rowid N out of order`). Every
+  `cass index` batch writes variable-width rows inside explicit
+  transactions. 0.4.12 also gives back the AUTOINCREMENT rowids a
+  rolled-back transaction reserved, reads a WAL that a stock SQLite writer
+  truncated to zero bytes as empty instead of corrupt (the OpenCode export
+  path in #519), seeks indexes for `IN (...)` lists and
+  `k = ? ORDER BY id`, and keeps explicit-rowid writes working in a table
+  that holds the largest rowid.
+
+- **`cass timeline` and `cass sessions` read `--since`/`--until` the way
+  `cass search` does.** Timeline understood only dates, `today`,
+  `yesterday` and day or hour offsets, and replaced anything else with its
+  7-day default: `cass timeline --since 5m` showed a week, with exit 0.
+  Both commands now accept search's forms (minutes and weeks, `5 minutes
+  ago`, `now`, US dates, unix timestamps), an `--until` date includes that
+  whole day, and a value they cannot read is a usage error (exit 2) before
+  the archive is opened.
+
+- **Factory, Vibe, Prime, Gemini and Cursor sessions synced from a remote
+  source are indexed (#520).** `cass sources sync` keeps only a configured
+  path's last component inside its `<path>_<hash>` mirror container, so
+  `~/.factory/sessions` arrives as `<container>/sessions` without its
+  `.factory` parent. Those connectors recognise a store by that parent
+  chain and indexed nothing from a correctly synced mirror. cass now passes
+  each configured remote path to the connectors with the mirror root, and
+  they find the store inside the container. Mirrors are unchanged on disk,
+  and conversations that already indexed keep their identities.
+
+- **`cass dedup` removes the duplicate Claude and Pi rows that remote
+  mirrors created before the fix below.** It now also lists every
+  remote-mirror conversation archived under an agent that does not own the
+  mirrored store (`misattributed_mirror` in `--json`). With `--apply` it
+  deletes such a row only when the same file is also archived under the
+  right agent, so nothing but a duplicate is removed. A misattributed row
+  that is the only copy is reported and kept; run `cass index` to index the
+  file under the right agent, then `cass dedup` again.
+
+- **Sessions synced from a remote source are no longer also indexed as Claude
+  or Pi conversations.** Every connector scanned every remote mirror
+  container, and the Claude connector claimed the transcripts it found in
+  other providers' mirrors: each synced Pi, Prime, Factory or Gemini session
+  also appeared as a Claude conversation, and each Prime session as a Pi one.
+  When a source's configured path names a known provider store
+  (`~/.pi/agent/sessions`, `~/.factory/sessions`, ...), only that provider's
+  connectors scan its mirror now. A path that names no known store is still
+  scanned by every connector. Duplicates indexed before this fix stay in the
+  archive until `cass dedup --apply` removes them (above).
+
+- **`cass timeline` no longer runs out of memory on a large archive (#521).**
+  To count each conversation's messages it joined every message row into a
+  `GROUP BY`, and FrankenSQLite evaluated that over the whole messages table
+  before the time window narrowed anything, so on a large archive every
+  timeline was OOM-killed whatever its window or filters. Timeline now
+  selects the window's conversations first and counts each one's messages
+  through the messages index, so its cost follows the window.
+
+- **`cass stats --by-source` returns on a large archive.** The per-source
+  breakdown joined every message row into a `GROUP BY` by source. On a
+  9.7-million-message archive, v0.10.0 was still running it after 15
+  minutes, while plain `cass stats` returned in about a minute. It now takes
+  each selected conversation's source from the conversations table and
+  counts messages in one streaming pass over the messages index: 13.5
+  seconds on the same archive.
+
+- **A first `cass index` on a new install is no longer many times slower
+  than `cass index --full`.** With an empty archive, a plain `cass index`
+  rebuilt the lexical index inline from the scan. It committed the index at
+  every batch, and every commit re-verified every segment, so the work grew
+  with the square of the index size: 10,252 Codex sessions took 62 minutes,
+  against 7 with `--full`. An empty archive now ingests first and builds
+  the index once from the database, as `--full` does; on the same host and
+  binary the two now take the same time. As with an interrupted `--full`, an
+  interrupted first index leaves no partial lexical index; the next run
+  builds it from the database before scanning the remaining sources.
+- **`cass search` and `cass pack` open the lexical index once.** Before
+  each search, cass checks that the lexical index is usable by opening it,
+  and every open verifies the hash of every live segment. The search then
+  opened and verified the index a second time. On this project's 41 GB
+  index (23 live segments, cass 0.10.0), a one-hit `cass search` took a
+  median of 20.1 s. The same search with `--no-maintenance`, which already
+  opened the index once, took 10.6 s. The default path now reuses the
+  reader the check opened, whenever the check found the index usable as it
+  is.
+- **A refused automatic wildcard retry no longer discards the exact hits
+  (#518 follow-up).** On an index of at most 10,000 documents, a sparse
+  exact search retries with `*term*` wildcards. When that retry ran out of
+  Quill query fuel, the whole search failed and the exact query's hits were
+  lost. Search now returns them, and robot mode reports
+  `_meta.wildcard_fallback_skipped: "query_fuel_exhausted"`.
+- **`cass doctor baseline save|diff|update` works on Windows.** Its path
+  check refused any path with a drive prefix, and every absolute Windows
+  path has one, so every baseline failed with "doctor baseline path is not
+  portable-safe". It now refuses `..` components and relative requests that
+  are not plain names (`D:name`, `\name`), which `join` would let escape the
+  baselines directory.
+- **OpenCode SQLite exports shut down the connector runtime before Windows
+  process teardown (#519).** The connector keeps a separate thread-local
+  Asupersync runtime. Dropping it after Windows terminated its worker
+  threads could panic with `threads should not terminate unexpectedly`
+  and exit `0xC0000409`, despite a complete export. FAD `=0.3.10` exposes
+  early shutdown; CASS now calls it alongside both of its own bridges on
+  success and error paths. Cleanup continues through all three bridges even
+  if one times out. Export matching also requires the requested database,
+  so an unreadable store cannot be replaced by a same-ID session from another default
+  OpenCode store. The preceding WAL salt warning remains a separate
+  diagnostic; FAD now logs the full chain for actual database-read errors.
+  The maintainer reports native Windows reproduction and verification of
+  the shutdown API in issue #519. The additional lifecycle and concurrency
+  regressions remain unexecuted here because dependency compilation exceeded
+  the available memory; this exact integration still needs runtime and native
+  Windows qualification.
+- **A two-word search no longer runs out of query fuel on a fragmented
+  index (#518).** In cass 0.10.0, Quill 0.3.4 charged the dictionary
+  lookups behind each term statistic again for every segment it searched,
+  so a query's cost grew with the square of the segment count. On an index
+  with thousands of segments, `cass search "git fixture"` spent its whole
+  10,000,000-unit budget on dictionary blocks and failed. Quill 0.4.0 (see
+  Changed) computes each statistic once per search. A test now runs a
+  two-word query over 120 one-document segments under a 40,000-unit budget;
+  it fails on v0.10.0.
+- **Errors print their remedy in human mode too.** The hint (for example
+  "Run 'cass index --full' once…" for a missing index, or the fuel-budget
+  remedies) reached only `--robot`/`--json` error envelopes. A human-mode
+  error now prints it on a `Hint:` line after the message. That includes
+  a mistyped command: `cass export --format json` printed only "Could not
+  parse arguments", and now also says which argument is missing and shows
+  examples.
+- **On Windows, `cass index` no longer fails with "Access is denied" while
+  replacing a semantic index.** A semantic rebuild or reconciliation over an
+  existing vector index kept its own handles to that file open while it
+  renamed the new generation over it, and Windows refuses such a rename:
+  `cass index --full` exited 9 with "install complete semantic rebuild |
+  Access is denied". The handles now close first.
+- **On Windows, a search or the TUI that has the semantic index open no
+  longer blocks `cass index` from replacing it.** frankensearch-index 0.4.1
+  (a lockfile update) moves a new vector or HNSW file into place with
+  `std::fs::rename`. On Windows that uses POSIX rename semantics, so a reader
+  keeps the generation it mapped, as on Unix, and the install no longer
+  fails with "Access is denied".
+- **On Windows, `cass index --semantic --build-hnsw` builds the HNSW graph
+  instead of failing every time.** After dumping the graph, frankensearch-index
+  flushed the graph and data files through read-only handles, and Windows
+  flushes a file only through a handle with write access, so the build
+  exited 9 with "failed to sync dumped HNSW sidecar ... Access is denied".
+  frankensearch-index 0.4.2 (a lockfile update) flushes them through write
+  handles.
+- **`cass index` hashes the lexical index fewer times.** Opening the Quill
+  writer verified (hashed) every segment four times: after recovery, again
+  for the orphan witness and for the garbage sweep, and once more for the
+  writer itself. frankensearch-quill 0.4.1 (a lockfile update) keeps the
+  post-recovery view and judges the other passes against it, so a no-op
+  `cass index` verifies the whole index three times instead of six.
+- **On Windows, `cass doctor archive-normalize` keeps the drive in its
+  plan.** The data directory in the plan's fingerprint and in the printed
+  apply command lost its drive: `C:\Users\x\data` became `/Users/x/data`.
+  So `C:\x` and `D:\x` produced the same plan identity, and the printed
+  `--data-dir` named a path on whatever drive was current. Windows plans
+  made by an older binary must be made again.
+- **On Windows, `cass index --watch-once` records plain `C:\...` source
+  paths.** It canonicalized each requested path with
+  `std::fs::canonicalize`, which on Windows returns the verbatim spelling
+  `\\?\C:\...`. A session first indexed through `--watch-once` kept that
+  spelling as its source path, so search results showed `\\?\C:\...`.
+  The watch-once paths, the scan roots matched against
+  them and the source-ledger key now drop the `\\?\` prefix whenever the
+  plain spelling names the same file, using `dunce`. Long paths and other
+  names that need the prefix keep it. A watch-once run and a scan of the
+  same session never created a second conversation, because both merge on
+  the session's id. Three more places compared the two spellings on
+  Windows:
+  - `cass sessions --workspace` and `--current` dropped sessions whose
+    stored workspace no longer exists.
+  - The swarm status asked Agent Mail for a `\\?\C:\...` project key that
+    no agent registers.
+  - The guard that keeps stale-on-read refresh and the TUI's first-run index
+    out of scratch data dirs missed a temp data dir that did not exist yet.
+    That last guard missed the same case on macOS, where the temp dir
+    resolves to `/private/var/folders/...`.
+  Linux is unchanged.
+- **On Windows, a stalled `cass index` exits 70 again instead of crashing.**
+  After printing the `index-stalled` envelope, the stall abort called
+  `std::process::exit(70)`. On Windows that ends the other threads and then
+  runs the exiting thread's thread-local destructors. One of them joined a
+  worker thread the exit had already killed, panicked, and the process
+  aborted with 0xC0000409 ("thread local panicked on drop") instead of the
+  documented exit 70. The exit now happens on a fresh thread that holds no
+  such state. Linux and macOS are unchanged.
+- **`cass index` verifies the lexical index one time fewer per run.** Each
+  Quill open hashes every live segment, and the startup check opened the
+  index twice: once for its document count and once for the contract check.
+  One open now supplies both. A writer's document count also comes from the
+  snapshot the writer already verified instead of a fresh reader. On a
+  471,594-message test archive with a 678 MB index, a run with nothing to
+  index now reads 4.1 GB through the page cache instead of 4.8 GB (disk reads
+  unchanged at 703 MB). Most of the remaining work is the Quill writer open,
+  which verifies the index four times; frankensearch's main branch reduces
+  that to once, and cass needs a frankensearch release to pick it up.
+- **`cass index` repairs duplicate `fts_messages` schema rows again instead
+  of refusing the archive.** Two pre-index checks counted the duplicate row
+  as archive damage, so `cass index` exited with "refusing to index: the
+  canonical archive ... is malformed" (exit 9) or "index refused to modify
+  an unhealthy canonical archive" (exit 5). The duplicate rows come from the
+  search FTS table, which cass rebuilds from the archive, and the regular
+  open already removes them. Both checks now let that open repair them; any
+  other malformed archive is still refused.
+- **`cass index --json` counts reused Claude Code and Codex sessions as
+  indexed again.** `connector_summary.<provider>.indexed` counts unchanged
+  sessions reused from the source ledger. For Claude Code and Codex, which
+  no longer list unchanged sessions before reusing them, the count covered
+  only the sessions parsed in that run.
 - **`CASS_EXCLUDE_PATHS` now keeps excluded sessions out of the index for
   every connector.** Only the Claude Code, Codex, Codebuff and Pi readers
   consulted the variable. For Gemini, Cursor, OpenCode, Aider and the other
@@ -239,6 +530,21 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   placeholder with every provider "not wired yet" and every count 0.
   Entering the tab now starts one background read, `r` reads again, and a
   count whose provider could not be read shows `?` instead of 0.
+- **franken-agent-detection 0.3.10 (from 0.3.8) changes what is indexed.**
+  0.3.10 is 0.3.9 plus the shutdown hook of the #519 fix, and 0.3.9
+  carries these connector changes. cass now indexes Qwen Code's native
+  JSONL sessions and Cline's native task directories. Gemini histories are
+  replayed the way Gemini CLI writes them: earlier versions of a reply are
+  no longer kept as separate messages, and turns that hold only thoughts or
+  tool calls are kept. Copilot CLI sessions are indexed only under
+  `copilot_cli`, no longer also under `copilot`. A transcript that fails
+  partway through a read is dropped instead of being indexed as complete.
+  An invalid `CASS_EXCLUDE_PATHS` entry (one that cannot be resolved, or a
+  relative entry with no usable working directory) is now an error from the
+  Claude Code, Codex and Pi-family readers; it used to mean "no
+  exclusions". The first index run with the new build re-reads sources that
+  are already indexed, so existing Gemini, Cline and Copilot CLI sessions
+  change then.
 - **frankensearch 0.7.1 / frankensearch-quill 0.4.0.** This is the first
   main-branch quill release after the 0.3.4 hotfix, and it keeps that
   hotfix's grammar, union and date-filter fixes. Snapshot segments are

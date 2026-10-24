@@ -161,7 +161,7 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 | `frankensqlite` (`fsqlite`) | Pure-Rust SQLite reimplementation — primary storage backend |
 | `rusqlite` | Dev-dependency only: C-SQLite interop fixtures in tests. Production never links it (historical salvage uses the external `sqlite3` CLI) |
 | `frankensearch` | Unified search engine: lexical BM25 + semantic + RRF fusion |
-| `franken_agent_detection` | Agent session auto-detection across 15+ providers |
+| `franken_agent_detection` | Agent session auto-detection across 34 providers |
 | `frankentorch` (via `frankensearch`) | Pure-Rust native MiniLM embeddings and reranking |
 | `frankenhnsw` (via `frankensearch`) | HNSW approximate nearest neighbors |
 | `half` + `wide` + `memmap2` | f16 quantized vectors, portable SIMD, memory-mapped I/O |
@@ -184,21 +184,31 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 **Optional local sibling checkouts** (under `/data/projects/`, via commented local patches only):
 - `frankensqlite` — Pure-Rust SQLite with BEGIN CONCURRENT (MVCC multi-writer)
 - `frankensearch` — Unified search: BM25 lexical + semantic embeddings + RRF fusion + reranking
-- `franken_agent_detection` — Auto-discovers agent sessions from 15+ providers
+- `franken_agent_detection` — Auto-discovers agent sessions from 34 providers
 - `frankentui` (`ftui` + `ftui-extras` + `ftui-runtime` + `ftui-tty`) — Terminal UI framework
 - `asupersync` — Async runtime (multi-thread, fs, spawn_blocking, signals)
 - `toon` — Token-optimized serialization
 
 **Dependency source contract:**
 
-Dependency update (2026-10-04): Cargo.toml and Cargo.lock pin the entire
-SQLite family, including `fsqlite-types`, at `=0.4.9`, with Asupersync `=0.5.0`.
-All 26 public SQLite packages are published at 0.4.9 (replacing the withdrawn
-0.4.8); the v0.4.9 tag points to `1eacdbe0d4bd1d864b106c096c904d2a3933ab46`.
-FAD `=0.3.8` accepts the family.
-The lockfile resolves the 20 SQLite packages used by CASS at 0.4.9.
-Full runtime qualification and the strict UBS gate remain pending. Do not
-publish a release candidate until those gates pass.
+Dependency update (2026-10-17): Cargo.toml and Cargo.lock pin the entire
+SQLite family, including `fsqlite-types`, at `=0.4.12`, with Asupersync `=0.5.0`.
+The v0.4.12 tag points to `26aa19afcbd5afdb01658a10bb33417ad0b513be`. 0.4.12
+carries the 0.4.10 data-integrity advisory fix (explicit-transaction inserts
+appended through a stale retained right-edge leaf and corrupted a table
+b-tree, bd-obwsy; 0.4.9 and the shipped v0.10.0's 0.4.6 are affected),
+ROLLBACK returning reserved AUTOINCREMENT rowids (bd-gwoit), reading a WAL
+a stock writer truncated to zero bytes as empty (bd-yxqs9, GH#519), and
+explicit-rowid writes to a table holding the largest rowid (9308c4bb6).
+FAD `=0.3.10` (git rev `6b337ba434b72c65c6c5a748b7ec47885f840ac0` for GH#520 remote-mirror source identity and Continue connector) asks for fsqlite `^0.4.1`, so it accepts the family, and exposes early SQLite bridge shutdown
+for Windows process teardown (GH#519).
+The lockfile resolves the 20 SQLite packages used by CASS at 0.4.12.
+CASS runtime qualification of 0.4.12 passed (gi7k7, 2026-10-19): a real
+`cass index --full` verified by stock sqlite3 on 0.4.12 and 0.4.9; the Linux,
+macOS and Windows storage subsets (the Windows failures are identical on
+0.4.9, v107y); release index timing on macOS inside its A/A null. The strict
+UBS gate (5v57k) remains pending. Do not publish a release candidate until it
+passes.
 SQLite `0.4.2` adds explicit derived WAL-index recovery for read-only opens
 (GH#477). The published SQLite 0.4.1 includes the GH#462 reserved-page WAL
 repair, but damaged-archive recovery remains unproven. SQLite 0.4.4 adds
@@ -216,14 +226,14 @@ WAL index (0853f5e8e). 0.4.9 refuses that index promptly again (48c6cf6b2) and
 lets the first write after stock SQLite opened the archive read-only
 establish the WAL generation instead of failing `BusyRecovery` on every later
 commit (frankensqlite GH#443, 4b48c95d8; cass GH#509/#508).
-The strict family guard requires uniform 0.4.9 registry versions.
+The strict family guard requires uniform 0.4.12 registry versions.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` (`fsqlite`) / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.9` (tag v0.4.9 = `1eacdbe0d4bd1d864b106c096c904d2a3933ab46`); `build.rs` refuses a mixed family. Carries 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs, 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes, 0.4.7's large multi-row INSERT index fix (bd-2eebi), serialized-DDL race fix (bd-4iaoi), GH#503 shadow-autoindex repair open, bounded published-page plane (5s1la) and first-`sqlite_master` full-file read fix (k2k20), and 0.4.9's prompt stale-WAL-index refusal (48c6cf6b2) and stock-empty-WAL-index first-write fix (4b48c95d8, cass GH#509). CASS runtime qualification of 0.4.9 is pending. 0.4.6 included upstream's likely fix (fd8c16a94) for a long-lived connection left refusing every BEGIN (2l1b0.75, frankensqlite GH#429), not yet verified on the owner-archive scenario; the legacy OMP analytics phase keeps its own fresh writer regardless |
-| `franken-agent-detection` | crates.io `=0.3.8`, features `pi-durable` and `pi-sqlite` (the `pi_durable` connector for Pi's durable-harness stores, FAD#28; `pi_agent_rust` SQLite sessions; Pi compaction/branch provenance, FAD#27) and `codex-zstd` (reads Codex rollouts compressed to `rollout-*.jsonl.zst` by Codex's `local_thread_store_compression`, with the id of their plain form, GH#513; indexes native Codebuff transcripts, whose timestamps are a locale time of day, with each instant taken from the message ID, and keeps indexing a store's other chats when one transcript does not parse, GH#511; indexes OpenCode 2.x sessions from `session_v2`/`session_message`, GH#504; decodes OpenClaw zstd-compressed transcript events; indexes Claude Code prompts typed mid-turn, GH#500; honors `CASS_EXCLUDE_PATHS` in the Codex and Pi-family connectors, GH#486, and resolves `..`, relative and symlink-alias spellings of an entry, 0f1k0; caps session reads while reading, and lets cass set the Codex rollout budget so `CASS_CODEX_MAX_SOURCE_BYTES` above 100 MiB works) |
+| `frankensqlite` (`fsqlite`) / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.12` (tag v0.4.12 = `26aa19afcbd5afdb01658a10bb33417ad0b513be`); `build.rs` refuses a mixed family. Carries 0.4.12's bd-obwsy (the 0.4.10 advisory), bd-gwoit, bd-yxqs9 and largest-rowid explicit-write (9308c4bb6) fixes, plus 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs, 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes, 0.4.7's large multi-row INSERT index fix (bd-2eebi), serialized-DDL race fix (bd-4iaoi), GH#503 shadow-autoindex repair open, bounded published-page plane (5s1la) and first-`sqlite_master` full-file read fix (k2k20), and 0.4.9's prompt stale-WAL-index refusal (48c6cf6b2) and stock-empty-WAL-index first-write fix (4b48c95d8, cass GH#509). CASS runtime qualification of 0.4.12 passed (gi7k7). 0.4.6 included upstream's likely fix (fd8c16a94) for a long-lived connection left refusing every BEGIN (2l1b0.75, frankensqlite GH#429), not yet verified on the owner-archive scenario; the legacy OMP analytics phase keeps its own fresh writer regardless |
+| `franken-agent-detection` | `=0.3.10` at git rev `6b337ba434b72c65c6c5a748b7ec47885f840ac0` (GH#520 remote-mirror source identity, Continue `continue` and Kiro CLI `kiro` connectors, early SQLite connector runtime shutdown and full OpenCode read-error chains, GH#519), features `pi-durable` and `pi-sqlite` (the `pi_durable` connector for Pi's durable-harness stores, FAD#28; `pi_agent_rust` SQLite sessions; Pi compaction/branch provenance, FAD#27) and `codex-zstd` (reads Codex rollouts compressed to `rollout-*.jsonl.zst` by Codex's `local_thread_store_compression`, with the id of their plain form, GH#513; indexes native Codebuff transcripts, whose timestamps are a locale time of day, with each instant taken from the message ID, and keeps indexing a store's other chats when one transcript does not parse, GH#511; indexes OpenCode 2.x sessions from `session_v2`/`session_message`, GH#504; decodes OpenClaw zstd-compressed transcript events; indexes Claude Code prompts typed mid-turn, GH#500; honors `CASS_EXCLUDE_PATHS` in the Codex and Pi-family connectors, GH#486, and resolves `..`, relative and symlink-alias spellings of an entry, 0f1k0; caps session reads while reading, and lets cass set the Codex rollout budget so `CASS_CODEX_MAX_SOURCE_BYTES` above 100 MiB works) |
 | `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x requires) |
-| `frankensearch` | crates.io `=0.7.1` (tag `crates-v0.7.1`), resolving `frankensearch-quill 0.4.0`, `frankensearch-rerank 0.5.0`, `frankenhnsw 0.3.5` and the `frankentorch-*` family; features `hash`, `cass-compat`, `quill`, `ann`, `native`. Quill 0.4.0 is the first main-branch release after the 0.3.4 hotfix and carries all three of its fixes: the GH#499 live-doc numeric scoring, the standard CASS Boolean grammar (NOT > AND > OR, parentheses; frankensearch#56) and the union seek_danger fix (a disjunction under a conjunction lost matches on concat-merged segments). It also verifies snapshot segments concurrently on open (GH#501; up to 8 threads, the same bytes are still hashed), builds snippets only for returned hits, and skips a read-only reopen when nothing was published. The CASS schema hash is unchanged (`v9-quill`), so the upgrade does not rebuild the lexical index |
+| `frankensearch` | crates.io `=0.7.1` (tag `crates-v0.7.1`), resolving `frankensearch-index 0.4.2` (hotfix, tag `frankensearch-index-v0.4.2`: files are installed with `std::fs::rename`, so on Windows an open reader no longer blocks an install, bead if17v; and the dumped HNSW sidecars are flushed through write handles, so an HNSW build works on Windows, bead ujxiq), `frankensearch-quill 0.4.1` (hotfix, tag `frankensearch-quill-v0.4.1`: opening a writer verifies each segment once instead of four times; bead hfosx), `frankensearch-rerank 0.5.0`, `frankenhnsw 0.3.5` and the `frankentorch-*` family; features `hash`, `cass-compat`, `quill`, `ann`, `native`. Quill 0.4.0 is the first main-branch release after the 0.3.4 hotfix and carries all three of its fixes: the GH#499 live-doc numeric scoring, the standard CASS Boolean grammar (NOT > AND > OR, parentheses; frankensearch#56) and the union seek_danger fix (a disjunction under a conjunction lost matches on concat-merged segments). It also verifies snapshot segments concurrently on open (GH#501; up to 8 threads, the same bytes are still hashed), builds snippets only for returned hits, and skips a read-only reopen when nothing was published. The CASS schema hash is unchanged (`v9-quill`), so the upgrade does not rebuild the lexical index |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |
 | `toon` (`tru`) | crates.io `=0.2.4` (2026-08-24; production sources byte-identical to the previously pinned git rev `d7185c78` — registry 0.2.3 was rejected because its tree differs from the rev in real source despite the matching version field) |
 
@@ -323,7 +333,7 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ### UBS Pre-Merge Gate
 
-Per `coding_agent_session_search-dpfvr`, every PR is meant to run `ubs --ci --fail-on-warning` against the changed files in CI (`.github/workflows/ci.yml::ubs-changed-files`). The gate is **blocking** — warnings stop merges. **GitHub Actions is permanently off** (owner, 2026-10-09: "NO GH ACTIONS, PERIOD!!! EVER!!! we ONLY ever use /dsr"). Nothing under `.github/workflows/` runs: do not add or edit a workflow as a verification lane, and never make a bead's closure wait on a workflow run. Windows and macOS proof comes from the dsr build hosts (`dsr health all`), releases from `dsr build` / `dsr release` / `dsr fallback`. This gate — like fmt/clippy/tests — is agent-run through `rch` before pushing. Run it as ONE fleet admission with `scripts/gate.sh` (fmt, clippy `-D warnings`, lib tests, targeted integration tests, goldens; `--lib-filter`, `--integration name:filter,...`, `--regen-goldens`; `GATE_RETRIES=40` retries fleet refusals) and cite its `STAGE=<name> EXIT=<code>` receipt lines in the bead closure and the commit message — never spend an admission on a bare `cargo check`.
+Per `coding_agent_session_search-dpfvr`, every change runs `ubs --ci --fail-on-warning` against the changed files (the `ubs` stage of `scripts/gate.sh`). The gate is **blocking** — warnings stop merges. **GitHub Actions is permanently off** (owner, 2026-10-09: "NO GH ACTIONS, PERIOD!!! EVER!!! we ONLY ever use /dsr"). `.github/workflows/` stays empty: never add a workflow for anything (verification, patch application, publication), never park a fix in one, and never make a bead's closure wait on a workflow run. `scripts/gate.sh` refuses to run on a tree that carries a workflow file, and `tests/no_github_actions.rs` fails on one (all 67 were removed 2026-10-21 with the owner's approval, after finished fixes parked in them sat unapplied on main: bead nqbwq). Windows and macOS proof comes from the dsr build hosts (`dsr health all`), releases from `dsr build` / `dsr release` / `dsr fallback`. This gate — like fmt/clippy/tests — is agent-run through `rch` before pushing. Run it as ONE fleet admission with `scripts/gate.sh` (fmt, clippy `-D warnings`, lib tests, targeted integration tests, goldens; `--lib-filter`, `--integration name:filter,...`, `--regen-goldens`; `GATE_RETRIES=40` retries fleet refusals) and cite its `STAGE=<name> EXIT=<code>` receipt lines in the bead closure and the commit message — never spend an admission on a bare `cargo check`.
 
 **Local pre-flight before pushing:**
 
@@ -339,7 +349,7 @@ ubs $(git diff --name-only --cached)
 
 If a known-acceptable warning needs to ship despite the gate, suppress at the UBS config level (`tests/policies/no_mock_allowlist.json` or per-file inline pragma) — never bypass by removing the gate.
 
-The pinned UBS version lives in `.github/workflows/ubs-version.txt`. Local installs should match.
+The pinned UBS version lives in `scripts/ubs-version.txt`. Local installs should match.
 
 ---
 
@@ -421,7 +431,7 @@ Running browser tests there:
 - Can freeze or slow down the development machine
 - May have different results than a clean host due to environment differences
 
-GitHub Actions is permanently off, so `.github/workflows/browser-tests.yml` never runs: pushing a branch does not run them. Run browser specs on a dsr build host, one spec file at a time while debugging (`test.only()`), and name the host in the receipt.
+GitHub Actions is permanently off, so pushing a branch never runs them. Run browser specs on a dsr build host, one spec file at a time while debugging (`test.only()`), and name the host in the receipt.
 
 ---
 
@@ -679,8 +689,9 @@ cass robot-docs guide         # LLM-optimized docs
 | Shelley | FAD `shelley` (feature `shelley`) | SQLite |
 | Pi Durable | FAD `pi_durable` (SQLite stores with feature `pi-durable`) | SQLite / JSONL commit log |
 | Kiro CLI | FAD `kiro` | event-log JSONL + JSON snapshot |
+| Continue | FAD `continue` | JSON session snapshots |
 
-All 33 connectors registered at runtime are listed by `cass capabilities --json` under `connectors`.
+All 34 connectors registered at runtime are listed by `cass capabilities --json` under `connectors`.
 
 ### HTML Export (Robot Mode)
 
@@ -1366,4 +1377,4 @@ NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are cha
 
 Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.
 
-For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"
+For any web requests you must make with curl or otherwise, identify yourself honestly: use a User-Agent that names this project, e.g. "coding_agent_session_search-agent (+https://github.com/Dicklesworthstone/coding_agent_session_search)". Never borrow another product's or company's crawler or client User-Agent, and never spoof a client to get past a block.

@@ -547,6 +547,8 @@ fn later_native_failure_discards_earlier_graph_and_delta_winners() {
     let set = SemanticAnnShardSet {
         artifacts: Arc::clone(&ctx.artifacts),
         graphs: vec![first_graph, wrong_graph],
+        native_ordinals: vec![0, 1],
+        exact_shards: Vec::new(),
     };
     let before = files(temp.path());
     let (expected, _) =

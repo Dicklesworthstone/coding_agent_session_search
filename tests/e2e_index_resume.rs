@@ -2,11 +2,12 @@
 use coding_agent_search::franken_sync::SqliteValue;
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use serde_json::{Value, json};
+use std::{fs, path::Path, process::Command, time::Duration};
+// Only the signal tests below are unix-only users of these.
+#[cfg(unix)]
 use std::{
-    fs,
-    path::Path,
-    process::{Child, Command, Stdio},
-    time::{Duration, Instant},
+    process::{Child, Stdio},
+    time::Instant,
 };
 
 fn source_term(source: usize) -> String {
@@ -198,7 +199,12 @@ fn gh426_bounded_stop_resumes_only_uncommitted_sources_in_both_modes() {
                 .get_output()
                 .stdout
                 .clone();
-        verify_completed_summary(&resumed, if reusable { 6 } else { 8 }, 8);
+        // at3us: an interrupted first index rebuilds no lexical index inline
+        // (as an interrupted --full), so the resume repairs it from the
+        // database before its scan, and after that repair the run's counters
+        // describe the archive (GH #457). Which sources this run parsed is
+        // asserted from the trace below.
+        verify_completed_summary(&resumed, 8, 8);
         let log = fs::read_to_string(&resumed_trace).unwrap();
         let observations = source_observations(&log);
         assert_eq!(

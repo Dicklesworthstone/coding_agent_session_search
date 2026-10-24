@@ -8,6 +8,7 @@
 mod artifacts;
 mod delegate;
 mod engine;
+mod replay;
 #[cfg(unix)]
 mod unchanged;
 
@@ -17,6 +18,12 @@ pub use artifacts::{
     reclaim_backfill_artifacts,
 };
 pub use engine::*;
+// Explicitly select bounded message replay over the engine glob export.
+pub(crate) use replay::{
+    packet_embedding_inputs_from_storage_for_message_ids,
+    packet_embedding_inputs_from_storage_since, packet_embedding_inputs_from_storage_with_progress,
+    visit_packet_embedding_inputs_from_storage,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -443,21 +450,23 @@ mod external_diagnostic_tests {
                 .checkpoint
                 .is_none()
         );
-        let mut manifest = SemanticManifest::default();
-        manifest.checkpoint = Some(BuildCheckpoint {
-            tier: TierKind::Quality,
-            embedder_id: "retained-provider".into(),
-            last_offset: 1,
-            docs_embedded: 1,
-            conversations_processed: 1,
-            total_conversations: 3,
-            db_fingerprint: "old-archive-fingerprint".into(),
-            schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
-            chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
-            saved_at_ms: 1,
-            last_message_id: Some(1),
-            cursor_exhausted: false,
-        });
+        let mut manifest = SemanticManifest {
+            checkpoint: Some(BuildCheckpoint {
+                tier: TierKind::Quality,
+                embedder_id: "retained-provider".into(),
+                last_offset: 1,
+                docs_embedded: 1,
+                conversations_processed: 1,
+                total_conversations: 3,
+                db_fingerprint: "old-archive-fingerprint".into(),
+                schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+                chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+                saved_at_ms: 1,
+                last_message_id: Some(1),
+                cursor_exhausted: false,
+            }),
+            ..SemanticManifest::default()
+        };
         manifest.save(dir.path()).unwrap();
         let before = std::fs::read(SemanticManifest::path(dir.path())).unwrap();
         // Use the already initialized provider; don't re-resolve an endpoint

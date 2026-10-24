@@ -14,6 +14,8 @@ use frankensearch::core::generation::{EmbeddingIdentityBundleV1, EmbeddingSpaceK
 use super::*;
 use crate::search::embedder::Embedder;
 
+pub(super) mod refinement;
+
 /// Bound the borrowed input before inspecting producers or running inference.
 pub const MAX_TEXT_QUERY_BYTES: usize = 4_096;
 

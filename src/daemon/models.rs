@@ -6,6 +6,9 @@
 
 mod slot;
 
+#[cfg(test)]
+mod test_support;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,7 +18,9 @@ use super::protocol::ModelInfo;
 use crate::search::embedder::{Embedder, EmbedderError, EmbedderResult};
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::fastembed_reranker::FastEmbedReranker;
-use crate::search::reranker::{Reranker, RerankerError, RerankerResult, rerank_texts};
+#[cfg(test)]
+use crate::search::reranker::RerankerError;
+use crate::search::reranker::{Reranker, RerankerResult, rerank_texts};
 use frankensearch::ModelCategory;
 use frankensearch::core::EmbeddingIdentityBundleV1;
 use slot::ModelSlot;
@@ -82,14 +87,7 @@ impl ModelManager {
     pub fn embedder_attestation_identity(
         &self,
     ) -> EmbedderResult<(EmbeddingIdentityBundleV1, ModelCategory)> {
-        self.warm_embedder()?;
-        let model = self
-            .embedder
-            .get()
-            .ok_or_else(|| EmbedderError::EmbedderUnavailable {
-                model: "unknown".to_owned(),
-                reason: "embedder not loaded".to_owned(),
-            })?;
+        let model = self.acquire_embedder()?;
         let identity = model.identity()?.clone();
         identity.validate()?;
         Ok((identity, model.category()))
@@ -143,7 +141,14 @@ impl ModelManager {
 
     /// Load one native embedder. Only the loader gate is held during I/O.
     pub fn warm_embedder(&self) -> EmbedderResult<()> {
-        self.embedder.load_with(|| {
+        self.acquire_embedder().map(drop)
+    }
+
+    /// Retain one producer for the entire caller-owned operation. Loading and
+    /// owner acquisition share a single publication handoff, including when
+    /// another thread unloads the slot immediately after a successful load.
+    pub(super) fn acquire_embedder(&self) -> EmbedderResult<Arc<dyn Embedder>> {
+        self.embedder.acquire_with(|| {
             // Check selection before model-directory overrides. Installed
             // MiniLM bytes must never enable a disabled quality tier.
             if FastEmbedder::canonical_name(&self.embedder_registry_name).is_none() {
@@ -180,7 +185,12 @@ impl ModelManager {
     }
 
     pub fn warm_reranker(&self) -> RerankerResult<()> {
-        self.reranker.load_with(|| {
+        self.acquire_reranker().map(drop)
+    }
+
+    /// Reranking chunks and response metadata must use this same owner.
+    pub(super) fn acquire_reranker(&self) -> RerankerResult<Arc<dyn Reranker>> {
+        self.reranker.acquire_with(|| {
             let model_dir = FastEmbedReranker::default_model_dir(&self.data_dir);
             info!(model_dir = %model_dir.display(), "Loading reranker");
             let model = FastEmbedReranker::load_from_dir(&model_dir).map_err(|error| {
@@ -196,38 +206,18 @@ impl ModelManager {
     }
 
     pub fn embed_batch(&self, texts: &[String]) -> EmbedderResult<Vec<Vec<f32>>> {
-        self.warm_embedder()?;
-        let model = self
-            .embedder
-            .get()
-            .ok_or_else(|| EmbedderError::EmbedderUnavailable {
-                model: "unknown".to_owned(),
-                reason: "embedder not loaded".to_owned(),
-            })?;
+        let model = self.acquire_embedder()?;
         let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
         model.embed_batch_sync(&texts)
     }
 
     pub fn embed(&self, text: &str) -> EmbedderResult<Vec<f32>> {
-        self.warm_embedder()?;
-        let model = self
-            .embedder
-            .get()
-            .ok_or_else(|| EmbedderError::EmbedderUnavailable {
-                model: "unknown".to_owned(),
-                reason: "embedder not loaded".to_owned(),
-            })?;
+        let model = self.acquire_embedder()?;
         model.embed_sync(text)
     }
 
     pub fn rerank(&self, query: &str, documents: &[String]) -> RerankerResult<Vec<f32>> {
-        self.warm_reranker()?;
-        let model = self
-            .reranker
-            .get()
-            .ok_or_else(|| RerankerError::RerankerUnavailable {
-                model: "reranker".to_owned(),
-            })?;
+        let model = self.acquire_reranker()?;
         let documents: Vec<&str> = documents.iter().map(String::as_str).collect();
         rerank_texts(model.as_ref(), query, &documents)
     }

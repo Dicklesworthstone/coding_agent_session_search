@@ -531,15 +531,11 @@ fn seed_large_health_latency_db(data_dir: &Path) {
 /// --json p50 latency must stay below the documented `<50ms`
 /// fast-surface budget (README line 14, `cass health --help`).
 ///
-/// **CI wiring:** this test lives in `tests/e2e_health.rs` and is
-/// auto-included in CI by the `git ls-files 'tests/e2e_*.rs'` glob
-/// in `.github/workflows/ci.yml:227` ("Run Rust E2E tests with JSONL
-/// logging" step). Any regression that pushes the warmed p50 above
-/// 50ms (e.g., a new synchronous DB query, an `fs::canonicalize`
-/// loop, or a synchronous embedder probe added to the health path)
-/// fails CI loudly instead of silently shipping. Pre-existing test
-/// scaffolding shipped by pane 4; this comment formalises the
-/// CI-hard-gate contract for future maintainers.
+/// **Gate wiring:** GitHub Actions is permanently off; run this target
+/// through `scripts/gate.sh --integration e2e_health`. Any regression that
+/// pushes the warmed p50 above 50ms (e.g., a new synchronous DB query, an
+/// `fs::canonicalize` loop, or a synchronous embedder probe added to the
+/// health path) fails that gate loudly instead of silently shipping.
 ///
 /// Flake mitigation: warmup runs followed by measured runs; the assertion uses
 /// the command-reported `latency_ms` so debug-binary relocation, dynamic linker

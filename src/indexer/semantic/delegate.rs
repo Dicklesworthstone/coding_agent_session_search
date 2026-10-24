@@ -14,6 +14,7 @@ use crate::search::semantic_manifest::TierKind;
 use crate::search::vector_index::{SemanticDocId, vector_index_path};
 
 mod append;
+mod hnsw;
 mod rebuild;
 mod reconcile;
 
@@ -108,6 +109,23 @@ impl SemanticIndexer {
     where
         I: IntoIterator<Item = EmbeddedMessage>,
     {
+        // Preserve argument-only rejection before creating a lock or archive.
+        // The engine retains its own checks and remains the sole publisher.
+        ensure!(
+            !plan.db_fingerprint.trim().is_empty(),
+            "semantic shard build requires a non-empty DB fingerprint"
+        );
+        ensure!(
+            plan.max_records_per_shard > 0,
+            "semantic shard build requires max_records_per_shard > 0"
+        );
+        self.inner.check_external_cancelled()?;
+        // Unique shard filenames do not serialize the shared sidecar's
+        // read/modify/write or its interaction with recovery. Hold the same
+        // lease as other vector writers through the final manifest save.
+        // Acquisition never sweeps unrelated scratch or assumes readiness.
+        let _artifacts = super::artifacts::BackfillArtifacts::for_shard_publication(data_dir)?;
+        self.inner.check_external_cancelled()?;
         self.inner
             .build_and_save_index_shards(embedded_messages, data_dir, plan)
     }
@@ -217,6 +235,9 @@ impl SemanticIndexer {
         Ok(Some(source))
     }
 
+    /// Serialize native graph verification/publication with backfill recovery.
+    /// The caller retains canonical-source authority; this lease never reclaims
+    /// its source or promotes manifest readiness.
     pub fn build_hnsw_index(
         &self,
         vector_index: &VectorIndex,
@@ -224,8 +245,9 @@ impl SemanticIndexer {
         m: Option<usize>,
         ef_construction: Option<usize>,
     ) -> Result<PathBuf> {
-        self.inner
-            .build_hnsw_index(vector_index, data_dir, m, ef_construction)
+        hnsw::run(self, vector_index, data_dir, m, ef_construction, || {
+            self.inner.check_external_cancelled()
+        })
     }
 
     pub(crate) fn completed_backfill_fingerprint(
@@ -354,6 +376,7 @@ mod full_rebuild_tests {
 
     mod cancellation;
     mod canonical;
+    mod hnsw;
 
     fn embedded(indexer: &SemanticIndexer) -> Result<Vec<EmbeddedMessage>> {
         indexer.embed_messages(&[

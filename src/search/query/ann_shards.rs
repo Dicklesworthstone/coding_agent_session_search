@@ -1,12 +1,16 @@
 //! Native ANN over every explicitly paired shard of one retained vector cohort.
 //!
-//! Admission is all-or-nothing: an unavailable sidecar never silently removes
-//! its source shard. The caller falls back to the complete exact cohort. Native
-//! loading uses the existing no-rebuild admission function; no query writes or
-//! rediscovers an artifact. Graph admission can still read all source vectors.
+//! Each optional accelerator is admitted independently against its retained
+//! source. Unavailable shards stay in the plan as exact searches; they never
+//! disappear and do not disable healthy graphs. An entirely unavailable cohort
+//! retains the caller's existing exact fallback. No query writes or rediscovers
+//! an artifact. Native admission can still read all source vectors.
 
 use super::*;
-use crate::search::ann_index::{AnnExactFallbackReason, AnnExactFallbackStats, AnnSearchStats};
+use crate::search::ann_index::{
+    AnnExactFallbackReason, AnnExactFallbackStats, AnnExactShardFallback, AnnPartialExactStats,
+    AnnSearchStats,
+};
 
 mod execution;
 mod refinement;
@@ -15,6 +19,9 @@ use refinement::{NativeRefillBudget, accumulate_native_stats};
 pub(super) struct SemanticAnnShardSet {
     artifacts: Arc<Vec<SemanticIndexArtifact>>,
     graphs: Vec<FsHnswIndex>,
+    // Parallel to graphs; do not confuse compact native positions with source ordinals.
+    native_ordinals: Vec<usize>,
+    exact_shards: Vec<AnnExactShardFallback>,
 }
 
 /// Only errors after query/owner validation may degrade to exact retrieval.
@@ -46,20 +53,30 @@ impl std::fmt::Display for NativeAnnSearchFailure {
 impl std::error::Error for NativeAnnSearchFailure {}
 
 impl SemanticAnnShardSet {
-    /// Cheap retained metadata check, before allocating any native graph.
+    /// Cheap whole-cohort unavailability, before allocating any native graph.
+    /// One potentially usable pairing keeps mixed admission possible.
     pub(super) fn unavailable_reason(
         artifacts: &[SemanticIndexArtifact],
     ) -> Option<SemanticAnnUnavailableReason> {
         if artifacts.is_empty() {
             return Some(SemanticAnnUnavailableReason::SidecarMissing);
         }
-        artifacts.iter().find_map(|artifact| {
-            artifact.ann_unavailable_reason().or_else(|| {
-                artifact
-                    .ann_path()
-                    .is_none()
-                    .then_some(SemanticAnnUnavailableReason::SidecarMissing)
-            })
+        let mut first = None;
+        for artifact in artifacts {
+            let reason = Self::pair_unavailable_reason(artifact)?;
+            first.get_or_insert(reason);
+        }
+        first
+    }
+
+    fn pair_unavailable_reason(
+        artifact: &SemanticIndexArtifact,
+    ) -> Option<SemanticAnnUnavailableReason> {
+        artifact.ann_unavailable_reason().or_else(|| {
+            artifact
+                .ann_path()
+                .is_none()
+                .then_some(SemanticAnnUnavailableReason::SidecarMissing)
         })
     }
 
@@ -97,14 +114,43 @@ impl SemanticAnnShardSet {
             }
         }
         let mut graphs = Vec::with_capacity(artifacts.len());
-        for artifact in artifacts.iter() {
-            let path = artifact.ann_path().ok_or(SemanticAnnOpenFailure {
-                reason: SemanticAnnUnavailableReason::SidecarMissing,
-                diagnostic: "shard_pairing_missing",
-            })?;
-            graphs.push(open_fs_semantic_ann_index(artifact.index(), path)?);
+        let mut native_ordinals = Vec::with_capacity(artifacts.len());
+        let mut exact_shards = Vec::new();
+        let mut first_failure = None;
+        for (shard, artifact) in artifacts.iter().enumerate() {
+            let opened = match Self::pair_unavailable_reason(artifact) {
+                Some(reason) => Err(SemanticAnnOpenFailure {
+                    reason,
+                    diagnostic: "shard_pairing_unavailable",
+                }),
+                None => open_fs_semantic_ann_index(
+                    artifact.index(),
+                    artifact.ann_path().expect("pairing checked above"),
+                ),
+            };
+            match opened {
+                Ok(graph) => {
+                    graphs.push(graph);
+                    native_ordinals.push(shard);
+                }
+                Err(failure) => {
+                    exact_shards.push(AnnExactShardFallback {
+                        shard,
+                        reason: failure.reason,
+                    });
+                    first_failure.get_or_insert(failure);
+                }
+            }
         }
-        Ok(Self { artifacts, graphs })
+        if graphs.is_empty() {
+            return Err(first_failure.expect("a nonempty unavailable cohort has a reason"));
+        }
+        Ok(Self {
+            artifacts,
+            graphs,
+            native_ordinals,
+            exact_shards,
+        })
     }
 }
 
@@ -116,6 +162,8 @@ mod tests {
     use super::*;
     use crate::search::vector_index::Quantization;
     use frankensearch::index::HnswConfig;
+
+    include!("ann_shards/mixed_tests.rs");
 
     fn doc(message: u64, source: u32) -> String {
         SemanticDocId {
@@ -647,10 +695,63 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_later_pair_rejects_the_whole_cohort() {
+    fn mixed_cohort_preserves_native_work_and_the_unavailable_shards_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = shard(dir.path(), "mixed-native", &records(1, 0.6));
+        let unavailable = shard(dir.path(), "mixed-exact", &records(2, 0.9));
+        let unavailable = SemanticIndexArtifact::open(unavailable.fsvi_path(), None).unwrap();
+        let context = recovery_context(Arc::new(vec![ready, unavailable]));
+        let before = snapshot(dir.path());
+        let set = SemanticAnnShardSet::open(Arc::clone(&context.artifacts))
+            .expect("an unavailable accelerator must not disable healthy native shards");
+        let (expected, _) = SearchClient::search_exact_semantic_indexes(
+            &context,
+            &[1.0, 0.0],
+            2,
+            Some(&selected_source()),
+        )
+        .unwrap();
+        let (hits, _, stats) = set
+            .search_with_exact_fallback(&context, &[1.0, 0.0], 2, Some(&selected_source()))
+            .unwrap();
+        assert_eq!(
+            ids(&hits),
+            vec![2, 1],
+            "never drop the exact shard's winner"
+        );
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (hit.message_id, hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .take(2)
+                .map(|hit| (hit.message_id, hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+        );
+        let stats = stats.expect("the healthy shard must actually execute native search");
+        assert_eq!(
+            stats.index_size, 65,
+            "exact vectors must not count as native work"
+        );
+        assert!(stats.k_requested > 0);
+        assert!(
+            stats.exact_fallback.is_none(),
+            "do not rescan the whole cohort"
+        );
+        assert_eq!(
+            snapshot(dir.path()),
+            before,
+            "query must not rebuild any artifact"
+        );
+    }
+
+    #[test]
+    fn entirely_unpaired_cohort_retains_the_existing_exact_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let first = shard(dir.path(), "a", &records(1, 0.6));
         let second = shard(dir.path(), "b", &records(2, 0.9));
+        let first = SemanticIndexArtifact::open(first.fsvi_path(), None).unwrap();
         let second = SemanticIndexArtifact::open(second.fsvi_path(), None).unwrap();
         let artifacts = Arc::new(vec![first, second]);
         let before = snapshot(dir.path());
@@ -679,7 +780,20 @@ mod tests {
         )
         .unwrap();
         let before = snapshot(dir.path());
-        assert!(SemanticAnnShardSet::open(Arc::new(vec![first, wrong])).is_err());
+        let context = recovery_context(Arc::new(vec![first, wrong]));
+        let set = SemanticAnnShardSet::open(Arc::clone(&context.artifacts)).unwrap();
+        assert_eq!(set.native_ordinals, vec![0]);
+        assert_eq!(set.exact_shards.len(), 1, "wrong graph is never admitted");
+        assert_eq!(set.exact_shards[0].shard, 1);
+        assert_eq!(
+            set.exact_shards[0].reason,
+            SemanticAnnUnavailableReason::SidecarNotNative
+        );
+        let (hits, _, stats) = set
+            .search_with_exact_fallback(&context, &[1.0, 0.0], 2, Some(&selected_source()))
+            .unwrap();
+        assert_eq!(ids(&hits), vec![2, 1]);
+        assert_eq!(stats.unwrap().partial_exact.unwrap().shards[0].shard, 1);
         assert_eq!(snapshot(dir.path()), before);
     }
 
@@ -763,7 +877,19 @@ mod tests {
         std::fs::write(&invalid, b"not-json").unwrap();
         let second = SemanticIndexArtifact::open(second.fsvi_path(), Some(invalid)).unwrap();
         let before = snapshot(dir.path());
-        assert!(SemanticAnnShardSet::open(Arc::new(vec![first, second])).is_err());
+        let context = recovery_context(Arc::new(vec![first, second]));
+        let set = SemanticAnnShardSet::open(Arc::clone(&context.artifacts)).unwrap();
+        assert_eq!(set.native_ordinals, vec![0]);
+        assert_eq!(
+            set.exact_shards.len(),
+            1,
+            "corrupt graph must remain unadmitted"
+        );
+        assert_eq!(set.exact_shards[0].shard, 1);
+        let (hits, _, _) = set
+            .search_with_exact_fallback(&context, &[1.0, 0.0], 2, Some(&selected_source()))
+            .unwrap();
+        assert_eq!(ids(&hits), vec![2, 1]);
         assert_eq!(snapshot(dir.path()), before);
     }
 
@@ -816,6 +942,8 @@ mod tests {
         let set = SemanticAnnShardSet {
             artifacts: Arc::clone(&artifacts),
             graphs: vec![first_graph, wrong_graph],
+            native_ordinals: vec![0, 1],
+            exact_shards: Vec::new(),
         };
         let before = snapshot(dir.path());
         let error = set.search(&artifacts, &[1.0, 0.0], 3, None).unwrap_err();

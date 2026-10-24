@@ -150,6 +150,11 @@ fn run_rsync_command(
     arg_protection: RsyncArgProtection,
 ) -> std::io::Result<std::process::Output> {
     let mut cmd = Command::new("rsync");
+    // Keep each negotiated attempt authoritative: inherited RSYNC_PROTECT_ARGS
+    // would otherwise re-enable -s on the rrsync compatibility retry (#531).
+    // RSYNC_OLD_ARGS disables rsync's own remote-shell escaping; never inherit it.
+    cmd.env("RSYNC_PROTECT_ARGS", "0")
+        .env_remove("RSYNC_OLD_ARGS");
     cmd.args(["-avz", "--links", "--safe-links", "--stats", "--partial"]);
     if let Some(flag) = arg_protection.flag() {
         cmd.arg(flag);
@@ -177,6 +182,24 @@ fn rsync_arg_protection_remote_rejected(stderr: &str) -> bool {
         || lower.contains("unknown option -- protect-args")
         // BSD/macOS getopt error format (openrsync uses getopt which prints "illegal option"):
         || lower.contains("illegal option -- s")
+        // GH #531: rrsync must inspect server arguments, so it refuses -s
+        // even when both rsync binaries support it. Match the complete
+        // diagnostic, not a generic disabled-option or authentication error.
+        // The existing one-shot retry retains rsync's own path escaping,
+        // strict SSH host-key checks, and additive/read-only transfer shape.
+        || lower.lines().any(|line| {
+            // Stock rrsync includes argv[0] (e.g. /usr/bin/rrsync), not
+            // necessarily only its basename. Keep the message anchored and
+            // reject arbitrary prose containing that diagnostic.
+            line.trim()
+                .strip_suffix(" error: option -s has been disabled on this server.")
+                .is_some_and(|program| {
+                    program == "rrsync"
+                        || (program.starts_with('/')
+                            && program.ends_with("/rrsync")
+                            && !program.chars().any(char::is_whitespace))
+                })
+        })
 }
 
 /// Return `true` if the first line of `rsync --version` output indicates
@@ -2759,10 +2782,14 @@ impl SourceSyncDecision {
                 ));
                 SourceHealthKind::Flapping
             }
-            Some(info) if info.duration_ms >= SOURCE_HIGH_LATENCY_MS => {
+            Some(info) if sync_was_high_latency(info) => {
                 reasons.push(format!(
-                    "last sync took {}ms, above {}ms high-latency guard",
-                    info.duration_ms, SOURCE_HIGH_LATENCY_MS
+                    "last sync took {}ms, above {}ms high-latency guard, moving {} bytes \
+                     (below the {} bytes/s of a bulk copy)",
+                    info.duration_ms,
+                    SOURCE_HIGH_LATENCY_MS,
+                    info.bytes_transferred,
+                    SOURCE_BULK_TRANSFER_MIN_BYTES_PER_SEC
                 ));
                 SourceHealthKind::HighLatency
             }
@@ -2943,6 +2970,10 @@ impl SyncStatus {
 }
 
 const SOURCE_HIGH_LATENCY_MS: u64 = 60_000;
+/// A long sync that moved data at least this fast was a bulk copy (a first
+/// sync of a large tree), not a slow host. Below it, a long sync still counts
+/// as high latency, including one that scanned for minutes and moved nothing.
+const SOURCE_BULK_TRANSFER_MIN_BYTES_PER_SEC: u64 = 1024 * 1024;
 const SOURCE_FAILURE_BACKOFF_BASE_MS: i64 = 5 * 60 * 1000;
 const SOURCE_FAILURE_BACKOFF_MAX_MS: i64 = 60 * 60 * 1000;
 
@@ -2968,6 +2999,12 @@ fn sync_schedule_due(last_sync: Option<i64>, period_ms: Option<i64>, now_ms: i64
         (Some(_), None) => false,
         (Some(last_sync), Some(period_ms)) => last_sync.saturating_add(period_ms) <= now_ms,
     }
+}
+
+fn sync_was_high_latency(info: &SourceSyncInfo) -> bool {
+    info.duration_ms >= SOURCE_HIGH_LATENCY_MS
+        && info.bytes_transferred.saturating_mul(1000) / info.duration_ms
+            < SOURCE_BULK_TRANSFER_MIN_BYTES_PER_SEC
 }
 
 fn automatic_source_sync_action(
@@ -4601,6 +4638,62 @@ Total transferred file size: 1,234 bytes
     }
 
     #[test]
+    fn source_sync_decision_does_not_call_a_bulk_first_sync_high_latency() {
+        // GH #531: a first sync of ~9 GB / 148,673 files took 83 s, about
+        // 110 MB/s. That is a large copy, not a slow host.
+        let now_ms = 1_700_000_000_000;
+        let source = source_with_schedule(SyncSchedule::Hourly);
+        let status = status_with_info(SourceSyncInfo {
+            last_sync: Some(now_ms - 10 * 60 * 1000),
+            last_result: SyncResult::Success,
+            files_synced: 148_673,
+            bytes_transferred: 9_000_000_000,
+            duration_ms: 83_000,
+            ..Default::default()
+        });
+
+        let decision = status.decision_for_source_at(&source, now_ms, false);
+
+        assert_eq!(decision.health, SourceHealthKind::Healthy);
+        assert!(!decision.fallback_active);
+        assert_eq!(decision.action, SourceSyncAction::Skip);
+    }
+
+    #[test]
+    fn source_sync_decision_keeps_slow_small_transfers_high_latency() {
+        let now_ms = 1_700_000_000_000;
+        let source = source_with_schedule(SyncSchedule::Hourly);
+        let health_for = |bytes_transferred: u64, duration_ms: u64| {
+            status_with_info(SourceSyncInfo {
+                last_sync: Some(now_ms - 10 * 60 * 1000),
+                last_result: SyncResult::Success,
+                bytes_transferred,
+                duration_ms,
+                ..Default::default()
+            })
+            .decision_for_source_at(&source, now_ms, false)
+            .health
+        };
+
+        // 10 MiB in 61 s, and a minute of scanning that moved nothing.
+        assert_eq!(
+            health_for(10 * 1024 * 1024, 61_000),
+            SourceHealthKind::HighLatency
+        );
+        assert_eq!(health_for(0, 120_000), SourceHealthKind::HighLatency);
+        // The bulk-copy floor is inclusive: exactly 1 MiB/s over 60 s is a
+        // bulk copy, one byte less is still high latency.
+        let floor = SOURCE_BULK_TRANSFER_MIN_BYTES_PER_SEC * 60;
+        assert_eq!(health_for(floor, 60_000), SourceHealthKind::Healthy);
+        assert_eq!(health_for(floor - 1, 60_000), SourceHealthKind::HighLatency);
+        // Below the duration guard, throughput does not matter.
+        assert_eq!(
+            health_for(0, SOURCE_HIGH_LATENCY_MS - 1),
+            SourceHealthKind::Healthy
+        );
+    }
+
+    #[test]
     fn source_sync_decision_manual_override_forces_sync() {
         let now_ms = 1_700_000_000_000;
         let source = source_with_schedule(SyncSchedule::Manual);
@@ -4764,3 +4857,6 @@ Total transferred file size: 1,234 bytes
         assert_eq!(expanded, path);
     }
 }
+
+#[cfg(test)]
+mod rrsync_tests;

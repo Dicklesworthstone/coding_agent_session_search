@@ -1947,16 +1947,15 @@ fn exercise_invalid_ann_fresh_process_fallback(case: InvalidAnnInstallation) {
 /// Invalid optional ANN artifacts must never disable exact semantic search.
 #[test]
 fn approximate_invalid_ann_falls_back_exact_without_mutation() {
-    let mut cases = vec![
+    let cases = [
         InvalidAnnInstallation::CorruptMetadata,
         InvalidAnnInstallation::Directory,
         InvalidAnnInstallation::CrossRoleAlias,
-    ];
-    #[cfg(unix)]
-    cases.extend([
+        #[cfg(unix)]
         InvalidAnnInstallation::FinalComponentSymlink,
+        #[cfg(unix)]
         InvalidAnnInstallation::BrokenFinalComponentSymlink,
-    ]);
+    ];
 
     for case in cases {
         exercise_invalid_ann_fresh_process_fallback(case);

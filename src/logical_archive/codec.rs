@@ -1,20 +1,48 @@
 //! Versioned, bounded JSONL framing. No SQL or filesystem paths are executable data.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Write};
+use std::io::{self, BufRead, Write};
 
 use anyhow::{Result, anyhow, bail, ensure};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[path = "chunked.rs"]
+mod chunked;
+
 pub const FORMAT: &str = "cass.logical_archive";
+/// Version 1 remains readable, with its original per-row limit and digest.
 pub const VERSION: u32 = 1;
+pub const CHUNKED_VERSION: u32 = 2;
+/// Version 3 also preserves AUTOINCREMENT allocation state, including the
+/// absence of a sqlite_sequence entry for a table that has never allocated.
+pub const SEQUENCE_VERSION: u32 = 3;
 pub const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
+/// Separate from the wire-frame bound. Reconstruction and SQLite parameter
+/// binding require one complete logical row; never assemble an unbounded row.
+pub const MAX_ROW_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_TABLES: usize = 256;
 pub const MAX_COLUMNS: usize = 256;
 const MAX_KEY_BYTES: usize = 64 * 1024;
+
+pub fn record_types(version: u32) -> Vec<String> {
+    let names: &[&str] = if matches!(version, CHUNKED_VERSION | SEQUENCE_VERSION) {
+        &[
+            "table",
+            "row",
+            "row_start",
+            "row_chunk",
+            "row_end",
+            "completion",
+        ]
+    } else {
+        &["table", "row", "completion"]
+    };
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -27,13 +55,27 @@ pub struct Header {
     pub record_types: Vec<String>,
     pub contains_private_data: bool,
     pub omissions: Vec<String>,
+    /// None is the historical v1/v2 omission. Version 3 requires a complete,
+    /// sorted inventory, including entries whose allocation value is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequences: Option<Vec<Sequence>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Sequence {
+    pub table: String,
+    pub value: Option<i64>,
 }
 
 impl Header {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.format == FORMAT, "unknown logical archive format");
         ensure!(
-            self.schema_version == VERSION,
+            matches!(
+                self.schema_version,
+                VERSION | CHUNKED_VERSION | SEQUENCE_VERSION
+            ),
             "unsupported logical archive version"
         );
         ensure!(
@@ -55,7 +97,7 @@ impl Header {
             "invalid canonical storage schema version"
         );
         ensure!(
-            self.record_types == ["table", "row", "completion"],
+            self.record_types == record_types(self.schema_version),
             "unsupported record types"
         );
         ensure!(
@@ -66,6 +108,33 @@ impl Header {
             self.omissions == ["derived_search_assets"],
             "unsupported archive omissions"
         );
+        if self.schema_version == SEQUENCE_VERSION {
+            let sequences = self
+                .sequences
+                .as_ref()
+                .ok_or_else(|| anyhow!("logical archive version 3 requires allocation state"))?;
+            ensure!(
+                sequences.len() <= MAX_TABLES,
+                "logical allocation state exceeds 256 tables"
+            );
+            let mut previous: Option<&str> = None;
+            for sequence in sequences {
+                ensure!(
+                    identifier(&sequence.table),
+                    "invalid logical allocation table identifier"
+                );
+                ensure!(
+                    previous.is_none_or(|name| name < sequence.table.as_str()),
+                    "logical allocation tables must be unique and ordered"
+                );
+                previous = Some(&sequence.table);
+            }
+        } else {
+            ensure!(
+                self.sequences.is_none(),
+                "logical archive versions 1 and 2 cannot declare allocation state"
+            );
+        }
         Ok(())
     }
 }
@@ -119,7 +188,7 @@ pub fn identifier(value: &str) -> bool {
 
 /// REAL is an exact, lowercase IEEE-754 binary64 bit string; JSON's number
 /// rounding cannot change a restored value. Integers remain signed 64-bit.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(
     tag = "kind",
     content = "value",
@@ -132,6 +201,107 @@ pub enum Cell {
     Real(String),
     Text(String),
     Blob(String),
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum CellKind {
+    Null,
+    Integer,
+    Real,
+    Text,
+    Blob,
+}
+
+thread_local! {
+    static ABORT_CONTINUED_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn clear_continued_read_abort() {
+    ABORT_CONTINUED_READ.with(|aborted| aborted.set(false));
+}
+
+pub(super) fn abort_continued_read() {
+    ABORT_CONTINUED_READ.with(|aborted| aborted.set(true));
+}
+
+pub(super) fn continued_read_aborted() -> bool {
+    ABORT_CONTINUED_READ.with(std::cell::Cell::get)
+}
+
+enum Scalar {
+    Integer(i64),
+    Text(String),
+}
+
+impl<'de> Deserialize<'de> for Scalar {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ScalarVisitor;
+
+        impl Visitor<'_> for ScalarVisitor {
+            type Value = Scalar;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                abort_continued_read();
+                formatter.write_str("a signed 64-bit integer or a string")
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Scalar, E> {
+                Ok(Scalar::Integer(value))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Scalar, E> {
+                i64::try_from(value).map(Scalar::Integer).map_err(|_| {
+                    abort_continued_read();
+                    E::custom("logical integer is outside the signed 64-bit range")
+                })
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Scalar, E> {
+                Ok(Scalar::Text(value.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Scalar, E> {
+                Ok(Scalar::Text(value))
+            }
+        }
+
+        // Reject arrays, objects, booleans and floating-point numbers at their
+        // first token, including when the value precedes its kind tag.
+        deserializer
+            .deserialize_any(ScalarVisitor)
+            .inspect_err(|_| {
+                abort_continued_read();
+            })
+    }
+}
+
+impl<'de> Deserialize<'de> for Cell {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            kind: CellKind,
+            value: Option<Scalar>,
+        }
+
+        let fields = Fields::deserialize(deserializer).inspect_err(|_| {
+            abort_continued_read();
+        })?;
+        match (fields.kind, fields.value) {
+            (CellKind::Null, None) => Ok(Self::Null),
+            (CellKind::Integer, Some(Scalar::Integer(value))) => Ok(Self::Integer(value)),
+            (CellKind::Real, Some(Scalar::Text(value))) => Ok(Self::Real(value)),
+            (CellKind::Text, Some(Scalar::Text(value))) => Ok(Self::Text(value)),
+            (CellKind::Blob, Some(Scalar::Text(value))) => Ok(Self::Blob(value)),
+            _ => {
+                abort_continued_read();
+                Err(de::Error::custom(
+                    "logical cell kind and scalar value disagree",
+                ))
+            }
+        }
+    }
 }
 
 impl Cell {
@@ -153,10 +323,22 @@ impl Cell {
                 );
             }
             Self::Blob(encoded) => {
-                ensure!(encoded.len() <= MAX_RECORD_BYTES, "oversized BLOB encoding");
-                STANDARD
-                    .decode(encoded)
-                    .map_err(|_| anyhow!("invalid BLOB encoding"))?;
+                ensure!(encoded.len() <= MAX_ROW_BYTES, "oversized BLOB encoding");
+                // Validation must not allocate a decoded copy of a potentially
+                // 192 MiB BLOB only to throw it away. Every nonfinal block ends
+                // on a base64 quartet and must not contain padding. The same
+                // STANDARD engine checks the final block's padding/tail bits.
+                let mut decoded = [0_u8; 3 * 1024];
+                let mut blocks = encoded.as_bytes().chunks(4 * 1024).peekable();
+                while let Some(block) = blocks.next() {
+                    ensure!(
+                        blocks.peek().is_none() || !block.contains(&b'='),
+                        "invalid BLOB encoding"
+                    );
+                    STANDARD
+                        .decode_slice(block, &mut decoded)
+                        .map_err(|_| anyhow!("invalid BLOB encoding"))?;
+                }
             }
             _ => {}
         }
@@ -172,7 +354,7 @@ pub struct Completion {
     pub content_sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Record {
     Header { header: Header },
@@ -181,14 +363,213 @@ pub enum Record {
     Completion { completion: Completion },
 }
 
-struct LimitedBuffer(Vec<u8>);
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum RecordKind {
+    Header,
+    Table,
+    Row,
+    Completion,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum RecordField {
+    Type,
+    Header,
+    Table,
+    Values,
+    Completion,
+}
+
+struct RowValues;
+
+impl<'de> DeserializeSeed<'de> for RowValues {
+    type Value = Vec<Cell>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for RowValues {
+    type Value = Vec<Cell>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        abort_continued_read();
+        formatter.write_str("at most 256 logical cells")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+        struct NextCell {
+            admitted: bool,
+        }
+
+        impl<'de> DeserializeSeed<'de> for NextCell {
+            type Value = Cell;
+
+            fn deserialize<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Cell, D::Error> {
+                if !self.admitted {
+                    abort_continued_read();
+                    return Err(de::Error::custom("logical row exceeds 256 columns"));
+                }
+                Cell::deserialize(deserializer)
+            }
+        }
+
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX_COLUMNS));
+        while let Some(cell) = sequence
+            .next_element_seed(NextCell {
+                admitted: values.len() < MAX_COLUMNS,
+            })
+            .inspect_err(|_| {
+                abort_continued_read();
+            })?
+        {
+            values.push(cell);
+        }
+        Ok(values)
+    }
+}
+
+struct RecordVisitor {
+    row_only: bool,
+}
+
+impl<'de> Visitor<'de> for RecordVisitor {
+    type Value = Record;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        abort_continued_read();
+        formatter.write_str("a logical record object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Record, A::Error> {
+        let mut kind = None;
+        let mut payload = None;
+        while let Some(field) = map.next_key::<RecordField>().inspect_err(|_| {
+            abort_continued_read();
+        })? {
+            if !matches!(field, RecordField::Type) && payload.is_some() {
+                abort_continued_read();
+                return Err(de::Error::custom(
+                    "duplicate or conflicting logical record payload",
+                ));
+            }
+            if self.row_only && !matches!(field, RecordField::Type | RecordField::Values) {
+                abort_continued_read();
+                return Err(de::Error::custom("only logical rows may use continuations"));
+            }
+            let (payload_kind, record) = match field {
+                RecordField::Type => {
+                    if kind.is_some() {
+                        abort_continued_read();
+                        return Err(de::Error::duplicate_field("type"));
+                    }
+                    let next = map.next_value::<RecordKind>().inspect_err(|_| {
+                        abort_continued_read();
+                    })?;
+                    if self.row_only && next != RecordKind::Row {
+                        abort_continued_read();
+                        return Err(de::Error::custom("only logical rows may use continuations"));
+                    }
+                    kind = Some(next);
+                    continue;
+                }
+                RecordField::Header => (
+                    RecordKind::Header,
+                    Record::Header {
+                        header: map.next_value().inspect_err(|_| {
+                            abort_continued_read();
+                        })?,
+                    },
+                ),
+                RecordField::Table => (
+                    RecordKind::Table,
+                    Record::Table {
+                        table: map.next_value().inspect_err(|_| {
+                            abort_continued_read();
+                        })?,
+                    },
+                ),
+                RecordField::Values => (
+                    RecordKind::Row,
+                    Record::Row {
+                        values: map.next_value_seed(RowValues).inspect_err(|_| {
+                            abort_continued_read();
+                        })?,
+                    },
+                ),
+                RecordField::Completion => (
+                    RecordKind::Completion,
+                    Record::Completion {
+                        completion: map.next_value().inspect_err(|_| {
+                            abort_continued_read();
+                        })?,
+                    },
+                ),
+            };
+            if kind.is_some_and(|kind| kind != payload_kind) {
+                abort_continued_read();
+                return Err(de::Error::custom(
+                    "logical record type and payload disagree",
+                ));
+            }
+            payload = Some((payload_kind, record));
+        }
+        let kind = kind.ok_or_else(|| {
+            abort_continued_read();
+            de::Error::missing_field("type")
+        })?;
+        match payload {
+            Some((payload_kind, record)) if kind == payload_kind => Ok(record),
+            Some(_) => {
+                abort_continued_read();
+                Err(de::Error::custom(
+                    "logical record type and payload disagree",
+                ))
+            }
+            None => {
+                abort_continued_read();
+                Err(de::Error::custom("logical record payload is missing"))
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Record {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Internally tagged enum derivation first buffers an untyped JSON tree.
+        // Typed fields keep rows bounded before validating the table shape and
+        // still allow the type discriminator to follow its payload.
+        deserializer.deserialize_map(RecordVisitor { row_only: false })
+    }
+}
+
+pub(super) struct ContinuedRow(pub Record);
+
+impl<'de> Deserialize<'de> for ContinuedRow {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer
+            .deserialize_map(RecordVisitor { row_only: true })
+            .map(Self)
+    }
+}
+
+struct LimitedBuffer(Vec<u8>, usize);
 
 impl Write for LimitedBuffer {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         // Leave room for the mandatory newline; never allocate an oversized
         // encoded message before discovering that it violates the contract.
-        if bytes.len() > (MAX_RECORD_BYTES - 1).saturating_sub(self.0.len()) {
-            return Err(std::io::Error::other("logical record exceeds 8 MiB"));
+        if bytes.len() > (self.1 - 1).saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("logical encoding exceeds its bound"));
         }
         self.0.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -199,17 +580,203 @@ impl Write for LimitedBuffer {
 }
 
 pub fn encode(record: &Record) -> Result<Vec<u8>> {
-    let mut buffer = LimitedBuffer(Vec::with_capacity(4096));
-    serde_json::to_writer(&mut buffer, record)
-        .map_err(|_| anyhow!("logical record cannot be encoded within 8 MiB"))?;
+    encode_with_limit(record, MAX_RECORD_BYTES)
+}
+
+fn encode_with_limit(record: &Record, limit: usize) -> Result<Vec<u8>> {
+    let mut buffer = LimitedBuffer(Vec::with_capacity(4096), limit);
+    serde_json::to_writer(&mut buffer, record).map_err(|_| {
+        anyhow!(
+            "logical record cannot be encoded within {} MiB",
+            limit / (1024 * 1024)
+        )
+    })?;
     buffer.0.push(b'\n');
     Ok(buffer.0)
+}
+
+/// Canonical hashing with fixed scratch space, not a second full encoded row.
+/// Buffer small serializer writes so field punctuation does not require a
+/// separate SHA-256 update; large strings are hashed directly in whole blocks.
+struct CanonicalHash {
+    digest: Sha256,
+    bytes: usize,
+    limit: usize,
+    buffer: [u8; 8192],
+    buffered: usize,
+}
+
+impl CanonicalHash {
+    fn new(digest: Sha256, limit: usize) -> Self {
+        Self {
+            digest,
+            bytes: 0,
+            limit,
+            buffer: [0; 8192],
+            buffered: 0,
+        }
+    }
+
+    fn finish(mut self) -> (Sha256, usize) {
+        self.digest.update(&self.buffer[..self.buffered]);
+        (self.digest, self.bytes)
+    }
+}
+
+impl Write for CanonicalHash {
+    fn write(&mut self, mut bytes: &[u8]) -> std::io::Result<usize> {
+        let count = bytes.len();
+        if count > self.limit.saturating_sub(self.bytes) {
+            return Err(std::io::Error::other("logical encoding exceeds its bound"));
+        }
+        self.bytes += count;
+        if self.buffered != 0 {
+            let take = bytes.len().min(self.buffer.len() - self.buffered);
+            self.buffer[self.buffered..self.buffered + take].copy_from_slice(&bytes[..take]);
+            self.buffered += take;
+            bytes = &bytes[take..];
+            if self.buffered == self.buffer.len() {
+                self.digest.update(self.buffer.as_slice());
+                self.buffered = 0;
+            }
+        }
+        if bytes.len() >= self.buffer.len() {
+            let take = bytes.len() / self.buffer.len() * self.buffer.len();
+            self.digest.update(&bytes[..take]);
+            bytes = &bytes[take..];
+        }
+        self.buffer[self.buffered..self.buffered + bytes.len()].copy_from_slice(bytes);
+        self.buffered += bytes.len();
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.digest.update(&self.buffer[..self.buffered]);
+        self.buffered = 0;
+        Ok(())
+    }
+}
+
+/// An admitted immutable record. Ordinary small rows keep the one-pass
+/// buffered path; larger rows are serialized directly to bounded transport
+/// frames after their exact size and canonical digest have been checked.
+pub struct PreparedRecord<'a> {
+    record: &'a Record,
+    encoded: Option<Vec<u8>>,
+    bytes: usize,
+}
+
+impl PreparedRecord<'_> {
+    pub fn write_to(&self, output: &mut impl Write) -> io::Result<()> {
+        if let Some(bytes) = &self.encoded {
+            write_encoded(bytes, output)
+        } else if self.bytes <= MAX_RECORD_BYTES {
+            serialize_record(self.record, self.bytes, output)
+        } else {
+            chunked::write_record(self.record, self.bytes, output)
+        }
+    }
+}
+
+/// serde_json wraps I/O failures. Retain the original typed cause, including
+/// the OS code, rather than degrading disk-full/permission errors to Other.
+/// This adapter never flushes on drop or retries a non-interrupted failure.
+struct CheckedOutput<'a, W> {
+    output: &'a mut W,
+    remaining: usize,
+    failure: Option<io::Error>,
+}
+
+impl<W: Write> CheckedOutput<'_, W> {
+    fn fail(&mut self, error: io::Error) -> io::Result<usize> {
+        self.failure = Some(error);
+        Err(io::Error::other("logical output write failed"))
+    }
+}
+
+impl<W: Write> Write for CheckedOutput<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.failure.is_some() {
+            return Err(io::Error::other("logical output write failed"));
+        }
+        if bytes.len() > self.remaining {
+            return self.fail(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "logical record exceeded its validated size",
+            ));
+        }
+        let written = loop {
+            match self.output.write(bytes) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return self.fail(error),
+                Ok(0) if !bytes.is_empty() => {
+                    return self.fail(io::ErrorKind::WriteZero.into());
+                }
+                Ok(written) if written > bytes.len() => {
+                    return self.fail(io::ErrorKind::InvalidData.into());
+                }
+                Ok(written) => break written,
+            }
+        };
+        self.remaining -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
+fn serialize_record(record: &Record, bytes: usize, output: &mut impl Write) -> io::Result<()> {
+    let mut checked = CheckedOutput {
+        output,
+        remaining: bytes,
+        failure: None,
+    };
+    let result = serde_json::to_writer(&mut checked, record)
+        .map_err(io::Error::other)
+        .and_then(|()| checked.write_all(b"\n"));
+    if let Some(error) = checked.failure.take() {
+        return Err(error);
+    }
+    result?;
+    if checked.remaining != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "logical record did not reach its validated size",
+        ));
+    }
+    Ok(())
+}
+
+/// Emit already validated canonical bytes, splitting an oversized v2 row into
+/// bounded frames. Small records retain the exact v1 representation. Callers
+/// must use Validator::push first; it enforces the header's version and limits.
+pub fn write_encoded(bytes: &[u8], output: &mut impl Write) -> std::io::Result<()> {
+    if bytes.len() <= MAX_RECORD_BYTES {
+        output.write_all(bytes)
+    } else {
+        chunked::write(bytes, output)
+    }
 }
 
 /// Enforce the encoded limit while reading, rather than after read_line has
 /// already allocated an attacker-controlled buffer. EOF is valid between, not
 /// within, newline-terminated records. Parsing errors never echo input bytes.
 pub fn read_record(reader: &mut impl BufRead, line: u64) -> Result<Option<Record>> {
+    let Some(bytes) = read_record_bytes(reader, line)? else {
+        return Ok(None);
+    };
+    // The ordinary path still parses once. Continuations are decoded here, so
+    // import, migration, reimport, search and view all see one ordinary row.
+    let record = match serde_json::from_slice(&bytes) {
+        Ok(record) => record,
+        Err(_) => chunked::read(reader, &bytes, line)?,
+    };
+    Ok(Some(record))
+}
+
+fn read_record_bytes(reader: &mut impl BufRead, line: u64) -> Result<Option<Vec<u8>>> {
     let mut bytes = Vec::with_capacity(4096);
     loop {
         let available = match reader.fill_buf() {
@@ -217,8 +784,10 @@ pub fn read_record(reader: &mut impl BufRead, line: u64) -> Result<Option<Record
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             // Keep the I/O cause: a failed read is not a verdict on the archive.
             Err(error) => {
-                return Err(anyhow::Error::new(error)
-                    .context(format!("cannot read logical archive at record {line}")));
+                return Err(super::export::io_failure(
+                    format!("cannot read logical archive at record {line}"),
+                    error,
+                ));
             }
         };
         if available.is_empty() {
@@ -239,13 +808,7 @@ pub fn read_record(reader: &mut impl BufRead, line: u64) -> Result<Option<Record
         bytes.extend_from_slice(&available[..take]);
         reader.consume(take);
         if newline.is_some() {
-            let record = serde_json::from_slice(&bytes).map_err(|error| {
-                super::integrity(format!(
-                    "malformed logical archive record {line}, column {}",
-                    error.column()
-                ))
-            })?;
-            return Ok(Some(record));
+            return Ok(Some(bytes));
         }
     }
 }
@@ -296,6 +859,7 @@ enum KeyCell {
 pub struct Validator {
     pub header: Header,
     current: Option<Table>,
+    current_has_sequence: bool,
     last_key: Option<Vec<KeyCell>>,
     counts: BTreeMap<String, u64>,
     rows: u64,
@@ -309,11 +873,22 @@ impl Validator {
         let mut identity = header.clone();
         identity.exported_at_ms = 0;
         let mut digest = Sha256::new();
-        digest.update(b"cass.logical_archive.v1\0");
+        if header.schema_version == SEQUENCE_VERSION {
+            // Allocation state changes logical identity, unlike the v2 framing
+            // extension. An absent old-format state must not equal an empty or
+            // reset v3 inventory merely because every live row matches.
+            digest.update(b"cass.logical_archive.v3\0");
+        } else {
+            // Preserve the original v1/v2 digest and byte representation.
+            identity.schema_version = VERSION;
+            identity.record_types = record_types(VERSION);
+            digest.update(b"cass.logical_archive.v1\0");
+        }
         digest.update(encode(&Record::Header { header: identity })?);
         Ok(Self {
             header,
             current: None,
+            current_has_sequence: false,
             last_key: None,
             counts: BTreeMap::new(),
             rows: 0,
@@ -324,10 +899,89 @@ impl Validator {
 
     pub fn push(&mut self, record: &Record) -> Result<Vec<u8>> {
         ensure!(!self.completed, "records follow the archive completion");
+        let bytes = encode_with_limit(record, self.record_limit(record))?;
+        let mut digest = self.digest.clone();
+        digest.update(&bytes);
+        self.accept(record, digest)?;
+        Ok(bytes)
+    }
+
+    /// Admit an output row without ever allocating a full large encoding.
+    /// Most session messages fit the 64 KiB fast path and serialize only once.
+    /// Oversize/escaping failures in the small buffer fall through to the
+    /// unchanged version-specific limits, not to truncation or omission.
+    pub fn prepare<'a>(&mut self, record: &'a Record) -> Result<PreparedRecord<'a>> {
+        ensure!(!self.completed, "records follow the archive completion");
+        match encode_with_limit(record, self.record_limit(record).min(64 * 1024)) {
+            Ok(encoded) => {
+                let mut digest = self.digest.clone();
+                digest.update(&encoded);
+                self.accept(record, digest)?;
+                Ok(PreparedRecord {
+                    record,
+                    bytes: encoded.len(),
+                    encoded: Some(encoded),
+                })
+            }
+            Err(_) => {
+                let bytes = self.validate(record)?;
+                Ok(PreparedRecord {
+                    record,
+                    encoded: None,
+                    bytes,
+                })
+            }
+        }
+    }
+
+    /// Verify a record and advance canonical identity without allocating its
+    /// serialized bytes. Return its exact encoded size, including the newline.
+    /// All checks and hashing precede state mutation, just as in `push`.
+    pub fn validate(&mut self, record: &Record) -> Result<usize> {
+        ensure!(!self.completed, "records follow the archive completion");
+        let limit = self.record_limit(record);
+        let mut hash = CanonicalHash::new(self.digest.clone(), limit);
+        let encode_error = || {
+            anyhow!(
+                "logical record cannot be encoded within {} MiB",
+                limit / (1024 * 1024)
+            )
+        };
+        serde_json::to_writer(&mut hash, record).map_err(|_| encode_error())?;
+        hash.write_all(b"\n").map_err(|_| encode_error())?;
+        let (digest, bytes) = hash.finish();
+        self.accept(record, digest)?;
+        Ok(bytes)
+    }
+
+    fn record_limit(&self, record: &Record) -> usize {
+        if matches!(
+            self.header.schema_version,
+            CHUNKED_VERSION | SEQUENCE_VERSION
+        ) && matches!(record, Record::Row { .. })
+        {
+            MAX_ROW_BYTES
+        } else {
+            MAX_RECORD_BYTES
+        }
+    }
+
+    /// The single invariant/state transition path for writers and readers.
+    /// A rejected record never advances the key, counts, or canonical digest.
+    fn accept(&mut self, record: &Record, digest: Sha256) -> Result<()> {
         match record {
             Record::Header { .. } => bail!("duplicate archive header"),
             Record::Table { table } => {
                 table.validate()?;
+                let has_sequence = self.header.sequences.as_ref().is_some_and(|sequences| {
+                    sequences
+                        .binary_search_by(|sequence| sequence.table.cmp(&table.name))
+                        .is_ok()
+                });
+                ensure!(
+                    !has_sequence || table.primary_key.len() == 1,
+                    "logical allocation tables require a single integer primary key"
+                );
                 ensure!(
                     self.counts.len() < MAX_TABLES,
                     "logical archive exceeds 256 tables"
@@ -340,6 +994,7 @@ impl Validator {
                 );
                 self.counts.insert(table.name.clone(), 0);
                 self.current = Some(table.clone());
+                self.current_has_sequence = has_sequence;
                 self.last_key = None;
             }
             Record::Row { values } => {
@@ -354,6 +1009,11 @@ impl Validator {
                 for cell in values {
                     cell.validate()?;
                 }
+                ensure!(
+                    !self.current_has_sequence
+                        || matches!(values.get(table.primary_key[0]), Some(Cell::Integer(_))),
+                    "logical allocation tables require an integer primary key"
+                );
                 let next_key = key(values, table)?;
                 ensure!(
                     self.last_key
@@ -361,8 +1021,7 @@ impl Validator {
                         .is_none_or(|previous| *previous < next_key),
                     "duplicate or unordered logical record identity"
                 );
-                self.last_key = Some(next_key);
-                self.rows = self
+                let rows = self
                     .rows
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("logical record count overflow"))?;
@@ -370,23 +1029,33 @@ impl Validator {
                     .counts
                     .get_mut(&table.name)
                     .expect("current table has a counter");
-                *count = count
+                let next_count = count
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("logical table count overflow"))?;
+                *count = next_count;
+                self.rows = rows;
+                self.last_key = Some(next_key);
             }
             Record::Completion { completion } => {
                 ensure!(self.current.is_some(), "logical archive contains no tables");
+                ensure!(
+                    self.header.sequences.as_ref().is_none_or(|sequences| {
+                        sequences
+                            .iter()
+                            .all(|sequence| self.counts.contains_key(&sequence.table))
+                    }),
+                    "logical allocation state references an absent table"
+                );
                 ensure!(
                     *completion == self.completion(),
                     "logical archive completion count or digest mismatch"
                 );
                 self.completed = true;
-                return encode(record);
+                return Ok(());
             }
         }
-        let bytes = encode(record)?;
-        self.digest.update(&bytes);
-        Ok(bytes)
+        self.digest = digest;
+        Ok(())
     }
 
     pub fn completion(&self) -> Completion {
@@ -416,7 +1085,7 @@ pub fn verify(reader: &mut impl BufRead) -> Result<(Header, Completion)> {
     let mut line = 2u64;
     while let Some(record) = read_record(reader, line)? {
         validator
-            .push(&record)
+            .validate(&record)
             .map_err(|error| super::integrity(format!("record {line}: {error}")))?;
         line = line
             .checked_add(1)
@@ -428,3 +1097,7 @@ pub fn verify(reader: &mut impl BufRead) -> Result<(Header, Completion)> {
 #[cfg(test)]
 #[path = "codec_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "streaming_tests.rs"]
+mod streaming_tests;

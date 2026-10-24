@@ -4,14 +4,17 @@
 //! archive reads and local model loaders never start writers or downloads. File
 //! witnesses detect ordinary publication/replacement and same-size writes; they
 //! are change detectors, not an immutable corpus-generation certificate.
+//! Explicit external selection uses the same strict admission and consent as
+//! one-shot search. Its HTTP provider is retained, not a local inference model.
 
 use std::collections::BTreeMap;
 use std::fs::{File, Metadata};
 use std::path::{Component, Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, ensure};
 use coding_agent_search::search::embedder::Embedder;
+use coding_agent_search::search::external_embedder::ExternalEmbeddingConfig;
 use coding_agent_search::search::fastembed_embedder::FastEmbedder;
 use coding_agent_search::search::hash_embedder::HashEmbedder;
 use coding_agent_search::search::model_manager::{
@@ -31,9 +34,42 @@ use serde_json::{Value, json};
 use super::Session;
 use super::protocol::{self, Filters};
 
+#[path = "hybrid_completion.rs"]
+mod completion;
+
 const MAX_GUARDED_FILES: usize = 4096;
 const MAX_SHARD_MANIFEST_BYTES: u64 = 1024 * 1024;
 const NATIVE_ANN_UNAVAILABLE: &str = "persistent_native_ann_requires_reclaimable_owners";
+const MAX_ADMISSION_BACKOFF_SECS: u64 = 30;
+
+/// Bound repeated cold admission after missing/corrupt assets or failed public
+/// endpoint preflight. This is a per-worker retry gate, not a result cache or a
+/// background retry task. It retains no query, credentials or reader owners.
+#[derive(Default)]
+struct AdmissionRetry {
+    failures: u32,
+    failed_at: Option<Instant>,
+}
+
+impl AdmissionRetry {
+    fn failed(&mut self, now: Instant) {
+        self.failures = self.failures.saturating_add(1);
+        self.failed_at = Some(now);
+    }
+
+    fn retry_after_ms(&self, now: Instant) -> u64 {
+        let Some(failed_at) = self.failed_at else {
+            return 0;
+        };
+        let seconds =
+            (1_u64 << self.failures.saturating_sub(1).min(5)).min(MAX_ADMISSION_BACKOFF_SECS);
+        let remaining =
+            Duration::from_secs(seconds).saturating_sub(now.saturating_duration_since(failed_at));
+        // Round up: a sub-millisecond remainder must not look ready. The
+        // duration is at most 30 seconds, even for a saturated failure counter.
+        u64::try_from(remaining.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
+    }
+}
 
 fn ann_metadata(requested: bool) -> Value {
     json!({
@@ -51,6 +87,8 @@ pub(super) enum EmbedderChoice {
     Minilm,
     MultilingualMinilm,
     Hash,
+    /// Send queries to a consented endpoint; requires CASS_EXTERNAL_EMBEDDINGS=1.
+    External,
 }
 
 impl EmbedderChoice {
@@ -59,16 +97,29 @@ impl EmbedderChoice {
             Self::Minilm => "minilm",
             Self::MultilingualMinilm => "multilingual-minilm",
             Self::Hash => "hash",
+            Self::External => "external",
         }
     }
 
     fn id(self) -> Result<String> {
         match self {
             Self::Hash => Ok(HashEmbedder::default().id().to_owned()),
+            Self::External => ExternalEmbeddingConfig::from_env()?
+                .map(|config| config.identity())
+                .ok_or_else(|| {
+                    Refusal::Unavailable(
+                        "external_disabled: set CASS_EXTERNAL_EMBEDDINGS=1 to consent to sending queries outside the process".into(),
+                    )
+                    .into()
+                }),
             _ => FastEmbedder::config_for(self.name())
                 .map(|config| config.embedder_id)
                 .context("unknown configured semantic embedder"),
         }
+    }
+
+    fn local_model(self) -> bool {
+        matches!(self, Self::Minilm | Self::MultilingualMinilm)
     }
 }
 
@@ -86,6 +137,10 @@ enum Refusal {
         "semantic assets or archive changed; call reload or unload before retrying semantic retrieval"
     )]
     Changed,
+    #[error(
+        "semantic_admission_backoff: retry in {retry_after_ms} ms or unload/reload after resolving the failure; no semantic work was started; last failure: {reason}"
+    )]
+    AdmissionBackoff { retry_after_ms: u64, reason: String },
     #[error("semantic retrieval is unavailable: {0}")]
     Unavailable(String),
 }
@@ -93,7 +148,7 @@ enum Refusal {
 pub(super) fn error_kind(error: &anyhow::Error) -> &'static str {
     match error.downcast_ref::<Refusal>() {
         Some(Refusal::Changed) => "semantic_reload_required",
-        Some(Refusal::Unavailable(_)) => "semantic_unavailable",
+        Some(Refusal::Unavailable(_) | Refusal::AdmissionBackoff { .. }) => "semantic_unavailable",
         None => "semantic_search_failed",
     }
 }
@@ -243,6 +298,7 @@ struct Configuration {
 pub(super) struct Semantic {
     config: Option<Configuration>,
     client: Option<SearchClient>,
+    active_identity: Option<String>,
     guard: AssetGuard,
     requires_reload: bool,
     load_attempts: u64,
@@ -250,6 +306,7 @@ pub(super) struct Semantic {
     calls_completed: u64,
     queries_attempted: u64,
     last_failure: Option<String>,
+    admission_retry: AdmissionRetry,
 }
 
 impl Semantic {
@@ -264,12 +321,19 @@ impl Semantic {
         self.config.is_some()
     }
 
+    /// Startup selection only, not a consent/configuration probe or HTTP call.
+    pub(super) fn external_selected(&self) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|config| matches!(config.embedder, EmbedderChoice::External))
+    }
+
     pub(super) fn model_loaded(&self) -> bool {
         self.client.is_some()
             && self
                 .config
                 .as_ref()
-                .is_some_and(|config| !matches!(config.embedder, EmbedderChoice::Hash))
+                .is_some_and(|config| config.embedder.local_model())
     }
 
     pub(super) fn archive_access_attempted(&self) -> bool {
@@ -278,20 +342,34 @@ impl Semantic {
 
     pub(super) fn unload(&mut self) {
         drop(self.client.take());
+        self.active_identity = None;
         self.guard = AssetGuard::default();
         self.requires_reload = false;
         self.last_failure = None;
+        self.admission_retry = AdmissionRetry::default();
     }
 
     pub(super) fn status(&self) -> Value {
         json!({
             "enabled": self.enabled(), "loaded": self.client.is_some(),
             "embedder": self.config.as_ref().map(|config| config.embedder),
-            "neural": self.config.as_ref().map(|config| !matches!(config.embedder, EmbedderChoice::Hash)),
+            "embedder_id": self.active_identity,
+            "neural": self.config.as_ref().and_then(|config| match config.embedder {
+                EmbedderChoice::External => None,
+                local => Some(local.local_model()),
+            }),
+            "external_provider_selected": self.external_selected(),
+            "local_model_loaded": self.model_loaded(),
             "context_epoch": self.client.as_ref().map(|_| self.successful_loads),
             "load_attempts": self.load_attempts, "successful_loads": self.successful_loads,
             "calls_completed": self.calls_completed, "requires_reload": self.requires_reload,
             "queries_attempted": self.queries_attempted,
+            "admission_retry": {
+                "consecutive_failures": self.admission_retry.failures,
+                "retry_after_ms": self.admission_retry.retry_after_ms(Instant::now()),
+                "max_delay_ms": MAX_ADMISSION_BACKOFF_SECS * 1000,
+                "automatic_retries": false,
+            },
             "last_failure": self.last_failure, "change_detection": "file_identity_size_mtime_and_unix_ctime",
             "snapshot_policy": "retained_assets_with_archive_change_checks", "immutable_generation_certified": false,
             "canonical_database_access_enabled": self.enabled(), "maintenance_performed": false,
@@ -299,19 +377,55 @@ impl Semantic {
         })
     }
 
-    fn ensure_loaded(&mut self, db: &Path) -> Result<()> {
+    /// Passive request admission precedes the shared reader pool. Known-unready
+    /// semantic work must neither reserve capacity nor mask lexical fallback.
+    fn admit_request(&self, now: Instant) -> Result<()> {
         if self.requires_reload {
             return Err(Refusal::Changed.into());
         }
+        if self.client.is_none() {
+            let retry_after_ms = self.admission_retry.retry_after_ms(now);
+            if retry_after_ms != 0 {
+                return Err(Refusal::AdmissionBackoff {
+                    retry_after_ms,
+                    reason: self
+                        .last_failure
+                        .clone()
+                        .unwrap_or_else(|| "semantic admission failed".into()),
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_loaded(&mut self, db: &Path) -> Result<()> {
+        self.admit_request(Instant::now())?;
         if self.client.is_some() {
             return self.check();
         }
+        let result = self.load(db);
+        if result.is_ok() {
+            self.admission_retry = AdmissionRetry::default();
+        } else {
+            // Backoff starts after teardown of the unsuccessful load, not at
+            // its start: a slow preflight must not consume its own retry delay.
+            self.admission_retry.failed(Instant::now());
+        }
+        result
+    }
+
+    fn load(&mut self, db: &Path) -> Result<()> {
         let config = self
             .config
             .as_ref()
             .context("semantic service is disabled")?;
         self.load_attempts = self.load_attempts.saturating_add(1);
-        let guard = AssetGuard::capture(&config.data_dir, db, &config.embedder.id()?)?;
+        // Resolve the external identity only on a semantic request. Startup,
+        // status and ordinary lexical search must not consult endpoint consent
+        // or credentials, much less construct a client or send public probes.
+        let expected_id = config.embedder.id()?;
+        let guard = AssetGuard::capture(&config.data_dir, db, &expected_id)?;
         let setup = match config.embedder {
             EmbedderChoice::Hash => load_hash_semantic_context_strict(&config.data_dir, db),
             _ => load_semantic_context_for_embedder_strict(
@@ -323,6 +437,10 @@ impl Semantic {
         let context = setup
             .context
             .ok_or_else(|| Refusal::Unavailable(setup.availability.summary()))?;
+        ensure!(
+            context.embedder.id() == expected_id,
+            "semantic provider identity changed during admission; retry with a fixed configuration"
+        );
         // Every retained artifact must have been witnessed before model_manager
         // selected/opened it. Unrecognized future layouts fail closed.
         for artifact in context
@@ -356,6 +474,7 @@ impl Semantic {
         )?;
         guard.check()?;
         self.client = Some(client);
+        self.active_identity = Some(expected_id);
         self.guard = guard;
         self.successful_loads = self.successful_loads.saturating_add(1);
         self.last_failure = None;
@@ -365,6 +484,7 @@ impl Semantic {
     fn check(&mut self) -> Result<()> {
         if self.requires_reload || self.guard.check().is_err() {
             drop(self.client.take());
+            self.active_identity = None;
             self.guard = AssetGuard::default();
             self.requires_reload = true;
             return Err(Refusal::Changed.into());
@@ -397,25 +517,50 @@ impl Session {
         limit: usize,
         offset: usize,
     ) -> Result<Value> {
-        let started = Instant::now();
-        let fallback_filters = filters.clone();
-        let reused = self.semantic.client.is_some();
-        let lease = if self.reader_lease.is_none() {
-            self.acquire_reader_lease()?
-        } else {
-            None
-        };
-        let archive = self
-            .archive
-            .as_deref()
-            .context("semantic search requires an explicit --db")?;
-        let setup = self.semantic.ensure_loaded(archive);
-        let setup_ms = started.elapsed().as_millis();
-        if setup.is_ok() && lease.is_some() {
-            self.reader_lease = lease;
-        } else {
-            drop(lease);
+        let result =
+            self.semantic_search_with_readers(query, mode, approximate, filters, limit, offset);
+        // Invalidation destroys the semantic owners, not the Session. An idle
+        // failed worker must not keep the pool full until an explicit unload.
+        // Wait for the entire attempt (including lexical fallback and local
+        // temporary owners) to finish before releasing the shared slot. A
+        // surviving lexical reader, reranker or semantic provider still owns it.
+        if self.semantic.client.is_none() && self.client.is_none() && !self.refiner.loaded() {
+            drop(self.reader_lease.take());
         }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn semantic_search_with_readers(
+        &mut self,
+        query: &str,
+        mode: Mode,
+        approximate: bool,
+        filters: Filters,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Value> {
+        let started = Instant::now();
+        let reused = self.semantic.client.is_some();
+        let setup = self.semantic.admit_request(Instant::now()).and_then(|()| {
+            let lease = if self.reader_lease.is_none() {
+                self.acquire_reader_lease()?
+            } else {
+                None
+            };
+            let archive = self
+                .archive
+                .as_deref()
+                .context("semantic search requires an explicit --db")?;
+            let setup = self.semantic.ensure_loaded(archive);
+            if setup.is_ok() && lease.is_some() {
+                self.reader_lease = lease;
+            } else {
+                drop(lease);
+            }
+            setup
+        });
+        let setup_ms = started.elapsed().as_millis();
         let started = Instant::now();
         // Independent retrieval introduces semantic candidates absent from the
         // lexical shortlist. Both legs use a bounded page candidate window.
@@ -454,27 +599,75 @@ impl Session {
             self.semantic.calls_completed = self.semantic.calls_completed.saturating_add(1);
             Ok((hits, metadata))
         });
+        let mut lexical_fallback = None;
+        // Request-local ownership only: keep the already-paid native page until
+        // the final semantic witness check, without cloning or caching its hits.
+        let mut native_lexical_page = None;
         let (mut hits, realized, ann, lexical_degrade) = match semantic {
             Ok((semantic_hits, ann)) if mode == Mode::Hybrid => {
-                let lexical = self.ensure_loaded().and_then(|()| {
+                let lexical_reused = self.client.is_some();
+                let lexical_started = Instant::now();
+                let lexical_setup = self.ensure_loaded();
+                let lexical_setup_ms = lexical_started.elapsed().as_millis();
+                let lexical_started = Instant::now();
+                let lexical = lexical_setup.and_then(|()| {
                     self.client
                         .as_ref()
                         .context("lexical reader is not loaded")?
                         .search(
                             query,
-                            search_filters(filters),
+                            search_filters(filters.clone()),
                             window,
                             0,
                             FieldMask::new(false, true, true, false),
                         )
                 });
+                let lexical_search_ms = lexical_started.elapsed().as_millis();
+                // A successful semantic leg must not bypass the caller's
+                // explicit lexical recovery grant. Recover only a Quill fuel
+                // refusal, using the SAME candidate window, exact filters,
+                // reader admission and whole-request watchdog as this fusion.
+                // A successful empty Quill page remains authoritative.
+                let lexical = lexical.or_else(|error| {
+                    let page = self.lexical_recovery.recover(
+                        self.archive.as_deref(),
+                        error,
+                        super::lexical_fallback::Search {
+                            query,
+                            filters: search_filters(filters),
+                            limit: window,
+                            offset: 0,
+                        },
+                    )?;
+                    // Recovery drops its temporary archive client before
+                    // returning. Keep its changed-backend receipt, not a
+                    // claim that these candidates came from the Quill epoch.
+                    lexical_fallback = Some(page.metadata);
+                    Ok::<_, anyhow::Error>(page.hits)
+                });
                 match lexical {
-                    Ok(lexical_hits) => (
-                        rrf_fuse_hits(&lexical_hits, &semantic_hits, query, limit + 1, offset),
-                        "hybrid",
-                        ann,
-                        None,
-                    ),
+                    Ok(lexical_hits) => {
+                        ensure!(
+                            lexical_hits.len() <= window,
+                            "lexical candidate budget exceeded"
+                        );
+                        let fused =
+                            rrf_fuse_hits(&lexical_hits, &semantic_hits, query, limit + 1, offset);
+                        // Only the independent pinned Quill page is reusable if
+                        // the archive/vector witness later changes. Archive
+                        // fallback results have no such snapshot guarantee.
+                        if lexical_fallback.is_none() {
+                            native_lexical_page = Some(completion::NativePage {
+                                hits: lexical_hits,
+                                window,
+                                reader_epoch: self.successful_opens,
+                                reader_reused: lexical_reused,
+                                setup_ms: lexical_setup_ms,
+                                search_ms: lexical_search_ms,
+                            });
+                        }
+                        (fused, "hybrid", ann, None)
+                    }
                     Err(error) => (
                         semantic_hits
                             .into_iter()
@@ -490,7 +683,14 @@ impl Session {
             Ok((hits, ann)) => (hits, "semantic", ann, None),
             Err(error) => {
                 let reason = format!("{error:#}");
-                self.semantic.last_failure = Some(reason.clone());
+                // Keep the original failure actionable during backoff rather
+                // than replacing it with the retry gate's synthetic refusal.
+                if !matches!(
+                    error.downcast_ref::<Refusal>(),
+                    Some(Refusal::AdmissionBackoff { .. })
+                ) {
+                    self.semantic.last_failure = Some(reason.clone());
+                }
                 if mode == Mode::Semantic {
                     return Err(error);
                 }
@@ -507,20 +707,31 @@ impl Session {
         // Check again after the lexical leg before returning any fused result.
         // A changed archive never turns stale semantic coordinates into success.
         if let Err(error) = self.semantic.check() {
-            let reason = format!("{error:#}");
-            self.semantic.last_failure = Some(reason.clone());
-            if mode == Mode::Semantic {
-                return Err(error);
-            }
-            let mut lexical = self.search(query, fallback_filters, limit, offset)?;
-            lexical["requested_mode"] = json!(mode);
-            lexical["realized_mode"] = json!("lexical");
-            lexical["semantic_fallback_reason"] = json!(reason);
-            lexical["semantic_reused"] = json!(reused);
-            lexical["semantic_setup_ms"] = json!(setup_ms);
-            lexical["ann"] = ann_metadata(approximate);
-            return Ok(lexical);
+            // A second search could burn another full fuel allowance and lose
+            // a native page that already succeeded. Complete from that page,
+            // or refuse without replaying a failed/uncertified archive leg.
+            let lexical_failure = lexical_degrade
+                .as_deref()
+                .or_else(|| lexical_fallback.as_ref()?.get("primary_error")?.as_str());
+            // Invalid semantic/fused candidates are not part of the response.
+            drop(hits);
+            return completion::after_invalidation(
+                self,
+                error,
+                native_lexical_page,
+                completion::Request {
+                    mode,
+                    limit,
+                    offset,
+                    approximate,
+                    semantic_reused: reused,
+                    semantic_setup_ms: setup_ms,
+                },
+                lexical_failure,
+            );
         }
+        // The independent prefix is no longer needed after successful validation.
+        drop(native_lexical_page);
         ensure!(
             hits.len() <= limit + 1,
             "semantic backend exceeded the requested page"
@@ -542,9 +753,106 @@ impl Session {
             "page_window_exhausted": has_next && next_offset.is_none(), "preview_only": true,
             "requested_mode": mode, "realized_mode": realized,
             "semantic_fallback_reason": null, "lexical_degrade_reason": lexical_degrade,
+            "degraded": lexical_degrade.is_some() || lexical_fallback.is_some(),
+            "lexical_backend": if realized == "hybrid" {
+                Some(if lexical_fallback.is_some() { "frankensqlite" } else { "quill" })
+            } else { None },
+            "lexical_result_reader_epoch": if realized == "hybrid" && lexical_fallback.is_none() {
+                Some(self.successful_opens)
+            } else { None },
+            "lexical_fallback": lexical_fallback,
             "semantic_reused": reused, "semantic_setup_ms": setup_ms, "search_ms": started.elapsed().as_millis(),
             "candidate_window_per_leg": if mode == Mode::Hybrid { window } else { limit + offset + 1 },
             "ann": ann, "snapshot": self.status(),
         }))
+    }
+}
+
+#[cfg(test)]
+#[path = "semantic_admission_tests.rs"]
+mod admission_tests;
+
+#[cfg(test)]
+mod external_selection_tests {
+    use super::super::{ServiceCli, ServiceCommand};
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn external_service_selection_is_explicit_and_requires_archive_coordinates() {
+        let base = ["cass", "serve", "--stdio", "--data-dir", "missing-data"];
+        let cli = ServiceCli::try_parse_from(base).unwrap();
+        let ServiceCommand::Serve {
+            semantic_embedder, ..
+        } = cli.command;
+        assert!(semantic_embedder.is_none());
+
+        assert!(
+            ServiceCli::try_parse_from(base.into_iter().chain(["--semantic-embedder", "external"]))
+                .is_err()
+        );
+        let cli = ServiceCli::try_parse_from(base.into_iter().chain([
+            "--db",
+            "missing-data/agent_search.db",
+            "--semantic-embedder",
+            "external",
+        ]))
+        .unwrap();
+        let ServiceCommand::Serve {
+            semantic_embedder, ..
+        } = cli.command;
+        assert!(matches!(semantic_embedder, Some(EmbedderChoice::External)));
+        assert!(
+            ServiceCli::try_parse_from([
+                "cass",
+                "serve",
+                "--stdio",
+                "--index",
+                "missing-index",
+                "--db",
+                "missing.db",
+                "--semantic-embedder",
+                "external",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn external_status_and_unload_are_passive_and_do_not_claim_a_local_model() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("never-created");
+        let mut semantic = Semantic::new(missing.clone(), EmbedderChoice::External);
+        for _ in 0..2 {
+            let status = semantic.status();
+            assert_eq!(status["enabled"], true);
+            assert_eq!(status["embedder"], "external");
+            assert_eq!(status["external_provider_selected"], true);
+            assert_eq!(status["loaded"], false);
+            assert_eq!(status["local_model_loaded"], false);
+            assert!(status["neural"].is_null());
+            assert!(status["embedder_id"].is_null());
+            assert_eq!(status["load_attempts"], 0);
+            assert!(!semantic.model_loaded());
+            semantic.unload();
+        }
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn local_provider_selection_keeps_local_identities_and_metadata() {
+        for choice in [
+            EmbedderChoice::Hash,
+            EmbedderChoice::Minilm,
+            EmbedderChoice::MultilingualMinilm,
+        ] {
+            assert_ne!(choice.name(), "external");
+            assert!(!choice.id().unwrap().starts_with("external-"));
+            let semantic = Semantic::new(PathBuf::from("unused"), choice);
+            assert_eq!(semantic.status()["external_provider_selected"], false);
+            assert_eq!(semantic.status()["neural"], choice.local_model());
+            assert!(!semantic.model_loaded());
+        }
     }
 }

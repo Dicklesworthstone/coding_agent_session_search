@@ -244,7 +244,7 @@ export function queryValue(sql, params = []) {
 /**
  * Execute a statement (INSERT, UPDATE, DELETE)
  * @param {string} sql - SQL statement
- * @param {Array} params - Statement parameters
+ * @param {Array} params - Query parameters
  * @returns {number} Number of affected rows
  */
 export function execute(sql, params = []) {
@@ -478,6 +478,140 @@ export class ConversationMessageSource {
         params,
       ),
     );
+  }
+
+  /**
+   * Find the next/previous message containing exact, case-sensitive text.
+   * Searches stored message content, not just the mounted DOM. The starting
+   * message is exclusive; wrapping visits it last, so a sole match is reusable.
+   *
+   * Each query returns at most 128 IDs, order keys and match flags, never bodies.
+   * Keyset pages use the same NULL-first (idx, id) order as get()/indexOfId().
+   * No transcript-sized result list or body cache is built. Yield between pages
+   * so callers can cancel, change queries, navigate or lock the archive. This
+   * bounds JavaScript hydration, not the time/memory SQLite needs for one huge
+   * message. A cancelled/invalidated search rejects; it is not an empty result.
+   */
+  async findText(text, { afterMessageId = null, direction = 1, signal, onProgress } = {}) {
+    if (typeof text !== "string" || text.length === 0 || text.length > 4096 ||
+        !text.isWellFormed()) {
+      throw new TypeError("Find text must contain 1-4096 well-formed UTF-16 code units");
+    }
+    if (direction !== 1 && direction !== -1) {
+      throw new RangeError("Find direction must be 1 or -1");
+    }
+    if (afterMessageId !== null &&
+        (!Number.isSafeInteger(afterMessageId) || afterMessageId <= 0)) {
+      throw new TypeError("Find anchor must be a positive safe-integer message ID");
+    }
+    if (onProgress !== undefined && typeof onProgress !== "function") {
+      throw new TypeError("Find progress callback must be a function");
+    }
+    const checkActive = () => {
+      this.#ensureActive();
+      if (signal?.aborted) {
+        const error = new Error("Conversation find cancelled");
+        error.name = "AbortError";
+        throw error;
+      }
+    };
+    checkActive();
+    const total = this.#length;
+    let cursor = null;
+    let position = direction === 1 ? 0 : total - 1;
+    if (afterMessageId !== null) {
+      cursor = queryOne(
+        "SELECT id, idx FROM messages WHERE conversation_id = ? AND id = ?",
+        [this.#conversationId, afterMessageId],
+      );
+      if (!cursor) {
+        throw new Error("Find anchor is not in this conversation");
+      }
+      this.#validateFindRow(cursor);
+      const anchorIndex = this.indexOfId(afterMessageId);
+      if (!Number.isSafeInteger(anchorIndex) || anchorIndex < 0 || anchorIndex >= total) {
+        throw new Error("Conversation changed while locating find anchor");
+      }
+      position = anchorIndex + direction;
+    }
+
+    let checked = 0;
+    let wrapped = false;
+    while (checked < total) {
+      checkActive();
+      if (position < 0 || position >= total) {
+        wrapped = true;
+        cursor = null;
+        position = direction === 1 ? 0 : total - 1;
+      }
+      const toBoundary = direction === 1 ? total - position : position + 1;
+      const limit = Math.min(128, total - checked, toBoundary);
+      const rows = this.#findTextPage(text, cursor, direction, limit);
+      if (rows.length !== limit) {
+        throw new Error("Conversation changed while finding text");
+      }
+      for (const row of rows) {
+        this.#validateFindRow(row);
+        checked += 1;
+        if (row.matched === 1) {
+          checkActive();
+          return { messageId: row.id, index: position, wrapped, checked, total };
+        }
+        cursor = row;
+        position += direction;
+      }
+      onProgress?.({ checked, total });
+      checkActive();
+      if (checked < total) {
+        // A macrotask, not Promise.resolve(): input/lock events need to run.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+    checkActive();
+    return { messageId: null, index: -1, wrapped, checked, total };
+  }
+
+  #validateFindRow(row) {
+    if (!Number.isSafeInteger(row.id) || row.id <= 0 ||
+        (row.idx !== null && !Number.isSafeInteger(row.idx))) {
+      throw new Error("Invalid message identity or order key in archive");
+    }
+  }
+
+  #findTextPage(text, cursor, direction, limit) {
+    const order = direction === 1 ? "ASC" : "DESC";
+    const compare = direction === 1 ? ">" : "<";
+    // Separate the NULL partition from tuple comparisons. SQL row comparisons
+    // with NULL are unknown, and a broad OR would lose the composite-index seek.
+    let ranges;
+    if (cursor === null) {
+      ranges = [["", [], `idx ${order}, id ${order}`]];
+    } else if (cursor.idx === null) {
+      ranges = [[` AND idx IS NULL AND id ${compare} ?`, [cursor.id], `id ${order}`]];
+      if (direction === 1) {
+        ranges.push([" AND idx IS NOT NULL", [], "idx ASC, id ASC"]);
+      }
+    } else {
+      ranges = [[
+        ` AND (idx, id) ${compare} (?, ?)`, [cursor.idx, cursor.id], `idx ${order}, id ${order}`,
+      ]];
+      if (direction === -1) {
+        ranges.push([" AND idx IS NULL", [], "id DESC"]);
+      }
+    }
+    const rows = [];
+    for (const [condition, params, sort] of ranges) {
+      if (rows.length === limit) {
+        break;
+      }
+      rows.push(...queryAll(
+        `SELECT id, idx, instr(content, ?) > 0 AS matched
+         FROM messages WHERE conversation_id = ?${condition}
+         ORDER BY ${sort} LIMIT ?`,
+        [text, this.#conversationId, ...params, limit - rows.length],
+      ));
+    }
+    return rows;
   }
 
   // Eager traversal is reserved for short direct-rendered conversations and
@@ -840,6 +974,68 @@ export function normalizeSearchTimeRange(since = null, until = null) {
 }
 
 /**
+ * Workspace identities are exact archive values, not local filesystem paths.
+ * Preserve case, separators, whitespace and wildcard characters. An absent or
+ * empty selector means all workspaces; malformed selectors must not widen it.
+ */
+function normalizeWorkspaceFilter(workspace) {
+  if (workspace === undefined || workspace === null || workspace === "") {
+    return null;
+  }
+  if (typeof workspace !== "string" || workspace.length > 4096 ||
+      workspace.includes("\0") || !workspace.isWellFormed()) {
+    throw new RangeError("Workspace must be a well-formed path of at most 4096 characters without NUL");
+  }
+  return workspace;
+}
+
+// Both text search and recent-session browsing apply the SAME intersection
+// before ordering/limiting. The fixed c alias is internal, never user input.
+function conversationScope({ agent = null, workspace = null, since = null, until = null }) {
+  const selectedWorkspace = normalizeWorkspaceFilter(workspace);
+  const bounds = normalizeSearchTimeRange(since, until);
+  const clauses = [];
+  const params = [];
+  if (agent) {
+    clauses.push("c.agent = ?");
+    params.push(agent);
+  }
+  if (selectedWorkspace !== null) {
+    clauses.push("c.workspace = ? COLLATE BINARY");
+    params.push(selectedWorkspace);
+  }
+  if (bounds.since !== null) {
+    clauses.push("c.started_at >= ?");
+    params.push(bounds.since);
+  }
+  if (bounds.until !== null) {
+    clauses.push("c.started_at <= ?");
+    params.push(bounds.until);
+  }
+  return { sql: clauses.length ? ` AND ${clauses.join(" AND ")}` : "", params };
+}
+
+/**
+ * Browse one page of conversations with intersecting agent/workspace/time
+ * filters. Uses searchConversations' filter semantics without requiring FTS
+ * text. Workspace is an exact stored path; omitted filters keep all sessions.
+ * @param {Object} options - limit (0-1000), offset, agent, workspace, since, until
+ * @returns {Array<Object>} Recent conversation metadata, never message bodies
+ */
+export function getConversations(options = {}) {
+  const { limit = 50, offset = 0 } = options;
+  validatePagination(limit, offset);
+  const scope = conversationScope(options);
+  return queryAll(
+    `SELECT c.id, c.agent, c.workspace, c.title, c.source_path,
+            c.started_at, c.ended_at, c.message_count
+     FROM conversations c WHERE 1 = 1${scope.sql}
+     ORDER BY c.started_at DESC, c.id DESC LIMIT ? OFFSET ?`,
+    [...scope.params, limit, offset],
+  );
+}
+
+/**
  * Search conversations using FTS5
  * Automatically routes to the appropriate FTS table:
  * - messages_fts (porter stemmer) for natural language
@@ -850,6 +1046,7 @@ export function normalizeSearchTimeRange(since = null, until = null) {
  * @param {number} [options.limit=50] - Maximum results (0-1000)
  * @param {number} [options.offset=0] - Result offset for pagination
  * @param {string|null} [options.agent=null] - Filter by agent name
+ * @param {string|null} [options.workspace=null] - Exact stored workspace path
  * @param {SearchMode} [options.searchMode='auto'] - Search mode: 'auto', 'prose', or 'code'
  * @param {number|string|null} [options.since=null] - Earliest conversation start timestamp (ms or YYYY-MM-DD)
  * @param {number|string|null} [options.until=null] - Latest conversation start timestamp (ms or YYYY-MM-DD)
@@ -860,12 +1057,13 @@ export function searchConversations(query, options = {}) {
     limit = 50,
     offset = 0,
     agent = null,
+    workspace = null,
     searchMode = "auto",
     since = null,
     until = null,
   } = options;
   validatePagination(limit, offset);
-  const { since: sinceTimestamp, until: untilTimestamp } = normalizeSearchTimeRange(since, until);
+  const scope = conversationScope({ agent, workspace, since, until });
 
   // Parse and escape the query before preparing any database statement.
   const escapedQuery = escapeFts5Query(query);
@@ -901,22 +1099,8 @@ export function searchConversations(query, options = {}) {
         WHERE ${ftsTable} MATCH ?
     `;
 
-  const params = [escapedQuery];
-
-  if (agent) {
-    sql += " AND c.agent = ?";
-    params.push(agent);
-  }
-
-  if (sinceTimestamp !== null) {
-    sql += " AND c.started_at >= ?";
-    params.push(sinceTimestamp);
-  }
-
-  if (untilTimestamp !== null) {
-    sql += " AND c.started_at <= ?";
-    params.push(untilTimestamp);
-  }
+  sql += scope.sql;
+  const params = [escapedQuery, ...scope.params];
 
   sql += `
         ORDER BY score, m.id ASC
@@ -1103,6 +1287,7 @@ export default {
   getExportMeta,
   getStatistics,
   getRecentConversations,
+  getConversations,
   getConversation,
   getConversationMessages,
   searchConversations,

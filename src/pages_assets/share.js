@@ -76,27 +76,61 @@ export function getHomeLink() {
 }
 
 /**
- * Copy text to the clipboard
+ * Copy text while the originating request is still current. Archive lock is
+ * a cancellation boundary even for callers without an explicit AbortSignal.
+ * Cancellation prevents NEW clipboard/fallback work; it cannot retract bytes
+ * already handed to the browser's non-cancellable writeText() operation.
  * @param {string} text - Text to copy
- * @returns {Promise<boolean>} True if successful
+ * @param {Object} options - Optional signal and synchronous isCurrent predicate
+ * @returns {Promise<boolean>} True only for a successful, still-current request
  */
-export async function copyTextToClipboard(text) {
-  const clipboard = globalThis.navigator?.clipboard;
-  if (clipboard?.writeText) {
-    try {
-      await clipboard.writeText(text);
-      return true;
-    } catch (error) {
-      console.error("[Share] Failed to copy text via Clipboard API:", error);
-    }
+export async function copyTextToClipboard(text, { signal, isCurrent = () => true } = {}) {
+  if (typeof text !== "string" || typeof isCurrent !== "function") {
+    throw new TypeError("Clipboard copy requires text and a current-request predicate");
   }
-
+  const lockEvents = globalThis.window;
   let textArea = null;
+  let cancelled = false;
+  let releaseCancelled;
+  const cancellation = new Promise(resolve => { releaseCancelled = () => resolve(false); });
+  const clearTemporaryText = () => {
+    if (textArea) {
+      textArea.value = "";
+      textArea.parentNode?.removeChild(textArea);
+    }
+  };
+  const cancel = () => {
+    cancelled = true;
+    releaseCancelled();
+    clearTemporaryText();
+  };
+  const active = () => !cancelled && !signal?.aborted && isCurrent();
+
   try {
-    if (!document.body || typeof document.execCommand !== "function") {
+    lockEvents?.addEventListener("cass:lock", cancel);
+    signal?.addEventListener("abort", cancel, { once: true });
+    if (!active()) return false;
+
+    const clipboard = globalThis.navigator?.clipboard;
+    if (clipboard?.writeText) {
+      try {
+        // Stop retaining the request/listeners when cancelled, even if a
+        // browser permission prompt never settles. The issued write itself
+        // is not cancelled. Promise.race also observes any later rejection.
+        const written = Promise.resolve(clipboard.writeText(text)).then(() => true);
+        if (!await Promise.race([written, cancellation])) return false;
+        return active();
+      } catch (error) {
+        // A permission prompt may outlive navigation, abort or archive lock.
+        // Never create a new plaintext textarea or retry copy after that.
+        if (!active()) return false;
+        console.error("[Share] Failed to copy text via Clipboard API:", error);
+      }
+    }
+
+    if (!active() || !document.body || typeof document.execCommand !== "function") {
       return false;
     }
-
     textArea = document.createElement("textarea");
     textArea.value = text;
     textArea.setAttribute("readonly", "");
@@ -106,16 +140,20 @@ export async function copyTextToClipboard(text) {
     textArea.style.opacity = "0";
     document.body.appendChild(textArea);
     textArea.focus();
+    // Focus/selection handlers may synchronously invalidate the request.
+    if (!active()) return false;
     textArea.select();
-
-    return document.execCommand("copy");
-  } catch (fallbackError) {
-    console.error("[Share] Fallback copy failed:", fallbackError);
+    if (!active()) return false;
+    return Boolean(document.execCommand("copy")) && active();
+  } catch (error) {
+    console.error("[Share] Clipboard copy failed:", error);
     return false;
   } finally {
-    if (textArea?.parentNode) {
-      textArea.parentNode.removeChild(textArea);
-    }
+    lockEvents?.removeEventListener("cass:lock", cancel);
+    signal?.removeEventListener("abort", cancel);
+    clearTemporaryText();
+    // Drop this helper's reference; JS strings cannot be reliably zeroized.
+    text = "";
   }
 }
 

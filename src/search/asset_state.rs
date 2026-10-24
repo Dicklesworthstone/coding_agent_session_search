@@ -1441,14 +1441,18 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
     let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
         .with_context(|| format!("loading lexical checkpoint from {}", index_path.display()))?;
     let current_db_fingerprint = if db_available && compute_lexical_fingerprint {
-        Some(
-            lexical_storage_fingerprint_for_db(db_path).with_context(|| {
-                format!(
-                    "computing lexical storage fingerprint for {}",
-                    db_path.display()
-                )
-            })?,
-        )
+        let fingerprint = lexical_storage_fingerprint_for_db(db_path).with_context(|| {
+            format!(
+                "computing lexical storage fingerprint for {}",
+                db_path.display()
+            )
+        })?;
+        crate::indexer::write_archive_fingerprint_cache_best_effort(
+            db_path,
+            &index_path,
+            &fingerprint,
+        );
+        Some(fingerprint)
     } else if db_available {
         // GH #353: the skip-open surfaces (health watermark lane, count-less
         // status) deliberately never open the archive, but they must still
@@ -5009,5 +5013,111 @@ mod tests {
             events[8].kind,
             MaintenanceEventKind::Cancelled { .. }
         ));
+    }
+
+    #[test]
+    fn inspect_lexical_assets_primes_fingerprint_cache_for_skip_open_health() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = crate::search::tantivy::expected_index_dir(temp.path());
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
+
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open canonical archive");
+        let fingerprint = crate::indexer::lexical_storage_fingerprint_for_storage(&storage)
+            .expect("compute storage fingerprint");
+        storage.close().expect("close storage");
+
+        let checkpoint_json = serde_json::json!({
+            "version": 3,
+            "schema_hash": SCHEMA_HASH,
+            "page_size": LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            "db": {
+                "db_path": db_path.display().to_string(),
+                "total_conversations": 0,
+                "total_messages": 0,
+                "storage_fingerprint": fingerprint,
+            },
+            "committed_offset": 0,
+            "committed_conversation_id": null,
+            "processed_conversations": 0,
+            "indexed_docs": 0,
+            "committed_meta_fingerprint": "test-meta",
+            "pending": null,
+            "completed": true,
+            "updated_at_ms": 1_733_000_000_000_i64,
+        });
+        std::fs::write(
+            index_path.join(".lexical-rebuild-state.json"),
+            serde_json::to_vec(&checkpoint_json).expect("serialize checkpoint"),
+        )
+        .expect("write checkpoint");
+
+        // Before priming the sidecar cache, skip-open health inspection cannot
+        // observe the fingerprint and therefore marks an age-exceeded archive stale.
+        let unprimed_health = inspect_lexical_assets(InspectLexicalAssetsInput {
+            data_dir: temp.path(),
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms: 1_733_000_600_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            db_available: true,
+            compute_lexical_fingerprint: false,
+        })
+        .expect("unprimed skip-open inspection");
+        assert_eq!(
+            unprimed_health.fingerprint.current_db_fingerprint, None,
+            "without sidecar cache, skip-open health has no fingerprint"
+        );
+        assert!(unprimed_health.stale);
+
+        // Status-mode inspection computes the fingerprint and primes the sidecar cache.
+        let status_view = inspect_lexical_assets(InspectLexicalAssetsInput {
+            data_dir: temp.path(),
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms: 1_733_000_600_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            db_available: true,
+            compute_lexical_fingerprint: true,
+        })
+        .expect("status inspection");
+        assert_eq!(status_view.status, "ready");
+        assert!(!status_view.stale);
+        assert_eq!(
+            status_view.fingerprint.matches_current_db_fingerprint,
+            Some(true)
+        );
+
+        // Subsequent skip-open health inspection now reads the primed sidecar cache
+        // and agrees with status on fingerprint and freshness.
+        let primed_health = inspect_lexical_assets(InspectLexicalAssetsInput {
+            data_dir: temp.path(),
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms: 1_733_000_600_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            db_available: true,
+            compute_lexical_fingerprint: false,
+        })
+        .expect("primed skip-open inspection");
+        assert_eq!(primed_health.status, "ready");
+        assert!(!primed_health.stale);
+        assert!(primed_health.fresh);
+        assert_eq!(
+            primed_health.fingerprint.current_db_fingerprint,
+            status_view.fingerprint.current_db_fingerprint
+        );
+        assert_eq!(
+            primed_health.fingerprint.matches_current_db_fingerprint,
+            Some(true)
+        );
     }
 }

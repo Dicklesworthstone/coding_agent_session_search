@@ -11,23 +11,30 @@
 //! distinguish the two paths verbatim:
 //!
 //! - first index against a fresh data-dir:
-//!   `"inline_rebuild_from_scan"`
-//!   reason: `"lexical_index_needs_rebuild_so_scan_results_repopulate_tantivy_directly"`
+//!   `"deferred_authoritative_db_rebuild"`
+//!   reason: `"empty_archive_defers_lexical_rebuild_to_authoritative_db_rebuild"`
+//!   (at3us: an empty archive is ingested first and its index built once
+//!   from the database, as `--full` does; rebuilding inline from the scan
+//!   re-verified the whole index at every batch commit)
 //! - second + later index against the same corpus:
 //!   `"incremental_inline"`
 //!   reason: `"incremental_scan_applies_inline_lexical_updates_only_for_new_messages"`
 //!
-//! This file pins three invariants:
+//! This file pins four invariants:
 //!
 //! 1. Two consecutive `cass index --json` invocations against the same
 //!    stable corpus produce stable `conversations` and `messages`
 //!    total counts. No double-counting, no under-counting.
-//! 2. The first run's `lexical_strategy` is `"inline_rebuild_from_scan"`
-//!    (the rebuild fast-path).
+//! 2. The first run's `lexical_strategy` is
+//!    `"deferred_authoritative_db_rebuild"` for the empty-archive reason,
+//!    and its lexical index already finds the fixture's text.
 //! 3. The second run's `lexical_strategy` is `"incremental_inline"`
 //!    (the no-op fast-path). A regression where every run does a
-//!    full rebuild would emit `"inline_rebuild_from_scan"` twice and
-//!    fail this assertion immediately.
+//!    full rebuild would emit a rebuild strategy twice and fail this
+//!    assertion immediately.
+//! 4. A populated archive whose lexical index is lost never takes the
+//!    empty-archive path (it is repaired from the database before its
+//!    scan), and its rebuilt index finds the fixture's text.
 //!
 //! Verified by copying the `tests/fixtures/aider/.aider.chat.history.md`
 //! file into an isolated HOME, pointing cwd into that directory so the
@@ -145,16 +152,57 @@ fn archive_totals(data_dir: &Path) -> Result<(usize, usize), Box<dyn Error>> {
     Ok((usize::try_from(conversations)?, usize::try_from(messages)?))
 }
 
+fn lexical_strategy_reason(envelope: &Value) -> Result<&str, Box<dyn Error>> {
+    envelope
+        .pointer("/indexing_stats/lexical_strategy_reason")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            test_error(format!(
+                "envelope missing indexing_stats.lexical_strategy_reason: {envelope}"
+            ))
+        })
+}
+
+/// Lexical hits for `query` in `data_dir`, from a fresh `cass search`.
+fn lexical_hit_count(data_dir: &Path, home: &Path, query: &str) -> Result<usize, Box<dyn Error>> {
+    let output = Command::cargo_bin("cass")?
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .args(["--color=never", "search", query, "--json"])
+        .args(["--mode", "lexical"])
+        .args(["--data-dir", data_dir.to_str().ok_or("non-utf8 path")?])
+        .output()?;
+    if !output.status.success() {
+        return Err(test_error(format!(
+            "cass search exited {:?}; stderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let parsed: Value = serde_json::from_slice(&output.stdout)?;
+    parsed
+        .get("hits")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .ok_or_else(|| test_error(format!("search envelope missing `hits`: {parsed}")))
+}
+
 #[test]
-fn first_index_uses_inline_rebuild_strategy_against_fresh_data_dir() -> TestResult {
+fn first_index_against_a_fresh_data_dir_rebuilds_lexical_from_the_database() -> TestResult {
     let (tmp, project, data) = install_aider_fixture_project()?;
     let envelope = run_index_in(&project, &data, tmp.path())?;
     let strategy = lexical_strategy(&envelope)?;
+    let reason = lexical_strategy_reason(&envelope)?;
     ensure(
-        strategy == "inline_rebuild_from_scan",
+        strategy == "deferred_authoritative_db_rebuild"
+            && reason == "empty_archive_defers_lexical_rebuild_to_authoritative_db_rebuild",
         format!(
-            "first index against a fresh data-dir should use \
-             `inline_rebuild_from_scan`; got {strategy:?}.\n\
+            "first index against a fresh data-dir should ingest first and rebuild the \
+             lexical index once from the database; got {strategy:?} / {reason:?}.\n\
              envelope.indexing_stats: {}",
             envelope.pointer("/indexing_stats").unwrap_or(&Value::Null)
         ),
@@ -166,6 +214,34 @@ fn first_index_uses_inline_rebuild_strategy_against_fresh_data_dir() -> TestResu
         !matches!(n_conv.cmp(&0), Ordering::Less | Ordering::Equal),
         format!("first index should find >=1 aider conversation; got {n_conv}"),
     )?;
+    // The deferred strategy skips inline lexical writes during the scan, so
+    // only the post-scan rebuild makes the text searchable. A run that took
+    // the strategy without that rebuild leaves the index empty.
+    let hits = lexical_hit_count(&data, tmp.path(), "refactor")?;
+    ensure(
+        hits > 0,
+        "the first index's lexical index must already find the fixture's text",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn populated_archive_lexical_rebuild_never_takes_the_empty_archive_path() -> TestResult {
+    let (tmp, project, data) = install_aider_fixture_project()?;
+    run_index_in(&project, &data, tmp.path())?;
+    // Lose the lexical index of the now-populated archive.
+    fs::remove_dir_all(data.join("index"))?;
+    let envelope = run_index_in(&project, &data, tmp.path())?;
+    let reason = lexical_strategy_reason(&envelope)?;
+    ensure(
+        reason != "empty_archive_defers_lexical_rebuild_to_authoritative_db_rebuild",
+        format!(
+            "a populated archive must keep its existing repair; got {} / {reason:?}",
+            lexical_strategy(&envelope)?
+        ),
+    )?;
+    let hits = lexical_hit_count(&data, tmp.path(), "refactor")?;
+    ensure(hits > 0, "the rebuilt index must find the fixture's text")?;
     Ok(())
 }
 

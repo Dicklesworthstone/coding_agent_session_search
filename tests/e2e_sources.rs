@@ -1212,6 +1212,197 @@ fn sources_add_no_test() {
     tracker.complete();
 }
 
+/// Test: `sources add --json` prints only the saved source as JSON, and a
+/// refused duplicate add prints a JSON error envelope with no stdout data
+/// (GH #531 follow-up, coding_agent_session_search-kw97g).
+#[test]
+fn sources_add_json_reports_the_saved_source_and_refuses_duplicates_as_json() {
+    let tracker =
+        tracker_for("sources_add_json_reports_the_saved_source_and_refuses_duplicates_as_json");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    let add = || {
+        tracker
+            .cass_assert_command()
+            .args([
+                "sources",
+                "add",
+                "user@myserver.local",
+                "--name",
+                "myserver",
+                "--preset",
+                "linux-defaults",
+                "--path",
+                "~/extra/sessions",
+                "--no-test",
+                "--json",
+            ])
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .output()
+            .expect("sources add --json")
+    };
+
+    let output = add();
+    assert!(
+        output.status.success(),
+        "sources add --json failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+        panic!(
+            "stdout must be exactly one JSON value ({err}): {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(result["status"], "added");
+    assert_eq!(result["source"]["name"], "myserver");
+    assert_eq!(result["source"]["type"], "ssh");
+    assert_eq!(result["source"]["host"], "user@myserver.local");
+    assert_eq!(result["source"]["platform"], "linux");
+    let paths: Vec<&str> = result["source"]["paths"]
+        .as_array()
+        .expect("paths array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(paths.contains(&"~/extra/sessions"), "paths: {paths:?}");
+    assert!(paths.len() > 1, "preset paths must be merged: {paths:?}");
+    assert_eq!(result["connectivity_tested"], false);
+    assert_eq!(
+        result["next_steps"][0],
+        "cass sources sync --source myserver"
+    );
+    assert!(read_sources_config(&config_dir).contains("user@myserver.local"));
+
+    let duplicate = add();
+    assert_eq!(duplicate.status.code(), Some(10));
+    assert!(
+        duplicate.stdout.is_empty(),
+        "a refused add must not print success data: {}",
+        String::from_utf8_lossy(&duplicate.stdout)
+    );
+    let error: Value = serde_json::from_slice(&duplicate.stderr).unwrap_or_else(|err| {
+        panic!(
+            "stderr must be a JSON error envelope ({err}): {}",
+            String::from_utf8_lossy(&duplicate.stderr)
+        )
+    });
+    assert_eq!(error["error"]["kind"], "config");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("already exists")),
+        "{error}"
+    );
+    assert_eq!(
+        read_sources_config(&config_dir)
+            .matches("user@myserver.local")
+            .count(),
+        1,
+        "the refused add must leave the config unchanged"
+    );
+
+    tracker.complete();
+}
+
+/// Test: `sources schedule` sets a remote source's sync_schedule in
+/// sources.toml, reports unchanged repeats, and refuses unknown names, local
+/// sources and invalid values without touching the config (GH #531
+/// follow-up, coding_agent_session_search-kw97g).
+#[test]
+fn sources_schedule_sets_a_remote_sync_schedule_and_refuses_bad_targets() {
+    let tracker =
+        tracker_for("sources_schedule_sets_a_remote_sync_schedule_and_refuses_bad_targets");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    create_sources_config(
+        &config_dir,
+        r#"
+[[sources]]
+name = "laptop"
+type = "ssh"
+host = "user@laptop.local"
+paths = ["/home/user/.claude/projects"]
+
+[[sources]]
+name = "here"
+type = "local"
+paths = ["/tmp/sessions"]
+"#,
+    );
+    let run = |args: &[&str]| {
+        tracker
+            .cass_assert_command()
+            .args(args)
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .output()
+            .expect("cass sources schedule")
+    };
+    let schedule_of = |name: &str| -> String {
+        let output = run(&["sources", "list", "--json"]);
+        assert!(output.status.success());
+        let list: Value = serde_json::from_slice(&output.stdout).unwrap();
+        list["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing from {list}"))["sync_schedule"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(schedule_of("laptop"), "manual");
+
+    let set = run(&["sources", "schedule", "laptop", "daily", "--json"]);
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let result: Value = serde_json::from_slice(&set.stdout).unwrap();
+    assert_eq!(result["status"], "updated");
+    assert_eq!(result["source"], "laptop");
+    assert_eq!(result["sync_schedule"], "daily");
+    assert_eq!(result["previous_sync_schedule"], "manual");
+    assert_eq!(schedule_of("laptop"), "daily");
+    assert!(read_sources_config(&config_dir).contains("sync_schedule = \"daily\""));
+
+    let again = run(&["sources", "schedule", "laptop", "daily", "--json"]);
+    assert!(again.status.success());
+    let result: Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(result["status"], "unchanged");
+
+    let hourly = run(&["sources", "schedule", "laptop", "hourly"]);
+    assert!(hourly.status.success());
+    assert!(String::from_utf8_lossy(&hourly.stdout).contains("daily -> hourly"));
+    assert_eq!(schedule_of("laptop"), "hourly");
+
+    let before = read_sources_config(&config_dir);
+    let missing = run(&["sources", "schedule", "nosuch", "daily", "--json"]);
+    assert_eq!(missing.status.code(), Some(13));
+    assert!(missing.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&missing.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "not-found");
+
+    let local = run(&["sources", "schedule", "here", "daily", "--json"]);
+    assert_eq!(local.status.code(), Some(10));
+    let error: Value = serde_json::from_slice(&local.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "config");
+
+    let invalid = run(&["sources", "schedule", "laptop", "weekly"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert_eq!(
+        read_sources_config(&config_dir),
+        before,
+        "refused schedules must leave sources.toml unchanged"
+    );
+
+    tracker.complete();
+}
+
 /// Test: sources add with explicit paths.
 #[test]
 fn sources_add_explicit_paths() {
@@ -5046,5 +5237,294 @@ to = "/work/projects"
         "{report}"
     );
     assert_eq!(code, Some(1));
+    tracker.complete();
+}
+
+/// GH #520, end to end: `sources sync` keeps only a configured path's
+/// basename inside its safe-name container (`~/.factory/sessions` arrives as
+/// `<container>/sessions`). Factory, Vibe, Prime, Gemini and Cursor recognise
+/// a store by its parent chain, so they indexed nothing from such a mirror.
+/// The real binary indexes a mirror laid out exactly that way: every agent
+/// must index, each marker must be searchable, and a second index must not
+/// add or rekey a conversation.
+#[test]
+fn gh520_remote_mirrors_index_structural_agents_end_to_end() {
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+    use coding_agent_search::sources::sync::path_to_safe_dirname;
+    use std::collections::BTreeSet;
+
+    let tracker = tracker_for("gh520_remote_mirrors_index_structural_agents_end_to_end");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    let home = root.join("home");
+    let config = root.join("config");
+    let data = root.join("data");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join(".env"), "").unwrap();
+
+    let paths = [
+        "~/.claude/projects",
+        "~/.codex/sessions",
+        "~/.pi/agent/sessions",
+        "~/.factory/sessions",
+        "~/.vibe/logs/session",
+        "~/.prime/agent/sessions",
+        "~/.gemini/tmp",
+        "~/.config/Cursor/User",
+    ];
+    create_sources_config(
+        &config,
+        &format!(
+            "[[sources]]\nname = \"laptop\"\ntype = \"ssh\"\nhost = \"operator@laptop\"\npaths = {}\n",
+            serde_json::to_string(&paths).unwrap()
+        ),
+    );
+
+    // The layout every sync method produces: <container>/<basename>/...
+    let mirror = data.join("remotes/laptop/mirror");
+    let container = |path: &str| mirror.join(path_to_safe_dirname(path));
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let copy_tree = |from: &Path, to: &Path| {
+        for entry in walkdir::WalkDir::new(from) {
+            let entry = entry.unwrap();
+            let target = to.join(entry.path().strip_prefix(from).unwrap());
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(&target).unwrap();
+            } else {
+                fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    };
+    let write = |path: std::path::PathBuf, lines: &[String]| {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, lines.join("\n") + "\n").unwrap();
+    };
+    copy_tree(
+        &fixtures.join("claude_code_real/projects"),
+        &container("~/.claude/projects").join("projects"),
+    );
+    copy_tree(
+        &fixtures.join("codex_real/sessions"),
+        &container("~/.codex/sessions").join("sessions"),
+    );
+    copy_tree(
+        &fixtures.join("pi_agent/sessions"),
+        &container("~/.pi/agent/sessions").join("sessions"),
+    );
+    write(
+        container("~/.factory/sessions").join("sessions/-home-operator-proj/fac-520.jsonl"),
+        &[
+            r#"{"type":"session_start","id":"fac-520","title":"Factory mirror","owner":"operator","cwd":"/home/operator/proj"}"#.into(),
+            r#"{"type":"message","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"factorymirrorprobe question"}}"#.into(),
+            r#"{"type":"message","timestamp":"2026-10-01T10:00:05Z","message":{"role":"assistant","content":"factory answer"}}"#.into(),
+        ],
+    );
+    write(
+        container("~/.vibe/logs/session").join("session/vibe-520/messages.jsonl"),
+        &[
+            r#"{"role":"user","content":"vibemirrorprobe question","timestamp":"2026-10-01T10:00:00.000Z"}"#.into(),
+            r#"{"role":"assistant","content":"vibe answer","timestamp":"2026-10-01T10:00:05.000Z"}"#.into(),
+        ],
+    );
+    write(
+        container("~/.prime/agent/sessions")
+            .join("sessions/2026-10-01T10-00-00-000Z_0192aa11-0000-7000-8000-000000000520.jsonl"),
+        &[
+            r#"{"type":"session","version":3,"id":"0192aa11-0000-7000-8000-000000000520","timestamp":"2026-10-01T10:00:00.000Z","cwd":"/home/operator/proj"}"#.into(),
+            r#"{"type":"message","id":"aaaa0001","parentId":null,"timestamp":"2026-10-01T10:00:01.000Z","message":{"role":"user","content":"primemirrorprobe question"}}"#.into(),
+            r#"{"type":"message","id":"aaaa0002","parentId":"aaaa0001","timestamp":"2026-10-01T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"prime answer"}]}}"#.into(),
+        ],
+    );
+    write(
+        container("~/.gemini/tmp").join("tmp/hash520/chats/session-520.json"),
+        &[serde_json::json!({
+            "sessionId": "gemini-520",
+            "projectHash": "hash520",
+            "startTime": "2026-10-01T10:00:00Z",
+            "lastUpdated": "2026-10-01T10:05:00Z",
+            "messages": [
+                {"type": "user", "content": "geminimirrorprobe question", "timestamp": "2026-10-01T10:00:00Z"},
+                {"type": "model", "content": "gemini answer", "timestamp": "2026-10-01T10:01:00Z"}
+            ]
+        })
+        .to_string()],
+    );
+    {
+        let db_path = container("~/.config/Cursor/User").join("User/globalStorage/state.vscdb");
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn =
+            coding_agent_search::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())
+                .unwrap();
+        conn.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute_compat(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            coding_agent_search::franken_sync::params![
+                "composerData:cursor-520",
+                r#"{"text":"cursormirrorprobe question"}"#
+            ],
+        )
+        .unwrap();
+    }
+
+    let command = || {
+        let mut command = tracker.cass_std_command();
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_DATA_HOME", root.join("xdg"))
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(&home);
+        tracker.command_environment().apply_to_std(&mut command);
+        command
+    };
+    let run = |args: &[&str]| {
+        let output = command().args(args).output().unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let index = |args: &[&str]| {
+        let (code, stdout, stderr) = run(args);
+        assert_eq!(code, Some(0), "{args:?}\nstdout={stdout}\nstderr={stderr}");
+    };
+    let rows = || -> BTreeSet<(String, Option<String>)> {
+        let storage = FrankenStorage::open_readonly(&data.join("agent_search.db")).unwrap();
+        storage
+            .raw()
+            .query(
+                "SELECT a.slug, c.external_id FROM conversations c \
+                 JOIN agents a ON a.id = c.agent_id WHERE c.source_id = 'laptop'",
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get_typed::<String>(0).unwrap(),
+                    row.get_typed::<Option<String>>(1).unwrap(),
+                )
+            })
+            .collect()
+    };
+    let conversation_count = || -> i64 {
+        let storage = FrankenStorage::open_readonly(&data.join("agent_search.db")).unwrap();
+        storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversations WHERE source_id = 'laptop'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+    };
+    let hits = |marker: &str| -> usize {
+        let (code, stdout, stderr) = run(&[
+            "search",
+            marker,
+            "--robot",
+            "--mode",
+            "lexical",
+            "--no-daemon",
+        ]);
+        assert_eq!(code, Some(0), "search {marker}\nstderr={stderr}");
+        let payload: Value = serde_json::from_str(&stdout).unwrap();
+        payload["hits"].as_array().unwrap().len()
+    };
+
+    index(&["index", "--full", "--json"]);
+    let first = rows();
+    eprintln!("gh520 indexed: {first:?}");
+    let slugs: BTreeSet<String> = first.iter().map(|(slug, _)| slug.clone()).collect();
+    for slug in [
+        "claude_code",
+        "codex",
+        "pi_agent",
+        "factory",
+        "vibe",
+        "prime_agent",
+        "gemini",
+        "cursor",
+    ] {
+        assert!(slugs.contains(slug), "{slug} missing: {first:?}");
+    }
+    for marker in [
+        "factorymirrorprobe",
+        "vibemirrorprobe",
+        "primemirrorprobe",
+        "geminimirrorprobe",
+        "cursormirrorprobe",
+    ] {
+        assert!(hits(marker) > 0, "{marker} not searchable");
+    }
+    assert_eq!(conversation_count(), i64::try_from(first.len()).unwrap());
+
+    // Each conversation belongs to the agent whose store its file was synced
+    // from. Before mx520 the Claude connector also claimed the Factory, Pi,
+    // Prime and Gemini files, and Pi claimed the Prime file.
+    let expected_agent: std::collections::BTreeMap<String, &str> = [
+        ("~/.claude/projects", "claude_code"),
+        ("~/.codex/sessions", "codex"),
+        ("~/.pi/agent/sessions", "pi_agent"),
+        ("~/.factory/sessions", "factory"),
+        ("~/.vibe/logs/session", "vibe"),
+        ("~/.prime/agent/sessions", "prime_agent"),
+        ("~/.gemini/tmp", "gemini"),
+        ("~/.config/Cursor/User", "cursor"),
+    ]
+    .into_iter()
+    .map(|(path, agent)| (path_to_safe_dirname(path), agent))
+    .collect();
+    let attributions: Vec<(String, String)> = {
+        let storage = FrankenStorage::open_readonly(&data.join("agent_search.db")).unwrap();
+        storage
+            .raw()
+            .query(
+                "SELECT a.slug, c.source_path FROM conversations c \
+                 JOIN agents a ON a.id = c.agent_id WHERE c.source_id = 'laptop'",
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get_typed::<String>(0).unwrap(),
+                    row.get_typed::<String>(1).unwrap(),
+                )
+            })
+            .collect()
+    };
+    let misattributed: Vec<&(String, String)> = attributions
+        .iter()
+        .filter(|(agent, source_path)| {
+            let container = Path::new(source_path)
+                .strip_prefix(&mirror)
+                .ok()
+                .and_then(|relative| relative.components().next())
+                .map(|component| component.as_os_str().to_string_lossy().into_owned());
+            container.and_then(|container| expected_agent.get(&container).copied())
+                != Some(agent.as_str())
+        })
+        .collect();
+    assert!(
+        misattributed.is_empty(),
+        "conversations attributed to the wrong agent: {misattributed:?}"
+    );
+
+    // A second, incremental index re-reads the remote roots: it must find the
+    // same conversations under the same identities, with no duplicate rows.
+    index(&["index", "--json"]);
+    assert_eq!(
+        rows(),
+        first,
+        "a second index changed remote conversation identity"
+    );
+    assert_eq!(conversation_count(), i64::try_from(first.len()).unwrap());
     tracker.complete();
 }

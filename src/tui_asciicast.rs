@@ -476,10 +476,9 @@ impl Drop for StdinNonBlockingGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ensure_asciicast_output_available, is_pty_eof_error, open_asciicast_recorder_no_overwrite,
-        strip_asciicast_args,
-    };
+    #[cfg(unix)]
+    use super::ensure_asciicast_output_available;
+    use super::{is_pty_eof_error, open_asciicast_recorder_no_overwrite, strip_asciicast_args};
     use std::io;
     use std::io::Write as _;
 

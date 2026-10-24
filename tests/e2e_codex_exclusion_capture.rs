@@ -78,6 +78,11 @@ impl Fixture {
             .env("HOME", home)
             .env("USERPROFILE", home)
             .env("CODEX_HOME", home.join(".codex"))
+            // HOME does not isolate Claude Code or Gemini on Windows (their
+            // home comes from the profile known folder), so the host's real
+            // sessions would be indexed into the test archive.
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("GEMINI_HOME", home.join(".gemini/tmp"))
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("XDG_DATA_HOME", home.join(".local/share"))
             .env("APPDATA", home.join("AppData/Roaming"))
@@ -155,6 +160,49 @@ impl Fixture {
     }
 }
 
+impl Fixture {
+    /// Source paths of the raw-mirror captures taken from this fixture's home,
+    /// sorted. VS Code-based connectors (Copilot) resolve `%APPDATA%` through
+    /// the Windows profile known folder, which no environment variable
+    /// redirects, so a Windows run also captures the host's own Copilot
+    /// stores; those are not this fixture's sources.
+    fn captured_sources(&self) -> Vec<PathBuf> {
+        let home = self.home.path();
+        let Ok(entries) = fs::read_dir(home.join("data/raw-mirror/v1/manifests")) else {
+            return Vec::new();
+        };
+        let mut captured: Vec<PathBuf> = entries
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .filter_map(|path| {
+                let manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap())
+                    .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+                let original = PathBuf::from(manifest["original_path"].as_str().unwrap());
+                original.starts_with(home).then_some(original)
+            })
+            .collect();
+        captured.sort();
+        captured
+    }
+
+    fn all_sources(&self) -> Vec<PathBuf> {
+        let mut all = vec![
+            self.hidden.clone(),
+            self.archived.clone(),
+            self.public.clone(),
+        ];
+        all.sort();
+        all
+    }
+}
+
+/// One single-message Codex rollout under a fresh directory.
+fn write_rollout(path: &Path, text: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let record = json!({"type":"response_item","payload":{"role":"user","content":text}});
+    fs::write(path, format!("{record}\n")).unwrap();
+}
+
 /// Files under `root` whose bytes contain `needle`: the canonical DB and its
 /// sidecars, raw mirror, lexical and vector assets, checkpoints and logs.
 fn files_containing(root: &Path, needle: &str) -> Vec<PathBuf> {
@@ -194,7 +242,7 @@ fn all_excluded_inventory_never_falls_back_to_raw_copy_in_either_ingest_mode() {
             .map(|path| fs::read(path).unwrap());
         fixture.index(streaming, home.join(".codex").to_str().unwrap(), true);
         fixture.assert_sources(&[]);
-        assert!(!home.join("data/raw-mirror").exists());
+        assert_eq!(fixture.captured_sources(), Vec::<PathBuf>::new());
         for (path, original) in [&fixture.hidden, &fixture.archived, &fixture.public]
             .into_iter()
             .zip(before)
@@ -216,7 +264,7 @@ fn removing_exclusions_ingests_old_sources_without_hidden_raw_copies_or_duplicat
         fixture.index(streaming, &exclusions, true);
         fixture.assert_sources(&[&fixture.public]);
         let summary = storage_summary(&fixture.home.path().join("data"));
-        assert_eq!(summary.manifest_count, 1);
+        assert_eq!(fixture.captured_sources(), vec![fixture.public.clone()]);
         assert_eq!(summary.invalid_manifest_count, 0);
         fixture.assert_hits("cassprivateproof9z", 0);
         fixture.assert_hits("cassarchiveproof8z", 0);
@@ -244,7 +292,7 @@ fn removing_exclusions_ingests_old_sources_without_hidden_raw_copies_or_duplicat
         fixture.assert_hits("cassprivateproof9z", 1);
         fixture.assert_hits("cassarchiveproof8z", 1);
         let summary = storage_summary(&fixture.home.path().join("data"));
-        assert_eq!(summary.manifest_count, 3);
+        assert_eq!(fixture.captured_sources(), fixture.all_sources());
         assert_eq!(summary.invalid_manifest_count, 0);
 
         fixture.index(streaming, "", false);
@@ -314,8 +362,11 @@ fn raw_mirror_switch_indexes_without_raw_copies_and_doctor_discloses_it() {
 
         let control = Fixture::new();
         control.index(streaming, "", true);
-        let captured = storage_summary(&control.home.path().join("data"));
-        assert_eq!(captured.manifest_count, 3, "streaming={streaming}");
+        assert_eq!(
+            control.captured_sources(),
+            control.all_sources(),
+            "streaming={streaming}"
+        );
     }
 }
 
@@ -385,7 +436,7 @@ fn every_spelling_of_an_exclusion_covers_claude_codex_and_gemini_sessions() {
     // Spells one excluded directory (relative to HOME) as an exclusion entry;
     // `None` when the platform cannot express that spelling.
     type Spelling = fn(&Path, &str) -> Option<String>;
-    let spellings: [(&str, Spelling); 4] = [
+    let spellings: [(&str, Spelling); 6] = [
         ("exact", |home, dir| {
             Some(home.join(dir).display().to_string())
         }),
@@ -405,6 +456,14 @@ fn every_spelling_of_an_exclusion_covers_claude_codex_and_gemini_sessions() {
             fs::create_dir_all(link.parent()?).unwrap();
             alias_dir(&home.join(dir), &link)?;
             Some(link.display().to_string())
+        }),
+        // Windows paths are case-insensitive and accept `/` as a separator
+        // (bead 2l1b0.37); elsewhere both spellings name a different path.
+        ("case", |home, dir| {
+            cfg!(windows).then(|| home.join(dir).display().to_string().to_uppercase())
+        }),
+        ("slash", |home, dir| {
+            cfg!(windows).then(|| home.join(dir).display().to_string().replace('\\', "/"))
         }),
     ];
 
@@ -458,5 +517,123 @@ fn every_spelling_of_an_exclusion_covers_claude_codex_and_gemini_sessions() {
                 fixture.assert_hits(included, 1);
             }
         }
+    }
+}
+
+/// Bead 2l1b0.37: an exclusion is prospective. Conversations archived before
+/// it was set stay stored and searchable (cass never deletes archived history
+/// because of an exclusion), while a session written later into the excluded
+/// directory is kept out.
+#[test]
+fn adding_an_exclusion_keeps_previously_archived_conversations() {
+    for streaming in ["0", "1"] {
+        let fixture = Fixture::new();
+        fixture.index(streaming, "", true);
+        fixture.assert_sources(&[&fixture.hidden, &fixture.archived, &fixture.public]);
+
+        let private = fixture.hidden.parent().unwrap();
+        write_rollout(&private.join("rollout-later.jsonl"), "casslaterproof5z");
+        fixture.index(streaming, &private.display().to_string(), false);
+        fixture.assert_sources(&[&fixture.hidden, &fixture.archived, &fixture.public]);
+        fixture.assert_hits("cassprivateproof9z", 1);
+        fixture.assert_hits("casslaterproof5z", 0);
+        assert_eq!(
+            files_containing(&fixture.home.path().join("data"), "casslaterproof5z"),
+            Vec::<PathBuf>::new(),
+            "a session written after the exclusion leaked (streaming={streaming})"
+        );
+    }
+}
+
+/// Bead 2l1b0.37: an excluded directory with a non-ASCII name, holding a
+/// session and a metadata-only compressed rollout, leaves no byte in the data
+/// dir and no trace in the command output, and neither file counts as a
+/// failed source. The included control is indexed.
+#[test]
+fn unicode_and_zero_output_excluded_sources_leave_no_trace_in_data_or_output() {
+    for streaming in ["0", "1"] {
+        let fixture = Fixture::new();
+        let excluded = fixture.home.path().join(".codex/sessions/私密-Ünïcode");
+        write_rollout(
+            &excluded.join("rollout-unicode.jsonl"),
+            "cassunicodeproof4z",
+        );
+        let metadata = br#"{"type":"session_meta","payload":{"id":"cassmetaproof3z"}}
+"#;
+        fs::write(
+            excluded.join("rollout-meta.jsonl.zst"),
+            zstd::stream::encode_all(&metadata[..], 0).unwrap(),
+        )
+        .unwrap();
+        let exclusions = format!(
+            "{},{}",
+            excluded.display(),
+            fixture.hidden.parent().unwrap().display()
+        );
+        let output = assert_cmd::Command::from_std(fixture.command(streaming, &exclusions))
+            .args(["index", "--json", "--full"])
+            .timeout(Duration::from_secs(180))
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let summary: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        assert_eq!(summary["success"], true, "{summary}");
+        fixture.assert_sources(&[&fixture.archived, &fixture.public]);
+        fixture.assert_hits("casspublicproof7z", 1);
+        let data = fixture.home.path().join("data");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for needle in [
+            "cassunicodeproof4z",
+            "cassmetaproof3z",
+            "cassprivateproof9z",
+        ] {
+            assert_eq!(
+                files_containing(&data, needle),
+                Vec::<PathBuf>::new(),
+                "{needle} leaked into the data dir (streaming={streaming})"
+            );
+            assert!(
+                !stdout.contains(needle) && !stderr.contains(needle),
+                "{needle} appeared in the index output (streaming={streaming})"
+            );
+        }
+    }
+}
+
+/// Bead 2l1b0.37: an explicit `--watch-once` path inside an excluded
+/// directory is excluded too, and the same run without the exclusion ingests
+/// it, so the refusal is the exclusion's.
+#[test]
+fn watch_once_of_an_excluded_codex_rollout_ingests_nothing() {
+    for streaming in ["0", "1"] {
+        let fixture = Fixture::new();
+        let private = fixture.hidden.parent().unwrap().display().to_string();
+        fixture.index(streaming, &private, true);
+        fixture.assert_sources(&[&fixture.archived, &fixture.public]);
+        for (exclusions, expected) in [
+            (private.as_str(), vec![&fixture.archived, &fixture.public]),
+            (
+                "",
+                vec![&fixture.hidden, &fixture.archived, &fixture.public],
+            ),
+        ] {
+            let output = assert_cmd::Command::from_std(fixture.command(streaming, exclusions))
+                .args(["index", "--watch-once"])
+                .arg(&fixture.hidden)
+                .args(["--json", "--no-progress-events"])
+                .timeout(Duration::from_secs(180))
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let report: Value = serde_json::from_slice(&output).unwrap_or(Value::Null);
+            assert_eq!(report["success"], true, "{report}");
+            let expected: Vec<&Path> = expected.into_iter().map(PathBuf::as_path).collect();
+            fixture.assert_sources(&expected);
+        }
+        fixture.assert_hits("cassprivateproof9z", 1);
     }
 }

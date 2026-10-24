@@ -1,6 +1,6 @@
 //! Candidate-only cross-encoder refinement of a retained lexical shortlist.
 //!
-//! The input is the existing bounded index preview, never a canonical body or
+//! The input is the existing bounded lexical preview, never a full body or
 //! a global vector generation. Only an explicit startup model path enables this
 //! lane. Model loading is local-only and lazy; ordinary searches remain lexical.
 
@@ -84,7 +84,7 @@ impl Refiner {
             "load_attempts": self.load_attempts,
             "successful_loads": self.successful_loads,
             "calls_completed": self.calls_completed,
-            "input": "title_and_index_snippet",
+            "input": "title_and_lexical_preview",
             "full_message_scored": false,
             "vector_assets_loaded": false,
             "candidate_limit": MAX_CANDIDATES,
@@ -266,6 +266,10 @@ impl Session {
             "next_offset": null,
             "preview_only": true,
             "reader_reused": lexical["reader_reused"],
+            "backend": lexical["backend"],
+            "degraded": lexical["degraded"],
+            "fallback": lexical["fallback"],
+            "result_reader_epoch": lexical["result_reader_epoch"],
             "setup_ms": lexical["setup_ms"],
             "search_ms": lexical["search_ms"],
             "refinement": metadata,

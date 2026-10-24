@@ -46,8 +46,14 @@ use crate::search::vector_index::{
 };
 use crate::storage::sqlite::FrankenStorage;
 
+mod replay_cache;
+
+#[cfg(test)]
+mod gh525_tests;
 #[cfg(test)]
 mod shard_publication_tests;
+#[cfg(test)]
+mod snapshot_tests;
 
 /// Default embedder batch size — the **maximum row count** per embed batch.
 /// 128 is a sweet spot for short messages: big enough to amortize dispatch
@@ -1571,7 +1577,7 @@ pub(crate) struct SemanticPacketContext {
 /// Invariants:
 /// - The `i`th element of `contexts` describes the `i`th packet.
 /// - Returns `Err` if the lengths disagree, so a callsite cannot
-///   silently mis-correlate packets and contexts.
+///   silently mis-correlate ids.
 /// - `source_id_hash` is derived from `packet.payload.provenance.source_id`
 ///   the same way `embedding_inputs_from_conversation_packet` derives
 ///   it from the canonical row, so the produced `EmbeddingInput.source_id`
@@ -1749,18 +1755,21 @@ fn fetch_canonical_embedding_batch_inner_with_caps_and_total(
 
     let conversations = fetch_canonical_embedding_conversations(storage, &conversation_ids)?;
 
-    let mut grouped_messages =
-        storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
+    let (selection, mut grouped_messages) = select_checkpoint_capped_conversations_lazily(
+        conversations,
+        after_message_id,
+        caps,
+        |conversation_id| {
+            let mut loaded =
+                storage.fetch_messages_for_lexical_rebuild_batch(&[conversation_id], None, None)?;
+            Ok(loaded.remove(&conversation_id).unwrap_or_default())
+        },
+    )?;
     let CheckpointCappedSelection {
         conversations,
         last_conversation_id,
         stopped_before_candidate,
-    } = select_checkpoint_capped_conversations(
-        conversations,
-        &mut grouped_messages,
-        after_message_id,
-        caps,
-    );
+    } = selection;
     let (inputs, _) = packet_embedding_inputs_from_materialized_canonical_messages(
         &conversations,
         &mut grouped_messages,
@@ -1795,26 +1804,42 @@ struct CheckpointCappedSelection {
     stopped_before_candidate: bool,
 }
 
-fn select_checkpoint_capped_conversations(
+fn select_checkpoint_capped_conversations_lazily<F>(
     conversations: Vec<CanonicalEmbeddingConversationRow>,
-    grouped_messages: &mut HashMap<i64, Vec<Message>>,
     after_message_id: Option<i64>,
     caps: SemanticCheckpointCaps,
-) -> CheckpointCappedSelection {
+    mut load_messages: F,
+) -> Result<(CheckpointCappedSelection, HashMap<i64, Vec<Message>>)>
+where
+    F: FnMut(i64) -> Result<Vec<Message>>,
+{
     let mut selected = Vec::new();
+    let mut grouped_messages = HashMap::new();
     let mut selected_messages = 0usize;
     let mut selected_bytes = 0u64;
     let mut last_conversation_id = None;
     let mut stopped_before_candidate = false;
 
     for conversation in conversations {
-        let mut messages = grouped_messages
-            .remove(&conversation.conversation_id)
-            .unwrap_or_default();
+        let message_cap_full = caps.message_limited()
+            && !selected.is_empty()
+            && selected_messages >= caps.max_messages;
+        let byte_cap_full =
+            caps.byte_limited() && !selected.is_empty() && selected_bytes >= caps.max_bytes;
+        if message_cap_full || byte_cap_full {
+            stopped_before_candidate = true;
+            break;
+        }
+
+        let mut messages = load_messages(conversation.conversation_id)?;
         if let Some(min_exclusive) = after_message_id {
             messages.retain(|message| message.id.is_some_and(|id| id > min_exclusive));
         }
         if messages.is_empty() {
+            // This candidate was actually inspected. Advancing past it avoids
+            // replaying an all-empty page selected through stale tail metadata.
+            // Unread and over-budget nonempty candidates never reach this arm.
+            last_conversation_id = Some(conversation.conversation_id);
             continue;
         }
 
@@ -1852,11 +1877,14 @@ fn select_checkpoint_capped_conversations(
         selected.push(conversation);
     }
 
-    CheckpointCappedSelection {
-        conversations: selected,
-        last_conversation_id,
-        stopped_before_candidate,
-    }
+    Ok((
+        CheckpointCappedSelection {
+            conversations: selected,
+            last_conversation_id,
+            stopped_before_candidate,
+        },
+        grouped_messages,
+    ))
 }
 
 #[cfg(test)]
@@ -2446,6 +2474,7 @@ pub struct SemanticIndexer {
     // MiniLM producers. Multilingual retains uncached batches until qualified.
     exact_reuse: bool,
     external_cancelled: Option<crate::search::external_embedder::CancelCheck>,
+    replay_cache: replay_cache::CanonicalReplayCache,
 }
 
 impl SemanticIndexer {
@@ -2472,6 +2501,7 @@ impl SemanticIndexer {
                 // Endpoint probes do not qualify the local exact-reuse contract.
                 exact_reuse: false,
                 external_cancelled: Some(cancelled),
+                replay_cache: replay_cache::CanonicalReplayCache::default(),
             });
         }
         let exact_reuse = embedder_type == "hash"
@@ -2495,6 +2525,7 @@ impl SemanticIndexer {
             batch_size: resolved_default_batch_size(),
             exact_reuse,
             external_cancelled: None,
+            replay_cache: replay_cache::CanonicalReplayCache::default(),
         })
     }
 
@@ -2514,6 +2545,7 @@ impl SemanticIndexer {
             batch_size: resolved_default_batch_size(),
             exact_reuse: false,
             external_cancelled: Some(cancelled),
+            replay_cache: replay_cache::CanonicalReplayCache::default(),
         })
     }
 
@@ -3016,39 +3048,37 @@ impl SemanticIndexer {
         )
         .map_err(|err| anyhow::anyhow!("create fsvi index failed: {err}"))?;
 
+        // The FSVI writer buffers records until finish() publishes its own
+        // temporary file. A rejected row therefore leaves no partial index
+        // at index_path: that path can still own the previous valid generation
+        // and its acknowledged WAL. Drop only the uncommitted writer on error;
+        // never unlink the destination as purported partial-output cleanup.
         let mut records_written = 0_usize;
-        let write_result: Result<()> = (|| {
-            for embedded in embedded_messages {
-                validate_embedding_vector(
-                    &embedded.embedding,
-                    self.embedder_dimension(),
-                    embedded.message_id,
-                )?;
-                let doc_id = semantic_doc_id_for_embedded(&embedded);
-                writer
-                    .write_record(&doc_id, &embedded.embedding)
-                    .map_err(|err| anyhow::anyhow!("write fsvi record failed: {err}"))?;
-                records_written = records_written.saturating_add(1);
-                on_progress(records_written);
-            }
-            Ok(())
-        })();
-
-        if let Err(e) = &write_result {
-            // Clean up partial index file to prevent corruption
-            tracing::warn!("removing partial vector index after write failure: {e}");
-            if let Err(rm_err) = std::fs::remove_file(index_path) {
-                tracing::error!(
-                    "failed to remove partial index file {}: {rm_err}",
-                    index_path.display()
-                );
-            }
-            return Err(anyhow::anyhow!("{e}"));
+        for embedded in embedded_messages {
+            validate_embedding_vector(
+                &embedded.embedding,
+                self.embedder_dimension(),
+                embedded.message_id,
+            )?;
+            let doc_id = semantic_doc_id_for_embedded(&embedded);
+            writer
+                .write_record(&doc_id, &embedded.embedding)
+                .map_err(|err| {
+                    // Preserve both the existing top-level diagnostic and the
+                    // backend's typed cause for callers that inspect the chain.
+                    let message = format!("write fsvi record failed: {err}");
+                    anyhow::Error::new(err).context(message)
+                })?;
+            records_written = records_written.saturating_add(1);
+            on_progress(records_written);
         }
 
-        writer
-            .finish()
-            .map_err(|err| anyhow::anyhow!("finish fsvi index failed: {err}"))?;
+        // Same for publication: callers distinguish a WAL-sidecar refusal
+        // (InvalidConfig { field: "wal_sidecar" }) from an I/O failure.
+        writer.finish().map_err(|err| {
+            let message = format!("finish fsvi index failed: {err}");
+            anyhow::Error::new(err).context(message)
+        })?;
 
         FsVectorIndex::open(index_path)
             .map_err(|err| anyhow::anyhow!("open fsvi index failed: {err}"))
@@ -3153,14 +3183,66 @@ impl SemanticIndexer {
         )
     }
 
+    #[cfg(test)]
     fn reconcile_index_at_paths(
         &self,
-        mut embedded_messages: Vec<EmbeddedMessage>,
+        embedded_messages: Vec<EmbeddedMessage>,
         index_path: &Path,
         final_index_path: &Path,
         tier: TierKind,
         db_fingerprint: &str,
         current_doc_ids: &HashSet<String>,
+    ) -> Result<FsVectorIndex> {
+        self.reconcile_in_private_directory(
+            embedded_messages,
+            final_index_path,
+            current_doc_ids,
+            || {
+                let index_parent = index_path.parent().with_context(|| {
+                    format!(
+                        "semantic reconciliation index path has no parent: {}",
+                        index_path.display()
+                    )
+                })?;
+                fs::create_dir_all(index_parent)?;
+                let temp_prefix = format!(
+                    ".reconcile-{}-{}-{:08x}-",
+                    tier.as_str(),
+                    safe_path_component(self.embedder_id()),
+                    crc32fast::hash(db_fingerprint.as_bytes())
+                );
+                let directory = tempfile::Builder::new()
+                    .prefix(&temp_prefix)
+                    .tempdir_in(index_parent)?;
+                let candidate = directory.path().join("candidate.fsvi");
+                fs::copy(index_path, &candidate).with_context(|| {
+                    format!("snapshot live semantic index {}", index_path.display())
+                })?;
+                let source_wal = fsvi_wal_path_for(index_path);
+                if source_wal.exists() {
+                    fs::copy(&source_wal, fsvi_wal_path_for(&candidate)).with_context(|| {
+                        format!("snapshot live semantic WAL {}", source_wal.display())
+                    })?;
+                }
+                Ok(directory)
+            },
+        )
+    }
+
+    /// Consume an exclusively owned scratch directory, never a published
+    /// pathname disguised as scratch. Ordinary reconciliation creates its
+    /// snapshot lazily; backfill transfers the snapshot it already copied and
+    /// compacted while selecting coverage. No second full-file copy is needed.
+    ///
+    /// Keeping preparation behind FnOnce preserves validation-before-I/O for
+    /// invalid replacements. The directory remains owned until publication or
+    /// error cleanup, and the old-WAL replay probe still runs on its exact image.
+    fn reconcile_in_private_directory(
+        &self,
+        mut embedded_messages: Vec<EmbeddedMessage>,
+        final_index_path: &Path,
+        current_doc_ids: &HashSet<String>,
+        prepare: impl FnOnce() -> Result<tempfile::TempDir>,
     ) -> Result<FsVectorIndex> {
         let mut replacement_doc_ids = HashSet::with_capacity(embedded_messages.len());
         for embedded in &embedded_messages {
@@ -3185,54 +3267,18 @@ impl SemanticIndexer {
             }
         }
 
-        let index_parent = index_path.parent().with_context(|| {
-            format!(
-                "semantic reconciliation index path has no parent: {}",
-                index_path.display()
-            )
-        })?;
-        fs::create_dir_all(index_parent)?;
-        let temp_prefix = format!(
-            ".reconcile-{}-{}-{:08x}-",
-            tier.as_str(),
-            safe_path_component(self.embedder_id()),
-            crc32fast::hash(db_fingerprint.as_bytes())
-        );
-        let staging_dir = tempfile::Builder::new()
-            .prefix(&temp_prefix)
-            .tempdir_in(index_parent)
-            .with_context(|| {
-                format!(
-                    "create semantic reconciliation staging directory in {}",
-                    index_parent.display()
-                )
-            })?;
+        let staging_dir = prepare()?;
         let staging_path = staging_dir.path().join("candidate.fsvi");
-        fs::copy(index_path, &staging_path).with_context(|| {
-            format!(
-                "snapshot live semantic index {} at {}",
-                index_path.display(),
-                staging_path.display()
-            )
-        })?;
-        let live_wal_path = fsvi_wal_path_for(index_path);
+        let live_wal_path = fsvi_wal_path_for(&staging_path);
         let live_wal_snapshot_path = staging_dir.path().join("live.wal.snapshot");
         if live_wal_path.exists() {
             fs::copy(&live_wal_path, &live_wal_snapshot_path).with_context(|| {
                 format!(
-                    "snapshot live semantic WAL {} at {}",
+                    "retain pre-reconciliation WAL {} at {}",
                     live_wal_path.display(),
                     live_wal_snapshot_path.display()
                 )
             })?;
-            fs::copy(&live_wal_snapshot_path, fsvi_wal_path_for(&staging_path)).with_context(
-                || {
-                    format!(
-                        "attach semantic WAL snapshot to candidate {}",
-                        staging_path.display()
-                    )
-                },
-            )?;
         }
 
         let embedded_docs = embedded_messages.len();
@@ -3250,7 +3296,7 @@ impl SemanticIndexer {
                 &staging_path,
             )?
         } else {
-            FsVectorIndex::open(&staging_path).map_err(|err| {
+            FsVectorIndex::open_writer(&staging_path).map_err(|err| {
                 anyhow::anyhow!(
                     "open semantic reconciliation snapshot {}: {err}",
                     staging_path.display()
@@ -3546,6 +3592,12 @@ impl SemanticIndexer {
         manifest.refresh_backlog(plan.total_conversations, &plan.db_fingerprint);
 
         if complete {
+            let retained_generation = self.retain_published_generation_during_replacement(
+                manifest,
+                plan.tier,
+                &plan.db_fingerprint,
+                &plan.model_revision,
+            );
             let db_fingerprint = plan.db_fingerprint.clone();
             if staged_index.wal_record_count() > 0 {
                 staged_index.compact().map_err(|err| {
@@ -3566,6 +3618,12 @@ impl SemanticIndexer {
                         ..Default::default()
                     },
                 );
+            }
+            // Contract-replacement batches keep the old complete generation
+            // published while staging. Retire it only at the actual publication
+            // boundary, immediately before the fixed destination is replaced.
+            if retained_generation {
+                self.revoke_backfill_serving(data_dir, manifest)?;
             }
             // Keep the WAL parked even if publication fails: a failure may
             // follow the rename (for example directory fsync), so restoring it
@@ -3819,6 +3877,55 @@ impl SemanticIndexer {
         Ok(())
     }
 
+    /// A same-corpus contract replacement is private build work, not evidence
+    /// that the last complete generation became invalid. Keep its ledger and
+    /// ANN association intact until the replacement reaches the publication
+    /// boundary. Query admission remains independently strict: this does not
+    /// make an old vector-space revision writable or current for this binary.
+    fn retain_published_generation_during_replacement(
+        &self,
+        manifest: &SemanticManifest,
+        tier: TierKind,
+        db_fingerprint: &str,
+        model_revision: &str,
+    ) -> bool {
+        let artifact = match tier {
+            TierKind::Fast => manifest.fast_tier.as_ref(),
+            TierKind::Quality => manifest.quality_tier.as_ref(),
+        };
+        artifact.is_some_and(|artifact| {
+            artifact.ready
+                && artifact.embedder_id == self.embedder_id()
+                && artifact.db_fingerprint == db_fingerprint
+                && artifact.dimension == self.embedder_dimension()
+                && (artifact.model_revision != model_revision
+                    || artifact.schema_version != SEMANTIC_SCHEMA_VERSION
+                    || artifact.chunking_version != CHUNKING_STRATEGY_VERSION)
+        })
+    }
+
+    fn prepare_backfill_serving(
+        &self,
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: &SemanticBackfillStoragePlan,
+    ) -> Result<()> {
+        if self.retain_published_generation_during_replacement(
+            manifest,
+            plan.tier,
+            &plan.db_fingerprint,
+            &plan.model_revision,
+        ) {
+            tracing::info!(
+                tier = plan.tier.as_str(),
+                embedder = self.embedder_id(),
+                "retaining complete semantic generation while replacement contract builds"
+            );
+            return Ok(());
+        }
+        self.revoke_backfill_serving(data_dir, manifest)
+    }
+
     /// Reuse exact canonical identities, never a count or a conversation tail
     /// as evidence that an older vector still describes the current row.
     /// Only one replayed conversation and the capped embedding delta retain
@@ -3844,7 +3951,7 @@ impl SemanticIndexer {
             fs::copy(candidate_wal, fsvi_wal_path_for(&snapshot_path))
                 .context("snapshot semantic backfill candidate WAL")?;
         }
-        let mut snapshot = FsVectorIndex::open(&snapshot_path)
+        let mut snapshot = FsVectorIndex::open_writer(&snapshot_path)
             .map_err(|err| anyhow::anyhow!("open semantic backfill candidate: {err}"))?;
         // Historical hash indexes used the generic "1.0" revision. Those
         // vectors cannot be appended to or served as the current space, but
@@ -3869,7 +3976,7 @@ impl SemanticIndexer {
         {
             bail!("semantic backfill candidate has an incompatible vector space");
         }
-        self.revoke_backfill_serving(data_dir, manifest)?;
+        self.prepare_backfill_serving(data_dir, manifest, &plan)?;
         if snapshot.wal_record_count() > 0 {
             snapshot.compact().map_err(|err| {
                 anyhow::anyhow!("compact semantic backfill candidate snapshot: {err}")
@@ -3891,16 +3998,6 @@ impl SemanticIndexer {
 
         let total_conversations =
             total_semantic_conversations_with_cancel(storage, self.external_cancelled.as_ref())?;
-        let mut current_ids = HashSet::new();
-        let mut selected_ids = HashSet::new();
-        let mut inputs = Vec::new();
-        let mut selected_conversations = 0usize;
-        let mut selected_messages = 0usize;
-        let mut selected_bytes = 0u64;
-        let mut covered_conversations = 0u64;
-        let mut after_conversation_id = 0i64;
-        let mut last_covered_conversation = 0i64;
-        let mut last_message_id = None;
         sink.emit(
             SemanticProgressEvent::SelectionStart,
             SemanticProgressFields {
@@ -3909,93 +4006,19 @@ impl SemanticIndexer {
                 ..Default::default()
             },
         );
-        loop {
-            self.check_external_cancelled()?;
-            // Page actual parent IDs independently of append-tail metadata:
-            // deleting the last message must not strand this scan on a stale
-            // tail cache or make a deleted document count as covered.
-            let conversation_ids: Vec<i64> = storage.raw().query_map_collect(
-                "SELECT id FROM conversations WHERE id > ?1 ORDER BY id LIMIT ?2",
-                &[
-                    ParamValue::from(after_conversation_id),
-                    ParamValue::from(DEFAULT_SEMANTIC_RECONCILIATION_SCAN_CONVERSATIONS as i64),
-                ],
-                |row| row.get_typed(0),
-            )?;
-            if conversation_ids.is_empty() {
-                break;
-            }
-            for conversation_id in conversation_ids {
-                self.check_external_cancelled()?;
-                let (conversation_inputs, _) =
-                    packet_embedding_inputs_from_selected_canonical_messages(
-                        storage,
-                        &[conversation_id],
-                        |_| true,
-                    )?;
-                let mut missing = Vec::new();
-                let mut missing_ids = Vec::new();
-                for input in conversation_inputs {
-                    let Some(id) = semantic_doc_id_for_input(&input) else {
-                        continue;
-                    };
-                    if !current_ids.insert(id.clone()) {
-                        bail!("canonical semantic backfill produced duplicate document {id}");
-                    }
-                    if !existing_ids.contains(&id) {
-                        missing_ids.push(id);
-                        missing.push(input);
-                    }
-                }
-                let missing_bytes = missing.iter().fold(0u64, |bytes, input| {
-                    bytes.saturating_add(saturating_u64_from_usize(input.content.len()))
-                });
-                let missing_messages = missing
-                    .iter()
-                    .map(|input| input.message_id)
-                    .collect::<HashSet<_>>()
-                    .len();
-                // Match the existing whole-conversation exception: the first
-                // missing conversation may exceed a message/byte cap by itself.
-                let select = !missing.is_empty()
-                    && selected_conversations < plan.max_conversations.max(1)
-                    && (selected_conversations == 0
-                        || ((!caps.message_limited()
-                            || selected_messages.saturating_add(missing_messages)
-                                <= caps.max_messages)
-                            && (!caps.byte_limited()
-                                || selected_bytes.saturating_add(missing_bytes)
-                                    <= caps.max_bytes)));
-                if missing.is_empty() || select {
-                    covered_conversations = covered_conversations.saturating_add(1);
-                    last_covered_conversation = conversation_id;
-                }
-                if select {
-                    selected_conversations = selected_conversations.saturating_add(1);
-                    selected_messages = selected_messages.saturating_add(missing_messages);
-                    selected_bytes = selected_bytes.saturating_add(missing_bytes);
-                    for input in &missing {
-                        let id = i64::try_from(input.message_id).unwrap_or(i64::MAX);
-                        last_message_id =
-                            Some(last_message_id.map_or(id, |prior: i64| prior.max(id)));
-                    }
-                    selected_ids.extend(missing_ids);
-                    inputs.extend(missing);
-                }
-                after_conversation_id = conversation_id;
-                sink.emit(
-                    SemanticProgressEvent::PacketReplayProgress,
-                    SemanticProgressFields {
-                        last_conversation_id: Some(conversation_id),
-                        rows_processed: Some(saturating_u64_from_usize(current_ids.len())),
-                        conversations_in_batch: Some(saturating_u64_from_usize(
-                            selected_conversations,
-                        )),
-                        ..Default::default()
-                    },
-                );
-            }
-        }
+        let (selection, replay_proof) =
+            self.replay_cache
+                .select(self, storage, &plan, &existing_ids, caps, sink)?;
+        let replay_cache::ReconcileSelection {
+            current_ids,
+            selected_ids,
+            inputs,
+            selected_conversations,
+            covered_conversations,
+            last_covered_conversation,
+            last_message_id,
+            ..
+        } = selection;
         let mut covered_ids: HashSet<String> =
             existing_ids.intersection(&current_ids).cloned().collect();
         covered_ids.extend(selected_ids);
@@ -4010,6 +4033,9 @@ impl SemanticIndexer {
             },
         );
         let embeddings = self.embed_messages_with_sink(&inputs, sink)?;
+        // A cache hit is valid only while the descriptor-bound canonical archive
+        // remains unchanged, including across a potentially long embed batch.
+        replay_proof.verify(storage)?;
         let embedded_docs = saturating_u64_from_usize(embeddings.len());
         let staging_path = semantic_staging_index_path(
             data_dir,
@@ -4018,13 +4044,13 @@ impl SemanticIndexer {
             &plan.db_fingerprint,
         );
         self.check_external_cancelled()?;
-        let staged_index = self.reconcile_index_at_paths(
+        let staged_index = self.reconcile_in_private_directory(
             embeddings,
-            &snapshot_path,
             &staging_path,
-            plan.tier,
-            &plan.db_fingerprint,
             &covered_ids,
+            // Move the actual TempDir owner, not a reusable path flag. The
+            // existing snapshot and its compacted vectors become the candidate.
+            || Ok(snapshot_dir),
         )?;
         let outcome = self.finish_backfill_batch(
             staged_index,
@@ -4251,7 +4277,7 @@ impl SemanticIndexer {
         }) {
             manifest.checkpoint = None;
         }
-        self.revoke_backfill_serving(data_dir, manifest)?;
+        self.prepare_backfill_serving(data_dir, manifest, &plan)?;
         let prior_checkpoint = manifest.checkpoint.as_ref().filter(|checkpoint| {
             checkpoint.tier == plan.tier
                 && checkpoint.embedder_id == self.embedder_id()
@@ -6510,6 +6536,116 @@ mod tests {
         let unchanged = run(&mut manifest)?;
         assert!(unchanged.published);
         assert_eq!(unchanged.embedded_docs, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn gh458_contract_replacement_checkpoints_without_revoking_published_generation() -> Result<()>
+    {
+        let temp = tempdir()?;
+        let storage = FrankenStorage::open(&temp.path().join("agent_search.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        for (name, text) in [
+            ("first", "first retained-contract message"),
+            ("second", "second retained-contract message"),
+        ] {
+            storage.insert_conversation_tree(agent_id, None, &test_conversation(name, text))?;
+        }
+
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let db_fingerprint = crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?;
+        let final_path = vector_index_path(temp.path(), indexer.embedder_id());
+        fs::create_dir_all(
+            final_path
+                .parent()
+                .context("semantic index has no parent")?,
+        )?;
+        let published_bytes = b"retained published generation sentinel";
+        fs::write(&final_path, published_bytes)?;
+
+        let mut manifest = SemanticManifest::default();
+        manifest.publish_artifact(ArtifactRecord {
+            tier: TierKind::Fast,
+            embedder_id: indexer.embedder_id().to_owned(),
+            model_revision: "hash".into(),
+            schema_version: SEMANTIC_SCHEMA_VERSION,
+            chunking_version: CHUNKING_STRATEGY_VERSION.wrapping_add(1),
+            dimension: indexer.embedder_dimension(),
+            doc_count: 2,
+            conversation_count: 2,
+            db_fingerprint: db_fingerprint.clone(),
+            index_path: final_path
+                .strip_prefix(temp.path())?
+                .to_string_lossy()
+                .into_owned(),
+            size_bytes: u64::try_from(published_bytes.len())?,
+            started_at_ms: 10,
+            completed_at_ms: 20,
+            ready: true,
+        });
+        manifest.publish_hnsw(crate::search::semantic_manifest::HnswRecord {
+            base_tier: TierKind::Fast,
+            embedder_id: indexer.embedder_id().to_owned(),
+            ef_search: 64,
+            index_path: "vector_index/retained-hnsw.chsw".into(),
+            size_bytes: 17,
+            built_at_ms: 30,
+            ready: true,
+        });
+        manifest.save(temp.path())?;
+        let published = manifest.fast_tier.clone();
+        let ann = manifest.hnsw.clone();
+
+        let run = |manifest: &mut SemanticManifest, max_conversations| {
+            indexer.run_backfill_from_storage(
+                &storage,
+                temp.path(),
+                manifest,
+                SemanticBackfillStoragePlan {
+                    tier: TierKind::Fast,
+                    db_fingerprint: db_fingerprint.clone(),
+                    model_revision: "hash".into(),
+                    max_conversations,
+                },
+            )
+        };
+
+        let checkpointed = run(&mut manifest, 1)?;
+        assert!(!checkpointed.published);
+        assert!(checkpointed.checkpoint_saved);
+        assert_eq!(manifest.fast_tier, published);
+        assert_eq!(manifest.hnsw, ann);
+        assert_eq!(fs::read(&final_path)?, published_bytes);
+        let checkpoint = manifest
+            .checkpoint
+            .as_ref()
+            .context("replacement checkpoint missing")?;
+        assert_eq!(checkpoint.chunking_version, CHUNKING_STRATEGY_VERSION);
+
+        let loaded = SemanticManifest::load(temp.path())?.context("saved manifest missing")?;
+        assert_eq!(loaded.fast_tier, published);
+        assert_eq!(loaded.hnsw, ann);
+        assert!(loaded.checkpoint.is_some());
+
+        let completed = run(&mut manifest, 16)?;
+        assert!(completed.published);
+        assert!(!completed.checkpoint_saved);
+        assert!(manifest.checkpoint.is_none());
+        let replacement = manifest
+            .fast_tier
+            .as_ref()
+            .context("replacement not published")?;
+        assert!(replacement.ready);
+        assert_eq!(replacement.chunking_version, CHUNKING_STRATEGY_VERSION);
+        assert_ne!(manifest.fast_tier, published);
+        assert!(manifest.hnsw.as_ref().is_some_and(|record| !record.ready));
+        assert_ne!(fs::read(&final_path)?, published_bytes);
         Ok(())
     }
 

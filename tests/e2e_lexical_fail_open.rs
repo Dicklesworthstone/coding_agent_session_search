@@ -46,6 +46,9 @@ fn cass_cmd(temp_home: &std::path::Path) -> Command {
     // Keep concurrent fleet tests and the worker's own sessions out of fixtures.
     cmd.current_dir(temp_home);
     cmd.env("CLAUDE_HOME", temp_home.join(".claude"));
+    // The Claude Code connector reads CLAUDE_CONFIG_DIR, not CLAUDE_HOME, and
+    // on Windows its default root is the profile known folder, not HOME.
+    cmd.env("CLAUDE_CONFIG_DIR", temp_home.join(".claude"));
     cmd.env("GEMINI_HOME", temp_home.join(".gemini"));
     cmd.env("OPENCODE_STORAGE_ROOT", temp_home.join(".opencode"));
     cmd.env("CASS_AIDER_DATA_ROOT", temp_home.join(".aider-missing"));
@@ -60,6 +63,36 @@ fn cass_cmd(temp_home: &std::path::Path) -> Command {
     cmd.env("CASS_AUTO_REFRESH", "0");
     cmd.env("CASS_DAEMON_SOCKET", temp_home.join("cass-daemon.sock"));
     cmd
+}
+
+/// The file a pack citation names. Pack redacts paths under a home directory,
+/// keeping only the file name, and a Windows temp dir is under one. Map such
+/// a citation back to the one fixture file under `home` with that name.
+fn cited_source(home: &Path, cited: &str) -> PathBuf {
+    let Some(redacted) = cited.strip_prefix("[REDACTED_PATH]") else {
+        return PathBuf::from(cited);
+    };
+    let name = Path::new(redacted.trim_start_matches(['/', '\\']))
+        .file_name()
+        .expect("a redacted citation keeps its file name")
+        .to_owned();
+    let matches: Vec<PathBuf> = walkdir::WalkDir::new(home)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file() && entry.file_name() == name)
+        .map(walkdir::DirEntry::into_path)
+        .collect();
+    assert_eq!(matches.len(), 1, "one fixture file is named {name:?}");
+    matches.into_iter().next().expect("one match")
+}
+
+/// Where `seed_codex_session` puts `filename`, joined component by component
+/// as the Codex connector walks it, so the separators match the archive's
+/// stored path on Windows too.
+fn native_codex_session_path(codex_home: &Path, filename: &str) -> PathBuf {
+    ["sessions", "2026", "04", "23", filename]
+        .iter()
+        .fold(codex_home.to_path_buf(), |path, part| path.join(part))
 }
 
 fn seed_codex_session(codex_home: &std::path::Path, filename: &str, keyword: &str) {
@@ -934,7 +967,9 @@ fn gh422_timeout_retry_preserves_scoped_read_only_search() {
     for name in ["rollout-selected.jsonl", "rollout-excluded.jsonl"] {
         seed_codex_session(&codex_home, name, "scopedretryneedle");
     }
-    let selected = codex_home.join("sessions/2026/04/23/rollout-selected.jsonl");
+    // A scope matches stored paths exactly, and the archive stores the
+    // connector's walked path: native separators throughout on Windows.
+    let selected = native_codex_session_path(&codex_home, "rollout-selected.jsonl");
     let scope = home.join("selected sessions.txt");
     fs::write(&scope, format!("{}\n", selected.display())).unwrap();
     let indexed = cass_cmd(&home)
@@ -981,7 +1016,10 @@ fn gh422_timeout_retry_preserves_scoped_read_only_search() {
     for (delay, agent, expected_hits) in [
         ("CASS_TEST_SEARCH_SETUP_SLOW_MS", "codex", 1),
         ("CASS_TEST_SEARCH_META_SLOW_MS", "codex", 1),
-        ("CASS_TEST_SEARCH_SETUP_SLOW_MS", "not-a-real-agent", 0),
+        // A known agent with no sessions in this archive: an unknown name is
+        // now a usage error (exit 2, unknown-agent; 4f21ac8a, #532), not an
+        // empty scope.
+        ("CASS_TEST_SEARCH_SETUP_SLOW_MS", "gemini", 0),
     ] {
         let output = cass_cmd(&home)
             .env(delay, "6000")
@@ -1240,7 +1278,7 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
     for item in evidence {
         let citation = &item["citation"];
         assert_eq!(
-            Path::new(citation["source_path"].as_str().expect("source path")),
+            cited_source(home, citation["source_path"].as_str().expect("source path")),
             source_path
         );
         let line = citation["line_start"].as_u64().expect("citation line") as usize;
@@ -1259,8 +1297,17 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
         // checked against the source file just above.
         let mut identity = blake3::Hasher::new();
         identity.update(b"cass.pack.evidence.v2\0");
+        // Pack binds the stored source path, and prints it redacted under a
+        // home directory (a Windows temp dir is under one).
+        let stored_path = native_codex_session_path(&codex_home, filename)
+            .to_string_lossy()
+            .into_owned();
         for field in ["source_id", "source_path", "agent", "content_hash"] {
-            let text = citation[field].as_str().expect(field);
+            let text = if field == "source_path" {
+                stored_path.as_str()
+            } else {
+                citation[field].as_str().expect(field)
+            };
             identity.update(&(text.len() as u64).to_le_bytes());
             identity.update(text.as_bytes());
         }
@@ -1707,8 +1754,11 @@ fn pack_final_output_budget_bounds_all_formats_and_refuses_oversized_metadata() 
             }
             for item in evidence {
                 assert_eq!(item["citation"]["verified"], true);
-                let source =
-                    fs::read_to_string(item["citation"]["source_path"].as_str().unwrap()).unwrap();
+                let source = fs::read_to_string(cited_source(
+                    home,
+                    item["citation"]["source_path"].as_str().unwrap(),
+                ))
+                .unwrap();
                 let line_index = source
                     .lines()
                     .position(|line| {
@@ -1859,8 +1909,8 @@ fn structured_pack_retains_source_verification_after_slow_planning() {
     );
     let source_path = codex_home.join("sessions/2026/04/23/rollout-planning.jsonl");
     assert_eq!(
-        citation["source_path"],
-        source_path.to_string_lossy().as_ref()
+        cited_source(home, citation["source_path"].as_str().expect("source path")),
+        source_path
     );
     assert_eq!(citation["line_start"], 2);
     let source = fs::read_to_string(source_path).unwrap();
@@ -1976,7 +2026,11 @@ fn pack_excludes_skill_payloads_without_losing_ordinary_evidence() {
             assert_eq!(evidence[0]["excerpt"], ordinary);
             let citation = &evidence[0]["citation"];
             assert_eq!(citation["verified"], true);
-            let source = fs::read_to_string(citation["source_path"].as_str().unwrap()).unwrap();
+            let source = fs::read_to_string(cited_source(
+                home,
+                citation["source_path"].as_str().unwrap(),
+            ))
+            .unwrap();
             let line = source.lines().nth(1).unwrap();
             assert_eq!(
                 citation["span_hash"],
@@ -2056,7 +2110,11 @@ fn pack_excludes_skill_payloads_without_losing_ordinary_evidence() {
             for item in evidence {
                 let citation = &item["citation"];
                 assert_eq!(citation["verified"], true, "opt-in {format}");
-                let source = fs::read_to_string(citation["source_path"].as_str().unwrap()).unwrap();
+                let source = fs::read_to_string(cited_source(
+                    home,
+                    citation["source_path"].as_str().unwrap(),
+                ))
+                .unwrap();
                 assert_eq!(
                     citation["span_hash"],
                     blake3::hash(source.lines().nth(1).unwrap().as_bytes())
@@ -2210,11 +2268,13 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
             } else {
                 format!("{excerpt}\n")
             });
-            let source = Path::new(
+            let source = cited_source(
+                home,
                 item["citation"]["source_path"]
                     .as_str()
                     .expect("source path"),
             );
+            let source = source.as_path();
             assert!(source.is_file());
             if source.file_name().and_then(|name| name.to_str())
                 == Some("rollout-markdown-safe.jsonl")
@@ -2348,9 +2408,7 @@ fn explicit_empty_session_scope_never_expands_to_the_archive() {
     }
     run_fresh_index(home, &data_dir);
     build_hash_semantic_assets(&data_dir, true);
-    let selected = codex_home
-        .join("sessions/2026/04/23")
-        .join("rollout-scope-selected.jsonl");
+    let selected = native_codex_session_path(&codex_home, "rollout-scope-selected.jsonl");
     let scope_path = home.join("session-scope.txt");
     let before = data_tree_snapshot(&data_dir);
 

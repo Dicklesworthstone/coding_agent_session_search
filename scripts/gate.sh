@@ -18,6 +18,7 @@
 #   scripts/gate.sh                 # fmt, clippy, lib tests, targeted integration, goldens
 #   scripts/gate.sh --lib-filter 'quill_bridge::tests health_watermark'   # narrow the lib run
 #   scripts/gate.sh --no-lib        # skip the lib suite (e.g. while bet45 wedge is open)
+#   scripts/gate.sh --no-bin        # skip the cass bin's own unit tests (stage bin-cass)
 #   scripts/gate.sh --local         # run stages locally (only where rch is not required)
 #   GATE_RETRIES=40 GATE_RETRY_SLEEP=90 scripts/gate.sh   # keep retrying fleet refusals
 #
@@ -27,9 +28,35 @@
 set -uo pipefail
 
 test_log_counts() {
-    awk '
+    local log="$1"
+    shift
+    local filters_nl=""
+    if [ "$#" -gt 0 ]; then
+        printf -v filters_nl '%s\n' "$@"
+    fi
+    GATE_TEST_FILTERS="$filters_nl" awk '
+        BEGIN {
+            n = split(ENVIRON["GATE_TEST_FILTERS"], raw_filters, "\n")
+            for (i = 1; i <= n; i++) {
+                if (length(raw_filters[i]) > 0) {
+                    filters[++filter_count] = raw_filters[i]
+                }
+            }
+        }
         /^running [0-9]+ tests?$/ {
             announced[++depth] = $2
+            next
+        }
+        depth == 1 && /^test [^ ].* \.\.\. ok$/ {
+            line = $0
+            sub(/^test /, "", line)
+            sub(/ \.\.\. ok$/, "", line)
+            sub(/ - should panic$/, "", line)
+            for (f = 1; f <= filter_count; f++) {
+                if (index(line, filters[f]) > 0) {
+                    matched[f]++
+                }
+            }
             next
         }
         /^test result: ok\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored; [0-9]+ measured; [0-9]+ filtered out/ {
@@ -44,10 +71,16 @@ test_log_counts() {
         }
         /^test result:/ { incomplete++ }
         END {
-            if (binaries == 0 || empty > 0 || incomplete > 0 || depth != 0) exit 1
+            for (f = 1; f <= filter_count; f++) {
+                if (!matched[f]) {
+                    printf "gate: test filter matched 0 passing tests: %s\n", filters[f] > "/dev/stderr"
+                    unmatched++
+                }
+            }
+            if (binaries == 0 || empty > 0 || incomplete > 0 || depth != 0 || unmatched > 0) exit 1
             printf "PASSED=%d BINARIES=%d\n", passed, binaries
         }
-    ' "$1"
+    ' "$log"
 }
 
 verify_receipt() {
@@ -141,7 +174,8 @@ if [ "${1:-}" = --verify-receipt ]; then
     exit $?
 fi
 if [ "${1:-}" = --verify-test-log ]; then
-    test_log_counts "$2"
+    shift
+    test_log_counts "$@"
     exit $?
 fi
 if [ "${1:-}" = --verify-fmt ]; then
@@ -156,9 +190,20 @@ fi
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)" || exit 1
 cd "$PROJECT_ROOT" || exit 1
 
+# GitHub Actions is permanently off (owner, 2026-10-09: "NO GH ACTIONS,
+# PERIOD!!! EVER!!! we ONLY ever use /dsr"). A workflow file is never a
+# verification or publication lane: fixes parked in them for a job that never
+# runs sat unapplied on main (bead nqbwq). Refuse to gate a tree carrying one.
+if [ -d .github/workflows ] && [ -n "$(ls -A .github/workflows)" ]; then
+    echo "gate: .github/workflows must stay empty (GitHub Actions is off; verify with scripts/gate.sh, release with dsr):" >&2
+    ls -A .github/workflows >&2
+    exit 2
+fi
+
 LIB_FILTER=""
 RUN_LIB=1
 RUN_INTEGRATION=1
+RUN_BIN=1
 RUN_GOLDENS=1
 LOCAL=0
 REGEN_GOLDENS=0
@@ -171,7 +216,9 @@ UBS_FILES=()
 # there is invisible to every golden. pages_bundle holds the Pages viewer's
 # safety checks (CSP, sanitizer, crypto worker, auth expiry, service worker);
 # 20 of them sat red for days because no gate ran the target (2l1b0.77).
-INTEGRATION_TESTS=(cli_robot bookmarks_cli search_metamorphic pages_bundle)
+# search_service compiles the `cass serve` sources and their unit tests (the
+# cass bin itself is `test = false`); 8 of them sat red for 9 days (5188e).
+INTEGRATION_TESTS=(cli_robot bookmarks_cli search_metamorphic pages_bundle search_service)
 while [ $# -gt 0 ]; do
     case "$1" in
         --lib-filter) LIB_FILTER="$2"; shift 2 ;;
@@ -190,6 +237,7 @@ while [ $# -gt 0 ]; do
         # second run with `--no-lib` for integration + goldens.
         --lib-only) RUN_INTEGRATION=0; RUN_GOLDENS=0; shift ;;
         --no-goldens) RUN_GOLDENS=0; shift ;;
+        --no-bin) RUN_BIN=0; shift ;;
         # README ↔ code truth (WS-A.9): key bindings, `cass … --flag` usages
         # and env vars, checked with the debug binary the integration stage
         # just built. Opt-in until the README is clean against main.
@@ -282,6 +330,11 @@ SOURCE_CONTENT="$(printf '%s' "$SOURCE_PATHS" | base64 -d | gzip -d | \
 run_tests() {
     local stage="$1"
     shift
+    local -a filters=()
+    while [ "${1:-}" = --filter ]; do
+        filters+=("$2")
+        shift 2
+    done
     local log rc counts
     local -a statuses
     log="$(mktemp -t cass-gate-tests.XXXXXX)"
@@ -290,7 +343,7 @@ run_tests() {
     rc=${statuses[0]}
     [ "${statuses[1]}" -eq 0 ] || rc=1
     if [ "$rc" -eq 0 ]; then
-        if counts="$(test_log_counts "$log")"; then
+        if counts="$(test_log_counts "$log" "${filters[@]}")"; then
             echo "TEST_COUNT=${stage} ${counts}"
         else
             echo "gate: ${stage} has missing or empty test binaries (log=${log})" >&2
@@ -302,7 +355,7 @@ run_tests() {
 
 run_ubs() {
     local expected actual scanner installed expected_sha expected_contract_sha tool_dir
-    expected="$(tr -d '[:space:]' < .github/workflows/ubs-version.txt)"
+    expected="$(tr -d '[:space:]' < scripts/ubs-version.txt)"
     # The runner verifies its language modules against embedded release hashes.
     # Updating the pin also requires reviewing the new runner digest here.
     if [ "$expected" != v5.4.4 ]; then
@@ -321,7 +374,7 @@ run_ubs() {
     else
         echo "gate: acquiring pinned UBS ${expected} in ${tool_dir}"
         curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --max-time 60 --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' \
+            --max-time 60 --user-agent 'cass-gate (+https://github.com/Dicklesworthstone/coding_agent_session_search)' \
             "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/${expected}/ubs" \
             --output "$scanner" || return 1
     fi
@@ -334,7 +387,7 @@ run_ubs() {
     # unsupported and exit without scanning anything.
     mkdir -p "$tool_dir/modules" || return 1
     curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-        --max-time 60 --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' \
+        --max-time 60 --user-agent 'cass-gate (+https://github.com/Dicklesworthstone/coding_agent_session_search)' \
         "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/${expected}/modules/contract.json" \
         --output "$tool_dir/modules/contract.json" || return 1
     if [ "$(sha256sum "$tool_dir/modules/contract.json" | cut -d' ' -f1)" != "$expected_contract_sha" ]; then
@@ -359,7 +412,10 @@ lib_stage=""
 if [ "$RUN_LIB" = 1 ]; then
     # A wedged test (the bet45 class: a producer parked forever at ~0 CPU)
     # would otherwise hold the fleet admission until the job's own ceiling.
-    # `timeout` turns that into a loud EXIT=124 on this stage instead.
+    # `timeout` turns that into a loud EXIT=124 on this stage instead. It
+    # bounds the test run only: lib-build compiles first, because a loaded
+    # worker can spend the whole budget compiling (gate b82: lib-tests EXIT=124
+    # before any test ran, after a 72-minute clippy compile).
     LIB_TIMEOUT="${GATE_LIB_TIMEOUT_SECS:-2400}"
     if [[ ! "$LIB_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
         echo "gate: GATE_LIB_TIMEOUT_SECS must be a positive integer" >&2
@@ -367,14 +423,22 @@ if [ "$RUN_LIB" = 1 ]; then
     fi
     read -r -a filter_words <<< "$LIB_FILTER"
     filter_args=""
-    [ "${#filter_words[@]}" -eq 0 ] || printf -v filter_args ' %q' "${filter_words[@]}"
-    lib_stage="run_tests lib-tests timeout ${LIB_TIMEOUT} cargo test --locked -j ${BUILD_JOBS} --lib -- --test-threads=${BUILD_JOBS} ${filter_args};"
+    filter_check_args=""
+    if [ "${#filter_words[@]}" -gt 0 ]; then
+        printf -v filter_args ' %q' "${filter_words[@]}"
+        for fw in "${filter_words[@]}"; do
+            printf -v fw_q ' --filter %q' "$fw"
+            filter_check_args+="$fw_q"
+        done
+    fi
+    lib_stage="cargo test --locked -j ${BUILD_JOBS} --lib --no-run; echo STAGE=lib-build EXIT=\$?; \
+run_tests lib-tests${filter_check_args} timeout ${LIB_TIMEOUT} cargo test --locked -j ${BUILD_JOBS} --lib -- --test-threads=${BUILD_JOBS} ${filter_args};"
 fi
 # Every stage the remote script will run, in order. The receipt check below
 # requires each one to report: a job cut short by the fleet's SSH ceiling
 # leaves later stages missing, and a missing stage is RED, never green.
 EXPECTED_STAGES=(source-identity source-freshness fmt clippy)
-[ "$RUN_LIB" = 1 ] && EXPECTED_STAGES+=(lib-tests)
+[ "$RUN_LIB" = 1 ] && EXPECTED_STAGES+=(lib-build lib-tests)
 integration_stage=""
 if [ "$RUN_INTEGRATION" = 1 ]; then
     declare -A integration_targets=()
@@ -396,10 +460,39 @@ if [ "$RUN_INTEGRATION" = 1 ]; then
         fi
         read -r -a filter_words <<< "$filter"
         filter_args=""
-        [ "${#filter_words[@]}" -eq 0 ] || printf -v filter_args ' %q' "${filter_words[@]}"
-        integration_stage+="run_tests test-${t} cargo test --locked -j ${BUILD_JOBS} --test ${t} -- --test-threads=${BUILD_JOBS} ${filter_args};"
+        filter_check_args=""
+        if [ "${#filter_words[@]}" -gt 0 ]; then
+            printf -v filter_args ' %q' "${filter_words[@]}"
+            for fw in "${filter_words[@]}"; do
+                printf -v fw_q ' --filter %q' "$fw"
+                filter_check_args+="$fw_q"
+            done
+        fi
+        integration_stage+="run_tests test-${t}${filter_check_args} cargo test --locked -j ${BUILD_JOBS} --test ${t} -- --test-threads=${BUILD_JOBS} ${filter_args};"
         EXPECTED_STAGES+=("test-${t}")
     done
+fi
+if [ "$RUN_INTEGRATION" = 1 ] && [ "$RUN_BIN" = 1 ]; then
+    # The cass bin is `test = false`, so the unit tests of its own modules
+    # (logical_archive's backup/restore codec, the CLI modules) ran in no gate;
+    # one hung for hours unseen (m5cob). search_service's share runs as
+    # --test search_service. Every other skip names the bead whose fix
+    # removes it.
+    BIN_TIMEOUT="${GATE_BIN_TIMEOUT_SECS:-900}"
+    if [[ ! "$BIN_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+        echo "gate: GATE_BIN_TIMEOUT_SECS must be a positive integer" >&2
+        exit 2
+    fi
+    BIN_SKIPS=(
+        search_service::
+        logical_archive::import::publication_tests::publication_materializes_wal_rows_without_borrowing_replay_sidecars # svhcf
+        logical_archive::export::ordering_tests::explicit_or_unattested_collations_keep_binary_order_and_verify # p94yt
+    )
+    printf -v bin_skip_args ' --skip %q' "${BIN_SKIPS[@]}"
+    # As for lib-tests, the timeout bounds the test run, not the compile.
+    integration_stage+="cargo test --locked -j ${BUILD_JOBS} --bin cass --no-run; echo STAGE=bin-build EXIT=\$?; \
+run_tests bin-cass timeout ${BIN_TIMEOUT} cargo test --locked -j ${BUILD_JOBS} --bin cass -- --test-threads=${BUILD_JOBS}${bin_skip_args};"
+    EXPECTED_STAGES+=(bin-build bin-cass)
 fi
 golden_regen_stage=""
 golden_stage=""

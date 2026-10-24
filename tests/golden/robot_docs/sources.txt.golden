@@ -95,3 +95,4 @@ Use --index-path and --expected-manifest to verify a copied artifact before exch
   cass sources artifact-manifest  Write/verify lexical artifact proof
   cass sources discover     Just discover hosts (no setup)
   cass sources add          Manually add a source
+  cass sources schedule     Set a remote source's sync_schedule (manual|hourly|daily)

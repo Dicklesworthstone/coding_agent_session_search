@@ -463,15 +463,9 @@ fn gh494_eof_resume_with_a_matching_count_publishes_its_candidate() {
     gh494_eof_resume_with_candidate_count(false);
 }
 
-/// GH #494, the mid-run half: the reporter's first refused run resumed a
-/// checkpoint short of EOF and was refused at validate_candidate only after
-/// replaying the rest of the archive (516 s). Its candidate held documents in
-/// the committed prefix that the checkpoint never counted. The #440 upsert
-/// window reconciles only replayed identities, so no resume could certify
-/// that candidate. The EOF resume check cannot see this case before the
-/// replay. The refusal must retain the candidate with the checkpoint that
-/// failed and rebuild from zero in the same run, not exit and leave the
-/// rebuild to the next run.
+/// GH #494 / #530: an uncounted committed prefix cannot be repaired by
+/// replaying suffix identities. Reject it before replay, retain its untouched
+/// generation and original cursor, and perform one clean replay in this run.
 #[test]
 #[serial_test::serial]
 fn gh494_mid_run_resume_with_an_uncounted_prefix_rebuilds_in_the_same_run() {
@@ -508,6 +502,7 @@ fn gh494_mid_run_resume_with_an_uncounted_prefix_rebuilds_in_the_same_run() {
         }
     }
     fs::write(scratch.join("failure-evidence"), "uncounted-prefix").unwrap();
+    let candidate_manifest = fs::read(scratch.join("MANIFEST")).unwrap();
     checkpoint.completed = false;
     checkpoint.pending = None;
     checkpoint.committed_offset = 1;
@@ -551,13 +546,14 @@ fn gh494_mid_run_resume_with_an_uncounted_prefix_rebuilds_in_the_same_run() {
     let retained = load_lexical_rebuild_state(&quarantine).unwrap().unwrap();
     assert!(!retained.completed);
     assert_eq!(
-        retained.processed_conversations, 2,
-        "the candidate was refused after its replay reached EOF"
+        retained.processed_conversations, 1,
+        "the ambiguous prefix must be refused before replaying the suffix"
     );
-    assert!(
-        retained.indexed_docs < 4,
-        "the quarantine keeps the count that could not certify the candidate: {}",
-        retained.indexed_docs
+    assert_eq!(retained.indexed_docs, 1);
+    assert_eq!(
+        fs::read(quarantine.join("index").join("MANIFEST")).unwrap(),
+        candidate_manifest,
+        "resume validation must not modify the refused generation"
     );
 
     // A plain rerun reuses the certified generation instead of refusing again.
@@ -1180,5 +1176,105 @@ fn gh494_pending_staged_commit_advances_from_the_candidate_manifest() {
     assert_eq!(
         load_lexical_rebuild_state(&live).unwrap().unwrap(),
         reconciled
+    );
+}
+
+#[test]
+fn gh523_killed_staged_rebuild_resumes_from_its_last_commit_not_its_heartbeat() {
+    let tmp = TempDir::new().unwrap();
+    let live = tmp.path().join("index");
+    let scratch = staged_lexical_rebuild_scratch_path(&live);
+    // A prior live generation sits beside the candidate, as on any host that
+    // already had an index when the rebuild started.
+    let mut prior = TantivyIndex::open_or_create(&live).unwrap();
+    prior.commit().unwrap();
+    drop(prior);
+    let conversation = |id: &str, first_idx: i64, count: i64| {
+        let messages = (first_idx..first_idx + count)
+            .map(|idx| norm_msg(idx, 1_700_000_000_000 + idx))
+            .collect();
+        norm_conv(Some(id), messages)
+    };
+    let new_state = || {
+        let mut state = LexicalRebuildState::new(
+            LexicalRebuildDbState {
+                db_path: "/fixture/agent_search.db".to_string(),
+                total_conversations: 3,
+                total_messages: 6,
+                storage_fingerprint: "content-v1:3:3:6".to_string(),
+            },
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        state.set_execution_mode(LexicalRebuildExecutionMode::StagedSingleIndex);
+        state
+    };
+    let runtime = LexicalRebuildPipelineRuntimeSnapshot::default();
+
+    // The candidate durably committed conversation 1 (2 documents).
+    let first = conversation("first", 0, 2);
+    let mut candidate = TantivyIndex::open_or_create(&scratch).unwrap();
+    candidate
+        .add_messages_with_conversation_id(&first, &first.messages, Some(1))
+        .unwrap();
+    candidate.commit().unwrap();
+    let mut state = new_state();
+    state.record_pending_commit(Some(1), 1, 2, index_meta_fingerprint(&scratch).unwrap());
+    state.finalize_commit(index_meta_fingerprint(&scratch).unwrap());
+
+    // A heartbeat records progress the writer holds but has not committed,
+    // then `timeout` kills the run before the next commit.
+    let mut heartbeat = state.clone();
+    persist_pending_lexical_rebuild_progress(
+        &live,
+        &scratch,
+        &mut heartbeat,
+        Some(3),
+        3,
+        6,
+        &runtime,
+    )
+    .unwrap();
+    assert_eq!(
+        heartbeat.pending.as_ref().unwrap().base_meta_fingerprint,
+        index_meta_fingerprint(&scratch).unwrap(),
+        "the pending base must describe the directory the next commit writes"
+    );
+    let reconciled = reconcile_pending_lexical_commit(&live, heartbeat).unwrap();
+    assert_eq!(
+        (reconciled.processed_conversations, reconciled.indexed_docs),
+        (1, 2),
+        "uncommitted heartbeat progress must replay, not be promoted"
+    );
+    assert!(reconciled.pending.is_none());
+
+    // A checkpoint an older cass wrote took the base from the live
+    // generation, which always differs from the candidate. It is not promoted
+    // past what the candidate committed either.
+    let mut legacy = state.clone();
+    legacy.record_pending_commit(Some(3), 3, 6, index_meta_fingerprint(&live).unwrap());
+    let reconciled = reconcile_pending_lexical_commit(&live, legacy).unwrap();
+    assert_eq!(
+        (reconciled.processed_conversations, reconciled.indexed_docs),
+        (1, 2)
+    );
+
+    // A commit that did land after its pending record is still promoted.
+    let mut landed = state;
+    persist_pending_lexical_rebuild_progress(&live, &scratch, &mut landed, Some(3), 3, 6, &runtime)
+        .unwrap();
+    let rest = conversation("rest", 2, 4);
+    candidate
+        .add_messages_with_conversation_id(&rest, &rest.messages, Some(3))
+        .unwrap();
+    candidate.commit().unwrap();
+    drop(candidate);
+    let reconciled = reconcile_pending_lexical_commit(&live, landed).unwrap();
+    assert_eq!(
+        (reconciled.processed_conversations, reconciled.indexed_docs),
+        (3, 6)
+    );
+    assert_eq!(
+        reconciled.committed_meta_fingerprint,
+        index_meta_fingerprint(&scratch).unwrap()
     );
 }

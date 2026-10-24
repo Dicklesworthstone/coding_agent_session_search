@@ -799,3 +799,134 @@ fn search_readers_open_across_a_forget_stop_returning_forgotten_text() -> TestRe
     }
     Ok(())
 }
+
+/// mxr52: before mx520 every connector scanned every remote mirror container,
+/// so a synced Factory session was also archived as a Claude conversation.
+/// `cass dedup` reports such rows and, with `--apply`, removes only those
+/// whose file is also archived under the store's owning agent; a
+/// misattributed only copy is reported and kept.
+#[test]
+fn dedup_removes_misattributed_remote_mirror_duplicates_only() -> TestResult {
+    use coding_agent_search::franken_sync::compat::RowExt;
+    use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use coding_agent_search::sources::provenance::{Source, SourceKind};
+    use coding_agent_search::sources::sync::path_to_safe_dirname;
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let (archive, _) = indexed_archive(&[])?;
+    let mirror = archive.data_dir.join("remotes/laptop/mirror");
+    let factory_container = mirror.join(path_to_safe_dirname("~/.factory/sessions"));
+    let pi_container = mirror.join(path_to_safe_dirname("~/.pi/agent/sessions"));
+    fs::create_dir_all(&factory_container)?;
+    fs::create_dir_all(&pi_container)?;
+
+    let storage = FrankenStorage::open(&archive.data_dir.join("agent_search.db"))?;
+    storage.upsert_source(&Source {
+        id: "laptop".into(),
+        kind: SourceKind::Ssh,
+        host_label: Some("user@laptop".into()),
+        machine_id: None,
+        platform: Some("linux".into()),
+        config_json: Some(json!({"paths": ["~/.factory/sessions", "~/.pi/agent/sessions"]})),
+        created_at: None,
+        updated_at: None,
+    })?;
+    let seed = |slug: &str, path: &Path, external_id: &str| -> TestResult<i64> {
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: slug.into(),
+            name: slug.into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let conversation = Conversation {
+            id: None,
+            agent_slug: slug.into(),
+            workspace: None,
+            external_id: Some(external_id.into()),
+            title: Some(external_id.into()),
+            source_path: path.to_path_buf(),
+            started_at: Some(1_790_000_000_000),
+            ended_at: Some(1_790_000_000_100),
+            approx_tokens: None,
+            metadata_json: Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_790_000_000_010),
+                content: format!("mirror row {external_id}"),
+                extra_json: Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: "laptop".into(),
+            origin_host: Some("user@laptop".into()),
+        };
+        Ok(storage
+            .insert_conversation_tree(agent_id, None, &conversation)?
+            .conversation_id)
+    };
+    let factory_file = factory_container.join("sessions/-proj/fac.jsonl");
+    let factory_row = seed("factory", &factory_file, "fac")?;
+    let claude_duplicate = seed("claude_code", &factory_file, "sessions/-proj/fac.jsonl")?;
+    let claude_only_copy = seed(
+        "claude_code",
+        &pi_container.join("sessions/--proj--/pi.jsonl"),
+        "sessions/--proj--/pi.jsonl",
+    )?;
+    drop(storage);
+
+    let report = |args: &[&str]| -> TestResult<Value> {
+        let output = archive.succeed("dedup", args)?;
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    let dry = report(&["dedup", "--json"])?;
+    let section = &dry["misattributed_mirror"];
+    if section["conversations_removed"] != 1 || section["unmatched"] != 1 {
+        return Err(format!("unexpected dry run: {dry}").into());
+    }
+    let rows: Vec<(i64, Option<i64>)> = section["rows"]
+        .as_array()
+        .ok_or("rows missing")?
+        .iter()
+        .map(|row| {
+            (
+                row["conversation_id"].as_i64().unwrap_or(-1),
+                row["owner_conversation_id"].as_i64(),
+            )
+        })
+        .collect();
+    if rows
+        != [
+            (claude_duplicate, Some(factory_row)),
+            (claude_only_copy, None),
+        ]
+    {
+        return Err(format!("unexpected rows: {dry}").into());
+    }
+
+    let applied = report(&["dedup", "--apply", "--json"])?;
+    if applied["misattributed_mirror"]["conversations_removed"] != 1 {
+        return Err(format!("unexpected apply: {applied}").into());
+    }
+    let storage = FrankenStorage::open_readonly(&archive.data_dir.join("agent_search.db"))?;
+    let laptop_rows: Vec<i64> = storage
+        .raw()
+        .query("SELECT id FROM conversations WHERE source_id = 'laptop' ORDER BY id")?
+        .into_iter()
+        .map(|row| row.get_typed::<i64>(0))
+        .collect::<Result<_, _>>()?;
+    drop(storage);
+    if laptop_rows != [factory_row, claude_only_copy] {
+        return Err(format!("expected only the duplicate removed: {laptop_rows:?}").into());
+    }
+
+    let again = report(&["dedup", "--apply", "--json"])?;
+    if again["misattributed_mirror"]["conversations_removed"] != 0
+        || again["misattributed_mirror"]["unmatched"] != 1
+    {
+        return Err(format!("dedup is not idempotent: {again}").into());
+    }
+    Ok(())
+}

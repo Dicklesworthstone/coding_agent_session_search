@@ -378,12 +378,133 @@ fn test_encrypted_export_hides_topic_in_default_name_and_html() {
         encrypted_name.ends_with("_session.html"),
         "encrypted default name must not carry the topic: {encrypted_name} (plain: {plain_name})"
     );
-    let html =
-        fs::read_to_string(encrypted_json["exported"]["output_path"].as_str().unwrap()).unwrap();
+    let html_path = encrypted_json["exported"]["output_path"]
+        .as_str()
+        .expect("output_path");
+    let html = fs::read_to_string(html_path).expect("read encrypted html");
     assert!(
         !html.contains(&plain_title),
         "the conversation title must not be visible before unlock: {plain_title}"
     );
+
+    let unlock_script = r#"
+        import { readFileSync } from 'node:fs';
+        import vm from 'node:vm';
+
+        const html = readFileSync(process.env.CASS_ENCRYPTED_HTML_PATH, 'utf8');
+        const expectedTitle = process.env.CASS_EXPECTED_TITLE;
+        const encryptedMatch = html.match(/<div id="encrypted-content" hidden>([\s\S]*?)<\/div>/);
+        const cryptoMatch = html.match(/(const CASS_HTML_PBKDF2_ITERATIONS =[\s\S]*?\nconst Crypto = \{[\s\S]*?\n\};)/);
+        if (!encryptedMatch || !cryptoMatch) {
+            throw new Error('missing encrypted-content or Crypto script block in exported HTML');
+        }
+        const decodeHtmlText = (s) =>
+            s.replace(/&lt;/g, '<')
+             .replace(/&gt;/g, '>')
+             .replace(/&quot;/g, '"')
+             .replace(/&#x27;|&#39;/g, "'")
+             .replace(/&amp;/g, '&');
+
+        let submitHandler = null;
+        const headerContent = { innerHTML: '<h1 class="header-title">Encrypted conversation</h1>' };
+        const footerTitle = { textContent: 'Encrypted conversation' };
+        const errorEl = { hidden: true, textContent: '' };
+        const modal = { hidden: false };
+        const passwordInput = { value: '' };
+        const form = {
+            addEventListener(event, fn) {
+                if (event === 'submit') submitHandler = fn;
+            },
+            reset() {
+                passwordInput.value = '';
+            },
+        };
+        const conversation = {
+            innerHTML: '',
+            querySelector(sel) {
+                if (sel !== '#cass-sealed-header') return null;
+                const m = this.innerHTML.match(/<template id="cass-sealed-header" data-title="([^"]*)">([\s\S]*?)<\/template>/);
+                if (!m) return null;
+                return {
+                    innerHTML: m[2],
+                    getAttribute(name) {
+                        return name === 'data-title' ? decodeHtmlText(m[1]) : null;
+                    },
+                    remove: () => {
+                        this.innerHTML = this.innerHTML.replace(m[0], '');
+                    },
+                };
+            },
+        };
+        const elements = {
+            '#password-modal': modal,
+            '#password-form': form,
+            '#decrypt-error': errorEl,
+            '#password-input': passwordInput,
+            '#encrypted-content': { textContent: decodeHtmlText(encryptedMatch[1]) },
+            '#conversation': conversation,
+            '.header .header-content': headerContent,
+            '.print-footer-title': footerTitle,
+        };
+        const documentStub = { title: 'Encrypted conversation' };
+        const context = {
+            $: (sel) => elements[sel] || null,
+            document: documentStub,
+            crypto: globalThis.crypto,
+            TextEncoder: globalThis.TextEncoder,
+            TextDecoder: globalThis.TextDecoder,
+            atob: globalThis.atob,
+            JSON,
+            Error,
+            Uint8Array,
+        };
+        vm.createContext(context);
+        vm.runInContext(`${cryptoMatch[1]}\nthis.Crypto = Crypto;`, context);
+        context.Crypto.init();
+        if (typeof submitHandler !== 'function') {
+            throw new Error('Crypto.init() did not attach a submit listener');
+        }
+
+        passwordInput.value = 'wrong-password';
+        await context.Crypto.decrypt();
+        if (errorEl.hidden || !errorEl.textContent.includes('Wrong password')) {
+            throw new Error(`wrong password should surface error: ${JSON.stringify(errorEl)}`);
+        }
+        if (documentStub.title !== 'Encrypted conversation') {
+            throw new Error(`title leaked on failed unlock: ${documentStub.title}`);
+        }
+
+        passwordInput.value = 'sealed-topic-password';
+        await context.Crypto.decrypt();
+        if (!errorEl.hidden || !modal.hidden) {
+            throw new Error('successful unlock should hide error and modal');
+        }
+        if (documentStub.title !== expectedTitle || footerTitle.textContent !== expectedTitle) {
+            throw new Error(`unlocked title mismatch: doc=${documentStub.title} footer=${footerTitle.textContent} expected=${expectedTitle}`);
+        }
+        if (!decodeHtmlText(headerContent.innerHTML).includes(expectedTitle) || conversation.innerHTML.includes('cass-sealed-header')) {
+            throw new Error('sealed header should move into .header-content and be removed from #conversation');
+        }
+        console.log(JSON.stringify({
+            step: 'browser_unlock_verified',
+            wrong_password_error: errorEl.textContent,
+            unlocked_title: documentStub.title,
+            header_restored: headerContent.innerHTML.includes('header-meta'),
+        }));
+    "#;
+    let node_out = std::process::Command::new("node")
+        .args(["--input-type=module", "--eval", unlock_script])
+        .env("CASS_ENCRYPTED_HTML_PATH", html_path)
+        .env("CASS_EXPECTED_TITLE", &plain_title)
+        .output()
+        .expect("run encrypted HTML unlock verification under node");
+    assert!(
+        node_out.status.success(),
+        "encrypted HTML unlock verification failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&node_out.stdout),
+        String::from_utf8_lossy(&node_out.stderr)
+    );
+    eprintln!("{}", String::from_utf8_lossy(&node_out.stdout).trim());
 }
 
 #[test]

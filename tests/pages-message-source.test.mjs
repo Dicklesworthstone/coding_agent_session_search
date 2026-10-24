@@ -313,6 +313,9 @@ async function viewerFixture(t, count = 2003) {
     setTimeout: later,
     clearTimeout: (id) => timers.delete(id),
     requestAnimationFrame: (callback) => later(callback),
+    // Browser globals the copy path uses (cancellation and the byte limit).
+    AbortController,
+    TextEncoder,
     console: {
       log() {},
       debug() {},
@@ -447,9 +450,19 @@ test("locking clears retained bodies and cancels pending deep-link rendering", a
 test("explicit Copy still includes the entire transcript, not just cached rows", async (t) => {
   const f = await viewerFixture(t);
   await f.viewer.loadConversation(1);
-  f.nodes.get("copy-btn").listeners.get("click")();
-  await Promise.resolve();
-  await Promise.resolve();
+  const button = f.nodes.get("copy-btn");
+  const click = button.listeners.get("click");
+  click();
+  // Preparation yields a macrotask between bounded pages. Without an async
+  // clipboard API the prepared text waits for a second click (a new gesture).
+  for (let turn = 0; turn < 1000 && button.innerHTML !== "Ready — click to copy"; turn += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+    f.flush(0);
+  }
+  assert.equal(button.innerHTML, "Ready — click to copy");
+  assert.equal(f.clipboard.length, 0, "preparation alone must not copy");
+  click();
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(f.clipboard.length, 1);
   assert.equal((f.clipboard[0].match(/^## User:/gm) ?? []).length, 2003);
   assert.match(f.clipboard[0], /Message 2002/);

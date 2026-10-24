@@ -207,7 +207,9 @@ test("a saved relative-filter snapshot keeps its explicit bounds", async () => {
   prepareUi();
   await ui.setSearchRoute({ time: "week", since: "2000", until: "4000" }, { runSearch: false });
   const filters = ui.getSearchState().filters;
-  assert.deepEqual(filters, { agent: null, since: 2000, until: 4000, timePreset: "custom" });
+  assert.deepEqual(filters, {
+    agent: null, workspace: null, since: 2000, until: 4000, timePreset: "custom",
+  });
   await ui.setSearchRoute(filters, { runSearch: false });
   assert.deepEqual(ui.getSearchState().filters, filters);
 });

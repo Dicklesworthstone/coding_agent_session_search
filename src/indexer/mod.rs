@@ -15,6 +15,7 @@ pub mod semantic;
 pub mod semantic_progress;
 #[cfg(test)]
 mod source_ledger_tests;
+mod source_writer_probe;
 pub(crate) mod staging_reclaim;
 
 use self::quarantine::{QuarantineKey, QuarantineState};
@@ -22,6 +23,7 @@ use self::refresh_ledger::{
     EquivalenceArtifacts as RefreshEquivalenceArtifacts, PhaseRecord, RefreshLedger,
     RefreshLedgerEvidence, RefreshPhase,
 };
+use self::source_writer_probe::SourceWriterProbe;
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -32,8 +34,6 @@ use std::io::{BufWriter, Seek, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -142,7 +142,7 @@ enum ActiveSessionSourceReason {
 
 #[derive(Debug, Default)]
 struct ActiveSessionSourceFilter {
-    writable_file_ids: HashSet<SourceFileId>,
+    writer_probe: SourceWriterProbe,
     recent_write_window: Option<Duration>,
     deferred_sources: Mutex<BTreeSet<PathBuf>>,
 }
@@ -150,7 +150,7 @@ struct ActiveSessionSourceFilter {
 impl ActiveSessionSourceFilter {
     fn new(enable_recent_write_window: bool) -> Self {
         Self {
-            writable_file_ids: collect_writable_open_session_file_ids(),
+            writer_probe: SourceWriterProbe::capture(is_session_log_source_candidate),
             recent_write_window: active_session_recent_write_window(enable_recent_write_window),
             deferred_sources: Mutex::default(),
         }
@@ -159,7 +159,7 @@ impl ActiveSessionSourceFilter {
     #[cfg(test)]
     fn with_recent_write_window_for_test(recent_write_window: Option<Duration>) -> Self {
         Self {
-            writable_file_ids: HashSet::new(),
+            writer_probe: SourceWriterProbe::default(),
             recent_write_window,
             deferred_sources: Mutex::default(),
         }
@@ -198,7 +198,9 @@ impl ActiveSessionSourceFilter {
             );
             return Some(ActiveSessionSourceReason::RecentlyModified);
         }
-        if source_file_id(path).is_some_and(|file_id| self.writable_file_ids.contains(&file_id)) {
+        if source_file_id(path)
+            .is_some_and(|file_id| self.writer_probe.should_defer((file_id.dev, file_id.ino)))
+        {
             return Some(ActiveSessionSourceReason::WritableFileDescriptor);
         }
         if source_file_has_active_advisory_lock(path) {
@@ -419,111 +421,6 @@ fn source_file_id(path: &Path) -> Option<SourceFileId> {
 #[cfg(not(unix))]
 fn source_file_id(_path: &Path) -> Option<SourceFileId> {
     None
-}
-
-#[cfg(target_os = "linux")]
-fn collect_writable_open_session_file_ids() -> HashSet<SourceFileId> {
-    let mut file_ids = HashSet::new();
-    let Ok(processes) = fs::read_dir("/proc") else {
-        return file_ids;
-    };
-
-    for process in processes.flatten() {
-        let pid = process.file_name();
-        let Some(pid) = pid.to_str() else {
-            continue;
-        };
-        if pid.parse::<u32>().is_err() {
-            continue;
-        }
-        let fd_dir = process.path().join("fd");
-        let Ok(fds) = fs::read_dir(&fd_dir) else {
-            continue;
-        };
-        for fd in fds.flatten() {
-            let fd_name = fd.file_name();
-            let Some(fd_name) = fd_name.to_str() else {
-                continue;
-            };
-            let fd_path = fd.path();
-            if !linux_fdinfo_is_writable(&process.path().join("fdinfo").join(fd_name)) {
-                continue;
-            }
-            let Ok(target) = fs::read_link(&fd_path) else {
-                continue;
-            };
-            if !is_session_log_source_candidate(&target) {
-                continue;
-            }
-            if let Some(file_id) = source_file_id(&fd_path) {
-                file_ids.insert(file_id);
-            }
-        }
-    }
-
-    file_ids
-}
-
-#[cfg(target_os = "linux")]
-fn linux_fdinfo_is_writable(fdinfo_path: &Path) -> bool {
-    const O_ACCMODE: u64 = 0o3;
-    const O_WRONLY: u64 = 0o1;
-    const O_RDWR: u64 = 0o2;
-
-    let Ok(contents) = fs::read_to_string(fdinfo_path) else {
-        return false;
-    };
-    let Some(flags_value) = contents.lines().find_map(|line| {
-        line.strip_prefix("flags:")
-            .and_then(|value| u64::from_str_radix(value.trim(), 8).ok())
-    }) else {
-        return false;
-    };
-    matches!(flags_value & O_ACCMODE, O_WRONLY | O_RDWR)
-}
-
-#[cfg(target_os = "macos")]
-fn collect_writable_open_session_file_ids() -> HashSet<SourceFileId> {
-    let mut file_ids = HashSet::new();
-    let Ok(output) = Command::new("lsof").args(["-nP", "-F", "pfn"]).output() else {
-        return file_ids;
-    };
-    if !output.status.success() {
-        return file_ids;
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut current_fd_is_writable = false;
-    for line in text.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let (field, value) = line.split_at(1);
-        match field {
-            "p" => {
-                current_fd_is_writable = false;
-            }
-            "f" => {
-                current_fd_is_writable = value.contains('w') || value.contains('u');
-            }
-            "n" if current_fd_is_writable => {
-                let path = Path::new(value);
-                if is_session_log_source_candidate(path)
-                    && let Some(file_id) = source_file_id(path)
-                {
-                    file_ids.insert(file_id);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    file_ids
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn collect_writable_open_session_file_ids() -> HashSet<SourceFileId> {
-    HashSet::new()
 }
 
 fn source_file_has_active_advisory_lock(path: &Path) -> bool {
@@ -1082,6 +979,45 @@ pub struct IndexingStats {
     /// True when SQLite ingest succeeded but inline lexical updates were
     /// deferred and the caller must rebuild lexical assets from the archive.
     pub lexical_update_deferred: bool,
+    /// Local session files this run did not read because a process was still
+    /// writing them (an open writable descriptor, an advisory lock or, in
+    /// watch mode, a recent write). Their scan watermark is held, so a later
+    /// run reads them once the writer lets go; until then their newest
+    /// messages are not searchable, and a run that exits 0 says so here
+    /// (GH #530).
+    pub deferred_active_sources: usize,
+    /// The first `DEFERRED_ACTIVE_SOURCE_SAMPLE` of those paths, sorted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deferred_active_source_sample: Vec<String>,
+    #[serde(skip)]
+    deferred_active_source_paths: BTreeSet<PathBuf>,
+}
+
+const DEFERRED_ACTIVE_SOURCE_SAMPLE: usize = 20;
+
+fn record_deferred_active_sources(
+    progress: Option<&Arc<IndexingProgress>>,
+    sources: &BTreeSet<PathBuf>,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if sources.is_empty() {
+        return;
+    }
+    let Ok(mut stats) = progress.stats.lock() else {
+        return;
+    };
+    stats
+        .deferred_active_source_paths
+        .extend(sources.iter().cloned());
+    stats.deferred_active_sources = stats.deferred_active_source_paths.len();
+    stats.deferred_active_source_sample = stats
+        .deferred_active_source_paths
+        .iter()
+        .take(DEFERRED_ACTIVE_SOURCE_SAMPLE)
+        .map(|path| path.display().to_string())
+        .collect();
 }
 
 fn record_connector_ingest_report(
@@ -1971,6 +1907,8 @@ const DEFAULT_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES: u64 = 1024 *
 const DEFERRED_LARGE_INCREMENTAL_LEXICAL_REPAIR_REASON: &str = "large_populated_incremental_index_defers_authoritative_lexical_repair_until_explicit_full_or_force_rebuild";
 const BOOTSTRAP_LARGE_INCREMENTAL_MISSING_WATERMARK_REASON: &str =
     "large_populated_incremental_index_bootstraps_missing_scan_watermark";
+const EMPTY_ARCHIVE_LEXICAL_REBUILD_REASON: &str =
+    "empty_archive_defers_lexical_rebuild_to_authoritative_db_rebuild";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DeferredIncrementalCanonicalLexicalRepair {
@@ -6615,6 +6553,7 @@ fn commit_lexical_rebuild_progress(
     let pending_progress_started = perf_profile.as_ref().map(|_| Instant::now());
     persist_pending_lexical_rebuild_progress(
         state_path,
+        content_path,
         rebuild_state,
         next_conversation_id,
         processed_conversations,
@@ -7099,7 +7038,7 @@ impl LexicalRebuildState {
 /// accepted job for retry without interpreting an arbitrary error message.
 #[derive(Debug, thiserror::Error)]
 #[error("another cass index process already holds {}", lock_path.display())]
-struct IndexRunBusy {
+pub struct IndexRunBusy {
     lock_path: PathBuf,
 }
 
@@ -9935,10 +9874,25 @@ fn reconcile_pending_lexical_commit(
     // directory that commit_lexical_rebuild_progress fingerprinted.
     let content_path = lexical_rebuild_resume_content_path(index_path, &state)?;
     let current_meta_fingerprint = index_meta_fingerprint(&content_path)?;
-    if pending_commit_landed(
-        pending.base_meta_fingerprint.as_deref(),
-        current_meta_fingerprint.as_deref(),
-    ) {
+    // A staged candidate's MANIFEST counts what really committed, and that
+    // count decides. A fingerprint cannot: a heartbeat's uncommitted progress
+    // in a checkpoint from an older cass carries the live generation's
+    // fingerprint, which always differs from the candidate's (so it was
+    // promoted, and the resume check then quarantined a candidate that was
+    // only behind its own heartbeat, GH #523), while the terminal checkpoint
+    // is written after the folding commit, so its base already describes the
+    // committed generation. The resume check applies the same count rule.
+    let landed = match (content_path != index_path)
+        .then(|| crate::search::tantivy::searchable_index_live_doc_count(&content_path))
+        .flatten()
+    {
+        Some(live_docs) => u128::from(live_docs) >= pending.indexed_docs as u128,
+        None => pending_commit_landed(
+            pending.base_meta_fingerprint.as_deref(),
+            current_meta_fingerprint.as_deref(),
+        ),
+    };
+    if landed {
         state.finalize_commit(current_meta_fingerprint);
     } else {
         state.clear_pending();
@@ -10112,12 +10066,8 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
     processed_conversations: usize,
     indexed_docs: usize,
     runtime: &LexicalRebuildPipelineRuntimeSnapshot,
-    base_meta_fingerprint_override: Option<&str>,
+    base_meta_fingerprint: Option<String>,
 ) -> Result<()> {
-    let base_meta_fingerprint = match base_meta_fingerprint_override {
-        Some(base_meta_fingerprint) => Some(base_meta_fingerprint.to_string()),
-        None => index_meta_fingerprint(index_path)?,
-    };
     let checkpoint_runtime = runtime.checkpoint_snapshot();
     let current_processed_conversations = state.reported_processed_conversations();
     let current_indexed_docs = state.reported_indexed_docs();
@@ -10159,8 +10109,18 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
     persist_lexical_rebuild_state(index_path, state)
 }
 
+/// `index_path` locates the checkpoint; `content_path` is the directory the
+/// next commit writes. After a crash, reconcile_pending_lexical_commit decides
+/// whether the pending commit landed by comparing its base fingerprint with
+/// that same content directory. A staged rebuild commits into its scratch
+/// sibling, so a base taken from `index_path` (the untouched live generation)
+/// always differs: every heartbeat's uncommitted counts were promoted, the
+/// resume check found the candidate short, and each killed run quarantined
+/// its candidate and restarted from zero (GH #523).
+#[allow(clippy::too_many_arguments)]
 fn persist_pending_lexical_rebuild_progress(
     index_path: &Path,
+    content_path: &Path,
     state: &mut LexicalRebuildState,
     next_conversation_id: Option<i64>,
     processed_conversations: usize,
@@ -10174,7 +10134,7 @@ fn persist_pending_lexical_rebuild_progress(
         processed_conversations,
         indexed_docs,
         runtime,
-        None,
+        index_meta_fingerprint(content_path)?,
     )
 }
 
@@ -10210,6 +10170,10 @@ fn maybe_persist_staged_lexical_rebuild_progress(
     }
 
     let heartbeat_progress_started = perf_profile.as_ref().map(|_| Instant::now());
+    let base_meta_fingerprint = match base_meta_fingerprint_override {
+        Some(base_meta_fingerprint) => Some(base_meta_fingerprint.to_string()),
+        None => index_meta_fingerprint(index_path)?,
+    };
     persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
         index_path,
         state,
@@ -10217,7 +10181,7 @@ fn maybe_persist_staged_lexical_rebuild_progress(
         processed_conversations,
         indexed_docs,
         runtime,
-        base_meta_fingerprint_override,
+        base_meta_fingerprint,
     )?;
     bump_index_run_lock_progress_if_present(progress_bump);
     if let (Some(profile), Some(started)) = (perf_profile.as_mut(), heartbeat_progress_started) {
@@ -12941,6 +12905,67 @@ fn lexical_storage_physical_identity(db_path: &Path) -> Option<ArchivePhysicalId
     })
 }
 
+fn write_archive_fingerprint_cache_for_identity(
+    identity: &ArchivePhysicalIdentity,
+    cache_dir: &Path,
+    fingerprint: &str,
+) {
+    if !fingerprint.starts_with("content-v1:") || !cache_dir.is_dir() {
+        return;
+    }
+    let cache_path = cache_dir.join(ARCHIVE_FINGERPRINT_CACHE_FILE);
+    let payload = ArchiveFingerprintCache {
+        schema_version: ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION,
+        identity: identity.clone(),
+        fingerprint: fingerprint.to_string(),
+        computed_at_ms: semantic_indexing_now_ms(),
+    };
+    // Per-process temp name: concurrent one-shot searches may all miss at once.
+    let tmp_path = cache_dir.join(format!(
+        "{ARCHIVE_FINGERPRINT_CACHE_FILE}.{}.tmp",
+        std::process::id()
+    ));
+    let written = serde_json::to_vec(&payload)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| fs::write(&tmp_path, bytes))
+        .and_then(|()| fs::rename(&tmp_path, &cache_path));
+    if let Err(err) = written {
+        tracing::debug!(
+            error = %err,
+            cache = %cache_path.display(),
+            "archive fingerprint cache write skipped"
+        );
+        let _ = fs::remove_file(&tmp_path);
+    }
+}
+
+pub(crate) fn write_archive_fingerprint_cache_best_effort(
+    db_path: &Path,
+    cache_dir: &Path,
+    fingerprint: &str,
+) {
+    let Some(identity) = lexical_storage_physical_identity(db_path) else {
+        return;
+    };
+    write_archive_fingerprint_cache_for_identity(&identity, cache_dir, fingerprint);
+}
+
+pub(crate) fn prime_archive_fingerprint_cache_from_completed_checkpoint(
+    db_path: &Path,
+    index_path: &Path,
+) {
+    let Ok(Some(checkpoint)) = load_lexical_rebuild_checkpoint(index_path) else {
+        return;
+    };
+    if checkpoint.completed && crate::stored_path_identity_matches(&checkpoint.db_path, db_path) {
+        write_archive_fingerprint_cache_best_effort(
+            db_path,
+            index_path,
+            &checkpoint.storage_fingerprint,
+        );
+    }
+}
+
 /// The on-disk layer of [`lexical_storage_fingerprint_for_db_cached`]: serve
 /// the sidecar's fingerprint when it was computed for exactly this physical
 /// identity, otherwise compute the strict fingerprint and rewrite the sidecar
@@ -12971,29 +12996,7 @@ fn lexical_storage_fingerprint_for_db_disk_cached(
         "archive fingerprint recomputed from the canonical database"
     );
     let fingerprint = lexical_storage_fingerprint_for_db_strict(db_path)?;
-    let payload = ArchiveFingerprintCache {
-        schema_version: ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION,
-        identity: identity.clone(),
-        fingerprint: fingerprint.clone(),
-        computed_at_ms: semantic_indexing_now_ms(),
-    };
-    // Per-process temp name: concurrent one-shot searches may all miss at once.
-    let tmp_path = cache_dir.join(format!(
-        "{ARCHIVE_FINGERPRINT_CACHE_FILE}.{}.tmp",
-        std::process::id()
-    ));
-    let written = serde_json::to_vec(&payload)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| fs::write(&tmp_path, bytes))
-        .and_then(|()| fs::rename(&tmp_path, &cache_path));
-    if let Err(err) = written {
-        tracing::debug!(
-            error = %err,
-            cache = %cache_path.display(),
-            "archive fingerprint cache write skipped"
-        );
-        let _ = fs::remove_file(&tmp_path);
-    }
+    write_archive_fingerprint_cache_for_identity(identity, cache_dir, &fingerprint);
     Ok(fingerprint)
 }
 
@@ -14427,8 +14430,10 @@ fn remember_discovered_connector(discovered_names: &mut Vec<String>, connector_n
 }
 
 fn source_ledger_key(source: &DiscoveredSourceFile, ctx: &ScanContext) -> String {
+    // dunce: on Windows the plain spelling (C:\...) a scan records, not the
+    // verbatim \\?\C:\... std::fs::canonicalize returns (9v9xi).
     let canonical =
-        std::fs::canonicalize(&source.source_path).unwrap_or_else(|_| source.source_path.clone());
+        dunce::canonicalize(&source.source_path).unwrap_or_else(|_| source.source_path.clone());
     let mappings = ctx
         .scan_roots
         .iter()
@@ -14911,12 +14916,15 @@ struct StreamingProducerConfig {
 /// any explicitly configured additional roots.
 /// Conversations are sent through the channel as they're discovered, providing
 /// backpressure when the consumer (indexer) falls behind.
-fn spawn_connector_producer(
+fn spawn_connector_producer<F>(
     name: &'static str,
-    factory: fn() -> Box<dyn Connector + Send>,
+    factory: F,
     tx: Sender<IndexMessage>,
     config: StreamingProducerConfig,
-) -> JoinHandle<()> {
+) -> JoinHandle<()>
+where
+    F: Fn() -> Box<dyn Connector + Send> + Send + 'static,
+{
     thread::spawn(move || {
         let scan_start = std::time::Instant::now();
         let conn = factory();
@@ -15096,6 +15104,9 @@ fn spawn_connector_producer(
         // Scan explicitly configured additional roots. These may be true remote
         // mirrors or machine-local backup directories wired through sources.toml.
         for root in &config.additional_scan_roots {
+            if !mirrored_root_may_hold(name, root) {
+                continue;
+            }
             let local_since_ts = config
                 .local_since_ts_by_connector
                 .get(name)
@@ -15980,7 +15991,9 @@ fn run_streaming_index(
         lexical_strategy,
         additional_scan_roots,
         local_connector_roots,
-        configured_connector_factories(),
+        filter_disabled_connector_factories(
+            crate::connectors::get_connector_factories_for_archive(&opts.data_dir),
+        ),
         scan_start_ts,
         progress_bump,
     )
@@ -15992,9 +16005,9 @@ fn configured_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
     filter_disabled_connector_factories(get_connector_factories())
 }
 
-fn filter_disabled_connector_factories(
-    connector_factories: Vec<(&'static str, ConnectorFactory)>,
-) -> Vec<(&'static str, ConnectorFactory)> {
+fn filter_disabled_connector_factories<F>(
+    connector_factories: Vec<(&'static str, F)>,
+) -> Vec<(&'static str, F)> {
     if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_ok() {
         return connector_factories;
     }
@@ -16030,7 +16043,7 @@ fn filter_disabled_connector_factories(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_streaming_index_with_connector_factories(
+fn run_streaming_index_with_connector_factories<F>(
     storage: &FrankenStorage,
     t_index: Option<&mut TantivyIndex>,
     opts: &IndexOptions,
@@ -16038,10 +16051,13 @@ fn run_streaming_index_with_connector_factories(
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
     local_connector_roots: LocalConnectorRootsOverride,
-    connector_factories: Vec<(&'static str, ConnectorFactory)>,
+    connector_factories: Vec<(&'static str, F)>,
     scan_start_ts: Option<i64>,
     progress_bump: Option<&Arc<AtomicI64>>,
-) -> Result<NonWatchIngestOutcome> {
+) -> Result<NonWatchIngestOutcome>
+where
+    F: Fn() -> Box<dyn Connector + Send> + Send + Sync + 'static,
+{
     if connector_factories.is_empty() {
         tracing::warn!("no enabled connectors are configured for indexing; skipping scan");
         if let Some(p) = &opts.progress {
@@ -16181,9 +16197,9 @@ fn run_streaming_index_with_connector_factories(
         Ok(result) => result,
         Err(_) => unreachable!("handled above"),
     };
-    ingest_outcome
-        .deferred_sources
-        .extend(producer_config.active_source_filter.take_deferred_sources());
+    let active_deferred = producer_config.active_source_filter.take_deferred_sources();
+    record_deferred_active_sources(opts.progress.as_ref(), &active_deferred);
+    ingest_outcome.deferred_sources.extend(active_deferred);
 
     // Update discovered agent names in progress tracker
     if let Some(p) = &opts.progress
@@ -16220,14 +16236,16 @@ fn run_batch_index(
         lexical_strategy,
         additional_scan_roots,
         local_connector_roots,
-        configured_connector_factories(),
+        filter_disabled_connector_factories(
+            crate::connectors::get_connector_factories_for_archive(&opts.data_dir),
+        ),
         scan_start_ts,
         progress_bump,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_batch_index_with_connector_factories(
+fn run_batch_index_with_connector_factories<F>(
     storage: &FrankenStorage,
     mut t_index: Option<&mut TantivyIndex>,
     opts: &IndexOptions,
@@ -16235,10 +16253,13 @@ fn run_batch_index_with_connector_factories(
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
     local_connector_roots: LocalConnectorRootsOverride,
-    connector_factories: Vec<(&'static str, ConnectorFactory)>,
+    connector_factories: Vec<(&'static str, F)>,
     scan_start_ts: Option<i64>,
     progress_bump: Option<&Arc<AtomicI64>>,
-) -> Result<NonWatchIngestOutcome> {
+) -> Result<NonWatchIngestOutcome>
+where
+    F: Fn() -> Box<dyn Connector + Send> + Send + Sync + 'static,
+{
     let (boundary, fallback): (Vec<_>, Vec<_>) = connector_factories
         .into_iter()
         .partition(|(_, factory)| factory().supports_source_boundaries());
@@ -16543,6 +16564,9 @@ fn run_batch_index_with_connector_factories(
 
                 if !additional_scan_roots.is_empty() {
                     for root in &additional_scan_roots {
+                        if !mirrored_root_may_hold(name, root) {
+                            continue;
+                        }
                         let local_since_ts = local_since_ts_by_connector
                             .get(name)
                             .copied()
@@ -16793,9 +16817,9 @@ fn run_batch_index_with_connector_factories(
 
     ingest_outcome.scanned_connectors.extend(scanned_connectors);
     ingest_outcome.scan_had_errors |= scan_had_errors;
-    ingest_outcome
-        .deferred_sources
-        .extend(active_source_filter.take_deferred_sources());
+    let active_deferred = active_source_filter.take_deferred_sources();
+    record_deferred_active_sources(opts.progress.as_ref(), &active_deferred);
+    ingest_outcome.deferred_sources.extend(active_deferred);
 
     Ok(ingest_outcome)
 }
@@ -16843,10 +16867,10 @@ fn connector_activity_time_lower_bound(name: &str, since_ts: Option<i64>) -> Opt
     }
 }
 
-fn connector_local_scan_since_ts_map(
+fn connector_local_scan_since_ts_map<F>(
     storage: &FrankenStorage,
     fallback_since_ts: Option<i64>,
-    connector_factories: &[(&'static str, ConnectorFactory)],
+    connector_factories: &[(&'static str, F)],
 ) -> Result<HashMap<&'static str, Option<i64>>> {
     let connector_names = connector_factories
         .iter()
@@ -16908,6 +16932,45 @@ fn record_scan_contract_with_watermark_held(
             "connector scan contract save failed; the next run scans this connector without a cutoff again"
         );
     }
+}
+
+/// The connectors that own the store a remote root's configured path names.
+///
+/// A remote mirror's scan root is its opaque `<path>_<hash>` container, and
+/// connectors that walk a root recursively claimed whatever transcripts they
+/// found under any container: each synced Pi, Prime, Factory or Gemini
+/// session was also indexed as a Claude conversation, and each Prime session
+/// as a Pi one. The deepest known store component in the configured path
+/// decides (`~/.gemini/antigravity` is Antigravity's, not Gemini's). A path
+/// that names no known store, and any local root, keeps every connector.
+pub(crate) fn mirrored_root_owners(root: &ScanRoot) -> Option<&'static [&'static str]> {
+    root.mirrored_source_path
+        .as_deref()?
+        .split(['/', '\\'])
+        .rev()
+        .find_map(|component| match component {
+            ".claude" => Some(&["claude"][..]),
+            ".codex" => Some(&["codex"][..]),
+            ".pi" => Some(&["pi_agent", "pi_durable"][..]),
+            ".prime" => Some(&["prime_agent"][..]),
+            ".omp" | "omp" => Some(&["omp"][..]),
+            ".factory" => Some(&["factory"][..]),
+            ".gemini" => Some(&["gemini", "antigravity"][..]),
+            "antigravity" | "antigravity-cli" => Some(&["antigravity"][..]),
+            ".vibe" => Some(&["vibe"][..]),
+            ".continue" => Some(&["continue"][..]),
+            ".goose" => Some(&["goose"][..]),
+            "opencode" => Some(&["opencode"][..]),
+            ".aider.chat.history.md" => Some(&["aider"][..]),
+            "saoudrizwan.claude-dev" | "rooveterinaryinc.roo-cline" => Some(&["cline"][..]),
+            "Cursor" => Some(&["cursor", "cline"][..]),
+            _ => None,
+        })
+}
+
+/// Whether `connector` scans `root`; see [`mirrored_root_owners`].
+fn mirrored_root_may_hold(connector: &str, root: &ScanRoot) -> bool {
+    mirrored_root_owners(root).is_none_or(|owners| owners.contains(&connector))
 }
 
 fn explicit_scan_root_since_ts(
@@ -17673,7 +17736,9 @@ fn run_index_with_storage_ownership(
             path_count,
             "skipping unchanged explicit watch-once index run before startup maintenance"
         );
-        return close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run");
+        close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run")?;
+        prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
+        return Ok(());
     }
 
     preflight_phase!("watch_startup:cleanup_orphan_fk_rows");
@@ -17937,29 +18002,17 @@ fn run_index_with_storage_ownership(
         // rebuild so we do a full scan and reindex messages into the new index
         // (SQLite is incremental-only by default).
         if !tantivy_requires_rebuild {
-            match crate::search::tantivy::searchable_index_summary(&index_path) {
-                Ok(Some(summary)) => {
-                    if let Err(e) =
-                        crate::search::tantivy::validate_searchable_index_contract(&index_path)
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            path = %index_path.display(),
-                            "tantivy contract preflight failed; forcing rebuild"
-                        );
-                        tantivy_requires_rebuild = true;
-                    } else {
-                        observed_tantivy_docs = Some(summary.docs);
-                    }
-                }
-                Ok(None) => {
-                    tantivy_requires_rebuild = true;
+            // One validated open supplies both the contract check and the
+            // live doc count; each Quill open hashes every live segment.
+            match crate::search::tantivy::validated_searchable_index_summary(&index_path) {
+                Ok(summary) => {
+                    observed_tantivy_docs = Some(summary.docs);
                 }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         path = %index_path.display(),
-                        "tantivy open preflight failed; forcing rebuild"
+                        "tantivy open/contract preflight failed; forcing rebuild"
                     );
                     tantivy_requires_rebuild = true;
                 }
@@ -18037,6 +18090,17 @@ fn run_index_with_storage_ownership(
         needs_rebuild = false;
     }
     let initial_needs_rebuild = needs_rebuild;
+    // at3us: a lexical rebuild on an archive that holds no conversations yet
+    // (a first plain `cass index`) has nothing to preserve, so it takes the
+    // path --full takes: ingest canonically, then rebuild the index once from
+    // the database. Rebuilding inline from the scan commits Quill at every
+    // batch, and every publish re-verifies every segment, so that path is
+    // quadratic in index size (10,252 Codex sessions: 62 min against 7). A
+    // populated archive that needs a rebuild is repaired from the database
+    // before its scan instead, so only an empty archive reached the inline
+    // rebuild here.
+    let empty_archive_lexical_rebuild =
+        !opts.full && initial_needs_rebuild && initial_canonical_sessions_before_salvage == 0;
 
     if needs_rebuild && let Some(p) = &opts.progress {
         p.is_rebuilding.store(true, Ordering::Relaxed);
@@ -18504,6 +18568,12 @@ fn run_index_with_storage_ownership(
                     "skipping broad incremental scan because targeted watch-once paths were supplied after authoritative lexical repair"
                 );
             } else {
+                let defer_empty_archive_rebuild = deferred_incremental_authoritative_lexical_repair
+                    .is_none()
+                    && !legacy_omp_upgrade.lexical_rebuild_required
+                    && empty_archive_lexical_rebuild
+                    && needs_rebuild
+                    && historical_salvage.messages_imported == 0;
                 let (lexical_strategy, lexical_strategy_reason) =
                     if let Some(deferred) = &deferred_incremental_authoritative_lexical_repair {
                         (
@@ -18514,6 +18584,11 @@ fn run_index_with_storage_ownership(
                         (
                             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
                             "legacy_omp_identity_upgrade_requires_authoritative_db_rebuild",
+                        )
+                    } else if defer_empty_archive_rebuild {
+                        (
+                            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                            EMPTY_ARCHIVE_LEXICAL_REBUILD_REASON,
                         )
                     } else {
                         resolve_lexical_population_strategy(
@@ -18793,7 +18868,8 @@ fn run_index_with_storage_ownership(
                 if !scan_lexical_update_deferred
                     && (opts.full
                         || historical_salvage.messages_imported > 0
-                        || legacy_omp_upgrade.lexical_rebuild_required)
+                        || legacy_omp_upgrade.lexical_rebuild_required
+                        || defer_empty_archive_rebuild)
                 {
                     let post_scan_observed_tantivy_docs =
                         observed_tantivy_docs_for_post_full_scan_skip(
@@ -19792,7 +19868,9 @@ fn run_index_with_storage_ownership(
                 path_count,
                 "skipping unchanged explicit watch-once paths before opening Tantivy"
             );
-            return close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run");
+            close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run")?;
+            prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
+            return Ok(());
         }
 
         // Startup watch ingest defers WAL auto-checkpoints for bulk import.
@@ -20096,6 +20174,11 @@ fn run_index_with_storage_ownership(
                 }
 
                 let mut deferred = active_source_filter.take_deferred_sources();
+                // A long-lived watch retries these itself; a single
+                // `--watch-once` cycle ends here, so its report must name them.
+                if watch_once_mode {
+                    record_deferred_active_sources(opts_clone.progress.as_ref(), &deferred);
+                }
                 deferred.extend(semantic_maintenance.borrow().pending_paths.iter().cloned());
                 Ok(deferred)
             },
@@ -20114,6 +20197,7 @@ fn run_index_with_storage_ownership(
             return Err(err);
         }
         close_result?;
+        prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
         return Ok(());
     }
 
@@ -20131,7 +20215,9 @@ fn run_index_with_storage_ownership(
     if let Some(progress) = opts.progress.as_ref() {
         progress.finalizing.store(true, Ordering::Relaxed);
     }
-    close_storage_after_index(storage, &opts.db_path, "index run")
+    close_storage_after_index(storage, &opts.db_path, "index run")?;
+    prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
+    Ok(())
 }
 
 /// Close a write handle the way `cass index` closes its own: restore the
@@ -21565,16 +21651,32 @@ fn index_storage_open_error_reason(err: &anyhow::Error) -> String {
 }
 
 fn non_destructive_meta_schema_version(db_path: &Path) -> Result<Option<i64>> {
-    let mut conn = crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
+    let mut conn = match crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
         db_path,
         Duration::from_secs(10),
-    )
-    .with_context(|| {
-        format!(
-            "opening canonical archive read-only before index: {}",
-            db_path.display()
-        )
-    })?;
+    ) {
+        Ok(conn) => conn,
+        // Duplicate `fts_messages` schema rows are derived-FTS debris, not
+        // archive damage: the storage open that follows deduplicates them
+        // (FrankenStorage::open) and checks the schema version itself.
+        Err(err)
+            if err.chain().any(|cause| {
+                let cause = cause.to_string();
+                cause.contains("conflicting virtual-table entries")
+                    && cause.contains("fts_messages")
+            }) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "opening canonical archive read-only before index: {}",
+                    db_path.display()
+                )
+            });
+        }
+    };
 
     let result = match conn.query("SELECT value FROM meta WHERE key = 'schema_version';") {
         Ok(rows) => Ok(rows
@@ -22063,7 +22165,10 @@ fn ensure_index_storage_headroom(
         return Ok(());
     }
 
-    let required = required_index_headroom_bytes(data_dir, db_path, requirement);
+    let projection = index_headroom_projection(data_dir, db_path, requirement);
+    let required = projection.map_or(INDEX_MIN_FREE_SPACE_BYTES, |projection| {
+        projection.required_bytes
+    });
     for probe_path in existing_headroom_probe_paths(data_dir, db_path) {
         let available = fs2::available_space(&probe_path).with_context(|| {
             format!(
@@ -22077,15 +22182,186 @@ fn ensure_index_storage_headroom(
 
         return Err(anyhow::anyhow!(
             "canonical archive disk headroom check failed for {}: available={} bytes, required={} bytes. \
-             Free space before running cass index so SQLite, WAL, and lexical scratch writes cannot fail mid-commit. \
+             Free space before running cass index so SQLite, WAL, and lexical scratch writes cannot fail mid-commit.{}{} \
              Run 'cass doctor check --json' for a read-only health report.",
             probe_path.display(),
             available,
-            required
+            required,
+            projection
+                .map(|projection| full_rebuild_refusal_terms(data_dir, &probe_path, &projection))
+                .unwrap_or_default(),
+            raw_mirror_headroom_note(data_dir, &probe_path)
         ));
     }
 
     Ok(())
+}
+
+/// What a full-rebuild refusal says beyond the two numbers (nw61n): the rule
+/// and the terms it charged, and, on the data dir's filesystem, the space cass
+/// can give back without touching the live index. Merge-retired segments,
+/// retained publish backups and failed-rebuild quarantine bundles are not
+/// charged, so freeing them raises the available side only. The quarantine
+/// inventory is a bounded metadata scan, run only on this refusal path.
+fn full_rebuild_refusal_terms(
+    data_dir: &Path,
+    probe_path: &Path,
+    projection: &FullRebuildHeadroomProjection,
+) -> String {
+    let mut terms = format!(
+        " The requirement is {FULL_REBUILD_HEADROOM_FORMULA}: lexical index {} bytes, \
+         staged generation credit {} bytes, db bundle {} bytes (growth allowance {} bytes), \
+         floor {} bytes.",
+        projection.lexical_index_bytes,
+        projection.rebuild_staging_bytes,
+        projection.db_bundle_bytes,
+        projection.db_growth_allowance_bytes,
+        projection.floor_bytes
+    );
+    if projection.lexical_index_bytes == 0 && projection.lexical_rebuild_basis_bytes > 0 {
+        terms.push_str(&format!(
+            " There is no live lexical generation to size the rebuild by, so it is sized as \
+             the db bundle ({} bytes).",
+            projection.lexical_rebuild_basis_bytes
+        ));
+    }
+    if projection.migration_repair_pending {
+        terms.push_str(&format!(
+            " It includes {} bytes for the engine's one-time migration repair, which is still \
+             pending for this archive and keeps a copy of the whole db bundle while it runs.",
+            projection.migration_copy_bytes
+        ));
+    }
+    let probes_data_dir = nearest_existing_path(data_dir)
+        .is_some_and(|data_dir_probe| same_headroom_probe_path(&data_dir_probe, probe_path));
+    if !probes_data_dir {
+        return terms;
+    }
+    if projection.retired_segment_bytes > 0 {
+        terms.push_str(&format!(
+            " {} bytes of merge-retired lexical segments are reclaimable: 'cass index --gc' \
+             removes them once no published generation has referenced them for the engine's \
+             grace period.",
+            projection.retired_segment_bytes
+        ));
+    }
+    if projection.retained_backup_bytes > 0 {
+        terms.push_str(&format!(
+            " {} bytes of prior lexical generations under index/.lexical-publish-backups/ are \
+             reclaimable with 'cass doctor cleanup'.",
+            projection.retained_backup_bytes
+        ));
+    }
+    if let Ok(inventory) = crate::search::lexical_quarantine::inspect(data_dir)
+        && inventory.total_bytes > 0
+    {
+        terms.push_str(&format!(
+            " Failed-rebuild quarantine bundles hold {} bytes, {} of them eligible under the \
+             retention policy; 'cass lexical-quarantine --data-dir {} --plan --json' previews \
+             reclaiming them.",
+            inventory.total_bytes,
+            inventory.eligible_bytes,
+            data_dir.display()
+        ));
+    }
+    terms
+}
+
+/// Marker the CLI matches to report a rebuild that stopped for disk space
+/// (exit 14, kind `storage`, retryable).
+pub(crate) const LEXICAL_REBUILD_DISK_STOP_MARKER: &str =
+    "lexical rebuild stopped: free disk space fell below the floor";
+
+/// Stop an authoritative lexical rebuild, keeping what it has committed, once
+/// free space where it writes falls below the preflight floor (nw61n). The
+/// preflight sizes the whole run from measurements; this catches a short
+/// projection before the filesystem fills, which is how the July trj rebuild
+/// failed (`disk I/O error (10)` with the root filesystem at 0 bytes). It runs
+/// before each commit, at the progress heartbeat and before the terminal
+/// commit, so one commit can still write past the floor; it is a backstop, not
+/// a reservation. `CASS_INDEX_SKIP_DISK_HEADROOM_CHECK` disables it with the
+/// preflight.
+fn ensure_lexical_rebuild_free_space(build_path: &Path) -> Result<()> {
+    if index_disk_headroom_check_disabled() {
+        return Ok(());
+    }
+    let Some(probe_path) = nearest_existing_path(build_path) else {
+        return Ok(());
+    };
+    let available = fs2::available_space(&probe_path).with_context(|| {
+        format!(
+            "checking free disk space for the lexical rebuild at {}",
+            probe_path.display()
+        )
+    })?;
+    lexical_rebuild_free_space_verdict(available, INDEX_MIN_FREE_SPACE_BYTES, &probe_path)
+}
+
+pub(crate) fn lexical_rebuild_free_space_verdict(
+    available: u64,
+    floor: u64,
+    probe_path: &Path,
+) -> Result<()> {
+    if available >= floor {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "{LEXICAL_REBUILD_DISK_STOP_MARKER} at {}: available={available} bytes, floor={floor} bytes. \
+         The live lexical index is unchanged, and what this rebuild committed stays in its staged \
+         generation; free space, then rerun the same cass index command to resume. Run \
+         'cass doctor check --json' for the headroom a rebuild needs.",
+        probe_path.display()
+    ))
+}
+
+/// Whether the post-rebuild fold (one `force_merge` over the staged
+/// generation) fits: it writes about as much as the generation holds while the
+/// inputs stay on disk. When it does not, the rebuild publishes the unmerged
+/// generation, which is what a failed fold already does (#441).
+fn lexical_rebuild_fold_fits(available: u64, generation_bytes: u64, floor: u64) -> bool {
+    available >= generation_bytes.saturating_add(floor)
+}
+
+/// Why the post-rebuild fold of `build_path` does not fit, or `None` when it
+/// does (or the headroom checks are disabled, or space cannot be read).
+fn lexical_rebuild_fold_shortfall(build_path: &Path) -> Option<String> {
+    if index_disk_headroom_check_disabled() {
+        return None;
+    }
+    let probe_path = nearest_existing_path(build_path)?;
+    let available = fs2::available_space(&probe_path).ok()?;
+    let generation_bytes = directory_size_bytes_best_effort(build_path);
+    (!lexical_rebuild_fold_fits(available, generation_bytes, INDEX_MIN_FREE_SPACE_BYTES)).then(
+        || {
+            format!(
+                "available={available} bytes at {}, generation={generation_bytes} bytes, floor={INDEX_MIN_FREE_SPACE_BYTES} bytes",
+                probe_path.display()
+            )
+        },
+    )
+}
+
+/// The raw mirror sits in the data dir and is the one large store there that
+/// cass shrinks on request, so a refusal on the data dir's filesystem names
+/// its size and the prune that retires superseded captures (#522: a 69 GB
+/// mirror left a timer-driven index refusing to start).
+fn raw_mirror_headroom_note(data_dir: &Path, probe_path: &Path) -> String {
+    let probes_data_dir = nearest_existing_path(data_dir)
+        .is_some_and(|data_dir_probe| same_headroom_probe_path(&data_dir_probe, probe_path));
+    if !probes_data_dir {
+        return String::new();
+    }
+    let mirror_bytes = crate::raw_mirror::physical_storage_bytes(data_dir);
+    if mirror_bytes == 0 {
+        return String::new();
+    }
+    format!(
+        " The raw mirror in {} holds {mirror_bytes} bytes; \
+         'cass mirror prune --keep-latest 1 --safety-hold-down 6h --json' previews retiring \
+         every capture older than 6 hours except the newest of each source file, and \
+         --apply reclaims them.",
+        data_dir.display()
+    )
 }
 
 pub(crate) fn index_disk_headroom_check_disabled() -> bool {
@@ -22157,26 +22433,55 @@ fn nearest_existing_path(path: &Path) -> Option<PathBuf> {
 /// Directory holding the lexical (Tantivy) index, relative to the data dir.
 const LEXICAL_INDEX_ROOT_DIR: &str = "index";
 
+/// The full-rebuild projection a requirement is checked against; the
+/// incremental requirement is the bare floor and has none.
+fn index_headroom_projection(
+    data_dir: &Path,
+    db_path: &Path,
+    requirement: IndexStorageHeadroomRequirement,
+) -> Option<FullRebuildHeadroomProjection> {
+    match requirement {
+        IndexStorageHeadroomRequirement::IncrementalStartup => None,
+        IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild => {
+            Some(full_rebuild_headroom_projection(data_dir, db_path))
+        }
+    }
+}
+
+#[cfg(test)]
 fn required_index_headroom_bytes(
     data_dir: &Path,
     db_path: &Path,
     requirement: IndexStorageHeadroomRequirement,
 ) -> u64 {
-    match requirement {
-        IndexStorageHeadroomRequirement::IncrementalStartup => INDEX_MIN_FREE_SPACE_BYTES,
-        IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild => {
-            full_rebuild_headroom_projection(data_dir, db_path).required_bytes
-        }
-    }
+    index_headroom_projection(data_dir, db_path, requirement)
+        .map_or(INDEX_MIN_FREE_SPACE_BYTES, |projection| {
+            projection.required_bytes
+        })
 }
 
 /// Human-readable statement of the full-rebuild headroom rule, reported by
 /// `doctor` next to the numbers so an agent can see *why* a rebuild is
 /// blocked. Keep in sync with [`full_rebuild_headroom_projection`].
-/// `lexical_index_bytes` is the LIVE lexical footprint (see
-/// [`LexicalIndexFootprint::live_bytes`]).
-pub(crate) const FULL_REBUILD_HEADROOM_FORMULA: &str =
-    "max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2 - rebuild_staging_bytes)";
+/// `lexical_rebuild_basis_bytes` is the LIVE lexical footprint (see
+/// [`LexicalIndexFootprint::live_bytes`]), or the db bundle when there is no
+/// live generation; `migration_copy_bytes` is the db bundle while the engine's
+/// one-time migration repair is pending, else 0.
+pub(crate) const FULL_REBUILD_HEADROOM_FORMULA: &str = "max(512 MiB, lexical_rebuild_basis_bytes * 9 / 4 - rebuild_staging_bytes + db_bundle_bytes / 16 + migration_copy_bytes), where lexical_rebuild_basis_bytes is lexical_index_bytes, or db_bundle_bytes when no live lexical generation exists";
+
+/// What a lexical rebuild writes per live lexical byte, as a fraction: the new
+/// generation's segments plus the post-run fold that rewrites them into one
+/// segment while the inputs are still on disk. Measured 2,821 MiB written for
+/// 1,329 MiB live (2.12x) rebuilding a 256k-message archive (nw61n,
+/// 2026-10-23); 9/4 keeps a margin over that.
+const LEXICAL_REBUILD_BYTES_PER_LIVE_BYTE: (u64, u64) = (9, 4);
+
+/// The db bundle's growth a rebuild or full rescan is charged for (WAL and the
+/// rows a rescan inserts), as a divisor of the bundle. The same measurement
+/// saw no growth for `--force-rebuild` or for a `--full` rescan of an
+/// unchanged archive; the July trj rebuild (25 GB db) wrote about 1 GB beyond
+/// twice its lexical index.
+const REBUILD_DB_GROWTH_DIVISOR: u64 = 16;
 
 /// The inputs and result of the full-rebuild headroom rule, so `doctor` can
 /// report the same requirement `index --full` / `--force-rebuild` enforces.
@@ -22191,6 +22496,9 @@ pub(crate) struct FullRebuildHeadroomProjection {
     /// Live on-disk size of the lexical index tree: the bytes a rebuild has
     /// to write a second copy of ([`LexicalIndexFootprint::live_bytes`]).
     pub(crate) lexical_index_bytes: u64,
+    /// The generation size the rule charges for: `lexical_index_bytes`, or
+    /// `db_bundle_bytes` when no live generation exists to size it by.
+    pub(crate) lexical_rebuild_basis_bytes: u64,
     /// Merge-retired segment files still on disk under the lexical index
     /// ([`LexicalIndexFootprint::retired_segment_bytes`]). Already consumed,
     /// reclaimed by the engine, never rewritten by a rebuild: excluded from
@@ -22209,13 +22517,26 @@ pub(crate) struct FullRebuildHeadroomProjection {
     /// for: they are subtracted from `required_bytes` (GH #496: doubling them
     /// locked a failed large rebuild out of its retry; GH #498 left 32 GB).
     pub(crate) rebuild_staging_bytes: u64,
+    /// Failed-rebuild quarantine bundles under `index/`
+    /// ([`LexicalIndexFootprint::quarantine_bytes`]): evidence a rebuild
+    /// never rewrites; excluded from `required_bytes`.
+    pub(crate) quarantine_bytes: u64,
+    /// The db growth allowance charged (`db_bundle_bytes / 16`).
+    pub(crate) db_growth_allowance_bytes: u64,
+    /// Whether the engine's one-time migration repair is still pending for
+    /// the archive (its `.fsqlite-migration-state` marker is absent or
+    /// incomplete). That repair keeps a `.pre-migration-bak` copy of the
+    /// whole bundle, so only then is the bundle charged a second time.
+    pub(crate) migration_repair_pending: bool,
+    /// `db_bundle_bytes` while `migration_repair_pending`, else 0.
+    pub(crate) migration_copy_bytes: u64,
 }
 
 /// Single source of truth for the authoritative (full) rebuild headroom rule.
 ///
-/// An authoritative rebuild writes a *second* full lexical index (plus staged
-/// shard/merge scratch) while the existing one is still on disk, so the db
-/// bundle alone badly under-projects the requirement.
+/// An authoritative rebuild writes a *second* full lexical index (plus the
+/// fold that rewrites it into one segment) while the existing one is still on
+/// disk, so the db bundle alone badly under-projects the requirement.
 ///
 /// Sizing this as `db_bundle * 2` (the pre-2026-07 formula) let a real
 /// rebuild run a filesystem to 0 bytes: on a host with a 25 GB db and a
@@ -22223,6 +22544,16 @@ pub(crate) struct FullRebuildHeadroomProjection {
 /// free, then consumed ~115 GB and died on `disk I/O error (10)`.
 /// Counting the lexical index makes that case fail the preflight
 /// instead of failing mid-commit.
+///
+/// The db is charged for what touches it (nw61n). A lexical rebuild of a
+/// migrated archive reads it and writes almost nothing there: rebuilding a
+/// 3.0 GB db / 1.3 GiB-live archive used 2.8 GB, all lexical, while
+/// `db * 2 + lexical * 2` demanded 9.1 GB and refused a `--full` that then
+/// wrote nothing. So the bundle is charged a growth allowance, plus one
+/// whole copy only while the engine's one-time migration repair (which keeps
+/// a `.pre-migration-bak` copy) is pending. The rebuild itself stops at the
+/// free-space floor rather than filling the disk if the projection is short
+/// ([`ensure_lexical_rebuild_free_space`]).
 ///
 /// Only the LIVE lexical bytes count (#453). Merge-retired segment files the
 /// MANIFEST no longer references and prior generations parked under
@@ -22238,25 +22569,63 @@ pub(crate) fn full_rebuild_headroom_projection(
     db_path: &Path,
 ) -> FullRebuildHeadroomProjection {
     let db_bundle_bytes = database_bundle_size_bytes(db_path);
-    let footprint = lexical_index_footprint(data_dir);
+    let migration_repair_pending =
+        db_path.is_file() && !crate::storage::sqlite::index_engine_migration_is_complete(db_path);
+    full_rebuild_headroom_projection_from(
+        db_bundle_bytes,
+        lexical_index_footprint(data_dir),
+        migration_repair_pending,
+    )
+}
+
+/// The rule of [`full_rebuild_headroom_projection`] over measured inputs.
+fn full_rebuild_headroom_projection_from(
+    db_bundle_bytes: u64,
+    footprint: LexicalIndexFootprint,
+    migration_repair_pending: bool,
+) -> FullRebuildHeadroomProjection {
+    let (per_live_num, per_live_den) = LEXICAL_REBUILD_BYTES_PER_LIVE_BYTE;
+    // With no live generation to size it by (the index was deleted, or only
+    // backups, staging or quarantine are left), a repair still writes a whole
+    // generation: size it as the db bundle. Measured generations were 0.44x
+    // (nw61n fixture) and 0.96x (ts1) of their bundle, so this over-provisions
+    // rather than projecting the floor for a full rebuild.
+    let lexical_rebuild_basis_bytes = if footprint.live_bytes > 0 {
+        footprint.live_bytes
+    } else {
+        db_bundle_bytes
+    };
+    let lexical_rebuild_bytes =
+        lexical_rebuild_basis_bytes.saturating_mul(per_live_num) / per_live_den;
+    let db_growth_allowance_bytes = db_bundle_bytes / REBUILD_DB_GROWTH_DIVISOR;
+    let migration_copy_bytes = if migration_repair_pending {
+        db_bundle_bytes
+    } else {
+        0
+    };
     // A leftover staged generation occupies disk the rebuild gets back: a
     // resume continues writing into it, and a from-zero restart clears it
     // before writing. Either way the new generation's bytes already on disk
     // (or about to be freed) are not needed a second time, so they are
-    // credited against the requirement rather than merely left out of it.
-    let projected = db_bundle_bytes
-        .saturating_mul(2)
-        .saturating_add(footprint.live_bytes.saturating_mul(2))
-        .saturating_sub(footprint.rebuild_staging_bytes);
+    // credited against the lexical charge rather than merely left out of it.
+    let projected = lexical_rebuild_bytes
+        .saturating_sub(footprint.rebuild_staging_bytes)
+        .saturating_add(db_growth_allowance_bytes)
+        .saturating_add(migration_copy_bytes);
     FullRebuildHeadroomProjection {
         required_bytes: INDEX_MIN_FREE_SPACE_BYTES.max(projected),
         floor_bytes: INDEX_MIN_FREE_SPACE_BYTES,
         db_bundle_bytes,
         lexical_index_bytes: footprint.live_bytes,
+        lexical_rebuild_basis_bytes,
         retired_segment_bytes: footprint.retired_segment_bytes,
         retired_segment_files: footprint.retired_segment_files,
         retained_backup_bytes: footprint.retained_backup_bytes,
         rebuild_staging_bytes: footprint.rebuild_staging_bytes,
+        quarantine_bytes: footprint.quarantine_bytes,
+        db_growth_allowance_bytes,
+        migration_repair_pending,
+        migration_copy_bytes,
     }
 }
 
@@ -22285,6 +22654,12 @@ pub(crate) struct LexicalIndexFootprint {
     /// resumes into it or clears it before starting over, so a rebuild never
     /// writes it a second time (GH #496).
     pub(crate) rebuild_staging_bytes: u64,
+    /// Everything under a failed rebuild's quarantine bundle (or an
+    /// interrupted reclaim of one) beneath `index/`, GH #523: evidence a
+    /// rebuild never rewrites, retired by retention and `cass
+    /// lexical-quarantine` (nw61n; ts1 held 34.6 GB of it, which the rule
+    /// had been charging as live).
+    pub(crate) quarantine_bytes: u64,
 }
 
 impl LexicalIndexFootprint {
@@ -22295,6 +22670,7 @@ impl LexicalIndexFootprint {
             .saturating_add(self.retired_segment_bytes)
             .saturating_add(self.retained_backup_bytes)
             .saturating_add(self.rebuild_staging_bytes)
+            .saturating_add(self.quarantine_bytes)
     }
 }
 
@@ -22411,9 +22787,10 @@ pub fn run_lexical_segment_gc(data_dir: &Path) -> Result<LexicalSegmentGcReport>
 pub(crate) fn lexical_index_footprint(data_dir: &Path) -> LexicalIndexFootprint {
     let mut footprint = LexicalIndexFootprint::default();
     // (path, whether an ancestor is the retained-backups directory, whether
-    // an ancestor is a staged rebuild's scratch generation)
-    let mut stack = vec![(data_dir.join(LEXICAL_INDEX_ROOT_DIR), false, false)];
-    while let Some((path, in_backups, in_staging)) = stack.pop() {
+    // an ancestor is a staged rebuild's scratch generation, whether an
+    // ancestor is a failed rebuild's quarantine bundle)
+    let mut stack = vec![(data_dir.join(LEXICAL_INDEX_ROOT_DIR), false, false, false)];
+    while let Some((path, in_backups, in_staging, in_quarantine)) = stack.pop() {
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             continue;
         };
@@ -22429,6 +22806,9 @@ pub(crate) fn lexical_index_footprint(data_dir: &Path) -> LexicalIndexFootprint 
                 footprint.rebuild_staging_bytes = footprint
                     .rebuild_staging_bytes
                     .saturating_add(metadata.len());
+            } else if in_quarantine {
+                footprint.quarantine_bytes =
+                    footprint.quarantine_bytes.saturating_add(metadata.len());
             } else {
                 footprint.live_bytes = footprint.live_bytes.saturating_add(metadata.len());
             }
@@ -22445,8 +22825,14 @@ pub(crate) fn lexical_index_footprint(data_dir: &Path) -> LexicalIndexFootprint 
             || path
                 .file_name()
                 .is_some_and(is_lexical_rebuild_staging_dir_name);
-        // Backups and staging are counted whole, never split by a MANIFEST.
-        let quill = if in_backups || in_staging {
+        let in_quarantine = in_quarantine
+            || path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(crate::search::lexical_quarantine::is_bundle_name);
+        // Backups, staging and quarantine are counted whole, never split by a
+        // MANIFEST.
+        let quill = if in_backups || in_staging || in_quarantine {
             None
         } else {
             crate::search::quill_bridge::quill_directory_footprint(&path)
@@ -22468,7 +22854,7 @@ pub(crate) fn lexical_index_footprint(data_dir: &Path) -> LexicalIndexFootprint 
             if quill.is_some() && !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                 continue;
             }
-            stack.push((entry.path(), in_backups, in_staging));
+            stack.push((entry.path(), in_backups, in_staging, in_quarantine));
         }
     }
     footprint
@@ -22940,15 +23326,32 @@ enum LexicalRebuildPagePrepResult {
     Part(LexicalRebuildSequencedPreparedPage),
     Error {
         sequence: u64,
-        error: String,
+        error: anyhow::Error,
     },
 }
 
 #[derive(Debug)]
 enum LexicalRebuildPipelineMessage {
     Batch(LexicalRebuildPreparedPage),
-    Error(String),
+    Error(anyhow::Error),
     Done,
+}
+
+fn lexical_rebuild_page_prep_error(sequence: u64, error: anyhow::Error) -> anyhow::Error {
+    error.context(format!(
+        "lexical rebuild page-prep worker failed at sequence {sequence}"
+    ))
+}
+
+/// Error chains are Send + Sync; carrying them through the existing channel
+/// preserves database/I/O classification without printing private cause text.
+fn send_lexical_rebuild_pipeline_error(
+    sender: &Sender<LexicalRebuildPipelineMessage>,
+    error: anyhow::Error,
+) {
+    let _ = sender.send(LexicalRebuildPipelineMessage::Error(
+        error.context("lexical rebuild packet producer failed"),
+    ));
 }
 
 fn lexical_rebuild_prepared_page_reserved_bytes(page: &LexicalRebuildPreparedPage) -> usize {
@@ -23452,14 +23855,9 @@ fn spawn_lexical_rebuild_page_prep_workers(
                             Err(err) => {
                                 let _ = worker_result_tx.send(LexicalRebuildPagePrepResult::Error {
                                     sequence: 0,
-                                    error: format!(
-                                        "{:#}",
-                                        err.context(format!(
-                                            "opening readonly storage for lexical rebuild page-prep worker {}: {}",
-                                            worker_idx,
-                                            worker_db_path.display()
-                                        ))
-                                    ),
+                                    error: err.context(format!(
+                                        "opening readonly storage for lexical rebuild page-prep worker {worker_idx}"
+                                    )),
                                 });
                                 return;
                             }
@@ -23522,7 +23920,9 @@ fn spawn_lexical_rebuild_page_prep_workers(
                                     worker_reservation_order.close();
                                     let _ = worker_result_tx.send(LexicalRebuildPagePrepResult::Error {
                                         sequence,
-                                        error: format!("{err:#}"),
+                                        error: err.context(format!(
+                                            "lexical rebuild page-prep worker {worker_idx} could not prepare page sequence {sequence}"
+                                        )),
                                     });
                                     break;
                                 }
@@ -23530,10 +23930,10 @@ fn spawn_lexical_rebuild_page_prep_workers(
                                     worker_reservation_order.close();
                                     let _ = worker_result_tx.send(LexicalRebuildPagePrepResult::Error {
                                         sequence,
-                                        error: format!(
-                                            "lexical rebuild page-prep worker {worker_idx} panicked while preparing page sequence {sequence}: {}",
-                                            panic_payload_message(payload)
-                                        ),
+                                        error: anyhow::anyhow!(panic_payload_message(payload))
+                                            .context(format!(
+                                                "lexical rebuild page-prep worker {worker_idx} panicked while preparing page sequence {sequence}"
+                                            )),
                                     });
                                     break;
                                 }
@@ -23596,7 +23996,7 @@ fn spawn_lexical_rebuild_packet_producer(
                 *step_started = Instant::now();
             };
             let send_error = |error: anyhow::Error| {
-                let _ = tx.send(LexicalRebuildPipelineMessage::Error(format!("{error:#}")));
+                send_lexical_rebuild_pipeline_error(&tx, error);
             };
 
             // Preparation owns any recovery writes. Worker readers cannot
@@ -24174,11 +24574,7 @@ fn spawn_lexical_rebuild_packet_producer(
                                 &mut completed_pages,
                                 flow_limiter.as_ref(),
                             );
-                            return Err(anyhow::anyhow!(
-                                "lexical rebuild page-prep worker failed at sequence {}: {}",
-                                sequence,
-                                error
-                            ));
+                            return Err(lexical_rebuild_page_prep_error(sequence, error));
                         }
                         Err(_) => {
                             reservation_order.close();
@@ -24507,7 +24903,7 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
         })?;
     }
     recover_or_finalize_interrupted_lexical_publish_backup(index_path)?;
-    ensure_lexical_publish_backups_dir(index_path)?;
+    remove_lexical_index_dir_placeholder(index_path);
 
     if !index_path.exists() {
         rename_lexical_publish_path(
@@ -24525,6 +24921,8 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
         sync_parent_directory(index_path)?;
         return Ok(());
     }
+
+    ensure_lexical_publish_backups_dir(index_path)?;
 
     let retained_backup_path = unique_lexical_publish_backup_path(index_path);
 
@@ -24910,11 +25308,56 @@ fn ensure_lexical_publish_backups_dir(index_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn remove_lexical_index_dir_placeholder(index_path: &Path) {
+    // `index_dir(&data_dir)` calls `fs::create_dir_all` at startup, creating an
+    // empty directory before any lexical generation has been published. A first
+    // full rebuild then writes its in-progress checkpoint into it, and status may
+    // cache the archive fingerprint there. Both are rewritten with the published
+    // generation, so a directory holding only them is still a placeholder;
+    // retaining it gave a fresh install a "prior-live" publish backup with no
+    // index in it. Only those two sidecars are removed. `fs::remove_dir` only
+    // succeeds when the directory has zero entries (failing with ENOTEMPTY if
+    // any other file or subdirectory exists), so calling it here turns the
+    // placeholder back into `!index_path.exists()` without touching a populated
+    // live index (dcp01).
+    if !fs::symlink_metadata(index_path).is_ok_and(|meta| meta.is_dir()) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(index_path) else {
+        return;
+    };
+    let placeholder_sidecars = [
+        lexical_rebuild_state_path(index_path),
+        index_path.join(ARCHIVE_FINGERPRINT_CACHE_FILE),
+    ];
+    let mut sidecars = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return;
+        };
+        let path = entry.path();
+        if !placeholder_sidecars.contains(&path)
+            || !entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            return;
+        }
+        sidecars.push(path);
+    }
+    for sidecar in &sidecars {
+        if fs::remove_file(sidecar).is_err() {
+            return;
+        }
+    }
+    let _ = fs::remove_dir(index_path);
+}
+
 fn recover_or_finalize_interrupted_lexical_publish_backup(index_path: &Path) -> Result<()> {
     let in_progress_backup_path = lexical_publish_in_progress_backup_path(index_path);
     if !in_progress_backup_path.exists() {
         return Ok(());
     }
+
+    remove_lexical_index_dir_placeholder(index_path);
 
     if index_path.exists() {
         ensure_lexical_publish_backups_dir(index_path)?;
@@ -25933,7 +26376,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                             )?;
                         }
                         Ok(LexicalRebuildPipelineMessage::Error(error)) => {
-                            return Err(anyhow::anyhow!(error));
+                            return Err(error);
                         }
                         Ok(LexicalRebuildPipelineMessage::Done) => {
                             producer_finished = true;
@@ -26743,27 +27186,21 @@ fn rebuild_tantivy_from_db_once(
     // checkpoint with the previous run's accounting still captured in locals.
     if !restart_from_zero && !will_use_atomic_staged_publish {
         let resume_check = (|| -> Result<()> {
-            crate::search::tantivy::validate_searchable_index_contract(&build_path)?;
-            let live_docs = crate::search::tantivy::searchable_index_live_doc_count(&build_path)
-                .context("resumed lexical candidate has no observable document count")?;
+            // GH #530: pending commit reconciliation above accounts for an
+            // exactly landed commit before this check. Any remaining count gap
+            // makes this prefix ambiguous, even when its cursor is short of EOF.
+            // Upserting the suffix cannot remove an uncounted prefix identity or
+            // a foreign document, and waiting for terminal certification wastes
+            // another pass through the suffix on every interrupted retry.
+            // Inspect one validated reader, without opening a writer or changing
+            // the expected count to whatever the candidate happens to contain.
+            let summary = crate::search::tantivy::validated_searchable_index_summary(&build_path)?;
             anyhow::ensure!(
-                u128::from(live_docs) >= rebuild_state.indexed_docs as u128,
-                "resumed lexical candidate contains {live_docs} documents, but its checkpoint \
-                 requires {} committed documents",
-                rebuild_state.indexed_docs
-            );
-            // A surplus is reconciled only by replaying the identities behind
-            // it through the #440 upsert window. With the cursor at EOF nothing
-            // is replayed, so the candidate keeps the surplus and the finalize
-            // count check (GH #457) refuses it; a refused finalize leaves this
-            // same EOF checkpoint, so every later run would repeat the refusal.
-            anyhow::ensure!(
-                rebuild_state.processed_conversations < total_conversations
-                    || u128::from(live_docs) == rebuild_state.indexed_docs as u128,
-                "resumed lexical candidate contains {live_docs} documents, more than the {} its \
-                 checkpoint counted, and the checkpoint is at the end of the archive, so no \
-                 replay can reconcile the difference",
-                rebuild_state.indexed_docs
+                summary.docs == rebuild_state.indexed_docs,
+                "resumed lexical candidate contains {} documents but its reconciled checkpoint \
+                 requires exactly {}; refusing ambiguous prefix before replay",
+                summary.docs,
+                rebuild_state.indexed_docs,
             );
             Ok(())
         })();
@@ -27235,6 +27672,7 @@ fn rebuild_tantivy_from_db_once(
                     commit_interval_messages,
                     commit_interval_message_bytes,
                 ) {
+                    ensure_lexical_rebuild_free_space(&build_path)?;
                     flush_streamed_lexical_rebuild_batch(
                         &mut pending_batch,
                         &mut pending_batch_message_count,
@@ -27350,8 +27788,10 @@ fn rebuild_tantivy_from_db_once(
                             pending_batch_message_bytes,
                         ),
                     );
+                    ensure_lexical_rebuild_free_space(&build_path)?;
                     persist_pending_lexical_rebuild_progress(
                         &index_path,
+                        &build_path,
                         &mut rebuild_state,
                         last_processed_conversation_id,
                         processed_conversations,
@@ -27511,7 +27951,7 @@ fn rebuild_tantivy_from_db_once(
                         }
                     }
                     Ok(LexicalRebuildPipelineMessage::Error(error)) => {
-                        return Err(anyhow::anyhow!(error));
+                        return Err(error);
                     }
                     Ok(LexicalRebuildPipelineMessage::Done) => break,
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -27685,6 +28125,7 @@ fn rebuild_tantivy_from_db_once(
     // one. The merge is a Q1-preserving concat behind an atomic MANIFEST
     // publish, so a failure leaves the (valid, merely unmerged) generation in
     // place and is logged rather than failing a completed rebuild.
+    ensure_lexical_rebuild_free_space(&build_path)?;
     let publication = lexical_publish::Finalization::new(
         &index_path,
         &build_path,
@@ -27700,6 +28141,15 @@ fn rebuild_tantivy_from_db_once(
         tracing::warn!(
             segments = t_index.segment_count(),
             "post-rebuild segment merge skipped by CASS_TEST_SKIP_POST_RUN_LEXICAL_MAINTENANCE (test hook)"
+        );
+    } else if let Some(shortfall) = lexical_rebuild_fold_shortfall(&build_path) {
+        // nw61n: the fold rewrites the whole generation while its inputs stay
+        // on disk. Without room for that, publish the unmerged generation, as
+        // a failed fold already does, instead of filling the filesystem.
+        tracing::warn!(
+            segments = t_index.segment_count(),
+            shortfall = %shortfall,
+            "skipping the post-rebuild segment fold for lack of disk space; publishing the unmerged generation (#441)"
         );
     } else {
         match t_index.force_merge() {
@@ -30157,7 +30607,7 @@ fn targeted_quarantine_retry_inner(
             source.provider
         )
     })?;
-    let connector = kind.create_connector();
+    let connector = kind.create_connector(Some(data_dir));
     let root = ScanRoot::local(source.source_path.clone());
     let context = crate::connectors::ScanContext::with_roots(
         source.source_path.clone(),
@@ -30349,7 +30799,9 @@ pub(crate) fn acquire_semantic_backfill_lock(
 
 /// Try to admit a daemon embedding job through the same writer ownership as
 /// standalone indexing. A busy archive leaves the queued job intact; all
-/// other failures retain their original error and context.
+/// other failures retain their original error and context. The daemon is
+/// Unix-only.
+#[cfg(any(unix, test))]
 pub(crate) fn try_acquire_semantic_backfill_lock(
     data_dir: &Path,
     db_path: &Path,
@@ -30623,7 +31075,7 @@ fn build_watch_roots(additional_scan_roots: Vec<ScanRoot>) -> Vec<(ConnectorKind
 
     for (name, factory) in factories {
         if let Some(kind) = ConnectorKind::from_slug(name) {
-            all_kinds.push(kind);
+            all_kinds.push((name, kind));
             let conn = factory();
             let detection = conn.detect();
             if detection.detected {
@@ -30634,10 +31086,12 @@ fn build_watch_roots(additional_scan_roots: Vec<ScanRoot>) -> Vec<(ConnectorKind
         }
     }
 
-    // Add explicitly configured roots for ALL connectors.
+    // Add explicitly configured roots for every connector that may own them.
     for configured_root in additional_scan_roots {
-        for kind in &all_kinds {
-            roots.push((*kind, configured_root.clone()));
+        for (name, kind) in &all_kinds {
+            if mirrored_root_may_hold(name, &configured_root) {
+                roots.push((*kind, configured_root.clone()));
+            }
         }
     }
 
@@ -30781,6 +31235,7 @@ impl ConnectorKind {
             "hermes" => Some(Self::Hermes),
             "codebuff" => Some(Self::Codebuff),
             "pi_durable" => Some(Self::PiDurable),
+            "continue" => Some(Self::Continue),
             _ => None,
         }
     }
@@ -30820,14 +31275,18 @@ impl ConnectorKind {
             Self::Hermes => "hermes",
             Self::Codebuff => "codebuff",
             Self::PiDurable => "pi_durable",
+            Self::Continue => "continue",
         }
     }
 
     /// Create a boxed connector instance for this kind.
     /// Centralizes connector instantiation to avoid duplicate match arms.
-    fn create_connector(&self) -> Box<dyn Connector + Send> {
+    fn create_connector(&self, archive_data_dir: Option<&Path>) -> Box<dyn Connector + Send> {
         match self {
-            Self::Codex => Box::new(CodexConnector::new()),
+            Self::Codex => Box::new(match archive_data_dir {
+                Some(data_dir) => CodexConnector::new().with_archive_data_dir(data_dir),
+                None => CodexConnector::new(),
+            }),
             Self::Cline => Box::new(ClineConnector::new()),
             Self::Gemini => Box::new(GeminiConnector::new()),
             Self::Antigravity => Box::new(AntigravityConnector::new()),
@@ -30860,6 +31319,7 @@ impl ConnectorKind {
             Self::Hermes => Box::new(franken_agent_detection::HermesConnector::new()),
             Self::Codebuff => Box::new(crate::connectors::codebuff::CodebuffConnector::new()),
             Self::PiDurable => Box::new(franken_agent_detection::PiDurableConnector::new()),
+            Self::Continue => Box::new(franken_agent_detection::ContinueConnector::new()),
         }
     }
 }
@@ -31059,6 +31519,20 @@ fn is_database_watch_root(kind: ConnectorKind, root: &ScanRoot) -> bool {
                 .extension()
                 .is_some_and(|extension| extension == "db")))
         && root.path.is_file()
+}
+
+/// Shelley and Devin take an explicit file root as their database and fail the
+/// whole scan on anything else. So `--watch-once <file>` under a directory root
+/// hands them the file only when it is a SQLite database. An unhinted Codex
+/// rollout under a shared configured source used to fail the run (GH #524).
+fn explicit_watch_once_file_may_be_database(kind: ConnectorKind, path: &Path) -> bool {
+    if !matches!(kind, ConnectorKind::Shelley | ConnectorKind::Devin) || !path.is_file() {
+        return true;
+    }
+    let mut header = [0_u8; 16];
+    std::fs::File::open(path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
+        .is_ok_and(|()| &header == b"SQLite format 3\0")
 }
 
 /// FSEvents (macOS) reports a write through a file descriptor that stays open
@@ -31469,7 +31943,7 @@ fn reindex_paths_with_semantic_delta(
     let preserve_watch_watermark = scan_path_exclusions_active();
 
     for (kind, root, min_ts, max_ts) in triggers {
-        let conn = kind.create_connector();
+        let conn = kind.create_connector(Some(&opts.data_dir));
         let detect = conn.detect();
         if !detect.detected && root.origin.kind == SourceKind::Local && !root.path.exists() {
             // For local roots, if detection fails and the root is gone, skip.
@@ -31944,7 +32418,9 @@ fn reindex_paths_with_semantic_delta(
                 for debt in pending_lexical_debt
                     .iter()
                     .chain(std::iter::once(&current_debt))
-                    .filter(|debt| debt.path.starts_with(&selected_path))
+                    .filter(|debt| {
+                        crate::normalize_path_identity(&debt.path).starts_with(&selected_path)
+                    })
                 {
                     clear_watch_lexical_replay_debt(&storage, debt)?;
                 }
@@ -32166,9 +32642,14 @@ fn watch_lexical_replay_debt_for_root(
     for row in rows {
         let debt: WatchLexicalReplayDebt =
             serde_json::from_str(&row).context("reading durable watch lexical replay debt")?;
+        // Re-normalize the saved path: an older build (or another alias of the
+        // same root) may have stored a different spelling, e.g. Windows' \\?\
+        // form before txc9h. The debt itself is returned as stored, so clearing
+        // deletes exactly the saved key.
+        let debt_path = crate::normalize_path_identity(&debt.path);
         if debt.connector == kind
             && debt.source_id == root.origin.source_id
-            && (debt.path.starts_with(&selected_path) || selected_path.starts_with(&debt.path))
+            && (debt_path.starts_with(&selected_path) || selected_path.starts_with(&debt_path))
         {
             pending.push(debt);
         }
@@ -32612,6 +33093,8 @@ enum ConnectorKind {
     /// Pi durable-harness stores (franken_agent_detection #28).
     #[serde(rename = "pd", alias = "PiDurable")]
     PiDurable,
+    #[serde(rename = "ct", alias = "Continue")]
+    Continue,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -32920,7 +33403,7 @@ fn explicit_watch_once_scan_path(
     } else {
         path.to_path_buf()
     };
-    std::fs::canonicalize(&scan_path).unwrap_or(scan_path)
+    dunce::canonicalize(&scan_path).unwrap_or(scan_path)
 }
 
 /// GH #478: existing explicit `--watch-once` paths that no connector claims.
@@ -32975,7 +33458,7 @@ fn classify_paths(
         .iter()
         .map(|(_, root)| {
             if prefer_explicit_paths {
-                std::fs::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone())
+                dunce::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone())
             } else {
                 root.path.clone()
             }
@@ -32990,7 +33473,7 @@ fn classify_paths(
         .iter()
         .map(|(_, root)| {
             (!prefer_explicit_paths)
-                .then(|| std::fs::canonicalize(&root.path).ok())
+                .then(|| dunce::canonicalize(&root.path).ok())
                 .flatten()
                 .filter(|canonical| canonical != &root.path)
         })
@@ -33000,8 +33483,11 @@ fn classify_paths(
         let hinted_kind = prefer_explicit_paths
             .then(|| explicit_watch_once_connector_hint(&requested))
             .flatten();
+        // dunce keeps Windows paths in the plain spelling a scan records, so
+        // a session indexed by --watch-once and by a scan has one identity
+        // (9v9xi). Elsewhere it is std::fs::canonicalize.
         let canonical = prefer_explicit_paths.then(|| {
-            std::fs::canonicalize(&requested).unwrap_or_else(|error| {
+            dunce::canonicalize(&requested).unwrap_or_else(|error| {
                 tracing::warn!(
                     path = %requested.display(),
                     %error,
@@ -33035,6 +33521,12 @@ fn classify_paths(
             {
                 if let Some(hinted_kind) = hinted_kind
                     && *kind != hinted_kind
+                {
+                    continue;
+                }
+                if prefer_explicit_paths
+                    && !is_database_watch_root(*kind, root)
+                    && !explicit_watch_once_file_may_be_database(*kind, p)
                 {
                     continue;
                 }
@@ -33276,7 +33768,8 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
                     let mirror_path = mirror_base.join(&safe_name);
 
                     if mirror_path.exists() {
-                        let mut scan_root = ScanRoot::remote(mirror_path, origin.clone(), platform);
+                        let mut scan_root = ScanRoot::remote(mirror_path, origin.clone(), platform)
+                            .with_mirrored_source_path(path);
                         scan_root.workspace_rewrites = workspace_rewrites.clone();
                         roots.push(scan_root);
                         continue;
@@ -33291,7 +33784,8 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
                                 let name_str = name.to_string_lossy();
                                 if name_str.ends_with(&safe_suffix) && entry.path().is_dir() {
                                     let mut scan_root =
-                                        ScanRoot::remote(entry.path(), origin.clone(), platform);
+                                        ScanRoot::remote(entry.path(), origin.clone(), platform)
+                                            .with_mirrored_source_path(path);
                                     scan_root.workspace_rewrites = workspace_rewrites.clone();
                                     roots.push(scan_root);
                                     break;
@@ -33384,7 +33878,8 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
                             kind: source.kind,
                             host: source.host_label.clone(),
                         };
-                        let mut scan_root = ScanRoot::remote(mirror_path, origin, platform);
+                        let mut scan_root = ScanRoot::remote(mirror_path, origin, platform)
+                            .with_mirrored_source_path(path);
                         scan_root.workspace_rewrites = workspace_rewrites.clone();
                         roots.push(scan_root);
                     } else {
@@ -34193,8 +34688,19 @@ pub mod persist {
                 })
             },
         )?;
-        let origin_kind =
-            crate::search::tantivy::normalized_index_origin_kind(&canonical.source_id, None);
+        // Use the registered kind, as a full rebuild's source map does. Without
+        // it, a local source named anything but `local` (GH #524's
+        // `full-history-plan`) was replayed as remote and dropped out of
+        // local-only keyword searches.
+        let registered_kind = storage
+            .get_source(&canonical.source_id)?
+            .map(|source| source.kind);
+        let origin_kind = crate::search::tantivy::normalized_index_origin_kind(
+            &canonical.source_id,
+            registered_kind
+                .as_ref()
+                .map(crate::sources::provenance::SourceKind::as_str),
+        );
         canonical.metadata_json = serde_json::json!({
             "cass": {
                 "origin": {
@@ -34211,11 +34717,16 @@ pub mod persist {
         conversation: &Conversation,
         messages: Vec<Message>,
     ) -> ConversationPacket {
+        // The envelope canonical_lexical_conversation synthesized already
+        // carries the registered kind.
         let provenance = ConversationPacketProvenance {
             source_id: conversation.source_id.clone(),
             origin_kind: crate::search::tantivy::normalized_index_origin_kind(
                 &conversation.source_id,
-                None,
+                conversation
+                    .metadata_json
+                    .pointer("/cass/origin/kind")
+                    .and_then(serde_json::Value::as_str),
             ),
             origin_host: conversation.origin_host.clone(),
         };
@@ -37745,6 +38256,85 @@ pub mod persist {
             for route in 0..3 {
                 assert_gh466_canonical_prefix_cap("claude_code", route, false);
             }
+        }
+
+        /// lk524 (GH #524 follow-up): canonical replay labels a conversation
+        /// with its registered source kind, as a full rebuild's source map
+        /// does. A local source named anything but `local` replayed as remote.
+        #[test]
+        fn canonical_replay_uses_the_registered_source_kind() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let storage = create_franken_db(&dir.path().join("agent_search.db"));
+            let mut named_local = Source::local();
+            named_local.id = "full-history-plan".into();
+            storage.upsert_source(&named_local).unwrap();
+            storage
+                .upsert_source(&Source::remote("laptop", "laptop.example"))
+                .unwrap();
+            let mut index = TantivyIndex::open_or_create(&dir.path().join("index")).unwrap();
+            let mut expected = Vec::new();
+            // Origins as the connectors record them; the replay must not
+            // depend on that stored metadata, which it does not read.
+            for (source_id, origin, kind) in [
+                (
+                    "full-history-plan",
+                    serde_json::json!({"source_id": "full-history-plan", "kind": "local"}),
+                    "local",
+                ),
+                (
+                    "laptop",
+                    serde_json::json!({"source_id": "laptop", "kind": "ssh", "host": "laptop.example"}),
+                    "remote",
+                ),
+                (
+                    "local",
+                    serde_json::json!({"source_id": "local", "kind": "local"}),
+                    "local",
+                ),
+            ] {
+                let conv = NormalizedConversation {
+                    agent_slug: "codex".into(),
+                    external_id: Some(format!("{source_id}-session")),
+                    title: Some(source_id.into()),
+                    workspace: None,
+                    source_path: dir.path().join(format!("{source_id}.jsonl")),
+                    started_at: Some(1_700_000_000_000),
+                    ended_at: Some(1_700_000_000_001),
+                    metadata: serde_json::json!({"cass": {"origin": origin}}),
+                    messages: vec![NormalizedMessage {
+                        idx: 0,
+                        role: "user".into(),
+                        author: None,
+                        created_at: Some(1_700_000_000_000),
+                        content: format!("{source_id} provenance probe"),
+                        extra: serde_json::json!({}),
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    }],
+                };
+                persist_conversation(&storage, &mut index, &conv).unwrap();
+                expected.push((source_id.to_string(), kind.to_string()));
+            }
+            let ids: Vec<i64> = storage
+                .raw()
+                .query_map_collect("SELECT id FROM conversations ORDER BY id", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            let replayed: Vec<(String, String)> = ids
+                .into_iter()
+                .map(|id| {
+                    let conversation = canonical_lexical_conversation(&storage, id).unwrap();
+                    let envelope = conversation.metadata_json["cass"]["origin"]["kind"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                    let packet = canonical_lexical_packet(&conversation, Vec::new());
+                    assert_eq!(packet.payload.provenance.origin_kind, envelope);
+                    (conversation.source_id, envelope)
+                })
+                .collect();
+            assert_eq!(replayed, expected);
         }
 
         /// bgn6s: an inline replay reads a conversation one bounded chunk at
@@ -51397,6 +51987,116 @@ mod tests {
     }
 
     #[test]
+    fn lexical_rebuild_failure_channels_preserve_database_and_io_causes() -> Result<()> {
+        use crate::franken_sync::FrankenError;
+
+        let causes = [
+            anyhow::Error::new(FrankenError::IoRead { page: 42 }),
+            anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "PRIVATE-LEXICAL-FAILURE-PATH",
+            )),
+            anyhow::Error::new(FrankenError::CheckpointFailed {
+                detail: "PRIVATE-LEXICAL-FAILURE-CHECKPOINT".to_owned(),
+            }),
+        ];
+        for (case, cause) in causes.into_iter().enumerate() {
+            let (worker_tx, worker_rx) = bounded(1);
+            let worker = thread::spawn(move || {
+                worker_tx.send(LexicalRebuildPagePrepResult::Error {
+                    sequence: 37,
+                    error: cause.context("PRIVATE-LEXICAL-FAILURE-WORKER-CONTEXT"),
+                })
+            });
+            let response = worker_rx.recv_timeout(Duration::from_secs(10))?;
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("failure fixture worker panicked"))?
+                .map_err(|_| anyhow::anyhow!("failure fixture channel disconnected"))?;
+            let LexicalRebuildPagePrepResult::Error { sequence, error } = response else {
+                anyhow::bail!("failure fixture did not reach the page-prep dispatcher");
+            };
+            assert_eq!(sequence, 37);
+            let error = lexical_rebuild_page_prep_error(sequence, error);
+            assert!(!error.to_string().contains("PRIVATE-LEXICAL-FAILURE"));
+
+            let (producer_tx, producer_rx) = bounded(1);
+            send_lexical_rebuild_pipeline_error(&producer_tx, error);
+            let LexicalRebuildPipelineMessage::Error(error) =
+                producer_rx.recv_timeout(Duration::from_secs(10))?
+            else {
+                anyhow::bail!("failure fixture did not reach the rebuild sink");
+            };
+            assert_eq!(error.to_string(), "lexical rebuild packet producer failed");
+            assert!(error.chain().any(|cause| {
+                cause.to_string() == "lexical rebuild page-prep worker failed at sequence 37"
+            }));
+            match case {
+                0 => assert!(matches!(
+                    error.downcast_ref::<FrankenError>(),
+                    Some(FrankenError::IoRead { page: 42 })
+                )),
+                1 => assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .context("filesystem failure lost its typed cause")?
+                        .kind(),
+                    std::io::ErrorKind::PermissionDenied
+                ),
+                2 => assert!(matches!(
+                    error.downcast_ref::<FrankenError>(),
+                    Some(FrankenError::CheckpointFailed { .. })
+                )),
+                _ => anyhow::bail!("unexpected failure fixture case"),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_rebuild_page_prep_open_failure_retains_its_engine_cause() -> Result<()> {
+        let root = TempDir::new()?;
+        let db_path = root.path().join("PRIVATE-WORKER-ARCHIVE-PATH.db");
+        let (work_tx, work_rx) = bounded(1);
+        let (result_tx, result_rx) = bounded(1);
+        let workers = spawn_lexical_rebuild_page_prep_workers(
+            1,
+            db_path.clone(),
+            Arc::new(HashMap::new()),
+            work_rx,
+            result_tx,
+            Arc::new(StreamingByteLimiter::new(1024)),
+            Arc::new(LexicalRebuildReservationOrder::new()),
+            Arc::new(LexicalRebuildProducerTelemetry::default()),
+            None,
+        )?;
+        let response = result_rx.recv_timeout(Duration::from_secs(30))?;
+        drop(work_tx);
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("archive admission worker panicked"))?;
+        }
+        let LexicalRebuildPagePrepResult::Error { sequence, error } = response else {
+            anyhow::bail!("missing archive did not fail page-prep admission");
+        };
+        assert_eq!(sequence, 0);
+        assert!(
+            error
+                .downcast_ref::<crate::franken_sync::FrankenError>()
+                .is_some(),
+            "page-prep admission must retain the engine error type"
+        );
+        assert!(error.to_string().contains("page-prep worker 0"));
+        assert!(!error.to_string().contains("PRIVATE-WORKER-ARCHIVE-PATH"));
+        assert!(
+            !db_path.exists(),
+            "read-only admission cannot create an archive"
+        );
+        Ok(())
+    }
+
+    #[test]
     #[serial]
     fn page_prep_worker_panic_surfaces_as_error_result_instead_of_parking_producer() {
         let tmp = TempDir::new().unwrap();
@@ -51447,12 +52147,21 @@ mod tests {
             LexicalRebuildPagePrepResult::Error { sequence, error } => {
                 assert_eq!(sequence, 0);
                 assert!(
-                    error.contains("panicked"),
+                    error.to_string().contains("panicked"),
                     "error must identify the panic: {error}"
                 );
                 assert!(
-                    error.contains("injected lexical rebuild page-prep panic"),
+                    error
+                        .root_cause()
+                        .to_string()
+                        .contains("injected lexical rebuild page-prep panic"),
                     "error must preserve the panic payload text: {error}"
+                );
+                assert!(
+                    !error
+                        .to_string()
+                        .contains("injected lexical rebuild page-prep panic"),
+                    "the public worker context must omit private panic payloads"
                 );
             }
             other => panic!("expected a page-prep Error result, got {other:?}"),
@@ -55333,7 +56042,10 @@ mod tests {
             Vec::new(),
             None,
             vec![
-                ("claude", active_batch_watermark_connector_factory),
+                (
+                    "claude",
+                    active_batch_watermark_connector_factory as ConnectorFactory,
+                ),
                 ("codex", safe_batch_watermark_connector_factory),
             ],
             Some(scan_start_ts),
@@ -55643,40 +56355,46 @@ mod tests {
         let db_path = data_dir.join("agent_search.db");
         // Fixtures must clear INDEX_MIN_FREE_SPACE_BYTES (512 MiB), otherwise the
         // floor dominates both sides and the lexical contribution is invisible.
-        // Sparse `set_len` keeps this cheap.
+        // An unmigrated 640 MiB db is charged 640 + 40 MiB. Sparse `set_len`
+        // keeps this cheap.
         std::fs::File::create(&db_path)
             .unwrap()
-            .set_len(300 * 1024 * 1024)
+            .set_len(640 * 1024 * 1024)
             .unwrap();
 
-        let without_index = required_index_headroom_bytes(
-            &data_dir,
-            &db_path,
-            IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+        let db_bytes = 640 * 1024 * 1024;
+        let required = || {
+            required_index_headroom_bytes(
+                &data_dir,
+                &db_path,
+                IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+            )
+        };
+
+        // No live generation yet: the rebuild is sized as the db bundle.
+        assert_eq!(
+            required(),
+            expected_rebuild_requirement(db_bytes, db_bytes, 0, true)
         );
 
-        // A rebuild must also make room for a second copy of the lexical index.
+        // With a live index, the rebuild is sized by it, and a larger index
+        // raises the requirement by 9/4 of the difference (nw61n).
         let index_dir = data_dir.join(LEXICAL_INDEX_ROOT_DIR).join("seg");
         std::fs::create_dir_all(&index_dir).unwrap();
-        std::fs::File::create(index_dir.join("0.store"))
-            .unwrap()
-            .set_len(200 * 1024 * 1024)
-            .unwrap();
-
-        let with_index = required_index_headroom_bytes(
-            &data_dir,
-            &db_path,
-            IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+        let store = std::fs::File::create(index_dir.join("0.store")).unwrap();
+        store.set_len(200 * 1024 * 1024).unwrap();
+        let with_index = required();
+        assert_eq!(
+            with_index,
+            expected_rebuild_requirement(db_bytes, 200 * 1024 * 1024, 0, true)
         );
-
-        assert!(
-            with_index > without_index,
-            "lexical index size must raise the rebuild headroom requirement \
-             (without={without_index}, with={with_index})"
+        store.set_len(400 * 1024 * 1024).unwrap();
+        let with_larger_index = required();
+        assert_eq!(
+            with_larger_index - with_index,
+            200 * 1024 * 1024 * 9 / 4,
+            "lexical index size must raise the rebuild headroom requirement"
         );
-        // db(300 MiB)*2 = 600 MiB already clears the 512 MiB floor, so the whole
-        // delta is attributable to the lexical index being counted twice.
-        assert_eq!(with_index - without_index, 2 * 200 * 1024 * 1024);
     }
 
     #[test]
@@ -55816,7 +56534,29 @@ mod tests {
         assert_eq!(t_index.doc_count().expect("doc count"), 6);
     }
 
-    /// #453: the headroom projection doubles only the live lexical bytes.
+    /// The full-rebuild rule written out independently of the implementation:
+    /// max(512 MiB, basis * 9/4 - staging (not below 0) + db / 16 + db while
+    /// the migration repair is pending), where the caller passes the live
+    /// lexical bytes as the basis, or the db bundle when there are none.
+    fn expected_rebuild_requirement(
+        db_bundle_bytes: u64,
+        basis_bytes: u64,
+        staging_bytes: u64,
+        migration_pending: bool,
+    ) -> u64 {
+        let lexical = (u128::from(basis_bytes) * 9 / 4).saturating_sub(u128::from(staging_bytes));
+        let db = u128::from(db_bundle_bytes) / 16
+            + if migration_pending {
+                u128::from(db_bundle_bytes)
+            } else {
+                0
+            };
+        u64::try_from(lexical + db)
+            .unwrap_or(u64::MAX)
+            .max(INDEX_MIN_FREE_SPACE_BYTES)
+    }
+
+    /// #453: the headroom projection charges only the live lexical bytes.
     /// Merge-retired segment files and retained publish backups are already
     /// on disk and are not rewritten by a rebuild, so they are reported but
     /// excluded from the requirement.
@@ -55827,7 +56567,7 @@ mod tests {
         let db_path = data_dir.join("agent_search.db");
         std::fs::File::create(&db_path)
             .unwrap()
-            .set_len(300 * 1024 * 1024)
+            .set_len(640 * 1024 * 1024)
             .unwrap();
         let index_path = plant_merged_quill_index(&data_dir, 4);
 
@@ -55894,16 +56634,33 @@ mod tests {
             projection.retained_backup_bytes,
             with_extras.retained_backup_bytes
         );
-        // db(300 MiB)*2 clears the floor, so the requirement is exactly the
-        // rule over live bytes: the 64 MiB backup and the retired inputs are
-        // not doubled into it.
+        // The planted db file has no engine migration marker, so it is charged
+        // one copy plus the growth allowance, which clears the floor: the
+        // requirement is exactly the rule over live bytes, and the 64 MiB
+        // backup and the retired inputs are not charged.
+        assert!(projection.migration_repair_pending);
+        assert_eq!(projection.migration_copy_bytes, projection.db_bundle_bytes);
+        assert_eq!(
+            projection.db_growth_allowance_bytes,
+            projection.db_bundle_bytes / 16
+        );
         assert_eq!(
             projection.required_bytes,
-            projection.db_bundle_bytes * 2 + with_extras.live_bytes * 2
+            expected_rebuild_requirement(
+                projection.db_bundle_bytes,
+                with_extras.live_bytes,
+                0,
+                true
+            )
         );
         assert!(
             projection.required_bytes
-                < projection.db_bundle_bytes * 2 + with_extras.total_bytes() * 2,
+                < expected_rebuild_requirement(
+                    projection.db_bundle_bytes,
+                    with_extras.total_bytes(),
+                    0,
+                    true
+                ),
             "the recursive size would have demanded more"
         );
     }
@@ -55918,9 +56675,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
         let db_path = data_dir.join("agent_search.db");
+        // Unmigrated (no marker), so the db charge alone clears the floor and
+        // the lexical credit stays visible in the requirement.
         std::fs::File::create(&db_path)
             .unwrap()
-            .set_len(300 * 1024 * 1024)
+            .set_len(640 * 1024 * 1024)
             .unwrap();
         let index_path = plant_merged_quill_index(&data_dir, 2);
         let before = lexical_index_footprint(&data_dir);
@@ -55955,27 +56714,183 @@ mod tests {
 
         let projection = full_rebuild_headroom_projection(&data_dir, &db_path);
         assert_eq!(projection.rebuild_staging_bytes, staged);
-        // db(300 MiB)*2 clears the 512 MiB floor even after the 96 MiB credit,
-        // so the requirement is exactly 2*db + 2*live - staging.
+        assert_eq!(
+            projection_before.required_bytes,
+            expected_rebuild_requirement(projection.db_bundle_bytes, before.live_bytes, 0, true)
+        );
         assert_eq!(
             projection.required_bytes,
-            projection.db_bundle_bytes * 2 + after.live_bytes * 2 - staged
+            expected_rebuild_requirement(
+                projection.db_bundle_bytes,
+                after.live_bytes,
+                staged,
+                true
+            )
         );
+        let lexical_charge = after.live_bytes * 9 / 4;
         assert_eq!(
-            projection.required_bytes + staged,
-            projection_before.required_bytes,
-            "the staged bytes are credited one-for-one against the requirement"
+            projection_before.required_bytes - projection.required_bytes,
+            staged.min(lexical_charge),
+            "the staged bytes are credited one-for-one against the lexical charge, never beyond it"
         );
 
-        // The credit never takes the requirement below the absolute floor.
+        // A staged generation larger than the lexical charge pays that charge
+        // and nothing more: the db terms stay.
         let huge = staging.join("seg-00000000000001ff.fslx");
         std::fs::File::create(&huge)
             .unwrap()
             .set_len(4 * 1024 * 1024 * 1024)
             .unwrap();
-        let floored = full_rebuild_headroom_projection(&data_dir, &db_path);
-        assert!(floored.rebuild_staging_bytes > floored.db_bundle_bytes * 2);
-        assert_eq!(floored.required_bytes, INDEX_MIN_FREE_SPACE_BYTES);
+        let capped = full_rebuild_headroom_projection(&data_dir, &db_path);
+        assert!(capped.rebuild_staging_bytes > capped.lexical_index_bytes * 9 / 4);
+        assert_eq!(
+            capped.required_bytes,
+            capped.db_growth_allowance_bytes + capped.migration_copy_bytes
+        );
+    }
+
+    /// nw61n, on the measured fixture (256k messages: db bundle 3,161,862,224
+    /// bytes, live lexical 1,393,617,850 bytes; `--force-rebuild` wrote 2,821
+    /// MiB). The db is charged only its growth allowance once migrated, so the
+    /// requirement covers the measured rebuild with margin and falls well
+    /// below the old `2*db + 2*live` (9,110,960,148 bytes, which refused a
+    /// `--full` that wrote nothing). Negative: with the engine's migration
+    /// repair pending the whole bundle is charged on top.
+    #[test]
+    fn full_rebuild_headroom_charges_the_db_only_for_what_touches_it() {
+        let footprint = LexicalIndexFootprint {
+            live_bytes: 1_393_617_850,
+            retired_segment_bytes: 1_563_884_292,
+            retired_segment_files: 150,
+            retained_backup_bytes: 2_937_502_205,
+            rebuild_staging_bytes: 0,
+            quarantine_bytes: 0,
+        };
+        let db = 3_161_862_224;
+        let migrated = full_rebuild_headroom_projection_from(db, footprint, false);
+        assert_eq!(
+            migrated.required_bytes,
+            expected_rebuild_requirement(db, footprint.live_bytes, 0, false)
+        );
+        assert!(!migrated.migration_repair_pending);
+        assert_eq!(migrated.migration_copy_bytes, 0);
+        let measured_force_rebuild_peak = 2_821 * 1024 * 1024;
+        assert!(migrated.required_bytes >= measured_force_rebuild_peak);
+        assert!(migrated.required_bytes < 9_110_960_148 / 2);
+
+        let pending = full_rebuild_headroom_projection_from(db, footprint, true);
+        assert!(pending.migration_repair_pending);
+        assert_eq!(pending.migration_copy_bytes, db);
+        assert_eq!(pending.required_bytes, migrated.required_bytes + db);
+
+        // Small archives sit on the floor; a staged generation never takes
+        // the requirement below it.
+        let small = LexicalIndexFootprint {
+            live_bytes: 8 * 1024 * 1024,
+            rebuild_staging_bytes: 64 * 1024 * 1024,
+            ..LexicalIndexFootprint::default()
+        };
+        assert_eq!(
+            full_rebuild_headroom_projection_from(16 * 1024 * 1024, small, false).required_bytes,
+            INDEX_MIN_FREE_SPACE_BYTES
+        );
+
+        // Quarantine bundles are evidence a rebuild never rewrites: ts1's
+        // 34.6 GB of them change nothing in the requirement.
+        let with_quarantine = LexicalIndexFootprint {
+            quarantine_bytes: 34_600_000_000,
+            ..footprint
+        };
+        let quarantined = full_rebuild_headroom_projection_from(db, with_quarantine, false);
+        assert_eq!(quarantined.required_bytes, migrated.required_bytes);
+        assert_eq!(quarantined.quarantine_bytes, 34_600_000_000);
+        assert_eq!(
+            quarantined.lexical_rebuild_basis_bytes,
+            footprint.live_bytes
+        );
+
+        // With no live generation left (only backups, retired segments and
+        // quarantine), the rebuild is sized as the db bundle, not the floor.
+        let no_live = LexicalIndexFootprint {
+            live_bytes: 0,
+            ..with_quarantine
+        };
+        let repair = full_rebuild_headroom_projection_from(db, no_live, false);
+        assert_eq!(repair.lexical_index_bytes, 0);
+        assert_eq!(repair.lexical_rebuild_basis_bytes, db);
+        assert_eq!(
+            repair.required_bytes,
+            expected_rebuild_requirement(db, db, 0, false)
+        );
+        assert!(repair.required_bytes > measured_force_rebuild_peak);
+        // Negative: an empty data dir with no db stays on the floor.
+        assert_eq!(
+            full_rebuild_headroom_projection_from(0, LexicalIndexFootprint::default(), false)
+                .required_bytes,
+            INDEX_MIN_FREE_SPACE_BYTES
+        );
+    }
+
+    /// The walker sets quarantine bundles (and interrupted reclaims of them)
+    /// apart from the live generation, by the inventory's own names.
+    #[test]
+    fn lexical_index_footprint_counts_quarantine_bundles_apart_from_live_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let index = tmp.path().join(LEXICAL_INDEX_ROOT_DIR);
+        let live = index.join("v9-quill");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("schema.json"), vec![0_u8; 100]).unwrap();
+        for (bundle, bytes) in [
+            (".lexical-rebuild-quarantine-Ab12Cd", 1_000_usize),
+            (".lexical-rebuild-reclaim-Ef34Gh", 300),
+        ] {
+            let generation = index.join(bundle).join("index");
+            std::fs::create_dir_all(&generation).unwrap();
+            std::fs::write(generation.join("seg-1.fslx"), vec![0_u8; bytes]).unwrap();
+        }
+        // Negative: a name the inventory would not match stays live.
+        let lookalike = index.join(".lexical-rebuild-quarantine-toolong1");
+        std::fs::create_dir_all(&lookalike).unwrap();
+        std::fs::write(lookalike.join("data"), vec![0_u8; 20]).unwrap();
+
+        let footprint = lexical_index_footprint(tmp.path());
+        assert_eq!(footprint.quarantine_bytes, 1_300);
+        assert_eq!(footprint.live_bytes, 120);
+        assert_eq!(footprint.total_bytes(), 1_420);
+    }
+
+    /// The rebuild's runtime backstop: below the floor it stops with the marker
+    /// the CLI maps to exit 14, naming the resume; at or above it, it runs on.
+    /// The fold runs only with room for a second copy of the generation plus
+    /// the floor.
+    #[test]
+    fn lexical_rebuild_free_space_backstop_stops_below_the_floor() {
+        let probe = Path::new("/data/cass/index");
+        let floor = INDEX_MIN_FREE_SPACE_BYTES;
+        assert!(lexical_rebuild_free_space_verdict(floor, floor, probe).is_ok());
+        assert!(lexical_rebuild_free_space_verdict(u64::MAX, floor, probe).is_ok());
+        let stopped = lexical_rebuild_free_space_verdict(floor - 1, floor, probe)
+            .expect_err("one byte below the floor stops the rebuild");
+        let message = format!("{stopped:#}");
+        assert!(
+            message.contains(LEXICAL_REBUILD_DISK_STOP_MARKER),
+            "{message}"
+        );
+        assert!(message.contains("/data/cass/index"), "{message}");
+        assert!(message.contains("resume"), "{message}");
+
+        let generation = 3 * 1024 * 1024 * 1024;
+        assert!(lexical_rebuild_fold_fits(
+            generation + floor,
+            generation,
+            floor
+        ));
+        assert!(!lexical_rebuild_fold_fits(
+            generation + floor - 1,
+            generation,
+            floor
+        ));
+        assert!(!lexical_rebuild_fold_fits(u64::MAX - 1, u64::MAX, floor));
     }
 
     /// An unreadable MANIFEST must make the walk conservative: every byte in
@@ -56078,6 +56993,183 @@ mod tests {
     }
 
     #[test]
+    fn headroom_refusal_names_the_raw_mirror_only_on_the_data_dir_probe() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        let db_parent = tmp.path().join("custom-db");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&db_parent).unwrap();
+        assert_eq!(raw_mirror_headroom_note(&data_dir, &data_dir), "");
+
+        let source = tmp.path().join("session.jsonl");
+        std::fs::write(&source, b"{\"text\":\"mirrored\"}\n").unwrap();
+        crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source,
+            db_links: &[],
+        })
+        .unwrap();
+        let mirror_bytes = crate::raw_mirror::physical_storage_bytes(&data_dir);
+        assert!(mirror_bytes > 0);
+
+        let note = raw_mirror_headroom_note(&data_dir, &data_dir);
+        assert!(
+            note.contains(&format!("holds {mirror_bytes} bytes")),
+            "{note}"
+        );
+        assert!(
+            note.contains("cass mirror prune --keep-latest 1 --safety-hold-down 6h --json"),
+            "{note}"
+        );
+        // A shortfall at a database directory elsewhere is not the mirror's.
+        assert_eq!(raw_mirror_headroom_note(&data_dir, &db_parent), "");
+    }
+
+    /// nw61n: a full-rebuild refusal names the rule and the terms it charged,
+    /// and on the data dir's filesystem what cass can reclaim without touching
+    /// the live index (none of which the requirement charges).
+    #[test]
+    fn full_rebuild_refusal_names_the_rule_terms_and_reclaimable_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        let elsewhere = tmp.path().join("custom-db");
+        std::fs::create_dir_all(data_dir.join(LEXICAL_INDEX_ROOT_DIR)).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let projection = FullRebuildHeadroomProjection {
+            required_bytes: 9_000,
+            floor_bytes: INDEX_MIN_FREE_SPACE_BYTES,
+            db_bundle_bytes: 3_200,
+            lexical_index_bytes: 1_600,
+            lexical_rebuild_basis_bytes: 1_600,
+            retired_segment_bytes: 4_096,
+            retired_segment_files: 2,
+            retained_backup_bytes: 8_192,
+            rebuild_staging_bytes: 512,
+            quarantine_bytes: 0,
+            db_growth_allowance_bytes: 200,
+            migration_repair_pending: true,
+            migration_copy_bytes: 3_200,
+        };
+        let terms = full_rebuild_refusal_terms(&data_dir, &data_dir, &projection);
+        // The formula itself names the fallback; the sentence below is the
+        // refusal saying it applied.
+        assert!(
+            !terms.contains("There is no live lexical generation"),
+            "{terms}"
+        );
+        let no_live = FullRebuildHeadroomProjection {
+            lexical_index_bytes: 0,
+            lexical_rebuild_basis_bytes: 3_200,
+            ..projection
+        };
+        let no_live_terms = full_rebuild_refusal_terms(&data_dir, &data_dir, &no_live);
+        assert!(
+            no_live_terms.contains("There is no live lexical generation to size the rebuild by")
+                && no_live_terms.contains("(3200 bytes)"),
+            "{no_live_terms}"
+        );
+        for expected in [
+            FULL_REBUILD_HEADROOM_FORMULA,
+            "lexical index 1600 bytes",
+            "staged generation credit 512 bytes",
+            "db bundle 3200 bytes (growth allowance 200 bytes)",
+            "It includes 3200 bytes for the engine's one-time migration repair",
+            "4096 bytes of merge-retired lexical segments",
+            "'cass index --gc'",
+            "8192 bytes of prior lexical generations",
+            "'cass doctor cleanup'",
+        ] {
+            assert!(terms.contains(expected), "missing {expected:?}: {terms}");
+        }
+        assert!(!terms.contains("quarantine"), "{terms}");
+
+        // A failed rebuild's quarantine bundle is named with its size and the
+        // read-only preview that would reclaim it.
+        let evidence = b"failed rebuild evidence";
+        let bundle = data_dir
+            .join(LEXICAL_INDEX_ROOT_DIR)
+            .join(".lexical-rebuild-quarantine-000001");
+        std::fs::create_dir_all(bundle.join("index")).unwrap();
+        std::fs::write(bundle.join("index/MANIFEST"), evidence).unwrap();
+        let terms = full_rebuild_refusal_terms(&data_dir, &data_dir, &projection);
+        assert!(
+            terms.contains(&format!(
+                "quarantine bundles hold {} bytes, 0 of them eligible",
+                evidence.len()
+            )),
+            "{terms}"
+        );
+        assert!(
+            terms.contains(&format!(
+                "'cass lexical-quarantine --data-dir {} --plan --json'",
+                data_dir.display()
+            )),
+            "{terms}"
+        );
+
+        // A probe elsewhere gets the rule but none of the data dir's
+        // reclaimable space, and a migrated archive no migration copy.
+        let migrated = FullRebuildHeadroomProjection {
+            migration_repair_pending: false,
+            migration_copy_bytes: 0,
+            ..projection
+        };
+        let elsewhere_terms = full_rebuild_refusal_terms(&data_dir, &elsewhere, &migrated);
+        assert!(
+            elsewhere_terms.contains(FULL_REBUILD_HEADROOM_FORMULA),
+            "{elsewhere_terms}"
+        );
+        for absent in [
+            "migration repair",
+            "merge-retired",
+            "publish-backups",
+            "quarantine",
+        ] {
+            assert!(
+                !elsewhere_terms.contains(absent),
+                "unexpected {absent:?}: {elsewhere_terms}"
+            );
+        }
+    }
+
+    /// nw61n: the production refusal carries those terms under the prefix the
+    /// CLI maps to exit 14 / storage. A sparse 2 TiB archive without an engine
+    /// migration marker needs more than any test host has free.
+    #[test]
+    fn full_rebuild_refusal_message_carries_the_rule_terms() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let db = std::fs::File::create(&db_path).unwrap();
+        db.set_len(2 * 1024 * 1024 * 1024 * 1024).unwrap();
+        drop(db);
+
+        let message = format!(
+            "{:#}",
+            ensure_index_storage_headroom(
+                &data_dir,
+                &db_path,
+                IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+            )
+            .expect_err("a 2 TiB unmigrated archive cannot fit")
+        );
+        assert!(
+            message.starts_with("canonical archive disk headroom check failed for "),
+            "{message}"
+        );
+        assert!(message.contains(FULL_REBUILD_HEADROOM_FORMULA), "{message}");
+        assert!(
+            message.contains("one-time migration repair, which is still pending"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn database_sidecar_paths_preserve_filename_bytes_without_display_roundtrip() {
         let db_path = PathBuf::from("/tmp/cass.db");
         let [wal, shm] = database_sidecar_paths(&db_path);
@@ -56138,20 +57230,29 @@ mod tests {
         );
     }
 
+    /// `--full` and `--force-rebuild` take the full-rebuild requirement. With no
+    /// lexical index the projection is the db charge: a whole copy of the
+    /// bundle while the engine's one-time migration repair is pending (it keeps
+    /// a `.pre-migration-bak`), plus the 1/16 growth allowance. Neither path
+    /// clones the canonical archive otherwise (a `--full` that would need to
+    /// replace it is refused), so once the migration marker is complete only
+    /// the allowance remains (nw61n).
     #[test]
-    fn full_and_force_rebuild_startup_headroom_keep_archive_clone_requirement() {
+    fn full_and_force_rebuild_startup_headroom_charge_the_archive_copy_only_while_migration_is_pending()
+     {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("agent_search.db");
         std::fs::File::create(&db_path)
             .unwrap()
-            .set_len(300 * 1024 * 1024)
+            .set_len(640 * 1024 * 1024)
             .unwrap();
         std::fs::write(database_path_with_suffix(&db_path, "-wal"), vec![0_u8; 256]).unwrap();
         std::fs::write(database_path_with_suffix(&db_path, "-shm"), vec![0_u8; 512]).unwrap();
-        // No lexical index exists in this fixture, so the rebuild projection is
-        // still just the archive-clone requirement.
-        let clone_requirement =
-            INDEX_MIN_FREE_SPACE_BYTES.max(database_bundle_size_bytes(&db_path).saturating_mul(2));
+        let bundle = database_bundle_size_bytes(&db_path);
+        // No lexical index here, so the rebuild itself is sized as the bundle.
+        let pending_requirement = expected_rebuild_requirement(bundle, bundle, 0, true);
+        let migrated_requirement = expected_rebuild_requirement(bundle, bundle, 0, false);
+        assert_eq!(pending_requirement - migrated_requirement, bundle);
 
         assert_eq!(
             index_startup_storage_headroom_requirement(true, false),
@@ -56167,8 +57268,27 @@ mod tests {
                 &db_path,
                 IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
             ),
-            clone_requirement,
-            "full/force rebuilds still need enough scratch for atomic publish safety"
+            pending_requirement,
+            "an unmigrated archive is charged the migration repair's whole copy"
+        );
+
+        // A completed engine migration marker removes the copy and nothing else.
+        std::fs::write(
+            database_path_with_suffix(&db_path, ".fsqlite-migration-state"),
+            br#"{"last_upgrade_version":1,"last_run_at":0,"repairs_applied":[]}"#,
+        )
+        .unwrap();
+        assert!(crate::storage::sqlite::index_engine_migration_is_complete(
+            &db_path
+        ));
+        assert_eq!(
+            required_index_headroom_bytes(
+                tmp.path(),
+                &db_path,
+                IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+            ),
+            migrated_requirement,
+            "a migrated archive is not charged the migration repair's copy"
         );
     }
 
@@ -60669,6 +61789,193 @@ c.close()
         }
     }
 
+    #[test]
+    fn publish_staged_lexical_index_first_publish_over_empty_index_dir_does_not_retain_empty_backup()
+     {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        // `index_dir(&data_dir)` creates the empty `index/v9-quill` directory at
+        // startup before any lexical generation is published (dcp01).
+        let index_path = index_dir(&data_dir).unwrap();
+        assert!(
+            index_path.is_dir(),
+            "precondition: empty index_dir placeholder exists"
+        );
+
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-first-publish-empty-dir-stage.")
+            .tempdir_in(data_dir.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let conv = norm_conv(
+            Some("first-publish-empty-dir"),
+            vec![norm_msg(0, 1_700_000_100_000)],
+        );
+        let mut staged_index = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged_index
+            .add_messages_with_conversation_id(&conv, &conv.messages, Some(1))
+            .unwrap();
+        staged_index.commit().unwrap();
+        drop(staged_index);
+
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "first publish over empty index_dir placeholder must land the staged index"
+        );
+        assert!(
+            !staged_index_path.exists(),
+            "staged path must be consumed by the rename"
+        );
+        let backups_dir = lexical_publish_backups_dir(&index_path);
+        if backups_dir.exists() {
+            let entries: Vec<_> = fs::read_dir(&backups_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert!(
+                entries.is_empty(),
+                "first publish over empty index_dir placeholder must not retain an empty backup; got {entries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_staged_lexical_index_first_publish_over_checkpoint_only_index_dir_does_not_retain_it()
+     {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        // A first full rebuild checkpoints into the startup placeholder, and
+        // status may cache the archive fingerprint there, before any generation
+        // exists. `cass index --force-rebuild` on a fresh data dir retained that
+        // directory as a "prior-live" publish backup holding no index.
+        let index_path = index_dir(&data_dir).unwrap();
+        fs::write(
+            lexical_rebuild_state_path(&index_path),
+            b"{\"completed\":false}",
+        )
+        .unwrap();
+        fs::write(index_path.join(ARCHIVE_FINGERPRINT_CACHE_FILE), b"{}").unwrap();
+
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-first-publish-checkpoint-dir-stage.")
+            .tempdir_in(data_dir.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let conv = norm_conv(
+            Some("first-publish-checkpoint-dir"),
+            vec![norm_msg(0, 1_700_000_100_000)],
+        );
+        let mut staged_index = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged_index
+            .add_messages_with_conversation_id(&conv, &conv.messages, Some(1))
+            .unwrap();
+        staged_index.commit().unwrap();
+        drop(staged_index);
+
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "first publish over a checkpoint-only placeholder must land the staged index"
+        );
+        assert!(
+            !lexical_rebuild_state_path(&index_path).exists(),
+            "the superseded in-progress checkpoint must not survive into the published generation"
+        );
+        assert!(
+            !lexical_publish_in_progress_backup_path(&index_path).exists(),
+            "first publish must not park the placeholder"
+        );
+        let backups_dir = lexical_publish_backups_dir(&index_path);
+        if backups_dir.exists() {
+            let entries: Vec<_> = fs::read_dir(&backups_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert!(
+                entries.is_empty(),
+                "a checkpoint-only placeholder is not a prior-live generation; got {entries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_staged_lexical_index_retains_a_checkpointed_index_dir_holding_anything_else() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+        fs::write(
+            lexical_rebuild_state_path(&index_path),
+            b"{\"completed\":false}",
+        )
+        .unwrap();
+        // Any entry beyond the two placeholder sidecars means the directory is
+        // not a placeholder, so publish must retain it untouched.
+        fs::write(
+            index_path.join("segment-unknown"),
+            b"not a placeholder sidecar",
+        )
+        .unwrap();
+
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-publish-checkpoint-plus-dir-stage.")
+            .tempdir_in(data_dir.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let conv = norm_conv(
+            Some("publish-checkpoint-plus-dir"),
+            vec![norm_msg(0, 1_700_000_100_000)],
+        );
+        let mut staged_index = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged_index
+            .add_messages_with_conversation_id(&conv, &conv.messages, Some(1))
+            .unwrap();
+        staged_index.commit().unwrap();
+        drop(staged_index);
+
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "publish must land the staged index"
+        );
+        let entries: Vec<_> = fs::read_dir(lexical_publish_backups_dir(&index_path))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the prior live directory must be retained; got {entries:?}"
+        );
+        assert_eq!(
+            fs::read(entries[0].join("segment-unknown")).unwrap(),
+            b"not a placeholder sidecar"
+        );
+        assert_eq!(
+            fs::read(entries[0].join(".lexical-rebuild-state.json")).unwrap(),
+            b"{\"completed\":false}",
+            "a retained directory keeps its checkpoint"
+        );
+    }
+
     /// An interrupted prior publish left a `.<name>.publish-in-progress.bak`
     /// sidecar AND the live index has since been re-created (e.g. a
     /// partially-recovered run followed by a fresh rebuild that
@@ -62870,10 +64177,9 @@ c.close()
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Claude);
-        assert_eq!(
-            classified[0].1.path,
-            std::fs::canonicalize(session).unwrap()
-        );
+        // The plain spelling a scan records, not Windows' verbatim `\\?\`
+        // (9v9xi); std::fs::canonicalize everywhere else.
+        assert_eq!(classified[0].1.path, dunce::canonicalize(session).unwrap());
     }
 
     #[test]
@@ -62894,10 +64200,40 @@ c.close()
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Codex);
-        assert_eq!(
-            classified[0].1.path,
-            std::fs::canonicalize(session).unwrap()
-        );
+        assert_eq!(classified[0].1.path, dunce::canonicalize(session).unwrap());
+    }
+
+    #[test]
+    fn classify_paths_gives_database_connectors_only_sqlite_watch_once_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let rollout =
+            root.join("rollout-2026-10-13T16-20-00-00000000-0000-4000-8000-000000000001.jsonl");
+        std::fs::write(&rollout, b"{}\n").unwrap();
+        let database = root.join("chats.db");
+        std::fs::write(&database, b"SQLite format 3\0rest of the header").unwrap();
+        let roots = vec![
+            (ConnectorKind::Codex, ScanRoot::local(root.clone())),
+            (ConnectorKind::Shelley, ScanRoot::local(root.clone())),
+            (ConnectorKind::Devin, ScanRoot::local(root.clone())),
+        ];
+        let kinds = |path: &PathBuf, explicit: bool| -> Vec<ConnectorKind> {
+            classify_paths(vec![path.clone()], &roots, explicit)
+                .into_iter()
+                .map(|(kind, ..)| kind)
+                .collect()
+        };
+
+        // An unhinted rollout under a shared root reaches Codex only; Shelley
+        // and Devin would open it as their database and fail the run (GH #524).
+        assert_eq!(kinds(&rollout, true), vec![ConnectorKind::Codex]);
+        // A SQLite file under the same root still reaches them.
+        let database_kinds = kinds(&database, true);
+        assert!(database_kinds.contains(&ConnectorKind::Shelley));
+        assert!(database_kinds.contains(&ConnectorKind::Devin));
+        // A live watch event keeps scanning the configured root for every kind.
+        assert_eq!(kinds(&rollout, false).len(), 3);
     }
 
     #[test]
@@ -62919,10 +64255,7 @@ c.close()
         let classified = classify_paths(vec![session.clone()], &roots, true);
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::PrimeAgent);
-        assert_eq!(
-            classified[0].1.path,
-            std::fs::canonicalize(session).unwrap()
-        );
+        assert_eq!(classified[0].1.path, dunce::canonicalize(session).unwrap());
         for path in [
             ".prime-other/agent/sessions/x.jsonl",
             ".pi/agent/sessions/x.jsonl",
@@ -62951,10 +64284,7 @@ c.close()
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Codex);
-        assert_eq!(
-            classified[0].1.path,
-            std::fs::canonicalize(session).unwrap()
-        );
+        assert_eq!(classified[0].1.path, dunce::canonicalize(session).unwrap());
         assert!(classified[0].2.is_some());
         assert!(classified[0].3.is_some());
     }
@@ -63100,7 +64430,7 @@ c.close()
         assert_eq!(classified[0].0, ConnectorKind::Omp);
         assert_eq!(
             classified[0].1.path,
-            std::fs::canonicalize(sessions_root).unwrap()
+            dunce::canonicalize(sessions_root).unwrap()
         );
         assert!(classified[0].2.is_some());
         assert!(classified[0].3.is_some());
@@ -63127,7 +64457,7 @@ c.close()
         assert_eq!(classified[0].0, ConnectorKind::Omp);
         assert_eq!(
             classified[0].1.path,
-            std::fs::canonicalize(sessions_root).unwrap()
+            dunce::canonicalize(sessions_root).unwrap()
         );
         assert!(classified[0].2.is_some());
         assert!(classified[0].3.is_some());
@@ -63432,6 +64762,7 @@ c.close()
     #[test]
     #[serial]
     fn gh515_targeted_watch_once_finishes_admitted_batch_after_stop() -> Result<()> {
+        use std::io::Write;
         use tracing::field::{Field, Visit};
         use tracing::{Event, Subscriber};
         use tracing_subscriber::Registry;
@@ -63487,7 +64818,17 @@ c.close()
             run_index(opts.clone(), None)?;
 
             let marker = "gh515admittedtargetedbatch";
-            write_semantic_watch_once_codex_session(&session, "gh515-watch-stop", marker)?;
+            // The admitted batch is a new turn appended to the session, as a
+            // live rollout grows. Rewriting the existing turns would not do:
+            // ingest keeps a message already stored at its index.
+            fs::OpenOptions::new().append(true).open(&session)?.write_all(
+                format!(
+                    r#"{{"timestamp":"2026-05-28T09:00:03.000Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{marker} user semantic"}}]}}}}
+{{"timestamp":"2026-05-28T09:00:04.000Z","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"{marker} assistant semantic"}}]}}}}
+"#
+                )
+                .as_bytes(),
+            )?;
             // Make this a changed source without depending on filesystem
             // timestamp resolution or a scheduling delay between runs.
             fs::File::options().write(true).open(&session)?.set_times(
@@ -63514,8 +64855,16 @@ c.close()
 
             let storage = FrankenStorage::open(&opts.db_path)?;
             let committed = watch_lexical_canonical_rows(&storage);
-            assert_eq!(committed.len(), 2);
-            assert!(committed.iter().all(|row| row.3.contains(marker)));
+            assert_eq!(committed.len(), 4, "{committed:?}");
+            assert_eq!(
+                committed
+                    .iter()
+                    .filter(|row| row.3.contains(marker))
+                    .map(|row| row.2)
+                    .collect::<Vec<_>>(),
+                [2, 3],
+                "the admitted turn must be committed whole: {committed:?}"
+            );
             assert_eq!(
                 storage.raw().query_row_map(
                     "SELECT COUNT(*) FROM meta WHERE key LIKE 'watch_lexical_replay_v1:%'",
@@ -65762,6 +67111,94 @@ c.close()
         );
     }
 
+    /// txc9h: a replay debt saved under another spelling of the same root
+    /// (here a symlink alias; on Windows the \\?\ form std::fs::canonicalize
+    /// produced) must still be found and cleared, not stranded by a plain
+    /// prefix comparison. An unrelated sibling root's debt must not match.
+    #[cfg(unix)]
+    #[test]
+    fn watch_lexical_replay_debt_matches_a_saved_alias_spelling_of_the_root() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real-root");
+        let sibling = tmp.path().join("real-root-sibling");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let alias = tmp.path().join("alias-root");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let storage = FrankenStorage::open(&tmp.path().join("agent_search.db")).unwrap();
+        let root = ScanRoot::local(real.clone());
+        let saved = WatchLexicalReplayDebt {
+            connector: ConnectorKind::Amp,
+            source_id: root.origin.source_id.clone(),
+            path: alias.clone(),
+        };
+        let unrelated = WatchLexicalReplayDebt {
+            connector: ConnectorKind::Amp,
+            source_id: root.origin.source_id.clone(),
+            path: sibling.clone(),
+        };
+        persist_watch_lexical_replay_debt(&storage, &saved).unwrap();
+        persist_watch_lexical_replay_debt(&storage, &unrelated).unwrap();
+        assert!(
+            !alias.starts_with(crate::normalize_path_identity(&real)),
+            "the alias must be a different spelling, or this test proves nothing"
+        );
+
+        let pending =
+            watch_lexical_replay_debt_for_root(&storage, ConnectorKind::Amp, &root).unwrap();
+        assert_eq!(pending.len(), 1, "alias debt found; sibling debt not");
+        assert_eq!(
+            pending[0].path, alias,
+            "returned as saved, so clearing hits its key"
+        );
+        clear_watch_lexical_replay_debt(&storage, &pending[0]).unwrap();
+        assert!(
+            watch_lexical_replay_debt_for_root(&storage, ConnectorKind::Amp, &root)
+                .unwrap()
+                .is_empty()
+        );
+        let sibling_root = ScanRoot::local(sibling.clone());
+        assert_eq!(
+            watch_lexical_replay_debt_for_root(&storage, ConnectorKind::Amp, &sibling_root)
+                .unwrap()
+                .len(),
+            1,
+            "clearing the alias debt left the sibling's debt in place"
+        );
+    }
+
+    /// txc9h upgrade case: builds before txc9h saved debts with the
+    /// std::fs::canonicalize spelling (\\?\C:\... on Windows); identities are
+    /// now dunce-normalized (C:\...). Such a debt must still match its root.
+    /// On Unix both spellings agree, so this guards Windows.
+    #[test]
+    fn watch_lexical_replay_debt_saved_with_std_canonical_spelling_still_matches() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real-root");
+        fs::create_dir_all(&real).unwrap();
+        let storage = FrankenStorage::open(&tmp.path().join("agent_search.db")).unwrap();
+        let root = ScanRoot::local(real.clone());
+        let saved = WatchLexicalReplayDebt {
+            connector: ConnectorKind::Amp,
+            source_id: root.origin.source_id.clone(),
+            path: std::fs::canonicalize(&real).unwrap(),
+        };
+        persist_watch_lexical_replay_debt(&storage, &saved).unwrap();
+        let pending =
+            watch_lexical_replay_debt_for_root(&storage, ConnectorKind::Amp, &root).unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "a pre-txc9h debt spelling must still match"
+        );
+        clear_watch_lexical_replay_debt(&storage, &pending[0]).unwrap();
+        assert!(
+            watch_lexical_replay_debt_for_root(&storage, ConnectorKind::Amp, &root)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     #[serial]
     fn watch_lexical_oom_retry_preserves_child_scope_and_unrelated_documents() {
@@ -67364,9 +68801,12 @@ c.close()
             conv.metadata.pointer("/cass/raw_mirror/storage_kind"),
             Some(&serde_json::json!("fixed_chunks_v1"))
         );
+        // A .jsonl transcript is captured in 256 KiB chunks (4c10a2a1).
         assert_eq!(
             conv.metadata.pointer("/cass/raw_mirror/chunk_count"),
-            Some(&serde_json::json!(4))
+            Some(&serde_json::json!(
+                CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES / (256 * 1024)
+            ))
         );
     }
 
@@ -67570,7 +69010,16 @@ c.close()
         std::fs::create_dir_all(&data_dir).unwrap();
         let storage = FrankenStorage::open(&data_dir.join("db.sqlite")).unwrap();
 
-        for path in ["~", "~/.codex/sessions", "/home/operator/.codex/sessions"] {
+        for path in [
+            "~",
+            "~/.codex/sessions",
+            "/home/operator/.codex/sessions",
+            "~/.factory/sessions",
+            "~/.config/Cursor/User",
+            "~/.gemini/tmp",
+            "~/.vibe/logs",
+            "~/.prime/agent/sessions",
+        ] {
             storage
                 .upsert_source(&crate::sources::provenance::Source {
                     id: "laptop".to_string(),
@@ -67593,6 +69042,157 @@ c.close()
             let remote = roots.iter().find(|root| root.origin.is_remote()).unwrap();
             assert_eq!(remote.path, mirror);
             assert_eq!(remote.origin.source_id, "laptop");
+            assert_eq!(remote.mirrored_source_path.as_deref(), Some(path));
+        }
+    }
+
+    #[test]
+    fn mirrored_roots_are_scanned_only_by_the_connectors_that_own_their_store() {
+        let remote = |path: &str| {
+            ScanRoot::remote(
+                PathBuf::from("/cass/remotes/laptop/mirror/opaque_0123456789abcdef"),
+                Origin::remote_with_host("laptop", "user@laptop"),
+                None,
+            )
+            .with_mirrored_source_path(path)
+        };
+        let cases: [(&str, &[&str]); 13] = [
+            ("~/.claude/projects", &["claude"]),
+            ("~/.codex/sessions", &["codex"]),
+            ("~/.pi/agent/sessions", &["pi_agent", "pi_durable"]),
+            ("~/.prime/agent/sessions", &["prime_agent"]),
+            ("~/.omp/agent/sessions", &["omp"]),
+            ("~/.local/share/omp", &["omp"]),
+            ("~/.factory/sessions", &["factory"]),
+            ("~/.vibe/logs/session", &["vibe"]),
+            ("~/.gemini/tmp", &["gemini", "antigravity"]),
+            ("/home/u/.gemini/antigravity", &["antigravity"]),
+            ("~/.config/Cursor/User", &["cursor", "cline"]),
+            (
+                "~/.config/Cursor/User/globalStorage/saoudrizwan.claude-dev",
+                &["cline"],
+            ),
+            (r"C:\Users\u\.claude\projects", &["claude"]),
+        ];
+        for (path, owners) in cases {
+            let root = remote(path);
+            assert_eq!(mirrored_root_owners(&root), Some(owners), "{path}");
+            for connector in [
+                "claude",
+                "pi_agent",
+                "prime_agent",
+                "factory",
+                "gemini",
+                "cline",
+            ] {
+                assert_eq!(
+                    mirrored_root_may_hold(connector, &root),
+                    owners.contains(&connector),
+                    "{connector} on {path}"
+                );
+            }
+        }
+        // The misattributions this prevents.
+        assert!(!mirrored_root_may_hold(
+            "claude",
+            &remote("~/.pi/agent/sessions")
+        ));
+        assert!(!mirrored_root_may_hold(
+            "claude",
+            &remote("~/.factory/sessions")
+        ));
+        assert!(!mirrored_root_may_hold(
+            "pi_agent",
+            &remote("~/.prime/agent/sessions")
+        ));
+        // A path naming no known store, an unannotated remote root and a local
+        // root keep every connector.
+        for root in [
+            remote("/backups/claude-sessions"),
+            remote("~"),
+            ScanRoot::remote(
+                PathBuf::from("/cass/remotes/laptop/mirror"),
+                Origin::remote("laptop"),
+                None,
+            ),
+            ScanRoot::local(PathBuf::from("/home/u/.factory/sessions")),
+        ] {
+            assert_eq!(mirrored_root_owners(&root), None, "{root:?}");
+            assert!(mirrored_root_may_hold("claude", &root));
+            assert!(mirrored_root_may_hold("factory", &root));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn build_scan_roots_discovers_gh520_mirrored_layouts() {
+        use crate::connectors::Connector;
+        use franken_agent_detection::connectors::{
+            cursor::CursorConnector, factory::FactoryConnector, gemini::GeminiConnector,
+            prime_agent::PrimeAgentConnector, vibe::VibeConnector,
+        };
+        let _guard = ignore_sources_config();
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let storage = FrankenStorage::open(&data_dir.join("db.sqlite")).unwrap();
+        let cases: Vec<(&str, &str, Box<dyn Connector>)> = vec![
+            (
+                "~/.factory/sessions",
+                "sessions/project/session.jsonl",
+                Box::new(FactoryConnector::new()),
+            ),
+            (
+                "~/.config/Cursor/User",
+                "User/globalStorage/state.vscdb",
+                Box::new(CursorConnector::new()),
+            ),
+            (
+                "~/.gemini/tmp",
+                "tmp/hash/chats/session-test.json",
+                Box::new(GeminiConnector::new()),
+            ),
+            (
+                "~/.vibe/logs",
+                "logs/session/session-test/messages.jsonl",
+                Box::new(VibeConnector::new()),
+            ),
+            (
+                "~/.prime/agent/sessions",
+                "sessions/session.jsonl",
+                Box::new(PrimeAgentConnector::new()),
+            ),
+        ];
+        for (path, relative, connector) in cases {
+            storage
+                .upsert_source(&crate::sources::provenance::Source {
+                    id: "laptop".to_string(),
+                    kind: SourceKind::Ssh,
+                    host_label: Some("user@laptop".to_string()),
+                    machine_id: None,
+                    platform: Some("linux".to_string()),
+                    config_json: Some(serde_json::json!({"paths": [path]})),
+                    created_at: None,
+                    updated_at: None,
+                })
+                .unwrap();
+            let file = data_dir
+                .join("remotes/laptop/mirror")
+                .join(path_to_safe_dirname(path))
+                .join(relative);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            // Discovery is deliberately pre-parse, including SQLite sources.
+            std::fs::write(&file, b"").unwrap();
+            let ctx = ScanContext::with_roots(
+                data_dir.clone(),
+                build_scan_roots(Some(&storage), &data_dir),
+                None,
+            );
+            let discovered = connector.discover_source_files(&ctx).unwrap();
+            assert_eq!(discovered.len(), 1, "{path}");
+            assert_eq!(discovered[0].source_path, file);
+            assert_eq!(discovered[0].origin.source_id, "laptop");
+            assert_eq!(discovered[0].origin.host.as_deref(), Some("user@laptop"));
         }
     }
 
@@ -68761,6 +70361,7 @@ c.close()
 
         persist_pending_lexical_rebuild_progress(
             &index_path,
+            &index_path,
             &mut state,
             Some(6),
             6,
@@ -68847,6 +70448,7 @@ c.close()
 
         persist_pending_lexical_rebuild_progress(
             &index_path,
+            &index_path,
             &mut state,
             Some(6),
             6,
@@ -68913,6 +70515,7 @@ c.close()
         };
 
         persist_pending_lexical_rebuild_progress(
+            &index_path,
             &index_path,
             &mut state,
             Some(5),
@@ -69004,7 +70607,7 @@ c.close()
             5,
             10,
             &runtime,
-            cached_base_meta_fingerprint.as_deref(),
+            cached_base_meta_fingerprint.clone(),
         )
         .unwrap();
 
@@ -70926,7 +72529,7 @@ c.close()
                 serde_json::from_str::<ConnectorKind>(&serialized).expect("read connector kind"),
                 kind
             );
-            let routed = kind.create_connector();
+            let routed = kind.create_connector(None);
             let expected = configured_factory();
             let routed_detection = routed.detect();
             let expected_detection = expected.detect();

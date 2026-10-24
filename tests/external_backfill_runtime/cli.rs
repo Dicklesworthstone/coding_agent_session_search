@@ -6,8 +6,10 @@ use coding_agent_search::storage::sqlite::FrankenStorage;
 use frankensearch::quill::cass::CassDocument;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::Instant;
+use std::process::{Command, Output};
+// Only the unix signal test below uses these.
+#[cfg(unix)]
+use std::{process::Stdio, time::Instant};
 
 fn seed(dir: &Path) -> Result<PathBuf> {
     let db = dir.join("agent_search.db");

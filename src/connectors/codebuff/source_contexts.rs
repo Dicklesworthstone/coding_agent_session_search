@@ -74,7 +74,9 @@ impl<'a> SourceContexts<'a> {
             (Some(previous), Some(next)) if std::ptr::eq(previous, next) => {
                 // Many chats share one selected store. Retain its immutable
                 // rewrites instead of cloning them again for every transcript.
-                self.single.scan_roots[0].path.clone_from(&source.source_path);
+                self.single.scan_roots[0]
+                    .path
+                    .clone_from(&source.source_path);
             }
             _ => {
                 let root = selected.map_or_else(

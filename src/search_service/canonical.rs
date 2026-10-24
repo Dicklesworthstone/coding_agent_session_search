@@ -16,6 +16,9 @@ use serde_json::{Value, json};
 
 use super::protocol::MAX_IDENTITY_BYTES;
 
+#[path = "transcript.rs"]
+pub(super) mod transcript;
+
 pub(super) const MAX_CONTEXT: usize = 20;
 pub(super) const MAX_CONTENT_BYTES: usize = 64 * 1024;
 pub(super) const MAX_BATCH_VIEWS: usize = 8;
@@ -262,19 +265,18 @@ fn read_snapshot(connection: &Connection, request: &View<'_>, started: Instant) 
     read_window(connection, request, started, &mut remaining_bytes)
 }
 
-fn read_window(
+fn require_conversation_identity(
     connection: &Connection,
-    request: &View<'_>,
-    started: Instant,
-    remaining_bytes: &mut usize,
-) -> Result<Value> {
-    check_budget(started)?;
+    source_path: &str,
+    source_id: &str,
+    conversation_id: i64,
+) -> Result<()> {
     // A fixed primary-key lookup cannot resolve an identically named session
     // in another source. Compare literal path/source BEFORE any body read.
     let identities = connection
         .query_map_collect(
             "SELECT source_path, source_id FROM conversations WHERE id = ?1 LIMIT 2",
-            params![request.conversation_id],
+            params![conversation_id],
             |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
         )
         .context("read canonical conversation identity")?;
@@ -284,9 +286,25 @@ fn read_window(
     if identities.len() != 1 {
         return Err(Refusal::InvalidCoordinates.into());
     }
-    if path != request.source_path || source != request.source_id {
+    if path != source_path || source != source_id {
         return Err(Refusal::IdentityMismatch.into());
     }
+    Ok(())
+}
+
+fn read_window(
+    connection: &Connection,
+    request: &View<'_>,
+    started: Instant,
+    remaining_bytes: &mut usize,
+) -> Result<Value> {
+    check_budget(started)?;
+    require_conversation_identity(
+        connection,
+        request.source_path,
+        request.source_id,
+        request.conversation_id,
+    )?;
     let idx = i64::try_from(request.message_index - 1)?;
     check_budget(started)?;
     let targets = connection

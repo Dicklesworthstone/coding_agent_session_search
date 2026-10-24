@@ -13,6 +13,11 @@
 //!
 //! The wizard supports resume capability via state persistence, allowing
 //! interrupted setups to continue where they left off.
+//! Automatic fleets larger than 64 hosts require confirmation before any SSH
+//! probe, including during dry-run or unfinished resume. Unattended callers
+//! must provide a reviewed --hosts list instead; discovery is never truncated.
+//! Dry-run may discover and probe hosts, but never writes or clears the setup
+//! checkpoint. A preview must not replace an interrupted real setup's progress.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -36,9 +41,12 @@ use super::probe::{CassStatus, HostProbeResult, deduplicate_probe_results, probe
 pub struct SetupOptions {
     /// Preview what would happen without making changes.
     pub dry_run: bool,
-    /// Skip interactive prompts (use defaults).
+    /// Skip interactive prompts (use defaults). Large automatic fleets require
+    /// an explicit hosts list rather than assuming consent to probe them all.
     pub non_interactive: bool,
     /// Specific hosts to configure (skips discovery/selection).
+    /// After completed probing, resume only accepts the saved discovery or
+    /// selection set; a different host list requires a new setup.
     pub hosts: Option<Vec<String>>,
     /// Include online peers from local Tailscale status during discovery.
     pub tailscale: bool,
@@ -56,6 +64,60 @@ pub struct SetupOptions {
     pub verbose: bool,
     /// Output as JSON.
     pub json: bool,
+}
+
+impl SetupOptions {
+    // Keep preview state in memory, including on early exits. Restoring the
+    // old file afterward would still expose simulated progress to other runs
+    // and could overwrite a concurrent real setup's checkpoint.
+    fn save_checkpoint(&self, state: &SetupState) -> Result<(), SetupError> {
+        if !self.dry_run {
+            state.save()?;
+        }
+        Ok(())
+    }
+
+    fn clear_checkpoint(&self) -> Result<(), SetupError> {
+        if !self.dry_run {
+            SetupState::clear()?;
+        }
+        Ok(())
+    }
+
+    fn validate_resume_hosts(&self, state: &SetupState) -> Result<(), SetupError> {
+        if !self.resume || !state.probing_complete {
+            return Ok(());
+        }
+        let Some(hosts) = &self.hosts else {
+            return Ok(());
+        };
+
+        // Completed phases are resumed from saved probes/selection, not from
+        // this invocation's discovery arguments. Never silently ignore a new
+        // host list and install/index on the previous list instead. Preserve
+        // the original plan rather than discarding completed per-host work.
+        // Exact SSH tokens matter: do not collapse usernames or alias spelling
+        // using source-name normalization. Order and repetition do not matter.
+        let requested: HashSet<&str> = hosts.iter().map(String::as_str).collect();
+        let matches = |saved: &[String]| {
+            requested == saved.iter().map(String::as_str).collect::<HashSet<_>>()
+        };
+        // Repeating the original discovery list is also valid after selection
+        // or physical-machine deduplication narrowed the saved target set.
+        if matches(&state.discovered_host_names)
+            || (state.selection_complete && matches(&state.selected_host_names))
+        {
+            return Ok(());
+        }
+
+        Err(SetupError::Config(super::config::ConfigError::Validation(
+            "Cannot change --hosts after setup probing has completed. \
+             Resume without --hosts to continue the saved plan, or start a new \
+             setup without --resume to use a different host list. \
+             No remote operations were started; the checkpoint is unchanged."
+                .into(),
+        )))
+    }
 }
 
 impl Default for SetupOptions {
@@ -130,6 +192,21 @@ fn setup_should_index_host(
         || RemoteIndexer::needs_indexing(host)
 }
 
+/// How an unfinished setup obtained its candidate hosts.
+///
+/// Automatic discovery must be refreshed before probing; only an explicit
+/// user-supplied host list can be replayed without provider metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupDiscoveryMode {
+    /// Discover aliases from the current SSH configuration only.
+    Ssh,
+    /// Discover SSH aliases and eligible peers from current Tailscale status.
+    Tailscale,
+    /// Use the explicit host list supplied with --hosts.
+    Explicit,
+}
+
 /// Persistent state for resumable setup.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SetupState {
@@ -139,6 +216,10 @@ pub struct SetupState {
     pub discovered_hosts: usize,
     /// Names of discovered hosts.
     pub discovered_host_names: Vec<String>,
+    /// Discovery provenance. Older state files omit this and must not have
+    /// their unverified candidate addresses replayed into automatic probes.
+    #[serde(default)]
+    pub discovery_mode: Option<SetupDiscoveryMode>,
     /// Whether probing phase is complete.
     pub probing_complete: bool,
     /// Probe results for each host.
@@ -459,8 +540,70 @@ fn print_phase_done(message: &str) {
     println!("└{}", "─".repeat(70).dimmed());
 }
 
+// A consent threshold, not a discovery limit. Never truncate a valid fleet.
+const AUTOMATIC_PROBE_CONFIRMATION_THRESHOLD: usize = 64;
+
+fn confirm_automatic_probe_fleet(
+    opts: &SetupOptions,
+    mode: SetupDiscoveryMode,
+    host_count: usize,
+) -> Result<(), SetupError> {
+    use std::io::IsTerminal as _;
+
+    if mode == SetupDiscoveryMode::Explicit || host_count <= AUTOMATIC_PROBE_CONFIRMATION_THRESHOLD
+    {
+        return Ok(());
+    }
+
+    let discovery_flag = if mode == SetupDiscoveryMode::Tailscale {
+        " --tailscale"
+    } else {
+        ""
+    };
+    let review_command = format!("cass sources discover{discovery_flag} --json");
+    if opts.non_interactive
+        || opts.json
+        || !std::io::stdin().is_terminal()
+        || !std::io::stderr().is_terminal()
+    {
+        // An unattended automatic selection does not authorize an unexpected
+        // bulk probe. Use the existing setup configuration-validation path.
+        return Err(SetupError::Config(super::config::ConfigError::Validation(
+            format!(
+                "Automatic discovery found {host_count} hosts, above the \
+                 {AUTOMATIC_PROBE_CONFIRMATION_THRESHOLD}-host confirmation threshold. \
+                 Review '{review_command}' and rerun setup interactively, or supply \
+                 a reviewed --hosts list. No SSH probes were started."
+            ),
+        )));
+    }
+
+    eprintln!(
+        "Automatic discovery found {host_count} SSH hosts. \
+         To review them without probing, run '{review_command}'."
+    );
+    let approved = confirm_action(
+        &format!(
+            "Start SSH probes to all {host_count} automatically discovered hosts \
+             (also during --dry-run)?"
+        ),
+        false,
+    )
+    .map_err(SetupError::Interactive)?;
+    if approved {
+        Ok(())
+    } else {
+        Err(SetupError::Cancelled)
+    }
+}
+
 /// Run the setup wizard.
 pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
+    // A configuration load failure is not an empty installation. Refuse before
+    // discovery, remote work or checkpoint mutation, including on --resume.
+    // Reload again at selection and merge so later errors are not swallowed.
+    SourcesConfig::load().map_err(SetupError::Config)?;
+
     // Set up interruption flag (Ctrl+C handled at CLI level)
     let interrupted = Arc::new(AtomicBool::new(false));
 
@@ -470,6 +613,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
     } else {
         SetupState::default()
     };
+    opts.validate_resume_hosts(&state)?;
 
     if state.started_at.is_none() {
         state.started_at = Some(Utc::now().to_rfc3339());
@@ -517,12 +661,20 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
     // =========================================================================
     // Phase 1: Discovery
     // =========================================================================
-    // An unfinished probe phase can resume discovery saved by an older version
-    // that included provider exit nodes. Saved names have no peer metadata, so
-    // refresh automatic Tailscale discovery rather than replaying that list.
-    // Explicit --hosts and already-completed probing keep their resume behavior.
+    // GH505: --resume must not replay automatic candidates just because the
+    // user omitted --tailscale this time. Remember the provider choice, not
+    // the eligibility of its old addresses. Current explicit hosts take
+    // precedence while probing is unfinished; completed phases stay intact.
+    let discovery_mode = if opts.hosts.is_some() {
+        SetupDiscoveryMode::Explicit
+    } else if opts.tailscale {
+        SetupDiscoveryMode::Tailscale
+    } else {
+        state.discovery_mode.unwrap_or(SetupDiscoveryMode::Ssh)
+    };
     let discovered_hosts = if !state.discovery_complete
-        || (opts.tailscale && opts.hosts.is_none() && !state.probing_complete)
+        || (!state.probing_complete
+            && (discovery_mode != SetupDiscoveryMode::Explicit || opts.hosts.is_some()))
     {
         check_interrupted()?;
 
@@ -543,7 +695,16 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                 })
                 .collect()
         } else {
-            let (hosts, warning) = discover_fleet_hosts(opts.tailscale);
+            if state.discovery_complete && state.discovery_mode.is_none() && !opts.tailscale {
+                // Legacy state cannot distinguish automatic peers from an
+                // explicit host list. Do not guess or enable a new provider.
+                eprintln!(
+                    "Saved setup discovery has no provider metadata; rediscovering SSH aliases. \
+                     Repeat --tailscale or --hosts to include other intended hosts."
+                );
+            }
+            let (hosts, warning) =
+                discover_fleet_hosts(discovery_mode == SetupDiscoveryMode::Tailscale);
             if let Some(warning) = warning {
                 eprintln!("{warning}");
             }
@@ -553,7 +714,8 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
         state.discovered_hosts = hosts.len();
         state.discovered_host_names = hosts.iter().map(|h| h.name.clone()).collect();
         state.discovery_complete = true;
-        state.save()?;
+        state.discovery_mode = Some(discovery_mode);
+        opts.save_checkpoint(&state)?;
 
         if !opts.json {
             if opts.hosts.is_some() {
@@ -568,7 +730,8 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
 
         hosts
     } else {
-        // Reconstruct from saved state
+        // Only explicit candidates or already-completed probing may use
+        // saved names. Automatic unfinished discovery always refreshes above.
         state
             .discovered_host_names
             .iter()
@@ -590,7 +753,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                 "  No SSH hosts found. Add hosts to ~/.ssh/config or use --hosts.".yellow()
             );
         }
-        SetupState::clear()?;
+        opts.clear_checkpoint()?;
         return Err(SetupError::NoHosts);
     }
 
@@ -599,6 +762,10 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
     // =========================================================================
     let probed_hosts = if !state.probing_complete {
         check_interrupted()?;
+        // Count the current filtered candidates, not raw provider inventory or
+        // a cached count. Real runs save discovery but leave probing incomplete
+        // on refusal; previews never replace a real checkpoint with this plan.
+        confirm_automatic_probe_fleet(opts, discovery_mode, discovered_hosts.len())?;
 
         if !opts.json {
             print_phase_header("Phase 2: Probing hosts");
@@ -644,7 +811,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
 
         state.probed_hosts = results.clone();
         state.probing_complete = true;
-        state.save()?;
+        opts.save_checkpoint(&state)?;
 
         if !opts.json {
             print_phase_done(&format!(
@@ -690,7 +857,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                 "  No reachable hosts found. Check SSH connectivity.".yellow()
             );
         }
-        SetupState::clear()?;
+        opts.clear_checkpoint()?;
         return Err(SetupError::NoHosts);
     }
 
@@ -705,7 +872,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             print_phase_header("Phase 3: Host Selection");
         }
 
-        let existing_config = SourcesConfig::load().unwrap_or_default();
+        let existing_config = SourcesConfig::load().map_err(SetupError::Config)?;
         let existing_name_keys: HashSet<_> = existing_config.configured_name_keys();
 
         if opts.non_interactive {
@@ -746,7 +913,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                     selected
                 }
                 Err(e) => {
-                    state.save()?;
+                    opts.save_checkpoint(&state)?;
                     return Err(SetupError::Interactive(e));
                 }
             }
@@ -798,7 +965,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
     if !state.selection_complete || state.selected_host_names != selected_host_names {
         state.selected_host_names = selected_host_names;
         state.selection_complete = true;
-        state.save()?;
+        opts.save_checkpoint(&state)?;
     }
 
     if selected_hosts.is_empty() {
@@ -806,7 +973,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             println!();
             println!("{}", "  No hosts selected. Setup cancelled.".yellow());
         }
-        SetupState::clear()?;
+        opts.clear_checkpoint()?;
         return Ok(SetupResult {
             sources_added: 0,
             hosts_installed: 0,
@@ -865,29 +1032,30 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                         check_interrupted()?;
 
                         state.current_operation = Some(format!("Installing on {}", host.host_name));
-                        state.save()?;
+                        opts.save_checkpoint(&state)?;
 
-                        // Create installer for this specific host
-                        // Skip hosts without system info (they likely failed probing)
+                        // Incomplete probe metadata cannot satisfy a requested
+                        // installation. Keep the checkpoint instead of silently
+                        // skipping this host and reporting setup complete.
                         let Some(system_info) = host.system_info.clone() else {
-                            if !opts.json {
-                                println!(
-                                    "│ {} {} skipped (no system info)",
-                                    "⚠".yellow(),
+                            return Err(SetupError::Install(
+                                super::install::InstallError::VerificationFailed(format!(
+                                    "Saved probe for {} has no system information; \
+                                     rerun setup without --resume to refresh probing, \
+                                     or resume with --skip-install.",
                                     host.host_name
-                                );
-                            }
-                            continue;
+                                )),
+                            ));
                         };
                         let Some(resources) = host.resources.clone() else {
-                            if !opts.json {
-                                println!(
-                                    "│ {} {} skipped (no resource info)",
-                                    "⚠".yellow(),
+                            return Err(SetupError::Install(
+                                super::install::InstallError::VerificationFailed(format!(
+                                    "Saved probe for {} has no resource information; \
+                                     rerun setup without --resume to refresh probing, \
+                                     or resume with --skip-install.",
                                     host.host_name
-                                );
-                            }
-                            continue;
+                                )),
+                            ));
                         };
                         let installer =
                             RemoteInstaller::new(host.host_name.clone(), system_info, resources);
@@ -916,16 +1084,22 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                                     println!("│ {} {} installed", "✓".green(), host.host_name);
                                 }
                                 state.completed_installs.push(host.host_name.clone());
-                                state.save()?;
+                                opts.save_checkpoint(&state)?;
                                 hosts_installed += 1;
                             }
                             Err(e) => {
                                 if !opts.json {
                                     println!("│ {} {} failed: {}", "✗".red(), host.host_name, e);
                                 }
-                                if opts.verbose {
-                                    eprintln!("  Install error: {e}");
-                                }
+                                // The installer already exhausted its fallback
+                                // chain. Do not configure/sync or clear the
+                                // successful per-host checkpoints on failure.
+                                eprintln!(
+                                    "Setup paused while installing on {}. Progress is saved; \
+                                     resolve the error before running 'cass sources setup --resume'.",
+                                    host.host_name
+                                );
+                                return Err(SetupError::Install(e));
                             }
                         }
                     }
@@ -952,7 +1126,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                 .filter(|h| !completed.contains(h.host_name.as_str()))
                 .count();
             state.installation_complete = remaining_installs == 0;
-            state.save()?;
+            opts.save_checkpoint(&state)?;
         }
     }
 
@@ -1001,7 +1175,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                     check_interrupted()?;
 
                     state.current_operation = Some(format!("Indexing on {}", host.host_name));
-                    state.save()?;
+                    opts.save_checkpoint(&state)?;
 
                     if !opts.json {
                         println!("│ Indexing on {}...", host.host_name);
@@ -1055,7 +1229,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                                 }
                             }
                             state.completed_indexes.push(host.host_name.clone());
-                            state.save()?;
+                            opts.save_checkpoint(&state)?;
                             hosts_indexed += 1;
                         }
                         Err(e) => {
@@ -1067,6 +1241,16 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                                     e
                                 );
                             }
+                            // In particular, a timeout can leave a remote job
+                            // running: retain the indexer's recovery advice and
+                            // the checkpoint, not a false completion result.
+                            eprintln!(
+                                "Setup paused while indexing on {}. {} Progress is saved; \
+                                 resolve the error before running 'cass sources setup --resume'.",
+                                host.host_name,
+                                e.help_message()
+                            );
+                            return Err(SetupError::Index(e));
                         }
                     }
                 }
@@ -1110,7 +1294,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                 .filter(|h| !completed.contains(h.host_name.as_str()))
                 .count();
             state.indexing_complete = remaining_indexes == 0;
-            state.save()?;
+            opts.save_checkpoint(&state)?;
         }
     }
 
@@ -1126,7 +1310,9 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             print_phase_header("Phase 6: Configuring sources");
         }
 
-        let mut config = SourcesConfig::load().unwrap_or_default();
+        // Reload rather than merging over a snapshot captured before remote
+        // work. A load error must never turn the existing config into defaults.
+        let mut config = SourcesConfig::load().map_err(SetupError::Config)?;
         let generator = SourceConfigGenerator::new();
 
         // Generate preview
@@ -1158,7 +1344,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
         }
 
         state.configuration_complete = true;
-        state.save()?;
+        opts.save_checkpoint(&state)?;
     }
 
     // =========================================================================
@@ -1234,7 +1420,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
     // The CLI has not attempted the final sync yet (JSON mode defers it).
     // Keep the selected hosts and completed phases so a failed sync can resume.
     if !sync_pending {
-        SetupState::clear()?;
+        opts.clear_checkpoint()?;
     }
 
     let total_sessions: u64 = selected_hosts
@@ -1297,6 +1483,7 @@ mod tests {
         assert!(!state.discovery_complete);
         assert_eq!(state.discovered_hosts, 0);
         assert!(state.discovered_host_names.is_empty());
+        assert!(state.discovery_mode.is_none());
         assert!(!state.probing_complete);
         assert!(state.probed_hosts.is_empty());
         assert!(!state.selection_complete);
@@ -1393,6 +1580,38 @@ mod tests {
         );
         assert_eq!(deserialized.selected_host_names, state.selected_host_names);
         assert_eq!(deserialized.started_at, state.started_at);
+    }
+
+    #[test]
+    fn test_setup_tailscale_discovery_mode_serde_roundtrip() {
+        for mode in [
+            SetupDiscoveryMode::Ssh,
+            SetupDiscoveryMode::Tailscale,
+            SetupDiscoveryMode::Explicit,
+        ] {
+            let state = SetupState {
+                discovery_complete: true,
+                discovery_mode: Some(mode),
+                ..Default::default()
+            };
+            let json = serde_json::to_vec(&state).unwrap();
+            let loaded: SetupState = serde_json::from_slice(&json).unwrap();
+            assert_eq!(loaded.discovery_mode, Some(mode));
+        }
+    }
+
+    #[test]
+    fn test_setup_tailscale_legacy_discovery_mode_is_unknown() {
+        let mut json = serde_json::to_value(SetupState::default()).unwrap();
+        json.as_object_mut().unwrap().remove("discovery_mode");
+        let loaded: SetupState = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(loaded.discovery_mode, None);
+        json["discovery_mode"] = serde_json::Value::Null;
+        let loaded: SetupState = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(loaded.discovery_mode, None);
+        // An unrecognized new mode must fail closed, never become Explicit.
+        json["discovery_mode"] = serde_json::json!("unrecognized_provider");
+        assert!(serde_json::from_value::<SetupState>(json).is_err());
     }
 
     #[test]
@@ -1724,5 +1943,125 @@ mod tests {
         let path = SetupState::path();
         assert!(path.ends_with("setup_state.json"));
         assert!(path.to_string_lossy().contains("cass"));
+    }
+
+    #[test]
+    fn test_setup_tailscale_probe_confirmation_boundaries() {
+        let opts = SetupOptions {
+            non_interactive: true,
+            json: true,
+            ..Default::default()
+        };
+        for mode in [SetupDiscoveryMode::Ssh, SetupDiscoveryMode::Tailscale] {
+            for count in [0, 1, 63, 64] {
+                assert!(confirm_automatic_probe_fleet(&opts, mode, count).is_ok());
+            }
+        }
+        // An explicit selection authorizes its whole list, never a prefix.
+        assert!(
+            confirm_automatic_probe_fleet(&opts, SetupDiscoveryMode::Explicit, usize::MAX).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_setup_tailscale_probe_confirmation_rejects_unattended_large_fleets() {
+        for opts in [
+            SetupOptions {
+                non_interactive: true,
+                ..Default::default()
+            },
+            SetupOptions {
+                json: true,
+                ..Default::default()
+            },
+            SetupOptions {
+                non_interactive: true,
+                dry_run: true,
+                resume: true,
+                ..Default::default()
+            },
+        ] {
+            for mode in [SetupDiscoveryMode::Ssh, SetupDiscoveryMode::Tailscale] {
+                let error = confirm_automatic_probe_fleet(&opts, mode, 65).unwrap_err();
+                assert!(matches!(&error, SetupError::Config(_)));
+                let message = error.to_string();
+                assert!(message.contains("65 hosts"));
+                assert!(message.contains("64-host confirmation threshold"));
+                assert!(message.contains("--hosts"));
+                assert!(message.contains("No SSH probes were started"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_setup_resume_hosts_accepts_only_unchanged_discovery_or_selection() {
+        let state = SetupState {
+            discovery_complete: true,
+            discovered_host_names: vec!["Alpha".into(), "operator@beta".into(), "alias".into()],
+            probing_complete: true,
+            selection_complete: true,
+            selected_host_names: vec!["Alpha".into(), "operator@beta".into()],
+            ..Default::default()
+        };
+        for hosts in [
+            vec!["alias", "operator@beta", "Alpha", "alias"],
+            vec!["operator@beta", "Alpha", "Alpha"],
+        ] {
+            let opts = SetupOptions {
+                resume: true,
+                hosts: Some(hosts.into_iter().map(str::to_owned).collect()),
+                ..Default::default()
+            };
+            assert!(opts.validate_resume_hosts(&state).is_ok());
+        }
+        for hosts in [
+            vec![],
+            vec!["Alpha"],
+            vec!["Alpha", "operator@beta", "new-machine"],
+            vec!["alpha", "operator@beta"],
+            vec!["Alpha", "other@beta"],
+        ] {
+            let opts = SetupOptions {
+                resume: true,
+                hosts: Some(hosts.into_iter().map(str::to_owned).collect()),
+                ..Default::default()
+            };
+            assert!(matches!(
+                opts.validate_resume_hosts(&state),
+                Err(SetupError::Config(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_setup_resume_hosts_does_not_lock_unfinished_discovery() {
+        let state = SetupState {
+            discovery_complete: true,
+            discovered_host_names: vec!["old-machine".into()],
+            // A list is not an approved selection until the phase completes.
+            selected_host_names: vec!["new-machine".into()],
+            ..Default::default()
+        };
+        let opts = SetupOptions {
+            resume: true,
+            hosts: Some(vec!["new-machine".into()]),
+            ..Default::default()
+        };
+        assert!(opts.validate_resume_hosts(&state).is_ok());
+        let probed = SetupState {
+            probing_complete: true,
+            ..state
+        };
+        assert!(opts.validate_resume_hosts(&probed).is_err());
+        let fresh = SetupOptions {
+            resume: false,
+            ..opts
+        };
+        assert!(fresh.validate_resume_hosts(&probed).is_ok());
+        let bare_resume = SetupOptions {
+            resume: true,
+            ..Default::default()
+        };
+        assert!(bare_resume.validate_resume_hosts(&probed).is_ok());
     }
 }

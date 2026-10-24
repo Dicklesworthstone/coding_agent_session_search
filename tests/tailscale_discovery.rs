@@ -4,11 +4,14 @@
 //! records transport attempts and fails locally, so no tailnet is contacted.
 #![cfg(target_os = "linux")]
 
-use coding_agent_search::sources::setup::SetupState;
+use coding_agent_search::sources::config::SourcesConfig;
+use coding_agent_search::sources::probe::{CassStatus, DetectedAgent, HostProbeResult};
+use coding_agent_search::sources::setup::{SetupDiscoveryMode, SetupState};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::Output;
 use std::time::Duration;
@@ -94,6 +97,8 @@ impl FleetFixture {
             .env("CASS_TEST_STATUS_JSON", &self.status)
             .env("CASS_TEST_STATUS_CALLS", &self.status_calls)
             .env("CASS_TEST_TRANSPORTS", &self.transports)
+            .env("CASS_TEST_SETUP_STATE", self.state_path())
+            .env("CASS_TEST_SNAPSHOTS", self.root.path().join("snapshots"))
             .args(args)
             .timeout(Duration::from_secs(30))
             .output()
@@ -108,25 +113,54 @@ impl FleetFixture {
             .collect()
     }
 
-    fn save_legacy_discovery(&self) {
+    fn state_path(&self) -> PathBuf {
+        self.root.path().join("cache/cass/setup_state.json")
+    }
+
+    fn save_discovery(&self, mode: Option<SetupDiscoveryMode>, names: &[&str]) {
         let state = SetupState {
             discovery_complete: true,
-            discovered_hosts: 2,
-            discovered_host_names: vec!["100.90.0.1".into(), "100.90.0.2".into()],
+            discovered_hosts: names.len(),
+            discovered_host_names: names.iter().map(|name| (*name).to_owned()).collect(),
+            discovery_mode: mode,
             ..Default::default()
         };
+        let mut json = serde_json::to_value(state).unwrap();
+        if mode.is_none() {
+            // Exercise the actual old format, not just a new struct's default.
+            json.as_object_mut().unwrap().remove("discovery_mode");
+        }
+        fs::write(self.state_path(), serde_json::to_vec(&json).unwrap()).unwrap();
+    }
+
+    fn save_legacy_discovery(&self) {
+        self.save_discovery(None, &["100.90.0.1", "100.90.0.2"]);
+    }
+
+    fn capture_state_at_transport(&self) {
+        fs::create_dir_all(self.root.path().join("snapshots")).unwrap();
         fs::write(
-            self.root.path().join("cache/cass/setup_state.json"),
-            serde_json::to_vec(&state).unwrap(),
+            self.root.path().join("record-transport.sh"),
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$1" >> "$CASS_TEST_TRANSPORTS"
+if [ -e "$CASS_TEST_SETUP_STATE" ]; then
+    /bin/cp "$CASS_TEST_SETUP_STATE" "$CASS_TEST_SNAPSHOTS/$1.json"
+fi
+exit 1
+"#,
         )
         .unwrap();
     }
 
     fn setup(&self, resume: bool) -> Output {
+        self.setup_with_options(resume, &["--tailscale"])
+    }
+
+    fn setup_with_options(&self, resume: bool, discovery_args: &[&str]) -> Output {
         let mut args = vec![
             "sources",
             "setup",
-            "--tailscale",
             "--non-interactive",
             "--skip-install",
             "--skip-index",
@@ -136,6 +170,7 @@ impl FleetFixture {
         if resume {
             args.push("--resume");
         }
+        args.extend_from_slice(discovery_args);
         self.run(&args)
     }
 }
@@ -257,4 +292,976 @@ fn gh505_resumed_setup_with_bad_status_keeps_aliases_not_cached_peers() {
             .count(),
         1
     );
+}
+
+#[test]
+fn gh505_legacy_resume_without_tailscale_never_replays_cached_peers() {
+    let fixture = FleetFixture::new(mixed_peers(), ALIAS);
+    fixture.save_legacy_discovery();
+    let output = fixture.setup_with_options(true, &[]);
+    assert_setup_no_hosts(&output);
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from(["100.64.0.1".into()])
+    );
+    // Missing provenance must not silently opt an SSH-only setup into Tailscale.
+    assert!(!fixture.status_calls.exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no provider metadata"), "{output:?}");
+    assert!(stderr.contains("--tailscale or --hosts"), "{output:?}");
+}
+
+#[test]
+fn gh505_legacy_resume_without_flags_or_aliases_never_starts_transport() {
+    let fixture = FleetFixture::new(mullvad_peers(), "");
+    fixture.save_legacy_discovery();
+    let output = fixture.setup_with_options(true, &[]);
+    assert_setup_no_hosts(&output);
+    assert!(fixture.attempted_transports().is_empty());
+    assert!(!fixture.status_calls.exists());
+}
+
+#[test]
+fn gh505_saved_tailscale_mode_refreshes_without_repeating_flag() {
+    let fixture = FleetFixture::new(mixed_peers(), ALIAS);
+    fixture.save_discovery(
+        Some(SetupDiscoveryMode::Tailscale),
+        &["100.90.0.1", "100.90.0.2"],
+    );
+    let output = fixture.setup_with_options(true, &[]);
+    assert_setup_no_hosts(&output);
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from(["100.64.0.1".into(), "100.64.0.2".into()])
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.status_calls).unwrap(),
+        "status --json\n"
+    );
+}
+
+#[test]
+fn gh505_saved_tailscale_mode_bad_status_never_falls_back_to_cache() {
+    let fixture = FleetFixture::new(mullvad_peers(), ALIAS);
+    fixture.save_discovery(
+        Some(SetupDiscoveryMode::Tailscale),
+        &["100.90.0.1", "100.90.0.2"],
+    );
+    fs::write(&fixture.status, "invalid status JSON").unwrap();
+    let output = fixture.setup_with_options(true, &[]);
+    assert_setup_no_hosts(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Tailscale discovery unavailable"),
+        "{output:?}"
+    );
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from(["100.64.0.1".into()])
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.status_calls).unwrap(),
+        "status --json\n"
+    );
+}
+
+#[test]
+fn gh505_saved_ssh_mode_refreshes_aliases_without_enabling_tailscale() {
+    let fixture = FleetFixture::new(mixed_peers(), ALIAS);
+    fixture.save_discovery(Some(SetupDiscoveryMode::Ssh), &["100.64.0.9"]);
+    let output = fixture.setup_with_options(true, &[]);
+    assert_setup_no_hosts(&output);
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from(["100.64.0.1".into()])
+    );
+    assert!(!fixture.status_calls.exists());
+}
+
+#[test]
+fn gh505_saved_explicit_hosts_are_preserved_without_discovery() {
+    let fixture = FleetFixture::new(mixed_peers(), ALIAS);
+    fixture.save_discovery(Some(SetupDiscoveryMode::Explicit), &["100.64.0.9"]);
+    let output = fixture.setup_with_options(true, &[]);
+    assert_setup_no_hosts(&output);
+    // An explicitly requested machine need not be in SSH config or Tailscale.
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from(["100.64.0.9".into()])
+    );
+    assert!(!fixture.status_calls.exists());
+}
+
+#[test]
+fn gh505_current_explicit_hosts_override_unfinished_legacy_candidates() {
+    let fixture = FleetFixture::new(mixed_peers(), ALIAS);
+    fixture.save_legacy_discovery();
+    let output = fixture.setup_with_options(true, &["--hosts", "workstation", "--tailscale"]);
+    assert_setup_no_hosts(&output);
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from(["100.64.0.1".into()])
+    );
+    assert!(!fixture.status_calls.exists());
+}
+
+#[test]
+fn gh505_completed_probing_does_not_restart_discovery_or_transport() {
+    let fixture = FleetFixture::new(mixed_peers(), ALIAS);
+    fixture.save_legacy_discovery();
+    let mut state: Value =
+        serde_json::from_slice(&fs::read(fixture.state_path()).unwrap()).unwrap();
+    // The completed probe phase found no reachable hosts; no later phase is due.
+    state["probing_complete"] = json!(true);
+    fs::write(fixture.state_path(), serde_json::to_vec(&state).unwrap()).unwrap();
+    let output = fixture.setup(true);
+    assert_setup_no_hosts(&output);
+    assert!(fixture.attempted_transports().is_empty());
+    assert!(!fixture.status_calls.exists());
+}
+
+#[test]
+fn gh505_real_saved_provider_mode_survives_resume_without_flags() {
+    let peers = json!({
+        "ordinary-exit": {"Online": true, "ExitNodeOption": true, "TailscaleIPs": ["100.64.0.2"]}
+    });
+    let fixture = FleetFixture::new(peers, "");
+    fixture.capture_state_at_transport();
+    let output = fixture.setup(false);
+    assert_setup_no_hosts(&output);
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from(["100.64.0.2".into()])
+    );
+    // Capture actual production state just after discovery and before probing
+    // completes. No killed children, timing races, or synthesized provenance.
+    let snapshot = fs::read(fixture.root.path().join("snapshots/100.64.0.2.json")).unwrap();
+    let state: Value = serde_json::from_slice(&snapshot).unwrap();
+    assert_eq!(state["discovery_mode"], "tailscale");
+    assert_eq!(state["discovery_complete"], true);
+    assert_eq!(state["probing_complete"], false);
+    assert_eq!(state["discovered_host_names"], json!(["100.64.0.2"]));
+
+    // Resume that exact saved state after the old peer goes offline and a new
+    // real machine appears alongside provider endpoints. Only current eligible
+    // peers may reach the real OpenSSH transport, even without --tailscale.
+    let mut peers = mullvad_peers();
+    peers["previous"] = json!({"Online": false, "TailscaleIPs": ["100.64.0.2"]});
+    peers["new-machine"] = json!({"Online": true, "TailscaleIPs": ["100.64.0.9"]});
+    fs::write(
+        &fixture.status,
+        serde_json::to_vec(&json!({"BackendState": "Running", "Peer": peers})).unwrap(),
+    )
+    .unwrap();
+    fs::write(fixture.state_path(), &snapshot).unwrap();
+    fs::write(&fixture.transports, "").unwrap();
+    let output = fixture.setup_with_options(true, &[]);
+    assert_setup_no_hosts(&output);
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from(["100.64.0.9".into()])
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.status_calls).unwrap(),
+        "status --json\nstatus --json\n"
+    );
+}
+
+const PROVIDER_ALIASES: &str = "Host provider-by-tag\n HostName 100.90.0.1\n\
+    Host provider-by-dns\n HostName se-sto-wg-001.mullvad.ts.net\n\
+    Host 100.90.0.2\n\
+    Host workstation.example.ts.net\n HostName 100.90.0.1\n";
+
+#[test]
+fn gh505_configured_provider_aliases_never_reach_setup_transport() {
+    // A provider-looking alias label can still be a legitimate SSH machine.
+    let aliases = format!(
+        "{ALIAS}{PROVIDER_ALIASES}Host se-sto-wg-001.mullvad.ts.net\n HostName 100.64.0.8\n"
+    );
+    let fixture = FleetFixture::new(mixed_peers(), &aliases);
+    let output = fixture.run(&["sources", "discover", "--tailscale", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let discovery: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        discovery["hosts"].as_array().unwrap().len(),
+        3,
+        "{discovery}"
+    );
+    assert!(fixture.attempted_transports().is_empty());
+
+    let output = fixture.setup(false);
+    assert_setup_no_hosts(&output);
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from([
+            "100.64.0.1".into(),
+            "100.64.0.2".into(),
+            "100.64.0.8".into(),
+        ])
+    );
+}
+
+#[test]
+fn gh505_only_provider_aliases_do_not_start_transport_even_when_offline() {
+    let mut peers = mullvad_peers();
+    peers["tag-only"]["Online"] = json!(false);
+    peers["dns-only"]["ShareeNode"] = json!(true);
+    let fixture = FleetFixture::new(peers, PROVIDER_ALIASES);
+    let output = fixture.run(&["sources", "discover", "--tailscale", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let discovery: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(discovery["status"], "no_hosts", "{discovery}");
+    let output = fixture.setup(false);
+    assert_setup_no_hosts(&output);
+    assert!(fixture.attempted_transports().is_empty());
+}
+
+#[test]
+fn gh505_bare_resume_filters_provider_aliases_before_peer_deduplication() {
+    let fixture = FleetFixture::new(mixed_peers(), PROVIDER_ALIASES);
+    fixture.save_discovery(
+        Some(SetupDiscoveryMode::Tailscale),
+        &["provider-by-tag", "100.90.0.2"],
+    );
+    let output = fixture.setup_with_options(true, &[]);
+    assert_setup_no_hosts(&output);
+    // The alias named workstation.example.ts.net points at a provider. It must
+    // be removed before considering the real workstation's DNS name, even
+    // though that real peer sorts ahead of the provider in the status map.
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from(["100.64.0.1".into(), "100.64.0.2".into()])
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.status_calls).unwrap(),
+        "status --json\n"
+    );
+}
+
+#[test]
+fn gh505_renamed_dns_alias_does_not_suppress_the_real_peer() {
+    let fixture = FleetFixture::new(
+        mixed_peers(),
+        "Host workstation.example.ts.net\n HostName 100.64.0.8\n User developer\n Port 2222\n",
+    );
+    let output = fixture.run(&["sources", "discover", "--tailscale", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let discovery: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        discovery["hosts"].as_array().unwrap().len(),
+        3,
+        "{discovery}"
+    );
+    assert!(fixture.attempted_transports().is_empty());
+
+    let output = fixture.setup(false);
+    assert_setup_no_hosts(&output);
+    // OpenSSH uses the explicit HostName for the alias. The separate peer
+    // bearing that DNS name must also be probed at its assigned address.
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from([
+            "100.64.0.1".into(),
+            "100.64.0.2".into(),
+            "100.64.0.8".into(),
+        ])
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("conflict with SSH aliases"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn gh505_excluded_numeric_alias_is_not_reintroduced_as_a_raw_peer_target() {
+    for resume in [false, true] {
+        let fixture = FleetFixture::new(mixed_peers(), "Host 100.64.0.1\n HostName 100.90.0.1\n");
+        let output = fixture.run(&["sources", "discover", "--tailscale", "--json"]);
+        assert!(output.status.success(), "{output:?}");
+        let discovery: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            discovery["hosts"].as_array().unwrap().len(),
+            1,
+            "{discovery}"
+        );
+        assert!(fixture.attempted_transports().is_empty());
+
+        let output = if resume {
+            fixture.save_discovery(Some(SetupDiscoveryMode::Tailscale), &["100.64.0.1"]);
+            fixture.setup_with_options(true, &[])
+        } else {
+            fixture.setup(false)
+        };
+        assert_setup_no_hosts(&output);
+        // Removing the alias from discovery does not change SSH config. A
+        // raw .1 would still go to provider .90.0.1, not the intended machine.
+        assert_eq!(
+            fixture.attempted_transports(),
+            BTreeSet::from(["100.64.0.2".into()])
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Tailscale discovery skipped 1 peer(s)"),
+            "{output:?}"
+        );
+        assert!(
+            stderr.contains("configure an unambiguous SSH alias"),
+            "{output:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.status_calls).unwrap(),
+            "status --json\nstatus --json\n"
+        );
+    }
+}
+
+#[test]
+fn gh505_safe_alternate_alias_preserves_a_peer_with_an_excluded_numeric_alias() {
+    let aliases = format!("{ALIAS}Host 100.64.0.1\n HostName 100.90.0.1\n");
+    let fixture = FleetFixture::new(mixed_peers(), &aliases);
+    let output = fixture.run(&["sources", "discover", "--tailscale", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let discovery: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        discovery["hosts"].as_array().unwrap().len(),
+        2,
+        "{discovery}"
+    );
+    assert!(fixture.attempted_transports().is_empty());
+    let output = fixture.setup(false);
+    assert_setup_no_hosts(&output);
+    // workstation resolves directly to .1; it does not invoke the separate
+    // Host 100.64.0.1 stanza. Blocking that numeric name must not drop this alias.
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from(["100.64.0.1".into(), "100.64.0.2".into()])
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("conflict with SSH aliases"),
+        "{output:?}"
+    );
+}
+
+fn numbered_fleet_peers(machine_count: usize, provider_count: usize) -> Value {
+    assert!(machine_count <= 254);
+    let mut peers = serde_json::Map::new();
+    for index in 1..=machine_count {
+        peers.insert(
+            format!("machine-{index:03}"),
+            json!({
+                "Online": true,
+                "DNSName": format!("machine-{index}.example.ts.net."),
+                "TailscaleIPs": [format!("100.64.0.{index}")],
+                "ExitNodeOption": true,
+                "Location": {"Country": "Sweden"}
+            }),
+        );
+    }
+    for index in 0..provider_count {
+        let mut peer = json!({
+            "Online": true,
+            "TailscaleIPs": [format!("100.90.{}.{}", index / 250, index % 250 + 1)]
+        });
+        if index % 2 == 0 {
+            peer["Tags"] = json!(["tag:mullvad-exit-node"]);
+        } else {
+            peer["DNSName"] = json!(format!("provider-{index}.mullvad.ts.net."));
+        }
+        peers.insert(format!("provider-{index:03}"), peer);
+    }
+    Value::Object(peers)
+}
+
+fn assert_large_fleet_rejected(fixture: &FleetFixture, output: &Output) {
+    assert!(!output.status.success(), "{output:?}");
+    let diagnostics = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for expected in [
+        "65 hosts",
+        "64-host confirmation threshold",
+        "--hosts",
+        "No SSH probes were started",
+    ] {
+        assert!(diagnostics.contains(expected), "{output:?}");
+    }
+    assert!(fixture.attempted_transports().is_empty());
+    assert!(
+        !fixture
+            .root
+            .path()
+            .join("config/cass/sources.toml")
+            .exists()
+    );
+}
+
+fn assert_large_fleet_refused(fixture: &FleetFixture, output: &Output, mode: SetupDiscoveryMode) {
+    assert_large_fleet_rejected(fixture, output);
+    let state: SetupState =
+        serde_json::from_slice(&fs::read(fixture.state_path()).unwrap()).unwrap();
+    assert!(state.discovery_complete);
+    assert_eq!(state.discovery_mode, Some(mode));
+    assert_eq!(state.discovered_hosts, 65);
+    assert_eq!(state.discovered_host_names.len(), 65);
+    assert_eq!(
+        state
+            .discovered_host_names
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len(),
+        65
+    );
+    assert!(!state.probing_complete);
+    assert!(state.probed_hosts.is_empty());
+    assert!(!state.selection_complete);
+    assert!(!state.installation_complete);
+    assert!(!state.indexing_complete);
+    assert!(!state.configuration_complete);
+    assert!(!state.sync_complete);
+    assert!(
+        !fixture
+            .root
+            .path()
+            .join("config/cass/sources.toml")
+            .exists()
+    );
+}
+
+#[test]
+fn gh505_large_fleet_requires_review_and_can_resume_with_explicit_hosts() {
+    for resume in [false, true] {
+        let fixture = FleetFixture::new(numbered_fleet_peers(65, 536), "");
+        let output = fixture.run(&["sources", "discover", "--tailscale", "--json"]);
+        assert!(output.status.success(), "{output:?}");
+        let discovery: Value = serde_json::from_slice(&output.stdout).unwrap();
+        // Discovery still reports the entire eligible fleet, not a prefix.
+        assert_eq!(discovery["hosts"].as_array().unwrap().len(), 65);
+        assert!(fixture.attempted_transports().is_empty());
+        let output = if resume {
+            // A cached small count must not bypass review of the current fleet.
+            fixture.save_discovery(Some(SetupDiscoveryMode::Tailscale), &["100.64.0.200"]);
+            fixture.setup_with_options(true, &[])
+        } else {
+            fixture.setup(false)
+        };
+        assert_large_fleet_refused(&fixture, &output, SetupDiscoveryMode::Tailscale);
+        // Refusal is not saved as approval; an unchanged bare resume refuses again.
+        let output = fixture.setup_with_options(true, &[]);
+        assert_large_fleet_refused(&fixture, &output, SetupDiscoveryMode::Tailscale);
+
+        let output = fixture.setup_with_options(true, &["--hosts", "100.64.0.1,100.64.0.65"]);
+        assert_setup_no_hosts(&output);
+        assert_eq!(
+            fixture.attempted_transports(),
+            BTreeSet::from(["100.64.0.1".into(), "100.64.0.65".into()])
+        );
+        // The explicit retry must not rediscover the large automatic inventory.
+        assert_eq!(
+            fs::read_to_string(&fixture.status_calls).unwrap(),
+            "status --json\nstatus --json\nstatus --json\n"
+        );
+    }
+}
+
+#[test]
+fn gh505_large_fleet_json_noninteractive_and_piped_modes_never_probe() {
+    for flags in [
+        vec!["--json"],
+        vec!["--non-interactive"],
+        vec!["--dry-run", "--json"],
+        Vec::new(),
+    ] {
+        let fixture = FleetFixture::new(numbered_fleet_peers(65, 0), "");
+        let mut args = vec![
+            "sources",
+            "setup",
+            "--tailscale",
+            "--skip-install",
+            "--skip-index",
+            "--skip-sync",
+        ];
+        args.extend_from_slice(&flags);
+        // output() captures the streams: even with no mode flag this is not
+        // an interactive terminal and must never block on a confirmation.
+        let output = fixture.run(&args);
+        if flags.contains(&"--dry-run") {
+            assert_large_fleet_rejected(&fixture, &output);
+            // A preview must refuse the probes without publishing a checkpoint.
+            assert!(checkpoint_files(&fixture).is_empty());
+        } else {
+            assert_large_fleet_refused(&fixture, &output, SetupDiscoveryMode::Tailscale);
+        }
+        assert_eq!(
+            fs::read_to_string(&fixture.status_calls).unwrap(),
+            "status --json\n"
+        );
+    }
+}
+
+#[test]
+fn gh505_large_ssh_only_discovery_also_requires_review() {
+    let aliases: String = (1..=65)
+        .map(|index| format!("Host machine-{index}\n HostName 100.64.0.{index}\n"))
+        .collect();
+    let fixture = FleetFixture::new(mullvad_peers(), &aliases);
+    let output = fixture.setup_with_options(false, &[]);
+    assert_large_fleet_refused(&fixture, &output, SetupDiscoveryMode::Ssh);
+    assert!(!fixture.status_calls.exists());
+}
+
+#[test]
+fn gh505_large_raw_inventory_counts_only_filtered_and_deduplicated_targets() {
+    // 536 providers plus 64 real machines and an alias for machine 1: count
+    // only the 64 final targets, not status records or the duplicate alias.
+    let fixture = FleetFixture::new(numbered_fleet_peers(64, 536), ALIAS);
+    let output = fixture.setup(false);
+    assert_setup_no_hosts(&output);
+    let expected: BTreeSet<_> = (1..=64).map(|index| format!("100.64.0.{index}")).collect();
+    assert_eq!(fixture.attempted_transports(), expected);
+    assert_eq!(
+        fs::read_to_string(&fixture.status_calls).unwrap(),
+        "status --json\n"
+    );
+}
+
+#[test]
+fn gh505_large_explicit_lists_are_never_truncated_or_rediscovered() {
+    let names: Vec<_> = (1..=65).map(|index| format!("100.64.0.{index}")).collect();
+    let references: Vec<_> = names.iter().map(String::as_str).collect();
+    let argument = names.join(",");
+    for resume in [false, true] {
+        let fixture = FleetFixture::new(numbered_fleet_peers(65, 536), "");
+        let output = if resume {
+            fixture.save_discovery(Some(SetupDiscoveryMode::Explicit), &references);
+            fixture.setup_with_options(true, &[])
+        } else {
+            fixture.setup_with_options(false, &["--hosts", argument.as_str()])
+        };
+        assert_setup_no_hosts(&output);
+        assert_eq!(
+            fixture.attempted_transports(),
+            names.iter().cloned().collect()
+        );
+        assert!(!fixture.status_calls.exists());
+    }
+}
+
+#[test]
+fn gh505_large_completed_probe_phase_does_not_repeat_confirmation_or_transport() {
+    let fixture = FleetFixture::new(numbered_fleet_peers(65, 536), "");
+    let names: Vec<_> = (1..=65).map(|index| format!("100.64.0.{index}")).collect();
+    let references: Vec<_> = names.iter().map(String::as_str).collect();
+    fixture.save_discovery(Some(SetupDiscoveryMode::Tailscale), &references);
+    let mut state: SetupState =
+        serde_json::from_slice(&fs::read(fixture.state_path()).unwrap()).unwrap();
+    state.probing_complete = true;
+    fs::write(fixture.state_path(), serde_json::to_vec(&state).unwrap()).unwrap();
+    let output = fixture.setup_with_options(true, &[]);
+    assert_setup_no_hosts(&output);
+    assert!(fixture.attempted_transports().is_empty());
+    assert!(!fixture.status_calls.exists());
+}
+
+// Include atomic-write sidecars and inode identity: serializing the same
+// logical state again, or restoring it after a preview, is still a mutation.
+fn checkpoint_files(fixture: &FleetFixture) -> BTreeMap<OsString, (Vec<u8>, u64)> {
+    fs::read_dir(fixture.state_path().parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains("setup_state.json")
+        })
+        .map(|entry| {
+            let bytes = fs::read(entry.path()).unwrap();
+            let inode = fs::symlink_metadata(entry.path()).unwrap().ino();
+            (entry.file_name(), (bytes, inode))
+        })
+        .collect()
+}
+
+#[test]
+fn gh505_dry_run_never_publishes_checkpoint_before_probing() {
+    let fixture = FleetFixture::new(mixed_peers(), ALIAS);
+    fixture.capture_state_at_transport();
+    for _ in 0..2 {
+        let output = fixture.setup_with_options(false, &["--tailscale", "--dry-run"]);
+        assert_setup_no_hosts(&output);
+        assert_eq!(
+            fixture.attempted_transports(),
+            BTreeSet::from(["100.64.0.1".into(), "100.64.0.2".into()])
+        );
+        assert!(checkpoint_files(&fixture).is_empty());
+        // The old code wrote state before probing and deleted it afterward.
+        // Inspect the transport-time observation, not only final absence.
+        assert_eq!(
+            fs::read_dir(fixture.root.path().join("snapshots"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(
+            !fixture
+                .root
+                .path()
+                .join("config/cass/sources.toml")
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn gh505_dry_run_preserves_checkpoint_on_empty_discovery_and_failed_probes() {
+    for resume in [false, true] {
+        for (peers, aliases, bad_status) in [
+            (mullvad_peers(), "", false),
+            (mixed_peers(), ALIAS, false),
+            (mixed_peers(), "", true),
+        ] {
+            let fixture = FleetFixture::new(peers, aliases);
+            fixture.save_discovery(
+                Some(SetupDiscoveryMode::Tailscale),
+                &["100.90.0.1", "100.64.0.200"],
+            );
+            let mut saved: Value =
+                serde_json::from_slice(&fs::read(fixture.state_path()).unwrap()).unwrap();
+            saved["checkpoint_canary"] = json!("preserve unknown fields and formatting");
+            fs::write(
+                fixture.state_path(),
+                serde_json::to_vec_pretty(&saved).unwrap(),
+            )
+            .unwrap();
+            if bad_status {
+                fs::write(&fixture.status, "invalid status JSON").unwrap();
+            }
+            let before = checkpoint_files(&fixture);
+            let original = fs::read(fixture.state_path()).unwrap();
+            fixture.capture_state_at_transport();
+            let flags: &[&str] = if resume {
+                &["--dry-run"]
+            } else {
+                &["--tailscale", "--dry-run"]
+            };
+            let output = fixture.setup_with_options(resume, flags);
+            assert_setup_no_hosts(&output);
+            assert_eq!(checkpoint_files(&fixture), before);
+            let expected = if aliases.is_empty() {
+                BTreeSet::new()
+            } else {
+                BTreeSet::from(["100.64.0.1".into(), "100.64.0.2".into()])
+            };
+            assert_eq!(fixture.attempted_transports(), expected);
+            for host in expected {
+                assert_eq!(
+                    fs::read(fixture.root.path().join(format!("snapshots/{host}.json"))).unwrap(),
+                    original
+                );
+            }
+            assert_eq!(
+                fs::read_to_string(&fixture.status_calls).unwrap(),
+                "status --json\n"
+            );
+            assert!(
+                !fixture
+                    .root
+                    .path()
+                    .join("config/cass/sources.toml")
+                    .exists()
+            );
+        }
+    }
+}
+
+#[test]
+fn gh505_large_dry_run_refusal_does_not_create_or_replace_checkpoint() {
+    for resume in [false, true] {
+        for saved in [false, true] {
+            let fixture = FleetFixture::new(numbered_fleet_peers(65, 536), "");
+            if saved {
+                fixture.save_discovery(Some(SetupDiscoveryMode::Tailscale), &["100.64.0.200"]);
+            }
+            let before = checkpoint_files(&fixture);
+            let flags: &[&str] = if resume && saved {
+                &["--dry-run"]
+            } else {
+                &["--tailscale", "--dry-run"]
+            };
+            for _ in 0..2 {
+                let output = fixture.setup_with_options(resume, flags);
+                assert_large_fleet_rejected(&fixture, &output);
+                assert_eq!(checkpoint_files(&fixture), before);
+            }
+            assert_eq!(
+                fs::read_to_string(&fixture.status_calls).unwrap(),
+                "status --json\nstatus --json\n"
+            );
+        }
+    }
+}
+
+#[test]
+fn gh505_dry_run_resume_keeps_pending_phases_for_real_configuration() {
+    let fixture = FleetFixture::new(mixed_peers(), ALIAS);
+    // A persisted checkpoint after a successful probe is input to resume,
+    // not a replacement for the production probe implementation.
+    let mut probe = HostProbeResult::unreachable("workstation", "unused fixture error");
+    probe.reachable = true;
+    probe.error = None;
+    probe.cass_status = CassStatus::NotFound;
+    probe.detected_agents = vec![DetectedAgent {
+        agent_type: "claude_code".into(),
+        path: "~/.claude/projects".into(),
+        estimated_sessions: Some(1),
+        estimated_size_mb: Some(1),
+    }];
+    let state = SetupState {
+        discovery_complete: true,
+        discovered_hosts: 1,
+        discovered_host_names: vec!["workstation".into()],
+        discovery_mode: Some(SetupDiscoveryMode::Tailscale),
+        probing_complete: true,
+        probed_hosts: vec![probe],
+        current_operation: Some("ready for selection".into()),
+        ..Default::default()
+    };
+    fs::write(
+        fixture.state_path(),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    let before = checkpoint_files(&fixture);
+    for _ in 0..2 {
+        let output = fixture.run(&[
+            "sources",
+            "setup",
+            "--resume",
+            "--dry-run",
+            "--non-interactive",
+        ]);
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for expected in [
+            "Would install cass on 1 hosts",
+            "Would index sessions on 1 hosts",
+            "Configuration Preview",
+            "Dry run complete",
+        ] {
+            assert!(stdout.contains(expected), "{output:?}");
+        }
+        assert_eq!(checkpoint_files(&fixture), before);
+        assert!(fixture.attempted_transports().is_empty());
+        assert!(!fixture.status_calls.exists());
+        assert!(
+            !fixture
+                .root
+                .path()
+                .join("config/cass/sources.toml")
+                .exists()
+        );
+    }
+    // A real retry must still execute configuration, not treat its preview
+    // as a completed phase or lose the successful probe and start over.
+    let output = fixture.setup_with_options(true, &[]);
+    assert!(output.status.success(), "{output:?}");
+    let config =
+        SourcesConfig::load_from(&fixture.root.path().join("config/cass/sources.toml")).unwrap();
+    assert_eq!(config.sources.len(), 1);
+    assert_eq!(config.sources[0].name, "workstation");
+    assert_eq!(config.sources[0].host.as_deref(), Some("workstation"));
+    assert_eq!(config.sources[0].paths, vec!["~/.claude/projects"]);
+    assert!(!fixture.state_path().exists());
+    assert!(fixture.attempted_transports().is_empty());
+    assert!(!fixture.status_calls.exists());
+}
+
+#[test]
+fn gh505_dry_run_explicit_override_does_not_change_saved_discovery_mode() {
+    let fixture = FleetFixture::new(mixed_peers(), ALIAS);
+    fixture.save_discovery(Some(SetupDiscoveryMode::Tailscale), &["100.90.0.1"]);
+    let before = checkpoint_files(&fixture);
+    let output = fixture.setup_with_options(true, &["--dry-run", "--hosts", "100.64.0.9"]);
+    assert_setup_no_hosts(&output);
+    assert_eq!(checkpoint_files(&fixture), before);
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from(["100.64.0.9".into()])
+    );
+    assert!(!fixture.status_calls.exists());
+    fs::write(&fixture.transports, "").unwrap();
+    let output = fixture.setup_with_options(true, &[]);
+    assert_setup_no_hosts(&output);
+    assert_eq!(
+        fixture.attempted_transports(),
+        BTreeSet::from(["100.64.0.1".into(), "100.64.0.2".into()])
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.status_calls).unwrap(),
+        "status --json\n"
+    );
+}
+
+#[test]
+fn gh505_setup_invalid_config_stops_before_discovery_and_checkpoint_writes() {
+    for invalid in [
+        "[[sources]\n",
+        "[[sources]]\nname = \"local\"\ntype = \"ssh\"\nhost = \"existing\"\n",
+        "[[sources]]\nname = \"Existing\"\ntype = \"ssh\"\nhost = \"first\"\n\
+         [[sources]]\nname = \"existing\"\ntype = \"ssh\"\nhost = \"second\"\n",
+    ] {
+        for resume in [false, true] {
+            for dry_run in [false, true] {
+                let fixture = FleetFixture::new(mixed_peers(), ALIAS);
+                fixture.save_discovery(Some(SetupDiscoveryMode::Tailscale), &["100.64.0.9"]);
+                let checkpoint_before = checkpoint_files(&fixture);
+                let path = fixture.root.path().join("config/cass/sources.toml");
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, invalid).unwrap();
+                let inode = fs::symlink_metadata(&path).unwrap().ino();
+                let mut flags = vec!["--tailscale"];
+                if dry_run {
+                    flags.push("--dry-run");
+                }
+                let output = fixture.setup_with_options(resume, &flags);
+                assert!(!output.status.success(), "{output:?}");
+                let diagnostics = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(diagnostics.contains("Config error:"), "{output:?}");
+                assert!(!fixture.status_calls.exists());
+                assert!(fixture.attempted_transports().is_empty());
+                assert_eq!(checkpoint_files(&fixture), checkpoint_before);
+                assert_eq!(fs::read(&path).unwrap(), invalid.as_bytes());
+                assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), inode);
+                // Refusal must not publish a replacement, backup or temp file.
+                assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn gh505_setup_config_read_error_preserves_saved_progress() {
+    let fixture = FleetFixture::new(mixed_peers(), ALIAS);
+    fixture.save_discovery(Some(SetupDiscoveryMode::Tailscale), &["100.64.0.9"]);
+    let checkpoint_before = checkpoint_files(&fixture);
+    // A directory at the config path gives a deterministic read error even
+    // under root, where chmod-based permission tests would silently succeed.
+    let path = fixture.root.path().join("config/cass/sources.toml");
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join("keep"), b"not a configuration file").unwrap();
+    let output = fixture.setup_with_options(true, &[]);
+    assert!(!output.status.success(), "{output:?}");
+    let diagnostics = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostics.contains("Failed to read config file"),
+        "{output:?}"
+    );
+    assert_eq!(checkpoint_files(&fixture), checkpoint_before);
+    assert!(!fixture.status_calls.exists());
+    assert!(fixture.attempted_transports().is_empty());
+    assert!(path.is_dir());
+    assert_eq!(
+        fs::read(path.join("keep")).unwrap(),
+        b"not a configuration file"
+    );
+    assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+}
+
+#[test]
+fn gh505_setup_config_error_can_resume_after_repair_without_losing_sources() {
+    let fixture = FleetFixture::new(mixed_peers(), ALIAS);
+    // Resume input with completed probing/selection reaches configuration
+    // without substituting for the production SSH or configuration code.
+    let mut probe = HostProbeResult::unreachable("workstation", "unused fixture error");
+    probe.reachable = true;
+    probe.error = None;
+    probe.cass_status = CassStatus::NotFound;
+    probe.detected_agents = vec![DetectedAgent {
+        agent_type: "claude_code".into(),
+        path: "~/.claude/projects".into(),
+        estimated_sessions: Some(1),
+        estimated_size_mb: Some(1),
+    }];
+    let state = SetupState {
+        discovery_complete: true,
+        discovered_hosts: 1,
+        discovered_host_names: vec!["workstation".into()],
+        discovery_mode: Some(SetupDiscoveryMode::Tailscale),
+        probing_complete: true,
+        probed_hosts: vec![probe],
+        selection_complete: true,
+        selected_host_names: vec!["workstation".into()],
+        ..Default::default()
+    };
+    fs::write(
+        fixture.state_path(),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    let checkpoint_before = checkpoint_files(&fixture);
+    let path = fixture.root.path().join("config/cass/sources.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let invalid = b"# preserve the broken configuration for repair\n[[sources]\n";
+    fs::write(&path, invalid).unwrap();
+    let output = fixture.setup_with_options(true, &[]);
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(fs::read(&path).unwrap(), invalid);
+    assert_eq!(checkpoint_files(&fixture), checkpoint_before);
+    assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+
+    // The caller repairs the file; retry merges instead of replacing the
+    // existing source, path mappings, schedule and disabled-agent policy.
+    let repaired = r#"disabled_agents = ["openclaw"]
+
+[[sources]]
+name = "existing"
+type = "ssh"
+host = "operator@existing"
+paths = ["~/.codex/sessions"]
+sync_schedule = "daily"
+
+[[sources.path_mappings]]
+from = "/remote/projects"
+to = "/local/projects"
+agents = ["codex"]
+"#;
+    fs::write(&path, repaired).unwrap();
+    let before = SourcesConfig::load_from(&path).unwrap();
+    let output = fixture.setup_with_options(true, &[]);
+    assert!(output.status.success(), "{output:?}");
+    let after = SourcesConfig::load_from(&path).unwrap();
+    assert_eq!(after.sources.len(), 2);
+    assert_eq!(after.disabled_agents, before.disabled_agents);
+    assert_eq!(
+        serde_json::to_value(after.find_source("existing").unwrap()).unwrap(),
+        serde_json::to_value(before.find_source("existing").unwrap()).unwrap()
+    );
+    let added = after.find_source("workstation").unwrap();
+    assert_eq!(added.host.as_deref(), Some("workstation"));
+    assert_eq!(added.paths, vec!["~/.claude/projects"]);
+    let backups: Vec<_> = fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("sources.toml.backup.")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(fs::read(&backups[0]).unwrap(), repaired.as_bytes());
+    assert!(!fixture.state_path().exists());
+    assert!(!fixture.status_calls.exists());
+    assert!(fixture.attempted_transports().is_empty());
 }

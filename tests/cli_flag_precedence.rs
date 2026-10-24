@@ -426,6 +426,7 @@ fn index_result_fields(s: &str) -> Option<(bool, i64, String, bool)> {
 
 /// Whether the test runs as uid 0. Root bypasses file-permission checks, which
 /// makes the read-only gate vacuous, so it skips there.
+#[cfg(unix)]
 fn running_as_root() -> bool {
     std::process::Command::new("id")
         .arg("-u")
@@ -437,6 +438,7 @@ fn running_as_root() -> bool {
 }
 
 /// chmod a directory to `mode` (octal). Used to toggle a data dir read-only.
+#[cfg(unix)]
 fn set_dir_mode(dir: &std::path::Path, mode: u32) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
@@ -521,6 +523,7 @@ fn unmount_tmpfs(mnt: &std::path::Path) {
 /// files are removed before locking the dir so the failure reproduces the
 /// proven "cannot create index-run.lock" refusal. Skips as root (uid 0 bypasses
 /// directory permissions).
+#[cfg(unix)]
 #[test]
 #[serial]
 fn write_path_read_only_data_dir_with_existing_db_fails_closed() -> Result<(), String> {

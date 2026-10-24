@@ -363,7 +363,8 @@ fn failed_or_unwound_lease_releases_duplicates_without_reclaiming_scratch() -> R
             assert!(stopped.expect("error return must not unwind").is_err());
         }
         let inherited = inherited.context("the interrupted owner duplicated its descriptor")?;
-        let before = before_release.context("the owner recorded state before releasing its lease")?;
+        let before =
+            before_release.context("the owner recorded state before releasing its lease")?;
         assert_eq!(snapshot(data)?, before, "Drop must not publish or reclaim");
         let successor = lock_file(&data.join(ARTIFACT_LOCK))?;
         assert!(inherited.metadata()?.is_file());
@@ -372,7 +373,11 @@ fn failed_or_unwound_lease_releases_duplicates_without_reclaiming_scratch() -> R
                 .join(".backfill-reuse-Abandoned123")
                 .is_dir()
         );
-        assert_eq!(snapshot(data)?, before, "unlock must not publish or reclaim");
+        assert_eq!(
+            snapshot(data)?,
+            before,
+            "unlock must not publish or reclaim"
+        );
         drop(inherited);
         assert!(lock_file(&data.join(ARTIFACT_LOCK)).is_err());
         drop(successor);
@@ -408,7 +413,10 @@ fn inherited_prior_lease_does_not_interrupt_checkpoint_resume_and_publication() 
     let complete =
         indexer.run_backfill_batch(&rows(2..4), data, &mut manifest, plan("resume", 3, 2, true))?;
     assert!(complete.published);
-    assert!(inherited.metadata()?.is_file(), "the duplicate is still open");
+    assert!(
+        inherited.metadata()?.is_file(),
+        "the duplicate is still open"
+    );
     assert!(!checkpoint.index_path.exists());
     assert!(SemanticManifest::load(data)?.unwrap().checkpoint.is_none());
     let actual = VectorIndex::open_read_only(&complete.index_path)?;

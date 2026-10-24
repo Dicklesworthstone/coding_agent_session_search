@@ -1,6 +1,7 @@
 //! Codebuff source admission must protect canonical rows, search and raw copies.
 //! These tests run the real CASS CLI with the native GH511 time-of-day records.
 
+use coding_agent_search::model::types::Conversation;
 use coding_agent_search::raw_mirror::storage_summary;
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use serde_json::{Value, json};
@@ -10,6 +11,18 @@ use std::time::{Duration, UNIX_EPOCH};
 
 const PRIVATE: &str = "codebuffprivateproof9z";
 const PUBLIC: &str = "codebuffpublicproof7z";
+
+/// The archive's Codebuff conversations. On Windows the other connectors find
+/// the real profile (FOLDERID_Profile ignores USERPROFILE), so a host with its
+/// own agent history adds conversations these tests do not own.
+fn codebuff_conversations(storage: &SqliteStorage) -> Vec<Conversation> {
+    storage
+        .list_conversations(i64::MAX, 0)
+        .unwrap()
+        .into_iter()
+        .filter(|conversation| conversation.agent_slug == "codebuff")
+        .collect()
+}
 
 struct Fixture {
     home: tempfile::TempDir,
@@ -114,7 +127,7 @@ impl Fixture {
 
     fn assert_sources(&self, expected: &[&Path]) {
         let storage = SqliteStorage::open_readonly(&self.data().join("agent_search.db")).unwrap();
-        let rows = storage.list_conversations(100, 0).unwrap();
+        let rows = codebuff_conversations(&storage);
         let mut actual: Vec<_> = rows
             .iter()
             .map(|row| row.source_path.canonicalize().unwrap())
@@ -280,10 +293,22 @@ fn codebuff_exclusions_all_selected_inputs_never_fall_back_to_default_history() 
         let root = fixture.projects();
         fixture.index(mode, root.to_str().unwrap(), true);
         fixture.assert_sources(&[]);
-        assert!(!fixture.data().join("raw-mirror").exists());
+        // No raw copy of either chat. A Windows host's own agent history may
+        // still be mirrored: its connectors find the real profile.
+        let raw_mirror = fixture.data().join("raw-mirror");
+        for token in [PRIVATE, PUBLIC] {
+            assert!(
+                !raw_mirror.exists() || files_containing(&raw_mirror, token).is_empty(),
+                "{token} was mirrored"
+            );
+        }
         assert_unchanged(&snapshot);
         fixture.index(mode, "", false);
         fixture.assert_sources(&[&fixture.private, &fixture.public]);
+        assert!(
+            !files_containing(&raw_mirror, PUBLIC).is_empty(),
+            "positive byte-sweep control"
+        );
         assert_unchanged(&snapshot);
     }
 }
@@ -349,7 +374,7 @@ fn codebuff_metadata_watch_updates_workspace_without_reimporting_other_chats() {
                 let storage =
                     SqliteStorage::open_readonly(&fixture.data().join("agent_search.db")).unwrap();
                 let mut ids = BTreeMap::new();
-                for conversation in storage.list_conversations(100, 0).unwrap() {
+                for conversation in codebuff_conversations(&storage) {
                     let id = conversation.id.unwrap();
                     for message in storage.fetch_messages(id).unwrap() {
                         assert!(
@@ -406,8 +431,7 @@ fn codebuff_metadata_watch_updates_workspace_without_reimporting_other_chats() {
             fixture.assert_sources(&[&fixture.private, &fixture.public]);
             let storage =
                 SqliteStorage::open_readonly(&fixture.data().join("agent_search.db")).unwrap();
-            let conversations = storage.list_conversations(100, 0).unwrap();
-            assert_eq!(conversations.len(), 2);
+            assert_eq!(codebuff_conversations(&storage).len(), 2);
             drop(storage);
             let output = fixture
                 .command(mode, "")

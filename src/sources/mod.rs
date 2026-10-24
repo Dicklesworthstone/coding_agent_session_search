@@ -99,6 +99,11 @@ use wait_timeout::ChildExt;
 /// Canonical SSH stderr marker for host-key verification failures.
 pub(crate) const HOST_KEY_VERIFICATION_FAILED: &str = "Host key verification failed";
 
+/// Remote command for an SSH connectivity check. A restricted key's forced
+/// command, such as stock `rrsync -ro DIR`, refuses everything except rsync
+/// and exactly `true`, so the check must not run `echo` or a shell (GH #531).
+pub(crate) const SSH_CONNECTIVITY_PROBE_COMMAND: &str = "true";
+
 /// Build strict SSH CLI tokens with consistent trust policy.
 ///
 /// The returned vector contains full `ssh` argument tokens:

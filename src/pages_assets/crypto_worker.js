@@ -12,6 +12,14 @@ let currentDek = null;
 let activeUnlockGeneration = 0;
 let activeDecryptGeneration = 0;
 let argon2LoadPromise = null;
+let argon2DownloadController = null;
+let argon2RuntimeDownloadFailed = false;
+
+// A derivation/unwrap owns admission until it settles, even after cancellation.
+// Only the latest waiting unlock is retained; replaced credentials are scrubbed.
+let activeUnlockJob = null;
+let pendingUnlockJob = null;
+const MAX_UNLOCK_SECRET_BYTES = 64 * 1024;
 
 // Only one full plaintext database may be owned by the decrypt pipeline.
 // A superseding request replaces the one waiting job, not a promise-chain queue.
@@ -19,6 +27,11 @@ let argon2LoadPromise = null;
 let activeDatabaseJob = null;
 let pendingDatabaseJob = null;
 const DATABASE_CHUNK_DOWNLOAD_TIMEOUT_MS = 120_000;
+// Credits include completed ciphertext awaiting ordered consumption and the
+// current chunk. Reserve two copies for the bounded streaming concatenation.
+// A format-maximum chunk can exceed this prefetch budget: it stays serial.
+const DATABASE_PREFETCH_MAX_CHUNKS = 4;
+const DATABASE_PREFETCH_BUFFER_BYTES = 32 * 1024 * 1024;
 
 const MAX_ARCHIVE_CHUNK_SIZE = 32 * 1024 * 1024;
 const MAX_ARCHIVE_CHUNKS = 0xffffffff;
@@ -109,15 +122,26 @@ function clearCurrentDek() {
 }
 
 function beginUnlockAttempt() {
-  activeUnlockGeneration += 1;
+  invalidateUnlockAttempts();
   invalidateDecryptAttempts();
-  clearCurrentDek();
   return activeUnlockGeneration;
 }
 
 function invalidateUnlockAttempts() {
   activeUnlockGeneration += 1;
   clearCurrentDek();
+  argon2DownloadController?.abort(new Error("Unlock request was superseded"));
+  if (pendingUnlockJob) {
+    const pending = pendingUnlockJob;
+    pendingUnlockJob = null;
+    pending.secret.fill(0);
+    pending.secret = null;
+    pending.cfg = null;
+    pending.reject(new Error("Unlock request was superseded"));
+  }
+  // Native KDF/WebCrypto promises are not preemptible. Keep the active slot
+  // until finally, but do not retain a readable source credential needlessly.
+  activeUnlockJob?.secret?.fill(0);
 }
 
 function ensureCurrentUnlockAttempt(generation) {
@@ -185,17 +209,104 @@ function commitUnlockResult(generation, unwrappedDek, requestId) {
 }
 
 /**
+ * Bound queued credentials separately from native KDF memory. Strings received
+ * from the UI cannot be zeroized; jobs own mutable UTF-8/secret bytes instead.
+ */
+function unlockSecret(kind, value) {
+  let bytes = null;
+  try {
+    if (kind === "password") {
+      if (typeof value !== "string" || value.trim().length === 0) {
+        throw new Error("Please enter a password");
+      }
+      // UTF-8 is at least one byte per UTF-16 unit for valid scalar input.
+      if (value.length > MAX_UNLOCK_SECRET_BYTES) {
+        throw new Error("Unlock credential exceeds the 64 KiB byte limit");
+      }
+      bytes = new TextEncoder().encode(value);
+    } else if (typeof value === "string") {
+      // Preserve URL-safe base64 and the historical literal-text fallback.
+      if (value.length > 4 * Math.ceil(MAX_UNLOCK_SECRET_BYTES / 3)) {
+        throw new Error("Unlock credential exceeds the 64 KiB byte limit");
+      }
+      try {
+        bytes = base64ToArray(value);
+      } catch {
+        bytes = new TextEncoder().encode(value);
+      }
+    } else if (value instanceof Uint8Array) {
+      if (value.byteLength > MAX_UNLOCK_SECRET_BYTES) {
+        throw new Error("Unlock credential exceeds the 64 KiB byte limit");
+      }
+      bytes = new Uint8Array(value);
+    }
+    if (!bytes || (kind === "recovery" && bytes.byteLength < MIN_RECOVERY_SECRET_BYTES)) {
+      throw new Error("Recovery secret must contain at least 24 bytes");
+    }
+    if (bytes.byteLength > MAX_UNLOCK_SECRET_BYTES) {
+      throw new Error("Unlock credential exceeds the 64 KiB byte limit");
+    }
+    return bytes;
+  } catch (error) {
+    bytes?.fill(0);
+    throw error;
+  }
+}
+
+function handleUnlockPassword(password, cfg, requestId) {
+  return enqueueUnlock("password", password, cfg, requestId);
+}
+
+function handleUnlockRecovery(recoverySecret, cfg, requestId) {
+  return enqueueUnlock("recovery", recoverySecret, cfg, requestId);
+}
+
+function enqueueUnlock(kind, credential, cfg, requestId) {
+  // Even a malformed replacement revokes the prior session and waiting job.
+  const generation = beginUnlockAttempt();
+  validateSupportedPayloadFormat(cfg);
+  const secret = unlockSecret(kind, credential);
+  return new Promise((resolve, reject) => {
+    pendingUnlockJob = { kind, generation, secret, cfg, requestId, resolve, reject };
+    startNextUnlockJob();
+  });
+}
+
+function startNextUnlockJob() {
+  if (activeUnlockJob || !pendingUnlockJob) return;
+  const job = pendingUnlockJob;
+  pendingUnlockJob = null;
+  activeUnlockJob = job;
+  void runUnlockJob(job);
+}
+
+async function runUnlockJob(job) {
+  try {
+    ensureCurrentUnlockAttempt(job.generation);
+    if (job.kind === "password") {
+      await runPasswordUnlock(job);
+    } else {
+      await runRecoveryUnlock(job);
+    }
+    job.resolve();
+  } catch (error) {
+    job.reject(error);
+  } finally {
+    job.secret.fill(0);
+    job.secret = null;
+    job.cfg = null;
+    activeUnlockJob = null;
+    startNextUnlockJob();
+  }
+}
+
+/**
  * Handle password-based unlock
  */
-async function handleUnlockPassword(password, cfg, requestId) {
-  const generation = beginUnlockAttempt();
+async function runPasswordUnlock(job) {
+  const { generation, secret: password, cfg, requestId } = job;
   let committed = false;
   try {
-    validateSupportedPayloadFormat(cfg);
-    if (typeof password !== "string" || password.trim().length === 0) {
-      throw new Error("Please enter a password");
-    }
-
     const passwordSlots = cfg.key_slots.filter(
       (slot) => slot.slot_type === "password" && isValidKeySlotMetadata(slot),
     );
@@ -207,7 +318,9 @@ async function handleUnlockPassword(password, cfg, requestId) {
 
     for (const slot of passwordSlots) {
       ensureCurrentUnlockAttempt(generation);
-      const kek = await deriveKekFromPassword(password, slot);
+      const kek = await deriveKekFromPassword(password, slot, () => {
+        ensureCurrentUnlockAttempt(generation);
+      });
       let unwrappedDek = null;
       try {
         ensureCurrentUnlockAttempt(generation);
@@ -240,13 +353,10 @@ async function handleUnlockPassword(password, cfg, requestId) {
 /**
  * Handle recovery secret-based unlock
  */
-async function handleUnlockRecovery(recoverySecret, cfg, requestId) {
-  const generation = beginUnlockAttempt();
+async function runRecoveryUnlock(job) {
+  const { generation, secret: secretBytes, cfg, requestId } = job;
   let committed = false;
-  let secretBytes = null;
   try {
-    validateSupportedPayloadFormat(cfg);
-
     const recoverySlots = cfg.key_slots.filter(
       (slot) => slot.slot_type === "recovery" && isValidKeySlotMetadata(slot),
     );
@@ -255,19 +365,6 @@ async function handleUnlockRecovery(recoverySecret, cfg, requestId) {
     }
 
     self.postMessage({ type: "PROGRESS", phase: "Deriving key...", percent: 10, requestId });
-
-    if (typeof recoverySecret === "string") {
-      try {
-        secretBytes = base64ToArray(recoverySecret);
-      } catch {
-        secretBytes = new TextEncoder().encode(recoverySecret);
-      }
-    } else if (recoverySecret instanceof Uint8Array) {
-      secretBytes = new Uint8Array(recoverySecret);
-    }
-    if (!secretBytes || secretBytes.byteLength < MIN_RECOVERY_SECRET_BYTES) {
-      throw new Error("Recovery secret must contain at least 24 bytes");
-    }
 
     for (const slot of recoverySlots) {
       ensureCurrentUnlockAttempt(generation);
@@ -305,24 +402,40 @@ async function handleUnlockRecovery(recoverySecret, cfg, requestId) {
 /**
  * Derive KEK from password using Argon2id
  */
-async function deriveKekFromPassword(password, slot) {
+async function deriveKekFromPassword(password, slot, checkCurrent = () => {}) {
   const params = slot.argon2_params;
   const salt = base64ToArray(slot.salt);
-  const passwordBytes = new TextEncoder().encode(password);
+  // Keep the job's original bytes intact for fallback through password slots.
+  const passwordBytes = typeof password === "string"
+    ? new TextEncoder().encode(password) : new Uint8Array(password);
   try {
     if (!self.argon2) {
       await loadArgon2();
     }
+    checkCurrent();
 
-    const result = await self.argon2.hash({
-      pass: passwordBytes,
-      salt,
-      time: params.iterations,
-      mem: params.memory_kb,
-      parallelism: params.parallelism,
-      hashLen: 32,
-      type: self.argon2.ArgonType.Argon2id,
-    });
+    let result;
+    try {
+      result = await self.argon2.hash({
+        pass: passwordBytes,
+        salt,
+        time: params.iterations,
+        mem: params.memory_kb,
+        parallelism: params.parallelism,
+        hashLen: 32,
+        type: self.argon2.ArgonType.Argon2id,
+      });
+    } catch (error) {
+      if (argon2RuntimeDownloadFailed) {
+        // The vendor caches a rejected loadModule promise. Retire that API only
+        // after its failed call drains, so the next admitted unlock can retry.
+        // No WASM module was initialized when the binary fetch failed.
+        argon2RuntimeDownloadFailed = false;
+        argon2LoadPromise = null;
+        self.argon2 = null;
+      }
+      throw error;
+    }
     if (!(result?.hash instanceof Uint8Array) || result.hash.byteLength !== 32) {
       result?.hash?.fill?.(0);
       throw new Error("Argon2 returned an invalid key");
@@ -457,10 +570,14 @@ async function runDatabaseJob(job) {
 }
 
 async function decryptDatabase(job) {
-  const { generation, cfg, requestId, requestDek, controller } = job;
+  const { cfg, requestId, requestDek, controller } = job;
   let dbBytes = null;
   let baseNonce = null;
   let exportId = null;
+  const scrubDatabase = () => {
+    if (dbBytes?.byteLength) dbBytes.fill(0);
+  };
+  controller.signal.addEventListener("abort", scrubDatabase, { once: true });
   try {
     if (requestDek.byteLength !== 32) {
       throw new Error("Invalid data encryption key length");
@@ -469,7 +586,7 @@ async function decryptDatabase(job) {
     const totalChunks = payload.chunk_count;
     baseNonce = base64ToArray(cfg.base_nonce);
     exportId = base64ToArray(cfg.export_id);
-    ensureCurrentDecryptAttempt(generation);
+    checkDatabaseJob(job);
     dbBytes = new Uint8Array(payload.total_plaintext_size);
     job.dbBytes = dbBytes;
 
@@ -480,7 +597,7 @@ async function decryptDatabase(job) {
     const dekKey = await crypto.subtle.importKey("raw", requestDek, { name: "AES-GCM" }, false, [
       "decrypt",
     ]);
-    ensureCurrentDecryptAttempt(generation);
+    checkDatabaseJob(job);
 
     // Decrypt and decompress each chunk. Rust writes one independent deflate
     // stream per encrypted chunk, so concatenating compressed streams before
@@ -488,25 +605,11 @@ async function decryptDatabase(job) {
     let totalDecrypted = 0;
     let totalCiphertext = 0;
 
-    for (let i = 0; i < totalChunks; i++) {
-      const chunkName = `chunk-${String(i).padStart(5, "0")}.bin`;
-      const expectedChunkPath = `payload/${chunkName}`;
-      if (payload.files[i] !== expectedChunkPath) {
-        throw new Error(`Invalid payload file entry ${i}: expected ${expectedChunkPath}`);
-      }
-      const chunkUrl = `./payload/${chunkName}`;
-
-      let encryptedChunk = null;
+    for await (const { index: i, bytes: encryptedChunk } of prefetchDatabaseChunks(payload, controller)) {
       let chunkNonce = null;
       let aad = null;
       try {
-        encryptedChunk = await fetchDatabaseChunk(
-          chunkUrl,
-          maxCiphertextChunkSize(payload.chunk_size),
-          `encrypted chunk ${i}`,
-          controller.signal,
-        );
-        ensureCurrentDecryptAttempt(generation);
+        checkDatabaseJob(job);
         totalCiphertext += encryptedChunk.byteLength;
         if (
           !Number.isSafeInteger(totalCiphertext) ||
@@ -532,10 +635,10 @@ async function decryptDatabase(job) {
         );
         const compressedChunk = new Uint8Array(decrypted);
         try {
-          ensureCurrentDecryptAttempt(generation);
+          checkDatabaseJob(job);
           const plaintext = await decompressDeflate(compressedChunk, payload.chunk_size);
           try {
-            ensureCurrentDecryptAttempt(generation);
+            checkDatabaseJob(job);
             const nextTotal = totalDecrypted + plaintext.byteLength;
             if (!Number.isSafeInteger(nextTotal) || nextTotal > payload.total_plaintext_size) {
               throw new Error("Decrypted payload exceeds its declared total size");
@@ -558,14 +661,17 @@ async function decryptDatabase(job) {
           requestId,
         });
       } catch (error) {
+        // Cancellation may scrub ciphertext while a native call is pending.
+        // Keep the first transfer/cancellation cause, not a secondary AES error.
+        checkDatabaseJob(job);
         throw new Error(`Failed to decrypt chunk ${i}: ${error?.message || String(error)}`);
       } finally {
-        encryptedChunk?.fill(0);
         chunkNonce?.fill(0);
         aad?.fill(0);
       }
     }
 
+    checkDatabaseJob(job);
     if (totalCiphertext !== payload.total_compressed_size) {
       throw new Error(
         `Encrypted payload size mismatch: got ${totalCiphertext}, expected ${payload.total_compressed_size}`,
@@ -578,7 +684,7 @@ async function decryptDatabase(job) {
     }
 
     self.postMessage({ type: "PROGRESS", phase: "Loading database...", percent: 95, requestId });
-    ensureCurrentDecryptAttempt(generation);
+    checkDatabaseJob(job);
 
     const dbSize = dbBytes.byteLength;
     // dbBytes is the exact preallocated database buffer. Transfer it
@@ -595,12 +701,111 @@ async function decryptDatabase(job) {
       [transfer],
     );
   } finally {
+    controller.signal.removeEventListener("abort", scrubDatabase);
     requestDek.fill(0);
     baseNonce?.fill(0);
     exportId?.fill(0);
     if (dbBytes?.byteLength) {
       dbBytes.fill(0);
     }
+  }
+}
+
+function checkDatabaseJob(job) {
+  ensureCurrentDecryptAttempt(job.generation);
+  throwIfAborted(job.controller.signal);
+}
+
+/**
+ * Keep a small, byte-admitted window of encrypted transfers ahead of the single
+ * decrypt/decompress consumer. A completed response still occupies its slot:
+ * fast later chunks cannot accumulate an archive behind a slow first chunk.
+ * All tasks settle without rejecting, so out-of-order failures are observed
+ * immediately and abort siblings rather than becoming unhandled rejections.
+ */
+async function* prefetchDatabaseChunks(payload, controller) {
+  const { signal } = controller;
+  const maximumBytes = Math.min(
+    maxCiphertextChunkSize(payload.chunk_size), payload.total_compressed_size,
+  );
+  const width = Math.min(
+    DATABASE_PREFETCH_MAX_CHUNKS,
+    Math.max(1, Math.floor(DATABASE_PREFETCH_BUFFER_BYTES / (2 * maximumBytes))),
+  );
+  const slots = new Map();
+  let next = 0;
+  let downloadedBytes = 0;
+  const scrub = () => {
+    for (const slot of slots.values()) {
+      slot.bytes?.fill(0);
+      slot.bytes = null;
+    }
+  };
+  signal.addEventListener("abort", scrub, { once: true });
+
+  const fill = () => {
+    while (!signal.aborted && next < payload.chunk_count && slots.size < width) {
+      const index = next++;
+      const path = `payload/chunk-${String(index).padStart(5, "0")}.bin`;
+      const slot = { bytes: null, task: null };
+      // Insert before starting asynchronous work. The consumer releases this
+      // credit only after authentication, decompression and copying complete.
+      slots.set(index, slot);
+      slot.task = (async () => {
+        let bytes = null;
+        try {
+          if (payload.files[index] !== path) {
+            throw new Error(`Invalid payload file entry ${index}: expected ${path}`);
+          }
+          bytes = await fetchDatabaseChunk(
+            `./${path}`, maximumBytes, `encrypted chunk ${index}`, signal,
+          );
+          throwIfAborted(signal);
+          downloadedBytes += bytes.byteLength;
+          if (!Number.isSafeInteger(downloadedBytes) || downloadedBytes > payload.total_compressed_size) {
+            throw new Error("Encrypted payload exceeds its declared total size");
+          }
+          slot.bytes = bytes;
+          bytes = null; // Ownership moves to the bounded window until consumed.
+        } catch (error) {
+          // Abort also scrubs completed siblings and accumulated plaintext. A
+          // late native call still holds the existing full-database job slot.
+          if (!signal.aborted) controller.abort(error);
+        } finally {
+          bytes?.fill(0);
+        }
+      })();
+    }
+  };
+
+  try {
+    fill();
+    for (let index = 0; index < payload.chunk_count; index++) {
+      throwIfAborted(signal);
+      const slot = slots.get(index);
+      await slot.task;
+      throwIfAborted(signal);
+      try {
+        yield { index, bytes: slot.bytes };
+      } finally {
+        slot.bytes?.fill(0);
+        slot.bytes = null;
+        slots.delete(index);
+      }
+      fill();
+    }
+  } finally {
+    // for-await closes us on a crypto/DEFLATE failure as well as supersession.
+    // Cancel before awaiting: the bounded I/O helper disposes even late values
+    // without waiting for an arbitrary underlying stream's cancel promise.
+    if (slots.size > 0 && !signal.aborted) {
+      controller.abort(new Error("Archive download stopped before completion"));
+    }
+    scrub();
+    await Promise.all(Array.from(slots.values(), (slot) => slot.task));
+    scrub();
+    slots.clear();
+    signal.removeEventListener("abort", scrub);
   }
 }
 
@@ -1135,11 +1340,21 @@ async function loadArgon2() {
   argon2LoadPromise = (async () => {
     self.loadArgon2WasmBinary = async () => {
       const wasmUrl = new URL("./vendor/argon2.wasm", self.location.href);
-      const response = await fetch(wasmUrl);
-      if (!response.ok) {
-        throw new Error(`Argon2 WASM request failed with status ${response.status}`);
+      const controller = new AbortController();
+      argon2DownloadController = controller;
+      try {
+        if (activeUnlockJob) ensureCurrentUnlockAttempt(activeUnlockJob.generation);
+        // Reuse bounded streaming I/O, late-response disposal and the 120-second
+        // header/body deadline. Do not race non-cancellable KDF execution itself.
+        return await fetchDatabaseChunk(
+          wasmUrl, MAX_ARGON2_WASM_SIZE, "Argon2 WASM runtime", controller.signal,
+        );
+      } catch (error) {
+        argon2RuntimeDownloadFailed = true;
+        throw error;
+      } finally {
+        if (argon2DownloadController === controller) argon2DownloadController = null;
       }
-      return readResponseBytesBounded(response, MAX_ARGON2_WASM_SIZE, "Argon2 WASM runtime");
     };
     self.loadArgon2WasmModule = () => {
       importScripts("./vendor/argon2-wasm.js");
@@ -1184,7 +1399,7 @@ function base64ToArray(base64) {
   const normalized = normalizeBase64(base64);
   const binary = atob(normalized);
   const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
+  for (let i = 0; i < bytes.length; i++) {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;

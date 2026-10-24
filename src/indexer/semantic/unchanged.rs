@@ -9,7 +9,6 @@
 //! promoted or repaired by this optimization.
 
 use super::engine::{self, SemanticBackfillBatchOutcome, SemanticBackfillStoragePlan};
-use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 use crate::indexer::semantic_progress::{
     SemanticProgressEvent, SemanticProgressFields, SemanticProgressSink,
 };
@@ -127,7 +126,8 @@ where
     }
     // Borrow IDs from the retained read-only image instead of duplicating all
     // strings or retaining canonical message bodies. Visit vectors one at a time.
-    let mut remaining = HashSet::with_capacity(index.record_count());
+    let mut remaining = HashSet::new();
+    remaining.try_reserve(index.record_count())?;
     for record in 0..index.record_count() {
         engine.check_external_cancelled()?;
         if !remaining.insert(index.doc_id_at(record)?) {
@@ -147,36 +147,20 @@ where
             ..Default::default()
         },
     );
-    let mut changed = false;
-    let mut visited = 0u64;
-    engine::visit_packet_embedding_inputs_from_storage(storage, |input| {
-        engine.check_external_cancelled()?;
-        if let Some(id) = engine::semantic_doc_id_for_input(&input) {
-            visited = visited.saturating_add(1);
-            // A duplicate canonical ID also fails: it was already removed.
-            changed |= !remaining.remove(id.as_str());
-            if visited.is_multiple_of(1024) {
-                sink.emit(
-                    SemanticProgressEvent::PacketReplayProgress,
-                    SemanticProgressFields {
-                        rows_processed: Some(visited),
-                        rows_total: Some(artifact.doc_count),
-                        ..Default::default()
-                    },
-                );
-            }
-        }
-        Ok(())
-    })?;
+    let (comparison, coverage) =
+        scan::compare_with_coverage(storage, &mut remaining, sink, artifact.doc_count, || {
+            engine.check_external_cancelled()
+        })?;
+    tracing::debug!(
+        visited = comparison.visited,
+        matches = comparison.matches,
+        "compared canonical replay with retained semantic identities"
+    );
     engine.check_external_cancelled()?;
-    // Conversation coverage is independent of passage cardinality. Do not
-    // preserve stale coverage counters just because a message moved parents.
-    let (conversations, last_offset): (i64, i64) = storage.raw().query_row_map(
-        "SELECT COUNT(*), COALESCE(MAX(c.id), 0) FROM conversations c
-         WHERE EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id)",
-        &[] as &[ParamValue],
-        |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-    )?;
+    // Replay already observed every nonempty canonical parent. Reuse that
+    // exact coverage instead of running another archive-wide query/probe pass.
+    // Partial or mismatching replay supplies no coverage. Keep all final file
+    // and cancellation fences before accepting this receipt or a cache miss.
     checkpoint()?;
     engine.check_external_cancelled()?;
     // Detect mutation across the entire proof, including WAL-only commits,
@@ -189,10 +173,10 @@ where
             && stamp(&pointer_path)?.is_none(),
         "archive or semantic artifacts changed during unchanged proof; reload and retry"
     );
-    if changed
-        || !remaining.is_empty()
-        || u64::try_from(conversations).ok() != Some(artifact.conversation_count)
-    {
+    let Some((conversations, last_offset)) = coverage else {
+        return Ok(None);
+    };
+    if conversations != artifact.conversation_count {
         return Ok(None);
     }
     // A cancelled proof cannot renew its skip receipt or report completion.
@@ -300,3 +284,4 @@ mod tests;
 mod cancellation_tests;
 
 mod cache;
+mod scan;

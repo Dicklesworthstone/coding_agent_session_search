@@ -16,15 +16,40 @@ identity, acknowledgement of private content, and a **new** output path. Reuse
 that identity for subsequent exports of the same archive. Do not use a pathname
 as identity. Receipts are JSON on stdout; failures are JSON on stderr.
 
+Current exports default to **wire format version 3**, which preserves the
+database's AUTOINCREMENT allocation history as well as its canonical rows.
+Versions 2 and 3 support a complete encoded logical row up to 256 MiB by splitting
+large rows into physical JSONL frames of at most 8 MiB each. This binary also
+reads, verifies and restores versions 1 and 2 under their original contracts.
+
+| Export selection | Complete encoded row limit | Allocation history |
+|---|---|---|
+| Default, or `--format-version 3` | 256 MiB | Preserved and authenticated |
+| `--format-version 2` | 256 MiB | Omitted under the original v2 contract |
+| `--format-version 1` | 8 MiB | Omitted under the original v1 contract |
+
+Every version keeps the 8 MiB physical-frame limit. Use an explicit legacy
+version only when required by an older reader. It cannot preserve the historical
+AUTOINCREMENT state of deleted rows; restoring that archive can reuse their IDs.
+Legacy verification and identical-import comparisons retain their original
+digests, which do not check allocation history. A binary without v3 support
+refuses a v3 archive even when all its rows are small. The receipt's
+`schema_version` reports the wire version actually exported or read; the header's
+separate `storage_schema_version` identifies the canonical database schema.
+An oversized row is refused without publishing a partial archive.
+
 Export opens FrankenSQLite read-only and holds one transaction across schema
-inspection and all table scans. It does not migrate, repair, checkpoint, acquire
-models, or update source export metadata. Physical logical tables are streamed
-one row at a time; the known derived `fts_messages` virtual table and its exact
-FTS5 shadow names, and SQLite internal tables, are omitted. Other prefix-sharing
-tables are not discarded. Unknown virtual tables and unkeyed tables are refused
-rather than silently losing data. Canonical schemas with unsupported identifiers,
-key types, or oversized rows require an explicit format extension; they are not
-truncated.
+inspection, allocation-state capture and all table scans. It does not migrate,
+repair, checkpoint, acquire models, or update source export metadata. Physical
+logical tables are streamed one row at a time. The known derived `fts_messages`
+virtual table, its exact FTS5 shadow names, and SQLite internal tables are omitted
+from the table stream.
+Version 3 separately records the `sqlite_sequence` state of every declared
+AUTOINCREMENT table in its bounded header. Other prefix-sharing tables are not
+discarded. Unknown virtual tables and unkeyed tables are refused rather than
+silently losing data. Unsupported identifiers, key types, and rows
+exceeding the 256 MiB encoded logical-row limit are refused explicitly. Export
+never truncates them or substitutes references to external provider files.
 
 The destination uses a separate adjacent lock, with a five-second lock
 acquisition deadline. An export is written to a private temporary file in the
@@ -33,6 +58,43 @@ before no-clobber publication. An existing output is never replaced. Persistent
 lock files prevent competing processes from locking different inodes. These
 controls do not impose a wall-clock deadline on database opening or scanning.
 Offline verification rejects special files and symlinks before reading JSONL.
+
+### Diagnosing an export failure
+
+Export errors identify the operation that failed. A row conversion, validation
+or output-write failure identifies the logical table and its **one-based row
+position in primary-key order**. When the table has a single integer primary key,
+the diagnostic also includes that column and value, for example
+`logical table messages, row 1025 (id=5128)`. A row position is not a message ID.
+Text and BLOB keys, message bodies and metadata values are never included.
+
+The reason appears in the JSON error's `message`, without requiring debug logs.
+Database-read errors include the FrankenSQLite error class and numeric code,
+plus the number of complete rows already written for that table. I/O errors
+report the error kind and OS code when available. Database page numbers and
+short-read byte counts may also be reported; arbitrary engine and I/O message
+payloads are withheld because they can contain private data. The original typed
+causes remain available to the exit-code classifier, so a busy database or a
+failed read is not mislabeled as an unsupported logical record.
+
+The current 256 MiB limit applies to **one complete encoded logical row**,
+including all its cells, JSON framing, escaping, base64 expansion and the final
+newline. Each physical frame remains bounded to 8 MiB. A collection can be much
+larger than either limit; a raw text field below 256 MiB can still exceed the
+logical-row limit when combined with the other cells and encoding overhead.
+The early payload check is only a lower bound; the bounded encoder decides
+whether the logical row actually fits. A row beyond that limit fails explicitly
+with its table, row and limit. Export never skips or shortens it. SQLite TEXT
+containing invalid UTF-8 is also refused instead of silently substituting
+replacement characters in a purportedly lossless backup. Version 1 inputs retain
+their original 8 MiB limit on a complete encoded row.
+
+An error after substantial streaming can therefore identify a single
+unsupported row. It does not make the already written prefix a valid backup.
+Failures before publication discard the private stage and leave no new final
+archive; the persistent destination lock file is expected. Verification must
+succeed and the completion receipt must be emitted before treating an export
+as successful.
 
 ## Search and read a backup without restoring it
 
@@ -105,9 +167,12 @@ fails. Selected orphan relationships or ambiguous view coordinates fail rather
 than falling back to a similarly named session on another machine.
 
 These are sequential scans, not indexed lookups: work grows with backup size
-and each page scans again. Retained application state is bounded by one 8 MiB
-wire record plus the page/context limits, with a 2 MiB encoded-response ceiling.
-This is not a measured whole-process RSS or wall-clock guarantee. No model,
+and each page scans again. Decoding and validation retain state proportional to
+one logical row, whose canonical encoding is at most 256 MiB in version 2, plus
+bounded frame, encoding and page/context buffers. Physical JSONL frames remain
+at most 8 MiB, and the encoded-response ceiling remains 2 MiB. The 64 KiB complete
+view window is unchanged even when an unselected row is larger. These are not
+measured whole-process RSS or wall-clock guarantees. No model,
 database, profile, index or provider file is created or opened by these commands.
 They report `content_source: "logical_archive"`, not canonical-database access.
 `integrity_verified` means the complete wire checksum/count/order contract
@@ -135,24 +200,62 @@ Rows are individually bound as typed SQL parameters using one prepared INSERT
 per table. No exported path is used as a write destination and no URL or provider
 source is fetched. Initializer seeds are removed only from the new private
 replay database. Trusted initializer triggers are suspended during replay and
-reinstated afterward, avoiding duplicate derived writes. Input batches are
-limited to 128 records or 16 MiB of consumed JSONL, including whitespace,
-whichever comes first. Batch commits are never exposed as a valid partial
-restore: the complete stream, footer, counts, digest, canonical schema metadata,
-foreign keys and database integrity must all pass first.
+reinstated afterward, avoiding duplicate derived writes. A batch rolls over
+before the next logical record would exceed 128 records or 16 MiB of consumed
+JSONL, including whitespace and continuation framing. One logical row cannot be
+split across database inserts: an admitted row larger than the byte budget is
+processed in its own batch and may exceed 16 MiB. Its canonical encoding still
+must fit the 256 MiB logical-row limit; continuation transport adds base64 and
+framing overhead. A continuation group counts as one logical record. Batch
+commits are never exposed as a valid partial restore: the complete stream,
+footer, counts, digest, canonical schema metadata, foreign keys and database
+integrity must all pass first.
 
-Replay retains the canonical WAL writer policy. A journal-mode change or clean
-close does not by itself prove a self-contained database. After all private
-batches commit and validate, parameterized `VACUUM INTO` materializes a separate
-publication image containing the committed logical database. The replay files
-are never relabelled as a complete image, and their sidecars are not discarded
-to manufacture a successful check. Allow disk space for both the replay database
+Version 3 also checks the header's AUTOINCREMENT-table inventory against the
+canonical schema. After all rows are replayed, it installs their authenticated
+allocation state inside the private database: a saved integer remains exact,
+and an absent `sqlite_sequence` row remains absent. This happens after row
+insertion because inserting explicit IDs can advance those counters. In
+particular, deleting a highest ID or emptying a table before export does not
+reset future allocations after restore. Versions 1 and 2 cannot supply that
+history and retain their original row-only restoration contract.
+
+Before publication or an identical-retry success, the migration ledger and
+`meta.schema_version` must agree with the admitted storage version. Every active
+initializer migration through that version must have a ledger entry: ordinary
+storage opening replays a missing intermediate migration even when the latest
+version is present. Such a replay can overwrite restored canonical state.
+Fresh histories beginning at v13 and legacy histories retaining v1 through v12
+are both accepted. Missing steps are reported by version without printing
+historical migration names or message contents, and are never repaired during
+backup restoration or comparison.
+
+Restore failures retain their database cause and report the failed operation,
+including batch boundaries and verification probes. An insertion failure also
+identifies the logical record, table, one-based table row and single integer
+primary key when available. These diagnostics exclude text/BLOB keys, message
+bodies, constraint payloads and arbitrary engine messages. Database I/O and busy
+failures retain their retryable classes. A failed integrity-query read supplies
+no integrity verdict; it is reported as a failed probe rather than as proof of
+broken relationships. The same policy applies to reviewed migrations and
+existing-destination comparisons.
+
+Replay retains the canonical WAL writer policy. After all private batches commit
+and validate, the engine's verified page-backup API checkpoints the private
+replay database and copies its committed image to a new publication candidate.
+The pinned engine copies with a fixed 64 KiB buffer and hashes images one page
+at a time. This avoids the whole-database hydration of its `VACUUM INTO` path.
+Only the private replay database is checkpointed; the input and the user's live
+source database are never passed to this API. The replay files are never
+relabelled as a complete image, and their sidecars are not discarded to
+manufacture a successful check. Allow disk space for both the replay database
 and its sidecars and the separate publication image during restoration.
 
 Import rejects content-bearing sidecars beside the image, closes the writer,
 then reopens that image read-only. It checks persisted foreign keys and integrity
-and re-exports the actual typed rows to a digest sink. Its digest must equal the
-input completion. This catches storage-affinity conversions, missing writes and
+and re-exports the actual typed rows, plus v3 allocation state, to a digest sink
+using the input's admitted wire version. Its digest must equal the input
+completion. This catches storage-affinity conversions, missing writes and
 schema side effects that input-only verification would miss. Sidecar absence is
 checked again after closing the reader. Only this synced image is published,
 using a same-filesystem hard link that cannot replace an existing destination;
@@ -190,6 +293,16 @@ other than `agent_search.db` is rejected **before** restoration: the normal
 input outside the destination directory because index, lock and checkpoint
 names there belong to maintenance, not interchange storage. The output path,
 not an ambient `CASS_DATA_DIR` or export-source `--db`, selects this profile.
+
+Indexed recovery also checks file identity before canonical restoration and
+again before rebuilding. Direct profile files and the entire lexical index
+tree, including staging and retained generations, must not contain symlinks,
+reparse points, special files, or hard links to the input backup or canonical
+database. This prevents lock metadata, maintenance logs and checkpoint writes
+from modifying either protected file through another pathname. The check keeps
+an open input handle and visits one directory entry at a time, with a maximum
+maintenance-tree depth of 64; it does not read file bodies or retain a list of
+index files. Independent regular maintenance files remain admissible.
 
 This path reads only the restored canonical database. It does not run normal
 provider discovery, rescan local histories, salvage historical source bundles,
@@ -242,6 +355,14 @@ cass archive import /private/backups/history.jsonl \
   --output /private/recovered-cass/agent_search.db \
   --if-identical --rebuild-index
 ```
+
+Index-run contention retains exit 7 (`logical-archive-busy`, retryable); typed
+filesystem and database I/O failures retain exit 14 (`logical-archive-io`,
+retryable). Page-preparation and packet-producer worker channels preserve these
+causes. The error message reports safe I/O kinds, database codes or page numbers,
+the retained database and retry flags without echoing worker payloads or private
+session text. Unclassified failures remain exit 9 and are not inferred from
+words such as "busy" in an arbitrary error message.
 
 `--if-identical` must verify the whole existing database before granting rebuild
 authority. A different archive is a conflict even when its caller-assigned
@@ -333,6 +454,16 @@ The flag combines with `--if-identical` (a retry reports `unchanged` without
 modifying the database image) and with `--rebuild-index`, whose failure message
 names the retry flags to repeat.
 
+Each accepting pass requires the archived `meta.schema_version` to be text
+matching the header's source storage version. A missing or conflicting marker
+fails before a migration candidate is created. Persisted comparison validates
+the same records it compares, including the shape, primary-key order and digest
+of skipped migration-history rows. It must reach a valid completion matching
+the originally inspected archive before issuing a success receipt. Rewinding
+an already verified input is never treated as proof that its contents stayed
+unchanged. This applies to both version 1 and version 2 archives and to
+`--if-identical` retries.
+
 ## Exit codes
 
 Archive failures are JSON on stderr with a kebab-case `kind`:
@@ -341,9 +472,110 @@ Archive failures are JSON on stderr with a kebab-case `kind`:
 |---|---|---|---|
 | 2 | `logical-archive-usage` | no | Malformed or unacknowledged request |
 | 5 | `logical-archive-integrity` | no | Archive failed decoding, count or digest checks |
-| 7 | `logical-archive-busy` | yes | The destination lock stayed held for five seconds, or the source database stayed locked past its busy timeout |
-| 14 | `logical-archive-io` | yes | Reading or writing a file failed |
+| 7 | `logical-archive-busy` | yes | Destination/source locking, a transaction conflict, or an expired read snapshot prevented completion |
+| 14 | `logical-archive-io` | yes | File, database-page, or checkpoint I/O failed |
 | 9 | `logical-archive-error` | no | Anything else, including an occupied destination |
+
+Retry a busy failure by running the whole archive command again. An expired
+snapshot requires a new read transaction; an emitted prefix must never be
+continued using a different snapshot. Corruption, constraint violations,
+database capacity limits and ambiguous multi-process consistency failures stay
+nonretryable. Engine error strings do not determine the classification.
+
+## Version 3 allocation-state contract
+
+Version 3 has `schema_version: 3` and uses the version 2 row and continuation
+transport below. Its header additionally requires `sequences`, a sorted list
+with exactly one entry for each declared AUTOINCREMENT table. The current
+canonical schema declares `embedding_jobs` and `token_usage`:
+
+```json
+{
+  "sequences": [
+    {"table": "embedding_jobs", "value": 100},
+    {"table": "token_usage", "value": null}
+  ]
+}
+```
+
+An integer is the exact signed 64-bit `sqlite_sequence.seq` value. `null` means
+the table has no `sqlite_sequence` row; it is distinct from a present row whose
+counter is zero. It does not represent a SQL NULL counter. Missing, duplicate,
+unordered, unknown-table or unsupported counter entries are refused. The list
+is bounded by the 256-table schema limit and uses the same bounded identifiers;
+capture and restoration do not retain an archive-sized allocation inventory.
+These entries are header metadata, so they do not increase table-row or total-row
+counts. They are captured in the same read transaction as the canonical rows.
+
+The v3 digest starts with `cass.logical_archive.v3\0`. It hashes the canonical
+header, including every sequence entry and absence marker, with only its export
+timestamp normalized to zero, followed by canonical table and row records.
+Allocation-state changes therefore change the digest even when all live rows
+and their counts are identical. Persisted-image verification, identical retries
+and reviewed migrations check this state before reporting success. A
+sequence-only conflict never authorizes an update to an existing destination.
+
+Versions 1 and 2 omit this header field and retain their original shared digest
+domain and row-only meaning. Their old digests are unchanged. A v3 digest is
+deliberately different and must not be compared directly with a legacy digest
+as though both authenticated the same state.
+
+## Version 2 row transport, also used by version 3
+
+Version 2 exports have `schema_version: 2` and declare these `record_types`, in order:
+`table`, `row`, `row_start`, `row_chunk`, `row_end`, `completion`. The header,
+table descriptors, typed cells, primary-key order, and completion have the same
+logical meanings as version 1. A row whose complete canonical JSON and newline
+fit within 8 MiB is written as one ordinary `row` record with the same bytes as
+version 1. The limit for an entire canonical logical row is 256 MiB.
+
+A larger row is written as one contiguous continuation group:
+
+* `row_start` declares `bytes`, the byte count of the complete encoded logical
+  row including its final newline. It must exceed 8 MiB and fit within 256 MiB.
+* `row_chunk` carries a zero-based `sequence` and standard padded base64 `data`.
+  Each chunk decodes to 1 MiB of the row's canonical JSON bytes, except the last,
+  which contains exactly the remaining bytes. Chunk boundaries can fall inside
+  UTF-8 characters or JSON escapes; decoding reconstructs the original bytes.
+* `row_end` carries the lowercase hexadecimal `sha256` of those complete row
+  bytes. The count and checksum must both match before the reader returns a row.
+
+Every physical frame is UTF-8 JSONL, ends in a newline, and fits within the same
+8 MiB frame bound. Declared row size, chunk size and sequence are checked while
+reading, with at most 256 chunks per row. Missing, duplicate, reordered, empty
+or extra chunks, malformed base64, checksum mismatches and incomplete groups
+fail verification. Only logical rows may use continuations. Padding a small row
+with whitespace does not permit it to use a continuation group or bypass the
+version 1 row limit.
+
+Typed parsing enforces the 256-column limit before collecting additional cells.
+Cell values are restricted to their scalar wire types during parsing, including
+when the value precedes its kind tag. Arrays or objects cannot cause an untyped
+JSON tree to be materialized as a malformed cell or continuation frame. Unknown,
+duplicate and mismatched fields are rejected, and a continued record must be a
+row before other record payloads are read. Valid field order remains flexible.
+
+The encoder holds one bounded canonical row and emits chunks successively.
+The decoder retains one decoded 1 MiB chunk while constructing the typed row;
+it does not concatenate a second complete encoded input row. Archive input
+validation counts and hashes canonical bytes through an 8 KiB buffer instead of
+allocating another encoded row. BLOB validation uses a fixed 3 KiB decode buffer
+and retains strict base64 padding and tail-bit checks. Verification, restore and
+migration input, and search/view scans share this validation path. Parsing,
+export encoding, BLOB conversion for restore and database binding still require
+memory proportional to that row, in addition to fixed frame buffers. The limits
+are not a promise of a 256 MiB whole-process memory ceiling.
+
+A continuation group contributes **one logical row** to table and archive
+counts. The completion digest covers canonical reconstructed rows, not the
+continuation envelopes. For hashing, versions 1 and 2 use the version 1 domain and
+normalize the header's wire version and record-type list to version 1, with its
+timestamp set to zero. Equal logical content under the same archive identity
+therefore retains the same digest across those two versions. Version 3 also
+authenticates allocation history using its separate domain above. Each group's
+checksum is an additional consistency check; it does not replace the final
+archive completion or provide a signature. Restore, repeated-import comparison, search and view
+consume the reconstructed row through the same validation path.
 
 ## Version 1 wire contract
 
@@ -380,9 +612,10 @@ material. Descriptors are bounded to 256 tables, 256 columns per table, and
 
 The digest starts with `cass.logical_archive.v1\0`, followed by compact canonical
 JSON records with their newlines. The header timestamp is normalized to zero
-when hashing. All table and row records are hashed; the completion is not.
+when hashing; version 2 also normalizes its wire version and record-type list
+as described above. All table and row records are hashed; the completion is not.
 Serialization follows the Rust format structs' declared field order, not input
-object key order. The digest binds archive identity, schema, descriptors, cell
+object key order. The digest binds archive identity, storage schema, descriptors, cell
 values and omissions, but not export time or incidental JSON whitespace. This
 is an integrity checksum, **not** a signature or proof of source authenticity.
 

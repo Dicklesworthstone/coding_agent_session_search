@@ -251,47 +251,51 @@ fn search_p95_stays_within_budget_while_indexing_in_background() {
     }
 }
 
-/// Test-only RAII guard that sets an env var and restores (or removes) it on
-/// drop, even when the body panics. Prevents a failing test from leaking
-/// `CASS_RESPONSIVENESS_DISABLE=1` into other tests in the same binary.
-struct EnvGuard {
-    key: &'static str,
-    previous: Option<String>,
-}
-
-impl EnvGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var(key).ok();
-        // SAFETY: tests in this file are #[ignore] and run in their own
-        // process in practice, but we also restore on Drop below so even
-        // concurrent tests in the same binary stay isolated.
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        // SAFETY: single-threaded Drop restores what `set` captured.
-        unsafe {
-            match &self.previous {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-}
+const GOVERNOR_DISABLED_CHILD_ENV: &str = "CASS_TEST_GOVERNOR_DISABLED_CHILD";
+const GOVERNOR_DISABLED_CHILD_RECEIPT: &str = "GOVERNOR_DISABLED_CHILD_OK";
 
 #[test]
 #[ignore = "timing-sensitive; run with --ignored explicitly"]
 fn governor_disabled_run_matches_idle_baseline() {
+    let temp = TempDir::new().unwrap();
+    let output = std::process::Command::new(
+        std::env::current_exe().expect("current search_latency_under_indexing binary"),
+    )
+    .arg("--exact")
+    .arg("governor_disabled_run_matches_idle_baseline_child")
+    .arg("--nocapture")
+    .current_dir(temp.path())
+    .env_clear()
+    .env(GOVERNOR_DISABLED_CHILD_ENV, "1")
+    .env("CASS_RESPONSIVENESS_DISABLE", "1")
+    .env("RUST_MIN_STACK", "16777216")
+    .output()
+    .expect("spawn isolated governor_disabled_run_matches_idle_baseline child");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "isolated governor_disabled_run_matches_idle_baseline child failed\nstatus={:?}\n{combined}",
+        output.status
+    );
+    assert!(
+        combined.contains(GOVERNOR_DISABLED_CHILD_RECEIPT),
+        "isolated governor_disabled_run_matches_idle_baseline child omitted receipt: {combined}"
+    );
+}
+
+#[test]
+fn governor_disabled_run_matches_idle_baseline_child() {
+    if std::env::var_os(GOVERNOR_DISABLED_CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+
     // Sanity check: with the governor pinned off, the pressured p95 should
     // still stay within the generous 750ms budget. If it blows past that,
     // something other than the governor is slowing foreground search.
-    let _guard = EnvGuard::set("CASS_RESPONSIVENESS_DISABLE", "1");
-
     let dir = TempDir::new().unwrap();
     let index_path = dir.path().to_path_buf();
     {
@@ -325,5 +329,5 @@ fn governor_disabled_run_matches_idle_baseline() {
         "governor-disabled p95 exceeded budget: {:?}",
         report.p95
     );
-    // `_guard` restores/removes CASS_RESPONSIVENESS_DISABLE on drop.
+    eprintln!("{GOVERNOR_DISABLED_CHILD_RECEIPT}");
 }

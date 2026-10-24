@@ -95,12 +95,18 @@ notify = "8.2.0"
 # index promptly again (48c6cf6b2) and lets the first write after stock
 # SQLite's empty, unindexed WAL index establish the WAL generation instead of
 # failing BusyRecovery on every later commit (GH#443 / cass#509, 4b48c95d8).
-# All family packages use 0.4.9 and build.rs checks each resolved package
+# 0.4.12 carries the 0.4.10 data-integrity advisory fix (an explicit
+# transaction's inserts appended through a stale retained right-edge leaf and
+# corrupted the table b-tree: bd-obwsy), ROLLBACK returning the AUTOINCREMENT
+# rowids it reserved (bd-gwoit), reading a WAL a stock writer truncated to zero
+# bytes as empty (bd-yxqs9, cass GH#519), and index seeks for IN lists and
+# k = ? ORDER BY id (GH#497/#498).
+# All family packages use 0.4.12 and build.rs checks each resolved package
 # exactly.
-frankensqlite = { version = "=0.4.9", package = "fsqlite", features = ["fts5", "async-api"] }
+frankensqlite = { version = "=0.4.12", package = "fsqlite", features = ["fts5", "async-api"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.4.9", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.4.12", package = "fsqlite-types" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -121,6 +127,9 @@ ftui-runtime = { version = "=0.5.0", features = ["native-backend", "crossterm-co
 ftui-tty = { version = "=0.5.0" }
 ftui-extras = { version = "=0.5.0", default-features = false, features = ["markdown", "syntax", "charts", "canvas", "theme", "clipboard", "clipboard-fallback", "export", "visual-fx", "forms", "validation", "help"] }
 dirs = "7.0.0"
+# Canonical paths without Windows' verbatim `\\?\` prefix where the plain
+# spelling names the same file (source identities, 9v9xi).
+dunce = "1.0.5"
 walkdir = "2.5.0"
 glob = "0.3.3"
 base64 = ">=0.21"
@@ -159,7 +168,9 @@ frankensearch = { version = "=0.7.1", default-features = false, features = ["has
 # codex-zstd reads Codex rollouts compressed to .jsonl.zst (GH #513).
 # pi-durable reads Pi durable-harness SQLite stores (FAD #28); pi-sqlite reads
 # pi_agent_rust SQLite sessions.
-franken-agent-detection = { version = "=0.3.8", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot", "openclaw-sqlite", "copilot-vscdb", "codebuff", "codex-zstd", "pi-durable", "pi-sqlite"] }
+# GH#520 needs remote-mirror source identity, added after crates.io 0.3.10.
+# Pin the exact fix until it is included in a published registry release.
+franken-agent-detection = { version = "=0.3.10", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "6b337ba434b72c65c6c5a748b7ec47885f840ac0", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot", "openclaw-sqlite", "copilot-vscdb", "codebuff", "codex-zstd", "pi-durable", "pi-sqlite"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -196,6 +207,10 @@ unicode-width = "0.2.2"
 # macOS keychain access (optional, for ChatGPT decryption)
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7.0"
+# SO_NOSIGPIPE on the clipboard socket pair: macOS has no MSG_NOSIGNAL, so a
+# write after the clipboard tool exits would raise SIGPIPE. Already built (with
+# "all") for asupersync, so this adds no crate.
+socket2 = { version = "0.6.5", features = ["all"] }
 
 # Statically link OpenSSL into Unix release binaries so they do not require a
 # matching system libssl. Windows builds use platform TLS/crypto stacks through
@@ -260,7 +275,7 @@ tokenizers = { version = "*", default-features = false, features = ["fancy-regex
 rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.4.9", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.4.12", package = "fsqlite-types" }
 
 # The fsqlite family resolves from exact reviewed registry versions for every
 # direct and transitive consumer. build.rs rejects duplicates and mixed sources.
@@ -328,9 +343,8 @@ strip = false
 #
 # If you need to build against a local checkout of asupersync (sibling
 # at ../asupersync) during runtime-level hacking, add the following
-# [patch.crates-io] block LOCALLY and DO NOT COMMIT IT — the
-# fresh-clone CI guard (.github/workflows/fresh-clone-build.yml) will
-# fail if any [patch] block pointing at sibling paths is committed:
+# [patch.crates-io] block LOCALLY and DO NOT COMMIT IT — a committed
+# [patch] block pointing at sibling paths breaks every fresh clone:
 #
 # Add these entries to the committed [patch.crates-io] table above:
 # asupersync = { path = "../asupersync" }
@@ -346,8 +360,8 @@ strip = false
 # are commented out by default so that a clean clone builds without requiring
 # specific directory layout. See build.rs for validation details.
 #
-# A fresh-clone build regression guard runs in CI (.github/workflows/fresh-clone-build.yml)
-# — if you re-enable any of these sibling-path [patch] blocks, that workflow will fail.
+# Never commit any of these sibling-path [patch] blocks re-enabled: a fresh
+# clone without the sibling checkouts would no longer build.
 #
 # [patch."https://github.com/Dicklesworthstone/frankensqlite"]
 # fsqlite = { path = "../frankensqlite/crates/fsqlite" }

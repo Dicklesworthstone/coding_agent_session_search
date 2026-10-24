@@ -17,10 +17,14 @@ use crate::search::semantic_manifest::{
 };
 use crate::search::vector_index::VECTOR_INDEX_DIR;
 
+mod checkpoint_coverage;
 mod inspection;
+mod publication;
 
 #[cfg(test)]
 mod checkpoint_tests;
+#[cfg(test)]
+mod checkpoint_tests_live;
 #[cfg(test)]
 mod lease_tests;
 #[cfg(test)]
@@ -71,6 +75,20 @@ pub(super) struct BackfillArtifacts {
     _lock: File,
 }
 
+/// A private working directory cannot outlive its ownership lease. TempDir
+/// cleans only this invocation's unpublished files on ordinary return/unwind;
+/// general artifact reclamation still never happens in Drop.
+pub(super) struct LeasedScratch<'a> {
+    directory: tempfile::TempDir,
+    _lease: &'a BackfillArtifacts,
+}
+
+impl LeasedScratch<'_> {
+    pub(super) fn path(&self) -> &Path {
+        self.directory.path()
+    }
+}
+
 impl Drop for BackfillArtifacts {
     fn drop(&mut self) {
         // Closing this descriptor alone does not release a Unix flock while a
@@ -84,6 +102,60 @@ impl Drop for BackfillArtifacts {
 }
 
 impl BackfillArtifacts {
+    /// Serialize mutation of an existing index with backfill/rebuild/recovery.
+    /// Unlike rebuild admission this never sweeps, reads a manifest, or creates
+    /// an archive/vector directory. Invalid and empty appends must not authorize
+    /// unrelated cleanup. The only possible new entry is the stable lock file.
+    pub(super) fn for_existing_writer(data_dir: &Path) -> Result<Self> {
+        let data_dir = data_dir
+            .canonicalize()
+            .context("semantic writer requires an existing data directory")?;
+        let root = data_dir.join(VECTOR_INDEX_DIR);
+        let metadata = fs::symlink_metadata(&root)
+            .context("semantic writer requires an existing vector_index")?;
+        ensure!(
+            metadata.is_dir() && !is_link_or_reparse(&metadata),
+            "semantic writer requires a real vector_index directory"
+        );
+        let lock = lock_file(&data_dir.join(ARTIFACT_LOCK))
+            .context("another semantic writer owns its artifacts")?;
+        Ok(Self {
+            data_dir,
+            _lock: lock,
+        })
+    }
+
+    /// Coordinate direct full/canonical rebuild scratch with the same owner
+    /// as backfill recovery. This lease supplements the caller's maintenance
+    /// lock; it does not grant publication or canonical-content authority.
+    pub(super) fn for_rebuild(data_dir: &Path) -> Result<Self> {
+        let artifacts = Self::lock(data_dir)?;
+        // Reclaim a previous interrupted operation before allocating its next
+        // potentially multi-GB candidate. Failed ownership/durability checks
+        // retain the candidates, not permission to guess from their names.
+        // Unlike checkpoint resume, direct rebuild admission does not depend
+        // on the mutable ledger; preserve that existing repair capability.
+        if let Err(error) = artifacts.sweep(None, None) {
+            tracing::warn!(%error, "semantic rebuild scratch cleanup incomplete; retained entries will be retried");
+        }
+        Ok(artifacts)
+    }
+
+    /// The historical reuse namespace is already covered by the shared GC.
+    /// The borrow keeps its lease alive until the TempDir has been dropped.
+    /// A process abort skips TempDir cleanup, but releases the OS lease so
+    /// the next writer or explicit recovery can discover the abandoned work.
+    pub(super) fn scratch(&self) -> Result<LeasedScratch<'_>> {
+        let directory = tempfile::Builder::new()
+            .prefix(".backfill-reuse-")
+            .tempdir_in(self.data_dir.join(VECTOR_INDEX_DIR))
+            .context("create lease-owned semantic rebuild scratch")?;
+        Ok(LeasedScratch {
+            directory,
+            _lease: self,
+        })
+    }
+
     fn lock(data_dir: &Path) -> Result<Self> {
         fs::create_dir_all(data_dir)?;
         let data_dir = data_dir.canonicalize()?;
@@ -111,7 +183,17 @@ impl BackfillArtifacts {
         // lease current. Reject stale ownership/cursors BEFORE the sweep or
         // engine can mutate anything, including after a failed prior save.
         artifacts.validate_input(input)?;
-        artifacts.sweep(Some(input), None)?;
+        if let Err(error) = artifacts.sweep(Some(input), None) {
+            if !error.is::<publication::PublicationUnavailable>() {
+                return Err(error);
+            }
+            // A missing/damaged completed publication is not permission to
+            // discard its fallbacks, nor should GC prevent a canonical rebuild
+            // from replacing it. Only this typed data-admission failure defers
+            // cleanup; stale callers, invalid metadata and checkpoint-validation
+            // errors still refuse the operation before the engine runs.
+            tracing::warn!(%error, "published semantic data unavailable; retaining scratch while backfill repairs coverage");
+        }
         Ok(artifacts)
     }
 
@@ -178,14 +260,14 @@ impl BackfillArtifacts {
         let mut metadata = RecoveryMetadata::new(durable);
         let mut protected = ProtectedPaths::default();
         let mut resumable_checkpoint = None;
-        if let Some(manifest) =
-            metadata.read::<SemanticManifest>(&SemanticManifest::path(&self.data_dir))?
-        {
+        let manifest =
+            metadata.read::<SemanticManifest>(&SemanticManifest::path(&self.data_dir))?;
+        if let Some(manifest) = &manifest {
             ensure!(
                 manifest.manifest_version <= MANIFEST_FORMAT_VERSION,
                 "unsupported semantic manifest version; refusing artifact reclamation"
             );
-            protected.manifest(&self.data_dir, &manifest)?;
+            protected.manifest(&self.data_dir, manifest)?;
             if let Some(checkpoint) = &manifest.checkpoint {
                 // Also pin the resumable artifact/WAL before retiring any
                 // previous copy. A dangling checkpoint is a recovery problem,
@@ -208,16 +290,16 @@ impl BackfillArtifacts {
         if let Some(output) = output {
             protected.index(output)?;
         }
-        if let Some(shards) =
-            metadata.read::<SemanticShardManifest>(&SemanticShardManifest::path(&self.data_dir))?
-        {
+        let shards =
+            metadata.read::<SemanticShardManifest>(&SemanticShardManifest::path(&self.data_dir))?;
+        if let Some(shards) = &shards {
             ensure!(
                 shards.manifest_version <= MANIFEST_FORMAT_VERSION,
                 "unsupported semantic shard manifest version; refusing artifact reclamation"
             );
-            for shard in shards.shards {
-                protected.index(&self.data_dir.join(shard.index_path))?;
-                if let Some(path) = shard.ann_index_path {
+            for shard in &shards.shards {
+                protected.index(&self.data_dir.join(&shard.index_path))?;
+                if let Some(path) = &shard.ann_index_path {
                     protected.index(&self.data_dir.join(path))?;
                 }
             }
@@ -265,6 +347,25 @@ impl BackfillArtifacts {
             // zero-length/truncated file can survive an interrupted writer.
             // Check the current checkpoint before deleting any fallback copy.
             validate_reclaim_checkpoint(&path, &checkpoint)?;
+        }
+
+        if !candidates.is_empty()
+            && let Some(manifest) = &manifest
+        {
+            // A durable ledger without its published vectors is no stronger
+            // than a dangling checkpoint. Admit and pin ready legacy tiers
+            // before returning ANY candidates, including after publication
+            // has cleared the resumable checkpoint.
+            publication::validate_ready(&self.data_dir, manifest, durable)?;
+        }
+
+        if !candidates.is_empty()
+            && let Some(shards) = &shards
+        {
+            // Shard-only archives need not have a legacy manifest. Validate
+            // the same sidecar snapshot that protected its paths, not a second
+            // read whose ownership may disagree with discovery.
+            publication::validate_shards(&self.data_dir, shards, durable)?;
         }
 
         Ok(Discovery {
@@ -660,22 +761,35 @@ fn validate_reclaim_checkpoint(path: &Path, checkpoint: &BuildCheckpoint) -> Res
         index.embedder_id(),
         checkpoint.embedder_id
     );
-    // Read-only recovery can ignore an incomplete or stale WAL batch. Even
-    // this upper bound (physical main slots + replayable WAL records) must
-    // cover the durable checkpoint's acknowledged count before retiring a
-    // fallback. Extra records are allowed: a killed writer may have durably
-    // appended its next batch without advancing the checkpoint yet.
-    let available = u64::try_from(index.record_count())
+    // A tombstoned main slot cannot stand in for an acknowledged document.
+    // In particular, a lost/torn replacement WAL can leave all physical slots
+    // present while the old copy of its document is already tombstoned. Counting
+    // that slot would authorize deleting the last recoverable fallback copy.
+    // Read only the record flags, not the potentially multi-GB vector slab.
+    let live_main = index
+        .record_count()
+        .checked_sub(index.tombstone_count())
+        .context("invalid checkpoint tombstone count; retaining fallback artifacts")?;
+    // Reject a short physical upper bound before allocating an identity set.
+    // Passing this bound alone is insufficient: replayable WAL entries may
+    // overlap surviving main IDs after a crash. Check distinct identities below.
+    let available = u64::try_from(live_main)
         .unwrap_or(u64::MAX)
         .saturating_add(u64::try_from(index.wal_record_count()).unwrap_or(u64::MAX));
     ensure!(
         available >= checkpoint.docs_embedded,
-        "resumable semantic checkpoint {} has at most {} records, below its recorded {}; retaining fallback artifacts",
+        "resumable semantic checkpoint {} has at most {} live records, below its recorded {}; retaining fallback artifacts",
         path.display(),
         available,
         checkpoint.docs_embedded
     );
-    Ok(())
+    checkpoint_coverage::require_distinct_live(&index, checkpoint.docs_embedded)
+        .with_context(|| format!("validate resumable checkpoint {}", path.display()))?;
+    // IDs alone do not make a replacement usable: quantization can leave a
+    // complete checkpoint with zero/non-finite signal. Check effective live
+    // payloads before any fallback is retired, just as for ready publications.
+    publication::validate_checkpoint_payload(&index)
+        .with_context(|| format!("validate resumable checkpoint {}", path.display()))
 }
 
 fn open_checkpoint_file(path: &Path) -> Result<Option<File>> {

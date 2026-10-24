@@ -58,13 +58,19 @@ fn invalid_requests_and_status_do_not_open_or_create_an_index() -> Result<()> {
     let path = temp.path().join("missing");
     let mut session = Session::new(path.clone());
     assert_eq!(session.status()["open_attempts"], 0);
+    assert!(
+        serde_json::from_value::<Request>(
+            json!({"op":"search", "id":6, "query":"x", "filters":{"agents":[""]}})
+        )
+        .is_err()
+    );
     for value in [
         json!({"op":"search", "id":1, "query":"x", "limit":0}),
         json!({"op":"search", "id":2, "query":"x", "limit":101}),
         json!({"op":"search", "id":3, "query":" ", "limit":1}),
         json!({"op":"search", "id":4, "query":"x", "offset":usize::MAX}),
         json!({"op":"search", "id":5, "query":"x", "filters":{"created_from":2, "created_to":1}}),
-        json!({"op":"search", "id":6, "query":"x", "filters":{"agents":[""]}}),
+        json!({"op":"search", "id":6, "query":"x", "filters":{"workspaces":[""]}}),
         json!({"op":"search", "id":7, "query":"x", "filters":{"source_id":" local "}}),
     ] {
         let (reply, stop) = session.handle(request(value));
@@ -311,7 +317,7 @@ fn semantic_service_reuses_global_vectors_without_a_lexical_match_and_preserves_
     assert_eq!(hybrid.result.as_ref().unwrap()["realized_mode"], "hybrid");
     assert_eq!(hybrid.result.unwrap()["hits"][0]["message_index"], 8);
     for filters in [
-        json!({"agents":["absent"]}),
+        json!({"agents":["claude_code"]}),
         json!({"source_id":"different-source"}),
         json!({"workspaces":["/another/workspace"]}),
         json!({"created_from":1000}),
@@ -457,7 +463,7 @@ fn semantic_service_shares_one_admission_slot_with_hybrid_and_canonical_view() -
     assert!(pool.acquire().is_err());
     session.unload();
     assert!(
-        pool.acquire().is_ok(),
+        admission::acquire_after_release(&pool).is_ok(),
         "unload must release every native owner before the slot"
     );
     Ok(())
@@ -750,7 +756,7 @@ fn failed_index_admission_releases_the_reserved_slot() -> Result<()> {
             .as_bool()
             .unwrap()
     );
-    drop(pool.acquire()?);
+    drop(admission::acquire_after_release(&pool)?);
     assert!(!session.index.exists());
     Ok(())
 }

@@ -175,6 +175,88 @@ fn mirror_prune_repeated_previews_do_not_grow_the_archive() {
     }
 }
 
+/// GH #522: `--keep-latest N` is a retention predicate on its own. It retires
+/// the superseded capture of an appended transcript and keeps the newest one,
+/// and the only capture of another session, through both preview and apply.
+#[test]
+fn mirror_prune_keep_latest_keeps_the_newest_capture_of_each_source() {
+    let temp = TempDir::new().expect("tempdir");
+    let data_dir = temp.path().join("data");
+    let capture = |source_path: &Path| {
+        capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path,
+            db_links: &[],
+        })
+        .expect("capture real source")
+    };
+    let lone = temp.path().join("lone.jsonl");
+    std::fs::write(&lone, "{\"text\":\"only copy\"}\n").expect("write lone session");
+    let only_copy = capture(&lone);
+    let active = temp.path().join("active.jsonl");
+    std::fs::write(&active, "{\"text\":\"first run\"}\n").expect("write transcript");
+    let superseded = capture(&active);
+    // Capture times are milliseconds; keep the two captures apart.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(
+        &active,
+        "{\"text\":\"first run\"}\n{\"text\":\"second run\"}\n",
+    )
+    .expect("append to transcript");
+    let newest = capture(&active);
+    let root = data_dir.join("raw-mirror/v1");
+
+    for mode in ["--dry-run", "--apply"] {
+        let mut cmd = cmd_in(temp.path());
+        cmd.args([
+            "mirror",
+            "prune",
+            "--keep-latest",
+            "1",
+            "--safety-hold-down",
+            "0s",
+            mode,
+            "--json",
+        ]);
+        let output = cmd.assert().success();
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.get_output().stdout).expect("prune JSON");
+        let report = &value["prune"];
+        assert_eq!(report["keep_latest"], 1, "{report}");
+        assert_eq!(report["planned_manifest_count"], 1, "{report}");
+        let manifests = report["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter(|entry| entry["kind"] == "manifest")
+            .collect::<Vec<_>>();
+        assert_eq!(manifests.len(), 1, "{report}");
+        assert_eq!(
+            manifests[0]["path"].as_str(),
+            Some(superseded.manifest_relative_path.as_str())
+        );
+        assert_eq!(
+            manifests[0]["reason"],
+            "superseded by the newest 1 captures of its source file"
+        );
+        assert_eq!(
+            root.join(&superseded.manifest_relative_path).exists(),
+            mode == "--dry-run"
+        );
+        assert!(root.join(&newest.manifest_relative_path).exists());
+        assert!(root.join(&only_copy.manifest_relative_path).exists());
+    }
+
+    let mut cmd = cmd_in(temp.path());
+    cmd.args(["mirror", "prune", "--keep-latest", "0", "--json"]);
+    cmd.assert().failure().code(2);
+    assert!(root.join(&newest.manifest_relative_path).exists());
+}
+
 /// Preview details are bounded, but apply must retain every audit entry.
 #[test]
 fn mirror_prune_caps_preview_details_without_truncating_apply() {

@@ -4,10 +4,14 @@
 //! milestones. Never turn a failed finalization step into a successful outcome.
 //! The best-effort last-failure record is history, not a readiness verdict. A
 //! successful swap can move it with the prior live generation into its backup.
+//! An off-live candidate also keeps bounded first-failure history that travels
+//! with a later quarantine, without attaching post-swap errors to its backup.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+mod failure_evidence;
 
 const LAST_FAILURE_FILE: &str = ".lexical-rebuild-last-failure.json";
 
@@ -57,6 +61,9 @@ pub(super) struct Finalization<'a> {
     candidate: &'a Path,
     indexed_docs: usize,
     processed_conversations: usize,
+    // Bind the original off-live candidate once, not a prior-live backup left
+    // at the same staging path by a successful publication.
+    candidate_evidence: Result<Option<failure_evidence::Candidate>>,
 }
 
 impl<'a> Finalization<'a> {
@@ -71,7 +78,19 @@ impl<'a> Finalization<'a> {
             candidate,
             indexed_docs,
             processed_conversations,
+            candidate_evidence: failure_evidence::Candidate::capture(live, candidate),
         }
+    }
+
+    // json! panics if an interpolated Serialize fails, including non-Unicode
+    // filesystem paths. Both diagnostic writers must encode these fallibly,
+    // before any write, rather than lose the original error or record a lossy
+    // spelling that could name a different directory.
+    fn diagnostic_paths(&self) -> Result<(serde_json::Value, serde_json::Value)> {
+        Ok((
+            serde_json::to_value(self.candidate).context("encoding lexical candidate path")?,
+            serde_json::to_value(self.live).context("encoding live lexical index path")?,
+        ))
     }
 
     // Keep the report in the existing live directory, on the same filesystem
@@ -85,13 +104,14 @@ impl<'a> Finalization<'a> {
                 .as_millis(),
         )
         .context("converting lexical failure timestamp")?;
+        let (build_path, live_path) = self.diagnostic_paths()?;
         let report = serde_json::json!({
             "version": 1,
             "at_ms": at_ms,
             "process_id": std::process::id(),
             "phase": phase,
-            "build_path": self.candidate,
-            "live_path": self.live,
+            "build_path": build_path,
+            "live_path": live_path,
             "expected_docs": self.indexed_docs,
             "processed_conversations": self.processed_conversations,
             "error_chain": cause,
@@ -153,6 +173,7 @@ impl<'a> Finalization<'a> {
                     error = %cause,
                     "lexical rebuild finalization failed"
                 );
+                failure_evidence::record(self, phase, &cause);
                 match self.persist_failure(phase, &cause) {
                     Ok(path) => tracing::info!(
                         phase,
@@ -415,5 +436,198 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("original publication refusal"));
         assert_eq!(std::fs::read_to_string(evidence).unwrap(), "keep");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod path_encoding_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::io;
+    use std::os::unix::ffi::OsStringExt;
+
+    const CHECKPOINT: &str = ".lexical-rebuild-state.json";
+    const PRIOR_REPORT: &[u8] = b"previous diagnostic evidence";
+
+    fn fixture() -> (tempfile::TempDir, fs::File) {
+        let root = tempfile::tempdir().unwrap();
+        let lock = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(root.path().join("index-run.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        (root, lock)
+    }
+
+    fn path(root: &Path, name: &str, invalid: bool) -> PathBuf {
+        let mut bytes = name.as_bytes().to_vec();
+        if invalid {
+            bytes.push(0xff);
+        }
+        let path = root.join(OsString::from_vec(bytes));
+        assert_eq!(path.to_str().is_none(), invalid);
+        path
+    }
+
+    fn seed(directory: &Path) {
+        fs::create_dir(directory).unwrap();
+        fs::write(directory.join("MANIFEST"), b"candidate index bytes").unwrap();
+        fs::write(directory.join(CHECKPOINT), b"incomplete checkpoint").unwrap();
+    }
+
+    fn unchanged(directory: &Path, prior_report: bool) {
+        assert_eq!(
+            fs::read(directory.join("MANIFEST")).unwrap(),
+            b"candidate index bytes"
+        );
+        assert_eq!(
+            fs::read(directory.join(CHECKPOINT)).unwrap(),
+            b"incomplete checkpoint"
+        );
+        if prior_report {
+            assert_eq!(
+                fs::read(directory.join(LAST_FAILURE_FILE)).unwrap(),
+                PRIOR_REPORT
+            );
+        }
+        // No failed diagnostic may leave a temporary or partially encoded record.
+        assert_eq!(
+            fs::read_dir(directory).unwrap().count(),
+            2 + usize::from(prior_report)
+        );
+    }
+
+    fn original_error_survives(context: &Finalization<'_>) {
+        let calls = Cell::new(0);
+        let error = context
+            .run::<()>("validate_candidate", || {
+                calls.set(calls.get() + 1);
+                Err(anyhow::Error::new(io::Error::from_raw_os_error(libc::EIO))
+                    .context("candidate certification refused"))
+            })
+            .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert!(error.to_string().contains("validate_candidate"));
+        assert!(
+            error
+                .to_string()
+                .contains("candidate certification refused")
+        );
+    }
+
+    #[test]
+    fn live_report_path_encoding_is_fallible_and_preserves_existing_evidence() {
+        for (bad_live, bad_candidate) in [(false, true), (true, false)] {
+            let (root, _lock) = fixture();
+            let live = path(root.path(), "live", bad_live);
+            let candidate = path(root.path(), "candidate", bad_candidate);
+            seed(&live);
+            seed(&candidate);
+            fs::write(live.join(LAST_FAILURE_FILE), PRIOR_REPORT).unwrap();
+            let context = Finalization::new(&live, &candidate, 2, 1);
+            let error = context
+                .persist_failure("validate_candidate", "original failure")
+                .unwrap_err();
+            assert!(error.downcast_ref::<serde_json::Error>().is_some());
+            unchanged(&live, true);
+            unchanged(&candidate, false);
+        }
+    }
+
+    #[test]
+    fn off_live_encoding_failures_preserve_typed_errors_and_quarantinable_bytes() {
+        for (bad_live, bad_candidate) in [(false, true), (true, false), (true, true)] {
+            let (root, _lock) = fixture();
+            let live = path(root.path(), "live", bad_live);
+            let candidate = path(root.path(), "candidate", bad_candidate);
+            seed(&live);
+            seed(&candidate);
+            fs::write(live.join(LAST_FAILURE_FILE), PRIOR_REPORT).unwrap();
+            let context = Finalization::new(&live, &candidate, 2, 1);
+            // Exercise the candidate writer as well as the independent live writer.
+            assert!(context.candidate_evidence.as_ref().unwrap().is_some());
+            original_error_survives(&context);
+            unchanged(&candidate, false);
+            unchanged(&live, true);
+            drop(context);
+            let quarantine = quarantine_incomplete_candidate(&candidate).unwrap();
+            assert!(!candidate.exists());
+            unchanged(&quarantine.join("index"), false);
+            unchanged(&live, true);
+        }
+    }
+
+    #[test]
+    fn in_place_encoding_failure_preserves_the_error_and_success_stays_a_noop() {
+        let (root, _lock) = fixture();
+        let live = path(root.path(), "live", true);
+        seed(&live);
+        fs::write(live.join(LAST_FAILURE_FILE), PRIOR_REPORT).unwrap();
+        let context = Finalization::new(&live, &live, 2, 1);
+        assert!(context.candidate_evidence.as_ref().unwrap().is_none());
+        original_error_survives(&context);
+        unchanged(&live, true);
+        assert_eq!(context.run("commit_candidate", || Ok(37)).unwrap(), 37);
+        unchanged(&live, true);
+    }
+
+    #[test]
+    fn unencodable_paths_do_not_manufacture_a_missing_live_index() {
+        for (bad_live, bad_candidate) in [(false, true), (true, false)] {
+            let (root, _lock) = fixture();
+            let live = path(root.path(), "missing-live", bad_live);
+            let candidate = path(root.path(), "candidate", bad_candidate);
+            seed(&candidate);
+            let context = Finalization::new(&live, &candidate, 2, 1);
+            assert!(context.candidate_evidence.as_ref().unwrap().is_some());
+            original_error_survives(&context);
+            assert!(!live.exists());
+            unchanged(&candidate, false);
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+        }
+    }
+
+    #[test]
+    fn unicode_and_control_char_paths_round_trip_in_both_existing_report_schemas() {
+        let (root, _lock) = fixture();
+        let live = root.path().join("live-界\n");
+        let candidate = root.path().join("candidate-é\t");
+        seed(&live);
+        seed(&candidate);
+        original_error_survives(&Finalization::new(&live, &candidate, 2, 1));
+        for (directory, is_candidate) in [(&live, false), (&candidate, true)] {
+            let record: serde_json::Value =
+                serde_json::from_slice(&fs::read(directory.join(LAST_FAILURE_FILE)).unwrap())
+                    .unwrap();
+            assert_eq!(record["version"], 1);
+            assert_eq!(record["build_path"].as_str(), candidate.to_str());
+            assert_eq!(record["live_path"].as_str(), live.to_str());
+            assert_eq!(record["expected_docs"], 2);
+            assert_eq!(record["processed_conversations"], 1);
+            assert_eq!(record["phase"], "validate_candidate");
+            assert!(
+                record["error_chain"]
+                    .as_str()
+                    .unwrap()
+                    .contains("candidate certification refused")
+            );
+            if is_candidate {
+                assert_eq!(record["record_scope"], "candidate_first_failure");
+                assert_eq!(record["error_chain_truncated"], false);
+                assert_eq!(record.as_object().unwrap().len(), 12);
+            } else {
+                assert!(record.get("record_scope").is_none());
+                assert_eq!(record.as_object().unwrap().len(), 9);
+            }
+            assert_eq!(fs::read_dir(directory).unwrap().count(), 3);
+        }
     }
 }

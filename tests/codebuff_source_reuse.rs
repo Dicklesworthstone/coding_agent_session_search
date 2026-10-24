@@ -129,7 +129,14 @@ fn index(
 fn archive(home: &Path) -> BTreeMap<String, (i64, i64)> {
     let storage = SqliteStorage::open_readonly(&home.join("data/agent_search.db")).unwrap();
     let mut messages = BTreeMap::new();
-    for conversation in storage.list_conversations(10, 0).unwrap() {
+    // On Windows the other connectors find the real profile (FOLDERID_Profile
+    // ignores USERPROFILE), so a host with agent history adds conversations.
+    for conversation in storage
+        .list_conversations(i64::MAX, 0)
+        .unwrap()
+        .into_iter()
+        .filter(|conversation| conversation.agent_slug == "codebuff")
+    {
         let id = conversation.id.unwrap();
         for message in storage.fetch_messages(id).unwrap() {
             assert_eq!(message.created_at, Some(1_774_113_351_457));
@@ -144,9 +151,23 @@ fn archive(home: &Path) -> BTreeMap<String, (i64, i64)> {
     messages
 }
 
+/// This fixture's source checkpoints. On Windows the other connectors find the
+/// real profile, so a host with agent history adds checkpoints of its own.
 fn ledger(home: &Path) -> HashMap<String, String> {
     let storage = SqliteStorage::open_readonly(&home.join("data/agent_search.db")).unwrap();
-    storage.source_ingest_ledger_entries().unwrap()
+    let home = fs::canonicalize(home).unwrap();
+    storage
+        .source_ingest_ledger_entries()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, observation)| {
+            serde_json::from_str::<Value>(observation)
+                .ok()
+                .and_then(|observation| observation["primary"]["path"].as_str().map(PathBuf::from))
+                .map(|path| fs::canonicalize(&path).unwrap_or(path))
+                .is_some_and(|path| path.starts_with(&home))
+        })
+        .collect()
 }
 
 fn search(home: &Path, content: &str) -> Value {

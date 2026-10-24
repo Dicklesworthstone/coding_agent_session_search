@@ -31,6 +31,26 @@
         "type": "unknown"
       }
     },
+    "misattributed_mirror": {
+      "type": "object",
+      "properties": {
+        "conversations_removed": {
+          "type": "integer"
+        },
+        "messages_removed": {
+          "type": "integer"
+        },
+        "unmatched": {
+          "type": "integer"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        }
+      }
+    },
     "recommended_action": {
       "type": "string"
     }

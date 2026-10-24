@@ -20,7 +20,12 @@ import {
   initConversationViewer,
   loadConversation,
 } from "./conversation.js";
-import { closeDatabase, getStatistics, isDatabaseReady } from "./database.js";
+import {
+  ConversationMessageSource,
+  closeDatabase,
+  getStatistics,
+  isDatabaseReady,
+} from "./database.js";
 import {
   buildConversationPath,
   buildSearchPath,
@@ -73,6 +78,218 @@ const elements = {
   navBar: null,
 };
 
+// The find bar lives outside conversationView: virtual message navigation
+// replaces that view, but must not discard the query or keyboard focus.
+const FIND_HELP = "Exact, case-sensitive text in stored messages. Enter: next; Shift+Enter: previous.";
+let transcriptFind = null;
+
+function setupTranscriptFind() {
+  teardownTranscriptFind();
+  const f = {
+    root: document.getElementById("transcript-find"),
+    launch: document.getElementById("transcript-find-open"),
+    form: document.getElementById("transcript-find-form"),
+    input: document.getElementById("transcript-find-input"),
+    status: document.getElementById("transcript-find-status"),
+    conversationId: null,
+    source: null,
+    request: null,
+    query: "",
+    matchId: null,
+  };
+  transcriptFind = f;
+  f.onClick = (event) => {
+    const action = event.target.closest?.("[data-find-action]")?.dataset.findAction;
+    if (action === "open") openTranscriptFind();
+    if (action === "previous") void runTranscriptFind(-1);
+    if (action === "close") closeTranscriptFind();
+  };
+  f.onSubmit = (event) => {
+    event.preventDefault();
+    void runTranscriptFind(1);
+  };
+  f.onInput = () => {
+    cancelTranscriptFind(f);
+    f.query = "";
+    f.matchId = null;
+    f.status.textContent = FIND_HELP;
+  };
+  f.root.addEventListener("click", f.onClick);
+  f.form.addEventListener("submit", f.onSubmit);
+  f.input.addEventListener("input", f.onInput);
+  // Capture only handled find keys before the transcript's own Escape/back
+  // handlers. Native browser shortcuts remain untouched outside a transcript.
+  window.addEventListener("keydown", handleTranscriptFindKey, true);
+  f.status.textContent = FIND_HELP;
+}
+
+function cancelTranscriptFind(f) {
+  f.request?.abort();
+  f.request = null;
+  f.form.setAttribute("aria-busy", "false");
+}
+
+function resetTranscriptFind() {
+  const f = transcriptFind;
+  if (!f) return;
+  cancelTranscriptFind(f);
+  f.source?.dispose();
+  f.source = null;
+  f.conversationId = null;
+  f.query = "";
+  f.matchId = null;
+  f.input.value = "";
+  f.status.textContent = FIND_HELP;
+  f.form.classList.add("hidden");
+  f.launch.setAttribute("aria-expanded", "false");
+}
+
+function teardownTranscriptFind() {
+  const f = transcriptFind;
+  if (!f) return;
+  resetTranscriptFind();
+  f.root.classList.add("hidden");
+  f.root.removeEventListener("click", f.onClick);
+  f.form.removeEventListener("submit", f.onSubmit);
+  f.input.removeEventListener("input", f.onInput);
+  window.removeEventListener("keydown", handleTranscriptFindKey, true);
+  transcriptFind = null;
+}
+
+function syncTranscriptFind(conversationId, messageId) {
+  const f = transcriptFind;
+  if (!f) return;
+  if (f.conversationId !== conversationId) {
+    resetTranscriptFind();
+    f.conversationId = conversationId;
+  } else {
+    if (f.request) f.status.textContent = "Search cancelled by navigation. Press Next to search again.";
+    cancelTranscriptFind(f);
+  }
+  f.matchId = messageId;
+}
+
+function openTranscriptFind() {
+  const f = transcriptFind;
+  if (!f || state.view !== "conversation" || !isDatabaseReady()) return false;
+  f.form.classList.remove("hidden");
+  f.launch.setAttribute("aria-expanded", "true");
+  f.input.focus();
+  f.input.select();
+  return true;
+}
+
+function closeTranscriptFind() {
+  const f = transcriptFind;
+  if (!f) return;
+  const conversationId = f.conversationId;
+  resetTranscriptFind();
+  f.conversationId = conversationId;
+  f.launch.focus();
+}
+
+function handleTranscriptFindKey(event) {
+  const f = transcriptFind;
+  if (!f || !state.initialized || state.view !== "conversation" ||
+      !isDatabaseReady() || event.defaultPrevented || event.isComposing || event.altKey) return;
+  const primary = event.ctrlKey || event.metaKey;
+  let action = null;
+  if (primary && !event.shiftKey && event.key.toLowerCase() === "f") action = "open";
+  if (!primary && event.key === "F3") action = event.shiftKey ? "previous" : "next";
+  if (!primary && !f.form.classList.contains("hidden")) {
+    if (event.key === "Escape") action = "close";
+    if (event.key === "Enter" && event.target === f.input) action = event.shiftKey ? "previous" : "next";
+  }
+  if (!action) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (action === "close") {
+    closeTranscriptFind();
+  } else if (action === "open" || !f.input.value || f.form.classList.contains("hidden")) {
+    openTranscriptFind();
+  } else {
+    void runTranscriptFind(action === "previous" ? -1 : 1);
+  }
+}
+
+async function runTranscriptFind(direction) {
+  const f = transcriptFind;
+  if (!f || state.view !== "conversation" || !router || !isDatabaseReady()) return;
+  cancelTranscriptFind(f);
+  if (getCurrentConversation()?.id !== state.conversationId) {
+    f.status.textContent = "Conversation is loading or unavailable. Retry after it opens.";
+    return;
+  }
+  const text = f.input.value;
+  if (!text) {
+    f.status.textContent = "Enter text to find in this conversation.";
+    f.input.focus();
+    return;
+  }
+  if (f.query !== text) {
+    f.query = text;
+    f.matchId = null;
+  }
+  const conversationId = state.conversationId;
+  const routeHash = window.location.hash;
+  const lifecycle = viewerLifecycleEpoch;
+  const request = new AbortController();
+  f.request = request;
+  const current = () => transcriptFind === f && f.request === request &&
+    !request.signal.aborted && lifecycle === viewerLifecycleEpoch &&
+    state.view === "conversation" && state.conversationId === conversationId &&
+    window.location.hash === routeHash && f.input.value === text && isDatabaseReady();
+  f.form.setAttribute("aria-busy", "true");
+  f.status.textContent = "Searching all stored messages…";
+  try {
+    f.source ??= new ConversationMessageSource(conversationId);
+    const result = await f.source.findText(text, {
+      afterMessageId: f.matchId,
+      direction,
+      signal: request.signal,
+      onProgress: ({ checked, total }) => {
+        if (current()) f.status.textContent = `Searching: ${checked} of ${total} messages checked…`;
+      },
+    });
+    if (!current()) return;
+    f.request = null;
+    f.form.setAttribute("aria-busy", "false");
+    if (result.messageId === null) {
+      f.matchId = null;
+      f.status.textContent = `No matching messages. Searched all ${result.total} messages.`;
+      return;
+    }
+    f.matchId = result.messageId;
+    f.status.textContent = `Found message ${result.index + 1} of ${result.total}${result.wrapped ? " (wrapped)" : ""}.`;
+    // Put only stable IDs in the route; never persist the private search text.
+    // Re-selecting a sole match still scrolls back to it even if the URL agrees.
+    try {
+      const path = buildConversationPath(conversationId, result.messageId);
+      if (window.location.hash === `#${path}`) {
+        handleConversationRoute(conversationId, result.messageId);
+      } else {
+        router.navigate(path, { replace: true });
+      }
+    } catch {
+      f.status.textContent = "Match found, but navigation failed. Reopen the conversation to retry.";
+    }
+  } catch (error) {
+    if (!current()) return;
+    // Never turn an incomplete/failed search into a successful empty answer or
+    // log query text. Dispose stale source owners so an explicit retry reopens.
+    f.source?.dispose();
+    f.source = null;
+    f.status.textContent = error?.name === "AbortError"
+      ? "Search cancelled."
+      : "Could not search the conversation. Use 1–4096 characters or reopen the archive and retry.";
+  } finally {
+    if (f.request === request) {
+      f.request = null;
+      f.form.setAttribute("aria-busy", "false");
+    }
+  }
+}
+
 /**
  * Initialize the viewer application
  */
@@ -120,6 +337,7 @@ function ensureDatabaseReadyListener() {
  * Handle database ready event
  */
 function handleDatabaseReady(event) {
+  resetTranscriptFind();
   console.log("[Viewer] Database ready:", event.detail);
   window.removeEventListener("cass:db-ready", handleDatabaseReady);
   waitingForDatabaseReady = false;
@@ -240,6 +458,24 @@ function createViewContainers() {
         </nav>
         <div id="stats-display" class="stats-display"></div>
         <div id="search-view" class="view-container"></div>
+        <div id="transcript-find" class="view-container hidden">
+            <button id="transcript-find-open" type="button" class="btn btn-small"
+                data-find-action="open" aria-expanded="false" aria-controls="transcript-find-form">
+                Find in conversation (Ctrl/⌘+F)
+            </button>
+            <form id="transcript-find-form" class="search-container hidden" role="search"
+                aria-label="Find in conversation" aria-busy="false">
+                <label for="transcript-find-input">Find exact text in all messages</label>
+                <div class="search-box">
+                    <input id="transcript-find-input" type="text" maxlength="4096"
+                        autocomplete="off" spellcheck="false" aria-describedby="transcript-find-status">
+                    <button type="button" class="btn btn-small" data-find-action="previous">Previous</button>
+                    <button type="submit" class="btn btn-primary">Next</button>
+                    <button type="button" class="btn btn-small" data-find-action="close">Close</button>
+                </div>
+                <p id="transcript-find-status" role="status" aria-live="polite" aria-atomic="true"></p>
+            </form>
+        </div>
         <div id="conversation-view" class="view-container hidden"></div>
         <div id="settings-view" class="view-container hidden"></div>
         <div id="stats-view" class="view-container hidden"></div>
@@ -253,6 +489,8 @@ function createViewContainers() {
   elements.statsView = document.getElementById("stats-view");
   elements.notFoundView = document.getElementById("not-found-view");
   elements.statsDisplay = document.getElementById("stats-display");
+
+  setupTranscriptFind();
 
   // Set up nav link highlighting
   setupNavLinks();
@@ -385,6 +623,7 @@ function handleConversationRoute(conversationId, messageId = null) {
   state.view = "conversation";
   state.conversationId = conversationId;
   state.messageId = messageId;
+  syncTranscriptFind(conversationId, messageId);
 
   // Show conversation view
   showViewContainer("conversation");
@@ -472,6 +711,10 @@ function handleNotFoundRoute(path) {
  * Show a specific view container
  */
 function showViewContainer(viewName) {
+  if (transcriptFind) {
+    if (viewName !== "conversation") resetTranscriptFind();
+    transcriptFind.root.classList.toggle("hidden", viewName !== "conversation");
+  }
   // Hide all views
   elements.searchView.classList.add("hidden");
   elements.conversationView.classList.add("hidden");
@@ -855,6 +1098,7 @@ function escapeHtml(text) {
  */
 export function cleanup() {
   viewerLifecycleEpoch += 1;
+  teardownTranscriptFind();
 
   // Destroy router
   if (router) {

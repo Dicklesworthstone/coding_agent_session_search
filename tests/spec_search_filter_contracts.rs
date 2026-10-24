@@ -17,10 +17,11 @@
 //!      downstream automation. Locked against the fixture's known
 //!      `aider`-only contents.
 //!
-//!   3. **`--agent X_unknown` is graceful zero-hit, not error.** The
-//!      filter must never raise: agents catalog the supported agents
-//!      via `cass capabilities --json` and may pass a name that has
-//!      gone stale. Returning `hits == []` with exit 0 is the contract.
+//!   3. **Invalid agent names are typed usage errors.** A misspelled or
+//!      unsupported name must fail with `unknown-agent`, exit 2, rather
+//!      than claim the requested agent has no matching history (GH#532).
+//!      A supported agent absent from this archive still returns an
+//!      empty hit set with exit 0.
 //!
 //!   4. **`--days N` is monotone in N.** Strictly: `hits(--days N1) ⊆
 //!      hits(--days N2)` whenever `N1 ≤ N2`. Equivalent practical form
@@ -92,8 +93,8 @@ fn copy_search_demo_fixture(test_home: &Path) -> Result<PathBuf, Box<dyn Error>>
 }
 
 /// Run `cass search "<q>" --robot --data-dir <fixture> <extra...>` and return
-/// the parsed JSON. Asserts exit 0 — every contract below assumes a successful
-/// filter application, not an error path.
+/// the parsed JSON for an accepted filter request. Asserts exit 0; invalid
+/// agent names are checked separately against the typed error contract.
 fn run_search(data_dir: &Path, extra_args: &[&str]) -> Result<Value, Box<dyn Error>> {
     let output = Command::cargo_bin("cass")?
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
@@ -186,18 +187,58 @@ fn check_hit_agent_matches(idx: usize, hit: &Value, expected: &str) -> TestResul
 }
 
 #[test]
-fn search_agent_filter_unknown_agent_returns_empty_set_not_error() -> TestResult {
+fn search_agent_filter_known_absent_agent_returns_empty_set() -> TestResult {
     let tmp = TempDir::new()?;
     let data_dir = copy_search_demo_fixture(tmp.path())?;
 
-    // Agents pass user-supplied / stale agent names; an unknown name must
-    // produce a clean empty result, never an error envelope. The
-    // run_search helper already asserts exit 0.
-    let response = run_search(&data_dir, &["--agent", "zzz_nonexistent_agent_xyz"])?;
+    // Gemini is supported, but this fixture contains only Aider sessions.
+    // A valid empty projection remains a successful search.
+    let response = run_search(&data_dir, &["--agent", "gemini"])?;
     let n = hit_count(&response)?;
     ensure(
         n == 0,
-        format!("--agent <unknown> should produce 0 hits; got {n}"),
+        format!("--agent gemini should produce 0 hits in the Aider fixture; got {n}"),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn search_agent_filter_unknown_agent_returns_usage_error_before_archive_access() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = tmp.path().join("missing-archive");
+    let output = Command::cargo_bin("cass")?
+        .current_dir(tmp.path())
+        .env("HOME", tmp.path())
+        .env("CASS_DATA_DIR", &data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("RUST_LOG", "error")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env_remove("CASS_DB_PATH")
+        .args(["--color=never", "search", "the", "--robot"])
+        .args(["--data-dir", data_dir.to_str().ok_or("non-utf8 path")?])
+        .args(["--agent", "aider", "--agent", "zzz_nonexistent_agent_xyz"])
+        .output()?;
+    ensure(
+        output.status.code() == Some(2),
+        format!(
+            "invalid agent should exit 2; stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    ensure(
+        output.stdout.is_empty(),
+        "invalid agent emitted a success payload",
+    )?;
+    let payload: Value = serde_json::from_slice(&output.stderr)?;
+    ensure(
+        payload["error"]["code"] == 2
+            && payload["error"]["kind"] == "unknown-agent"
+            && payload["error"]["retryable"] == false,
+        format!("expected a non-retryable unknown-agent error, got {payload}"),
+    )?;
+    ensure(
+        !data_dir.exists(),
+        "invalid agent created the archive directory",
     )?;
     Ok(())
 }

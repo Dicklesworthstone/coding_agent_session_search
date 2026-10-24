@@ -180,6 +180,89 @@ pub(super) fn resume(
     Ok(current)
 }
 
+/// An interrupted repair may outlive append-only ingestion. A larger count is
+/// not proof of an extension: audit the entire old projected prefix on the
+/// caller's pinned canonical snapshot before binding a complete new replay.
+/// Changed bindings deliberately invalidate the optional publication cursor.
+pub(super) fn resume_on_snapshot(
+    mut current: LexicalReconcileCheckpoint,
+    previous: Option<LexicalReconcileCheckpoint>,
+    projection: &super::CanonicalProjection<'_>,
+) -> Result<LexicalReconcileCheckpoint> {
+    let refusal = match resume(current.clone(), previous.clone()) {
+        Ok(checkpoint) => return Ok(checkpoint),
+        Err(error) => error,
+    };
+    let Some(previous) = previous else {
+        return Err(refusal);
+    };
+    // Legacy checkpoints cannot prove any old content. Rewrites, deletions,
+    // source changes, malformed bindings and exhausted attempts remain errors.
+    if current.version != VERSION
+        || previous.version != VERSION
+        || current.conversation_id <= 0
+        || previous.conversation_id != current.conversation_id
+        || previous.source_id != current.source_id
+        || previous.source_path != current.source_path
+        || !valid_digest(current.projection_blake3.as_deref())
+        || !valid_digest(previous.projection_blake3.as_deref())
+        || previous.expected_docs == 0
+        || previous.attempt == u32::MAX
+        || current.message_count <= previous.message_count
+        || current.max_message_idx <= previous.max_message_idx
+        || current.content_bytes < previous.content_bytes
+        || current.expected_docs < previous.expected_docs
+    {
+        return Err(refusal);
+    }
+    ensure!(
+        projection.conversation_id == current.conversation_id
+            && projection.row.source_id == current.source_id
+            && projection.row.source_path.to_string_lossy() == current.source_path,
+        "lexical append proof belongs to another source; checkpoint retained"
+    );
+
+    let mut prefix = ProjectionFingerprint::new(previous.expected_docs);
+    let mut complete = ProjectionFingerprint::new(current.expected_docs);
+    let mut saw_tail = false;
+    let summary = projection.visit(|docs| {
+        complete.update(docs)?;
+        let boundary = docs
+            .partition_point(|doc| i128::from(doc.msg_idx) <= i128::from(previous.max_message_idx));
+        ensure!(
+            (!saw_tail || boundary == 0)
+                && docs[boundary..]
+                    .iter()
+                    .all(|doc| { i128::from(doc.msg_idx) > i128::from(previous.max_message_idx) }),
+            "canonical lexical prefix order changed; checkpoint retained"
+        );
+        prefix.update(&docs[..boundary])?;
+        saw_tail |= boundary < docs.len();
+        Ok(())
+    })?;
+    ensure!(
+        summary.matches_checkpoint(&current)
+            && current.projection_blake3.as_deref() == Some(complete.finish()?.as_str()),
+        "canonical lexical projection changed during append proof; checkpoint retained"
+    );
+    ensure!(
+        previous.projection_blake3.as_deref() == Some(prefix.finish()?.as_str()),
+        "canonical lexical prefix content or metadata changed; checkpoint retained"
+    );
+    current.attempt = previous
+        .attempt
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("lexical reconcile attempt counter exhausted"))?;
+    current.started_at_ms = previous.started_at_ms;
+    tracing::info!(
+        conversation_id = current.conversation_id,
+        previous_docs = previous.expected_docs,
+        current_docs = current.expected_docs,
+        "verified append-only lexical projection; replaying the complete current snapshot"
+    );
+    Ok(current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

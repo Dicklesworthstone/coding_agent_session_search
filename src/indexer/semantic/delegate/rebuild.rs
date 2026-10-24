@@ -21,19 +21,17 @@ where
     C: FnMut() -> Result<()>,
 {
     check_cancelled()?;
+    // Declare the lease before any source observations or candidate owners.
+    // Its scratch borrow also prevents releasing it before TempDir cleanup.
+    let artifacts = super::super::artifacts::BackfillArtifacts::for_rebuild(data_dir)?;
+    check_cancelled()?;
     let destination = vector_index_path(data_dir, indexer.embedder_id());
     refuse_publication_sidecars(&destination, false)?;
     let previous = RebuildDestination::capture(&destination)?;
     let revision = expected_vector_space_revision(indexer.embedder_id())
         .context("full rebuild has no registered vector-space revision")?;
-    let parent = destination
-        .parent()
-        .context("semantic index has no parent")?;
     check_cancelled()?;
-    fs::create_dir_all(parent)?;
-    let scratch = tempfile::Builder::new()
-        .prefix(".semantic-full-rebuild-")
-        .tempdir_in(parent)?;
+    let scratch = artifacts.scratch()?;
     let candidate_path = vector_index_path(scratch.path(), indexer.embedder_id());
     fs::create_dir_all(candidate_path.parent().context("candidate has no parent")?)?;
     if previous.generation.is_none() {
@@ -94,6 +92,11 @@ where
         RebuildDestination::capture(&destination)? == previous,
         "semantic destination changed during full rebuild; retry under the maintenance lock"
     );
+    // The observation holds the destination open, which only the comparison
+    // above needs. Windows refuses to rename over a file while any handle to
+    // it is open, so holding it made every rebuild over an existing
+    // generation fail with "Access is denied" (if17v).
+    drop(previous);
     check_cancelled()?;
     VectorIndex::install_replacement(&destination, &candidate_path)
         .context("install complete semantic rebuild")
@@ -206,3 +209,6 @@ fn validate_candidate(
     check_cancelled()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod scratch_tests;

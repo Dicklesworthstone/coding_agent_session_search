@@ -1,7 +1,9 @@
 //! A caller-owned, persistent lexical search session over standard I/O.
 //!
 //! The reader is loaded lazily and retained until explicit reload, shutdown, or
-//! EOF. Search is index-only. Canonical follow-up requires an explicit --db
+//! EOF. Search is index-only unless --lexical-fallback is explicitly enabled.
+//! That recovery lane admits only small archives after a Quill fuel refusal.
+//! Canonical follow-up requires an explicit --db
 //! and exact source/conversation/message coordinates; it never opens raw files.
 //! Separate opt-in semantic retrieval retains local models and vector assets.
 //! No lane starts writers, automatic refresh, downloads, or detached children.
@@ -15,10 +17,16 @@ mod admission;
 mod canonical;
 #[path = "search_service/deadline.rs"]
 mod deadline;
+#[path = "search_service/lexical_fallback.rs"]
+mod lexical_fallback;
 #[path = "search_service/mcp.rs"]
 mod mcp;
 #[path = "search_service/memory.rs"]
 mod memory;
+#[path = "search_service/once.rs"]
+mod once;
+#[path = "search_service/once_refine.rs"]
+mod once_refine;
 #[path = "search_service/protocol.rs"]
 mod protocol;
 #[path = "search_service/refinement.rs"]
@@ -53,7 +61,7 @@ struct ServiceCli {
 
 #[derive(Debug, Subcommand)]
 enum ServiceCommand {
-    /// Reuse read-only search readers for a stream of JSON requests.
+    /// Reuse read-only search readers, or run one supervised request and exit.
     /// Semantic retrieval and refinement require explicit opt-in. See docs/SEARCH_SERVICE.md.
     Serve {
         /// Published lexical index directory, instead of --data-dir.
@@ -70,29 +78,59 @@ enum ServiceCommand {
             long,
             value_name = "PATH",
             required_unless_present = "index",
-            conflicts_with = "index"
+            conflicts_with = "index",
+            required_if_eq_any = [("mode", "semantic"), ("mode", "hybrid")]
         )]
         data_dir: Option<PathBuf>,
         /// Use newline-delimited JSON requests and responses on standard I/O.
-        #[arg(long, required = true)]
+        #[arg(
+            long,
+            required_unless_present_any = ["query", "transcript", "refine"],
+            conflicts_with_all = ["query", "transcript", "refine"]
+        )]
         stdio: bool,
+        #[command(flatten)]
+        once: once::Options,
+        /// Refine one bounded lexical shortlist and exit without reading stdin.
+        /// JSON selects query, lexical_query, filters, candidate_limit and limit.
+        /// Requires an installed --reranker-model; never downloads model files.
+        #[arg(long, value_name = "JSON", requires = "reranker_model", conflicts_with_all = [
+            "stdio", "mcp", "query", "transcript", "semantic_embedder"
+        ])]
+        refine: Option<String>,
         /// Speak MCP instead of the CASS JSON-lines protocol on the same stdio transport.
         #[arg(long, requires = "stdio")]
         mcp: bool,
         /// Opt in to canonical view requests against this fixed read-only archive.
-        /// Search, status and startup still never open the database.
-        #[arg(long, value_name = "PATH")]
+        /// Search stays index-only unless --lexical-fallback is also supplied.
+        #[arg(
+            long,
+            value_name = "PATH",
+            required_if_eq_any = [("mode", "semantic"), ("mode", "hybrid")]
+        )]
         db: Option<PathBuf>,
+        /// Recover Quill fuel refusals using this explicit archive's SQLite lane.
+        /// Admits at most 64 MiB of database plus WAL; shares the request deadline.
+        /// Results identify the changed backend and are not Quill-score equivalent.
+        #[arg(long, requires = "db")]
+        lexical_fallback: bool,
         /// Opt in to candidate-only refinement with this installed local reranker.
         /// Never downloads files; ordinary search, startup and status stay model-free.
         #[arg(long, value_name = "PATH")]
         reranker_model: Option<PathBuf>,
         /// Opt in to retained semantic/hybrid retrieval using installed assets.
         /// Requires explicit --data-dir and --db; ordinary search stays lexical.
-        #[arg(long, value_enum, requires_all = ["data_dir", "db"])]
+        #[arg(
+            long,
+            value_enum,
+            requires_all = ["data_dir", "db"],
+            conflicts_with = "index",
+            required_if_eq_any = [("mode", "semantic"), ("mode", "hybrid")]
+        )]
         semantic_embedder: Option<semantic::EmbedderChoice>,
-        /// Whole-request deadline, from first frame byte through response flush.
-        /// Expiry exits the worker with code 124; idle sessions are not timed out.
+        /// Whole-request deadline, including setup, search, teardown and one-shot output.
+        /// For --stdio, starts at the first frame byte; idle sessions are not timed out.
+        /// Expiry exits the worker with code 124.
         #[arg(
             long,
             default_value_t = deadline::DEFAULT_TIMEOUT_MS,
@@ -146,8 +184,11 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         index,
         data_dir,
         stdio: _,
+        once,
+        refine,
         mcp,
         db,
+        lexical_fallback,
         reranker_model,
         semantic_embedder,
         request_timeout_ms,
@@ -155,6 +196,18 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         admission_slots,
         max_resident_mib,
     } = cli.command;
+    let one_shot = match refine {
+        Some(selection) => Some(once_refine::request(&selection).map_err(once::invalid_request)?),
+        None => once.request().map_err(once::invalid_request)?,
+    };
+    // One budget covers ALL one-shot work, including the initial memory probe,
+    // reader setup, optional recovery, native teardown and blocked output. This
+    // guard stays alive until run returns; no stage gets a fresh deadline.
+    let _one_shot_deadline = one_shot
+        .as_ref()
+        .map(|_| deadline::Deadline::start(Duration::from_millis(request_timeout_ms)))
+        .transpose()
+        .map_err(cli_io_error)?;
     let semantic_data_dir = data_dir.clone();
     let index = match (index, data_dir) {
         (Some(index), None) => index,
@@ -177,7 +230,11 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         std::env::current_dir().map_err(cli_io_error)?.join(index)
     };
     let mut session = Session::new(index);
+    session.lexical_recovery.enabled = lexical_fallback;
     session.request_timeout = Duration::from_millis(request_timeout_ms);
+    if one_shot.is_some() {
+        session.timeout_scope = "validated_arguments_through_reader_teardown_and_response_flush";
+    }
     session.archive = db
         .map(|path| {
             if path.is_absolute() {
@@ -234,6 +291,22 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
             .transpose()
             .map_err(cli_io_error)?,
     );
+    if let Some(request) = one_shot {
+        let (mut reply, _) = session.handle(request);
+        // Do not publish successful results before storage destruction has
+        // completed. In particular, never reopen stdin or rearm the watchdog.
+        drop(session);
+        if !coding_agent_search::shutdown_thread_local_bridge_runtimes() {
+            reply = Reply::failure(
+                Some(1),
+                "bridge_shutdown_failed",
+                "search bridge teardown did not complete; no successful result was published",
+            );
+        }
+        let result = once::publish(&reply, &mut io::stdout().lock(), &mut io::stderr().lock());
+        drop(memory_guard);
+        return result;
+    }
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     let result = if mcp {
@@ -246,9 +319,23 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
     let _teardown = deadline::Deadline::start(session.request_timeout)
         .unwrap_or_else(|_| std::process::exit(deadline::WATCHDOG_FAILURE_EXIT_CODE));
     drop(session);
+    // Cached bridge runtimes own scheduler threads even after the readers are
+    // gone. Tear them down before either supervisor stops; main's later
+    // idempotent shutdown must not be the first guarded attempt.
+    let bridges_shutdown = coding_agent_search::shutdown_thread_local_bridge_runtimes();
     // Join the sampler while the teardown deadline still protects this process.
     drop(memory_guard);
-    result.map_err(cli_io_error)
+    result.map_err(cli_io_error)?;
+    if !bridges_shutdown {
+        return Err(coding_agent_search::CliError {
+            code: deadline::WATCHDOG_FAILURE_EXIT_CODE,
+            kind: "bridge_shutdown_failed",
+            message: "search service bridge teardown did not complete".into(),
+            hint: None,
+            retryable: false,
+        });
+    }
+    Ok(())
 }
 
 fn cli_io_error(error: io::Error) -> coding_agent_search::CliError {
@@ -264,10 +351,12 @@ fn cli_io_error(error: io::Error) -> coding_agent_search::CliError {
 struct Session {
     index: PathBuf,
     request_timeout: Duration,
+    timeout_scope: &'static str,
     archive: Option<PathBuf>,
     memory_observation: Option<std::sync::Arc<memory::Observation>>,
     refiner: refinement::Refiner,
     semantic: semantic::Semantic,
+    lexical_recovery: lexical_fallback::Recovery,
     canonical_read_attempts: u64,
     canonical_reads_completed: u64,
     client: Option<SearchClient>,
@@ -284,10 +373,12 @@ impl Session {
         Self {
             index,
             request_timeout: Duration::from_millis(deadline::DEFAULT_TIMEOUT_MS),
+            timeout_scope: "first_frame_byte_through_response_flush",
             archive: None,
             memory_observation: None,
             refiner: refinement::Refiner::default(),
             semantic: semantic::Semantic::default(),
+            lexical_recovery: lexical_fallback::Recovery::default(),
             canonical_read_attempts: 0,
             canonical_reads_completed: 0,
             client: None,
@@ -364,12 +455,15 @@ impl Session {
             "snapshot_policy": "pinned_until_reload",
             "freshness": "not_checked",
             "canonical_view_enabled": self.archive.is_some(),
-            "canonical_database_accessed": self.canonical_read_attempts != 0 || self.semantic.archive_access_attempted(),
+            "canonical_database_accessed": self.canonical_read_attempts != 0
+                || self.semantic.archive_access_attempted()
+                || self.lexical_recovery.archive_access_attempted(),
             "canonical_read_attempts": self.canonical_read_attempts,
             "canonical_reads_completed": self.canonical_reads_completed,
             "models_loaded": self.refiner.loaded() || self.semantic.model_loaded(),
             "refinement": self.refiner.status(),
             "semantic": self.semantic.status(),
+            "lexical_fallback": self.lexical_recovery.status(),
             "maintenance_performed": false,
             "memory_supervision": memory.unwrap_or_else(|| json!({"enabled": false})),
             "reader_admission": {
@@ -390,9 +484,11 @@ impl Session {
                 "canonical_batch_views": canonical::MAX_BATCH_VIEWS,
                 "canonical_batch_messages": canonical::MAX_BATCH_MESSAGES,
                 "canonical_batch_content_bytes": canonical::MAX_CONTENT_BYTES,
+                "transcript_messages": canonical::transcript::MAX_MESSAGES,
+                "transcript_content_bytes": canonical::transcript::MAX_PAGE_BYTES,
                 "request_timeout_ms": self.request_timeout.as_millis(),
                 "timeout_exit_code": deadline::TIMEOUT_EXIT_CODE,
-                "timeout_scope": "first_frame_byte_through_response_flush",
+                "timeout_scope": self.timeout_scope,
             }
         })
     }
@@ -430,13 +526,34 @@ impl Session {
         // No payload hydration and no query-prefix response cache: every call
         // uses the production lexical parser, scorer and result reducer against
         // the SAME admitted reader, without opening a canonical archive.
-        let mut hits = client.search(
+        let primary = client.search(
             query,
-            filters,
+            filters.clone(),
             limit + 1,
             offset,
             FieldMask::new(false, true, true, false),
-        )?;
+        );
+        // A valid empty primary result remains authoritative. Only a work-
+        // budget refusal enters the explicit fallback, including a refusal in
+        // SearchClient's internal overfetch or federated search. Never restart
+        // the request deadline or increase the engine's fuel allowance here.
+        let (mut hits, fallback) = match primary {
+            Ok(hits) => (hits, None),
+            Err(error) => {
+                let page = self.lexical_recovery.recover(
+                    self.archive.as_deref(),
+                    error,
+                    lexical_fallback::Search {
+                        query,
+                        filters,
+                        limit: limit + 1,
+                        offset,
+                    },
+                )?;
+                (page.hits, Some(page.metadata))
+            }
+        };
+        let degraded = fallback.is_some();
         ensure!(
             hits.len() <= limit + 1,
             "search backend exceeded the requested page"
@@ -463,7 +580,11 @@ impl Session {
             "next_offset": next_offset,
             "page_window_exhausted": has_next && next_offset.is_none(),
             "preview_only": true,
-            "reader_reused": reused,
+            "backend": if degraded { "frankensqlite" } else { "quill" },
+            "degraded": degraded,
+            "fallback": fallback,
+            "reader_reused": reused && !degraded,
+            "result_reader_epoch": if degraded { None } else { Some(self.successful_opens) },
             "setup_ms": setup_ms,
             "search_ms": started.elapsed().as_millis(),
             "snapshot": self.status(),
@@ -472,6 +593,68 @@ impl Session {
 
     fn handle(&mut self, request: Request) -> (Reply, bool) {
         match request {
+            Request::Transcript {
+                id,
+                source_path,
+                source_id,
+                conversation_id,
+                cursor,
+                limit,
+            } => {
+                let page = canonical::transcript::Page {
+                    source_path: &source_path,
+                    source_id: &source_id,
+                    conversation_id,
+                    cursor: cursor.as_ref(),
+                    limit,
+                };
+                if let Err(message) = page.validate() {
+                    return (Reply::failure(Some(id), "invalid_request", message), false);
+                }
+                let Some(db) = &self.archive else {
+                    return (
+                        Reply::failure(
+                            Some(id),
+                            "canonical_access_disabled",
+                            "transcript requires an explicit --db at service startup",
+                        ),
+                        false,
+                    );
+                };
+                // Hold admission through this page's reader teardown, but never
+                // pin an archive transaction while waiting for another request.
+                let _lease = if self.reader_lease.is_none() {
+                    match self.acquire_reader_lease() {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            return (
+                                Reply::failure(
+                                    Some(id),
+                                    admission_error_kind(&error, "admission_unavailable"),
+                                    format!("{error:#}"),
+                                ),
+                                false,
+                            );
+                        }
+                    }
+                } else {
+                    None
+                };
+                self.canonical_read_attempts = self.canonical_read_attempts.saturating_add(1);
+                let reply = match canonical::transcript::read(db, &page) {
+                    Ok(result) => {
+                        self.canonical_reads_completed =
+                            self.canonical_reads_completed.saturating_add(1);
+                        Reply::success(id, result)
+                    }
+                    Err(error) => Reply::failure(
+                        Some(id),
+                        canonical::transcript::error_kind(&error),
+                        format!("{error:#}"),
+                    ),
+                };
+                (reply, false)
+            }
             Request::ViewBatch { id, views } => {
                 if views.is_empty() || views.len() > canonical::MAX_BATCH_VIEWS {
                     return (

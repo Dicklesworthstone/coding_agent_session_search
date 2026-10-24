@@ -108,10 +108,11 @@ impl Pool {
             .into());
         }
 
-        // Serialize first initialization and policy checking, without ever waiting
-        // for another worker. All cooperating workers must agree on the pool size.
+        // Serialize first initialization and policy checking. The wait for this
+        // control is bounded and never waits for a worker: workers hold slots.
+        // All cooperating workers must agree on the pool size.
         let mut policy = open_control(&self.path.join("policy-v1"))?;
-        lock(&policy)?;
+        lock_control(&policy)?;
         let expected = format!("CASS-READER-POOL-1\nslots={}\n", self.slots);
         let mut actual = String::new();
         (&mut policy).take(513).read_to_string(&mut actual)?;
@@ -140,6 +141,26 @@ fn lock(file: &File) -> Result<(), Refusal> {
         Ok(()) => Ok(()),
         Err(TryLockError::WouldBlock) => Err(Refusal::Busy),
         Err(TryLockError::Error(error)) => Err(Refusal::Io(error)),
+    }
+}
+
+/// How long `acquire` waits for the policy control (j79k1). That lock covers
+/// only reading or initializing `policy-v1` and scanning the slots, so
+/// contention means another acquirer is inside that step, or a child process
+/// another thread just spawned holds a copy of the descriptor until it execs.
+/// Neither means the pool is full, yet a nonblocking attempt reported `Busy`
+/// (and hid a `Policy` mismatch behind it). Slot locks stay nonblocking.
+const CONTROL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn lock_control(file: &File) -> Result<(), Refusal> {
+    let deadline = std::time::Instant::now() + CONTROL_LOCK_WAIT;
+    loop {
+        match lock(file) {
+            Err(Refusal::Busy) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            outcome => return outcome,
+        }
     }
 }
 
@@ -172,6 +193,29 @@ fn open_control(path: &Path) -> io::Result<File> {
     // The operator must own/trust the directory and its parents. This preflight
     // is not an atomic security boundary against concurrent path replacement.
     Ok(file)
+}
+
+/// Acquire a slot a test has just released (j79k1). A lease is a `flock` on
+/// an open file, and while another thread of the same test binary spawns a
+/// child, the child holds a copy of every descriptor until it execs
+/// (close-on-exec), so a released slot can stay locked for that window
+/// (search_service's own tests spawn `cass` and their own binary in parallel).
+/// Slots are nonblocking by design, so every test that re-acquires to prove a
+/// release uses this: waiting, bounded, keeps the assertion that the release
+/// happens without racing a peer's spawn, and a lease that is never released
+/// still fails after the deadline. (The policy control's equivalent window is
+/// handled in `acquire` itself; see `CONTROL_LOCK_WAIT`.)
+#[cfg(test)]
+pub(super) fn acquire_after_release(pool: &Pool) -> Result<Lease, Refusal> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match pool.acquire() {
+            Err(Refusal::Busy) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -218,13 +262,58 @@ mod tests {
         assert!(matches!(pool.acquire(), Err(Refusal::Busy)));
         let before = fs::read(path.join("policy-v1"))?;
         drop(first);
-        let replacement = pool.acquire()?;
+        let replacement = acquire_after_release(&pool)?;
         assert!(matches!(pool.acquire(), Err(Refusal::Busy)));
         drop(second);
         drop(replacement);
-        drop(pool.acquire()?);
+        drop(acquire_after_release(&pool)?);
         assert_eq!(fs::read(path.join("policy-v1"))?, before);
         assert_eq!(fs::read_dir(path)?.count(), 3);
+        Ok(())
+    }
+
+    /// j79k1: contention on the policy control is transient, so acquire waits
+    /// for it, bounded, instead of reporting a full pool; a control held past
+    /// the bound still refuses `Busy`.
+    #[test]
+    fn acquire_waits_briefly_for_the_policy_control_and_refuses_past_the_bound()
+    -> Result<(), Refusal> {
+        let path = directory();
+        let pool = Pool::new(path.clone(), 1)?;
+        drop(pool.acquire()?);
+
+        let control = open_control(&path.join("policy-v1"))?;
+        control.lock()?;
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let acquirer = {
+            let pool = pool.clone();
+            thread::spawn(move || {
+                started_tx.send(()).ok();
+                pool.acquire().map(drop)
+            })
+        };
+        started_rx
+            .recv()
+            .map_err(|error| Refusal::Io(io::Error::other(error)))?;
+        thread::sleep(Duration::from_millis(20));
+        drop(control);
+        acquirer
+            .join()
+            .map_err(|_| Refusal::Io(io::Error::other("acquirer panicked")))??;
+
+        // Negative: held past the bound, the control still refuses Busy, and
+        // the wait is bounded.
+        let control = open_control(&path.join("policy-v1"))?;
+        control.lock()?;
+        let started = Instant::now();
+        assert!(matches!(pool.acquire(), Err(Refusal::Busy)));
+        let waited = started.elapsed();
+        assert!(
+            waited >= CONTROL_LOCK_WAIT && waited < CONTROL_LOCK_WAIT * 8,
+            "{waited:?}"
+        );
+        drop(control);
+        drop(acquire_after_release(&pool)?);
         Ok(())
     }
 

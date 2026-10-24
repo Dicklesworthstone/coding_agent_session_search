@@ -157,7 +157,7 @@ function harness(t, fixture, options = {}) {
     decrypt: (id, extra) => dispatch("DECRYPT_DATABASE", id, extra),
     replaceFetch(implementation) { fetchImpl = implementation; },
     fireDeadline() {
-      assert.equal(deadlines.size, 1, "exactly one active download has a deadline");
+      assert.equal(deadlines.size, 4, "every admitted transfer has its own deadline");
       [...deadlines.values()][0]();
     },
     databaseBuffers: () => arrays.filter((bytes) => bytes.byteLength === fixture.plain.length),
@@ -244,7 +244,7 @@ test("reset settles a stalled header fetch, aborts its signal, and permits a fre
   const fixture = await archive();
   const f = harness(t, fixture, { fetch: () => new Promise(() => {}) });
   const old = f.decrypt("old");
-  await until(() => f.calls.length === 1);
+  await until(() => f.calls.length === 4);
   await f.dispatch("CLEAR_KEYS", "clear");
   await completed(old);
   assert.equal(f.calls[0].signal.aborted, true);
@@ -262,7 +262,7 @@ test("a late header response after reset is cancelled rather than read or decryp
   let cancelled = 0;
   const f = harness(t, fixture, { fetch: () => headers.promise });
   const old = f.decrypt("old");
-  await until(() => f.calls.length === 1);
+  await until(() => f.calls.length === 4);
   await f.dispatch("CLEAR_KEYS", "clear");
   await completed(old);
   headers.resolve(new Response(new ReadableStream({ cancel() { cancelled++; } })));
@@ -278,7 +278,7 @@ for (const phase of ["headers", "body"]) {
     const f = harness(t, fixture, { fetch: () => phase === "headers" ? new Promise(() => {}) :
       new Response(new ReadableStream({ cancel() { cancelled = true; return new Promise(() => {}); } })) });
     const job = f.decrypt("timeout");
-    await until(() => f.calls.length === 1);
+    await until(() => f.calls.length === 4);
     await yieldTurn();
     f.fireDeadline();
     await completed(job);
@@ -391,7 +391,7 @@ test("oversized headers cancel unread response bodies and leave the slot retryab
   }), { headers: { "content-length": "99999999" } }) });
   await completed(f.decrypt("oversize"));
   failed(f, "oversize", /download limit/);
-  assert.equal(cancelled, 1);
+  assert.equal(cancelled, 4);
   assert.equal(f.decryptOutputs.length, 0);
   f.replaceFetch(null);
   await completed(f.decrypt("retry"));
@@ -409,7 +409,7 @@ test("stream overflow ignores misleading content-length and never waits for canc
   await completed(f.decrypt("overflow"));
   failed(f, "overflow", /download limit/);
   assert.ok(zeros(piece));
-  assert.equal(cancelled, 1);
+  assert.equal(cancelled, 4);
   assert.equal(f.decryptOutputs.length, 0);
 });
 
@@ -427,11 +427,11 @@ test("late body bytes are scrubbed even when an adversarial reader ignores cance
   };
   const f = harness(t, fixture, { fetch: () => ({ ok: true, body: { getReader: () => reader } }) });
   const job = f.decrypt("late-body");
-  await until(() => reads === 1);
+  await until(() => reads === 4);
   await f.dispatch("CLEAR_KEYS", "clear");
   await completed(job);
   failed(f, "late-body", /superseded/);
-  assert.equal(cancelled, 1);
+  assert.equal(cancelled, 4);
   assert.ok(released);
   const piece = new Uint8Array(16).fill(9);
   read.resolve({ done: false, value: piece });
@@ -447,7 +447,7 @@ test("missing chunks fail once, cancel bodies, and release download deadlines", 
   }), { status: 503 }) });
   await completed(f.decrypt("missing"));
   failed(f, "missing", /503/);
-  assert.equal(cancelled, 1);
+  assert.equal(cancelled, 4);
   assert.equal(f.deadlines.size, 0);
   assert.ok(f.databaseBuffers().every(zeros));
 });
@@ -486,9 +486,9 @@ test("real worker and HTTP Fetch abort the superseded archive before serving its
     requests++;
     if (requests === 1) {
       response.on("close", firstClosed.resolve);
-      firstRequest.resolve();
       return; // Deliberately leave the old archive's response headers pending.
     }
+    if (requests === fixture.chunks.length) firstRequest.resolve();
     const index = Number(request.url.match(/chunk-(\d+)\.bin$/)?.[1]);
     response.writeHead(200, { "content-type": "application/octet-stream" });
     response.end(Buffer.from(fixture.chunks[index]));
@@ -523,7 +523,7 @@ test("real worker and HTTP Fetch abort the superseded archive before serving its
   assert.equal(result.type, "DECRYPT_SUCCESS", String(result.error));
   assert.deepEqual(new Uint8Array(result.dbBytes), fixture.plain);
   await completed(firstClosed.promise);
-  assert.equal(requests, fixture.chunks.length + 1);
+  assert.equal(requests, fixture.chunks.length * 2);
   const old = messages.filter((message) => message.requestId === "old" && message.type !== "PROGRESS");
   assert.equal(old.length, 1);
   assert.equal(old[0].type, "DECRYPT_FAILED");

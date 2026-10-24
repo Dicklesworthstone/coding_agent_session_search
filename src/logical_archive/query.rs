@@ -167,7 +167,7 @@ fn scan(
     let mut line = 2_u64;
     while let Some(record) = codec::read_record(input, line)? {
         validator
-            .push(&record)
+            .validate(&record)
             .with_context(|| format!("logical evidence record {line}"))
             .map_err(super::integrity_unless_io)?;
         match &record {
@@ -433,7 +433,7 @@ fn search_page(
         hits.push(value);
     }
     bounded_response(json!({
-        "operation": "search", "format": codec::FORMAT, "schema_version": codec::VERSION,
+        "operation": "search", "format": codec::FORMAT, "schema_version": verified.0.schema_version,
         "archive_id": verified.0.archive_id, "content_sha256": verified.1.content_sha256,
         "integrity_verified": true, "database_integrity_checked": false,
         "match_mode": "literal_case_sensitive", "order": "message_id",
@@ -641,7 +641,7 @@ fn view_stream(
         "selected logical messages are missing or ambiguous"
     );
     bounded_response(json!({
-        "operation": "view", "format": codec::FORMAT, "schema_version": codec::VERSION,
+        "operation": "view", "format": codec::FORMAT, "schema_version": verified.0.schema_version,
         "archive_id": verified.0.archive_id, "content_sha256": verified.1.content_sha256,
         "integrity_verified": true, "database_integrity_checked": false,
         "source_id": conversation.source_id, "source_path": conversation.source_path,
@@ -709,15 +709,20 @@ mod tests {
     }
 
     fn wire(records: Vec<Record>) -> Vec<u8> {
+        wire_version(records, codec::VERSION)
+    }
+
+    fn wire_version(records: Vec<Record>, version: u32) -> Vec<u8> {
         let header = Header {
             format: codec::FORMAT.into(),
-            schema_version: codec::VERSION,
+            schema_version: version,
             archive_id: "query-fixture".into(),
             exported_at_ms: 1,
             storage_schema_version: "17".into(),
-            record_types: vec!["table".into(), "row".into(), "completion".into()],
+            record_types: codec::record_types(version),
             contains_private_data: true,
             omissions: vec!["derived_search_assets".into()],
+            sequences: (version == codec::SEQUENCE_VERSION).then(Vec::new),
         };
         let mut bytes = codec::encode(&Record::Header {
             header: header.clone(),
@@ -725,7 +730,7 @@ mod tests {
         .unwrap();
         let mut validator = Validator::new(header).unwrap();
         for record in records {
-            bytes.extend(validator.push(&record).unwrap());
+            codec::write_encoded(&validator.push(&record).unwrap(), &mut bytes).unwrap();
         }
         bytes.extend(
             codec::encode(&Record::Completion {
@@ -734,6 +739,25 @@ mod tests {
             .unwrap(),
         );
         bytes
+    }
+
+    #[test]
+    fn search_and_view_receipts_report_the_verified_wire_version() {
+        for version in [
+            codec::VERSION,
+            codec::CHUNKED_VERSION,
+            codec::SEQUENCE_VERSION,
+        ] {
+            let bytes = wire_version(records(), version);
+            let search = search_stream(&mut Cursor::new(&bytes), "needle", 2, None).unwrap();
+            assert_eq!(search["schema_version"], version);
+            assert_eq!(search["integrity_verified"], true);
+            assert_eq!(search["matches"], 3);
+            let view = view_fixture(&bytes, 2, 0).unwrap();
+            assert_eq!(view["schema_version"], version);
+            assert_eq!(view["content_sha256"], search["content_sha256"]);
+            assert_eq!(view["messages"][0]["content"], "δ\0 needle beta");
+        }
     }
 
     #[test]

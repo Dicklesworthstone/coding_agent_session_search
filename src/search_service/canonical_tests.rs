@@ -346,7 +346,7 @@ fn mcp_catalog_and_dispatch_require_explicit_canonical_permission() -> Result<()
     session.archive = Some(fixture.db.clone());
     let replies = mcp_exchange(&mut session, &[list])?;
     let tools = replies[1]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 7);
     let view = tools
         .iter()
         .find(|tool| tool["name"] == "cass_view")
@@ -508,7 +508,7 @@ fn canonical_reads_share_admission_and_release_temporary_leases() -> Result<()> 
             reply.result.unwrap()["messages"][0]["content"],
             "canonical content 12"
         );
-        drop(pool.acquire()?);
+        drop(super::super::admission::acquire_after_release(&pool)?);
     }
     assert_eq!(session.open_attempts, 0);
     assert_eq!(archive_image(&fixture.db)?, before);
@@ -571,7 +571,7 @@ fn canonical_batch_returns_ordered_sparse_windows_with_one_reader_admission() ->
     assert_eq!(session.canonical_reads_completed, 1);
     assert_eq!(session.open_attempts, 0);
     assert!(!session.refiner.loaded());
-    drop(pool.acquire()?);
+    drop(super::super::admission::acquire_after_release(&pool)?);
     assert_eq!(archive_image(&fixture.db)?, before);
     Ok(())
 }

@@ -114,9 +114,15 @@ fn gh511_metadata_replay_keeps_inventory_and_watch_in_sync() -> anyhow::Result<(
             watched.push(conversation);
             Ok(())
         })?;
-        assert_eq!(serde_json::to_value(&watched)?, serde_json::to_value(&expected)?);
+        assert_eq!(
+            serde_json::to_value(&watched)?,
+            serde_json::to_value(&expected)?
+        );
         let (delivered, completed) = collect(&ctx)?;
-        assert_eq!(serde_json::to_value(&delivered)?, serde_json::to_value(&expected)?);
+        assert_eq!(
+            serde_json::to_value(&delivered)?,
+            serde_json::to_value(&expected)?
+        );
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].source, inventory[0]);
         assert_eq!(completed[0].required_sidecars, vec![inventory[1].clone()]);
@@ -151,7 +157,10 @@ fn gh511_metadata_removal_and_return_replay_an_untouched_primary() -> anyhow::Re
         assert!(completed[0].required_sidecars.is_empty());
         let identity = without[0].external_id.clone();
         assert!(identity.is_some());
-        assert_eq!(CodebuffConnector::new().discover_source_files(&ctx)?.len(), 1);
+        assert_eq!(
+            CodebuffConnector::new().discover_source_files(&ctx)?.len(),
+            1
+        );
 
         fs::rename(&saved, &state)?;
         let (restored, completed) = collect(&ctx)?;
@@ -183,7 +192,10 @@ fn gh511_metadata_replay_does_not_clear_other_roots_cutoffs() -> anyhow::Result<
     let connector = CodebuffConnector::new();
     let mut unfiltered = context(temp.path(), vec![other_store.clone()]);
     unfiltered.since_ts = None;
-    assert!(connector.scan(&unfiltered).is_err(), "real malformed-source control");
+    assert!(
+        connector.scan(&unfiltered).is_err(),
+        "real malformed-source control"
+    );
     for directory in [false, true] {
         for other_root in [&other, &other_store] {
             for replay_first in [false, true] {
@@ -205,8 +217,16 @@ fn gh511_metadata_replay_does_not_clear_other_roots_cutoffs() -> anyhow::Result<
         }
     }
     // The public primary-file and broad-store timestamp contracts remain intact.
-    assert!(connector.scan(&context(temp.path(), vec![other]))?.is_empty());
-    assert!(connector.scan(&context(temp.path(), vec![other_store]))?.is_empty());
+    assert!(
+        connector
+            .scan(&context(temp.path(), vec![other]))?
+            .is_empty()
+    );
+    assert!(
+        connector
+            .scan(&context(temp.path(), vec![other_store]))?
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -226,7 +246,11 @@ fn gh511_metadata_replay_keeps_parse_errors_and_admission() -> anyhow::Result<()
         .unwrap_err();
     assert_eq!(delivered, 0);
     assert!(error.chain().any(|cause| cause.is::<serde_json::Error>()));
-    assert!(error.to_string().contains(primary.to_string_lossy().as_ref()));
+    assert!(
+        error
+            .to_string()
+            .contains(primary.to_string_lossy().as_ref())
+    );
 
     let mut admitted = 0;
     let mut completed = 0;

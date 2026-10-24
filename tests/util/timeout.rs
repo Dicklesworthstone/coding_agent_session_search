@@ -363,11 +363,15 @@ fn list_dir_bounded(root: &Path, limit: usize) -> Vec<String> {
                 return out;
             }
             let path = entry.path();
+            // Join components with '/' so the listing reads the same on
+            // every platform (Windows would otherwise print `sub\b.bin`).
             let rel = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
             match std::fs::symlink_metadata(&path) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
                     out.push(format!("{rel} (symlink)"));
@@ -442,8 +446,18 @@ mod tests {
     /// normally with no panic and no diagnostic noise.
     #[test]
     fn happy_path_returns_output_without_panicking() {
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg("printf 'hi' && exit 0");
+        #[cfg(unix)]
+        let cmd = {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c").arg("printf 'hi' && exit 0");
+            cmd
+        };
+        #[cfg(not(unix))]
+        let cmd = {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "echo hi"]);
+            cmd
+        };
         let out = spawn_with_timeout_or_diag(cmd, "happy_path", None, Duration::from_secs(5));
         assert!(out.status.success(), "shell must exit 0");
         assert_eq!(
@@ -458,8 +472,23 @@ mod tests {
     /// block before exit and get misdiagnosed as a timeout.
     #[test]
     fn large_stdout_child_can_exit_without_pipe_deadlock() {
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg("yes x | head -c 1048576");
+        #[cfg(unix)]
+        let cmd = {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c").arg("yes x | head -c 1048576");
+            cmd
+        };
+        #[cfg(not(unix))]
+        let cmd = {
+            let mut cmd = Command::new("powershell");
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::Out.Write('x' * 1048576)",
+            ]);
+            cmd
+        };
         let out = spawn_with_timeout_or_diag(cmd, "large_stdout", None, Duration::from_secs(10));
         assert!(out.status.success(), "large stdout child must exit 0");
         assert_eq!(out.stdout.len(), 1024 * 1024);
@@ -481,10 +510,14 @@ mod tests {
                 cmd.arg("-c").arg("sleep 30");
                 cmd
             };
+            // No shell wrapper on Windows: killing `cmd.exe` would leave its
+            // child holding the pipes open. `ping` is the direct child here.
             #[cfg(not(unix))]
-            let mut cmd = Command::new("/bin/sleep");
-            #[cfg(not(unix))]
-            cmd.arg("30");
+            let cmd = {
+                let mut cmd = Command::new("ping");
+                cmd.args(["-n", "31", "127.0.0.1"]);
+                cmd
+            };
             spawn_with_timeout_or_diag(cmd, "intentional_hang", None, Duration::from_millis(300))
         });
         let panic = result.expect_err("a stalled child must time out");

@@ -292,7 +292,7 @@ pub(super) fn scan(
         exclusions: ScanExclusions::from_env(),
         limits,
     };
-    let sources = archives::discover(inner, ctx)?;
+    let (sources, discovery_result) = archives::discover_for_scan(ctx)?.into_parts();
     let mut failures = Failures {
         budgets: limits.incomplete(),
         ..Failures::default()
@@ -325,7 +325,15 @@ pub(super) fn scan(
             failures.record(&source, error);
         }
     }
-    failures.finish()
+    match (discovery_result, failures.finish()) {
+        (Err(discovery_error), Err(source_error)) => {
+            // Retain discovery as the typed cause; this mixed failure must
+            // never be mistaken for a budget-only refusal by its caller.
+            Err(discovery_error.context(source_error))
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), result) => result,
+    }
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ fn header() -> Header {
         record_types: ["table", "row", "completion"].map(str::to_owned).to_vec(),
         contains_private_data: true,
         omissions: vec!["derived_search_assets".to_owned()],
+        sequences: None,
     }
 }
 
@@ -57,6 +58,149 @@ fn complete_archive_round_trips_and_preserves_unicode() {
         matches!(read_record(&mut reader, 3).unwrap(), Some(Record::Row { values })
         if values == vec![Cell::Integer(7), Cell::Text("private\n雪".to_owned())])
     );
+}
+
+#[test]
+fn legacy_headers_and_digest_remain_byte_compatible_without_sequence_metadata() {
+    for version in [VERSION, CHUNKED_VERSION] {
+        let mut input_header = header();
+        input_header.schema_version = version;
+        input_header.record_types = record_types(version);
+        let bytes = archive(
+            input_header,
+            vec![Cell::Integer(7), Cell::Text("private\n雪".to_owned())],
+        );
+        let first_line = bytes.split(|byte| *byte == b'\n').next().unwrap();
+        assert!(
+            !first_line
+                .windows(b"sequences".len())
+                .any(|part| part == b"sequences")
+        );
+        let (got, completion) = verify(&mut Cursor::new(&bytes)).unwrap();
+        assert_eq!(got.sequences, None);
+        // Independent canonical-v1 fixture: timestamp 0, one messages row.
+        assert_eq!(
+            completion.content_sha256,
+            "cc479f79dd8d5edb3af938722254d954846d29b37580c41c17ea2f5af95b963e"
+        );
+    }
+}
+
+fn sequence_header(value: Option<i64>) -> Header {
+    let mut header = header();
+    header.schema_version = SEQUENCE_VERSION;
+    header.record_types = record_types(SEQUENCE_VERSION);
+    header.sequences = Some(vec![Sequence {
+        table: "messages".to_owned(),
+        value,
+    }]);
+    header
+}
+
+#[test]
+fn allocation_state_is_authenticated_including_absence_and_signed_extremes() {
+    let mut digests = std::collections::BTreeSet::new();
+    for value in [
+        None,
+        Some(0),
+        Some(-7),
+        Some(9001),
+        Some(i64::MIN),
+        Some(i64::MAX),
+    ] {
+        let expected_header = sequence_header(value);
+        let bytes = archive(expected_header.clone(), vec![Cell::Integer(7), Cell::Null]);
+        let (got, completion) = verify(&mut Cursor::new(&bytes)).unwrap();
+        assert_eq!(got, expected_header);
+        assert!(digests.insert(completion.content_sha256.clone()));
+
+        let first_newline = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+        let mut changed = expected_header;
+        changed.sequences.as_mut().unwrap()[0].value = Some(42);
+        let mut tampered = encode(&Record::Header { header: changed }).unwrap();
+        tampered.extend_from_slice(&bytes[first_newline..]);
+        assert!(verify(&mut Cursor::new(tampered)).is_err());
+    }
+    let legacy = verify(&mut Cursor::new(archive(
+        header(),
+        vec![Cell::Integer(7), Cell::Null],
+    )))
+    .unwrap()
+    .1;
+    assert!(!digests.contains(&legacy.content_sha256));
+}
+
+#[test]
+fn allocation_inventory_rejects_undeclared_or_ambiguous_state_before_use() {
+    let mut missing = sequence_header(None);
+    missing.sequences = None;
+    assert!(Validator::new(missing).is_err());
+    for version in [VERSION, CHUNKED_VERSION] {
+        let mut legacy = sequence_header(None);
+        legacy.schema_version = version;
+        legacy.record_types = record_types(version);
+        assert!(Validator::new(legacy).is_err());
+    }
+    for names in [
+        vec!["messages", "messages"],
+        vec!["z", "a"],
+        vec!["PRIVATE-INVALID-IDENTIFIER"],
+    ] {
+        let mut input_header = sequence_header(None);
+        input_header.sequences = Some(
+            names
+                .into_iter()
+                .map(|name| Sequence {
+                    table: name.to_owned(),
+                    value: None,
+                })
+                .collect(),
+        );
+        let error = Validator::new(input_header).err().unwrap();
+        assert!(!error.to_string().contains("PRIVATE-INVALID-IDENTIFIER"));
+    }
+    let mut too_many = sequence_header(None);
+    too_many.sequences = Some(
+        (0..=MAX_TABLES)
+            .map(|index| Sequence {
+                table: format!("t{index:03}"),
+                value: None,
+            })
+            .collect(),
+    );
+    assert!(Validator::new(too_many).is_err());
+}
+
+#[test]
+fn allocation_tables_must_be_present_and_have_integer_single_keys() {
+    let mut composite = table();
+    composite.primary_key = vec![0, 1];
+    let mut validator = Validator::new(sequence_header(None)).unwrap();
+    assert!(validator.push(&Record::Table { table: composite }).is_err());
+    validator.push(&Record::Table { table: table() }).unwrap();
+    assert!(
+        validator
+            .push(&Record::Row {
+                values: vec![Cell::Text("PRIVATE-KEY".to_owned()), Cell::Null],
+            })
+            .is_err()
+    );
+    assert_eq!(validator.completion().records, 0);
+    validator
+        .push(&Record::Row {
+            values: vec![Cell::Integer(7), Cell::Null],
+        })
+        .unwrap();
+    let completion = validator.completion();
+    validator.push(&Record::Completion { completion }).unwrap();
+    validator.finish().unwrap();
+
+    let mut validator = Validator::new(sequence_header(None)).unwrap();
+    let mut other = table();
+    other.name = "other".to_owned();
+    validator.push(&Record::Table { table: other }).unwrap();
+    let completion = validator.completion();
+    assert!(validator.push(&Record::Completion { completion }).is_err());
 }
 
 #[test]
@@ -204,6 +348,7 @@ fn an_unterminated_oversized_stream_is_stopped_before_unbounded_reading() {
 
 #[test]
 fn malformed_errors_do_not_echo_private_bodies() {
+    // ubs:ignore[rust.security.hardcoded-secrets] -- Synthetic payload verifies diagnostic redaction.
     let secret = "PRIVATE_SESSION_SECRET";
     let bytes = format!("{{\"type\":\"{secret}\"}}\n");
     let error = read_record(&mut Cursor::new(bytes), 12)
@@ -213,6 +358,81 @@ fn malformed_errors_do_not_echo_private_bodies() {
     assert!(!error.contains(secret));
     assert!(read_record(&mut Cursor::new(b"\xff\n"), 1).is_err());
     assert!(read_record(&mut Cursor::new(b"\n"), 1).is_err());
+}
+
+#[test]
+fn failed_read_after_valid_records_reports_io_and_position_without_private_details() {
+    struct FailedRead {
+        prefix: Cursor<Vec<u8>>,
+    }
+
+    impl Read for FailedRead {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.prefix.read(bytes)?;
+            if count == 0 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "PRIVATE_READ_ERROR_DETAIL",
+                ))
+            } else {
+                Ok(count)
+            }
+        }
+    }
+
+    // Header, table and one complete private row have already verified when
+    // the underlying reader fails before the completion. This is not evidence
+    // of an invalid archive, and the reader's arbitrary message is not public.
+    let prefix = valid()
+        .split_inclusive(|byte| *byte == b'\n')
+        .take(3)
+        .flatten()
+        .copied()
+        .collect();
+    let mut input = BufReader::with_capacity(
+        64,
+        FailedRead {
+            prefix: Cursor::new(prefix),
+        },
+    );
+    let error = verify(&mut input).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("record 4"), "{message}");
+    assert!(message.contains("UnexpectedEof"), "{message}");
+    assert!(!message.contains("PRIVATE_READ_ERROR_DETAIL"));
+    assert!(!message.contains("private"));
+    assert_eq!(
+        super::super::classify_failure(&error),
+        (14, "logical-archive-io", true)
+    );
+    assert!(error.downcast_ref::<std::io::Error>().is_some());
+}
+
+#[test]
+fn interrupted_reads_resume_and_verify_the_complete_archive() {
+    struct InterruptedOnce {
+        bytes: Cursor<Vec<u8>>,
+        interrupted: bool,
+    }
+
+    impl Read for InterruptedOnce {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            // Exercise records spanning many read buffers as well as EINTR.
+            let take = bytes.len().min(7);
+            self.bytes.read(&mut bytes[..take])
+        }
+    }
+
+    let expected = verify(&mut Cursor::new(valid())).unwrap();
+    let input = InterruptedOnce {
+        bytes: Cursor::new(valid()),
+        interrupted: false,
+    };
+    assert_eq!(verify(&mut BufReader::new(input)).unwrap(), expected);
 }
 
 #[test]
@@ -233,6 +453,162 @@ fn numeric_and_blob_encodings_are_lossless_and_strict() {
     }
     assert!(Cell::Blob("AAH/".to_owned()).validate().is_ok());
     assert!(Cell::Blob("%%%".to_owned()).validate().is_err());
+}
+
+#[test]
+fn typed_cells_preserve_scalar_values_and_allow_the_kind_after_the_value() {
+    let fixtures = [
+        (r#"{"kind":"null"}"#, Cell::Null),
+        (r#"{"kind":"null","value":null}"#, Cell::Null),
+        (r#"{"value":null,"kind":"null"}"#, Cell::Null),
+        (
+            r#"{"value":-9223372036854775808,"kind":"integer"}"#,
+            Cell::Integer(i64::MIN),
+        ),
+        (
+            r#"{"kind":"integer","value":9223372036854775807}"#,
+            Cell::Integer(i64::MAX),
+        ),
+        (r#"{"value":0,"kind":"integer"}"#, Cell::Integer(0)),
+        (
+            r#"{"value":"8000000000000000","kind":"real"}"#,
+            Cell::Real("8000000000000000".to_owned()),
+        ),
+        (
+            r#"{"value":"雪\u0000\"","kind":"text"}"#,
+            Cell::Text("雪\0\"".to_owned()),
+        ),
+        (
+            r#"{"value":"AP+A","kind":"blob"}"#,
+            Cell::Blob("AP+A".to_owned()),
+        ),
+    ];
+    for (wire, expected) in fixtures {
+        assert_eq!(serde_json::from_str::<Cell>(wire).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_reader::<_, Cell>(Cursor::new(wire)).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn typed_cells_reject_nested_values_overflow_floats_and_duplicate_fields() {
+    for wire in [
+        r#"{"kind":"integer","value":9223372036854775808}"#,
+        r#"{"value":-9223372036854775809,"kind":"integer"}"#,
+        r#"{"kind":"integer","value":18446744073709551616}"#,
+        r#"{"value":1.0,"kind":"integer"}"#,
+        r#"{"value":1e0,"kind":"integer"}"#,
+        r#"{"value":"7","kind":"integer"}"#,
+        r#"{"value":7,"kind":"text"}"#,
+        r#"{"value":true,"kind":"integer"}"#,
+        r#"{"value":[],"kind":"text"}"#,
+        r#"{"value":{},"kind":"blob"}"#,
+        r#"{"value":null,"kind":"text"}"#,
+        r#"{"value":0,"kind":"null"}"#,
+        r#"{"kind":"text"}"#,
+        r#"{"value":"PRIVATE_VALUE"}"#,
+        r#"{"kind":"null","kind":"null"}"#,
+        r#"{"kind":"null","value":null,"value":null}"#,
+        r#"{"kind":"null","PRIVATE_FIELD":null}"#,
+        r#"{"kind":{"null":null}}"#,
+        r#"{"kind":["null"]}"#,
+        r#"{"kind":0}"#,
+        r#"{"kind":null}"#,
+    ] {
+        assert!(serde_json::from_str::<Cell>(wire).is_err());
+        let record = format!("{{\"type\":\"row\",\"values\":[{wire}]}}\n");
+        let error = read_record(&mut Cursor::new(record), 23).unwrap_err();
+        assert_eq!(
+            super::super::classify_failure(&error),
+            (5, "logical-archive-integrity", false)
+        );
+        assert!(error.to_string().contains("23"));
+        assert!(!error.to_string().contains("PRIVATE_"));
+    }
+}
+
+#[test]
+fn typed_records_accept_payload_before_type_for_every_record_kind() {
+    let records = [
+        ("header", "header", Record::Header { header: header() }),
+        ("table", "table", Record::Table { table: table() }),
+        (
+            "row",
+            "values",
+            Record::Row {
+                values: vec![Cell::Integer(7), Cell::Text("雪\0".to_owned())],
+            },
+        ),
+        (
+            "completion",
+            "completion",
+            Record::Completion {
+                completion: Completion {
+                    records: 0,
+                    tables: BTreeMap::new(),
+                    content_sha256: "0".repeat(64),
+                },
+            },
+        ),
+    ];
+    for (kind, field, expected) in records {
+        let encoded = serde_json::to_value(&expected).unwrap();
+        let payload = &encoded[field];
+        let reordered = format!("{{\"{field}\":{payload},\"type\":\"{kind}\"}}\n");
+        assert_eq!(
+            read_record(&mut Cursor::new(reordered), 1).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            read_record(&mut Cursor::new(encode(&expected).unwrap()), 1).unwrap(),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn typed_records_reject_unknown_duplicate_missing_and_conflicting_fields() {
+    for wire in [
+        r#"{"type":"row","values":[],"values":[]}"#,
+        r#"{"type":"row","type":"row","values":[]}"#,
+        r#"{"values":[],"type":"row","type":"row"}"#,
+        r#"{"type":"row","values":[],"header":null}"#,
+        r#"{"type":"table","values":[]}"#,
+        r#"{"values":[],"type":"table"}"#,
+        r#"{"values":[]}"#,
+        r#"{"type":"row"}"#,
+        r#"{"type":"row","values":null}"#,
+        r#"{"type":"row","values":[],"PRIVATE_FIELD":[]}"#,
+        r#"{"type":{"row":null},"values":[]}"#,
+        r#"{"values":[],"type":["row"]}"#,
+        r#"{"type":2,"values":[]}"#,
+        r#"{"type":null,"values":[]}"#,
+    ] {
+        assert!(serde_json::from_str::<Record>(wire).is_err());
+        let error = read_record(&mut Cursor::new(format!("{wire}\n")), 31).unwrap_err();
+        assert_eq!(
+            super::super::classify_failure(&error),
+            (5, "logical-archive-integrity", false)
+        );
+        assert!(!error.to_string().contains("PRIVATE_"));
+    }
+}
+
+#[test]
+fn row_cell_limit_is_enforced_during_decoding_at_the_exact_boundary() {
+    let at_limit = Record::Row {
+        values: vec![Cell::Null; MAX_COLUMNS],
+    };
+    assert_eq!(
+        read_record(&mut Cursor::new(encode(&at_limit).unwrap()), 1).unwrap(),
+        Some(at_limit)
+    );
+    let oversized = Record::Row {
+        values: vec![Cell::Null; MAX_COLUMNS + 1],
+    };
+    assert!(read_record(&mut Cursor::new(encode(&oversized).unwrap()), 1).is_err());
 }
 
 #[test]

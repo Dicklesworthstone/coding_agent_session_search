@@ -1449,6 +1449,21 @@ impl DensityMode {
         }
     }
 
+    /// Lines per result row for this density and context window.
+    ///
+    /// `ContextWindow::Medium` (the default) preserves `self.row_height()`.
+    /// `Small` reduces snippet lines (`row_h - 1`, min 2); `Large` adds 1 snippet
+    /// line (`row_h + 1`); `XLarge` adds 3 snippet lines (`row_h + 3`).
+    pub fn row_height_with_context(self, context_window: ContextWindow) -> u16 {
+        let base = self.row_height();
+        match context_window {
+            ContextWindow::Small => base.saturating_sub(1).max(2),
+            ContextWindow::Medium => base,
+            ContextWindow::Large => base.saturating_add(1),
+            ContextWindow::XLarge => base.saturating_add(3),
+        }
+    }
+
     /// Expected number of dedicated snippet lines for this density.
     pub fn snippet_lines(self) -> usize {
         match self {
@@ -3585,14 +3600,12 @@ impl ResultItem {
     }
 
     fn snippet_line_budget(&self, max_width: usize) -> usize {
-        // Snippet budget per density:
-        //   Compact (row_h=2): 0 (uses inline preview instead)
-        //   Cozy    (row_h=5): 2 dedicated snippet lines
-        //   Spacious(row_h=6): 3 dedicated snippet lines
+        // Snippet budget per density + context window:
+        //   Compact (row_h=2..=3): 0 (uses inline preview instead)
+        //   Cozy/Spacious/ContextWindow (row_h>=4): row_h - 3
         let base: usize = match self.row_height {
             0..=3 => 0,
-            4..=5 => self.row_height.saturating_sub(3) as usize,
-            _ => 3,
+            _ => self.row_height.saturating_sub(3) as usize,
         };
         if base == 0 {
             return 0;
@@ -6469,7 +6482,11 @@ impl CassApp {
             if !pane_rects.is_empty() {
                 let first_idx = *self.last_pane_first_index.borrow();
                 let term_w = self.last_content_area.borrow().map_or(120, |r| r.width);
-                let row_h = self.density_mode.effective(term_w).row_height().max(1);
+                let row_h = self
+                    .density_mode
+                    .effective(term_w)
+                    .row_height_with_context(self.context_window)
+                    .max(1);
                 for (vis_idx, rect) in pane_rects.iter().copied().enumerate() {
                     if !rect.contains(x, y) {
                         continue;
@@ -6505,7 +6522,10 @@ impl CassApp {
             && rect.contains(x, y)
         {
             let term_w = self.last_content_area.borrow().map_or(120, |r| r.width);
-            let row_h = self.density_mode.effective(term_w).row_height();
+            let row_h = self
+                .density_mode
+                .effective(term_w)
+                .row_height_with_context(self.context_window);
             let state = self.results_list_state.borrow();
             let scroll = state.scroll_offset();
             let row_in_viewport = ((y - rect.y) / row_h.max(1)) as usize;
@@ -17813,12 +17833,17 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::msg(CassMsg::SearchRequested)
             }
             CassMsg::ContextWindowCycled => {
+                self.peek_window_saved = None;
                 self.context_window = match self.context_window {
                     ContextWindow::Small => ContextWindow::Medium,
                     ContextWindow::Medium => ContextWindow::Large,
                     ContextWindow::Large => ContextWindow::XLarge,
                     ContextWindow::XLarge => ContextWindow::Small,
                 };
+                self.status = format!(
+                    "Context window: {}",
+                    context_window_token(self.context_window)
+                );
                 self.dirty_since = Some(Instant::now());
                 ftui::Cmd::none()
             }
@@ -21479,7 +21504,7 @@ impl super::ftui_adapter::Model for CassApp {
             style_system::BorderTier::Square | style_system::BorderTier::None => BorderType::Square,
         };
         let effective_density = self.density_mode.effective(area.width);
-        let row_h = effective_density.row_height();
+        let row_h = effective_density.row_height_with_context(self.context_window);
         let adaptive_borders = if deco.border_tier == style_system::BorderTier::None {
             Borders::NONE
         } else {
@@ -48643,5 +48668,66 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             option_env!("GIT_SHA").unwrap_or("local"),
         );
         std::fs::write(out_dir.join("MANIFEST.md"), manifest).expect("write manifest");
+    }
+
+    #[test]
+    fn context_window_cycled_and_peek_toggled_change_result_row_height_and_snippet_lines() {
+        assert_eq!(
+            DensityMode::Cozy.row_height_with_context(ContextWindow::Medium),
+            5
+        );
+        assert_eq!(
+            DensityMode::Cozy.row_height_with_context(ContextWindow::Small),
+            4
+        );
+        assert_eq!(
+            DensityMode::Cozy.row_height_with_context(ContextWindow::Large),
+            6
+        );
+        assert_eq!(
+            DensityMode::Cozy.row_height_with_context(ContextWindow::XLarge),
+            8
+        );
+        assert_eq!(
+            DensityMode::Compact.row_height_with_context(ContextWindow::Small),
+            2
+        );
+
+        let mut app = CassApp::default();
+        app.density_mode = DensityMode::Cozy;
+        assert_eq!(app.context_window, ContextWindow::Medium);
+
+        let _ = app.update(CassMsg::ContextWindowCycled);
+        assert_eq!(app.context_window, ContextWindow::Large);
+        assert_eq!(app.status, "Context window: L");
+        assert!(app.peek_window_saved.is_none());
+
+        let _ = app.update(CassMsg::ContextWindowCycled);
+        assert_eq!(app.context_window, ContextWindow::XLarge);
+        assert_eq!(app.status, "Context window: XL");
+
+        let _ = app.update(CassMsg::ContextWindowCycled);
+        assert_eq!(app.context_window, ContextWindow::Small);
+        assert_eq!(app.status, "Context window: S");
+
+        let _ = app.update(CassMsg::ContextWindowCycled);
+        assert_eq!(app.context_window, ContextWindow::Medium);
+        assert_eq!(app.status, "Context window: M");
+
+        let _ = app.update(CassMsg::PeekToggled);
+        assert_eq!(app.context_window, ContextWindow::XLarge);
+        assert_eq!(app.peek_window_saved, Some(ContextWindow::Medium));
+
+        let item = make_result_item(
+            make_test_hit(),
+            app.density_mode.row_height_with_context(app.context_window),
+        );
+        assert_eq!(item.row_height, 8);
+        assert_eq!(item.snippet_line_budget(80), 5);
+
+        // Manual cycle while peek is active clears peek_window_saved.
+        let _ = app.update(CassMsg::ContextWindowCycled);
+        assert_eq!(app.context_window, ContextWindow::Small);
+        assert!(app.peek_window_saved.is_none());
     }
 }

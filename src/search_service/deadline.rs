@@ -6,6 +6,10 @@
 //! There is at most one watchdog per serial request; completion joins it before
 //! admitting another request. Idle time before the first frame byte is excluded.
 
+#[path = "termination.rs"]
+pub(super) mod termination;
+pub(super) use termination::terminate;
+
 use std::io::{self, BufRead};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
@@ -55,11 +59,12 @@ impl Deadline {
                     Ok(_) | Err(RecvTimeoutError::Timeout) => {
                         // Do not log, flush, unwind or lock stdout/stderr here:
                         // the request can be blocked while holding those locks.
-                        // OS teardown releases all worker threads and handles.
-                        std::process::exit(TIMEOUT_EXIT_CODE);
+                        // Bypass runtime/atexit cleanup too: it can block on
+                        // exactly those locks or on a stalled engine owner.
+                        terminate(TIMEOUT_EXIT_CODE);
                     }
                     Err(RecvTimeoutError::Disconnected) => {
-                        std::process::exit(WATCHDOG_FAILURE_EXIT_CODE);
+                        terminate(WATCHDOG_FAILURE_EXIT_CODE);
                     }
                 }
             })?;
@@ -91,7 +96,7 @@ impl Drop for Deadline {
             .is_some_and(|watchdog| watchdog.join().is_ok());
         if !signalled || !joined {
             // A failed supervisor must not leave later native work unprotected.
-            std::process::exit(WATCHDOG_FAILURE_EXIT_CODE);
+            terminate(WATCHDOG_FAILURE_EXIT_CODE);
         }
     }
 }
@@ -175,6 +180,22 @@ mod tests {
     #[test]
     fn held_stdio_locks_do_not_block_deadline_termination() -> io::Result<()> {
         expect_timeout("held_stdio_fixture")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn blocked_exit_handlers_do_not_disable_the_request_deadline() -> io::Result<()> {
+        expect_timeout("blocked_cleanup_fixture")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "subprocess fixture: normal process exit would hang in cleanup"]
+    fn blocked_cleanup_fixture() {
+        termination::install_blocked_exit_handler();
+        let _guard = Deadline::start(Duration::from_millis(100)).unwrap();
+        thread::sleep(Duration::from_secs(30));
+        panic!("deadline entered an exit handler instead of terminating");
     }
 
     #[test]

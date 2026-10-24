@@ -36,6 +36,8 @@ use std::sync::{
 use asupersync::runtime::{Runtime, RuntimeBuilder};
 use fsqlite_types::cx::{CancelReason, LocalCancelRelay};
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use frankensqlite::BackupReport;
 pub use frankensqlite::{FileIdentity, FrankenError, Row, SqliteValue, fsqlite_vfs, params};
 
 // ---------------------------------------------------------------------------
@@ -278,6 +280,20 @@ impl Connection {
     /// Descriptor-bound identity, distinct from a possibly replaced pathname.
     pub fn file_identity(&self) -> Result<Option<FileIdentity>, FrankenError> {
         self.drive_operation(self.inner.file_identity())
+    }
+
+    /// Copy a quiescent file-backed database into a new, verified image.
+    ///
+    /// The engine checkpoints committed WAL data before its bounded image copy
+    /// and compares the source and target receipts. This can modify the source
+    /// WAL state; callers requiring a read-only source snapshot must not use it.
+    /// Existing targets and active transactions are refused by the engine.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn backup_exact_to(
+        &self,
+        target: impl AsRef<std::path::Path>,
+    ) -> Result<BackupReport, FrankenError> {
+        self.drive_operation(self.inner.backup_exact_to(target))
     }
 
     /// Execute a single SQL statement, returning the affected row count.
@@ -756,6 +772,123 @@ mod tests {
     use super::*;
     use asupersync::{Cx, cx::CapMask};
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn backup_exact_to_includes_wal_rows_and_refuses_existing_or_active_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("source.db");
+        let destination = directory.path().join("copied.db");
+        let active_target = directory.path().join("uncommitted.db");
+        let conn = Connection::open(source.to_string_lossy())?;
+        conn.execute("PRAGMA journal_mode = WAL")?;
+        conn.execute("PRAGMA wal_autocheckpoint = 0")?;
+        conn.execute("CREATE TABLE backup_rows (id INTEGER PRIMARY KEY, body TEXT, extra BLOB)")?;
+        let body = "recovery-λ\0".repeat(8192);
+        let extra = vec![0xa5_u8; 80 * 1024];
+        conn.execute_with_params(
+            "INSERT INTO backup_rows VALUES (?1, ?2, ?3)",
+            &[
+                SqliteValue::Integer(7),
+                SqliteValue::Text(body.clone().into()),
+                SqliteValue::Blob(extra.clone().into()),
+            ],
+        )?;
+        assert!(std::fs::metadata(directory.path().join("source.db-wal"))?.len() > 32);
+
+        let report = conn.backup_exact_to(&destination)?;
+        assert!(report.byte_len > 64 * 1024, "exercise multiple copy chunks");
+        assert_eq!(report.byte_len, std::fs::metadata(&destination)?.len());
+        assert_eq!(
+            report.byte_len,
+            u64::from(report.page_count) * u64::from(report.page_size)
+        );
+        let published = std::fs::read(&destination)?;
+        assert_eq!(published, std::fs::read(&source)?);
+        assert!(matches!(
+            conn.backup_exact_to(&destination),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert_eq!(std::fs::read(&destination)?, published);
+
+        conn.execute("BEGIN IMMEDIATE")?;
+        conn.execute("INSERT INTO backup_rows VALUES (8, 'not committed', NULL)")?;
+        assert!(matches!(
+            conn.backup_exact_to(&active_target),
+            Err(FrankenError::Busy)
+        ));
+        assert!(!active_target.exists());
+        assert!(conn.as_async().in_transaction());
+        conn.execute("ROLLBACK")?;
+        conn.close()?;
+
+        let reader = compat::open_with_flags(
+            destination.to_string_lossy().as_ref(),
+            compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let row = reader.query_row("SELECT id, body, extra FROM backup_rows")?;
+        assert_eq!(row.get_typed::<i64>(0)?, 7);
+        assert_eq!(row.get_typed::<String>(1)?, body);
+        assert_eq!(row.get_typed::<Vec<u8>>(2)?, extra);
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM backup_rows")?
+                .get_typed::<i64>(0)?,
+            1
+        );
+        reader.close_without_checkpoint()?;
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn backup_exact_to_cancellation_preserves_uncheckpointed_source_and_recovers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("cancelled-source.db");
+        let wal = directory.path().join("cancelled-source.db-wal");
+        let target = directory.path().join("not-admitted.db");
+        let conn = Connection::open(source.to_string_lossy())?;
+        conn.execute("PRAGMA journal_mode = WAL")?;
+        conn.execute("PRAGMA wal_autocheckpoint = 0")?;
+        conn.execute("CREATE TABLE backup_cancel (id INTEGER PRIMARY KEY)")?;
+        conn.execute("INSERT INTO backup_cancel VALUES (42)")?;
+        let source_before = std::fs::read(&source)?;
+        let wal_before = std::fs::read(&wal)?;
+        assert!(wal_before.len() > 32);
+
+        let handle = CancellationHandle::default();
+        handle.cancel();
+        {
+            let _scope = handle.enter();
+            assert!(matches!(
+                conn.backup_exact_to(&target),
+                Err(FrankenError::Abort)
+            ));
+        }
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(&source)?, source_before);
+        assert_eq!(std::fs::read(&wal)?, wal_before);
+        assert!(handle.inner.active.lock().unwrap().is_empty());
+
+        // Local cancellation must not poison the connection or its runtime.
+        // An admitted retry can checkpoint and include the committed WAL row.
+        conn.backup_exact_to(&target)?;
+        conn.close()?;
+        let reader = compat::open_with_flags(
+            target.to_string_lossy().as_ref(),
+            compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        assert_eq!(
+            reader
+                .query_row("SELECT id FROM backup_cancel")?
+                .get_typed::<i64>(0)?,
+            42
+        );
+        reader.close_without_checkpoint()?;
+        Ok(())
+    }
+
     #[test]
     fn cancellation_before_open_preserves_files_and_runtime()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1006,6 +1139,230 @@ mod tests {
             blocker.close()?;
             Ok(())
         })
+    }
+
+    /// GH #515: a CASS migration opens with `BEGIN IMMEDIATE` under a 5 s
+    /// busy timeout. A stop requested while another writer holds the archive
+    /// must end that wait, as it ends an INSERT's (test above).
+    #[test]
+    fn cancellation_stops_begin_immediate_waiting_for_another_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("begin-immediate.db");
+        let blocker = Connection::open(path.to_string_lossy().into_owned())?;
+        blocker.execute("PRAGMA fsqlite.concurrent_mode = OFF")?;
+        blocker.execute("CREATE TABLE writes(value INTEGER)")?;
+        blocker.execute("BEGIN IMMEDIATE")?;
+        blocker.execute("INSERT INTO writes VALUES(1)")?;
+        let handle = CancellationHandle::default();
+        let worker_handle = handle.clone();
+        let worker_path = path.clone();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || -> Result<(Duration, String), String> {
+            let conn = Connection::open(worker_path.to_string_lossy().into_owned())
+                .map_err(|error| error.to_string())?;
+            conn.execute("PRAGMA fsqlite.concurrent_mode = OFF")
+                .map_err(|error| error.to_string())?;
+            conn.execute("PRAGMA busy_timeout = 10000")
+                .map_err(|error| error.to_string())?;
+            let _scope = worker_handle.enter();
+            let started = Instant::now();
+            let _ = waiting_tx.send(());
+            let result = conn.execute("BEGIN IMMEDIATE");
+            let elapsed = started.elapsed();
+            if result.is_ok() {
+                let _ = conn.execute("ROLLBACK");
+            }
+            Ok((elapsed, format!("{result:?}")))
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(10))?;
+        std::thread::sleep(Duration::from_millis(300));
+        handle.cancel();
+        let joined = worker
+            .join()
+            .map_err(|_| "BEGIN IMMEDIATE owner thread panicked")?;
+        blocker.execute("COMMIT")?;
+        blocker.close()?;
+        let (elapsed, result) = joined?;
+        assert!(
+            result.contains("Abort") && elapsed < Duration::from_secs(3),
+            "BEGIN IMMEDIATE must end on cancellation, not at the busy timeout: \
+             {result} after {elapsed:?}"
+        );
+        Ok(())
+    }
+
+    /// GH #515 (362yj): cass opens the archive in the engine's default
+    /// (concurrent) mode and migrates it through `MigrationRunner` before its
+    /// config turns anything off; a traced `cass index` then sat out the full
+    /// 5 s busy timeout after SIGTERM inside the runner's BEGIN IMMEDIATE.
+    /// Both the direct BEGIN IMMEDIATE and the runner, in that default mode,
+    /// must end on cancellation while another writer holds the archive.
+    #[test]
+    fn cancellation_stops_default_mode_writes_and_migrations_waiting_for_another_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let mut outcomes = Vec::new();
+        for through_migration_runner in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("default-mode.db");
+            let blocker = Connection::open(path.to_string_lossy().into_owned())?;
+            blocker.execute("PRAGMA fsqlite.concurrent_mode = OFF")?;
+            blocker.execute("CREATE TABLE writes(value INTEGER)")?;
+            blocker.execute("BEGIN IMMEDIATE")?;
+            blocker.execute("INSERT INTO writes VALUES(1)")?;
+            let handle = CancellationHandle::default();
+            let worker_handle = handle.clone();
+            let worker_path = path.clone();
+            let (waiting_tx, waiting_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || -> Result<(Duration, String), String> {
+                let conn = Connection::open(worker_path.to_string_lossy().into_owned())
+                    .map_err(|error| error.to_string())?;
+                conn.execute("PRAGMA busy_timeout = 10000")
+                    .map_err(|error| error.to_string())?;
+                let _scope = worker_handle.enter();
+                let started = Instant::now();
+                let _ = waiting_tx.send(());
+                let result = if through_migration_runner {
+                    migrate::MigrationRunner::new()
+                        .add(1, "gh515_probe", "CREATE TABLE gh515_probe(value INTEGER);")
+                        .run(&conn)
+                        .map(drop)
+                } else {
+                    let result = conn.execute("BEGIN IMMEDIATE").map(drop);
+                    if result.is_ok() {
+                        let _ = conn.execute("ROLLBACK");
+                    }
+                    result
+                };
+                Ok((started.elapsed(), format!("{result:?}")))
+            });
+            waiting_rx.recv_timeout(Duration::from_secs(10))?;
+            std::thread::sleep(Duration::from_millis(300));
+            handle.cancel();
+            let joined = worker.join().map_err(|_| "default-mode writer panicked")?;
+            blocker.execute("COMMIT")?;
+            blocker.close()?;
+            let (elapsed, result) = joined?;
+            outcomes.push((through_migration_runner, elapsed, result));
+        }
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, elapsed, result)| result.contains("Abort")
+                    && *elapsed < Duration::from_secs(3)),
+            "a default-mode write wait must end on cancellation, not at the busy timeout: \
+             {outcomes:?}"
+        );
+        Ok(())
+    }
+
+    /// Subprocess fixture for the cross-process probe below: holds an
+    /// uncommitted write on the probe database until the parent kills it.
+    #[test]
+    #[ignore = "subprocess fixture: the cross-process cancellation probe kills this writer"]
+    fn gh515_cross_process_writer_holder() -> Result<(), Box<dyn std::error::Error>> {
+        let path = dotenvy::var("CASS_GH515_PROBE_DB")?;
+        let blocker = Connection::open(path.clone())?;
+        blocker.execute("PRAGMA fsqlite.concurrent_mode = OFF")?;
+        blocker.execute("BEGIN IMMEDIATE")?;
+        blocker.execute("INSERT INTO writes VALUES(1)")?;
+        std::fs::write(format!("{path}.ready"), b"holding")?;
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        Ok(())
+    }
+
+    /// GH #515 (362yj): in the reported wedge and in the CLI test, the writer
+    /// that blocks `cass index` lives in ANOTHER process (the daemon, the test
+    /// harness). Same-process probes above end on cancellation; this one puts
+    /// the blocker in a child process and requires the same. On 0.4.12 both
+    /// cases wait the whole 10 s busy_timeout before `Abort`: the engine's
+    /// busy-retry loops never consult the cancelled context between retries
+    /// (frankensqlite#524). Run it with `--ignored` when bumping the engine.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "frankensqlite#524: busy-retry loops ignore cancellation for a cross-process writer"]
+    fn cancellation_stops_a_write_waiting_for_a_writer_in_another_process()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let mut outcomes = Vec::new();
+        for through_migration_runner in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("cross-process.db");
+            let setup = Connection::open(path.to_string_lossy().into_owned())?;
+            setup.execute("CREATE TABLE writes(value INTEGER)")?;
+            setup.close()?;
+            let ready = directory.path().join("cross-process.db.ready");
+            let mut holder = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "franken_sync::tests::gh515_cross_process_writer_holder",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("CASS_GH515_PROBE_DB", &path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !ready.exists() {
+                if Instant::now() > deadline {
+                    let _ = holder.kill();
+                    return Err("cross-process writer never held the database".into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let handle = CancellationHandle::default();
+            let worker_handle = handle.clone();
+            let worker_path = path.clone();
+            let (waiting_tx, waiting_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || -> Result<(Duration, String), String> {
+                let conn = Connection::open(worker_path.to_string_lossy().into_owned())
+                    .map_err(|error| error.to_string())?;
+                conn.execute("PRAGMA busy_timeout = 10000")
+                    .map_err(|error| error.to_string())?;
+                let _scope = worker_handle.enter();
+                let started = Instant::now();
+                let _ = waiting_tx.send(());
+                let result = if through_migration_runner {
+                    migrate::MigrationRunner::new()
+                        .add(1, "gh515_probe", "CREATE TABLE gh515_probe(value INTEGER);")
+                        .run(&conn)
+                        .map(drop)
+                } else {
+                    let result = conn.execute("BEGIN IMMEDIATE").map(drop);
+                    if result.is_ok() {
+                        let _ = conn.execute("ROLLBACK");
+                    }
+                    result
+                };
+                Ok((started.elapsed(), format!("{result:?}")))
+            });
+            waiting_rx.recv_timeout(Duration::from_secs(10))?;
+            std::thread::sleep(Duration::from_millis(300));
+            handle.cancel();
+            let joined = worker.join().map_err(|_| "cross-process waiter panicked");
+            let _ = holder.kill();
+            let _ = holder.wait();
+            let (elapsed, result) = joined??;
+            outcomes.push((through_migration_runner, elapsed, result));
+        }
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, elapsed, result)| result.contains("Abort")
+                    && *elapsed < Duration::from_secs(3)),
+            "a write waiting on another process's writer must end on cancellation, \
+             not at the busy timeout: {outcomes:?}"
+        );
+        Ok(())
     }
 
     #[test]

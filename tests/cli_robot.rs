@@ -50,6 +50,17 @@ where
 
 const SEARCH_DEMO_DATA_DIR: &str = "tests/fixtures/search_demo_data";
 
+/// Subcommands the binary parses before the main CLI and registers for help,
+/// completions, capabilities and introspect (`register_external_subcommands`
+/// in src/main.rs).
+const BINARY_DISPATCHED_COMMANDS: [&str; 5] = [
+    "serve",
+    "archive",
+    "codex-layout-migrate",
+    "lexical-quarantine",
+    "semantic-reclaim",
+];
+
 fn is_transient_lexical_build_path(path: &Path) -> bool {
     path.components().any(|component| {
         component.as_os_str().to_str().is_some_and(|name| {
@@ -974,6 +985,56 @@ fn leading_json_before_search_attaches_to_search() {
     assert_eq!(json["error"]["kind"], "missing-index");
 }
 
+/// A human-mode error prints its remedy, not only its message. The hint used
+/// to reach robot envelopes alone, so `cass search` on an empty data dir said
+/// search "cannot run until the first index completes" without naming
+/// `cass index --full` (GH #518 hit the same with fuel exhaustion). Robot mode
+/// keeps the remedy inside the envelope and prints no extra line.
+#[test]
+fn human_mode_error_prints_its_hint() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap();
+    let mut human = base_cmd();
+    human
+        .env_remove("CASS_OUTPUT_FORMAT")
+        .env_remove("TOON_DEFAULT_FORMAT")
+        .args(["search", "foo", "--data-dir", data_dir]);
+    let output = human.assert().failure().get_output().clone();
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot run until the first index completes"),
+        "{stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("Hint: Run 'cass index --full'")),
+        "the remedy must reach a human reader: {stderr}"
+    );
+
+    let mut robot = base_cmd();
+    robot.args(["search", "foo", "--robot", "--data-dir", data_dir]);
+    let output = robot.assert().failure().get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.lines().any(|line| line.starts_with("Hint: ")),
+        "robot mode keeps the hint inside its envelope: {stderr}"
+    );
+    let last_line = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("stderr should contain JSON error");
+    let json: Value = serde_json::from_str(last_line).expect("valid JSON error");
+    assert!(
+        json["error"]["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("cass index --full")),
+        "{json}"
+    );
+}
+
 #[test]
 fn leading_robot_before_search_attaches_to_search() {
     let tmp = TempDir::new().unwrap();
@@ -1322,9 +1383,13 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
     assert_eq!(json["evidence"].as_array().expect("pack evidence").len(), 1);
     assert_eq!(json["evidence"][0]["excerpt"], "auth alias evidence");
     let citation = &json["evidence"][0]["citation"];
-    assert_eq!(
-        Path::new(citation["source_path"].as_str().expect("source path")),
-        source_path
+    // Pack redacts paths under a home directory, and a Windows temp dir is
+    // under one.
+    let cited = citation["source_path"].as_str().expect("source path");
+    assert!(
+        Path::new(cited) == source_path
+            || (cited.starts_with("[REDACTED_PATH]") && cited.ends_with(filename)),
+        "the citation names the indexed source, verbatim or redacted: {cited}"
     );
     assert_eq!(citation["verified"], true);
 
@@ -1693,22 +1758,41 @@ fn capabilities_output_json_alias_outputs_capabilities_json() {
     assert!(json["mistake_recoveries"].as_array().is_some());
 }
 
+/// A human-mode usage error states its message, then explains on a `Hint:`
+/// line what the parser rejected (v0.10.0 printed the message alone), and no
+/// line of it is a robot error envelope.
+fn assert_human_usage_error(stderr: &str, context: &str) {
+    let lines: Vec<&str> = stderr.lines().collect();
+    let message = lines
+        .iter()
+        .position(|line| *line == "Could not parse arguments")
+        .unwrap_or_else(|| panic!("{context}: no usage message in {stderr}"));
+    assert!(
+        lines
+            .get(message + 1)
+            .is_some_and(|line| line.starts_with("Hint: Argument parsing failed")),
+        "{context}: the parser's explanation should follow the message: {stderr}"
+    );
+    assert!(
+        stderr.contains("the following required arguments were not provided"),
+        "{context}: the hint should name what is missing: {stderr}"
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|line| !serde_json::from_str::<Value>(line).is_ok_and(|value| value.is_object())),
+        "{context}: {stderr}"
+    );
+}
+
 #[test]
 fn export_format_json_missing_path_is_not_robot_error_wrapped() {
     let mut cmd = base_cmd();
     cmd.args(["export", "--format", "json"]);
     let output = cmd.assert().failure().code(2).get_output().clone();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let last_line = stderr
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .expect("stderr should contain a usage error");
-
-    assert_eq!(last_line, "Could not parse arguments");
-    assert!(
-        serde_json::from_str::<Value>(last_line).is_err(),
-        "export --format json is the export format enum, not robot mode"
+    assert_human_usage_error(
+        &String::from_utf8_lossy(&output.stderr),
+        "export --format json is the export format enum, not robot mode",
     );
 }
 
@@ -1717,17 +1801,9 @@ fn export_output_json_missing_path_is_not_robot_error_wrapped() {
     let mut cmd = base_cmd();
     cmd.args(["export", "--output", "json"]);
     let output = cmd.assert().failure().code(2).get_output().clone();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let last_line = stderr
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .expect("stderr should contain a usage error");
-
-    assert_eq!(last_line, "Could not parse arguments");
-    assert!(
-        serde_json::from_str::<Value>(last_line).is_err(),
-        "export --output json is an output file path, not robot mode"
+    assert_human_usage_error(
+        &String::from_utf8_lossy(&output.stderr),
+        "export --output json is an output file path, not robot mode",
     );
 }
 
@@ -3777,13 +3853,13 @@ fn introspect_commands_match_clap_subcommands() {
             .filter_map(|c| c["name"].as_str().map(|s| s.to_string()))
             .collect();
 
-        // The binary also registers the two subcommands it dispatches before
-        // the main CLI parses (src/main.rs).
+        // The binary also registers the subcommands it dispatches before the
+        // main CLI parses (src/main.rs).
         let mut expected = clap_commands;
-        expected.extend(["serve".to_string(), "archive".to_string()]);
+        expected.extend(BINARY_DISPATCHED_COMMANDS.map(String::from));
         assert_eq!(
             expected, introspect_commands,
-            "introspect should list exactly the Clap subcommands plus serve and archive"
+            "introspect should list exactly the Clap subcommands plus the binary-dispatched ones"
         );
 
         // Ensure no help/version pseudo-args leak into schemas
@@ -5811,9 +5887,29 @@ fn search_robot_meta_echoes_the_query_grouping() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Midnight of a date in epoch milliseconds as a cass child run with TZ=UTC
+/// reads a bare `--since` date, computed with chrono rather than cass. cass
+/// takes local midnight in its own time zone: Unix honors TZ, so that is UTC
+/// midnight; Windows ignores TZ, so it is the host's (if17v: wlap runs at
+/// UTC+8).
+fn tz_utc_child_midnight_ms(year: i32, month: u32, day: u32) -> Result<i64, Box<dyn Error>> {
+    let midnight = chrono::NaiveDate::from_ymd_opt(year, month, day)
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .ok_or("valid date")?;
+    #[cfg(unix)]
+    let millis = midnight.and_utc().timestamp_millis();
+    #[cfg(not(unix))]
+    let millis = midnight
+        .and_local_timezone(chrono::Local)
+        .single()
+        .ok_or("unambiguous local midnight")?
+        .timestamp_millis();
+    Ok(millis)
+}
+
 /// 2l1b0.68: `_meta.effective` echoes what search actually ran. Every
-/// expected value here comes from outside cass: the fixture path, a UTC
-/// epoch computed by hand, and the flags as typed. Negative control: before
+/// expected value here comes from outside cass: the fixture path, local
+/// midnight computed with chrono, and the flags as typed. Negative control: before
 /// 2l1b0.68 `_meta.effective` did not exist, so the first assertion fails.
 #[test]
 fn search_robot_meta_echoes_the_effective_interpretation() -> Result<(), Box<dyn Error>> {
@@ -5848,8 +5944,13 @@ fn search_robot_meta_echoes_the_effective_interpretation() -> Result<(), Box<dyn
         )
     );
     assert_eq!(effective["db_path_source"], "--data-dir");
-    // 2026-01-01T00:00:00Z.
-    assert_eq!(effective["time_window"]["since_ms"], 1_767_225_600_000_i64);
+    // A bare date is local midnight in cass's time zone. This child runs
+    // with TZ=UTC: 2026-01-01T00:00:00Z on Unix, eight hours earlier on a
+    // UTC+8 Windows host, which ignores TZ.
+    assert_eq!(
+        effective["time_window"]["since_ms"],
+        tz_utc_child_midnight_ms(2026, 1, 1)?
+    );
     assert_eq!(effective["time_window"]["since_from"], "--since 2026-01-01");
     assert!(effective["time_window"]["until_ms"].is_null());
     assert!(effective["time_window"]["until_from"].is_null());
@@ -5911,8 +6012,13 @@ fn pack_echoes_the_effective_interpretation() -> Result<(), Box<dyn Error>> {
         "db_path is the data dir's database, verbatim or redacted: {effective}"
     );
     assert_eq!(effective["db_path_source"], "--data-dir");
-    // 2026-01-01T00:00:00Z.
-    assert_eq!(effective["time_window"]["since_ms"], 1_767_225_600_000_i64);
+    // A bare date is local midnight in cass's time zone. This child runs
+    // with TZ=UTC: 2026-01-01T00:00:00Z on Unix, eight hours earlier on a
+    // UTC+8 Windows host, which ignores TZ.
+    assert_eq!(
+        effective["time_window"]["since_ms"],
+        tz_utc_child_midnight_ms(2026, 1, 1)?
+    );
     assert_eq!(effective["time_window"]["since_from"], "--since 2026-01-01");
     assert_eq!(
         effective["filters"]["agents"],
@@ -6125,16 +6231,30 @@ fn cass_db_path_env_selects_the_archive_like_db_flag() -> Result<(), Box<dyn Err
 /// 2l1b0.64: an unparseable `--since`/`--until` used to be dropped, so the
 /// search ran unfiltered with exit 0 (or, on an empty data dir, failed later
 /// with exit 3 missing-index). It is a usage error before anything opens.
+/// tsp52: timeline turned such a value (including `--since 5m`) into its
+/// 7-day default, and sessions only failed after opening the archive.
 #[test]
 fn unparseable_time_bound_is_a_usage_error() -> Result<(), Box<dyn Error>> {
-    for (subcommand, flag, value) in [
-        ("search", "--since", "2026-13-01"),
-        ("search", "--until", "yesterdayish"),
-        ("pack", "--since", "not-a-date"),
+    for (args, flag) in [
+        (
+            &["search", "anything", "--since", "2026-13-01"][..],
+            "--since",
+        ),
+        (
+            &["search", "anything", "--until", "yesterdayish"],
+            "--until",
+        ),
+        (&["pack", "anything", "--since", "not-a-date"], "--since"),
+        (&["timeline", "--since", "5x"], "--since"),
+        (&["timeline", "--until", "yesterdayish"], "--until"),
+        (&["sessions", "--since", "5x"], "--since"),
     ] {
+        let subcommand = args[0];
+        let value = args[args.len() - 1];
         let tmp = TempDir::new()?;
         let output = base_cmd()
-            .args([subcommand, "anything", flag, value, "--json"])
+            .args(args)
+            .arg("--json")
             .env("CASS_DATA_DIR", tmp.path().join("data"))
             .env("HOME", tmp.path())
             .output()?;
@@ -7456,13 +7576,13 @@ fn introspect_matches_golden_contract_structure() {
             .iter()
             .filter_map(|c| c["name"].as_str())
             .collect();
-        // Plus the two subcommands the binary dispatches itself (src/main.rs).
+        // Plus the subcommands the binary dispatches itself (src/main.rs).
         let clap_cmd = Cli::command();
         let mut expected_cmd_names: HashSet<_> = clap_cmd
             .get_subcommands()
             .map(|command| command.get_name().to_string())
             .collect();
-        expected_cmd_names.extend(["serve".to_string(), "archive".to_string()]);
+        expected_cmd_names.extend(BINARY_DISPATCHED_COMMANDS.map(String::from));
         assert_eq!(
             actual_cmd_names,
             expected_cmd_names
@@ -8639,6 +8759,10 @@ fn isolated_cass_cmd(temp_home: &std::path::Path) -> Command {
     cmd.env("XDG_DATA_HOME", temp_home.join(".local/share"));
     cmd.env("XDG_CONFIG_HOME", temp_home.join(".config"));
     cmd.env("CODEX_HOME", temp_home.join(".codex"));
+    // HOME does not isolate Claude Code on Windows (its root comes from the
+    // profile known folder) or under an inherited CLAUDE_CONFIG_DIR. On wlap
+    // the pack alias tests cited the host's own sessions (if17v).
+    cmd.env("CLAUDE_CONFIG_DIR", temp_home.join(".claude"));
     cmd
 }
 

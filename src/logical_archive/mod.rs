@@ -3,17 +3,23 @@
 //! or the reviewed v20/v21 -> v22 schema migration; export and verification never do so.
 
 mod codec;
+#[cfg(test)]
+#[path = "conversation_extract_cli_tests.rs"]
+mod conversation_cli_tests;
+mod conversation_extract;
 mod export;
+mod extract;
 mod import;
 mod migrate;
 mod query;
 mod reimport;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use coding_agent_search::franken_sync::FrankenError;
+use coding_agent_search::indexer::IndexRunBusy;
 use coding_agent_search::search::archive_rebuild::ArchiveIndexPlan;
 
 #[derive(Parser)]
@@ -54,6 +60,10 @@ enum Operation {
         /// Acknowledge that full session bodies and metadata are exported.
         #[arg(long)]
         include_private: bool,
+        /// Wire version: 3 preserves allocation history and supports large rows.
+        /// Legacy 1/2 omit allocation history; 1 also limits rows to 8 MiB.
+        #[arg(long, default_value_t = codec::SEQUENCE_VERSION, value_parser = clap::value_parser!(u32).range(1..=3))]
+        format_version: u32,
     },
     /// Verify framing, identities, counts and digest without opening a database.
     Verify { input: PathBuf },
@@ -89,6 +99,41 @@ enum Operation {
         #[arg(long, short = 'C', default_value_t = 2)]
         context: usize,
         /// Acknowledge that complete private session text will be displayed.
+        #[arg(long)]
+        include_private: bool,
+    },
+    /// Extract one complete message field to a NEW private file, without a DB restore.
+    Extract {
+        input: PathBuf,
+        /// Exact canonical message ID from archive search, not a physical line.
+        #[arg(long)]
+        message_id: i64,
+        /// Require the exact backup content digest returned by search or verify.
+        #[arg(long)]
+        content_sha256: String,
+        /// Stored field: text is exact UTF-8; extra-bin is decoded raw BLOB bytes.
+        #[arg(long, value_enum, default_value = "content")]
+        field: extract::Field,
+        /// New file only. Parent must exist; existing files are never replaced.
+        #[arg(long)]
+        output: PathBuf,
+        /// Acknowledge that the file contains complete private session content.
+        #[arg(long)]
+        include_private: bool,
+    },
+    /// Recover a complete conversation and all message fields without restoring a DB.
+    ExtractConversation {
+        input: PathBuf,
+        /// Positive conversation ID from archive search, scoped to the exact digest.
+        #[arg(long)]
+        conversation_id: i64,
+        /// Require the exact backup content digest returned by search or verify.
+        #[arg(long)]
+        content_sha256: String,
+        /// New private typed JSONL transcript; not a full archive import input.
+        #[arg(long)]
+        output: PathBuf,
+        /// Acknowledge that all private message bodies and metadata are copied.
         #[arg(long)]
         include_private: bool,
     },
@@ -165,12 +210,61 @@ fn require_private_acknowledgement(include_private: bool, message: &str) -> Resu
     }
 }
 
+/// Engine payloads can contain SQL, filesystem paths or private cell values.
+/// Report only structural error codes and numeric I/O coordinates, retaining
+/// the typed cause so automation can still distinguish busy and I/O failures.
+fn database_failure_message(context: impl std::fmt::Display, error: &FrankenError) -> String {
+    let detail = match error {
+        FrankenError::Io(error) => match error.raw_os_error() {
+            Some(code) => format!("; I/O {:?} (OS error {code})", error.kind()),
+            None => format!("; I/O {:?}", error.kind()),
+        },
+        FrankenError::IoRead { page } => format!("; cannot read database page {page}"),
+        FrankenError::IoWrite { page } => format!("; cannot write database page {page}"),
+        FrankenError::ShortRead { expected, actual } => {
+            format!("; short read: expected {expected} bytes, received {actual}")
+        }
+        FrankenError::NoSuchTable { .. } => "; missing table".to_owned(),
+        FrankenError::NoSuchColumn { .. } => "; missing column".to_owned(),
+        FrankenError::QueryReturnedNoRows => "; required row missing".to_owned(),
+        FrankenError::QueryReturnedMultipleRows => "; expected a single row".to_owned(),
+        FrankenError::SnapshotTooOld { .. } => {
+            "; source snapshot is too old; retry the archive command for a fresh snapshot".to_owned()
+        }
+        FrankenError::WriteConflict { page, .. } => {
+            format!("; database write conflict on page {page}")
+        }
+        FrankenError::SerializationFailure { page } => {
+            format!("; database page {page} changed after the transaction snapshot")
+        }
+        FrankenError::LockFailed { .. } => "; database lock operation failed".to_owned(),
+        FrankenError::CheckpointFailed { .. } => "; database checkpoint failed".to_owned(),
+        FrankenError::MultiProcessContractViolation { .. } => {
+            "; multi-process consistency could not be established; inspect the database before retrying".to_owned()
+        }
+        FrankenError::WalCorrupt { .. } => "; corrupt WAL".to_owned(),
+        _ => String::new(),
+    };
+    format!(
+        "{context}: FrankenSQLite {:?} (code {}){detail}",
+        error.error_code(),
+        error.extended_error_code(),
+    )
+}
+
+fn database_failure(context: impl std::fmt::Display, error: FrankenError) -> anyhow::Error {
+    let message = database_failure_message(context, &error);
+    anyhow::Error::new(error).context(message)
+}
+
 /// Exit code, kebab-case error kind and retryability for a failed archive
 /// command: usage 2, integrity 5, busy 7, I/O 14 (retryable, like every other
 /// cass `io` kind), anything else 9. Classification is by error type, never by
 /// message text, so a path that happens to contain "usage" stays I/O. Busy
-/// covers both the destination lock and a source database that stayed locked
-/// past its busy timeout (an index run writing it, say); both clear on retry.
+/// covers destination/source locks and transaction conflicts. Retry the whole
+/// command to obtain a fresh consistent snapshot; never resume an emitted
+/// prefix with a different generation. An ambiguous multi-process contract
+/// refusal stays nonretryable because it can represent damaged shared state.
 pub fn classify_failure(error: &anyhow::Error) -> (i32, &'static str, bool) {
     let has = |matches: fn(&(dyn std::error::Error + 'static)) -> bool| error.chain().any(matches);
     if has(|cause| cause.is::<ArchiveUsageError>()) {
@@ -178,6 +272,7 @@ pub fn classify_failure(error: &anyhow::Error) -> (i32, &'static str, bool) {
     }
     if has(|cause| {
         cause.is::<ArchiveBusyError>()
+            || cause.is::<IndexRunBusy>()
             || cause.downcast_ref::<FrankenError>().is_some_and(|error| {
                 matches!(
                     error,
@@ -185,18 +280,74 @@ pub fn classify_failure(error: &anyhow::Error) -> (i32, &'static str, bool) {
                         | FrankenError::BusyRecovery
                         | FrankenError::BusySnapshot { .. }
                         | FrankenError::DatabaseLocked { .. }
+                        | FrankenError::SnapshotTooOld { .. }
+                        | FrankenError::WriteConflict { .. }
+                        | FrankenError::SerializationFailure { .. }
+                        | FrankenError::LockFailed { .. }
                 )
             })
     }) {
         return (7, "logical-archive-busy", true);
     }
-    if has(|cause| cause.is::<std::io::Error>()) {
+    if has(|cause| {
+        cause.is::<std::io::Error>()
+            || cause.downcast_ref::<FrankenError>().is_some_and(|error| {
+                matches!(
+                    error,
+                    FrankenError::Io(_)
+                        | FrankenError::IoRead { .. }
+                        | FrankenError::IoWrite { .. }
+                        | FrankenError::ShortRead { .. }
+                        | FrankenError::CheckpointFailed { .. }
+                )
+            })
+    }) {
         return (14, "logical-archive-io", true);
     }
     if has(|cause| cause.is::<ArchiveIntegrityError>()) {
         return (5, "logical-archive-integrity", false);
     }
     (9, "logical-archive-error", false)
+}
+
+/// Keep the canonical-restore receipt and retry instructions in the visible
+/// message without flattening the indexing cause. Index workers and engine
+/// errors may contain private text, so summarize only recognized typed causes.
+fn index_rebuild_failure(
+    error: anyhow::Error,
+    database: &Path,
+    created: bool,
+    retry_flags: &str,
+) -> anyhow::Error {
+    let detail = if error
+        .chain()
+        .any(|cause| cause.is::<IndexRunBusy>() || cause.is::<ArchiveBusyError>())
+    {
+        "lexical rebuild failed: maintenance or database lock contention".to_owned()
+    } else if let Some(cause) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<FrankenError>())
+    {
+        database_failure_message("lexical rebuild failed", cause)
+    } else if let Some(cause) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+    {
+        match cause.raw_os_error() {
+            Some(code) => format!(
+                "lexical rebuild failed: I/O {:?} (OS error {code})",
+                cause.kind()
+            ),
+            None => format!("lexical rebuild failed: I/O {:?}", cause.kind()),
+        }
+    } else {
+        "lexical rebuild failed during index recovery admission or publication".to_owned()
+    };
+    error.context(format!(
+        "canonical archive was {} and is retained at {}; {detail}; retry the same import with {retry_flags}",
+        if created { "created" } else { "verified unchanged" },
+        database.display(),
+    ))
 }
 
 /// The `archive` subcommand tree, for the main CLI's help and command
@@ -244,6 +395,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
             output,
             archive_id,
             include_private,
+            format_version,
         } => {
             require_private_acknowledgement(
                 include_private,
@@ -260,7 +412,11 @@ pub fn run(args: Vec<String>) -> Result<()> {
                         "export requires an explicit --db or --data-dir (or CASS_DATA_DIR)".into(),
                     )
                 })?;
-            let (header, completion) = export::export_file(&source, &output, archive_id)?;
+            let (header, completion) = if format_version == codec::SEQUENCE_VERSION {
+                export::export_file(&source, &output, archive_id)?
+            } else {
+                export::export_file_for_version(&source, &output, archive_id, format_version)?
+            };
             ("export", header, completion)
         }
         Operation::Verify { input } => {
@@ -296,6 +452,43 @@ pub fn run(args: Vec<String>) -> Result<()> {
                 "backup view emits private session text; pass --include-private to acknowledge this",
             )?;
             let result = query::view(&input, message_id, context, &content_sha256)?;
+            println!("{result}");
+            return Ok(());
+        }
+        Operation::Extract {
+            input,
+            message_id,
+            content_sha256,
+            field,
+            output,
+            include_private,
+        } => {
+            require_private_acknowledgement(
+                include_private,
+                "backup extraction writes complete private session data; pass --include-private to acknowledge this",
+            )?;
+            let result =
+                extract::extract_file(&input, &output, message_id, &content_sha256, field)?;
+            println!("{result}");
+            return Ok(());
+        }
+        Operation::ExtractConversation {
+            input,
+            conversation_id,
+            content_sha256,
+            output,
+            include_private,
+        } => {
+            require_private_acknowledgement(
+                include_private,
+                "conversation extraction writes complete private session data; pass --include-private to acknowledge this",
+            )?;
+            let result = conversation_extract::extract_file(
+                &input,
+                &output,
+                conversation_id,
+                &content_sha256,
+            )?;
             println!("{result}");
             return Ok(());
         }
@@ -337,12 +530,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
                     "--if-identical --rebuild-index"
                 };
                 lexical_rebuild = Some(plan.rebuild().map_err(|error| {
-                    anyhow!(
-                        "canonical archive was {} and is retained at {}; lexical rebuild failed: {}; retry the same import with {retry_flags}",
-                        if created { "created" } else { "verified unchanged" },
-                        plan.database().display(),
-                        error,
-                    )
+                    index_rebuild_failure(error, plan.database(), created, retry_flags)
                 })?);
             }
             ("import", header, completion)
@@ -351,7 +539,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     let mut receipt = serde_json::json!({
         "operation": operation,
         "format": codec::FORMAT,
-        "schema_version": codec::VERSION,
+        "schema_version": header.schema_version,
         "archive_id": header.archive_id,
         "records": completion.records,
         "tables": completion.tables,
@@ -377,6 +565,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     fn classified(error: FrankenError) -> (i32, &'static str, bool) {
         classify_failure(
@@ -414,5 +603,234 @@ mod tests {
             classified(FrankenError::DatatypeMismatch),
             (9, "logical-archive-error", false)
         );
+    }
+
+    #[test]
+    fn database_io_variants_remain_retryable_through_context() {
+        let io = (14, "logical-archive-io", true);
+        for error in [
+            FrankenError::Io(std::io::ErrorKind::PermissionDenied.into()),
+            FrankenError::IoRead { page: 42 },
+            FrankenError::IoWrite { page: 43 },
+            FrankenError::ShortRead {
+                expected: 4096,
+                actual: 2048,
+            },
+            FrankenError::CheckpointFailed {
+                detail: "PRIVATE-CHECKPOINT-PATH-AND-SQL".into(),
+            },
+        ] {
+            assert_eq!(classified(error), io);
+        }
+    }
+
+    #[test]
+    fn failed_index_rebuild_keeps_typed_causes_and_private_retry_diagnostics() {
+        for (cause, class, detail) in [
+            (
+                anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "PRIVATE-WORKER-CONTENT",
+                )),
+                (14, "logical-archive-io", true),
+                "I/O StorageFull",
+            ),
+            (
+                anyhow::Error::new(FrankenError::IoRead { page: 42 }),
+                (14, "logical-archive-io", true),
+                "cannot read database page 42",
+            ),
+            (
+                anyhow::Error::new(FrankenError::CheckpointFailed {
+                    detail: "PRIVATE-WORKER-CONTENT".into(),
+                }),
+                (14, "logical-archive-io", true),
+                "database checkpoint failed",
+            ),
+            (
+                anyhow::Error::new(FrankenError::BusySnapshot {
+                    conflicting_pages: "PRIVATE-WORKER-CONTENT".into(),
+                }),
+                (7, "logical-archive-busy", true),
+                "FrankenSQLite",
+            ),
+            (
+                anyhow::Error::new(FrankenError::SnapshotTooOld { txn_id: 88 }),
+                (7, "logical-archive-busy", true),
+                "retry the archive command for a fresh snapshot",
+            ),
+            (
+                anyhow::Error::new(FrankenError::WriteConflict {
+                    page: 44,
+                    holder: 88,
+                }),
+                (7, "logical-archive-busy", true),
+                "database write conflict on page 44",
+            ),
+            (
+                anyhow::Error::new(FrankenError::DatabaseCorrupt {
+                    detail: "PRIVATE-WORKER-CONTENT".into(),
+                }),
+                (9, "logical-archive-error", false),
+                "FrankenSQLite",
+            ),
+            (
+                anyhow!("busy permission denied PRIVATE-WORKER-CONTENT"),
+                (9, "logical-archive-error", false),
+                "index recovery admission or publication",
+            ),
+        ] {
+            let has_engine_cause = cause.downcast_ref::<FrankenError>().is_some();
+            let has_io_cause = cause.downcast_ref::<std::io::Error>().is_some();
+            let error = index_rebuild_failure(
+                cause.context("PRIVATE-WORKER-CONTENT in a producer context"),
+                Path::new("recovered/agent_search.db"),
+                false,
+                "--if-identical --allow-compatible-schema --rebuild-index",
+            );
+            assert_eq!(classify_failure(&error), class);
+            assert_eq!(
+                error.downcast_ref::<FrankenError>().is_some(),
+                has_engine_cause
+            );
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().is_some(),
+                has_io_cause
+            );
+            let message = error.to_string();
+            assert!(message.contains("verified unchanged and is retained at"));
+            assert!(message.contains("recovered/agent_search.db"));
+            assert!(message.contains(detail), "{message}");
+            assert!(message.contains("--if-identical --allow-compatible-schema --rebuild-index"));
+            assert!(!message.contains("PRIVATE-WORKER-CONTENT"), "{message}");
+        }
+    }
+
+    #[test]
+    fn snapshot_conflicts_and_lock_failures_keep_safe_retryable_causes() {
+        for (cause, detail) in [
+            (
+                FrankenError::SnapshotTooOld { txn_id: 88 },
+                "retry the archive command for a fresh snapshot",
+            ),
+            (
+                FrankenError::WriteConflict {
+                    page: 42,
+                    holder: 88,
+                },
+                "database write conflict on page 42",
+            ),
+            (
+                FrankenError::SerializationFailure { page: 43 },
+                "database page 43 changed after the transaction snapshot",
+            ),
+            (
+                FrankenError::LockFailed {
+                    detail: "PRIVATE-LOCK-PATH-AND-SQL".into(),
+                },
+                "database lock operation failed",
+            ),
+        ] {
+            let error = database_failure(
+                "cannot stream logical table messages before row 60001, after 60000 complete rows",
+                cause,
+            );
+            assert_eq!(classify_failure(&error), (7, "logical-archive-busy", true));
+            assert!(error.downcast_ref::<FrankenError>().is_some());
+            let message = error.to_string();
+            assert!(message.contains("before row 60001, after 60000 complete rows"));
+            assert!(message.contains(detail), "{message}");
+            assert!(!message.contains("PRIVATE-LOCK-PATH-AND-SQL"));
+        }
+    }
+
+    #[test]
+    fn contract_and_data_failures_do_not_become_retryable_from_message_text() {
+        for cause in [
+            // The engine also maps this to SQLITE_BUSY, but its detail can
+            // describe damaged freelist/shared state rather than contention.
+            FrankenError::MultiProcessContractViolation {
+                detail: "SQLITE_BUSY PRIVATE-SQL-AND-MESSAGE".into(),
+            },
+            FrankenError::DatabaseCorrupt {
+                detail: "I/O busy retry PRIVATE-SQL-AND-MESSAGE".into(),
+            },
+            FrankenError::UniqueViolation {
+                columns: "busy PRIVATE-SQL-AND-MESSAGE".into(),
+            },
+            FrankenError::DatabaseFull,
+        ] {
+            let error = database_failure("logical table messages, row 257", cause);
+            assert_eq!(
+                classify_failure(&error),
+                (9, "logical-archive-error", false)
+            );
+            assert!(error.downcast_ref::<FrankenError>().is_some());
+            assert!(!error.to_string().contains("PRIVATE-SQL-AND-MESSAGE"));
+        }
+        assert_eq!(
+            classify_failure(&anyhow!("database busy: retry the archive command")),
+            (9, "logical-archive-error", false)
+        );
+    }
+
+    #[test]
+    fn safe_database_diagnostics_preserve_classes_without_private_payloads() {
+        let cases = [
+            (
+                FrankenError::Io(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "PRIVATE-SQL-AND-MESSAGE",
+                )),
+                (14, "logical-archive-io", true),
+            ),
+            (
+                FrankenError::IoWrite { page: 43 },
+                (14, "logical-archive-io", true),
+            ),
+            (
+                FrankenError::ShortRead {
+                    expected: 4096,
+                    actual: 2048,
+                },
+                (14, "logical-archive-io", true),
+            ),
+            (
+                FrankenError::CheckpointFailed {
+                    detail: "PRIVATE-SQL-AND-MESSAGE".into(),
+                },
+                (14, "logical-archive-io", true),
+            ),
+            (
+                FrankenError::BusySnapshot {
+                    conflicting_pages: "PRIVATE-SQL-AND-MESSAGE".into(),
+                },
+                (7, "logical-archive-busy", true),
+            ),
+            (
+                FrankenError::DatabaseLocked {
+                    path: PathBuf::from("PRIVATE-SQL-AND-MESSAGE"),
+                },
+                (7, "logical-archive-busy", true),
+            ),
+            (
+                FrankenError::DatabaseCorrupt {
+                    detail: "PRIVATE-SQL-AND-MESSAGE".into(),
+                },
+                (9, "logical-archive-error", false),
+            ),
+        ];
+        for (cause, expected) in cases {
+            let error = database_failure(
+                "record 260: logical table messages, row 257 (id=1799), insertion failed",
+                cause,
+            );
+            assert_eq!(classify_failure(&error), expected);
+            assert!(error.downcast_ref::<FrankenError>().is_some());
+            let message = error.to_string();
+            assert!(message.contains("logical table messages, row 257 (id=1799)"));
+            assert!(message.contains("FrankenSQLite"));
+            assert!(!message.contains("PRIVATE-SQL-AND-MESSAGE"));
+        }
     }
 }

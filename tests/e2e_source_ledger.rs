@@ -408,3 +408,90 @@ fn gh512_whole_source_exclusions_reuse_allowed_files_without_losing_deferred_sou
         }
     }
 }
+
+/// GH #536: btrfs gives a subvolume mount a new device number when it is
+/// mounted, so a ledger row that saved st_dev stopped matching after a reboot
+/// and every unchanged source was parsed again. Rows an older build wrote stay
+/// reusable after the device changes, this build records no device, and a real
+/// change behind such a row is still parsed.
+#[test]
+fn gh536_a_new_device_number_after_a_remount_does_not_reparse_unchanged_sources() {
+    let reusable = env!("CASS_SOURCE_INGEST_REUSE") == "true";
+    for provider in ["claude_code", "codex"] {
+        for streaming in ["0", "1"] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path();
+            let directory = home.join(if provider == "claude_code" {
+                ".claude/projects/ledger"
+            } else {
+                ".codex/sessions/2026/08/01"
+            });
+            fs::create_dir_all(&directory).unwrap();
+            let first = transcript(&directory, provider, 0);
+            transcript(&directory, provider, 1);
+            index(home, streaming, "initial", 0, 2);
+            let initial = archive(home, 2, false);
+            // The number an older build saved before the remount; the mount
+            // now has another one (the report: 36, then 54).
+            #[cfg(unix)]
+            let saved_device =
+                std::os::unix::fs::MetadataExt::dev(&fs::metadata(&first).unwrap()) + 18;
+            #[cfg(not(unix))]
+            let saved_device = 36_u64;
+            let storage = SqliteStorage::open(&home.join("data/agent_search.db")).unwrap();
+            let rows = storage.source_ingest_ledger_entries().unwrap();
+            assert_eq!(rows.len(), 2);
+            for (key, observation) in rows {
+                let mut saved: Value = serde_json::from_str(&observation).unwrap();
+                assert!(saved["primary"].get("device").is_none(), "{saved}");
+                saved["primary"]["device"] = json!(saved_device);
+                storage
+                    .raw()
+                    .execute_with_params(
+                        "UPDATE meta SET value = ?1 WHERE key = ?2",
+                        &[
+                            SqliteValue::Text(saved.to_string().into()),
+                            SqliteValue::Text(key.into()),
+                        ],
+                    )
+                    .unwrap();
+            }
+            drop(storage);
+            index(
+                home,
+                streaming,
+                "remounted",
+                if reusable { 2 } else { 0 },
+                if reusable { 0 } else { 2 },
+            );
+            assert_eq!(archive(home, 2, false), initial);
+
+            let mut content = fs::read_to_string(&first).unwrap();
+            content.push_str(&format!("{}\n", row(provider, 0, 1)));
+            fs::write(&first, content).unwrap();
+            index(
+                home,
+                streaming,
+                "remounted-appended",
+                if reusable { 1 } else { 0 },
+                if reusable { 1 } else { 2 },
+            );
+            let appended = archive(home, 2, true);
+            for (content, id) in &initial {
+                assert_eq!(appended.get(content), Some(id));
+            }
+            assert_searchable(home, "ghledger000message001z");
+            let legacy_rows = source_ledger(home)
+                .values()
+                .filter(|observation| {
+                    serde_json::from_str::<Value>(observation).unwrap()["primary"]
+                        .get("device")
+                        .is_some()
+                })
+                .count();
+            // The reparsed source's row is rewritten without a device; the
+            // reused one keeps the row the older build wrote.
+            assert_eq!(legacy_rows, usize::from(reusable));
+        }
+    }
+}

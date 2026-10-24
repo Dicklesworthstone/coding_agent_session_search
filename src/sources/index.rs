@@ -1,13 +1,15 @@
 //! Remote cass indexing via SSH.
 //!
 //! This module provides functionality to trigger `cass index` on remote machines
-//! after installation, ensuring session data is ready to sync.
+//! after `cass sources setup` installs cass there.
 //!
-//! # Why This Matters
+//! # What It Is For
 //!
-//! Syncing works by pulling from the remote's indexed data. If the remote has
-//! never run `cass index`, there's nothing meaningful to sync. This module
-//! ensures remotes are indexed before attempting sync.
+//! `cass sources sync` does not read the remote's index: it copies the remote's
+//! raw session files (rsync, with SFTP as the fallback) and indexes them
+//! locally, so a remote that never ran `cass index` can still be synced. Setup
+//! indexes remotes so the remote's own `cass` is ready to search and later
+//! probes report its session inventory (`CassStatus::Indexed`).
 //!
 //! # Example
 //!
