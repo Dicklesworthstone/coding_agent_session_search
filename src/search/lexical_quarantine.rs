@@ -181,6 +181,14 @@ fn valid_name(name: &str, prefix: &str) -> bool {
     })
 }
 
+/// Whether a directory entry is a failed rebuild's bundle, or an interrupted
+/// reclaim of one, by the same names this inventory matches. A rebuild never
+/// rewrites that evidence, so the full-rebuild headroom rule does not charge
+/// it (nw61n).
+pub(crate) fn is_bundle_name(name: &str) -> bool {
+    valid_name(name, QUARANTINE_PREFIX) || valid_name(name, RECLAIM_PREFIX)
+}
+
 fn real_directory(path: &Path) -> io::Result<fs::Metadata> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_dir() {

@@ -46121,8 +46121,12 @@ struct DoctorFullRebuildReadinessReport {
     floor_bytes: u64,
     db_bundle_bytes: u64,
     /// Live lexical bytes: what the current MANIFEST references plus the
-    /// index's own bookkeeping files. The formula charges 9/4 of it.
+    /// index's own bookkeeping files.
     lexical_index_bytes: u64,
+    /// nw61n: the generation size the formula charges 9/4 of:
+    /// `lexical_index_bytes`, or `db_bundle_bytes` when no live generation
+    /// exists to size the rebuild by.
+    lexical_rebuild_basis_bytes: u64,
     /// #453: merge-retired segment files still under the lexical index. The
     /// engine's writer-open sweep reclaims them once they have been
     /// unreferenced by both MANIFEST slots for its grace period; a rebuild
@@ -46138,6 +46142,10 @@ struct DoctorFullRebuildReadinessReport {
     /// `index/.<name>.rebuild-staging/`. The next rebuild resumes into it or
     /// clears it first, so it is excluded from `required_bytes`.
     rebuild_staging_bytes: u64,
+    /// nw61n: failed-rebuild quarantine bundles under `index/` (GH #523
+    /// evidence a rebuild never rewrites), excluded from `required_bytes`;
+    /// `lexical_rebuild_quarantine` lists them with their retention verdicts.
+    quarantine_bytes: u64,
     /// nw61n: the db growth allowance charged (`db_bundle_bytes / 16`).
     db_growth_allowance_bytes: u64,
     /// nw61n: whether the engine's one-time migration repair is still
@@ -46271,6 +46279,18 @@ fn build_doctor_full_rebuild_readiness(
         },
         projection.floor_bytes
     ));
+    if projection.lexical_index_bytes == 0 && projection.lexical_rebuild_basis_bytes > 0 {
+        notes.push(format!(
+            "There is no live lexical generation to size the rebuild by, so it is sized as the db bundle ({} bytes).",
+            projection.lexical_rebuild_basis_bytes
+        ));
+    }
+    if projection.quarantine_bytes > 0 {
+        notes.push(format!(
+            "{} bytes of failed-rebuild quarantine bundles sit under index/ and are not charged; lexical_rebuild_quarantine lists them with their retention verdicts, and its next_safe_argv previews reclaiming them.",
+            projection.quarantine_bytes
+        ));
+    }
     if projection.retired_segment_bytes > 0 {
         notes.push(format!(
             "The lexical figure counts only bytes the current MANIFEST references; {} merge-retired segment file(s) totalling {} bytes sit next to it and are not charged. The engine unlinks them at the next `cass index` open once they have been unreferenced for its {}-second grace period (`cass index --gc` runs that sweep on its own).",
@@ -46306,10 +46326,12 @@ fn build_doctor_full_rebuild_readiness(
         floor_bytes: projection.floor_bytes,
         db_bundle_bytes: projection.db_bundle_bytes,
         lexical_index_bytes: projection.lexical_index_bytes,
+        lexical_rebuild_basis_bytes: projection.lexical_rebuild_basis_bytes,
         retired_segment_bytes: projection.retired_segment_bytes,
         retired_segment_files: projection.retired_segment_files,
         retained_publish_backup_bytes: projection.retained_backup_bytes,
         rebuild_staging_bytes: projection.rebuild_staging_bytes,
+        quarantine_bytes: projection.quarantine_bytes,
         db_growth_allowance_bytes: projection.db_growth_allowance_bytes,
         migration_repair_pending: projection.migration_repair_pending,
         migration_copy_bytes: projection.migration_copy_bytes,
@@ -105385,8 +105407,9 @@ mod response_schema_tests {
     }
 
     /// GH#442 reproduction shape: a 100 GiB (sparse) archive with no engine
-    /// migration marker projects a 106.25 GiB requirement (one copy for the
-    /// pending migration repair plus the 1/16 growth allowance; nw61n), and
+    /// migration marker and no lexical index projects a 331.25 GiB
+    /// requirement (a rebuild sized as the bundle, 9/4 of it, plus one copy
+    /// for the pending migration repair and the 1/16 growth allowance; nw61n), and
     /// doctor reports it blocked against the free space the indexer's refusal
     /// named, even though the 1 GiB general pressure floor is satisfied.
     #[test]
@@ -105401,7 +105424,12 @@ mod response_schema_tests {
 
         let projection = crate::indexer::full_rebuild_headroom_projection(root, &db_path);
         assert!(projection.migration_repair_pending);
-        assert_eq!(projection.required_bytes, 114_085_068_800);
+        assert_eq!(projection.lexical_index_bytes, 0);
+        assert_eq!(
+            projection.lexical_rebuild_basis_bytes,
+            projection.db_bundle_bytes
+        );
+        assert_eq!(projection.required_bytes, 355_676_979_200);
 
         let available = 45_252_415_488_u64;
         let report = build_doctor_storage_pressure_report(
@@ -105419,9 +105447,21 @@ mod response_schema_tests {
         assert_eq!(report.low_disk_risk, "none");
         let readiness = &report.full_rebuild_readiness;
         assert_eq!(readiness.status, "blocked");
-        assert_eq!(readiness.required_bytes, 114_085_068_800);
+        assert_eq!(readiness.required_bytes, 355_676_979_200);
         assert_eq!(readiness.available_bytes, Some(available));
-        assert_eq!(readiness.shortfall_bytes, 114_085_068_800 - available);
+        assert_eq!(readiness.shortfall_bytes, 355_676_979_200 - available);
+        assert_eq!(
+            readiness.lexical_rebuild_basis_bytes,
+            projection.db_bundle_bytes
+        );
+        assert!(
+            readiness
+                .notes
+                .iter()
+                .any(|note| note.starts_with("There is no live lexical generation")),
+            "{:?}",
+            readiness.notes
+        );
 
         let json = serde_json::to_value(&report).expect("serialize storage pressure");
         assert_eq!(json["schema_version"], 3);
@@ -105431,7 +105471,7 @@ mod response_schema_tests {
         );
         assert_eq!(
             json["full_rebuild_readiness"]["required_bytes"].as_u64(),
-            Some(114_085_068_800)
+            Some(355_676_979_200)
         );
         assert_eq!(
             json["full_rebuild_readiness"]["formula"].as_str(),
@@ -105449,10 +105489,12 @@ mod response_schema_tests {
             floor_bytes: 512 * 1024 * 1024,
             db_bundle_bytes: 11_900_000_000,
             lexical_index_bytes: 6_800_000_000,
+            lexical_rebuild_basis_bytes: 6_800_000_000,
             retired_segment_bytes: 4_200_000_000,
             retired_segment_files: 1_642,
             retained_backup_bytes: 6_400_000_000,
             rebuild_staging_bytes: 32_000_000_000,
+            quarantine_bytes: 34_600_000_000,
             db_growth_allowance_bytes: 11_900_000_000 / 16,
             migration_repair_pending: false,
             migration_copy_bytes: 0,
@@ -105500,6 +105542,24 @@ mod response_schema_tests {
             staging_note.contains("subtracted from the requirement"),
             "{staging_note}"
         );
+        let quarantine_note = blocked
+            .notes
+            .iter()
+            .find(|note| note.contains("quarantine bundles"))
+            .expect("quarantine note (nw61n)");
+        assert!(
+            quarantine_note.contains("34600000000 bytes"),
+            "{quarantine_note}"
+        );
+        assert!(quarantine_note.contains("not charged"), "{quarantine_note}");
+        assert!(
+            blocked
+                .notes
+                .iter()
+                .all(|note| !note.starts_with("There is no live lexical generation")),
+            "a live index sizes the rebuild: {:?}",
+            blocked.notes
+        );
         assert!(
             blocked
                 .notes
@@ -105517,6 +105577,11 @@ mod response_schema_tests {
             Some(6_400_000_000)
         );
         assert_eq!(json["rebuild_staging_bytes"].as_u64(), Some(32_000_000_000));
+        assert_eq!(json["quarantine_bytes"].as_u64(), Some(34_600_000_000));
+        assert_eq!(
+            json["lexical_rebuild_basis_bytes"].as_u64(),
+            Some(6_800_000_000)
+        );
 
         // With nothing reclaimable the notes stay exactly the two-line shape
         // the robot goldens pin.
@@ -105526,6 +105591,7 @@ mod response_schema_tests {
                 retired_segment_files: 0,
                 retained_backup_bytes: 0,
                 rebuild_staging_bytes: 0,
+                quarantine_bytes: 0,
                 ..projection
             },
             vec![(root, Ok(37_000_000_000))],
