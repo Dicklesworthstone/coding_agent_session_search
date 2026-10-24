@@ -1195,6 +1195,176 @@ mod tests {
         Ok(())
     }
 
+    /// GH #515 (362yj): cass opens the archive in the engine's default
+    /// (concurrent) mode and migrates it through `MigrationRunner` before its
+    /// config turns anything off; a traced `cass index` then sat out the full
+    /// 5 s busy timeout after SIGTERM inside the runner's BEGIN IMMEDIATE.
+    /// Both the direct BEGIN IMMEDIATE and the runner, in that default mode,
+    /// must end on cancellation while another writer holds the archive.
+    #[test]
+    fn cancellation_stops_default_mode_writes_and_migrations_waiting_for_another_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let mut outcomes = Vec::new();
+        for through_migration_runner in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("default-mode.db");
+            let blocker = Connection::open(path.to_string_lossy().into_owned())?;
+            blocker.execute("PRAGMA fsqlite.concurrent_mode = OFF")?;
+            blocker.execute("CREATE TABLE writes(value INTEGER)")?;
+            blocker.execute("BEGIN IMMEDIATE")?;
+            blocker.execute("INSERT INTO writes VALUES(1)")?;
+            let handle = CancellationHandle::default();
+            let worker_handle = handle.clone();
+            let worker_path = path.clone();
+            let (waiting_tx, waiting_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || -> Result<(Duration, String), String> {
+                let conn = Connection::open(worker_path.to_string_lossy().into_owned())
+                    .map_err(|error| error.to_string())?;
+                conn.execute("PRAGMA busy_timeout = 10000")
+                    .map_err(|error| error.to_string())?;
+                let _scope = worker_handle.enter();
+                let started = Instant::now();
+                let _ = waiting_tx.send(());
+                let result = if through_migration_runner {
+                    migrate::MigrationRunner::new()
+                        .add(1, "gh515_probe", "CREATE TABLE gh515_probe(value INTEGER);")
+                        .run(&conn)
+                        .map(drop)
+                } else {
+                    let result = conn.execute("BEGIN IMMEDIATE").map(drop);
+                    if result.is_ok() {
+                        let _ = conn.execute("ROLLBACK");
+                    }
+                    result
+                };
+                Ok((started.elapsed(), format!("{result:?}")))
+            });
+            waiting_rx.recv_timeout(Duration::from_secs(10))?;
+            std::thread::sleep(Duration::from_millis(300));
+            handle.cancel();
+            let joined = worker.join().map_err(|_| "default-mode writer panicked")?;
+            blocker.execute("COMMIT")?;
+            blocker.close()?;
+            let (elapsed, result) = joined?;
+            outcomes.push((through_migration_runner, elapsed, result));
+        }
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, elapsed, result)| result.contains("Abort")
+                    && *elapsed < Duration::from_secs(3)),
+            "a default-mode write wait must end on cancellation, not at the busy timeout: \
+             {outcomes:?}"
+        );
+        Ok(())
+    }
+
+    /// Subprocess fixture for the cross-process probe below: holds an
+    /// uncommitted write on the probe database until the parent kills it.
+    #[test]
+    #[ignore = "subprocess fixture: the cross-process cancellation probe kills this writer"]
+    fn gh515_cross_process_writer_holder() -> Result<(), Box<dyn std::error::Error>> {
+        let path = dotenvy::var("CASS_GH515_PROBE_DB")?;
+        let blocker = Connection::open(path.clone())?;
+        blocker.execute("PRAGMA fsqlite.concurrent_mode = OFF")?;
+        blocker.execute("BEGIN IMMEDIATE")?;
+        blocker.execute("INSERT INTO writes VALUES(1)")?;
+        std::fs::write(format!("{path}.ready"), b"holding")?;
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        Ok(())
+    }
+
+    /// GH #515 (362yj): in the reported wedge and in the CLI test, the writer
+    /// that blocks `cass index` lives in ANOTHER process (the daemon, the test
+    /// harness). Same-process probes above end on cancellation; this one puts
+    /// the blocker in a child process and requires the same. On 0.4.12 both
+    /// cases wait the whole 10 s busy_timeout before `Abort`: the engine's
+    /// busy-retry loops never consult the cancelled context between retries
+    /// (frankensqlite#524). Run it with `--ignored` when bumping the engine.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "frankensqlite#524: busy-retry loops ignore cancellation for a cross-process writer"]
+    fn cancellation_stops_a_write_waiting_for_a_writer_in_another_process()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let mut outcomes = Vec::new();
+        for through_migration_runner in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("cross-process.db");
+            let setup = Connection::open(path.to_string_lossy().into_owned())?;
+            setup.execute("CREATE TABLE writes(value INTEGER)")?;
+            setup.close()?;
+            let ready = directory.path().join("cross-process.db.ready");
+            let mut holder = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "franken_sync::tests::gh515_cross_process_writer_holder",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("CASS_GH515_PROBE_DB", &path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !ready.exists() {
+                if Instant::now() > deadline {
+                    let _ = holder.kill();
+                    return Err("cross-process writer never held the database".into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let handle = CancellationHandle::default();
+            let worker_handle = handle.clone();
+            let worker_path = path.clone();
+            let (waiting_tx, waiting_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || -> Result<(Duration, String), String> {
+                let conn = Connection::open(worker_path.to_string_lossy().into_owned())
+                    .map_err(|error| error.to_string())?;
+                conn.execute("PRAGMA busy_timeout = 10000")
+                    .map_err(|error| error.to_string())?;
+                let _scope = worker_handle.enter();
+                let started = Instant::now();
+                let _ = waiting_tx.send(());
+                let result = if through_migration_runner {
+                    migrate::MigrationRunner::new()
+                        .add(1, "gh515_probe", "CREATE TABLE gh515_probe(value INTEGER);")
+                        .run(&conn)
+                        .map(drop)
+                } else {
+                    let result = conn.execute("BEGIN IMMEDIATE").map(drop);
+                    if result.is_ok() {
+                        let _ = conn.execute("ROLLBACK");
+                    }
+                    result
+                };
+                Ok((started.elapsed(), format!("{result:?}")))
+            });
+            waiting_rx.recv_timeout(Duration::from_secs(10))?;
+            std::thread::sleep(Duration::from_millis(300));
+            handle.cancel();
+            let joined = worker.join().map_err(|_| "cross-process waiter panicked");
+            let _ = holder.kill();
+            let _ = holder.wait();
+            let (elapsed, result) = joined??;
+            outcomes.push((through_migration_runner, elapsed, result));
+        }
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, elapsed, result)| result.contains("Abort")
+                    && *elapsed < Duration::from_secs(3)),
+            "a write waiting on another process's writer must end on cancellation, \
+             not at the busy timeout: {outcomes:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn nested_sql_bridge_restores_full_and_restricted_callers()
     -> Result<(), Box<dyn std::error::Error>> {
