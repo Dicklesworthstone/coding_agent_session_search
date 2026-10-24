@@ -7355,6 +7355,11 @@ mod tests {
             cursor_exhausted: false,
         });
         manifest.save(temp.path())?;
+        // A chunking-contract replacement on an unchanged archive keeps the
+        // complete old generation published until the replacement publishes
+        // (5e96ebc6, GH #458); only that boundary retires it.
+        let retained = manifest.fast_tier.clone();
+        assert!(retained.as_ref().is_some_and(|artifact| artifact.ready));
         let first =
             indexer.run_backfill_from_storage(&storage, temp.path(), &mut manifest, plan(1))?;
         assert!(!first.unchanged && !first.published && first.checkpoint_saved);
@@ -7363,13 +7368,7 @@ mod tests {
         assert_eq!(checkpoint.conversations_processed, 1);
         assert_eq!(checkpoint.last_message_id, Some(i64::try_from(long_id)?));
         assert_eq!(checkpoint.docs_embedded, 8);
-        assert!(
-            !manifest
-                .fast_tier
-                .as_ref()
-                .context("revoked artifact")?
-                .ready
-        );
+        assert_eq!(manifest.fast_tier, retained);
         assert_eq!(fs::read(&initial.index_path)?, prior_live);
         let staged = FsVectorIndex::open(&staging)?;
         assert_eq!(staged.embedder_revision(), HASH_VECTOR_SPACE_REVISION);
@@ -7379,9 +7378,13 @@ mod tests {
         let second =
             indexer.run_backfill_from_storage(&storage, temp.path(), &mut resumed, plan(1))?;
         assert!(!second.published);
+        assert_eq!(resumed.fast_tier, retained);
         let done =
             indexer.run_backfill_from_storage(&storage, temp.path(), &mut resumed, plan(1))?;
         assert!(done.published && !done.unchanged);
+        let replacement = resumed.fast_tier.as_ref().context("replacement artifact")?;
+        assert!(replacement.ready);
+        assert_eq!(replacement.chunking_version, CHUNKING_STRATEGY_VERSION);
         let actual = FsVectorIndex::open(&done.index_path)?;
         assert_eq!(actual.embedder_revision(), HASH_VECTOR_SPACE_REVISION);
         assert_eq!(validated_semantic_index_ids(&actual)?, expected);
