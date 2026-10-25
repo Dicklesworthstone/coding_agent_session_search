@@ -6237,6 +6237,18 @@
             "hollow": {
               "type": "boolean"
             },
+            "manifest_source": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "current",
+                "previous_after_missing_current",
+                "previous_after_corrupt_current",
+                null
+              ]
+            },
             "segment_files": {
               "type": [
                 "integer",
@@ -30020,6 +30032,18 @@
                 "hollow": {
                   "type": "boolean"
                 },
+                "manifest_source": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "current",
+                    "previous_after_missing_current",
+                    "previous_after_corrupt_current",
+                    null
+                  ]
+                },
                 "segment_files": {
                   "type": [
                     "integer",
@@ -32902,6 +32926,18 @@
                     "hollow": {
                       "type": "boolean"
                     },
+                    "manifest_source": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "enum": [
+                        "current",
+                        "previous_after_missing_current",
+                        "previous_after_corrupt_current",
+                        null
+                      ]
+                    },
                     "segment_files": {
                       "type": [
                         "integer",
@@ -33686,6 +33722,18 @@
                 "engine_incompatible": {
                   "type": "boolean"
                 },
+                "manifest_source": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "current",
+                    "previous_after_missing_current",
+                    "previous_after_corrupt_current",
+                    null
+                  ]
+                },
                 "rebuilding": {
                   "type": "boolean"
                 },
@@ -34177,6 +34225,18 @@
             },
             "hollow": {
               "type": "boolean"
+            },
+            "manifest_source": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "current",
+                "previous_after_missing_current",
+                "previous_after_corrupt_current",
+                null
+              ]
             },
             "segment_files": {
               "type": [
@@ -36319,6 +36379,18 @@
             "hollow": {
               "type": "boolean"
             },
+            "manifest_source": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "current",
+                "previous_after_missing_current",
+                "previous_after_corrupt_current",
+                null
+              ]
+            },
             "segment_files": {
               "type": [
                 "integer",
@@ -38460,6 +38532,18 @@
                 },
                 "hollow": {
                   "type": "boolean"
+                },
+                "manifest_source": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "current",
+                    "previous_after_missing_current",
+                    "previous_after_corrupt_current",
+                    null
+                  ]
                 },
                 "segment_files": {
                   "type": [

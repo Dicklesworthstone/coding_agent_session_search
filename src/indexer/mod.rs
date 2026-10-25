@@ -18031,6 +18031,24 @@ fn run_index_with_storage_ownership(
     } else {
         tracing::info!(db_path = %opts.db_path.display(), "skipping live Tantivy reader preflight");
     }
+    // mknmt: a corrupt current MANIFEST opens through MANIFEST.prev, so the
+    // reader preflight succeeds on the generation before the newest publish,
+    // and a full run's post-scan skip compares only document counts. cass
+    // builds Quill without durability sidecars, so only the canonical DB
+    // restores that publish. Metadata only; a resumed rebuild replaces it.
+    if !tantivy_requires_rebuild
+        && !resume_lexical_rebuild
+        && crate::search::tantivy::searchable_index_live_docs(&index_path).is_some_and(|live| {
+            live.manifest_source
+                == crate::search::quill_bridge::QuillManifestSource::PreviousAfterCorruptCurrent
+        })
+    {
+        tracing::warn!(
+            path = %index_path.display(),
+            "lexical MANIFEST is corrupt and readers serve MANIFEST.prev; rebuilding the generation from the canonical database"
+        );
+        tantivy_requires_rebuild = true;
+    }
     // 2l1b0.79: rows deleted outside the indexer (a forget, dedup or agent
     // purge whose own lexical rebuild failed or was interrupted) keep their
     // documents in the published generation, and the incremental scan never

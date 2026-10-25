@@ -7,6 +7,10 @@
 //! The legacy shape is produced deterministically from a real index: build a
 //! Quill generation, then rename its `MANIFEST` to `meta.json` (rename only;
 //! nothing is deleted).
+//!
+//! Bead `coding_agent_session_search-mknmt`: a corrupt current `MANIFEST` is
+//! read through `MANIFEST.prev`; status, health and search robot-meta must say
+//! so, and `cass index` must rebuild the newest publish.
 
 mod util;
 
@@ -207,4 +211,199 @@ fn check() -> Result<(), String> {
 #[test]
 fn status_reports_legacy_tantivy_generation_as_engine_incompatible() -> Result<(), String> {
     check()
+}
+
+// mknmt: a corrupt current MANIFEST is read through MANIFEST.prev, so search
+// silently served the generation before the newest publish while health and
+// status called the index ready.
+const SECOND_KEYWORD: &str = "manifest-slot-gate-keyword-qwer";
+const CORRUPT_SOURCE: &str = "previous_after_corrupt_current";
+
+fn json_run(fixture: &Fixture, label: &str, args: &[&str]) -> Result<(Output, Value), String> {
+    let out = run(fixture, label, args, INDEX_TIMEOUT);
+    let value = serde_json::from_str(text(&out.stdout).trim()).map_err(|e| {
+        format!(
+            "{label}: stdout not JSON: {e}; stderr: {}",
+            text(&out.stderr)
+        )
+    })?;
+    Ok((out, value))
+}
+
+fn index_ok(fixture: &Fixture, label: &str, args: &[&str]) -> Result<(), String> {
+    let (_, value) = json_run(fixture, label, args)?;
+    if value.get("success").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(format!("{label}: index did not succeed: {value}"))
+    }
+}
+
+/// Lexical hits for `keyword`, plus the search's robot-meta.
+fn search_hits(fixture: &Fixture, label: &str, keyword: &str) -> Result<(usize, Value), String> {
+    let (_, value) = json_run(
+        fixture,
+        label,
+        &[
+            "search",
+            keyword,
+            "--json",
+            "--robot-meta",
+            "--mode",
+            "lexical",
+            "--limit",
+            "5",
+        ],
+    )?;
+    let hits = value
+        .get("hits")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .ok_or_else(|| format!("{label}: no hits array: {value}"))?;
+    Ok((hits, value))
+}
+
+fn corrupt_current_manifest(data_dir: &Path) -> Result<(), String> {
+    let manifest = quill_generation_dir(data_dir)?.join("MANIFEST");
+    let mut bytes = std::fs::read(&manifest).map_err(|e| format!("read MANIFEST: {e}"))?;
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    std::fs::write(&manifest, &bytes).map_err(|e| format!("corrupt MANIFEST: {e}"))
+}
+
+/// The newest publish is served again: current slot, not stale for it, and
+/// the second session's keyword is found.
+fn expect_repaired(fixture: &Fixture, label: &str) -> Result<(), String> {
+    let status = status_json(fixture, &format!("{label}_status"))?;
+    if str_at(&status, "/index/manifest_source") != Some("current") {
+        return Err(format!("{label}: manifest_source after repair: {status}"));
+    }
+    if str_at(&status, "/index/reason").is_some_and(|reason| reason.contains("MANIFEST")) {
+        return Err(format!(
+            "{label}: corrupt-MANIFEST reason survived repair: {status}"
+        ));
+    }
+    let (hits, _) = search_hits(fixture, &format!("{label}_search"), SECOND_KEYWORD)?;
+    if hits == 0 {
+        return Err(format!("{label}: the newest publish is still not served"));
+    }
+    Ok(())
+}
+
+fn check_corrupt_current_manifest() -> Result<(), String> {
+    let fixture = indexed_fixture()?;
+    // A second publish after the full build, so MANIFEST.prev holds a real
+    // generation (the first session only), not the empty genesis.
+    util::seed_codex_session(
+        &fixture.codex_home,
+        "rollout-2026-04-23T11-00-00-second.jsonl",
+        SECOND_KEYWORD,
+        true,
+    );
+    index_ok(
+        &fixture,
+        "slot_incremental",
+        &["index", "--json", "--no-progress-events"],
+    )?;
+    let control = status_json(&fixture, "slot_status_current")?;
+    if str_at(&control, "/index/manifest_source") != Some("current") {
+        return Err(format!("intact MANIFEST must read as current: {control}"));
+    }
+    let (hits, _) = search_hits(&fixture, "slot_search_current", SECOND_KEYWORD)?;
+    if hits == 0 {
+        return Err("the second session must be searchable before corruption".to_string());
+    }
+
+    corrupt_current_manifest(&fixture.data_dir)?;
+    let mut failures = Vec::new();
+    let status = status_json(&fixture, "slot_status_corrupt")?;
+    if str_at(&status, "/index/manifest_source") != Some(CORRUPT_SOURCE) {
+        failures.push(format!(
+            "status index.manifest_source: {:?}",
+            status.pointer("/index/manifest_source")
+        ));
+    }
+    if str_at(&status, "/index/status") != Some("stale")
+        || bool_at(&status, "/index/fresh") != Some(false)
+    {
+        failures.push(format!(
+            "a generation one publish behind is stale, not ready: status={:?} fresh={:?}",
+            str_at(&status, "/index/status"),
+            bool_at(&status, "/index/fresh")
+        ));
+    }
+    let reason = str_at(&status, "/index/reason").unwrap_or("");
+    if !reason.contains("MANIFEST.prev") || !reason.contains("corrupt") {
+        failures.push(format!("status reason must name the slot: {reason:?}"));
+    }
+    let recommended = str_at(&status, "/recommended_action").unwrap_or("");
+    if !recommended.contains("cass index") || !recommended.contains("MANIFEST.prev") {
+        failures.push(format!("status recommended_action: {recommended:?}"));
+    }
+    let (_, health) = json_run(&fixture, "slot_health_corrupt", &["health", "--json"])?;
+    if str_at(&health, "/state/index/manifest_source") != Some(CORRUPT_SOURCE) {
+        failures.push(format!(
+            "health state.index.manifest_source: {:?}",
+            health.pointer("/state/index/manifest_source")
+        ));
+    }
+    if bool_at(&health, "/healthy") != Some(false) {
+        failures.push("health must not call a corrupt MANIFEST healthy".to_string());
+    }
+    let errors = health
+        .get("errors")
+        .and_then(Value::as_array)
+        .map(|errors| {
+            errors
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .unwrap_or_default();
+    if !errors.contains("MANIFEST corrupt") {
+        failures.push(format!(
+            "health errors must name the corrupt MANIFEST: {errors:?}"
+        ));
+    }
+    // What readers serve: the first session, not the newest publish.
+    let (first_hits, _) = search_hits(&fixture, "slot_search_first", KEYWORD)?;
+    let (second_hits, meta) = search_hits(&fixture, "slot_search_second", SECOND_KEYWORD)?;
+    if first_hits == 0 || second_hits != 0 {
+        failures.push(format!(
+            "readers should serve MANIFEST.prev: first={first_hits} second={second_hits}"
+        ));
+    }
+    if str_at(&meta, "/_meta/index_freshness/manifest_source") != Some(CORRUPT_SOURCE) {
+        failures.push(format!(
+            "search robot-meta index_freshness.manifest_source: {:?}",
+            meta.pointer("/_meta/index_freshness/manifest_source")
+        ));
+    }
+    if !failures.is_empty() {
+        return Err(failures.join("\n"));
+    }
+
+    // The advised command repairs it: a plain incremental run rebuilds the
+    // generation from the canonical database even though nothing changed.
+    index_ok(
+        &fixture,
+        "slot_repair_incremental",
+        &["index", "--json", "--no-progress-events"],
+    )?;
+    expect_repaired(&fixture, "slot_after_index")?;
+
+    // So does a full run.
+    corrupt_current_manifest(&fixture.data_dir)?;
+    index_ok(
+        &fixture,
+        "slot_repair_full",
+        &["index", "--full", "--json", "--no-progress-events"],
+    )?;
+    expect_repaired(&fixture, "slot_after_full")
+}
+
+#[test]
+fn corrupt_current_manifest_is_reported_and_rebuilt_by_cass_index() -> Result<(), String> {
+    check_corrupt_current_manifest()
 }

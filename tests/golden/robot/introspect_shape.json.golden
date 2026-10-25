@@ -4292,6 +4292,23 @@
                             }
                           }
                         },
+                        "manifest_source": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "enum": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "segment_files": {
                           "type": "object",
                           "properties": {
@@ -54920,6 +54937,23 @@
                                     }
                                   }
                                 },
+                                "manifest_source": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "enum": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
                                 "segment_files": {
                                   "type": "object",
                                   "properties": {
@@ -61547,6 +61581,23 @@
                                             }
                                           }
                                         },
+                                        "manifest_source": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            },
+                                            "enum": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
                                         "segment_files": {
                                           "type": "object",
                                           "properties": {
@@ -63240,6 +63291,23 @@
                                     }
                                   }
                                 },
+                                "manifest_source": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "enum": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
                                 "rebuilding": {
                                   "type": "object",
                                   "properties": {
@@ -64308,6 +64376,23 @@
                           "properties": {
                             "type": {
                               "type": "string"
+                            }
+                          }
+                        },
+                        "manifest_source": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "enum": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         },
@@ -68939,6 +69024,23 @@
                             }
                           }
                         },
+                        "manifest_source": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "enum": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "segment_files": {
                           "type": "object",
                           "properties": {
@@ -73519,6 +73621,23 @@
                                   "properties": {
                                     "type": {
                                       "type": "string"
+                                    }
+                                  }
+                                },
+                                "manifest_source": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "enum": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
                                     }
                                   }
                                 },

@@ -22725,6 +22725,7 @@ fn state_meta_json_inner(
                 indexed_docs: None,
                 hollow: false,
                 live_docs: None,
+                manifest_source: None,
                 status_reason: Some(format!("asset inspection failed: {summary}")),
                 fingerprint: crate::search::asset_state::LexicalFingerprintState {
                     current_db_fingerprint: None,
@@ -23051,6 +23052,11 @@ fn state_meta_json_inner(
             // checkpoint. `reason` carries the operator-facing verdict.
             "live_documents": lexical.live_docs,
             "hollow": lexical.hollow,
+            // mknmt: which MANIFEST slot readers serve; anything but
+            // "current" is an older generation than the newest publish.
+            "manifest_source": lexical
+                .manifest_source
+                .map(crate::search::quill_bridge::QuillManifestSource::as_str),
             // #441: upper bound on published Quill segments, metadata only.
             "segment_files": lexical_segment_files,
             "empty_with_messages": index_empty_with_messages,
@@ -23387,6 +23393,8 @@ fn state_index_freshness(state: &serde_json::Value) -> Option<serde_json::Value>
         "stale_threshold_seconds": index.get("stale_threshold_seconds"),
         // b4uax: legacy Tantivy generation the current engine cannot read.
         "engine_incompatible": index.get("engine_incompatible"),
+        // mknmt: readers serving MANIFEST.prev, not the newest publish.
+        "manifest_source": index.get("manifest_source"),
         "rebuilding": index.get("rebuilding"),
         // [coding_agent_session_search #301] propagate the incomplete-index
         // markers so `cass search --robot-meta` can warn that the index is
@@ -86850,6 +86858,8 @@ fn run_status(
         // generation from the canonical DB) rather than the generic stale
         // advice, so the operator knows why the next run rebuilds.
         Some(HOLLOW_INDEX_RECOMMENDED_ACTION.to_string())
+    } else if state_index_manifest_corrupt(&state) {
+        Some(CORRUPT_MANIFEST_RECOMMENDED_ACTION.to_string())
     } else if index_empty_with_messages {
         Some("Run 'cass index --full' to populate the empty search index".to_string())
     } else if ingest_quarantine_critical {
@@ -88087,6 +88097,25 @@ const HOLLOW_INDEX_HEALTH_ERROR: &str = "index hollow — the published lexical 
 /// for a hollow lexical generation.
 const HOLLOW_INDEX_RECOMMENDED_ACTION: &str = "Run 'cass index' to rebuild the hollow search index from the canonical database (the published generation serves far fewer documents than its completed checkpoint certified; the pre-scan repair rebuilds it, and 'cass index --full' does the same after a full rescan).";
 
+/// mknmt: `errors[]` entry on `cass health` when readers serve `MANIFEST.prev`
+/// because the current MANIFEST is corrupt.
+const CORRUPT_MANIFEST_HEALTH_ERROR: &str = "index MANIFEST corrupt — search serves the previous lexical generation (MANIFEST.prev), which lacks the newest publish; run 'cass index' to rebuild it from the canonical database";
+
+/// mknmt: `recommended_action` shared by `cass health` and `cass status` for
+/// a corrupt current MANIFEST.
+const CORRUPT_MANIFEST_RECOMMENDED_ACTION: &str = "Run 'cass index' to rebuild the search index from the canonical database (its current MANIFEST is corrupt, so search serves the previous generation from MANIFEST.prev, which lacks the newest publish; 'cass index --full' does the same after a full rescan).";
+
+/// mknmt: readers serve `MANIFEST.prev` because the current slot is corrupt.
+fn state_index_manifest_corrupt(state: &serde_json::Value) -> bool {
+    state
+        .get("index")
+        .and_then(|index| index.get("manifest_source"))
+        .and_then(serde_json::Value::as_str)
+        == Some(
+            crate::search::quill_bridge::QuillManifestSource::PreviousAfterCorruptCurrent.as_str(),
+        )
+}
+
 /// Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy.
 /// Designed for agent pre-flight checks before complex operations.
 ///
@@ -88249,6 +88278,8 @@ fn run_health(
         // GH #457: mirror run_status — name the repair, not the generic
         // stale advice, so the operator knows why the run will rebuild.
         Some(HOLLOW_INDEX_RECOMMENDED_ACTION.to_string())
+    } else if state_index_manifest_corrupt(&state) {
+        Some(CORRUPT_MANIFEST_RECOMMENDED_ACTION.to_string())
     } else if ingest_quarantine_critical
         || (healthy && (quarantined_conversations > 0 || deferred_conversations > 0))
     {
@@ -88280,6 +88311,8 @@ fn run_health(
     }
     if index_hollow {
         errors.push(HOLLOW_INDEX_HEALTH_ERROR.to_string());
+    } else if state_index_manifest_corrupt(&state) {
+        errors.push(CORRUPT_MANIFEST_HEALTH_ERROR.to_string());
     } else if index_exists && !index_fresh && !not_initialized {
         errors.push("index stale".to_string());
     }
@@ -88485,6 +88518,8 @@ fn run_health(
         }
         if index_hollow {
             println!("  - {HOLLOW_INDEX_HEALTH_ERROR}");
+        } else if state_index_manifest_corrupt(&state) {
+            println!("  - {CORRUPT_MANIFEST_HEALTH_ERROR}");
         } else if index_exists && !index_fresh {
             println!("  - index stale");
         }
@@ -99260,6 +99295,10 @@ fn response_schema_index_state() -> serde_json::Value {
             "documents": { "type": ["integer", "null"] },
             "live_documents": { "type": ["integer", "null"] },
             "hollow": { "type": "boolean" },
+            "manifest_source": {
+                "type": ["string", "null"],
+                "enum": ["current", "previous_after_missing_current", "previous_after_corrupt_current", null]
+            },
             "segment_files": { "type": ["integer", "null"] },
             "empty_with_messages": { "type": "boolean" },
             "quarantined_conversations": { "type": "integer" },
@@ -99768,6 +99807,10 @@ fn response_schema_index_freshness() -> serde_json::Value {
             "stale": { "type": "boolean" },
             "stale_threshold_seconds": { "type": "integer" },
             "engine_incompatible": { "type": "boolean" },
+            "manifest_source": {
+                "type": ["string", "null"],
+                "enum": ["current", "previous_after_missing_current", "previous_after_corrupt_current", null]
+            },
             "rebuilding": { "type": "boolean" },
             "pending_sessions": { "type": "integer" },
             "auto_refresh": {

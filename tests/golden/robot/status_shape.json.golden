@@ -79,6 +79,9 @@
         "hollow": {
           "type": "boolean"
         },
+        "manifest_source": {
+          "type": "null"
+        },
         "segment_files": {
           "type": "null"
         },

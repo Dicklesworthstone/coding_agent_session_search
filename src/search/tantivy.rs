@@ -1115,17 +1115,42 @@ pub fn searchable_index_summary(index_path: &Path) -> Result<Option<SearchableIn
 /// and when no manifest decodes.
 #[must_use]
 pub fn searchable_index_live_doc_count(index_path: &Path) -> Option<u64> {
+    searchable_index_live_docs(index_path).map(|live| live.live_docs)
+}
+
+/// What a searchable lexical generation serves, from manifest metadata alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchableLiveDocs {
+    pub live_docs: u64,
+    /// The worst MANIFEST slot any shard was read from (mknmt): a federated
+    /// bundle serves an older generation as soon as one shard does.
+    pub manifest_source: crate::search::quill_bridge::QuillManifestSource,
+}
+
+/// [`searchable_index_live_doc_count`] together with the MANIFEST slot it was
+/// read from. Same `None` cases.
+#[must_use]
+pub fn searchable_index_live_docs(index_path: &Path) -> Option<SearchableLiveDocs> {
     if let Ok(Some(manifest)) = load_federated_search_manifest_internal(index_path) {
-        let mut total = 0_u64;
+        let mut total = SearchableLiveDocs {
+            live_docs: 0,
+            manifest_source: crate::search::quill_bridge::QuillManifestSource::Current,
+        };
         for shard in &manifest.shards {
             let shard_live = crate::search::quill_bridge::manifest_live_doc_count(
                 &index_path.join(&shard.relative_path),
             )?;
-            total = total.saturating_add(shard_live.live_docs);
+            total.live_docs = total.live_docs.saturating_add(shard_live.live_docs);
+            total.manifest_source = total.manifest_source.max(shard_live.source);
         }
         return Some(total);
     }
-    crate::search::quill_bridge::manifest_live_doc_count(index_path).map(|live| live.live_docs)
+    crate::search::quill_bridge::manifest_live_doc_count(index_path).map(|live| {
+        SearchableLiveDocs {
+            live_docs: live.live_docs,
+            manifest_source: live.source,
+        }
+    })
 }
 
 fn searchable_index_summary_from_tantivy_meta(

@@ -47,6 +47,8 @@ use clap::{Parser, Subcommand};
 use coding_agent_search::search::query::{
     FieldMask, SearchClient, SearchClientOptions, SearchFilters, SearchHit,
 };
+use coding_agent_search::search::quill_bridge::QuillManifestSource;
+use coding_agent_search::search::tantivy::searchable_index_live_docs;
 use coding_agent_search::sources::provenance::SourceFilter;
 use serde_json::{Value, json};
 
@@ -366,6 +368,9 @@ struct Session {
     open_attempts: u64,
     successful_opens: u64,
     queries_completed: u64,
+    /// MANIFEST slot read beside the snapshot open (mknmt): anything but
+    /// `Current` means the pinned snapshot is older than the newest publish.
+    manifest_source: Option<QuillManifestSource>,
 }
 
 impl Session {
@@ -387,6 +392,7 @@ impl Session {
             open_attempts: 0,
             successful_opens: 0,
             queries_completed: 0,
+            manifest_source: None,
         }
     }
 
@@ -401,6 +407,8 @@ impl Session {
             let client = open_snapshot(&self.index)?;
             self.successful_opens = self.successful_opens.saturating_add(1);
             self.client = Some(client);
+            self.manifest_source =
+                searchable_index_live_docs(&self.index).map(|live| live.manifest_source);
             if lease.is_some() {
                 self.reader_lease = lease;
             }
@@ -422,6 +430,7 @@ impl Session {
         self.semantic.unload();
         drop(self.client.take());
         drop(self.reader_lease.take());
+        self.manifest_source = None;
     }
 
     fn status(&self) -> Value {
@@ -454,6 +463,7 @@ impl Session {
             "queries_completed": self.queries_completed,
             "snapshot_policy": "pinned_until_reload",
             "freshness": "not_checked",
+            "manifest_source": self.manifest_source.map(QuillManifestSource::as_str),
             "canonical_view_enabled": self.archive.is_some(),
             "canonical_database_accessed": self.canonical_read_attempts != 0
                 || self.semantic.archive_access_attempted()

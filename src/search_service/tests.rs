@@ -604,6 +604,41 @@ fn publication_is_invisible_until_reload_and_new_snapshot_replaces_old() -> Resu
     Ok(())
 }
 
+/// mknmt: the snapshot names the MANIFEST slot it was opened from. After the
+/// current MANIFEST is corrupted, a reload serves the previous generation and
+/// says so instead of passing it off as the newest publish.
+#[test]
+fn reload_reports_a_snapshot_served_from_the_previous_manifest_slot() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("index");
+    let mut writer = index(&path, &[document(41, "needle original", "local")])?;
+    writer.add_prebuilt_documents_slice(&[document(42, "needle appended", "local")])?;
+    writer.commit()?;
+    drop(writer);
+    let mut session = Session::new(path.clone());
+    let current = search(&mut session, 1, "needle");
+    assert_eq!(current["count"], 2);
+    assert_eq!(current["snapshot"]["manifest_source"], "current");
+
+    let manifest = path.join("MANIFEST");
+    let mut bytes = std::fs::read(&manifest)?;
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    std::fs::write(&manifest, &bytes)?;
+    let (reload, _) = session.handle(Request::Reload { id: 2 });
+    assert!(reload.ok, "{reload:?}");
+    let previous = search(&mut session, 3, "needle");
+    assert_eq!(
+        previous["count"], 1,
+        "MANIFEST.prev lacks the newest publish"
+    );
+    assert_eq!(
+        previous["snapshot"]["manifest_source"],
+        "previous_after_corrupt_current"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn failed_reload_releases_the_old_reader_and_recovery_never_serves_it_as_current() -> Result<()> {

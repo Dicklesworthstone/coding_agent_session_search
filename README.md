@@ -1609,6 +1609,14 @@ Run `cass index` to let its pre-scan repair rebuild from the canonical archive;
 `cass index --full` also rescans the session sources. A missing count provides
 no hollow-generation verdict.
 
+`index.manifest_source` (also under search `--robot-meta`
+`_meta.index_freshness` and in `cass serve`'s `snapshot`) names the MANIFEST
+slot readers serve: `current`,
+`previous_after_missing_current` or `previous_after_corrupt_current`. A corrupt
+current MANIFEST is read through `MANIFEST.prev`, the generation before the
+newest publish, so the index reports `stale` and `health` reports it as an
+error; `cass index` rebuilds the generation from the canonical archive.
+
 ### Robot Documentation System
 
 For machine-readable documentation, use `cass robot-docs <topic>`:
