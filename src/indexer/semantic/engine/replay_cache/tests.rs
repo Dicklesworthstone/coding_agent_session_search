@@ -49,6 +49,36 @@ fn fixture(bodies: &[&str]) -> Result<(tempfile::TempDir, FrankenStorage)> {
     Ok((dir, storage))
 }
 
+fn signed_fixture(parents: &[i64]) -> Result<(tempfile::TempDir, FrankenStorage)> {
+    let (dir, storage) = fixture(&[])?;
+    let agent: i64 = storage.raw().query_row_map(
+        "SELECT id FROM agents WHERE slug = 'codex'",
+        &[] as &[ParamValue],
+        |row| row.get_typed(0),
+    )?;
+    for (ordinal, &id) in parents.iter().enumerate() {
+        storage.raw().execute_compat(
+            "INSERT INTO conversations(id, agent_id, source_id, external_id, source_path)
+             VALUES (?1, ?2, 'local', ?3, ?4)",
+            &[
+                ParamValue::from(id),
+                ParamValue::from(agent),
+                ParamValue::from(format!("signed-replay-{ordinal}")),
+                ParamValue::from(format!("/signed-replay/{ordinal}.jsonl")),
+            ],
+        )?;
+        storage.raw().execute_compat(
+            "INSERT INTO messages(conversation_id, idx, role, content, created_at)
+             VALUES (?1, 0, 'user', ?2, 1)",
+            &[
+                ParamValue::from(id),
+                ParamValue::from(format!("signed replay evidence {ordinal}")),
+            ],
+        )?;
+    }
+    Ok((dir, storage))
+}
+
 fn plan(limit: usize) -> SemanticBackfillStoragePlan {
     SemanticBackfillStoragePlan {
         tier: TierKind::Fast,
@@ -157,6 +187,108 @@ fn replay_cache_reads_the_archive_once_and_only_reloads_selected_text() -> Resul
 
 fn cache_disabled() -> CanonicalReplayCache {
     cache(0)
+}
+
+#[test]
+fn replay_cache_preserves_signed_parents_across_pages_and_budget_modes() -> Result<()> {
+    // The first page contains only negative IDs. Later pages cross zero and
+    // end at MAX, exercising both cursor bounds without cursor+1 arithmetic.
+    let mut parents = vec![i64::MIN];
+    parents.extend(-(DEFAULT_SEMANTIC_RECONCILIATION_SCAN_CONVERSATIONS as i64)..=0);
+    parents.push(i64::MAX);
+    let (_dir, storage) = signed_fixture(&parents)?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let plan = plan(parents.len());
+    let expected_contents: Vec<_> = (0..parents.len())
+        .map(|ordinal| format!("signed replay evidence {ordinal}"))
+        .collect();
+    let can_retain = BackfillFilePair::archive(&storage).is_some();
+    let mut expected_signature = None;
+    for bytes in [0, 1, MAX_RETAINED_BYTES] {
+        let cache = cache(bytes);
+        for round in 0..2 {
+            let (selection, proof) = select(
+                &cache,
+                &indexer,
+                &storage,
+                &HashSet::new(),
+                &plan,
+                SemanticCheckpointCaps::unlimited(),
+            )?;
+            assert_eq!(
+                selection
+                    .inputs
+                    .iter()
+                    .map(|input| input.content.clone())
+                    .collect::<Vec<_>>(),
+                expected_contents,
+                "canonical parents must survive cached, disabled and budget-refused replay"
+            );
+            assert_eq!(selection.current_ids.len(), parents.len());
+            assert_eq!(selection.covered_conversations, parents.len() as u64);
+            assert_eq!(selection.last_covered_conversation, i64::MAX);
+            let expected_replayed = if round == 1 && bytes == MAX_RETAINED_BYTES && can_retain {
+                0
+            } else {
+                parents.len()
+            };
+            assert_eq!(selection.replayed_conversations, expected_replayed);
+            let observed = signature(&selection);
+            if let Some(expected) = &expected_signature {
+                assert_eq!(&observed, expected);
+            } else {
+                expected_signature = Some(observed);
+            }
+            proof.verify(&storage)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn replay_cache_bounded_batches_retain_nonpositive_checkpoint_progress() -> Result<()> {
+    let parents = [i64::MIN, -1, 0, i64::MAX];
+    let (_dir, storage) = signed_fixture(&parents)?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let cached = cache(MAX_RETAINED_BYTES);
+    let uncached = cache_disabled();
+    let plan = plan(1);
+    let mut existing = HashSet::new();
+    for (ordinal, parent) in parents.into_iter().enumerate() {
+        let (expected, _) = select(
+            &uncached,
+            &indexer,
+            &storage,
+            &existing,
+            &plan,
+            SemanticCheckpointCaps::unlimited(),
+        )?;
+        let (actual, proof) = select(
+            &cached,
+            &indexer,
+            &storage,
+            &existing,
+            &plan,
+            SemanticCheckpointCaps::unlimited(),
+        )?;
+        assert_eq!(signature(&actual), signature(&expected));
+        assert_eq!(actual.inputs.len(), 1);
+        assert_eq!(
+            actual.inputs[0].content,
+            format!("signed replay evidence {ordinal}")
+        );
+        assert_eq!(actual.current_ids.len(), parents.len());
+        assert_eq!(actual.covered_conversations, (ordinal + 1) as u64);
+        assert_eq!(actual.last_covered_conversation, parent);
+        assert_eq!(
+            actual.last_covered_conversation,
+            expected.last_covered_conversation
+        );
+        proof.verify(&storage)?;
+        existing.extend(actual.selected_ids);
+    }
+    assert_eq!(existing.len(), parents.len());
+    Ok(())
 }
 
 #[test]
@@ -376,7 +508,7 @@ fn replay_cache_hit_cannot_publish_after_a_later_canonical_write() -> Result<()>
         &plan,
         SemanticCheckpointCaps::unlimited(),
     )?;
-    let (_, proof) = select(
+    let (selection, proof) = select(
         &cache,
         &indexer,
         &storage,
@@ -384,9 +516,13 @@ fn replay_cache_hit_cannot_publish_after_a_later_canonical_write() -> Result<()>
         &plan,
         SemanticCheckpointCaps::unlimited(),
     )?;
+    assert_eq!(
+        selection.replayed_conversations, 0,
+        "negative requires an actual inventory hit"
+    );
     assert!(
         proof.0.is_some(),
-        "negative requires an actual inventory hit"
+        "cached replay must retain its archive observation"
     );
     proof.verify(&storage)?;
     storage.raw().execute(
@@ -399,6 +535,43 @@ fn replay_cache_hit_cannot_publish_after_a_later_canonical_write() -> Result<()>
             .to_string()
             .contains("archive changed")
     );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn replay_cache_cold_scan_cannot_publish_after_a_later_canonical_write() -> Result<()> {
+    // Cold retained, disabled and budget-refused scans all need the same
+    // archive fence. Mutate an unselected conversation after selection, just
+    // as an ingest can commit while a long embedding batch is running.
+    for bytes in [MAX_RETAINED_BYTES, 0, 1] {
+        let (_dir, storage) = fixture(&["selected message", "unselected message"])?;
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let cache = cache(bytes);
+        let (selection, proof) = select(
+            &cache,
+            &indexer,
+            &storage,
+            &HashSet::new(),
+            &plan(1),
+            SemanticCheckpointCaps::unlimited(),
+        )?;
+        assert_eq!(selection.replayed_conversations, 2);
+        assert_eq!(selection.inputs.len(), 1);
+        assert_eq!(selection.inputs[0].content, "selected message");
+        assert!(proof.0.is_some(), "cold replay must retain its observation");
+        proof.verify(&storage)?;
+        storage.raw().execute(
+            "UPDATE messages SET content = 'changed during embedding' WHERE conversation_id = 2",
+        )?;
+        assert!(
+            proof
+                .verify(&storage)
+                .unwrap_err()
+                .to_string()
+                .contains("archive changed")
+        );
+    }
     Ok(())
 }
 

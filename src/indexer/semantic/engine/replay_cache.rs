@@ -107,9 +107,11 @@ pub(super) struct ReconcileSelection {
     loaded_selected_conversations: usize,
 }
 
-/// Keep the observation that authorized a hit through the final embedding
-/// batch. A changed or unavailable stamp is never permission to publish from
-/// an older cached inventory. The uncached path retains its existing behavior.
+/// Keep a stable archive observation through replay and the final embedding
+/// batch, whether the inventory was cached or freshly read. A changed or
+/// unavailable stamp cannot authorize publication from either inventory.
+/// Platforms and explicit transactions without an observation retain the
+/// existing uncached reconciliation path.
 pub(super) struct ReplayProof(Option<BackfillFilePair>);
 
 impl ReplayProof {
@@ -117,7 +119,7 @@ impl ReplayProof {
         if let Some(expected) = &self.0 {
             anyhow::ensure!(
                 BackfillFilePair::archive(storage).as_ref() == Some(expected),
-                "canonical archive changed during cached semantic replay; retry backfill"
+                "canonical archive changed during semantic replay; retry backfill"
             );
         }
         Ok(())
@@ -280,7 +282,7 @@ impl CanonicalReplayCache {
                 budget > 0 && cached.retained_bytes <= budget && key.as_ref() == Some(&cached.key)
             });
         let cache_hit = cached.is_some();
-        let proof = ReplayProof(cached.as_ref().map(|cached| cached.key.archive.clone()));
+        let proof = ReplayProof(key.as_ref().map(|key| key.archive.clone()));
         let mut selected = ReconcileSelection::default();
         let inventory = if let Some(cached) = cached {
             for conversation in &cached.conversations {
@@ -303,24 +305,33 @@ impl CanonicalReplayCache {
                 conversations: Vec::new(),
                 retained_bytes: 0,
             });
-            let mut after_id = 0i64;
+            let mut after_id = None;
             loop {
                 indexer.check_external_cancelled()?;
-                let ids: Vec<i64> = storage.raw().query_map_collect(
-                    "SELECT id FROM conversations WHERE id > ?1 ORDER BY id LIMIT ?2",
-                    &[
-                        ParamValue::from(after_id),
-                        ParamValue::from(DEFAULT_SEMANTIC_RECONCILIATION_SCAN_CONVERSATIONS as i64),
-                    ],
-                    |row| row.get_typed(0),
-                )?;
+                // All signed SQLite rowids are valid canonical parents. A
+                // sentinel of zero would discard nonpositive IDs; arithmetic
+                // at either end of the rowid range can overflow.
+                let limit = DEFAULT_SEMANTIC_RECONCILIATION_SCAN_CONVERSATIONS as i64;
+                let (sql, params) = match after_id {
+                    None => (
+                        "SELECT id FROM conversations ORDER BY id LIMIT ?1",
+                        vec![ParamValue::from(limit)],
+                    ),
+                    Some(id) => (
+                        "SELECT id FROM conversations WHERE id > ?1 ORDER BY id LIMIT ?2",
+                        vec![ParamValue::from(id), ParamValue::from(limit)],
+                    ),
+                };
+                let ids: Vec<i64> = storage
+                    .raw()
+                    .query_map_collect(sql, &params, |row| row.get_typed(0))?;
                 if ids.is_empty() {
                     break;
                 }
                 for id in ids {
                     indexer.check_external_cancelled()?;
                     anyhow::ensure!(
-                        id > after_id,
+                        after_id.is_none_or(|previous| id > previous),
                         "canonical semantic replay cursor did not advance"
                     );
                     let (conversation, _) = project_conversation(indexer, storage, id, false)?;
@@ -352,7 +363,7 @@ impl CanonicalReplayCache {
                             building = None;
                         }
                     }
-                    after_id = id;
+                    after_id = Some(id);
                 }
             }
             building
