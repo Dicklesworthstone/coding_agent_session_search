@@ -94237,6 +94237,9 @@ pub(crate) fn run_doctor_impl(
         }
     }
     let candidate_staging_started = Instant::now();
+    // Set when this run built an isolated reconstruct candidate, which by
+    // design leaves every live asset untouched (see the post-repair probes).
+    let mut isolated_candidate_built = false;
     let mut candidate_staging =
         collect_doctor_candidate_staging_report(&data_dir, &db_path, &index_path);
     if candidate_repair_authority_complete
@@ -94259,6 +94262,7 @@ pub(crate) fn run_doctor_impl(
         );
         if build_report.status == "completed" {
             auto_fix_applied = true;
+            isolated_candidate_built = true;
             if let Some(candidate_id) = build_report.candidate_id.as_deref() {
                 auto_fix_actions.push(format!(
                     "Built isolated reconstruct candidate {candidate_id} without changing live archive inventory"
@@ -95340,13 +95344,22 @@ pub(crate) fn run_doctor_impl(
     );
 
     let post_repair_probes_started = Instant::now();
+    // zp0fp (GH #374): the post-repair probes verify live assets after a
+    // mutation. When the run's only action built an isolated reconstruct
+    // candidate, no live asset changed, so probing an unreadable archive
+    // measured its pre-existing damage, reported the build as a failed repair
+    // and left the failure marker that then blocked promoting that very
+    // candidate. Every other action (each one pushes to `auto_fix_actions`),
+    // filesystem mutation receipt or cleanup still runs every probe.
+    let live_assets_mutated =
+        auto_fix_applied && !(isolated_candidate_built && auto_fix_actions.len() == 1);
     let post_repair_probes = collect_doctor_post_repair_probes(DoctorPostRepairProbeRunContext {
         data_dir: &data_dir,
         db_path: &db_path,
         index_path: &index_path,
         readiness_snapshot: &readiness_snapshot,
         fix_can_mutate,
-        auto_fix_applied,
+        auto_fix_applied: live_assets_mutated,
         fs_mutation_receipts: &fs_mutation_receipts,
         cleanup_apply_result: cleanup_apply_result.as_ref(),
     });

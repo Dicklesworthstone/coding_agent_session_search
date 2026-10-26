@@ -4897,6 +4897,113 @@ fn doctor_fix_refuses_repeated_repair_when_failure_marker_exists() {
     );
 }
 
+/// zp0fp (GH #374): on an archive that cannot be opened but has a verified
+/// raw mirror, `doctor --fix` builds an isolated reconstruct candidate and
+/// leaves the live archive alone. Its post-repair probes used to open that
+/// untouched, unreadable archive, report the build as a failed repair, and
+/// leave the failure marker that then blocked promoting the very candidate.
+/// Now the run is not a verification failure, writes no marker, the dry-run
+/// plan offers the promotion with no blockers, and applying its fingerprint
+/// without the repeated-repair override restores a readable, searchable
+/// archive. Planted negative: before the fix, `doctor --fix` returned
+/// `verification-failed` and the plan was blocked by `marker-present`.
+#[test]
+fn doctor_fix_candidate_build_on_unreadable_archive_leaves_promotion_unblocked() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let home = test_home.path();
+    let data_dir = home.join("cass-data");
+    let data = data_dir.to_str().expect("utf8");
+    for (index, keyword) in ["zpalpha", "zpbravo", "zpcharlie"].iter().enumerate() {
+        util::seed_codex_session(
+            &home.join(".codex"),
+            &format!("rollout-zp0fp-{index}.jsonl"),
+            keyword,
+            true,
+        );
+    }
+    let run = |args: &[&str]| {
+        cass_cmd(home)
+            .args(args)
+            .args(["--data-dir", data])
+            .env("CASS_AUTO_REFRESH", "0")
+            .output()
+            .expect("run cass")
+    };
+    let indexed = run(&["index", "--full", "--json"]);
+    assert!(indexed.status.success(), "{indexed:?}");
+
+    let db_path = data_dir.join("agent_search.db");
+    let mut damaged = fs::read(&db_path).expect("read archive");
+    damaged[..100].fill(0);
+    fs::write(&db_path, &damaged).expect("damage archive header");
+
+    let fixed = run(&["doctor", "--json", "--fix"]);
+    let fixed_payload: Value = serde_json::from_slice(&fixed.stdout).expect("doctor --fix JSON");
+    assert!(
+        fixed_payload["auto_fix_actions"]
+            .as_array()
+            .expect("auto_fix_actions")
+            .iter()
+            .any(|action| action
+                .as_str()
+                .is_some_and(|text| text.starts_with("Built isolated reconstruct candidate"))),
+        "an unreadable archive with a verified raw mirror gets a candidate: {fixed_payload:#}"
+    );
+    assert_ne!(
+        fixed_payload["operation_outcome"]["kind"].as_str(),
+        Some("verification-failed"),
+        "building an isolated candidate is not a failed live repair: {fixed_payload:#}"
+    );
+    let markers = data_dir.join("doctor").join("failure-markers");
+    assert!(
+        !markers.exists() || fs::read_dir(&markers).expect("markers").next().is_none(),
+        "no failure marker may block the promotion"
+    );
+    assert_eq!(
+        fs::read(&db_path).expect("reread archive"),
+        damaged,
+        "doctor --fix leaves the live archive untouched"
+    );
+
+    let planned = run(&["doctor", "repair", "--dry-run", "--json"]);
+    let plan = serde_json::from_slice::<Value>(&planned.stdout).expect("repair dry-run JSON")
+        ["repair_plan"]
+        .clone();
+    assert!(
+        plan["planned_actions"]
+            .as_array()
+            .expect("planned actions")
+            .iter()
+            .any(|action| action["action_kind"] == "promote_reconstruct_candidate_archive_bundle"),
+        "{plan:#}"
+    );
+    assert_eq!(plan["blocked_reasons"], json!([]), "{plan:#}");
+    let fingerprint = plan["plan_fingerprint"].as_str().expect("fingerprint");
+
+    let applied = run(&[
+        "doctor",
+        "repair",
+        "--yes",
+        "--plan-fingerprint",
+        fingerprint,
+        "--json",
+    ]);
+    let applied_payload: Value = serde_json::from_slice(&applied.stdout).expect("repair JSON");
+    assert_ne!(
+        applied_payload["operation_outcome"]["kind"].as_str(),
+        Some("repair-refused"),
+        "{applied_payload:#}"
+    );
+    let health = run(&["health", "--json"]);
+    assert!(health.status.success(), "{health:?}");
+    let search = run(&["search", "zpbravo", "--robot", "--mode", "lexical"]);
+    let hits: Value = serde_json::from_slice(&search.stdout).expect("search JSON");
+    assert!(
+        !hits["hits"].as_array().expect("hits").is_empty(),
+        "the promoted archive answers searches: {hits:#}"
+    );
+}
+
 #[test]
 fn doctor_fix_allow_repeated_repair_runs_without_deleting_existing_marker() {
     let test_home = tempfile::tempdir().expect("tempdir");
