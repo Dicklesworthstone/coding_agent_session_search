@@ -51,6 +51,51 @@ pub(crate) fn table_has_column(conn: &Connection, table: &str, column: &str) -> 
     rows.iter().any(|name| name == column)
 }
 
+/// Whether `column` identifies at most one row of `table`: the table's
+/// single-column primary key, or the sole column of a full (non-partial)
+/// UNIQUE index.
+fn column_is_unique_key(conn: &Connection, table: &str, column: &str) -> bool {
+    let is_identifier = |name: &str| name.chars().all(|c| c.is_alphanumeric() || c == '_');
+    if !is_identifier(table) || !is_identifier(column) {
+        return false;
+    }
+    let Ok(columns) =
+        conn.query_map_collect(&format!("PRAGMA table_info({table})"), &[], |row: &Row| {
+            Ok((row.get_typed::<String>(1)?, row.get_typed::<i64>(5)?))
+        })
+    else {
+        return false;
+    };
+    let primary_key: Vec<&str> = columns
+        .iter()
+        .filter(|(_, pk)| *pk > 0)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if primary_key == [column] {
+        return true;
+    }
+    let Ok(indexes) =
+        conn.query_map_collect(&format!("PRAGMA index_list({table})"), &[], |row: &Row| {
+            Ok((
+                row.get_typed::<String>(1)?,
+                row.get_typed::<i64>(2)?,
+                row.get_typed::<i64>(4).unwrap_or(0),
+            ))
+        })
+    else {
+        return false;
+    };
+    indexes
+        .iter()
+        .filter(|(index, unique, partial)| *unique == 1 && *partial == 0 && is_identifier(index))
+        .any(|(index, _, _)| {
+            conn.query_map_collect(&format!("PRAGMA index_info({index})"), &[], |row: &Row| {
+                row.get_typed::<String>(2)
+            })
+            .is_ok_and(|names| names == [column])
+        })
+}
+
 fn table_has_plan_token_rollups(conn: &Connection, table: &str) -> bool {
     table_has_column(conn, table, "plan_content_tokens_est_total")
         && table_has_column(conn, table, "plan_api_tokens_total")
@@ -370,7 +415,7 @@ fn push_source_filter_clause(
 }
 
 /// Internal stats from a single COUNT/MIN/MAX query on a rollup table.
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 struct RollupStats {
     row_count: i64,
     min_day: Option<i64>,
@@ -1185,6 +1230,113 @@ fn query_token_daily_stats_status(
 // query_status
 // ---------------------------------------------------------------------------
 
+/// The counts behind an unfiltered `analytics status`, read from plain tables.
+struct UnrestrictedStatusCounts {
+    message_metrics: RollupStats,
+    api_messages: i64,
+    token_usage: RollupStats,
+    token_usage_with_model: i64,
+    token_usage_estimated: i64,
+    total_messages: i64,
+}
+
+/// GH #496: the counts of an unfiltered `analytics status` without the joins
+/// the filtered path needs. On FrankenSQLite 0.4.12 a statement with a third
+/// source, a subquery source, or a join carrying any WHERE/ON predicate or
+/// computed aggregate takes the generic join fallback, which materializes
+/// every source row with all its columns, `messages.content` included: status
+/// held ~3x the archive in RSS (6.9 GB on a 2.26 GB archive) and the reporter's
+/// was OOM-killed. Single-table aggregates and a bare two-table COUNT join
+/// stream. Every number here equals the general path's, because each table's
+/// `message_id` is unique (the general path's `GROUP BY message_id` is then a
+/// no-op) and its LEFT JOINs to agents and message_metrics only serve filters.
+/// The one difference: a metrics or token row whose message is gone (a broken
+/// foreign key) is counted here. `None` when a filter applies or a legacy
+/// table may hold several rows per message; the general path handles those.
+fn query_unrestricted_status_counts(
+    conn: &Connection,
+    filter: &AnalyticsFilter,
+) -> AnalyticsResult<Option<UnrestrictedStatusCounts>> {
+    let unrestricted = filter.since_ms.is_none()
+        && filter.until_ms.is_none()
+        && filter.agents.is_empty()
+        && filter.workspace_ids.is_empty()
+        && filter.source == SourceFilter::All;
+    let has_message_metrics = table_exists(conn, "message_metrics");
+    let has_token_usage = table_exists(conn, "token_usage");
+    let plain_message_metrics = !has_message_metrics
+        || (column_is_unique_key(conn, "message_metrics", "message_id")
+            && table_has_column(conn, "message_metrics", "day_id")
+            && table_has_column(conn, "message_metrics", "api_data_source"));
+    let plain_token_usage = !has_token_usage
+        || (column_is_unique_key(conn, "token_usage", "message_id")
+            && ["day_id", "model_name", "data_source"]
+                .iter()
+                .all(|column| table_has_column(conn, "token_usage", column)));
+    if !unrestricted
+        || !table_exists(conn, "messages")
+        || !table_exists(conn, "conversations")
+        || !plain_message_metrics
+        || !plain_token_usage
+    {
+        return Ok(None);
+    }
+
+    let stats = |table: &str| -> AnalyticsResult<RollupStats> {
+        conn.query_row_map(
+            &format!("SELECT COUNT(*), MIN(day_id), MAX(day_id), NULL FROM {table}"),
+            &[],
+            rollup_stats_from_summary_row,
+        )
+        .map_err(|error| analytics_query_error("Analytics status aggregate failed", error))
+    };
+    let (message_metrics, api_messages) = if has_message_metrics {
+        (
+            stats("message_metrics")?,
+            query_scalar_i64(
+                conn,
+                "SELECT COUNT(*) FROM message_metrics \
+                 WHERE LOWER(TRIM(COALESCE(api_data_source, ''))) = 'api'",
+                &[],
+            )?,
+        )
+    } else {
+        (RollupStats::default(), 0)
+    };
+    let (token_usage, token_usage_with_model, token_usage_estimated) = if has_token_usage {
+        (
+            stats("token_usage")?,
+            query_scalar_i64(
+                conn,
+                "SELECT COUNT(*) FROM token_usage \
+                 WHERE model_name IS NOT NULL AND TRIM(model_name) != ''",
+                &[],
+            )?,
+            query_scalar_i64(
+                conn,
+                "SELECT COUNT(*) FROM token_usage \
+                 WHERE LOWER(TRIM(COALESCE(data_source, ''))) = 'estimated'",
+                &[],
+            )?,
+        )
+    } else {
+        (RollupStats::default(), 0, 0)
+    };
+    let total_messages = query_scalar_i64(
+        conn,
+        "SELECT COUNT(*) FROM messages m JOIN conversations c ON c.id = m.conversation_id",
+        &[],
+    )?;
+    Ok(Some(UnrestrictedStatusCounts {
+        message_metrics,
+        api_messages,
+        token_usage,
+        token_usage_with_model,
+        token_usage_estimated,
+        total_messages,
+    }))
+}
+
 /// Run the analytics status query — returns table health, coverage, and drift.
 pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsResult<StatusResult> {
     const TABLE_MESSAGE_METRICS: &str = "message_metrics";
@@ -1211,23 +1363,27 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
             "no message-level timestamp column is available",
         ));
     }
-    let mm = query_table_stats_from_source(
-        conn,
-        TABLE_MESSAGE_METRICS,
-        &message_metrics_from_sql,
-        "mm.day_id",
-        None,
-        filter,
-        Some("mm.workspace_id"),
-        Some(normalized_analytics_agent_sql_expr("mm.agent_slug")),
-        message_metrics_source_sql,
-        Some(
-            message_metrics_time_sql
-                .as_deref()
-                .map(AnalyticsTimeColumn::TimestampMs)
-                .unwrap_or(AnalyticsTimeColumn::Day("mm.day_id")),
-        ),
-    )?;
+    let unrestricted = query_unrestricted_status_counts(conn, filter)?;
+    let mm = match &unrestricted {
+        Some(counts) => counts.message_metrics,
+        None => query_table_stats_from_source(
+            conn,
+            TABLE_MESSAGE_METRICS,
+            &message_metrics_from_sql,
+            "mm.day_id",
+            None,
+            filter,
+            Some("mm.workspace_id"),
+            Some(normalized_analytics_agent_sql_expr("mm.agent_slug")),
+            message_metrics_source_sql,
+            Some(
+                message_metrics_time_sql
+                    .as_deref()
+                    .map(AnalyticsTimeColumn::TimestampMs)
+                    .unwrap_or(AnalyticsTimeColumn::Day("mm.day_id")),
+            ),
+        )?,
+    };
     let uh = query_track_a_rollup_status_with_message_metrics_fallback(
         conn,
         TABLE_USAGE_HOURLY,
@@ -1252,30 +1408,40 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
             "no token-usage timestamp column is available",
         ));
     }
-    let tu = query_table_stats_from_source(
-        conn,
-        TABLE_TOKEN_USAGE,
-        &token_usage_from_sql,
-        "tu.day_id",
-        None,
-        filter,
-        Some("tu.workspace_id"),
-        token_usage_agent_sql,
-        token_usage_source_sql,
-        Some(
-            token_usage_time_sql
-                .as_deref()
-                .map(AnalyticsTimeColumn::TimestampMs)
-                .unwrap_or(AnalyticsTimeColumn::Day("tu.day_id")),
-        ),
-    )?;
+    let tu = match &unrestricted {
+        Some(counts) => counts.token_usage,
+        None => query_table_stats_from_source(
+            conn,
+            TABLE_TOKEN_USAGE,
+            &token_usage_from_sql,
+            "tu.day_id",
+            None,
+            filter,
+            Some("tu.workspace_id"),
+            token_usage_agent_sql,
+            token_usage_source_sql,
+            Some(
+                token_usage_time_sql
+                    .as_deref()
+                    .map(AnalyticsTimeColumn::TimestampMs)
+                    .unwrap_or(AnalyticsTimeColumn::Day("tu.day_id")),
+            ),
+        )?,
+    };
     let tds = query_token_daily_stats_status(conn, filter)?;
 
-    let total_messages = query_total_messages_filtered(conn, filter)?;
+    let total_messages = match &unrestricted {
+        Some(counts) => counts.total_messages,
+        None => query_total_messages_filtered(conn, filter)?,
+    };
 
     let api_coverage_pct = if has_message_metrics && mm.row_count > 0 {
-        let api_count =
-            query_message_metrics_filtered_count(conn, filter, Some("api_data_source = 'api'"))?;
+        let api_count = match &unrestricted {
+            Some(counts) => counts.api_messages,
+            None => {
+                query_message_metrics_filtered_count(conn, filter, Some("api_data_source = 'api'"))?
+            }
+        };
         super::derive::safe_pct(api_count, mm.row_count)
     } else if total_messages > 0 {
         crate::metric_integrity::MetricOutcome::RebuildRequired
@@ -1284,11 +1450,14 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
     };
 
     let model_coverage_pct = if has_token_usage && tu.row_count > 0 {
-        let with_model = query_token_usage_filtered_count(
-            conn,
-            filter,
-            Some("model_name IS NOT NULL AND TRIM(model_name) != ''"),
-        )?;
+        let with_model = match &unrestricted {
+            Some(counts) => counts.token_usage_with_model,
+            None => query_token_usage_filtered_count(
+                conn,
+                filter,
+                Some("model_name IS NOT NULL AND TRIM(model_name) != ''"),
+            )?,
+        };
         super::derive::safe_pct(with_model, tu.row_count)
     } else if total_messages > 0 {
         crate::metric_integrity::MetricOutcome::RebuildRequired
@@ -1297,8 +1466,12 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
     };
 
     let estimate_only_pct = if has_token_usage && tu.row_count > 0 {
-        let estimates =
-            query_token_usage_filtered_count(conn, filter, Some("data_source = 'estimated'"))?;
+        let estimates = match &unrestricted {
+            Some(counts) => counts.token_usage_estimated,
+            None => {
+                query_token_usage_filtered_count(conn, filter, Some("data_source = 'estimated'"))?
+            }
+        };
         super::derive::safe_pct(estimates, tu.row_count)
     } else if total_messages > 0 {
         crate::metric_integrity::MetricOutcome::RebuildRequired
@@ -5188,6 +5361,114 @@ mod tests {
         .unwrap();
 
         conn
+    }
+
+    /// GH #496: an unfiltered status reads plain tables (the join path held
+    /// ~3x the archive in RSS on FrankenSQLite 0.4.12), and each count equals
+    /// the general join path's on the same data. Planted negatives: a
+    /// token_usage table that may hold several rows per message, and any
+    /// filter, keep the general path.
+    #[test]
+    fn unfiltered_status_counts_match_the_general_join_path() {
+        let conn = setup_status_filter_db();
+        let filter = AnalyticsFilter::default();
+        assert!(
+            query_unrestricted_status_counts(&conn, &filter)
+                .unwrap()
+                .is_none(),
+            "token_usage without a unique message_id must be deduplicated by the general path"
+        );
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX token_usage_message_id ON token_usage(message_id);
+             UPDATE message_metrics SET api_data_source = ' API ' WHERE message_id = 12;
+             UPDATE token_usage SET data_source = ' Estimated' WHERE message_id = 21;
+             INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
+                 VALUES (13, 1, 2, 'user', NULL, 'a3');",
+        )
+        .unwrap();
+        let fast = query_unrestricted_status_counts(&conn, &filter)
+            .unwrap()
+            .expect("the current schema takes the plain-table path");
+
+        let (mm_from_sql, mm_source_sql) = message_metrics_from_sql_and_source_sql(&conn);
+        let general_mm = query_table_stats_from_source(
+            &conn,
+            "message_metrics",
+            &mm_from_sql,
+            "mm.day_id",
+            None,
+            &filter,
+            Some("mm.workspace_id"),
+            Some(normalized_analytics_agent_sql_expr("mm.agent_slug")),
+            mm_source_sql,
+            Some(AnalyticsTimeColumn::Day("mm.day_id")),
+        )
+        .unwrap();
+        let (tu_from_sql, tu_agent_sql, tu_source_sql) =
+            token_usage_from_sql_agent_and_source_sql(&conn);
+        let general_tu = query_table_stats_from_source(
+            &conn,
+            "token_usage",
+            &tu_from_sql,
+            "tu.day_id",
+            None,
+            &filter,
+            Some("tu.workspace_id"),
+            tu_agent_sql,
+            tu_source_sql,
+            Some(AnalyticsTimeColumn::Day("tu.day_id")),
+        )
+        .unwrap();
+        let stats = |s: RollupStats| (s.row_count, s.min_day, s.max_day);
+        assert_eq!(stats(fast.message_metrics), stats(general_mm));
+        assert_eq!(stats(fast.message_metrics), (3, Some(10), Some(11)));
+        assert_eq!(stats(fast.token_usage), stats(general_tu));
+        assert_eq!(stats(fast.token_usage), (3, Some(10), Some(11)));
+        assert_eq!(
+            fast.total_messages,
+            query_total_messages_filtered(&conn, &filter).unwrap()
+        );
+        assert_eq!(fast.total_messages, 4);
+        assert_eq!(
+            fast.api_messages,
+            query_message_metrics_filtered_count(&conn, &filter, Some("api_data_source = 'api'"))
+                .unwrap()
+        );
+        assert_eq!(fast.api_messages, 2, "' API ' normalizes to 'api'");
+        assert_eq!(
+            fast.token_usage_with_model,
+            query_token_usage_filtered_count(
+                &conn,
+                &filter,
+                Some("model_name IS NOT NULL AND TRIM(model_name) != ''"),
+            )
+            .unwrap()
+        );
+        assert_eq!(fast.token_usage_with_model, 2);
+        assert_eq!(
+            fast.token_usage_estimated,
+            query_token_usage_filtered_count(&conn, &filter, Some("data_source = 'estimated'"))
+                .unwrap()
+        );
+        assert_eq!(fast.token_usage_estimated, 1, "' Estimated' normalizes");
+
+        let status = query_status(&conn, &filter).unwrap();
+        assert_eq!(status.coverage.total_messages, 4);
+        assert_eq!(status.tables[0].table, "message_metrics");
+        assert_eq!(status.tables[0].row_count, 3);
+        assert_eq!(status.tables[3].table, "token_usage");
+        assert_eq!(status.tables[3].row_count, 3);
+
+        let agent_filter = AnalyticsFilter {
+            agents: vec!["codex".to_string()],
+            ..AnalyticsFilter::default()
+        };
+        assert!(
+            query_unrestricted_status_counts(&conn, &agent_filter)
+                .unwrap()
+                .is_none(),
+            "a filter needs the joins"
+        );
     }
 
     #[test]
