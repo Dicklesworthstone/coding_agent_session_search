@@ -52685,13 +52685,21 @@ fn doctor_raw_mirror_existing_evidence(
     }
 }
 
+/// Raw-mirror evidence for archive conversations, keyed by `(conversation_id,
+/// source path)`, and evidence by source key. A db link names a conversation
+/// id in the archive that wrote it; after that archive is replaced (doctor's
+/// reconstruct promotion numbers conversations anew), the same id can name a
+/// different source. So a link is evidence only for the conversation at the
+/// link's own source path, and a stale link falls through to the source-key
+/// lookup instead of comparing a source with another source's digest (zp0fp).
 fn doctor_raw_mirror_existing_evidence_maps(
     raw_mirror: &DoctorRawMirrorReport,
 ) -> (
-    HashMap<i64, DoctorRawMirrorExistingEvidence>,
+    HashMap<(i64, String), DoctorRawMirrorExistingEvidence>,
     HashMap<String, DoctorRawMirrorExistingEvidence>,
 ) {
-    let mut by_conversation_id: HashMap<i64, DoctorRawMirrorExistingEvidence> = HashMap::new();
+    let mut by_conversation_id: HashMap<(i64, String), DoctorRawMirrorExistingEvidence> =
+        HashMap::new();
     let mut by_source_key: HashMap<String, DoctorRawMirrorExistingEvidence> = HashMap::new();
 
     for manifest in raw_mirror
@@ -52702,8 +52710,15 @@ fn doctor_raw_mirror_existing_evidence_maps(
         let linked_evidence = doctor_raw_mirror_existing_evidence(manifest, true);
         for link in &manifest.db_links {
             if let Some(conversation_id) = link.conversation_id {
+                let linked_path = link
+                    .source_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .unwrap_or_else(|| manifest.original_path.trim())
+                    .to_string();
                 by_conversation_id
-                    .entry(conversation_id)
+                    .entry((conversation_id, linked_path))
                     .and_modify(|existing| {
                         if doctor_raw_mirror_evidence_is_newer(&linked_evidence, existing) {
                             *existing = linked_evidence.clone();
@@ -52844,7 +52859,7 @@ fn doctor_raw_mirror_backfill_live_source_changed(
 fn doctor_raw_mirror_backfill_candidate_receipt(
     data_dir: &Path,
     candidate: &DoctorRawMirrorBackfillCandidate,
-    by_conversation_id: &HashMap<i64, DoctorRawMirrorExistingEvidence>,
+    by_conversation_id: &HashMap<(i64, String), DoctorRawMirrorExistingEvidence>,
     by_source_key: &HashMap<String, DoctorRawMirrorExistingEvidence>,
     source_stat_cache: &mut HashMap<PathBuf, DoctorRawMirrorBackfillSourceStatSnapshot>,
     apply: bool,
@@ -52927,7 +52942,9 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
     receipt.source_stat_snapshot = Some(source_stat.clone());
     receipt.source_missing = !source_stat.exists;
 
-    if let Some(evidence) = by_conversation_id.get(&candidate.conversation_id) {
+    if let Some(evidence) =
+        by_conversation_id.get(&(candidate.conversation_id, source_path.clone()))
+    {
         doctor_raw_mirror_backfill_mark_existing_evidence(&mut receipt, evidence);
         receipt.raw_mirror_db_linked = true;
         receipt.parse_loss_unknown = false;
@@ -82282,7 +82299,7 @@ paths = ["~/.claude/projects"]
         let (by_conversation_id, by_source_key) = doctor_raw_mirror_existing_evidence_maps(&report);
         let expected_source_blake3 = blake3::hash(&second_bytes).to_hex().to_string();
         let linked = by_conversation_id
-            .get(&7)
+            .get(&(7, source_path.display().to_string()))
             .expect("newest conversation-linked evidence");
         assert_eq!(linked.source_content_blake3, expected_source_blake3);
         assert_ne!(
@@ -82371,6 +82388,84 @@ paths = ["~/.claude/projects"]
             &mut receipt,
             linked
         ));
+    }
+
+    /// zp0fp: a reconstruct promotion numbers conversations anew, so a raw
+    /// mirror manifest keeps a db link to its source's id in the replaced
+    /// archive while that id now names another source. Evidence is matched
+    /// by conversation id and source path, so neither source is compared with
+    /// the other's digest (`live_source_changed`), whichever was captured
+    /// last. Keyed by id alone, conversation 2 (source A) got source B's
+    /// newer evidence and was reported as a changed live source.
+    #[test]
+    fn raw_mirror_backfill_ignores_db_links_whose_id_now_names_another_source() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let capture = |name: &str, bytes: &[u8], old_id: i64, new_id: i64| {
+            let path = temp.path().join(name);
+            std::fs::write(&path, bytes).expect("write source");
+            let links = [old_id, new_id].map(|id| crate::raw_mirror::RawMirrorDbLink {
+                conversation_id: Some(id),
+                message_count: Some(1),
+                source_path: Some(path.display().to_string()),
+                started_at_ms: Some(1_733_000_000_000),
+            });
+            let record = crate::raw_mirror::capture_source_file_with_chunk_policy(
+                crate::raw_mirror::RawMirrorCaptureInput {
+                    data_dir: &data_dir,
+                    provider: "codex",
+                    source_id: "local",
+                    origin_kind: "local",
+                    origin_host: None,
+                    source_path: &path,
+                    db_links: &links,
+                },
+                1 << 20,
+                1 << 16,
+            )
+            .expect("capture source");
+            (path, record.manifest_id)
+        };
+        // Source A was conversation 1 in the replaced archive and is 2 now;
+        // source B was 2 and is 1. B is captured last, so it is the newer
+        // evidence for both ids.
+        let (path_a, manifest_a) = capture("a.jsonl", b"alpha source bytes", 1, 2);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let (path_b, manifest_b) = capture("b.jsonl", b"bravo source bytes", 2, 1);
+
+        let report = collect_doctor_raw_mirror_report_with_threshold(&data_dir, u64::MAX);
+        let (by_conversation_id, by_source_key) = doctor_raw_mirror_existing_evidence_maps(&report);
+        for (conversation_id, path, manifest_id) in
+            [(1, &path_b, &manifest_b), (2, &path_a, &manifest_a)]
+        {
+            let candidate = DoctorRawMirrorBackfillCandidate {
+                conversation_id,
+                provider: "codex".to_string(),
+                source_path: Some(path.display().to_string()),
+                source_id: "local".to_string(),
+                origin_host: None,
+                origin_kind: Some("local".to_string()),
+                started_at_ms: Some(1_733_000_000_000),
+                message_count: 1,
+            };
+            let receipt = doctor_raw_mirror_backfill_candidate_receipt(
+                &data_dir,
+                &candidate,
+                &by_conversation_id,
+                &by_source_key,
+                &mut HashMap::new(),
+                false,
+            );
+            assert_eq!(
+                receipt.action, "already_raw_source_captured",
+                "conversation {conversation_id}"
+            );
+            assert_eq!(
+                receipt.raw_mirror_manifest_id.as_deref(),
+                Some(manifest_id.as_str()),
+                "conversation {conversation_id}"
+            );
+        }
     }
 
     #[test]

@@ -5058,6 +5058,17 @@ fn doctor_fix_candidate_build_on_unreadable_archive_leaves_promotion_unblocked()
     let reindexed = run(&["index", "--json"]);
     assert!(reindexed.status.success(), "{reindexed:?}");
     assert_eq!(counts(run(&["stats", "--json"])), indexed_counts);
+
+    // The mirror's db links still carry the replaced archive's conversation
+    // ids, which the promoted archive reassigned; doctor must not read them as
+    // evidence that the untouched sources changed.
+    let rechecked = run(&["doctor", "check", "--json"]);
+    let rechecked: Value = serde_json::from_slice(&rechecked.stdout).expect("doctor check JSON");
+    assert_eq!(
+        rechecked["raw_mirror_backfill"]["changed_source_hash_count"], 0,
+        "{:#}",
+        rechecked["raw_mirror_backfill"]
+    );
 }
 
 #[test]
