@@ -13,19 +13,24 @@
  *   npx playwright test e2e/export/pages-pipeline-e2e.spec.ts
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import http from "http";
 import type { AddressInfo } from "net";
+import type { Page } from "@playwright/test";
 import path from "path";
-import { expect, test, waitForPageReady } from "../setup/test-utils";
+import { collectBrowserErrors, expect, test, waitForPageReady } from "../setup/test-utils";
 
 // Test artifact directory
 const ARTIFACT_DIR = path.join(process.cwd(), "test-results", "e2e", "pages-pipeline");
 
-// Get pages preview bundle path from environment or default
+// The site directory of the bundle global-setup generates (its
+// TEST_PAGES_PREVIEW_SITE_DIR is the bundle root, which holds `site/`).
+// Playwright runs from tests/, so a cwd-relative default never resolved.
 const PAGES_PREVIEW_DIR =
   process.env.TEST_PAGES_PREVIEW_DIR ||
-  path.join(process.cwd(), "tests", "e2e", "pages_preview", "bundle", "site");
+  (process.env.TEST_PAGES_PREVIEW_SITE_DIR
+    ? path.join(process.env.TEST_PAGES_PREVIEW_SITE_DIR, "site")
+    : path.join(process.cwd(), "e2e", "pages_preview", "bundle", "site"));
 
 test.describe("Pages Bundle - Static Files", () => {
   test.beforeAll(async () => {
@@ -98,7 +103,7 @@ test.describe("Pages Bundle - Browser Validation", () => {
       let filePath = path.join(PAGES_PREVIEW_DIR, req.url === "/" ? "index.html" : req.url!);
 
       // Handle directory paths
-      if (existsSync(filePath) && require("fs").statSync(filePath).isDirectory()) {
+      if (existsSync(filePath) && statSync(filePath).isDirectory()) {
         filePath = path.join(filePath, "index.html");
       }
 
@@ -275,31 +280,38 @@ test.describe("Pages Bundle - Browser Validation", () => {
     });
   });
 
-  test("OPFS (Origin Private File System) available", async ({ page }, testInfo) => {
+  test("OPFS (Origin Private File System) available", async ({ page, browserName }, testInfo) => {
     test.skip(!server, "Server not started - pages preview not found");
 
     await page.goto(baseURL, { waitUntil: "domcontentloaded" });
 
     await test.step("Check OPFS availability", async () => {
-      const opfsAvailable = await page.evaluate(async () => {
+      const opfs = await page.evaluate(async () => {
         try {
           const root = await navigator.storage.getDirectory();
-          return root !== null;
-        } catch {
-          return false;
+          return { available: root !== null, error: "" };
+        } catch (error) {
+          return { available: false, error: String(error) };
         }
       });
 
       console.log(
         JSON.stringify({
           event: "opfs_check",
-          available: opfsAvailable,
+          available: opfs.available,
+          error: opfs.error,
           ts: new Date().toISOString(),
         }),
       );
 
-      // OPFS should be available in modern browsers
-      expect(opfsAvailable).toBe(true);
+      // Playwright's WebKit contexts are ephemeral, and WebKit rejects
+      // getDirectory() there. The viewer treats OPFS as an optional cache
+      // (storage.js feature detection), so record the rejection instead.
+      if (browserName === "webkit" && !opfs.available) {
+        testInfo.annotations.push({ type: "opfs-unavailable", description: opfs.error });
+        test.skip(true, `WebKit rejected getDirectory(): ${opfs.error}`);
+      }
+      expect(opfs.available, opfs.error).toBe(true);
     });
   });
 
@@ -343,7 +355,7 @@ test.describe("Pages Bundle - Search Functionality", () => {
     server = http.createServer((req, res) => {
       let filePath = path.join(PAGES_PREVIEW_DIR, req.url === "/" ? "index.html" : req.url!);
 
-      if (existsSync(filePath) && require("fs").statSync(filePath).isDirectory()) {
+      if (existsSync(filePath) && statSync(filePath).isDirectory()) {
         filePath = path.join(filePath, "index.html");
       }
 
@@ -406,6 +418,77 @@ test.describe("Pages Bundle - Search Functionality", () => {
         }),
       );
     });
+  });
+});
+
+// Bead browser-e2e-lane-bnueb: each unlock path of a real bundle, served by the
+// `cass pages --preview` server global-setup starts. The recovery slot and the
+// revoked password come from `cass pages key add-recovery`, `add-password` and
+// `revoke`; global-setup checks that the revoked password opened its slot
+// before the revoke. Only a missing preview server skips these tests: a slot
+// that could not be prepared fails them with global-setup's reason.
+test.describe("Pages Bundle - Key Slots", () => {
+  const archivePassword = process.env.TEST_PAGES_PREVIEW_PASSWORD || "";
+  const recoveryKey = process.env.TEST_PAGES_PREVIEW_RECOVERY_KEY || "";
+  const revokedPassword = process.env.TEST_PAGES_PREVIEW_REVOKED_PASSWORD || "";
+  const slotError = process.env.TEST_PAGES_KEY_SLOT_ERROR || "no reason recorded";
+  const unlockTimeout = 60_000;
+  // Longer than the unlock wait, so a stalled unlock fails with its diagnosis.
+  test.describe.configure({ timeout: unlockTimeout + 30_000 });
+
+  /** Waits for the unlock outcome; a miss reports what the viewer showed and logged. */
+  async function expectOutcome(
+    page: Page,
+    selector: string,
+    errors: ReturnType<typeof collectBrowserErrors>,
+  ) {
+    try {
+      await expect(page.locator(selector)).toBeVisible({ timeout: unlockTimeout });
+    } catch (error) {
+      const authText = await page
+        .locator("#auth-screen")
+        .innerText({ timeout: 1_000 })
+        .catch(() => "");
+      throw new Error(
+        `${selector} never became visible: ${String(error).split("\n")[0]}\n` +
+          `auth screen: ${authText.replace(/\s+/g, " ").slice(0, 400)}\n` +
+          `page errors: ${JSON.stringify(errors.pageErrors)}\n` +
+          `console errors: ${JSON.stringify(errors.consoleErrors)}`,
+      );
+    }
+  }
+
+  test("unlocks with the archive password", async ({ page, previewUrl }) => {
+    test.skip(!previewUrl, "Pages preview server not available");
+    expect(archivePassword, "global-setup exported no archive password").not.toBe("");
+    const errors = collectBrowserErrors(page);
+    await page.goto(previewUrl, { waitUntil: "domcontentloaded" });
+    await page.locator("#password").fill(archivePassword);
+    await page.locator("#unlock-btn").click();
+    await expectOutcome(page, "#app-screen", errors);
+    await expect(page.locator("#auth-screen")).toBeHidden();
+  });
+
+  test("unlocks with the typed recovery key", async ({ page, previewUrl }) => {
+    test.skip(!previewUrl, "Pages preview server not available");
+    expect(recoveryKey, `recovery slot not prepared: ${slotError}`).not.toBe("");
+    const errors = collectBrowserErrors(page);
+    await page.goto(previewUrl, { waitUntil: "domcontentloaded" });
+    await page.locator("#recovery-key-btn").click();
+    await page.locator("#recovery-key-input").fill(recoveryKey);
+    await page.locator("#recovery-key-submit").click();
+    await expectOutcome(page, "#app-screen", errors);
+  });
+
+  test("refuses a revoked password", async ({ page, previewUrl }) => {
+    test.skip(!previewUrl, "Pages preview server not available");
+    expect(revokedPassword, `revoked slot not prepared: ${slotError}`).not.toBe("");
+    const errors = collectBrowserErrors(page);
+    await page.goto(previewUrl, { waitUntil: "domcontentloaded" });
+    await page.locator("#password").fill(revokedPassword);
+    await page.locator("#unlock-btn").click();
+    await expectOutcome(page, "#auth-error", errors);
+    await expect(page.locator("#app-screen")).toBeHidden();
   });
 });
 

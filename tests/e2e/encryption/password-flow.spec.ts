@@ -181,31 +181,32 @@ test.describe("Encrypted Export - Wrong Password", () => {
 });
 
 test.describe("Encrypted Export - Security", () => {
-  test("plaintext content is not visible in encrypted HTML", async ({
+  // 2l1b0.67 in a real browser: before unlock, neither the title nor the
+  // session metadata nor any message text is readable; after unlock the same
+  // conversation text appears, so the negative cannot pass on an empty page.
+  // The phrases come from the export's fixture (claude_code_auth_fix.jsonl):
+  // its first prompt, workspace path and git branch.
+  test("no plaintext title, metadata or messages before unlock", async ({
     page,
     encryptedExportPath,
+    password,
   }) => {
     test.skip(!encryptedExportPath, "Encrypted export path not available");
+    const secrets = ["JWT token refresh", "/home/dev/myapp", "fix/auth-refresh"];
 
-    // Get the raw HTML source before decryption
     await gotoFile(page, encryptedExportPath);
-    const html = await page.content();
-
-    // Encrypted content should contain base64/hex encrypted data
-    expect(html).toMatch(/ciphertext|encrypted|base64|iv|salt/i);
-
-    // Should not contain obvious plaintext message content
-    // (unless it's UI text like "Enter password")
-    const messagePhrases = ["authentication", "function main", "import React", "def __init__"];
-
-    for (const phrase of messagePhrases) {
-      // These should NOT appear in the HTML (they should be encrypted)
-      const containsPhrase = html.toLowerCase().includes(phrase.toLowerCase());
-      // Skip if it's a common word that might appear in UI
-      if (containsPhrase && phrase !== "authentication") {
-        // This is a potential security issue - plaintext visible
-        console.warn(`Potential plaintext leak: "${phrase}" found in encrypted HTML`);
-      }
+    expect(await page.title()).toBe("Encrypted conversation");
+    const sealed = await page.content();
+    for (const secret of secrets) {
+      expect(sealed, `"${secret}" is readable before unlock`).not.toContain(secret);
     }
+
+    const passwordInput = page.locator(
+      '#password-input, input[type="password"], [data-testid="password-input"]',
+    );
+    await passwordInput.first().fill(password);
+    await passwordInput.first().press("Enter");
+    await expect(page.locator(".message").first()).toBeVisible({ timeout: 10000 });
+    expect(await page.content()).toContain(secrets[0]);
   });
 });

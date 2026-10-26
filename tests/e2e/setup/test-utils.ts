@@ -316,7 +316,15 @@ export function collectBrowserErrors(page: Page): {
 export async function waitForPageReady(page: Page): Promise<void> {
   // For local file URLs, domcontentloaded is sufficient and more reliable
   await page.waitForLoadState("domcontentloaded");
-  // Stabilize animations/transitions to avoid flake from entrance effects
+  // Stabilize animations/transitions to avoid flake from entrance effects.
+  // The Pages viewer's CSP (style-src 'self') refuses injected inline styles,
+  // by design and under test, so there reduced-motion emulation stands in.
+  const cspMeta = await page.locator('meta[http-equiv="Content-Security-Policy" i]').count();
+  if (cspMeta > 0) {
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.waitForTimeout(150);
+    return;
+  }
   await page.addStyleTag({
     content: `
 *,

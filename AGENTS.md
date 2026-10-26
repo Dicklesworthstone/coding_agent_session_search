@@ -433,6 +433,8 @@ Running browser tests there:
 
 GitHub Actions is permanently off, so pushing a branch never runs them. Run browser specs on a dsr build host, one spec file at a time while debugging (`test.only()`), and name the host in the receipt.
 
+The lane is one command on that host: `scripts/browser_e2e_lane.sh --project chromium --project firefox --project webkit` builds the release `cass` and `cass-pages-perf-bundle`, regenerates the HTML exports and the Pages bundle (with password, recovery and revoked key slots) from that binary, runs the HTML-export, encryption, Pages and CDN-fallback specs, and writes `tests/e2e-lane-receipt.json` (host, commit, binary SHA-256, Playwright and browser versions, per-spec counts, each skip with its reason). A skipped test did not run; it is not a pass.
+
 ---
 
 ## Testing
