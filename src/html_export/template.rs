@@ -97,29 +97,53 @@ const PRISM_THEME_URL: &str =
     "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css";
 const PRISM_THEME_SRI: &str =
     "sha384-wFjoQjtV1y5jVHbt0p35Ui8aV8GVpEZkyF99OXWqP/eNJDU93D3Ugxkoyh6Y2I4A";
-const PRISM_CORE_URL: &str = "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js";
-const PRISM_CORE_SRI: &str =
-    "sha384-ZM8fDxYm+GXOWeJcxDetoRImNnEAS7XwVFH5kv0pT6RXNy92Nemw/Sj7NfciXpqg";
-const PRISM_RUST_URL: &str =
-    "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-rust.min.js";
-const PRISM_RUST_SRI: &str =
-    "sha384-JyDgFjMbyrE/TGiEUSXW3CLjQOySrsoiUNAlXTFdIsr/XUfaB7E+eYlR+tGQ9bCO";
-const PRISM_PYTHON_URL: &str =
-    "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-python.min.js";
-const PRISM_PYTHON_SRI: &str =
-    "sha384-WJdEkJKrbsqw0evQ4GB6mlsKe5cGTxBOw4KAEIa52ZLB7DDpliGkwdme/HMa5n1m";
-const PRISM_JS_URL: &str =
-    "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-javascript.min.js";
-const PRISM_JS_SRI: &str =
-    "sha384-D44bgYYKvaiDh4cOGlj1dbSDpSctn2FSUj118HZGmZEShZcO2v//Q5vvhNy206pp";
-const PRISM_TS_URL: &str =
-    "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-typescript.min.js";
-const PRISM_TS_SRI: &str =
-    "sha384-PeOqKNW/piETaCg8rqKFy+Pm6KEk7e36/5YZE5XO/OaFdO+/Aw3O8qZ9qDPKVUgx";
-const PRISM_BASH_URL: &str =
-    "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-bash.min.js";
-const PRISM_BASH_SRI: &str =
-    "sha384-9WmlN8ABpoFSSHvBGGjhvB3E/D8UkNB9HpLJjBQFC2VSQsM1odiQDv4NbEo+7l15";
+/// The Prism scripts and their SRI, in execution order (all `defer`, so they
+/// run in document order and a component never runs before what it extends).
+/// Each is a file shipped in the prismjs 1.29.0 npm package, so its bytes and
+/// hash never change. Never reference a name the package lacks, such as
+/// `prism.min.js`: jsDelivr minifies those on request, its output changed after
+/// the hash was pinned, and browsers then blocked the core on the stale SRI, so
+/// every export lost highlighting and raised one "Prism is not defined" page
+/// error per component (found by the browser lane, bead bnueb). core, markup,
+/// css and clike rebuild what `prism.js` bundles; javascript precedes typescript.
+const PRISM_SCRIPTS: [(&str, &str); 9] = [
+    (
+        "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js",
+        "sha384-MXybTpajaBV0AkcBaCPT4KIvo0FzoCiWXgcihYsw4FUkEz0Pv3JGV6tk2G8vJtDc",
+    ),
+    (
+        "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-markup.min.js",
+        "sha384-HkMr0bZB9kBW4iVtXn6nd35kO/L/dQtkkUBkL9swzTEDMdIe5ExJChVDSnC79aNA",
+    ),
+    (
+        "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-css.min.js",
+        "sha384-0mV13Neu0xhJFylI+HV43C+XiR13bGSeL7D0/7e6hK7sJgvyvK6HVjeQwmvXTstY",
+    ),
+    (
+        "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-clike.min.js",
+        "sha384-7LHwxHIDSHTBleLmgDWZbC/IMJsfYfFVOihKhvsrxYW4j47YQcRwZja4ToFE3bA8",
+    ),
+    (
+        "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-javascript.min.js",
+        "sha384-D44bgYYKvaiDh4cOGlj1dbSDpSctn2FSUj118HZGmZEShZcO2v//Q5vvhNy206pp",
+    ),
+    (
+        "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-typescript.min.js",
+        "sha384-PeOqKNW/piETaCg8rqKFy+Pm6KEk7e36/5YZE5XO/OaFdO+/Aw3O8qZ9qDPKVUgx",
+    ),
+    (
+        "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-rust.min.js",
+        "sha384-JyDgFjMbyrE/TGiEUSXW3CLjQOySrsoiUNAlXTFdIsr/XUfaB7E+eYlR+tGQ9bCO",
+    ),
+    (
+        "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-python.min.js",
+        "sha384-WJdEkJKrbsqw0evQ4GB6mlsKe5cGTxBOw4KAEIa52ZLB7DDpliGkwdme/HMa5n1m",
+    ),
+    (
+        "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-bash.min.js",
+        "sha384-9WmlN8ABpoFSSHvBGGjhvB3E/D8UkNB9HpLJjBQFC2VSQsM1odiQDv4NbEo+7l15",
+    ),
+];
 
 const PRINT_EXTRA_CSS: &str = r#"
 .print-only {
@@ -395,36 +419,11 @@ impl HtmlTemplate {
                     url = PRISM_THEME_URL,
                     sri = PRISM_THEME_SRI
                 ));
-                tags.push(format!(
-                    r#"<script src="{url}" integrity="{sri}" crossorigin="anonymous" defer onerror="document.documentElement.classList.add('no-prism')"></script>"#,
-                    url = PRISM_CORE_URL,
-                    sri = PRISM_CORE_SRI
-                ));
-                tags.push(format!(
-                    r#"<script src="{url}" integrity="{sri}" crossorigin="anonymous" defer onerror="document.documentElement.classList.add('no-prism')"></script>"#,
-                    url = PRISM_RUST_URL,
-                    sri = PRISM_RUST_SRI
-                ));
-                tags.push(format!(
-                    r#"<script src="{url}" integrity="{sri}" crossorigin="anonymous" defer onerror="document.documentElement.classList.add('no-prism')"></script>"#,
-                    url = PRISM_PYTHON_URL,
-                    sri = PRISM_PYTHON_SRI
-                ));
-                tags.push(format!(
-                    r#"<script src="{url}" integrity="{sri}" crossorigin="anonymous" defer onerror="document.documentElement.classList.add('no-prism')"></script>"#,
-                    url = PRISM_JS_URL,
-                    sri = PRISM_JS_SRI
-                ));
-                tags.push(format!(
-                    r#"<script src="{url}" integrity="{sri}" crossorigin="anonymous" defer onerror="document.documentElement.classList.add('no-prism')"></script>"#,
-                    url = PRISM_TS_URL,
-                    sri = PRISM_TS_SRI
-                ));
-                tags.push(format!(
-                    r#"<script src="{url}" integrity="{sri}" crossorigin="anonymous" defer onerror="document.documentElement.classList.add('no-prism')"></script>"#,
-                    url = PRISM_BASH_URL,
-                    sri = PRISM_BASH_SRI
-                ));
+                for (url, sri) in PRISM_SCRIPTS {
+                    tags.push(format!(
+                        r#"<script src="{url}" integrity="{sri}" crossorigin="anonymous" defer onerror="document.documentElement.classList.add('no-prism')"></script>"#
+                    ));
+                }
             }
 
             format!(
@@ -898,8 +897,20 @@ mod tests {
         // Note: Tailwind CDN removed - Tailwind v3+/v4 requires compilation.
         // Our inline critical CSS provides complete styling.
         assert!(!html.contains("tailwindcss"));
-        assert!(html.contains(PRISM_CORE_URL));
-        assert!(html.contains(PRISM_CORE_SRI));
+        let mut previous = 0;
+        for (url, sri) in PRISM_SCRIPTS {
+            let tag = format!(r#"<script src="{url}" integrity="{sri}""#);
+            let position = html
+                .find(&tag)
+                .unwrap_or_else(|| panic!("missing SRI-pinned script {url}"));
+            // Deferred scripts run in document order: a component must follow
+            // the core and the components it extends.
+            assert!(position >= previous, "{url} is out of load order");
+            previous = position;
+        }
+        // jsDelivr generates `prism.min.js` on request (the package has no such
+        // file), so its bytes drift and a pinned SRI goes stale.
+        assert!(!html.contains("prismjs@1.29.0/prism.min.js"));
         assert!(html.contains("document.documentElement.classList.add('no-prism')"));
     }
 
