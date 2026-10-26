@@ -47582,10 +47582,11 @@ fn doctor_recommended_action_for_reports(
     if initialized_action.is_some() {
         return initialized_action;
     }
-    if operation_state.active_doctor_repair
-        || operation_state.active_index_maintenance
-        || operation_state.mutation_blocked_reason.is_some()
-    {
+    // Active index maintenance and another process's doctor repair both set
+    // `mutation_blocked_reason`. An active repair with no blocker is this
+    // `doctor --fix` run holding its own lock, whose `next_action` only says
+    // mutation is allowed; it must not mask the step after this run (zp0fp).
+    if operation_state.mutation_blocked_reason.is_some() {
         return Some(operation_state.next_action.clone());
     }
     if coverage_risk.recommended_action != "none" {
@@ -47595,6 +47596,50 @@ fn doctor_recommended_action_for_reports(
         .iter()
         .find(|check| check.status != "pass" && check.recommended_action != "none")
         .map(|check| check.recommended_action.to_string())
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_recommended_action_defers_to_operation_state_only_when_mutation_is_blocked() {
+    let state = |blocked: Option<&str>| DoctorOperationStateReport {
+        schema_version: 1,
+        read_only_check_allowed: true,
+        mutating_doctor_allowed: blocked.is_none(),
+        active_index_maintenance: false,
+        active_rebuild: false,
+        active_watch: false,
+        active_doctor_repair: true,
+        owner_count: 1,
+        stale_owner_count: 0,
+        interrupted_state_count: 0,
+        mutation_blocked_reason: blocked.map(str::to_string),
+        owners: Vec::new(),
+        interrupted_states: Vec::new(),
+        next_action: "operation-state next action".to_string(),
+        notes: Vec::new(),
+    };
+    let risk = DoctorCoverageRiskSummary {
+        recommended_action: "coverage next step".to_string(),
+        ..DoctorCoverageRiskSummary::default()
+    };
+    // This `doctor --fix` run holds its own lock: the step after it wins.
+    assert_eq!(
+        doctor_recommended_action_for_reports(None, &state(None), &risk, &[]).as_deref(),
+        Some("coverage next step")
+    );
+    // Another doctor holds the lock: wait for it first.
+    assert_eq!(
+        doctor_recommended_action_for_reports(
+            None,
+            &state(Some(
+                "another cass doctor --fix owner holds the mutation lock"
+            )),
+            &risk,
+            &[],
+        )
+        .as_deref(),
+        Some("operation-state next action")
+    );
 }
 
 fn doctor_active_repair_report(operation_state: &DoctorOperationStateReport) -> serde_json::Value {
@@ -92159,6 +92204,88 @@ fn doctor_archive_wide_collectors_deferred_reason(
     ))
 }
 
+/// zp0fp: while archive-wide collectors are deferred, the recommended action
+/// names the command that moves recovery forward for the cause doctor
+/// observed. A staged reconstruct candidate goes to the repair dry-run, a
+/// buildable one to `doctor --fix`, a held archive waits, and a timed-out or
+/// size-deferred probe reruns with the setting that lets it finish.
+fn doctor_deferred_archive_recommended_action(
+    reason: &str,
+    candidate_staged: bool,
+    candidate_buildable: bool,
+    busy_or_locked: bool,
+    probe_timed_out: bool,
+    full_page_probe_deferred: bool,
+) -> String {
+    let next = if candidate_staged {
+        "An isolated reconstruct candidate is staged: review its promotion plan with 'cass doctor repair --dry-run --json', then run the apply command that plan prints."
+    } else if candidate_buildable {
+        "Run 'cass doctor --fix --json' to build an isolated reconstruct candidate from the checksum-verified raw mirror (the live archive is not changed), then review its promotion plan with 'cass doctor repair --dry-run --json'."
+    } else if busy_or_locked {
+        "Another process holds the archive (an index run, the daemon, or another doctor): wait for it to finish, then rerun 'cass doctor check --json'."
+    } else if probe_timed_out {
+        "Rerun 'cass doctor check --json' when the machine is idle, with a larger CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS."
+    } else if full_page_probe_deferred {
+        "Rerun 'cass doctor check --json' with CASS_DOCTOR_FULL_PAGE_INTEGRITY_PROBE=1 and a larger CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS."
+    } else {
+        "Run process-isolated archive coverage probes before archive repair."
+    };
+    format!("{reason}. {next}")
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_deferred_archive_recommended_action_names_the_next_command_for_each_cause() {
+    let reason =
+        "archive_wide_collectors_deferred: archive database open did not complete successfully";
+    let action = |staged, buildable, busy, timed_out, deferred| {
+        doctor_deferred_archive_recommended_action(
+            reason, staged, buildable, busy, timed_out, deferred,
+        )
+    };
+    assert!(action(false, false, false, false, false).starts_with(reason));
+    // A staged candidate outranks building another one, which outranks
+    // waiting on a holder; the cause-specific reruns come after both.
+    let staged = action(true, true, true, true, true);
+    assert!(
+        staged.contains("'cass doctor repair --dry-run --json'"),
+        "{staged}"
+    );
+    assert!(!staged.contains("'cass doctor --fix --json'"), "{staged}");
+    let buildable = action(false, true, true, true, true);
+    assert!(
+        buildable.contains("'cass doctor --fix --json'"),
+        "{buildable}"
+    );
+    assert!(
+        buildable.contains("'cass doctor repair --dry-run --json'"),
+        "{buildable}"
+    );
+    let busy = action(false, false, true, true, true);
+    assert!(busy.contains("holds the archive"), "{busy}");
+    assert!(busy.contains("'cass doctor check --json'"), "{busy}");
+    let timed_out = action(false, false, false, true, true);
+    assert!(
+        timed_out.contains("CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS"),
+        "{timed_out}"
+    );
+    assert!(
+        !timed_out.contains("CASS_DOCTOR_FULL_PAGE_INTEGRITY_PROBE"),
+        "{timed_out}"
+    );
+    let deferred = action(false, false, false, false, true);
+    assert!(
+        deferred.contains("CASS_DOCTOR_FULL_PAGE_INTEGRITY_PROBE=1"),
+        "{deferred}"
+    );
+    // With no repair authority and no transient cause there is no command to
+    // name yet; the previous guidance stays.
+    assert!(
+        action(false, false, false, false, false)
+            .ends_with("Run process-isolated archive coverage probes before archive repair.")
+    );
+}
+
 #[cfg(test)]
 #[test]
 fn doctor_franken_deep_integrity_size_gate_has_an_exact_boundary() {
@@ -93378,13 +93505,16 @@ pub(crate) fn run_doctor_impl(
             not_initialized,
             storage_integrity_failed,
         );
+    // Kept for the deferred-archive recommendation; the probe itself is
+    // consumed by the storage report below.
+    let storage_busy_or_locked = dedicated_storage_probe.busy_or_locked;
     let archive_wide_collectors_deferred_reason = doctor_archive_wide_collectors_deferred_reason(
         storage_integrity_skipped_reason.as_deref(),
         storage_probe_timed_out,
         storage_db_open_failed,
         storage_integrity_unverified,
         storage_integrity_failed,
-        dedicated_storage_probe.busy_or_locked,
+        storage_busy_or_locked,
     );
     let archive_wide_collectors_complete = archive_wide_collectors_deferred_reason.is_none();
 
@@ -94109,7 +94239,7 @@ pub(crate) fn run_doctor_impl(
             &sole_copy_warnings,
         )
     };
-    let coverage_risk = if let Some(reason) = recovery_evidence_deferred_reason.as_deref() {
+    let mut coverage_risk = if let Some(reason) = recovery_evidence_deferred_reason.as_deref() {
         let mut risk = doctor_fast_coverage_risk_unchecked(db_path.exists());
         risk.recommended_action = format!(
             "{reason}. Run process-isolated archive coverage probes before archive repair."
@@ -94329,21 +94459,32 @@ pub(crate) fn run_doctor_impl(
             false,
         )
     };
+    let candidate_buildable = candidate_staging.total_candidate_count == 0
+        && candidate_repair_authority_complete
+        && doctor_candidate_build_should_run(
+            !fix && operation_state.mutating_doctor_allowed,
+            archive_queryable_for_non_destructive_derived_rebuild,
+            needs_rebuild,
+            &coverage_risk,
+            &source_authority,
+        );
     checks.push(Check {
         name: "candidate_staging".to_string(),
         status: candidate_check_status.to_string(),
         message: candidate_check_message,
-        fix_available: candidate_staging.total_candidate_count == 0
-            && candidate_repair_authority_complete
-            && doctor_candidate_build_should_run(
-                !fix && operation_state.mutating_doctor_allowed,
-                archive_queryable_for_non_destructive_derived_rebuild,
-                needs_rebuild,
-                &coverage_risk,
-                &source_authority,
-            ),
+        fix_available: candidate_buildable,
         fix_applied: candidate_fix_applied,
     });
+    if let Some(reason) = recovery_evidence_deferred_reason.as_deref() {
+        coverage_risk.recommended_action = doctor_deferred_archive_recommended_action(
+            reason,
+            candidate_repair_authority_complete && candidate_staging.completed_candidate_count > 0,
+            candidate_buildable,
+            storage_busy_or_locked,
+            storage_probe_timed_out,
+            storage_integrity_skipped_reason.is_some(),
+        );
+    }
     if let Some(build) = candidate_staging.latest_build.as_ref()
         && !build.coverage_gate.promote_allowed
     {

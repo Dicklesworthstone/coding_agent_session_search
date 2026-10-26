@@ -4907,6 +4907,7 @@ fn doctor_fix_refuses_repeated_repair_when_failure_marker_exists() {
 /// without the repeated-repair override restores a readable, searchable
 /// archive. Planted negative: before the fix, `doctor --fix` returned
 /// `verification-failed` and the plan was blocked by `marker-present`.
+/// Each step's `recommended_action` names the next command (zp0fp C).
 #[test]
 fn doctor_fix_candidate_build_on_unreadable_archive_leaves_promotion_unblocked() {
     let test_home = tempfile::tempdir().expect("tempdir");
@@ -4937,8 +4938,36 @@ fn doctor_fix_candidate_build_on_unreadable_archive_leaves_promotion_unblocked()
     damaged[..100].fill(0);
     fs::write(&db_path, &damaged).expect("damage archive header");
 
+    // The read-only check names the step that builds the candidate (it used
+    // to say only "Run process-isolated archive coverage probes").
+    let checked = run(&["doctor", "check", "--json"]);
+    let checked_payload: Value =
+        serde_json::from_slice(&checked.stdout).expect("doctor check JSON");
+    let check_action = checked_payload["recommended_action"]
+        .as_str()
+        .expect("recommended_action");
+    assert!(
+        check_action.contains("'cass doctor --fix --json'"),
+        "{checked_payload:#}"
+    );
+    assert!(
+        !check_action.contains("process-isolated"),
+        "{checked_payload:#}"
+    );
+
     let fixed = run(&["doctor", "--json", "--fix"]);
     let fixed_payload: Value = serde_json::from_slice(&fixed.stdout).expect("doctor --fix JSON");
+    let fix_action = fixed_payload["recommended_action"]
+        .as_str()
+        .expect("recommended_action");
+    assert!(
+        fix_action.contains("'cass doctor repair --dry-run --json'"),
+        "the staged candidate's next step is its promotion plan: {fixed_payload:#}"
+    );
+    assert!(
+        !fix_action.contains("process-isolated"),
+        "{fixed_payload:#}"
+    );
     assert!(
         fixed_payload["auto_fix_actions"]
             .as_array()
