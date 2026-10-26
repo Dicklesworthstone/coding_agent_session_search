@@ -17213,18 +17213,17 @@ fn run_index_with_storage_ownership(
     // below its explicit physical bundle-size ceiling also run the stronger
     // real-column projections. A busy or missing DB never trips it.
     // CASS_INDEX_ALLOW_MALFORMED_DB=1 bypasses for emergency flows that
-    // knowingly operate on a damaged archive.
+    // knowingly operate on a damaged archive. The refusal is the shared
+    // unhealthy-archive one (zp0fp, GH #374): typed as data corruption, not
+    // retryable, and routed to the doctor recovery that can rebuild from a
+    // verified raw mirror, rather than to an external sqlite3 '.recover'.
     if !dotenvy::var("CASS_INDEX_ALLOW_MALFORMED_DB").is_ok_and(|v| v == "1")
         && let Some(detail) =
             crate::bounded_canonical_db_corruption_probe(&opts.db_path, "index-preflight")
     {
-        return Err(anyhow::anyhow!(
-            "refusing to index: the canonical archive at {} is malformed ({detail}). \
-             Rebuilding on top of a corrupt database destroys recoverable data. \
-             Run 'cass doctor check --json', recover the database first \
-             (sqlite3 <db> '.recover'), or set CASS_INDEX_ALLOW_MALFORMED_DB=1 \
-             to proceed anyway",
-            opts.db_path.display()
+        return Err(canonical_archive_unhealthy_for_index_error(
+            &opts.db_path,
+            &format!("the archive is malformed ({detail})"),
         ));
     }
     // GH#324: reclaim staging debris stranded by previous hard-crashed runs

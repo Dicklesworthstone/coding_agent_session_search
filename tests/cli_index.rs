@@ -1062,6 +1062,71 @@ fn index_full_rebuilds() {
     cmd2.assert().success();
 }
 
+/// zp0fp (GH #374): `index --full` over an archive whose SQLite header is
+/// destroyed refuses as data corruption (exit 5, kind `storage`, not
+/// retryable), routes to the doctor recovery that can rebuild from a verified
+/// raw mirror instead of an external `sqlite3 '.recover'`, and leaves the
+/// archive's bytes untouched. Before: exit 9, kind `index`, retryable, and a
+/// suggestion to bypass the guard.
+#[test]
+fn index_refuses_a_malformed_archive_with_the_doctor_recovery_route() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    base_cmd(tmp.path())
+        .args(["index", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let db_path = data_dir.join("agent_search.db");
+    let mut damaged = fs::read(&db_path).unwrap();
+    damaged[..100].fill(0);
+    fs::write(&db_path, &damaged).unwrap();
+
+    let output = base_cmd(tmp.path())
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5), "{output:?}");
+    // A failed `index --json` run reports through its own result payload
+    // (`success: false` with top-level `kind`/`retryable` and the message in
+    // `error`); failures before the run use the `{"error": {...}}` envelope.
+    let error = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .find_map(|payload| match &payload["error"] {
+            serde_json::Value::Object(_) => Some(payload["error"].clone()),
+            serde_json::Value::String(message) if payload["kind"].is_string() => {
+                Some(serde_json::json!({
+                    "kind": payload["kind"],
+                    "retryable": payload["retryable"],
+                    "message": message,
+                }))
+            }
+            _ => None,
+        })
+        .expect("a JSON error report");
+    assert_eq!(error["kind"], "storage", "{error}");
+    assert_eq!(error["retryable"], false, "{error}");
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("malformed"), "{message}");
+    assert!(message.contains("cass doctor --fix --json"), "{message}");
+    assert!(
+        message.contains("cass doctor repair --dry-run --json"),
+        "{message}"
+    );
+    assert!(!message.contains(".recover'"), "{message}");
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        damaged,
+        "the refusal must leave the archive untouched"
+    );
+}
+
 #[test]
 fn index_watch_once_triggers() {
     let tmp = TempDir::new().unwrap();
