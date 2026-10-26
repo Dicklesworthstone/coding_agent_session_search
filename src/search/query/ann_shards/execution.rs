@@ -432,6 +432,10 @@ impl SemanticAnnShardSet {
         };
         let mut best_by_message = HashMap::new();
         let mut has_more_candidates = false;
+        // Exact shards and retained WAL deltas are scored with the exact FSVI
+        // kernel, and every hit of a message competes for its best score. When
+        // either is present, native hits are rescored with the same kernel.
+        let native_scores_compete_with_exact = !self.exact_shards.is_empty() || !overlay.is_empty();
         for (&ordinal, graph) in self.native_ordinals.iter().zip(&self.graphs) {
             let candidate = candidate_limit.min(graph.len());
             let ef = FS_HNSW_DEFAULT_EF_SEARCH.max(candidate);
@@ -459,7 +463,7 @@ impl SemanticAnnShardSet {
                     continue;
                 }
                 if filter.is_none_or(|filter| filter.matches(&hit.doc_id, None)) {
-                    if self.exact_shards.is_empty() {
+                    if !native_scores_compete_with_exact {
                         SearchClient::record_fs_semantic_hit(&mut best_by_message, hit);
                     } else {
                         // Distance-to-score restoration can differ by an ULP

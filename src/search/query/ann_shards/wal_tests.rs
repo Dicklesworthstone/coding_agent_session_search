@@ -353,6 +353,33 @@ fn wal_shadowing_is_local_to_its_retained_source_shard() {
 }
 
 #[test]
+fn native_scores_use_the_exact_kernel_when_a_wal_delta_joins_the_merge() {
+    // An append-only WAL tombstones nothing, so the graph stays native. Its
+    // delta is scored with the exact kernel, so the native winners must be
+    // too: HNSW restores 0.8 here one ULP low.
+    let temp = tempfile::tempdir().unwrap();
+    let ctx = context(vec![shard(
+        temp.path(),
+        "append-only",
+        &[(doc(1, 3), [0.8, 0.6]), (doc(2, 3), [0.6, 0.8])],
+        &[(doc(3, 3), [0.0, 1.0])],
+    )]);
+    let set = SemanticAnnShardSet::open(Arc::clone(&ctx.artifacts)).unwrap();
+    let (hits, _, stats) = set
+        .search_with_exact_fallback(&ctx, &[1.0, 0.0], 2, None)
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(hits[0].score.to_bits(), 0.8_f32.to_bits());
+    assert_eq!(hits[1].score.to_bits(), 0.6_f32.to_bits());
+    let stats = stats.unwrap();
+    assert!(stats.exact_fallback.is_none());
+    assert_eq!(stats.candidate_rescore.unwrap().candidates, 2);
+}
+
+#[test]
 fn wal_chunk_replacement_keeps_unmodified_chunks_of_the_same_message() {
     let temp = tempfile::tempdir().unwrap();
     let other_chunk = SemanticDocId {
