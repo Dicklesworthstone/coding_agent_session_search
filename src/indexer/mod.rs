@@ -33945,8 +33945,9 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
 /// This adds the `cass.origin` field to the conversation's metadata JSON
 /// so that persistence can extract and store the source_id.
 ///
-/// Part of P2.2 - provenance injection.
-fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
+/// Part of P2.2 - provenance injection. Doctor's raw-mirror reconstruct
+/// stamps re-parsed sources the same way (zp0fp).
+pub(crate) fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
     // Ensure metadata is an object
     if !conv.metadata.is_object() {
         conv.metadata = serde_json::json!({});

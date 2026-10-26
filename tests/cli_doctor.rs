@@ -4932,6 +4932,11 @@ fn doctor_fix_candidate_build_on_unreadable_archive_leaves_promotion_unblocked()
     };
     let indexed = run(&["index", "--full", "--json"]);
     assert!(indexed.status.success(), "{indexed:?}");
+    let counts = |output: std::process::Output| {
+        let stats: Value = serde_json::from_slice(&output.stdout).expect("stats JSON");
+        (stats["conversations"].clone(), stats["messages"].clone())
+    };
+    let indexed_counts = counts(run(&["stats", "--json"]));
 
     let db_path = data_dir.join("agent_search.db");
     let mut damaged = fs::read(&db_path).expect("read archive");
@@ -5031,6 +5036,28 @@ fn doctor_fix_candidate_build_on_unreadable_archive_leaves_promotion_unblocked()
         !hits["hits"].as_array().expect("hits").is_empty(),
         "the promoted archive answers searches: {hits:#}"
     );
+
+    // zp0fp D: the candidate was rebuilt by the Codex connector from the
+    // mirrored sources, so the promoted archive holds exactly what indexing
+    // them produced, and the next index of the untouched sources updates it
+    // in place. The line salvage stored every JSONL record (session_meta
+    // included) as a message under a doctor-made identity and a "Recovered"
+    // title, so this re-index added a second copy of every session.
+    assert_eq!(counts(run(&["stats", "--json"])), indexed_counts);
+    assert!(
+        hits["hits"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .all(|hit| !hit["title"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("Recovered")),
+        "{hits:#}"
+    );
+    let reindexed = run(&["index", "--json"]);
+    assert!(reindexed.status.success(), "{reindexed:?}");
+    assert_eq!(counts(run(&["stats", "--json"])), indexed_counts);
 }
 
 #[test]

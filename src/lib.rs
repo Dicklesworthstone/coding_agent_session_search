@@ -55336,6 +55336,163 @@ fn doctor_candidate_conversation_from_raw_mirror(
     }
 }
 
+/// Re-reads verified raw-mirror sources through their providers' connectors
+/// for one candidate build (zp0fp). It caches each provider's connector and
+/// detected roots and owns the scratch tree the source copies are parsed
+/// from; the tree is removed when the build drops it.
+struct DoctorConnectorReparse {
+    scratch: tempfile::TempDir,
+    providers: HashMap<String, Option<DoctorReparseConnector>>,
+}
+
+/// A provider's connector and the roots it detects on this machine.
+type DoctorReparseConnector = (Box<dyn crate::connectors::Connector + Send>, Vec<PathBuf>);
+
+impl DoctorConnectorReparse {
+    fn new(candidate_dir: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            scratch: tempfile::Builder::new()
+                .prefix(".connector-reparse-")
+                .tempdir_in(candidate_dir)?,
+            providers: HashMap::new(),
+        })
+    }
+
+    /// The source as the indexer would read it at its original path: the
+    /// verified bytes are written under a scratch root at the same path
+    /// relative to the root the provider's connector detects, scanned by
+    /// that connector, and given back their original source path and local
+    /// provenance. The rows then carry the connector's agent, conversation
+    /// identity (`external_id`), titles and roles, so the next `cass index`
+    /// of the untouched source updates them instead of adding a second copy
+    /// of every session. `Err` names why a source does not qualify (not
+    /// local, no registered connector, outside every detected root, or not
+    /// parseable); the caller keeps the lossless line salvage for it.
+    fn conversations(
+        &mut self,
+        manifest: &DoctorRawMirrorManifestReport,
+        bytes: &[u8],
+    ) -> std::result::Result<Vec<crate::connectors::NormalizedConversation>, String> {
+        if manifest.origin_kind != "local" {
+            return Err(format!("its origin is {}, not local", manifest.origin_kind));
+        }
+        let provider = match doctor_normalized_provider_slug(&manifest.provider).as_str() {
+            // The connector registry keys Claude Code as `claude`.
+            "claude_code" => "claude".to_string(),
+            other => other.to_string(),
+        };
+        let entry = self.providers.entry(provider.clone()).or_insert_with(|| {
+            crate::connectors::get_connector_factories()
+                .into_iter()
+                .find(|(name, _)| *name == provider)
+                .map(|(_, factory)| {
+                    let connector = factory();
+                    let roots = connector.detect().root_paths;
+                    (connector, roots)
+                })
+        });
+        let Some((connector, roots)) = entry.as_ref() else {
+            return Err(format!("no connector is registered as {provider}"));
+        };
+        let original = Path::new(&manifest.original_path);
+        let Some((original_root, relative)) = roots
+            .iter()
+            .filter_map(|root| {
+                original
+                    .strip_prefix(root)
+                    .ok()
+                    .filter(|relative| relative.components().next().is_some())
+                    .map(|relative| (root, relative))
+            })
+            .min_by_key(|(_, relative)| relative.components().count())
+        else {
+            return Err(format!(
+                "it is outside every root the {provider} connector detects"
+            ));
+        };
+        let staged_dir = self.scratch.path().join(&manifest.manifest_id);
+        let staged_root = staged_dir.join("root");
+        let staged = staged_root.join(relative);
+        let parent = staged
+            .parent()
+            .ok_or_else(|| "its staged copy has no parent directory".to_string())?;
+        std::fs::create_dir_all(parent)
+            .and_then(|()| std::fs::write(&staged, bytes))
+            .map_err(|err| format!("staging a copy for its connector failed: {err}"))?;
+        let ctx = crate::connectors::ScanContext::with_roots(
+            staged_dir.join("data"),
+            vec![crate::connectors::ScanRoot::local(staged_root.clone())],
+            None,
+        );
+        let mut conversations = connector
+            .scan(&ctx)
+            .map_err(|err| format!("the {provider} connector could not parse it: {err:#}"))?;
+        if conversations.is_empty() {
+            return Err(format!(
+                "the {provider} connector found no conversation in it"
+            ));
+        }
+        let canonical_root = staged_root.canonicalize().ok();
+        for conversation in &mut conversations {
+            let relative = conversation
+                .source_path
+                .strip_prefix(&staged_root)
+                .ok()
+                .or_else(|| {
+                    canonical_root
+                        .as_deref()
+                        .and_then(|root| conversation.source_path.strip_prefix(root).ok())
+                })
+                .map(Path::to_path_buf)
+                .ok_or_else(|| {
+                    format!(
+                        "the {provider} connector returned a conversation from outside the staged source"
+                    )
+                })?;
+            conversation.source_path = original_root.join(relative);
+            crate::indexer::inject_provenance(conversation, &crate::connectors::Origin::local());
+        }
+        Ok(conversations)
+    }
+}
+
+/// zp0fp: a source is re-read by its connector only when it is local, its
+/// provider has a registered connector, and it lies under a root that
+/// connector detects. Otherwise the reason comes back and the build keeps the
+/// line salvage for it.
+#[cfg(test)]
+#[test]
+fn doctor_connector_reparse_reports_why_a_source_keeps_the_line_salvage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut reparse = DoctorConnectorReparse::new(dir.path()).expect("scratch directory");
+    let mut manifest = doctor_raw_mirror_invalid_manifest_report(
+        dir.path(),
+        &dir.path().join("manifest.json"),
+        String::new(),
+    );
+    manifest.manifest_id = "zp0fp-manifest".to_string();
+    manifest.provider = "codex".to_string();
+    manifest.origin_kind = "ssh".to_string();
+    manifest.original_path = "/zp0fp-nowhere/sessions/rollout-1.jsonl".to_string();
+    let remote = reparse.conversations(&manifest, b"{}").unwrap_err();
+    assert!(remote.contains("its origin is ssh, not local"), "{remote}");
+
+    manifest.origin_kind = "local".to_string();
+    manifest.provider = "zp0fp-unknown-agent".to_string();
+    let unknown = reparse.conversations(&manifest, b"{}").unwrap_err();
+    assert!(
+        unknown.contains("no connector is registered as zp0fp_unknown_agent"),
+        "{unknown}"
+    );
+
+    manifest.provider = "codex".to_string();
+    let outside = reparse.conversations(&manifest, b"{}").unwrap_err();
+    assert!(
+        outside.contains("outside every root the codex connector detects"),
+        "{outside}"
+    );
+}
+
 fn doctor_candidate_copy_raw_mirror_evidence_to_staging(
     context: &DoctorCandidateCopyContext<'_>,
     manifest: &DoctorRawMirrorManifestReport,
@@ -55472,6 +55629,8 @@ fn doctor_candidate_reconstruct_archive_from_raw_mirror(
     let mut inserted_messages = 0usize;
     let mut evidence_sources = Vec::new();
     let mut receipts = Vec::new();
+    let mut reparse = DoctorConnectorReparse::new(copy_context.candidate_dir)
+        .map_err(|err| format!("its connector scratch directory could not be created: {err}"));
 
     let mut verified_manifests = raw_mirror
         .manifests
@@ -55513,47 +55672,108 @@ fn doctor_candidate_reconstruct_archive_from_raw_mirror(
                 continue;
             }
         };
-        let conversation =
-            doctor_candidate_conversation_from_raw_mirror(manifest, &bytes, parse_errors);
-        let agent = crate::model::types::Agent {
-            id: None,
-            slug: conversation.agent_slug.clone(),
-            name: conversation.agent_slug.clone(),
-            version: Some("doctor-reconstruct".to_string()),
-            kind: crate::model::types::AgentKind::Cli,
+        let reparsed = match reparse.as_mut() {
+            Ok(reparse) => reparse.conversations(manifest, &bytes),
+            Err(reason) => Err(reason.clone()),
         };
-        let agent_id = storage.ensure_agent(&agent).map_err(|err| {
-            format!(
-                "failed to ensure reconstructed candidate agent {}: {err}",
-                agent.slug
-            )
-        })?;
-        let message_count = conversation.messages.len();
-        let outcome = storage
-            .insert_conversation_tree(agent_id, None, &conversation)
-            .map_err(|err| {
+        // The connector path maps with the indexer's own transform, so the
+        // candidate also gets the indexer's secret redaction.
+        let (conversations, method) = match reparsed {
+            Ok(normalized) => {
+                let mapped = crate::indexer::persist::map_batch_to_internal(
+                    &normalized,
+                    crate::indexer::persist::PersistHeartbeat::NONE,
+                );
+                let workspaces = normalized
+                    .into_iter()
+                    .map(|conversation| conversation.workspace);
+                (
+                    mapped.into_iter().zip(workspaces).collect::<Vec<_>>(),
+                    "connector".to_string(),
+                )
+            }
+            Err(reason) => (
+                vec![(
+                    doctor_candidate_conversation_from_raw_mirror(manifest, &bytes, parse_errors),
+                    None,
+                )],
+                format!("line_salvage ({reason})"),
+            ),
+        };
+        let reparsed = method == "connector";
+        let mut manifest_conversations_inserted = 0usize;
+        let mut manifest_messages = 0usize;
+        let mut last_conversation_id = None;
+        for (mut conversation, workspace) in conversations {
+            if reparsed
+                && let Some(cass) = conversation
+                    .metadata_json
+                    .as_object_mut()
+                    .and_then(|metadata| metadata.get_mut("cass"))
+                    .and_then(serde_json::Value::as_object_mut)
+            {
+                cass.insert(
+                    "doctor_reconstruct".to_string(),
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "source": "verified_raw_mirror",
+                        "method": "connector",
+                        "manifest_id": manifest.manifest_id,
+                        "blob_blake3": manifest.blob_blake3,
+                    }),
+                );
+            }
+            let agent = crate::model::types::Agent {
+                id: None,
+                slug: conversation.agent_slug.clone(),
+                name: conversation.agent_slug.clone(),
+                version: (!reparsed).then(|| "doctor-reconstruct".to_string()),
+                kind: crate::model::types::AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent).map_err(|err| {
                 format!(
-                    "failed to insert raw mirror manifest {} into candidate archive: {err}",
-                    manifest.manifest_id
+                    "failed to ensure reconstructed candidate agent {}: {err}",
+                    agent.slug
                 )
             })?;
-        if !outcome.conversation_inserted && outcome.inserted_indices.is_empty() {
-            seen.insert(key);
+            let workspace_id = workspace
+                .as_deref()
+                .map(|workspace| storage.ensure_workspace(workspace, None))
+                .transpose()
+                .map_err(|err| {
+                    format!("failed to ensure reconstructed candidate workspace: {err}")
+                })?;
+            let message_count = conversation.messages.len();
+            let outcome = storage
+                .insert_conversation_tree(agent_id, workspace_id, &conversation)
+                .map_err(|err| {
+                    format!(
+                        "failed to insert raw mirror manifest {} into candidate archive: {err}",
+                        manifest.manifest_id
+                    )
+                })?;
+            last_conversation_id = Some(outcome.conversation_id);
+            if outcome.conversation_inserted || !outcome.inserted_indices.is_empty() {
+                manifest_conversations_inserted += usize::from(outcome.conversation_inserted);
+                manifest_messages += message_count;
+            }
+        }
+        seen.insert(key);
+        if manifest_conversations_inserted == 0 && manifest_messages == 0 {
             skipped_records.push(serde_json::json!({
                 "manifest_id": manifest.manifest_id,
                 "status": "skipped",
                 "reason": "candidate_storage_reported_duplicate_conversation",
-                "candidate_conversation_id": outcome.conversation_id,
+                "candidate_conversation_id": last_conversation_id,
                 "redacted_manifest_path": manifest.redacted_manifest_path,
                 "raw_content_included": false
             }));
             continue;
         }
-        seen.insert(key);
-        inserted_conversations += usize::from(outcome.conversation_inserted);
-        inserted_messages += message_count;
+        inserted_conversations += manifest_conversations_inserted;
+        inserted_messages += manifest_messages;
         evidence_sources.push(format!(
-            "verified_raw_mirror:manifest_id={}:messages={message_count}:blob={}",
+            "verified_raw_mirror:manifest_id={}:messages={manifest_messages}:blob={}:method={method}",
             manifest.manifest_id, manifest.blob_blake3
         ));
         receipts.extend(doctor_candidate_copy_raw_mirror_evidence_to_staging(
