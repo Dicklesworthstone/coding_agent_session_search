@@ -117,9 +117,13 @@ fn select(
     plan: &SemanticBackfillStoragePlan,
     caps: SemanticCheckpointCaps,
 ) -> Result<(ReconcileSelection, ReplayProof)> {
+    let database_path = storage.database_path()?;
     cache.select(
         indexer,
         storage,
+        database_path
+            .parent()
+            .context("fixture archive has no parent directory")?,
         plan,
         existing,
         caps,
@@ -686,7 +690,8 @@ fn replay_cache_live_backfill_converges_with_identical_published_fsvi_coverage()
         .collect();
     assert_eq!(actual, expected);
     assert_eq!(actual.len(), 4);
-    // A fresh invocation has no hidden global cache or disk authority.
+    // A fresh indexer has no hidden global memory slot. Any reuse must load
+    // the bounded disk inventory and revalidate it against the open archive.
     assert!(
         SemanticIndexer::new("hash", None)?
             .replay_cache
@@ -754,5 +759,206 @@ fn replay_cache_records_same_invocation_uncached_and_cached_work() -> Result<()>
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn replay_cache_fresh_indexer_reuses_disk_inventory_without_rewriting_it() -> Result<()> {
+    let (dir, storage) = fixture(&["first message", "second message", "third message"])?;
+    let plan = plan(1);
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let first_cache = cache(MAX_RETAINED_BYTES);
+    let (first, _) = select(
+        &first_cache,
+        &indexer,
+        &storage,
+        &HashSet::new(),
+        &plan,
+        SemanticCheckpointCaps::unlimited(),
+    )?;
+    assert_eq!(first.replayed_conversations, 3);
+    let path = persistent_path(dir.path(), plan.tier);
+    let stamp = backfill_file_stamp(&path)
+        .flatten()
+        .context("persisted inventory")?;
+    drop(first_cache);
+    drop(indexer);
+
+    let fresh_indexer = SemanticIndexer::new("hash", None)?;
+    let fresh_cache = cache(MAX_RETAINED_BYTES);
+    let (next, proof) = select(
+        &fresh_cache,
+        &fresh_indexer,
+        &storage,
+        &first.selected_ids,
+        &plan,
+        SemanticCheckpointCaps::unlimited(),
+    )?;
+    let (expected, _) = select(
+        &cache_disabled(),
+        &fresh_indexer,
+        &storage,
+        &first.selected_ids,
+        &plan,
+        SemanticCheckpointCaps::unlimited(),
+    )?;
+    assert_eq!(next.replayed_conversations, 0);
+    assert_eq!(next.loaded_selected_conversations, 1);
+    assert_eq!(signature(&next), signature(&expected));
+    assert_eq!(next.current_ids, expected.current_ids);
+    assert_eq!(next.inputs[0].content, "second message");
+    proof.verify(&storage)?;
+    assert_eq!(backfill_file_stamp(&path).flatten(), Some(stamp));
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn replay_cache_persisted_inventory_rejects_edits_deletions_and_producer_changes() -> Result<()> {
+    let (_dir, storage) = fixture(&["old content", "deleted content", "retained content"])?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let mut plan = plan(3);
+    let (before, _) = select(
+        &cache(MAX_RETAINED_BYTES),
+        &indexer,
+        &storage,
+        &HashSet::new(),
+        &plan,
+        SemanticCheckpointCaps::unlimited(),
+    )?;
+    let fingerprint = crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?;
+    storage
+        .raw()
+        .execute("UPDATE messages SET content = 'new content' WHERE conversation_id = 1")?;
+    assert_eq!(
+        crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?,
+        fingerprint
+    );
+    let (changed, _) = select(
+        &cache(MAX_RETAINED_BYTES),
+        &indexer,
+        &storage,
+        &before.current_ids,
+        &plan,
+        SemanticCheckpointCaps::unlimited(),
+    )?;
+    assert_eq!(changed.replayed_conversations, 3);
+    assert_eq!(changed.inputs.len(), 1);
+    assert_eq!(changed.inputs[0].content, "new content");
+    storage
+        .raw()
+        .execute("DELETE FROM messages WHERE conversation_id = 2")?;
+    let (deleted, _) = select(
+        &cache(MAX_RETAINED_BYTES),
+        &indexer,
+        &storage,
+        &changed.current_ids,
+        &plan,
+        SemanticCheckpointCaps::unlimited(),
+    )?;
+    assert_eq!(deleted.replayed_conversations, 3);
+    assert_eq!(deleted.current_ids.len(), 2);
+    assert!(deleted.inputs.is_empty());
+    assert_eq!(deleted.covered_conversations, 3);
+    plan.model_revision = "replacement-producer".into();
+    let (producer, _) = select(
+        &cache(MAX_RETAINED_BYTES),
+        &indexer,
+        &storage,
+        &HashSet::new(),
+        &plan,
+        SemanticCheckpointCaps::unlimited(),
+    )?;
+    assert_eq!(producer.replayed_conversations, 3);
+    assert_eq!(producer.current_ids, deleted.current_ids);
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn replay_cache_corrupt_inventory_falls_back_to_complete_canonical_selection() -> Result<()> {
+    let (dir, storage) = fixture(&["first message", "second message"])?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let plan = plan(1);
+    let (first, _) = select(
+        &cache(MAX_RETAINED_BYTES),
+        &indexer,
+        &storage,
+        &HashSet::new(),
+        &plan,
+        SemanticCheckpointCaps::unlimited(),
+    )?;
+    let path = persistent_path(dir.path(), plan.tier);
+    let mut bytes = fs::read(&path)?;
+    *bytes.last_mut().context("inventory checksum")? ^= 1;
+    fs::write(&path, bytes)?;
+    let (recovered, proof) = select(
+        &cache(MAX_RETAINED_BYTES),
+        &indexer,
+        &storage,
+        &first.selected_ids,
+        &plan,
+        SemanticCheckpointCaps::unlimited(),
+    )?;
+    assert_eq!(recovered.replayed_conversations, 2);
+    assert_eq!(recovered.current_ids, first.current_ids);
+    assert_eq!(recovered.inputs.len(), 1);
+    assert_eq!(recovered.inputs[0].content, "second message");
+    proof.verify(&storage)?;
+    // The canonical rescan replaces the damaged cache; the next fresh instance
+    // can reuse it, without treating the earlier selected input as coverage.
+    let (retry, _) = select(
+        &cache(MAX_RETAINED_BYTES),
+        &indexer,
+        &storage,
+        &first.selected_ids,
+        &plan,
+        SemanticCheckpointCaps::unlimited(),
+    )?;
+    assert_eq!(retry.replayed_conversations, 0);
+    assert_eq!(signature(&retry), signature(&recovered));
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn replay_cache_fresh_backfill_instances_converge_to_exact_published_coverage() -> Result<()> {
+    let (dir, storage) = fixture(&[
+        "first message",
+        "second message",
+        "third message",
+        "last message",
+    ])?;
+    let path = persistent_path(dir.path(), TierKind::Fast);
+    let mut inventory_stamp = None;
+    let mut published = None;
+    for batch in 0..4 {
+        let mut manifest = SemanticManifest::load_or_default(dir.path())?;
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let outcome =
+            indexer.run_backfill_from_storage(&storage, dir.path(), &mut manifest, plan(1))?;
+        assert_eq!(outcome.embedded_docs, 1);
+        if batch == 1 {
+            inventory_stamp = backfill_file_stamp(&path).flatten();
+            assert!(inventory_stamp.is_some());
+        } else if batch > 1 {
+            assert_eq!(backfill_file_stamp(&path).flatten(), inventory_stamp);
+        }
+        if outcome.published {
+            assert_eq!(batch, 3);
+            published = Some(outcome.index_path);
+        }
+    }
+    let manifest = SemanticManifest::load_or_default(dir.path())?;
+    assert!(manifest.checkpoint.is_none());
+    let path = published.context("fresh bounded invocations did not publish")?;
+    let vectors = FsVectorIndex::open_read_only(&path)?;
+    let expected: HashSet<_> = packet_embedding_inputs_from_storage(&storage)?
+        .iter()
+        .filter_map(semantic_doc_id_for_input)
+        .collect();
+    assert_eq!(vectors.live_doc_ids()?, expected);
+    assert_eq!(expected.len(), 4);
     Ok(())
 }

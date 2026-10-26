@@ -1,27 +1,34 @@
-//! Invocation-local canonical identity replay for repeated bounded backfills.
+//! Bounded canonical identity replay for repeated backfill checkpoints.
 //!
 //! This is a disposable optimization, not a coverage or serving authority. A
 //! hit requires the existing descriptor-bound archive/WAL stamps, the exact
 //! producer/input context, and an observation outside a database transaction.
 //! Every pass still reads the candidate's identities; selected text is reloaded
-//! and checked against this inventory before embedding. Nothing is persisted.
+//! and checked against this inventory before embedding. A checksummed inventory
+//! can survive process restarts while the exact archive and input contract stay
+//! unchanged. Ingest, edits, deletion, or a producer change require fresh replay.
 
 use super::*;
 use std::mem::size_of;
 use std::sync::Mutex;
+
+mod persist;
 
 #[cfg(test)]
 mod tests;
 
 const MAX_RETAINED_BYTES: usize = 128 * 1024 * 1024;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct ReplayKey {
     archive: BackfillFilePair,
     embedder_id: String,
     vector_revision: String,
     model_revision: String,
     db_fingerprint: String,
+    schema_version: u32,
+    chunking_version: u32,
+    source_ingest_contract: String,
 }
 
 impl ReplayKey {
@@ -37,6 +44,9 @@ impl ReplayKey {
             vector_revision: vector_revision.into(),
             model_revision: plan.model_revision.clone(),
             db_fingerprint: plan.db_fingerprint.clone(),
+            schema_version: SEMANTIC_SCHEMA_VERSION,
+            chunking_version: CHUNKING_STRATEGY_VERSION,
+            source_ingest_contract: env!("CASS_SOURCE_INGEST_CONTRACT").into(),
         }))
     }
 }
@@ -74,7 +84,7 @@ struct CachedReplay {
     retained_bytes: usize,
 }
 
-/// One inventory per indexer, released with the indexer. The slot is taken
+/// One memory inventory per indexer, released with the indexer. The slot is taken
 /// before I/O: concurrent callers may do redundant work, but cannot share a
 /// mutable scan or use a partially constructed inventory.
 pub(super) struct CanonicalReplayCache {
@@ -260,6 +270,7 @@ impl CanonicalReplayCache {
         &self,
         indexer: &SemanticIndexer,
         storage: &FrankenStorage,
+        data_dir: &Path,
         plan: &SemanticBackfillStoragePlan,
         existing_ids: &HashSet<String>,
         caps: SemanticCheckpointCaps,
@@ -273,7 +284,7 @@ impl CanonicalReplayCache {
                 self.max_bytes,
             ));
         // Poison only disables the optimization, never canonical reconciliation.
-        let cached = self
+        let mut cached = self
             .slot
             .lock()
             .ok()
@@ -281,6 +292,28 @@ impl CanonicalReplayCache {
             .filter(|cached| {
                 budget > 0 && cached.retained_bytes <= budget && key.as_ref() == Some(&cached.key)
             });
+        // A local path dependency can change canonicalization without changing
+        // the recorded build inputs. Keep the in-memory optimization, but never
+        // trust a previous process's inventory in such development builds.
+        let cache_path = (budget > 0 && env!("CASS_SOURCE_INGEST_REUSE") == "true")
+            .then(|| persistent_path(data_dir, plan.tier));
+        let mut disk_hit = false;
+        if cached.is_none()
+            && let (Some(path), Some(key)) = (cache_path.as_ref(), key.as_ref())
+        {
+            match persist::load(path, key, budget, || indexer.check_external_cancelled()) {
+                Ok(inventory) => {
+                    disk_hit = inventory.is_some();
+                    cached = inventory;
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "semantic replay inventory unavailable; reading canonical archive");
+                }
+            }
+            // A cancellation reported by the optional cache reader must not
+            // turn into an expensive uncached replay.
+            indexer.check_external_cancelled()?;
+        }
         let cache_hit = cached.is_some();
         let proof = ReplayProof(key.as_ref().map(|key| key.archive.clone()));
         let mut selected = ReconcileSelection::default();
@@ -373,12 +406,31 @@ impl CanonicalReplayCache {
         let retained_bytes = inventory.as_ref().map_or(0, |cache| cache.retained_bytes);
         if let Some(inventory) = inventory
             && ReplayKey::capture(indexer, storage, plan)?.as_ref() == Some(&inventory.key)
-            && let Ok(mut slot) = self.slot.lock()
         {
-            *slot = Some(inventory);
+            // Serialize a complete cold inventory only once. A hit must not
+            // rewrite up to 128 MiB on every bounded checkpoint. Atomic install
+            // preserves the prior complete file if writing is interrupted.
+            if !cache_hit && let Some(path) = cache_path.as_ref() {
+                let saved = (|| -> Result<()> {
+                    fs::create_dir_all(data_dir.join(VECTOR_INDEX_DIR))?;
+                    persist::save(path, &inventory, || indexer.check_external_cancelled())
+                })();
+                if let Err(error) = saved {
+                    tracing::debug!(%error, "semantic replay inventory was not persisted; memory reuse remains available");
+                }
+                indexer.check_external_cancelled()?;
+            }
+            if let Ok(mut slot) = self.slot.lock() {
+                *slot = Some(inventory);
+            }
         }
+        // Persisting a large inventory is optional I/O, but its time still
+        // belongs to this selection. Refuse a concurrent write before handing
+        // inputs to an expensive embedding batch.
+        proof.verify(storage)?;
         tracing::debug!(
             cache_hit,
+            disk_hit,
             canonical_conversations_replayed = selected.replayed_conversations,
             selected_conversations_reloaded = selected.loaded_selected_conversations,
             retained_identity_bytes = retained_bytes,
@@ -386,4 +438,12 @@ impl CanonicalReplayCache {
         );
         Ok((selected, proof))
     }
+}
+
+fn persistent_path(data_dir: &Path, tier: TierKind) -> PathBuf {
+    // One replaceable cache per tier bounds disk growth. The serialized key,
+    // not this pathname, binds the selected archive and producer identities.
+    data_dir
+        .join(VECTOR_INDEX_DIR)
+        .join(format!(".canonical-replay-{}.bin", tier.as_str()))
 }

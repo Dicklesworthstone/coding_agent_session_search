@@ -4008,7 +4008,7 @@ impl SemanticIndexer {
         );
         let (selection, replay_proof) =
             self.replay_cache
-                .select(self, storage, &plan, &existing_ids, caps, sink)?;
+                .select(self, storage, data_dir, &plan, &existing_ids, caps, sink)?;
         let replay_cache::ReconcileSelection {
             current_ids,
             selected_ids,
@@ -4033,8 +4033,9 @@ impl SemanticIndexer {
             },
         );
         let embeddings = self.embed_messages_with_sink(&inputs, sink)?;
-        // A cache hit is valid only while the descriptor-bound canonical archive
-        // remains unchanged, including across a potentially long embed batch.
+        // Every descriptor-bound selection, cached or freshly replayed, remains
+        // valid only while the canonical archive is unchanged, including across
+        // a potentially long embedding batch.
         replay_proof.verify(storage)?;
         let embedded_docs = saturating_u64_from_usize(embeddings.len());
         let staging_path = semantic_staging_index_path(
