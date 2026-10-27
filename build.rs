@@ -7,6 +7,9 @@ use std::process::{self, Command};
 
 use toml::Value;
 
+#[path = "build_support/source_ingest_contract.rs"]
+mod source_ingest_contract;
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ValidationMode {
     ActivePathOverride,
@@ -447,10 +450,13 @@ fn emit_source_ingest_contract(manifest_dir: &Path) {
         packages
             .iter()
             .find(|package| {
-                package.get("source").and_then(Value::as_str).is_none()
-                    && !(package.get("name").and_then(Value::as_str) == Some(crate_name.as_str())
-                        && package.get("version").and_then(Value::as_str)
-                            == Some(crate_version.as_str()))
+                source_ingest_contract::dependency_blocks_reuse(
+                    package.get("name").and_then(Value::as_str),
+                    package.get("version").and_then(Value::as_str),
+                    package.get("source").and_then(Value::as_str),
+                    &crate_name,
+                    &crate_version,
+                )
             })
             .map(|package| {
                 format!(
@@ -469,51 +475,16 @@ fn emit_source_ingest_contract(manifest_dir: &Path) {
         "cargo:rustc-env=CASS_SOURCE_INGEST_REUSE_BLOCKER={}",
         reuse_blocker.unwrap_or_default()
     );
-    let mut inputs = BTreeSet::from([
-        PathBuf::from("Cargo.toml"),
-        PathBuf::from("Cargo.lock"),
-        PathBuf::from("build.rs"),
-    ]);
-    let mut directories = vec![PathBuf::from("src")];
-    while let Some(directory) = directories.pop() {
-        println!("cargo:rerun-if-changed={}", directory.display());
-        let entries = fs::read_dir(manifest_dir.join(&directory))
-            .unwrap_or_else(|error| fatal(format!("cannot read ingest inputs: {error}")));
-        for entry in entries {
-            let entry = entry
-                .unwrap_or_else(|error| fatal(format!("cannot inspect ingest input: {error}")));
-            let path = directory.join(entry.file_name());
-            let kind = entry.file_type().unwrap_or_else(|error| {
-                fatal(format!("cannot inspect ingest input type: {error}"))
-            });
-            if kind.is_dir() {
-                directories.push(path);
-            } else {
-                inputs.insert(path);
-            }
-        }
-    }
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"cass-source-ingest-contract-v1\0");
-    for input in inputs {
-        println!("cargo:rerun-if-changed={}", input.display());
-        let name = input.to_string_lossy().replace('\\', "/");
-        let bytes = fs::read(manifest_dir.join(&input))
-            .unwrap_or_else(|error| fatal(format!("cannot read ingest input {name}: {error}")));
-        hasher.update(&(name.len() as u64).to_le_bytes());
-        hasher.update(name.as_bytes());
-        hasher.update(&(bytes.len() as u64).to_le_bytes());
-        hasher.update(&bytes);
-    }
-    let features: BTreeSet<_> = env::vars()
-        .filter(|(name, _)| name.starts_with("CARGO_FEATURE_"))
-        .collect();
-    for (name, value) in features {
-        hasher.update(name.as_bytes());
-        hasher.update(b"=");
-        hasher.update(value.as_bytes());
-        hasher.update(b"\0");
-    }
+    source_ingest_contract::emit_contract(
+        manifest_dir,
+        env::vars(),
+        |bytes| {
+            hasher.update(bytes);
+        },
+        |input| println!("cargo:rerun-if-changed={}", input.display()),
+    )
+    .unwrap_or_else(|error| fatal(format!("cannot compute source ingest contract: {error}")));
     println!(
         "cargo:rustc-env=CASS_SOURCE_INGEST_CONTRACT={}",
         hasher.finalize()

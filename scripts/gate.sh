@@ -319,7 +319,7 @@ SOURCE_DIFF="$(source_digest)" || exit 1
 # (green on one worker, red on another for the same tree). No build or test
 # reads them, so they are not inputs this gate can or needs to verify.
 SOURCE_PATHS="$(git ls-files --cached --others --exclude-standard -z -- \
-    Cargo.toml Cargo.lock rust-toolchain.toml build.rs src tests benches scripts \
+    Cargo.toml Cargo.lock rust-toolchain.toml build.rs build_support src tests benches scripts \
     .cargo .github README.md ':(exclude,glob)**/.beads/**' | \
     sort -zu | gzip -c | base64 -w0)" || exit 1
 SOURCE_CONTENT="$(printf '%s' "$SOURCE_PATHS" | base64 -d | gzip -d | \
