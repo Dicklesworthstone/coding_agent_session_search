@@ -1,6 +1,6 @@
 //! Explicit logical-archive commands. Kept outside the ordinary search startup
 //! path. Only explicit import flags opt into canonical-only lexical rebuilding
-//! or the reviewed v20/v21 -> v22 schema migration; export and verification never do so.
+//! or the reviewed v20/v21/v22 -> v23 schema migrations; export and verification never do so.
 
 mod codec;
 #[cfg(test)]
@@ -153,9 +153,10 @@ enum Operation {
         /// reviewed migration-projection match. This never grants overwrite permission.
         #[arg(long)]
         if_identical: bool,
-        /// Permit only the reviewed storage-schema v20 or v21 -> v22 migration.
+        /// Permit only reviewed storage-schema v20, v21 or v22 -> v23 migrations.
         /// Canonical table/column/primary-key descriptors must match the current
-        /// ones, apart from v22's `forgotten_sources`, which is created empty.
+        /// ones, apart from tables added after the archived schema, which start
+        /// empty. Existing source and session tombstones are preserved.
         #[arg(long)]
         allow_compatible_schema: bool,
         /// Rebuild lexical search from the restored DB, without scanning providers.

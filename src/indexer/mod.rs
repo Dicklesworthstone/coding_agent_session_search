@@ -305,6 +305,105 @@ fn should_skip_excluded_source(source_path: &Path) -> bool {
     excluded
 }
 
+/// Prospective workspace exclusions (GH #537) are a completed ingest policy,
+/// unlike an unreadable or deferred source. They never hold scan watermarks.
+/// Bind the policy to reuse evidence so removing a glob revisits old sources.
+#[derive(Debug, Clone, Default)]
+struct WorkspaceExclusions {
+    patterns: Vec<glob::Pattern>,
+    signature: String,
+}
+
+impl WorkspaceExclusions {
+    fn parse(value: &str) -> Result<Self> {
+        let entries: BTreeSet<&str> = value
+            .split([',', '\n'])
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .collect();
+        let patterns = entries
+            .iter()
+            .map(|entry| {
+                glob::Pattern::new(entry).with_context(|| {
+                    format!(
+                        "invalid CASS_EXCLUDE_WORKSPACES glob {entry:?}; use valid workspace \
+                         globs separated by commas or newlines"
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            patterns,
+            signature: entries.into_iter().collect::<Vec<_>>().join("\n"),
+        })
+    }
+
+    fn from_env() -> Result<Self> {
+        match dotenvy::var("CASS_EXCLUDE_WORKSPACES") {
+            Ok(value) => Self::parse(&value),
+            Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => Ok(Self::default()),
+            Err(error) => Err(error).context("CASS_EXCLUDE_WORKSPACES must be valid Unicode"),
+        }
+    }
+
+    fn excludes(&self, workspace: Option<&Path>) -> bool {
+        workspace.is_some_and(|path| {
+            self.patterns
+                .iter()
+                .any(|pattern| pattern.matches_path(path))
+        })
+    }
+
+    fn bind_contract(&self, contract: &str) -> String {
+        if self.patterns.is_empty() {
+            contract.to_string()
+        } else {
+            format!(
+                "{contract}:workspace-exclusions-v1:{}",
+                blake3::hash(self.signature.as_bytes()).to_hex()
+            )
+        }
+    }
+}
+
+const WORKSPACE_EXCLUSION_SCAN_PREFIX: &str = "workspace_exclusions:connector:";
+
+fn workspace_exclusion_scan_policies(storage: &FrankenStorage) -> Result<HashMap<String, String>> {
+    Ok(storage
+        .raw()
+        .query_map_collect(
+            "SELECT key, value FROM meta WHERE key >= 'workspace_exclusions:connector:' \
+         AND key < 'workspace_exclusions:connector;'",
+            &[],
+            |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
+        )?
+        .into_iter()
+        .collect())
+}
+
+fn record_connector_scan_watermark(
+    storage: &FrankenStorage,
+    connector_name: &str,
+    scan_start_ts: i64,
+) -> Result<()> {
+    let policy = WorkspaceExclusions::from_env()?;
+    storage.set_connector_last_scan_ts(connector_name, scan_start_ts)?;
+    // Write the policy after the watermark. If this write fails, a subsequent
+    // run conservatively scans again; it cannot bless a partial policy change.
+    let key = format!(
+        "{WORKSPACE_EXCLUSION_SCAN_PREFIX}{}",
+        connector_name.trim().to_ascii_lowercase()
+    );
+    storage.raw().execute_compat(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        &[
+            ParamValue::from(key.as_str()),
+            ParamValue::from(policy.signature.as_str()),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Whether `CASS_SKIP_SUBAGENTS` is enabled (#292). Subagent transcripts
 /// (Claude Code's `<project>/<session>/subagents/agent-*.jsonl`) are ephemeral
 /// one-task scratchpads whose conclusions already live in the parent session;
@@ -13438,7 +13537,7 @@ fn persist_connector_scan_watermarks(
                     "updating connector scan watermarks",
                     |writer| {
                         for connector_name in scanned_connectors {
-                            writer.set_connector_last_scan_ts(connector_name, scan_start_ts)?;
+                            record_connector_scan_watermark(writer, connector_name, scan_start_ts)?;
                         }
                         Ok(())
                     },
@@ -14458,13 +14557,22 @@ fn source_file_observation(path: &Path) -> Option<serde_json::Value> {
     crate::connectors::source_dependencies::observation::file_observation(path)
 }
 
-fn source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bool {
+fn source_ledger_matches_with_contract(
+    observation: &str,
+    source: &DiscoveredSourceFile,
+    producer_contract: &str,
+) -> bool {
     crate::connectors::source_dependencies::observation::ledger_matches(
         observation,
         &source.source_path,
         source_folder_is_dependency(source),
-        env!("CASS_SOURCE_INGEST_CONTRACT"),
+        producer_contract,
     )
+}
+
+#[cfg(test)]
+fn source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bool {
+    source_ledger_matches_with_contract(observation, source, env!("CASS_SOURCE_INGEST_CONTRACT"))
 }
 
 /// A connector capability, not an inference from this scan's sidecar list.
@@ -14531,6 +14639,8 @@ fn scan_with_durable_source_boundaries(
     sender: &mut StreamingBatchSender<'_>,
     mut prepare: impl FnMut(NormalizedConversation) -> Result<Option<NormalizedConversation>>,
 ) -> Result<()> {
+    let producer_contract =
+        WorkspaceExclusions::from_env()?.bind_contract(env!("CASS_SOURCE_INGEST_CONTRACT"));
     if !connector.supports_source_boundaries() {
         return connector.scan_with_callback(ctx, &mut |conversation| {
             if let Some(conversation) = prepare(conversation)? {
@@ -14598,7 +14708,9 @@ fn scan_with_durable_source_boundaries(
             && config
                 .source_ledger
                 .get(&source_ledger_key(source, &ctx))
-                .is_some_and(|saved| source_ledger_matches(saved, source));
+                .is_some_and(|saved| {
+                    source_ledger_matches_with_contract(saved, source, &producer_contract)
+                });
         tracing::debug!(connector=%source.provider_slug, skipped=skip,"source_ingest_observation");
         if skip {
             sender
@@ -14631,7 +14743,7 @@ fn scan_with_durable_source_boundaries(
         let entry = crate::storage::sqlite::SourceIngestLedgerEntry {
             key: source_ledger_key(&completion.source, &ctx),
             observation: serde_json::json!({"primary":primary,"dependencies":dependencies,
-                "producer_contract":env!("CASS_SOURCE_INGEST_CONTRACT")})
+                "producer_contract":producer_contract})
             .to_string(),
         };
         sender.borrow_mut().complete_source(entry)
@@ -15867,7 +15979,7 @@ fn run_streaming_consumer(
                             storage,
                             true,
                             "updating streaming connector scan watermark",
-                            |writer| writer.set_connector_last_scan_ts(connector_name, ts),
+                            |writer| record_connector_scan_watermark(writer, connector_name, ts),
                         )
                     {
                         tracing::warn!(
@@ -16771,7 +16883,7 @@ where
                 storage,
                 !opts.watch,
                 "updating completed batch connector scan watermark",
-                |writer| writer.set_connector_last_scan_ts(pending.name, scan_start_ts),
+                |writer| record_connector_scan_watermark(writer, pending.name, scan_start_ts),
             ) {
                 tracing::warn!(
                     connector = pending.name,
@@ -16877,6 +16989,8 @@ fn connector_local_scan_since_ts_map<F>(
         .map(|(name, _)| *name)
         .collect::<Vec<_>>();
     let connector_states = storage.connector_scan_states(&connector_names)?;
+    let workspace_policy = WorkspaceExclusions::from_env()?;
+    let saved_workspace_policies = workspace_exclusion_scan_policies(storage)?;
 
     connector_factories
         .iter()
@@ -16887,7 +17001,17 @@ fn connector_local_scan_since_ts_map<F>(
             // dedicated connector has ever completed a scan; do one full OMP
             // scan until its own watermark exists so older profile/XDG roots
             // are not skipped by the global Pi-era cutoff.
-            let local_since_ts = if *name == "omp" && state.last_scan_ts.is_none() {
+            let workspace_policy_key = format!("{WORKSPACE_EXCLUSION_SCAN_PREFIX}{name}");
+            let saved_workspace_policy = saved_workspace_policies
+                .get(&workspace_policy_key)
+                .map(String::as_str)
+                .unwrap_or_default();
+            let local_since_ts = if saved_workspace_policy != workspace_policy.signature {
+                // A removed or changed exclusion can admit sessions older than
+                // the previous successful scan. Revisit once, then save the new
+                // policy alongside this connector's ordinary advancing watermark.
+                None
+            } else if *name == "omp" && state.last_scan_ts.is_none() {
                 None
             } else if state.scan_contract_pending {
                 // A source form this build reads can predate any cutoff (GH
@@ -17142,6 +17266,9 @@ fn run_index_with_storage_ownership(
     local_connector_roots: LocalConnectorRootsOverride,
     mirror_source_ids: Option<Vec<String>>,
 ) -> Result<()> {
+    // Reject malformed configuration before opening storage or capturing any
+    // source evidence. Every persistence entry also validates the policy.
+    WorkspaceExclusions::from_env()?;
     if let Some(progress) = opts.progress.as_ref() {
         progress.check_stop()?;
     }
@@ -32809,6 +32936,7 @@ fn plan_remote_mirror_scan_skips(
     roots: Vec<ScanRoot>,
 ) -> (Vec<ScanRoot>, Vec<(String, String)>) {
     let skip_enabled = !opts.full && !opts.force_rebuild;
+    let workspace_policy = WorkspaceExclusions::from_env().ok();
     let mut scanned = Vec::with_capacity(roots.len());
     let mut fingerprints_to_store: Vec<(String, String)> = Vec::new();
     let mut skipped = 0usize;
@@ -32817,17 +32945,27 @@ fn plan_remote_mirror_scan_skips(
             scanned.push(root);
             continue;
         }
-        let fingerprint_now = remote_mirror_scan_fingerprint(&root.path);
+        let fingerprint_now = remote_mirror_scan_fingerprint(&root.path).and_then(|fingerprint| {
+            workspace_policy
+                .as_ref()
+                .map(|policy| policy.bind_contract(&fingerprint))
+        });
         let stored = storage
             .read_mirror_scan_fingerprint(&root.origin.source_id)
             .ok()
             .flatten();
+        // A clean scan can deliberately exclude every session. Its saved
+        // fingerprint still proves completion under this exact policy even
+        // though no canonical conversation exists to prove prior admission.
         let unchanged = skip_enabled
             && fingerprint_now.is_some()
             && stored.is_some()
             && stored.as_deref() == fingerprint_now.as_deref()
-            && remote_mirror_source_already_indexed(storage, &root.origin.source_id)
-                .unwrap_or(false);
+            && (remote_mirror_source_already_indexed(storage, &root.origin.source_id)
+                .unwrap_or(false)
+                || workspace_policy
+                    .as_ref()
+                    .is_some_and(|policy| !policy.patterns.is_empty()));
         if unchanged {
             skipped += 1;
             tracing::info!(
@@ -34031,7 +34169,11 @@ fn prepare_conversation_for_ingest(
         apply_workspace_rewrite(conv, root);
     }
     compact_large_connector_extras(connector_name, conv);
-    attach_raw_mirror_capture(data_dir, conv);
+    if WorkspaceExclusions::from_env()
+        .is_ok_and(|policy| !policy.excludes(conv.workspace.as_deref()))
+    {
+        attach_raw_mirror_capture(data_dir, conv);
+    }
 }
 
 fn capture_connector_sources_before_parse(
@@ -34057,14 +34199,23 @@ fn capture_connector_sources_before_parse(
                     source.role == crate::connectors::DiscoveredSourceRole::PrimarySessionLog
                 })
                 .count();
-            let defer_primary_sources =
-                primary_source_count > PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT;
+            // A per-session transcript's workspace is known only after parse.
+            // Defer its capture to prepare_conversation_for_ingest so excluded
+            // transcripts do not create new mirror blobs. Shared databases and
+            // reconstruction sidecars remain source-level recovery evidence.
+            let workspace_exclusions_active = WorkspaceExclusions::from_env()
+                .map(|policy| !policy.patterns.is_empty())
+                .unwrap_or(true);
+            let defer_primary_sources = primary_source_count
+                > PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT
+                || workspace_exclusions_active;
             if defer_primary_sources {
                 tracing::info!(
                     provider,
                     primary_source_count,
                     limit = PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT,
-                    "deferring large primary source raw-mirror capture to per-conversation streaming path"
+                    workspace_exclusions_active,
+                    "deferring primary source raw-mirror capture to per-conversation streaming path"
                 );
             }
             let mut observed_sources = Vec::with_capacity(sources.len());
@@ -34631,7 +34782,10 @@ pub fn apply_workspace_rewrite(conv: &mut NormalizedConversation, root: &ScanRoo
 pub mod persist {
     #[cfg(test)]
     use super::WatchLexicalTestFault;
-    use super::{LexicalPopulationStrategy, lexical_population_strategy_requires_inline_tantivy};
+    use super::{
+        LexicalPopulationStrategy, WorkspaceExclusions,
+        lexical_population_strategy_requires_inline_tantivy,
+    };
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::ops::Range;
     use std::path::Path;
@@ -36878,23 +37032,46 @@ pub mod persist {
         Ok(())
     }
 
-    /// `cass forget --apply` tombstones (2l1b0.50). A connector rescan (any
-    /// sibling change can trigger one) re-reads a forgotten source, and to
-    /// ingest it is a new conversation. Drop conversations whose forgotten
-    /// source is unchanged since the forget; a changed source is ingested
-    /// again, whole, and loses its tombstone. `None` when nothing is dropped.
-    fn retain_unforgotten_conversations(
+    /// Apply explicit archive exclusions before any canonical/derived writes.
+    /// Shared-store session tombstones survive a sibling's source-file change;
+    /// single-session source stamps retain their existing change/reingest rule.
+    /// Workspace exclusions are prospective and never remove archived rows.
+    fn retain_admitted_conversations(
         storage: &FrankenStorage,
         convs: &[NormalizedConversation],
     ) -> Result<Option<Vec<NormalizedConversation>>> {
         let tombstones = storage.forgotten_source_stamps()?;
-        if tombstones.is_empty() {
+        let forgotten_sessions = storage.forgotten_conversation_keys()?;
+        let workspace_policy = WorkspaceExclusions::from_env()?;
+        if tombstones.is_empty()
+            && forgotten_sessions.is_empty()
+            && workspace_policy.patterns.is_empty()
+        {
             return Ok(None);
         }
         let mut keep = Vec::with_capacity(convs.len());
         let mut changed = Vec::new();
         for conv in convs {
             let path = conv.source_path.to_string_lossy();
+            let forgotten_session = !forgotten_sessions.is_empty()
+                && conv.external_id.as_ref().is_some_and(|external_id| {
+                    let (source_id, _) = extract_provenance(&conv.metadata);
+                    forgotten_sessions.contains(&crate::storage::sqlite::ForgottenConversationKey {
+                        source_id,
+                        agent_slug: conv.agent_slug.clone(),
+                        source_path: path.to_string(),
+                        external_id: external_id.clone(),
+                    })
+                });
+            if forgotten_session || workspace_policy.excludes(conv.workspace.as_deref()) {
+                tracing::debug!(
+                    source_path = %conv.source_path.display(),
+                    forgotten_session,
+                    "skipping a conversation excluded by archive policy"
+                );
+                keep.push(false);
+                continue;
+            }
             let forgotten_and_unchanged = match tombstones.get(path.as_ref()) {
                 None => false,
                 Some(stamp) if *stamp == SourceFileStamp::of(&conv.source_path) => true,
@@ -37069,6 +37246,31 @@ pub mod persist {
         source_completion: Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
         limits: PersistSliceLimits,
     ) -> Result<PersistBatchOutcome> {
+        let retained;
+        let admitted = match retain_admitted_conversations(storage, convs)? {
+            Some(kept) => {
+                retained = kept;
+                retained.as_slice()
+            }
+            None => convs,
+        };
+        if admitted.is_empty() {
+            if !convs.is_empty()
+                && let Some(completion) = source_completion
+            {
+                // Intentional exclusion is a completed policy decision. Keep
+                // its source evidence so an unchanged excluded store is not
+                // reparsed on every pass; the policy binds the observation.
+                with_ephemeral_writer(
+                    storage,
+                    defer_checkpoints,
+                    "recording deliberately filtered source completion",
+                    |writer| writer.record_filtered_source_completion(completion),
+                )?;
+            }
+            return Ok(PersistBatchOutcome::default());
+        }
+        let convs = admitted;
         let oversized = |conv: &NormalizedConversation| should_slice_conversation(conv, limits);
         if !convs.iter().any(oversized) {
             return persist_conversations_batched_whole(
@@ -37209,17 +37411,6 @@ pub mod persist {
         // Link recording re-verifies the mirror blob; a sliced conversation
         // records one link, with its full message count, after its last slice.
         let link_data_dir = raw_mirror_data_dir.filter(|_| record_raw_mirror_links);
-        let retained;
-        let convs = match retain_unforgotten_conversations(storage, convs)? {
-            Some(kept) => {
-                retained = kept;
-                retained.as_slice()
-            }
-            None => convs,
-        };
-        if convs.is_empty() {
-            return Ok(PersistBatchOutcome::default());
-        }
         // GH459: revoke completed lexical authority durably BEFORE any writer
         // transaction can change workspace associations. A crash or failed
         // publication is then recovered by the existing full canonical rebuild.
@@ -41784,6 +41975,269 @@ mod tests {
         assert!(scan_path_exclusions_value_active(Some(
             " /tmp/active.jsonl ,\n/var/log/cass "
         )));
+    }
+
+    fn gh537_isolated_workspace_policy_test(name: &str) -> Result<bool> {
+        const CHILD: &str = "CASS_TEST_GH537_WORKSPACE_POLICY_CHILD";
+        if dotenvy::var(CHILD).is_ok_and(|value| value == name) {
+            return Ok(true);
+        }
+        // Other indexer tests run concurrently and read this policy. Keep
+        // mutations in a fresh process executing only the requested test.
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", &format!("indexer::tests::{name}"), "--nocapture"])
+            .env(CHILD, name)
+            .env_remove("CASS_EXCLUDE_WORKSPACES")
+            .env_remove("CASS_EXCLUDE_PATHS")
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "workspace policy test {name} failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        anyhow::ensure!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "workspace policy child did not execute its test"
+        );
+        Ok(false)
+    }
+
+    #[test]
+    fn gh537_workspace_exclusions_validate_and_match_known_workspace_globs() -> Result<()> {
+        let policy = WorkspaceExclusions::parse(" /work/retired/*,\n/work/scratch-*,, ")?;
+        assert!(policy.excludes(Some(Path::new("/work/retired/project"))));
+        assert!(policy.excludes(Some(Path::new("/work/scratch-build"))));
+        assert!(!policy.excludes(Some(Path::new("/work/active"))));
+        assert!(!policy.excludes(None));
+        assert!(!WorkspaceExclusions::parse(" ,\n ")?.excludes(Some(Path::new("/work/active"))));
+        let error = WorkspaceExclusions::parse("/work/ok,/work/[broken")
+            .expect_err("invalid workspace glob must not be ignored");
+        assert!(error.to_string().contains("CASS_EXCLUDE_WORKSPACES"));
+        assert!(error.to_string().contains("/work/[broken"));
+
+        let reordered =
+            WorkspaceExclusions::parse("/work/scratch-*, /work/retired/*,/work/scratch-*")?;
+        assert_eq!(
+            policy.bind_contract("producer"),
+            reordered.bind_contract("producer")
+        );
+        assert_ne!(policy.bind_contract("producer"), "producer");
+        assert_ne!(
+            policy.bind_contract("producer"),
+            WorkspaceExclusions::parse("/work/retired/*")?.bind_contract("producer")
+        );
+        assert_eq!(
+            WorkspaceExclusions::default().bind_contract("producer"),
+            "producer"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn gh537_workspace_exclusions_advance_watermarks_and_revisit_policy_changes() -> Result<()> {
+        if !gh537_isolated_workspace_policy_test(
+            "gh537_workspace_exclusions_advance_watermarks_and_revisit_policy_changes",
+        )? {
+            return Ok(());
+        }
+        let _paths = unset_env_var("CASS_EXCLUDE_PATHS");
+        let tmp = TempDir::new()?;
+        let storage = FrankenStorage::open(&tmp.path().join("workspace-policy.db"))?;
+        let factories = get_connector_factories()
+            .into_iter()
+            .filter(|(name, _)| *name == "claude")
+            .collect::<Vec<_>>();
+        assert_eq!(factories.len(), 1);
+        let _policy = set_env("CASS_EXCLUDE_WORKSPACES", "/work/retired/*");
+        storage.set_connector_last_scan_ts("claude", 1000)?;
+        let initial = connector_local_scan_since_ts_map(&storage, Some(999), &factories)?;
+        assert_eq!(
+            initial["claude"], None,
+            "a changed policy revisits historical sources"
+        );
+        record_connector_scan_watermark(&storage, "claude", 2000)?;
+        assert_eq!(storage.get_connector_last_scan_ts("claude")?, Some(2000));
+        let unchanged = connector_local_scan_since_ts_map(&storage, Some(1999), &factories)?;
+        assert_eq!(
+            unchanged["claude"],
+            Some(1999),
+            "exclusions do not hold the watermark"
+        );
+        {
+            let _removed = set_env("CASS_EXCLUDE_WORKSPACES", "");
+            let removed = connector_local_scan_since_ts_map(&storage, Some(1999), &factories)?;
+            assert_eq!(
+                removed["claude"], None,
+                "removed exclusions admit old sessions"
+            );
+            record_connector_scan_watermark(&storage, "claude", 3000)?;
+            let resumed = connector_local_scan_since_ts_map(&storage, Some(2999), &factories)?;
+            assert_eq!(resumed["claude"], Some(2999));
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn gh537_workspace_excluded_source_keeps_reusable_completion_without_rows() -> Result<()> {
+        if !gh537_isolated_workspace_policy_test(
+            "gh537_workspace_excluded_source_keeps_reusable_completion_without_rows",
+        )? {
+            return Ok(());
+        }
+        let _policy = set_env("CASS_EXCLUDE_WORKSPACES", "/workspace/demo");
+        let tmp = TempDir::new()?;
+        let storage = FrankenStorage::open(&tmp.path().join("archive.db"))?;
+        let source_path = tmp.path().join("session.jsonl");
+        fs::write(&source_path, b"completed transcript")?;
+        let mut conv = norm_conv(Some("excluded"), vec![norm_msg(0, 100)]);
+        conv.agent_slug = "codex".into();
+        conv.source_path = source_path.clone();
+        let source = DiscoveredSourceFile::new(
+            "codex",
+            &ScanRoot::local(tmp.path().to_path_buf()),
+            source_path.clone(),
+            crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            true,
+        )
+        .with_fs_metadata();
+        let contract =
+            WorkspaceExclusions::from_env()?.bind_contract(env!("CASS_SOURCE_INGEST_CONTRACT"));
+        let completion = crate::storage::sqlite::SourceIngestLedgerEntry {
+            key: "source_ingest_v1:workspace-excluded".into(),
+            observation: serde_json::json!({
+                "primary": source_file_observation(&source_path),
+                "dependencies": [],
+                "producer_contract": contract,
+            })
+            .to_string(),
+        };
+        let outcome = persist::persist_conversations_batched_inner(
+            &storage,
+            None,
+            std::slice::from_ref(&conv),
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            false,
+            false,
+            None,
+            persist::PersistHeartbeat::NONE,
+            Some(&completion),
+        )?;
+        assert_eq!(outcome.inserted_conversations, 0);
+        assert_eq!(count_total_conversations_exact(&storage)?, 0);
+        let ledger = storage.source_ingest_ledger_entries()?;
+        let saved = ledger
+            .get(&completion.key)
+            .context("excluded source completion")?;
+        assert_eq!(saved, &completion.observation);
+        assert!(source_ledger_matches_with_contract(
+            saved, &source, &contract
+        ));
+        assert!(!source_ledger_matches_with_contract(
+            saved,
+            &source,
+            env!("CASS_SOURCE_INGEST_CONTRACT")
+        ));
+        {
+            let _removed = set_env("CASS_EXCLUDE_WORKSPACES", "");
+            let admitted = persist::persist_conversations_batched(
+                &storage,
+                None,
+                std::slice::from_ref(&conv),
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                false,
+            )?;
+            assert_eq!(admitted.inserted_conversations, 1);
+            assert_eq!(count_total_messages_exact(&storage)?, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn gh537_shared_store_tombstones_filter_sessions_with_exact_provenance() -> Result<()> {
+        if !gh537_isolated_workspace_policy_test(
+            "gh537_shared_store_tombstones_filter_sessions_with_exact_provenance",
+        )? {
+            return Ok(());
+        }
+        let _policy = set_env("CASS_EXCLUDE_WORKSPACES", "");
+        let tmp = TempDir::new()?;
+        let storage = FrankenStorage::open(&tmp.path().join("archive.db"))?;
+        let source_path = tmp.path().join("sessions.db");
+        fs::write(&source_path, b"shared database before sibling update")?;
+        let mut forgotten = norm_conv(Some("forgotten"), vec![norm_msg(0, 100)]);
+        forgotten.agent_slug = "opencode".into();
+        forgotten.workspace = Some(PathBuf::from("/workspace/retired"));
+        forgotten.source_path = source_path.clone();
+        let mut sibling = forgotten.clone();
+        sibling.external_id = Some("kept-sibling".into());
+        sibling.workspace = Some(PathBuf::from("/workspace/active"));
+        let persist = |convs: &[NormalizedConversation]| {
+            persist::persist_conversations_batched(
+                &storage,
+                None,
+                convs,
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                false,
+            )
+        };
+        persist(&[forgotten.clone(), sibling.clone()])?;
+        let report = storage.forget_conversations(
+            &crate::storage::sqlite::ForgetConversationsFilter {
+                workspace_glob: Some("/workspace/retired"),
+                ..Default::default()
+            },
+            false,
+        )?;
+        assert_eq!(report.conversations_deleted, 1);
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        fs::write(
+            &source_path,
+            b"shared database after sibling append and checkpoint",
+        )?;
+        sibling.messages.push(norm_msg(1, 200));
+        sibling.ended_at = Some(200);
+        let outcome = persist(&[forgotten.clone(), sibling.clone()])?;
+        assert_eq!(outcome.inserted_conversations, 0);
+        assert_eq!(outcome.inserted_messages, 1);
+        assert_eq!(count_total_conversations_exact(&storage)?, 1);
+        assert_eq!(count_total_messages_exact(&storage)?, 2);
+
+        let mut remote = forgotten.clone();
+        inject_provenance(&mut remote, &Origin::remote("another-host"));
+        let mut other_agent = forgotten;
+        other_agent.agent_slug = "devin".into();
+        let other_identities = persist(&[remote, other_agent])?;
+        assert_eq!(other_identities.inserted_conversations, 2);
+        assert_eq!(count_total_conversations_exact(&storage)?, 3);
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn gh537_workspace_exclusions_skip_per_conversation_raw_capture() -> Result<()> {
+        if !gh537_isolated_workspace_policy_test(
+            "gh537_workspace_exclusions_skip_per_conversation_raw_capture",
+        )? {
+            return Ok(());
+        }
+        let _policy = set_env("CASS_EXCLUDE_WORKSPACES", "/workspace/demo");
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        let source_path = tmp.path().join("session.jsonl");
+        let source_bytes = b"{\"role\":\"user\",\"content\":\"keep source intact\"}\n";
+        fs::write(&source_path, source_bytes)?;
+        let mut conv = norm_conv(Some("excluded-mirror"), vec![norm_msg(0, 100)]);
+        conv.source_path = source_path.clone();
+        prepare_conversation_for_ingest(&data_dir, "codex", &Origin::local(), None, &mut conv);
+        assert!(conv.metadata.pointer("/cass/raw_mirror").is_none());
+        assert!(!data_dir.join("raw-mirror").exists());
+        assert_eq!(fs::read(source_path)?, source_bytes);
+        Ok(())
     }
 
     #[test]

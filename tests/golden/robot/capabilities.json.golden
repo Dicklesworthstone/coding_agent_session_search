@@ -3161,14 +3161,28 @@
     },
     {
       "name": "forget",
-      "description": "Prune an already-indexed subset of conversations by source-path glob (dry-run by default; `--apply` to commit). Removes matching rows from the canonical DB and rebuilds derived search/analytics assets. Source files are kept: a source that changes afterwards is indexed again",
+      "description": "Prune archived conversations by source path, workspace, or age (dry-run by default; `--apply` to commit). At least one selector is required; supplied selectors are ANDed. Rebuilds derived search and analytics assets while keeping source files. Forgotten sessions in shared stores stay forgotten when other sessions change",
       "arguments": [
         {
           "name": "source-glob",
           "description": "Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`)",
           "arg_type": "option",
           "value_type": "string",
-          "required": true
+          "required": false
+        },
+        {
+          "name": "workspace-glob",
+          "description": "Glob over the recorded workspace path (e.g. `/work/scratch/**`)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "older-than",
+          "description": "Forget sessions whose last message is older than this duration (e.g. `90d`, `24h`). Sessions with unknown message times are kept",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
         },
         {
           "name": "db",
@@ -4055,6 +4069,14 @@
     {
       "name": "CASS_DB_PATH",
       "description": "Override the SQLite database path."
+    },
+    {
+      "name": "CASS_EXCLUDE_PATHS",
+      "description": "Comma/newline-separated source files or directory prefixes to exclude from future ingestion and raw capture. Holds scan/watch watermarks; existing archived history remains searchable. Use cass forget to remove indexed copies."
+    },
+    {
+      "name": "CASS_EXCLUDE_WORKSPACES",
+      "description": "Comma/newline-separated workspace globs to exclude from future ingestion. Scan watermarks advance; changing the policy revisits sources. Existing history and shared raw-store captures remain; use cass forget --workspace-glob and cass mirror prune for explicit cleanup."
     },
     {
       "name": "CASS_OUTPUT_FORMAT",

@@ -1,4 +1,4 @@
-//! Real-binary proof for the reviewed logical-archive v20 and v21 -> v22
+//! Real-binary proof for the reviewed logical-archive v20, v21 and v22 -> v23
 //! bridges.
 
 use std::collections::BTreeMap;
@@ -14,7 +14,7 @@ use coding_agent_search::model::types::{Agent, AgentKind};
 use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, SqliteStorage};
 use serde_json::Value;
 
-const REVIEWED_TARGET_VERSION: i64 = 22;
+const REVIEWED_TARGET_VERSION: i64 = 23;
 
 fn command(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cass"));
@@ -59,8 +59,9 @@ fn database_files(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 }
 
 /// A canonical database at storage schema `version`, made by undoing on a
-/// current database exactly what each later reviewed step added: v22's
-/// `forgotten_sources` table, and for v20 also v21's context index.
+/// current database exactly what each later reviewed step added: v23's session
+/// tombstones, v22's source tombstones, and v21's context index. The v22 fixture
+/// retains an existing source tombstone, which migration must preserve.
 fn make_source(root: &Path, version: i64) -> PathBuf {
     assert_eq!(
         CURRENT_SCHEMA_VERSION, REVIEWED_TARGET_VERSION,
@@ -77,19 +78,35 @@ fn make_source(root: &Path, version: i64) -> PathBuf {
             kind: AgentKind::Cli,
         })
         .expect("insert canonical source row");
+    if version >= 22 {
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO forgotten_sources(source_path, size_bytes, mtime_ms, forgotten_at_ms)
+             VALUES('/fixture/retained-forget.jsonl', 12, 34, 56)",
+            )
+            .expect("seed existing source tombstone");
+    }
     drop(storage);
 
     let downgrade = match version {
         20 => {
-            "DROP TABLE forgotten_sources;
+            "DROP TABLE forgotten_conversations;
+             DROP TABLE forgotten_sources;
              DROP INDEX idx_conversations_context;
              DELETE FROM _schema_migrations WHERE version >= 21;
              UPDATE meta SET value = '20' WHERE key = 'schema_version';"
         }
         21 => {
-            "DROP TABLE forgotten_sources;
+            "DROP TABLE forgotten_conversations;
+             DROP TABLE forgotten_sources;
              DELETE FROM _schema_migrations WHERE version >= 22;
              UPDATE meta SET value = '21' WHERE key = 'schema_version';"
+        }
+        22 => {
+            "DROP TABLE forgotten_conversations;
+             DELETE FROM _schema_migrations WHERE version >= 23;
+             UPDATE meta SET value = '22' WHERE key = 'schema_version';"
         }
         other => panic!("no reviewed downgrade for schema {other}"),
     };
@@ -117,14 +134,19 @@ fn export_source(home: &Path, source: &Path, backup: &Path, archive_id: &str) ->
 }
 
 #[test]
-fn reviewed_v20_backup_migrates_to_v22_and_retries_read_only() {
-    assert_reviewed_backup_migrates(20, "reviewed_v20_to_v22");
+fn reviewed_v20_backup_migrates_to_v23_and_retries_read_only() {
+    assert_reviewed_backup_migrates(20, "reviewed_v20_to_v23");
 }
 
-/// A v0.9.0 export (schema v21) restores into the current v22 build.
+/// A v0.9.0 export (schema v21) restores into the current v23 build.
 #[test]
-fn reviewed_v21_backup_migrates_to_v22_and_retries_read_only() {
-    assert_reviewed_backup_migrates(21, "reviewed_v21_to_v22");
+fn reviewed_v21_backup_migrates_to_v23_and_retries_read_only() {
+    assert_reviewed_backup_migrates(21, "reviewed_v21_to_v23");
+}
+
+#[test]
+fn reviewed_v22_backup_preserves_tombstones_and_retries_read_only() {
+    assert_reviewed_backup_migrates(22, "reviewed_v22_to_v23");
 }
 
 fn assert_reviewed_backup_migrates(version: i64, mode: &str) {
@@ -204,12 +226,39 @@ fn assert_reviewed_backup_migrates(version: i64, mode: &str) {
         agent.get_typed::<Option<String>>(1).expect("agent version"),
         Some("preserve-me".into())
     );
-    // v22's table exists and is empty, as an in-place upgrade leaves it.
+    // Newly introduced tables are empty; existing v22 tombstones survive.
     let forgotten = storage
         .raw()
         .query_row("SELECT COUNT(*) FROM forgotten_sources")
         .expect("forgotten_sources exists after migration");
-    assert_eq!(forgotten.get_typed::<i64>(0).expect("count"), 0);
+    assert_eq!(
+        forgotten.get_typed::<i64>(0).expect("count"),
+        if version >= 22 { 1 } else { 0 }
+    );
+    if version >= 22 {
+        let stamp = storage
+            .raw()
+            .query_row(
+                "SELECT source_path, size_bytes, mtime_ms, forgotten_at_ms FROM forgotten_sources",
+            )
+            .expect("preserved source tombstone");
+        assert_eq!(
+            stamp.get_typed::<String>(0).expect("source path"),
+            "/fixture/retained-forget.jsonl"
+        );
+        assert_eq!(stamp.get_typed::<i64>(1).expect("size"), 12);
+        assert_eq!(stamp.get_typed::<i64>(2).expect("mtime"), 34);
+        assert_eq!(stamp.get_typed::<i64>(3).expect("forgotten time"), 56);
+    }
+    assert_eq!(
+        storage
+            .raw()
+            .query_row("SELECT COUNT(*) FROM forgotten_conversations")
+            .expect("session tombstones table exists")
+            .get_typed::<i64>(0)
+            .expect("count"),
+        0
+    );
     drop(storage);
 
     let before = database_files(&destination);

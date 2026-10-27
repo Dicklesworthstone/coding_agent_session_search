@@ -1053,7 +1053,7 @@ mod publication_tests {
 
     #[test]
     fn schema_authority_checks_each_active_step_in_fresh_and_legacy_histories() -> Result<()> {
-        for expected in [20_i64, 21, 22] {
+        for expected in [20_i64, 21, 22, 23] {
             for legacy in [false, true] {
                 let connection = Connection::open(":memory:")?;
                 connection.execute_batch(

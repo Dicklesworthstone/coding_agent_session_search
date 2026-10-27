@@ -413,6 +413,9 @@ pub enum Commands {
         refresh: bool,
     },
     /// Run indexer
+    #[command(
+        after_help = "Exclusions: CASS_EXCLUDE_PATHS accepts comma/newline-separated source files or directory prefixes. CASS_EXCLUDE_WORKSPACES accepts comma/newline-separated workspace globs. Both affect future ingestion; existing history remains searchable.\n\nTo remove archived conversations, preview `cass forget --workspace-glob '<glob>' --older-than 90d --json`, then add --apply. To reclaim raw source captures, use `cass mirror prune --older-than 90d --json`, then add --apply."
+    )]
     Index {
         /// Perform full rebuild
         #[arg(long)]
@@ -1691,14 +1694,28 @@ pub enum Commands {
     /// Inspect and manage the conversation-ingest quarantine (list / clear)
     #[command(subcommand)]
     Quarantine(QuarantineCommand),
-    /// Prune an already-indexed subset of conversations by source-path glob
-    /// (dry-run by default; `--apply` to commit). Removes matching rows from the
-    /// canonical DB and rebuilds derived search/analytics assets. Source files
-    /// are kept: a source that changes afterwards is indexed again.
+    /// Prune archived conversations by source path, workspace, or age
+    /// (dry-run by default; `--apply` to commit). At least one selector is
+    /// required; supplied selectors are ANDed. Rebuilds derived search and
+    /// analytics assets while keeping source files. Forgotten sessions in
+    /// shared stores stay forgotten when other sessions change.
+    #[command(group(clap::ArgGroup::new("forget_selectors")
+        .required(true)
+        .multiple(true)
+        .args(["source_glob", "workspace_glob", "older_than"])))]
     Forget {
         /// Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`).
         #[arg(long = "source-glob")]
-        source_glob: String,
+        source_glob: Option<String>,
+
+        /// Glob over the recorded workspace path (e.g. `/work/scratch/**`).
+        #[arg(long = "workspace-glob")]
+        workspace_glob: Option<String>,
+
+        /// Forget sessions whose last message is older than this duration
+        /// (e.g. `90d`, `24h`). Sessions with unknown message times are kept.
+        #[arg(long = "older-than")]
+        older_than: Option<String>,
 
         /// Override db path
         #[arg(long)]
@@ -9377,12 +9394,22 @@ async fn execute_cli(
                 }
                 Commands::Forget {
                     source_glob,
+                    workspace_glob,
+                    older_than,
                     db,
                     apply,
                     json,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
-                    run_forget_command(source_glob, db, apply, cli, structured_format)?;
+                    run_forget_command(
+                        source_glob,
+                        workspace_glob,
+                        older_than,
+                        db,
+                        apply,
+                        cli,
+                        structured_format,
+                    )?;
                 }
                 Commands::Mirror(subcmd) => {
                     run_mirror_command(subcmd, cli)?;
@@ -9962,12 +9989,138 @@ fn run_quarantine_clear(
     Ok(())
 }
 
-/// `cass forget --source-glob <pat>`: prune an already-indexed subset of
-/// conversations by source-path glob (#292 ask #2). Dry-run by default;
-/// `--apply` deletes the matching rows from the canonical DB and rebuilds the
-/// derived search/analytics assets so search coverage stays consistent.
+/// Resolve the entire selection before opening the archive. Invalid input
+/// must never turn a selective forget into a broader deletion or trigger a
+/// storage migration. Resolve relative age exactly once for this invocation.
+fn forget_filter<'a>(
+    source_glob: Option<&'a str>,
+    workspace_glob: Option<&'a str>,
+    older_than: Option<&str>,
+    now_ms: i64,
+) -> CliResult<crate::storage::sqlite::ForgetConversationsFilter<'a>> {
+    if source_glob.is_none() && workspace_glob.is_none() && older_than.is_none() {
+        return Err(CliError::usage(
+            "cass forget requires at least one selector",
+            Some("Pass --source-glob, --workspace-glob, or --older-than. Supplied selectors are ANDed; preview with --json before adding --apply.".to_string()),
+        ));
+    }
+    let source_glob = source_glob.map(str::trim);
+    let workspace_glob = workspace_glob.map(str::trim);
+    for (name, pattern) in [
+        ("source-glob", source_glob),
+        ("workspace-glob", workspace_glob),
+    ] {
+        if let Some(pattern) = pattern {
+            if pattern.is_empty() {
+                return Err(CliError::usage(
+                    format!("forget --{name} must not be empty"),
+                    None,
+                ));
+            }
+            glob::Pattern::new(pattern).map_err(|error| {
+                CliError::usage(
+                    format!("invalid forget --{name} glob: {error}"),
+                    Some("Quote the glob so your shell passes it to cass unchanged.".to_string()),
+                )
+            })?;
+        }
+    }
+    let before_ms = older_than
+        .map(|duration| {
+            let age_ms = parse_duration_millis(duration)?;
+            now_ms
+                .checked_sub(age_ms)
+                .ok_or_else(|| CliError::usage("forget --older-than is too large", None))
+        })
+        .transpose()?;
+    Ok(crate::storage::sqlite::ForgetConversationsFilter {
+        source_glob,
+        workspace_glob,
+        before_ms,
+    })
+}
+
+#[cfg(test)]
+mod forget_selector_tests {
+    use super::*;
+
+    #[test]
+    fn forget_requires_an_explicit_selector_even_with_apply() {
+        for args in [vec!["cass", "forget"], vec!["cass", "forget", "--apply"]] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(forget_filter(None, None, None, 0).is_err());
+    }
+
+    #[test]
+    fn forget_accepts_each_selector_and_intersections() {
+        for selectors in [
+            vec!["--source-glob", "**/rollout-*.jsonl"],
+            vec!["--workspace-glob", "/work/scratch/**"],
+            vec!["--older-than", "90d"],
+            vec![
+                "--source-glob",
+                "**/rollout-*.jsonl",
+                "--workspace-glob",
+                "/work/scratch/**",
+                "--older-than",
+                "90d",
+            ],
+        ] {
+            let mut args = vec!["cass", "forget"];
+            args.extend(selectors);
+            args.push("--json");
+            let cli = Cli::try_parse_from(args).expect("valid forget selectors");
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Forget { apply: false, .. })
+            ));
+        }
+        let filter = forget_filter(
+            Some(" **/*.jsonl "),
+            Some("/work/*"),
+            Some("2d"),
+            200_000_000,
+        )
+        .expect("valid selection");
+        assert_eq!(filter.source_glob, Some("**/*.jsonl"));
+        assert_eq!(filter.workspace_glob, Some("/work/*"));
+        assert_eq!(filter.before_ms, Some(27_200_000));
+    }
+
+    #[test]
+    fn forget_rejects_invalid_selectors_before_storage() {
+        for pattern in ["", "   ", "["] {
+            assert!(forget_filter(Some(pattern), None, None, 0).is_err());
+            assert!(forget_filter(None, Some(pattern), None, 0).is_err());
+        }
+        for duration in [
+            "",
+            "yesterday",
+            "-1d",
+            "1.5d",
+            "90fortnights",
+            "9223372036854775807d",
+        ] {
+            assert!(forget_filter(None, None, Some(duration), 0).is_err());
+        }
+        assert!(forget_filter(None, None, Some("1s"), i64::MIN).is_err());
+        assert_eq!(
+            forget_filter(None, None, Some("0s"), 42)
+                .expect("explicit zero age")
+                .before_ms,
+            Some(42)
+        );
+    }
+}
+
+/// Prune an explicitly selected subset of archived conversations. Preview
+/// opens strictly read-only; apply holds maintenance ownership through both
+/// canonical deletion and publication of the replacement search generation.
 fn run_forget_command(
-    source_glob: String,
+    source_glob: Option<String>,
+    workspace_glob: Option<String>,
+    older_than: Option<String>,
     db_override: Option<PathBuf>,
     apply: bool,
     cli: &Cli,
@@ -9975,6 +10128,12 @@ fn run_forget_command(
 ) -> CliResult<()> {
     use crate::storage::sqlite::FrankenStorage;
 
+    let filter = forget_filter(
+        source_glob.as_deref(),
+        workspace_glob.as_deref(),
+        older_than.as_deref(),
+        chrono::Utc::now().timestamp_millis(),
+    )?;
     let db_path = db_override
         .or_else(|| cli.db.clone())
         .unwrap_or_else(default_db_path);
@@ -10010,7 +10169,39 @@ fn run_forget_command(
         });
     }
 
-    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+    // An active-owner probe alone races a new index/daemon job. Acquire the
+    // same data-directory and archive writer leases as indexing, and keep
+    // them until all derived assets have stopped serving the deleted rows.
+    let _mutation_guard = apply
+        .then(|| {
+            crate::indexer::acquire_search_maintenance_mutation_lock(
+                &data_dir,
+                &db_path,
+                crate::search::asset_state::SearchMaintenanceJobKind::LexicalRefresh,
+            )
+            .map_err(|error| {
+                let detail = format!("{error:#}");
+                if error_chain_indicates_active_cass_index(&detail) {
+                    return active_index_run_details(&data_dir, &db_path)
+                        .map(|details| details.to_cli_error())
+                        .unwrap_or_else(|| index_storage_contention_cli_error(&detail));
+                }
+                CliError {
+                    code: 5,
+                    kind: "forget",
+                    message: format!("failed to acquire forget maintenance lock: {detail}"),
+                    hint: Some(format!("Check permissions under {}.", data_dir.display())),
+                    retryable: true,
+                }
+            })
+        })
+        .transpose()?;
+    let storage = if apply {
+        FrankenStorage::open(&db_path)
+    } else {
+        FrankenStorage::open_strict_readonly(&db_path)
+    }
+    .map_err(|e| CliError {
         code: 5,
         kind: "forget",
         message: format!("failed to open canonical database: {e}"),
@@ -10019,13 +10210,13 @@ fn run_forget_command(
     })?;
 
     let report = storage
-        .forget_conversations_by_source_glob(&source_glob, !apply)
+        .forget_conversations(&filter, !apply)
         .map_err(|e| CliError {
             code: 5,
             kind: "forget",
             message: format!("forget failed: {e}"),
             hint: Some(
-                "Run `cass forget --source-glob <pat> --json` (dry-run) first to inspect matches."
+                "Preview the same selectors with `cass forget ... --json` before adding --apply."
                     .to_string(),
             ),
             retryable: false,
@@ -10086,16 +10277,27 @@ fn run_forget_command(
     // analytics and daily-stats tables; close through the checkpointing path
     // so the next opener does not replay all of that from the WAL. A dry run
     // wrote nothing and must not checkpoint anything.
-    if apply
-        && let Err(err) =
+    if apply {
+        if let Err(err) =
             crate::indexer::close_storage_with_wal_checkpoint(storage, &db_path, "forget")
-    {
-        tracing::warn!(
-            error = %format!("{err:#}"),
-            db_path = %db_path.display(),
-            "forget: final WAL checkpoint did not complete"
-        );
-        eprintln!("Warning: final WAL checkpoint after forget did not complete: {err:#}");
+        {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                db_path = %db_path.display(),
+                "forget: final WAL checkpoint did not complete"
+            );
+            eprintln!("Warning: final WAL checkpoint after forget did not complete: {err:#}");
+        }
+    } else {
+        storage
+            .close_without_checkpoint()
+            .map_err(|error| CliError {
+                code: 5,
+                kind: "forget",
+                message: format!("failed to close forget preview: {error}"),
+                hint: None,
+                retryable: false,
+            })?;
     }
 
     if let Some(remaining_conversations) = remaining_conversations {
@@ -10146,6 +10348,7 @@ fn run_forget_command(
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("schema_version".to_string(), serde_json::json!(1));
             obj.insert("applied".to_string(), serde_json::json!(apply));
+            obj.insert("older_than".to_string(), serde_json::json!(older_than));
             obj.insert(
                 "db_path".to_string(),
                 serde_json::json!(db_path.display().to_string()),
@@ -10154,7 +10357,7 @@ fn run_forget_command(
         return output_structured_value(payload, fmt);
     }
 
-    println!("CASS Forget (prune conversations by source glob)");
+    println!("CASS Forget (prune selected conversations)");
     println!("================================================");
     println!();
     println!(
@@ -10165,7 +10368,19 @@ fn run_forget_command(
             "dry-run (inspect only)"
         }
     );
-    println!("Pattern: {}", report.pattern);
+    if let Some(pattern) = &report.source_glob {
+        println!("Source glob: {pattern}");
+    }
+    if let Some(pattern) = &report.workspace_glob {
+        println!("Workspace glob: {pattern}");
+    }
+    if let Some(cutoff) = report.before_ms {
+        let cutoff = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(cutoff)
+            .map(|time| time.to_rfc3339())
+            .unwrap_or_else(|| format!("{cutoff} ms since the Unix epoch"));
+        println!("Last message before: {cutoff} (unknown message times are kept)");
+    }
+    println!("All supplied selectors must match.");
     println!();
     println!(
         "Matched conversations: {} ({} messages)",
@@ -27301,6 +27516,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT=<N>  defer full raw-mirror hashing above this manifest count (default 256)".to_string(),
             "  CASS_DOCTOR_WAL_CHECKPOINT_TIMEOUT_SECS=<N>  wall-clock budget in seconds for `cass doctor --fix` WAL checkpoint (default 120; 0 keeps default)".to_string(),
             "  CASS_EXCLUDE_PATHS=p1,p2                 comma/newline-delimited files or directory prefixes to skip without advancing scan/watch watermarks".to_string(),
+            "  CASS_EXCLUDE_WORKSPACES=g1,g2            comma/newline-delimited workspace globs to exclude from future ingestion; scan watermarks advance, policy changes revisit sources".to_string(),
             "  CASS_FTS_INLINE_BUDGET_SECS=<N>          wall-clock budget in seconds per index run for inline fts_messages shadow writes (default 300; 0 disables)".to_string(),
             "  CASS_FTS_REPAIR_PAGE_BUDGET_SECS=<N>     per-page budget in seconds for paged fts_messages shadow repair/rebuild (default 120; 0 disables)".to_string(),
             "  CASS_FTS_SHADOW_MAX_MESSAGES=<N>         max indexable message count for retaining the fts_messages SQL-fallback shadow (default 100000; 0 disables)".to_string(),
@@ -97888,6 +98104,16 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
         ),
         env_var_capability("CASS_DATA_DIR", None, "Override the cass data directory."),
         env_var_capability("CASS_DB_PATH", None, "Override the SQLite database path."),
+        env_var_capability(
+            "CASS_EXCLUDE_PATHS",
+            None,
+            "Comma/newline-separated source files or directory prefixes to exclude from future ingestion and raw capture. Holds scan/watch watermarks; existing archived history remains searchable. Use cass forget to remove indexed copies.",
+        ),
+        env_var_capability(
+            "CASS_EXCLUDE_WORKSPACES",
+            None,
+            "Comma/newline-separated workspace globs to exclude from future ingestion. Scan watermarks advance; changing the policy revisits sources. Existing history and shared raw-store captures remain; use cass forget --workspace-glob and cass mirror prune for explicit cleanup.",
+        ),
         env_var_capability(
             "CASS_OUTPUT_FORMAT",
             None,

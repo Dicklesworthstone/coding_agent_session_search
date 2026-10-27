@@ -3,13 +3,13 @@
 //! Exact-schema restoration remains the default. Cross-version restoration is
 //! deliberately allowlisted rather than inferred from "compatible-looking" SQL
 //! shapes: data backfills can be semantically required even when columns appear
-//! additive. The reviewed bridges are storage schema v20 and v21 -> v22.
+//! additive. The reviewed bridges are storage schema v20, v21 and v22 -> v23.
 //! Repository migration fixtures establish what each step adds. v21 adds the
 //! conversation-context index. v22 adds the `forgotten_sources` table, the
-//! `cass forget` tombstones. An archive older than v22 cannot carry rows for
-//! that table, so a migrated archive gets it empty, which is the state an
-//! in-place v21 -> v22 upgrade leaves. Every other canonical table layout is
-//! unchanged.
+//! `cass forget` source tombstones; v23 adds durable per-session tombstones in
+//! `forgotten_conversations`. Tables introduced after the source version start
+//! empty, as in an in-place upgrade. Existing source tombstones from v22 must
+//! be preserved. Every other canonical table layout is unchanged.
 //!
 //! The current initializer remains the sole executable schema authority. Archived
 //! `_schema_migrations` rows and `meta.schema_version` are verified as input but
@@ -39,11 +39,18 @@ const META_TABLE: &str = "meta";
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// Storage schema versions an archive may be migrated from, into
 /// [`REVIEWED_TARGET_VERSION`] only.
-const REVIEWED_SOURCE_VERSIONS: [u32; 2] = [20, 21];
-const REVIEWED_TARGET_VERSION: u32 = 22;
-/// Canonical tables the target added after every reviewed source. A migrated
-/// archive has no rows for them, and they must stay empty.
-const TABLES_ADDED_SINCE_REVIEWED_SOURCES: [&str; 1] = ["forgotten_sources"];
+const REVIEWED_SOURCE_VERSIONS: [u32; 3] = [20, 21, 22];
+const REVIEWED_TARGET_VERSION: u32 = 23;
+/// The introducing version is part of the bridge: a table already present in
+/// the source must be replayed and compared, never silently replaced by empty.
+const ADDED_CANONICAL_TABLES: [(&str, u32); 2] =
+    [("forgotten_sources", 22), ("forgotten_conversations", 23)];
+
+fn table_added_after_source(name: &str, source_version: u32) -> bool {
+    ADDED_CANONICAL_TABLES
+        .iter()
+        .any(|&(table, version)| table == name && version > source_version)
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SchemaMigrationReceipt {
@@ -236,16 +243,21 @@ fn inspect(file: &mut File, expected_archive_id: &str) -> Result<Inspected> {
 fn require_reviewed_table_layout(
     connection: &Connection,
     archived: &[Table],
+    source_version: u32,
 ) -> Result<Vec<Table>> {
     let (added, carried): (Vec<Table>, Vec<Table>) = export::tables(connection)?
         .into_iter()
-        .partition(|table| TABLES_ADDED_SINCE_REVIEWED_SOURCES.contains(&table.name.as_str()));
+        .partition(|table| table_added_after_source(&table.name, source_version));
     ensure!(
         archived == carried,
-        "reviewed migration to v{REVIEWED_TARGET_VERSION} requires canonical table/column/primary-key descriptors identical to the current ones, apart from tables added since v21; table drift is not authorized"
+        "reviewed migration to v{REVIEWED_TARGET_VERSION} requires canonical table/column/primary-key descriptors identical to the current ones, apart from tables added after v{source_version}; table drift is not authorized"
     );
     ensure!(
-        added.len() == TABLES_ADDED_SINCE_REVIEWED_SOURCES.len(),
+        added.len()
+            == ADDED_CANONICAL_TABLES
+                .iter()
+                .filter(|(_, version)| *version > source_version)
+                .count(),
         "current schema lacks a table the reviewed migration adds"
     );
     for table in &added {
@@ -397,7 +409,7 @@ fn restore_reviewed<R: BufRead>(
     let source_version = parse_source_version(&inspected.header)?;
     let target = target_version()?;
     require_reviewed_transition(source_version, target)?;
-    require_reviewed_table_layout(connection, &inspected.tables)?;
+    require_reviewed_table_layout(connection, &inspected.tables, source_version)?;
     verify_current_schema_authority(connection)?;
 
     let Some(Record::Header { header }) = input.record(1)? else {
@@ -881,7 +893,11 @@ fn verify_persisted_projection(
     }
     super::import::verify_database(&reader)?;
     verify_current_schema_authority(&reader)?;
-    require_reviewed_table_layout(&reader, &inspected.tables)?;
+    require_reviewed_table_layout(
+        &reader,
+        &inspected.tables,
+        parse_source_version(&inspected.header)?,
+    )?;
 
     file.seek(SeekFrom::Start(0))?;
     verify_projection_rows(&reader, BufReader::new(&mut *file), inspected)?;
@@ -912,8 +928,9 @@ fn migration_receipt(inspected: &Inspected) -> Result<SchemaMigrationReceipt> {
     require_reviewed_transition(source, target_version()?)?;
     Ok(SchemaMigrationReceipt {
         mode: match source {
-            20 => "reviewed_v20_to_v22",
-            21 => "reviewed_v21_to_v22",
+            20 => "reviewed_v20_to_v23",
+            21 => "reviewed_v21_to_v23",
+            22 => "reviewed_v22_to_v23",
             _ => bail!("no reviewed migration mode for storage schema {source}"),
         },
         from_storage_schema_version: inspected.header.storage_schema_version.clone(),
@@ -1244,7 +1261,7 @@ mod tests {
     fn projection_verifies_v1_v2_boundaries_and_current_or_reviewed_markers() -> Result<()> {
         let connection = projection_database("PRIVATE-BODY")?;
         for version in [codec::VERSION, codec::CHUNKED_VERSION] {
-            for source in [20, 21, REVIEWED_TARGET_VERSION] {
+            for source in [20, 21, 22, REVIEWED_TARGET_VERSION] {
                 let records =
                     projection_records(Some(Cell::Text(source.to_string())), "PRIVATE-BODY");
                 let (wire, inspected) = archive_wire(projection_header(version, source), &records)?;
@@ -1657,6 +1674,12 @@ mod tests {
             version: Some("v20-data".into()),
             kind: AgentKind::Cli,
         })?;
+        if source_version >= 22 {
+            storage.raw().execute(
+                "INSERT INTO forgotten_sources(source_path, size_bytes, mtime_ms, forgotten_at_ms)
+                 VALUES('/fixture/retained-forget.jsonl', 12, 34, 56)",
+            )?;
+        }
         drop(storage);
         if format_version == codec::SEQUENCE_VERSION {
             let writer = Connection::open(export::path_text(&source)?)?;
@@ -1696,10 +1719,7 @@ mod tests {
         })?)?;
 
         for mut table in export::tables(&connection)? {
-            if !carry_added_tables
-                && source_version < REVIEWED_TARGET_VERSION
-                && TABLES_ADDED_SINCE_REVIEWED_SOURCES.contains(&table.name.as_str())
-            {
+            if !carry_added_tables && table_added_after_source(&table.name, source_version) {
                 continue;
             }
             if descriptor_drift && table.name == "agents" {
@@ -1871,7 +1891,11 @@ mod tests {
 
     #[test]
     fn reviewed_migrations_restore_rows_under_current_authority() -> Result<()> {
-        for (source, mode) in [(20, "reviewed_v20_to_v22"), (21, "reviewed_v21_to_v22")] {
+        for (source, mode) in [
+            (20, "reviewed_v20_to_v23"),
+            (21, "reviewed_v21_to_v23"),
+            (22, "reviewed_v22_to_v23"),
+        ] {
             let root = tempfile::tempdir()?;
             let input = versioned_archive(root.path(), source, false, false)?;
             let destination = root.path().join("restored.db");
@@ -1895,11 +1919,29 @@ mod tests {
                 .query_row("SELECT slug, version FROM agents WHERE slug = 'migration-fixture'")?;
             assert_eq!(row.get_typed::<String>(0)?, "migration-fixture");
             assert_eq!(row.get_typed::<Option<String>>(1)?, Some("v20-data".into()));
-            // The table v22 added exists, empty, as an in-place upgrade leaves it.
+            // A v22 source's existing tombstone is canonical data. The newly
+            // introduced session table starts empty, as in an in-place upgrade.
             let forgotten = storage
                 .raw()
                 .query_row("SELECT COUNT(*) FROM forgotten_sources")?;
-            assert_eq!(forgotten.get_typed::<i64>(0)?, 0);
+            assert_eq!(forgotten.get_typed::<i64>(0)?, i64::from(source >= 22));
+            if source >= 22 {
+                let stamp = storage.raw().query_row("SELECT source_path, size_bytes, mtime_ms, forgotten_at_ms FROM forgotten_sources")?;
+                assert_eq!(
+                    stamp.get_typed::<String>(0)?,
+                    "/fixture/retained-forget.jsonl"
+                );
+                assert_eq!(stamp.get_typed::<i64>(1)?, 12);
+                assert_eq!(stamp.get_typed::<i64>(2)?, 34);
+                assert_eq!(stamp.get_typed::<i64>(3)?, 56);
+            }
+            assert_eq!(
+                storage
+                    .raw()
+                    .query_row("SELECT COUNT(*) FROM forgotten_conversations")?
+                    .get_typed::<i64>(0)?,
+                0
+            );
         }
         Ok(())
     }
@@ -1922,7 +1964,7 @@ mod tests {
     #[test]
     fn reviewed_v3_migration_preserves_allocation_and_refuses_sequence_only_conflicts() -> Result<()>
     {
-        for source_version in [20, 21] {
+        for source_version in [20, 21, 22] {
             let root = tempfile::tempdir()?;
             let input = versioned_archive_with_format(
                 root.path(),

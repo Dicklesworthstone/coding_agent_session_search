@@ -2771,7 +2771,7 @@ This means corrupted lexical data is a repairable derivative-state problem. Oper
 
 ### Database Schema Migrations
 
-The SQLite database uses 22 versioned schema migrations, tracked in the `_schema_migrations` table (`CURRENT_SCHEMA_VERSION = 22` and `MIGRATION_NAMES` in `src/storage/sqlite.rs`):
+The SQLite database uses 23 versioned schema migrations, tracked in the `_schema_migrations` table (`CURRENT_SCHEMA_VERSION = 23` and `MIGRATION_NAMES` in `src/storage/sqlite.rs`):
 
 | Version | Migration | Version | Migration |
 |---------|-----------|---------|-----------|
@@ -2785,7 +2785,8 @@ The SQLite database uses 22 versioned schema migrations, tracked in the `_schema
 | 8 | `daily_stats` | 19 | `conversation_external_lookup` |
 | 9 | `embedding_jobs` | 20 | `conversation_external_tail_lookup` |
 | 10 | `token_analytics` | 21 | `conversation_context_index` |
-| 11 | `message_metrics` | 22 | `forgotten_sources` (current) |
+| 11 | `message_metrics` | 22 | `forgotten_sources` |
+| — | — | 23 | `forgotten_conversations` (current; durable shared-store session tombstones) |
 
 **Migration Process**:
 1. On startup, `cass` checks `_schema_migrations` in the database (older databases that still record `schema_version` in the `meta` table are transitioned automatically)
@@ -3141,7 +3142,7 @@ Other subcommands (all present in the `Commands` enum in `src/lib.rs`):
 | `state` | Quick state/health check (alias of `status`) |
 | `onboarding` | Read-only first-run source onboarding + readiness wizard; `--json` for scripts, never launches the TUI |
 | `quarantine` | Inspect and manage the conversation-ingest quarantine: `list` (each excluded conversation, plus a `status` grouping by cause, version and retry eligibility with the next command), `retry` (bounded re-ingest plan; `--apply` runs it), `clear` |
-| `forget` | Prune already-indexed conversations by source-path glob; dry-run by default, `--apply` to commit. Deletes the canonical rows, then rebuilds FTS, analytics and the lexical index. Semantic vectors are not rewritten, so explicit semantic search then reports `semantic-unavailable` and hybrid falls back to lexical until `cass index --semantic` re-embeds from the canonical rows; no surface returns forgotten messages. `dedup --apply` and `sources agents exclude` behave the same way. It removes indexed copies, not source files: forget records each source's size and modification time, so an unchanged source stays forgotten across `cass index`, `--full` and rescans triggered by other sessions, but if its agent appends to it the whole conversation is indexed again. A store that keeps many sessions in one file (a SQLite database) counts as changed when any of its sessions changes. Delete or move the file to keep it out for good. The raw mirror keeps its verbatim capture of the source; once the source is gone, `cass mirror prune --older-than 0s --safety-hold-down 0s --source-path '<glob>' --apply` removes that capture too (a source still on disk is captured again by the next scan). A `cass serve` session opened before the forget keeps its pinned snapshot until `reload`; the TUI drops forgotten hits on its next search. If the lexical rebuild fails, forget exits 5 (`lexical-rebuild`) and `cass index --full` finishes the purge |
+| `forget` | Prune archived conversations with `--source-glob '<glob>'`, `--workspace-glob '<glob>'`, and/or `--older-than 90d`; at least one selector is required, and supplied selectors are ANDed. Preview is strictly read-only; add `--apply` to delete canonical rows and rebuild FTS, analytics and the lexical index under the indexing maintenance lock. Age means the last message time, strictly before the reported `before_ms` cutoff; sessions with missing message times are kept. Shared stores such as OpenCode/Devin SQLite databases use durable session identities, so forgotten sessions stay out when siblings change while retained siblings keep updating. Single-session files retain size/mtime tombstones: an unchanged file stays forgotten across incremental/full indexing, and a changed file is indexed again. Source files and raw-mirror captures remain. Use `CASS_EXCLUDE_PATHS` or `CASS_EXCLUDE_WORKSPACES` for prospective exclusion, and `cass mirror prune` for explicit raw-capture retention. Semantic vectors are not rewritten: explicit semantic search reports `semantic-unavailable` and hybrid falls back to lexical until `cass index --semantic` catches up. A previously opened `cass serve` keeps its pinned snapshot until `reload`; the TUI drops forgotten hits on its next search. If lexical rebuilding fails, forget exits 5 (`lexical-rebuild`) and the next index repairs the derived data |
 | `fleet upgrade-rehearsal` | Fleet-safe upgrade rehearsal (dry run) with bounded post-upgrade verification; `--live` opts in to SSH probes of configured remotes |
 | `lessons list\|search` | Mine and query durable, redacted lessons from local evidence (commits, closed beads, proof manifests) |
 | `import chatgpt` | Split a ChatGPT web export (`conversations.json`) into files the ChatGPT connector can index |
@@ -3528,7 +3529,24 @@ Update check state is stored in `update_state.json` in the data directory:
 
 - **Cache debug**: set `CASS_DEBUG_CACHE_METRICS=1` to emit cache hit/miss/shortfall/reload stats via tracing (debug level).
 
-- **Temporary scan exclusions**: `CASS_EXCLUDE_PATHS` accepts comma- or newline-delimited file paths or directory prefixes to keep out of the archive: no conversation from an excluded source is stored, indexed or raw-mirrored, whichever connector found it. The Claude Code, Codex, Codebuff and Pi readers skip an excluded file without opening it; other connectors read it, and cass discards its conversations before storing anything. Entries match whole path components (`sess` does not exclude `sessions`), a relative entry is taken from the working directory, and symlinks and other aliases of an existing directory are resolved on both sides, so a `..`, symlinked or (on Windows) differently-cased spelling of a directory excludes it too. While exclusions are active, CASS preserves scan/watch watermarks so excluded active session files are picked up after the exclusion is removed. An exclusion is prospective: conversations archived before it was set stay in the archive and stay searchable, because cass never deletes archived history on its own. To remove them, run `cass forget --source-glob '<glob>'` (a dry run until `--apply`).
+- **Temporary source exclusions**: `CASS_EXCLUDE_PATHS` accepts comma- or newline-delimited file paths or directory prefixes to keep out of the archive: no conversation from an excluded source is stored, indexed or raw-mirrored, whichever connector found it. The Claude Code, Codex, Codebuff and Pi readers skip an excluded file without opening it; other connectors read it, and cass discards its conversations before storing anything. Entries match whole path components (`sess` does not exclude `sessions`), a relative entry is taken from the working directory, and symlinks and other aliases of an existing directory are resolved on both sides, so a `..`, symlinked or (on Windows) differently-cased spelling of a directory excludes it too. While source exclusions are active, CASS preserves scan/watch watermarks so excluded active session files are picked up after the exclusion is removed. An exclusion is prospective: conversations archived before it was set stay in the archive and stay searchable, because cass never deletes archived history on its own. To remove them, run `cass forget --source-glob '<glob>'` (a dry run until `--apply`).
+- **Workspace exclusions**: `CASS_EXCLUDE_WORKSPACES` accepts comma- or newline-delimited, case-sensitive globs over recorded workspace paths, such as `/work/scratch/*,/work/retired/**`. It works even when source paths are date-sharded Codex rollouts or a shared OpenCode/Devin database. Missing workspaces do not match; invalid globs stop indexing with an error. Workspace exclusions allow normal scan watermarks and source-completion records to advance, so an excluded workspace does not force repeated historical scans. Changing or removing the policy revisits sources once. Existing archived conversations remain searchable; use `cass forget --workspace-glob '<glob>'` to remove them. Raw captures made before parsing a shared store can still contain excluded sessions; workspace exclusion is not erasure of raw evidence.
+
+Preview a selective cleanup, review the counts, and then repeat with `--apply`:
+
+```bash
+# Scratch history older than 90 days; both selectors must match.
+cass forget --workspace-glob '/work/scratch/*' --older-than 90d --json
+cass forget --workspace-glob '/work/scratch/*' --older-than 90d --json --apply
+
+# Exclude that workspace from future ingestion, while keeping scan progress.
+CASS_EXCLUDE_WORKSPACES='/work/scratch/*' cass index --json
+
+# Raw source captures have separate retention and their own preview.
+cass mirror prune --older-than 90d --json
+```
+
+Forgetting is always an explicit operation. CASS does not automatically delete old archived conversations. Source files remain on disk, and raw-mirror captures are governed separately by `mirror prune`; captures of a source still on disk may be made again by a later scan.
 - **Active session retries**: continuous watch mode retains paths skipped because they are still being written, including during startup, and retries them after the normal watch cooldown even without another filesystem event. `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` controls the recent-write window (default 120 seconds, maximum 3600); writer and advisory-lock checks still apply.
 
 - **Watch testing (dev only)**: `cass index --watch --watch-once path1,path2` triggers a single reindex without filesystem notify (also respects `CASS_TEST_WATCH_PATHS` for backward compatibility); useful for deterministic tests/smoke runs.

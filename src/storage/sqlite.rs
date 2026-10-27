@@ -4097,7 +4097,7 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 22;
+pub const CURRENT_SCHEMA_VERSION: i64 = 23;
 pub(crate) const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 const LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v2";
 const PREVIOUS_LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v1";
@@ -4822,6 +4822,20 @@ CREATE TABLE IF NOT EXISTS forgotten_sources (
     size_bytes INTEGER,
     mtime_ms INTEGER,
     forgotten_at_ms INTEGER NOT NULL
+);
+";
+
+const MIGRATION_V23: &str = r"
+-- Shared stores change whenever any session changes. Keep forgotten session
+-- identities independently of the store's file stamp (GH #537). These values
+-- deliberately do not reference rows that forgetting or agent removal deletes.
+CREATE TABLE IF NOT EXISTS forgotten_conversations (
+    source_id TEXT NOT NULL,
+    agent_slug TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    forgotten_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (source_id, agent_slug, source_path, external_id)
 );
 ";
 
@@ -6502,6 +6516,7 @@ const POST_TAIL_CACHE_MIGRATION_STEPS: &[(i64, &str, &str)] = &[
     (20, "conversation_external_tail_lookup", MIGRATION_V20),
     (21, "conversation_context_index", MIGRATION_V21),
     (22, "forgotten_sources", MIGRATION_V22),
+    (23, "forgotten_conversations", MIGRATION_V23),
 ];
 
 /// Migration versions that ordinary storage open may apply when their ledger
@@ -7431,6 +7446,11 @@ const CURRENT_SCHEMA_REPAIR_BATCHES: &[SchemaRepairBatch] = &[
         tables: &["forgotten_sources"],
         sql: MIGRATION_V22,
     },
+    SchemaRepairBatch {
+        name: "forgotten_conversations",
+        tables: &["forgotten_conversations"],
+        sql: MIGRATION_V23,
+    },
 ];
 
 fn current_schema_repair_batches_for_missing_tables(
@@ -7464,7 +7484,7 @@ fn current_schema_repair_batches_for_missing_tables(
 }
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 22] = [
+const MIGRATION_NAMES: [(i64, &str); 23] = [
     (1, "core_tables"),
     (2, "fts_messages"),
     (3, "fts_messages_rebuild"),
@@ -7487,6 +7507,7 @@ const MIGRATION_NAMES: [(i64, &str); 22] = [
     (20, "conversation_external_tail_lookup"),
     (21, "conversation_context_index"),
     (22, "forgotten_sources"),
+    (23, "forgotten_conversations"),
 ];
 
 /// Transitions an existing database from `meta` table schema versioning to the
@@ -7627,6 +7648,10 @@ const REQUIRED_CURRENT_SCHEMA_TABLE_PROBES: &[(&str, &str)] = &[
     (
         "forgotten_sources",
         "SELECT source_path FROM forgotten_sources LIMIT 1;",
+    ),
+    (
+        "forgotten_conversations",
+        "SELECT source_id, agent_slug, source_path, external_id FROM forgotten_conversations LIMIT 1;",
     ),
 ];
 
@@ -11112,21 +11137,6 @@ impl FrankenStorage {
         })
     }
 
-    /// `cass forget` (#292 ask #2): prune an already-indexed subset of
-    /// conversations whose `source_path` matches a glob pattern, from the
-    /// canonical DB. Child rows (messages, snippets, tags, etc.) cascade via
-    /// `ON DELETE CASCADE`; the two non-cascading external-lookup tables are
-    /// deleted explicitly, mirroring [`purge_agent_archive_data`].
-    ///
-    /// `dry_run=true` (the CLI default) inspects only — it returns the matched
-    /// conversation/message counts and a bounded sample of matched source paths
-    /// without mutating anything. `dry_run=false` performs the deletion in a
-    /// single transaction. The caller is responsible for rebuilding derived
-    /// assets (FTS/analytics) afterward, exactly as the agent-purge path does.
-    ///
-    /// Matching is done in Rust with the `glob` crate (not a SQL `GLOB`
-    /// operator) so the semantics are portable and deterministic across the
-    /// frankensqlite backend.
     /// Tombstones written by `cass forget --apply` (2l1b0.50), by source path.
     pub fn forgotten_source_stamps(&self) -> Result<HashMap<String, SourceFileStamp>> {
         let rows: Vec<(String, Option<i64>, Option<i64>)> = self.conn.query_map_collect(
@@ -11154,6 +11164,28 @@ impl FrankenStorage {
             .collect())
     }
 
+    /// Session tombstones survive changes to unrelated sessions in the same
+    /// source store. They are independent of both canonical row IDs and file
+    /// size/mtime, so neither a rescan nor a full index revives them.
+    pub fn forgotten_conversation_keys(&self) -> Result<HashSet<ForgottenConversationKey>> {
+        Ok(self
+            .conn
+            .query_map_collect(
+                "SELECT source_id, agent_slug, source_path, external_id FROM forgotten_conversations",
+                fparams![],
+                |row| {
+                    Ok(ForgottenConversationKey {
+                        source_id: row.get_typed(0)?,
+                        agent_slug: row.get_typed(1)?,
+                        source_path: row.get_typed(2)?,
+                        external_id: row.get_typed(3)?,
+                    })
+                },
+            )?
+            .into_iter()
+            .collect())
+    }
+
     /// Drops the tombstones of forgotten sources that changed since the
     /// forget, so their next ingest is permanent.
     pub fn clear_forgotten_sources(&self, paths: &[String]) -> Result<()> {
@@ -11173,99 +11205,248 @@ impl FrankenStorage {
         pattern: &str,
         dry_run: bool,
     ) -> Result<ForgetConversationsResult> {
-        let trimmed = pattern.trim();
-        if trimmed.is_empty() {
-            return Err(anyhow!("forget source-glob pattern cannot be empty"));
-        }
-        let glob = glob::Pattern::new(trimmed)
-            .with_context(|| format!("invalid forget source-glob pattern: {trimmed}"))?;
-
-        // Pull (id, source_path) for every conversation and match the glob in
-        // Rust. source_path may be NULL on legacy rows; those never match a
-        // path glob.
-        let rows: Vec<(i64, Option<String>)> = self.conn.query_map_collect(
-            "SELECT id, source_path FROM conversations ORDER BY id",
-            fparams![],
-            |row| {
-                Ok((
-                    row.get_typed::<i64>(0)?,
-                    row.get_typed::<Option<String>>(1)?,
-                ))
+        self.forget_conversations(
+            &ForgetConversationsFilter {
+                source_glob: Some(pattern),
+                ..Default::default()
             },
-        )?;
+            dry_run,
+        )
+    }
 
-        let mut matched_ids: Vec<i64> = Vec::new();
-        let mut sample_paths: Vec<String> = Vec::new();
-        let mut matched_paths: BTreeSet<String> = BTreeSet::new();
-        for (id, source_path) in rows {
-            let Some(path) = source_path else { continue };
-            if glob.matches(&path) {
-                matched_ids.push(id);
-                if sample_paths.len() < 20 {
-                    sample_paths.push(path.clone());
+    /// Select canonical conversations by intersecting source, workspace and
+    /// age predicates. One snapshot covers selection, tombstones and deletion;
+    /// a dry run uses only reads and explicitly releases its snapshot. The
+    /// caller rebuilds derived search/analytics assets after an applied change.
+    ///
+    /// Candidate envelopes and message aggregates are read in bounded pages.
+    /// No message body or metadata payload is hydrated for a preview, and no
+    /// SQL statement grows with the total number of selected conversations.
+    pub fn forget_conversations(
+        &self,
+        filter: &ForgetConversationsFilter<'_>,
+        dry_run: bool,
+    ) -> Result<ForgetConversationsResult> {
+        const PAGE_SIZE: usize = 256;
+        let parse_glob = |value: Option<&str>, label: &str| -> Result<Option<glob::Pattern>> {
+            value
+                .map(|pattern| {
+                    let trimmed = pattern.trim();
+                    if trimmed.is_empty() {
+                        bail!("forget {label} pattern cannot be empty");
+                    }
+                    glob::Pattern::new(trimmed)
+                        .with_context(|| format!("invalid forget {label} pattern: {trimmed}"))
+                })
+                .transpose()
+        };
+        let source_glob = parse_glob(filter.source_glob, "source-glob")?;
+        let workspace_glob = parse_glob(filter.workspace_glob, "workspace-glob")?;
+        if source_glob.is_none() && workspace_glob.is_none() && filter.before_ms.is_none() {
+            bail!("forget requires a source-glob, workspace-glob or age cutoff");
+        }
+
+        let mut report = ForgetConversationsResult {
+            pattern: filter.source_glob.unwrap_or_default().trim().to_owned(),
+            source_glob: filter.source_glob.map(|value| value.trim().to_owned()),
+            workspace_glob: filter.workspace_glob.map(|value| value.trim().to_owned()),
+            before_ms: filter.before_ms,
+            dry_run,
+            ..Default::default()
+        };
+        let mut tx = self.conn.transaction()?;
+        let mut next_id = i64::MIN;
+        let mut matched = Vec::new();
+        let mut selected_by_path: HashMap<String, usize> = HashMap::new();
+        loop {
+            let page: Vec<ForgetCandidate> = tx.query_map_collect(
+                "SELECT c.id, c.source_id, a.slug, c.source_path, c.external_id, w.path
+                 FROM conversations c
+                 JOIN agents a ON a.id = c.agent_id
+                 LEFT JOIN workspaces w ON w.id = c.workspace_id
+                 WHERE c.id >= ?1 ORDER BY c.id LIMIT 256",
+                fparams![next_id],
+                |row| {
+                    Ok(ForgetCandidate {
+                        id: row.get_typed(0)?,
+                        source_id: row.get_typed(1)?,
+                        agent_slug: row.get_typed(2)?,
+                        source_path: row.get_typed(3)?,
+                        external_id: row.get_typed(4)?,
+                        workspace: row.get_typed(5)?,
+                    })
+                },
+            )?;
+            let Some(last) = page.last() else { break };
+            let following_id = last.id.checked_add(1);
+            let candidates: Vec<_> = page
+                .into_iter()
+                .filter(|candidate| {
+                    source_glob.as_ref().is_none_or(|pattern| {
+                        candidate
+                            .source_path
+                            .as_deref()
+                            .is_some_and(|path| pattern.matches(path))
+                    }) && workspace_glob.as_ref().is_none_or(|pattern| {
+                        candidate
+                            .workspace
+                            .as_deref()
+                            .is_some_and(|path| pattern.matches(path))
+                    })
+                })
+                .collect();
+            if !candidates.is_empty() {
+                let placeholders = vec!["?"; candidates.len()].join(",");
+                let parameters: Vec<_> = candidates
+                    .iter()
+                    .map(|candidate| ParamValue::from(candidate.id))
+                    .collect();
+                let statistics: HashMap<i64, (i64, i64, Option<i64>)> = tx
+                    .query_map_collect(
+                        &format!(
+                            "SELECT conversation_id, COUNT(*), COUNT(created_at), MAX(created_at)
+                             FROM messages WHERE conversation_id IN ({placeholders})
+                             GROUP BY conversation_id"
+                        ),
+                        &parameters,
+                        |row| {
+                            Ok((
+                                row.get_typed(0)?,
+                                (row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?),
+                            ))
+                        },
+                    )?
+                    .into_iter()
+                    .collect();
+                for candidate in candidates {
+                    let (message_count, dated_count, latest) =
+                        statistics.get(&candidate.id).copied().unwrap_or_default();
+                    if filter.before_ms.is_some_and(|cutoff| {
+                        message_count == 0
+                            || dated_count != message_count
+                            || latest.is_none_or(|timestamp| timestamp >= cutoff)
+                    }) {
+                        continue;
+                    }
+                    report.messages_matched = report
+                        .messages_matched
+                        .checked_add(
+                            usize::try_from(message_count)
+                                .context("invalid matched message count")?,
+                        )
+                        .context("matched message count overflow")?;
+                    if let Some(path) = &candidate.source_path {
+                        *selected_by_path.entry(path.clone()).or_default() += 1;
+                        if report.sample_source_paths.len() < 20 {
+                            report.sample_source_paths.push(path.clone());
+                        }
+                    }
+                    matched.push(candidate);
                 }
-                matched_paths.insert(path);
+            }
+            let Some(following_id) = following_id else {
+                break;
+            };
+            next_id = following_id;
+        }
+        report.conversations_matched = matched.len();
+        if matched.is_empty() {
+            tx.rollback()?;
+            return Ok(report);
+        }
+
+        // Source-wide stamps must never suppress unselected siblings. Count
+        // all rows for only the matched paths, using bounded parameter lists.
+        let paths: Vec<_> = selected_by_path.keys().map(String::as_str).collect();
+        let mut total_by_path: HashMap<String, usize> = HashMap::new();
+        for page in paths.chunks(PAGE_SIZE) {
+            let placeholders = vec!["?"; page.len()].join(",");
+            let parameters: Vec<_> = page.iter().map(|path| ParamValue::from(*path)).collect();
+            let counts: Vec<(String, i64)> = tx.query_map_collect(
+                &format!("SELECT source_path, COUNT(*) FROM conversations WHERE source_path IN ({placeholders}) GROUP BY source_path"),
+                &parameters,
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )?;
+            for (path, count) in counts {
+                total_by_path.insert(
+                    path,
+                    usize::try_from(count).context("invalid source conversation count")?,
+                );
             }
         }
-
-        if matched_ids.is_empty() {
-            return Ok(ForgetConversationsResult {
-                pattern: trimmed.to_string(),
-                dry_run,
-                conversations_matched: 0,
-                messages_matched: 0,
-                conversations_deleted: 0,
-                sample_source_paths: Vec::new(),
-            });
+        // A source remains shared even after earlier forgets removed all but
+        // one of its sessions. A read-only v22 preview has no session table yet.
+        let previously_shared: HashSet<String> = if self.schema_version()? >= 23 {
+            tx.query_map_collect(
+                "SELECT source_path FROM forgotten_conversations",
+                fparams![],
+                |row| row.get_typed(0),
+            )?
+            .into_iter()
+            .collect()
+        } else {
+            HashSet::new()
+        };
+        let mut session_tombstones = Vec::new();
+        let mut file_tombstones = BTreeSet::new();
+        let mut session_only_paths = BTreeSet::new();
+        for candidate in &matched {
+            let Some(path) = &candidate.source_path else {
+                continue;
+            };
+            let total = *total_by_path
+                .get(path)
+                .context("matched source lost its conversation count")?;
+            let shared =
+                total > 1 || source_path_is_shared_store(path) || previously_shared.contains(path);
+            let external_id = candidate
+                .external_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty());
+            if shared && let Some(external_id) = external_id {
+                session_tombstones.push(ForgottenConversationKey {
+                    source_id: candidate.source_id.clone(),
+                    agent_slug: candidate.agent_slug.clone(),
+                    source_path: path.clone(),
+                    external_id: external_id.to_owned(),
+                });
+                session_only_paths.insert(path.clone());
+            } else {
+                if selected_by_path.get(path).copied() != Some(total) {
+                    bail!(
+                        "cannot forget only part of shared source {path}: a selected conversation has no stable external ID; select the entire source with --source-glob"
+                    );
+                }
+                file_tombstones.insert(path.clone());
+            }
         }
-
-        let id_list = matched_ids
-            .iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let messages_matched: i64 = self.conn.query_row_map(
-            &format!("SELECT COUNT(*) FROM messages WHERE conversation_id IN ({id_list})"),
-            fparams![],
-            |row| row.get_typed(0),
-        )?;
-
         if dry_run {
-            return Ok(ForgetConversationsResult {
-                pattern: trimmed.to_string(),
-                dry_run,
-                conversations_matched: matched_ids.len(),
-                messages_matched: messages_matched.max(0) as usize,
-                conversations_deleted: 0,
-                sample_source_paths: sample_paths,
-            });
+            tx.rollback()?;
+            return Ok(report);
         }
 
-        let mut tx = self.conn.transaction()?;
-        // Non-cascading external-lookup tables first (mirrors agent purge).
-        tx.execute_compat(
-            &format!(
-                "DELETE FROM conversation_external_lookup WHERE conversation_id IN ({id_list})"
-            ),
-            fparams![],
-        )?;
-        tx.execute_compat(
-            &format!(
-                "DELETE FROM conversation_external_tail_lookup WHERE conversation_id IN ({id_list})"
-            ),
-            fparams![],
-        )?;
-        // The remaining child tables (messages, snippets, tags, ...) cascade.
-        tx.execute_compat(
-            &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
-            fparams![],
-        )?;
-        clear_semantic_embed_watermark_after_deletion(&tx)?;
-        // Tombstone every forgotten source so a later scan (triggered by any
-        // sibling change) does not ingest it again while it is unchanged.
         let forgotten_at_ms = Self::now_millis();
-        for path in &matched_paths {
+        for key in &session_tombstones {
+            tx.execute_compat(
+                "INSERT OR REPLACE INTO forgotten_conversations
+                     (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                fparams![
+                    key.source_id.as_str(),
+                    key.agent_slug.as_str(),
+                    key.source_path.as_str(),
+                    key.external_id.as_str(),
+                    forgotten_at_ms
+                ],
+            )?;
+        }
+        for path in session_only_paths.difference(&file_tombstones) {
+            tx.execute_compat(
+                "DELETE FROM forgotten_sources WHERE source_path = ?1",
+                fparams![path.as_str()],
+            )?;
+        }
+        for path in &file_tombstones {
             let stamp = SourceFileStamp::of(Path::new(path));
             tx.execute_compat(
                 "INSERT OR REPLACE INTO forgotten_sources
@@ -11279,16 +11460,14 @@ impl FrankenStorage {
                 ],
             )?;
         }
+        for candidate in &matched {
+            delete_duplicate_conversation_rows(&tx, candidate.id)?;
+        }
+        clear_semantic_embed_watermark_after_deletion(&tx)?;
         tx.commit()?;
-
-        Ok(ForgetConversationsResult {
-            pattern: trimmed.to_string(),
-            dry_run,
-            conversations_matched: matched_ids.len(),
-            messages_matched: messages_matched.max(0) as usize,
-            conversations_deleted: matched_ids.len(),
-            sample_source_paths: sample_paths,
-        })
+        self.invalidate_fts_messages_present_cache();
+        report.conversations_deleted = matched.len();
+        Ok(report)
     }
 
     /// `coding_agent_session_search-uhhxy` (gh #302 ask #2): collapse
@@ -16951,6 +17130,28 @@ impl FrankenStorage {
             fparams![],
             |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
         )?.into_iter().collect())
+    }
+
+    /// Record a fully observed source whose final batch was intentionally
+    /// excluded by workspace policy or explicit forget tombstones. This is
+    /// separate from canonical batch completion: an arbitrary empty/failed
+    /// parser batch must still never advance a source's observation ledger.
+    pub(crate) fn record_filtered_source_completion(
+        &self,
+        completion: &SourceIngestLedgerEntry,
+    ) -> Result<()> {
+        if !completion.key.starts_with("source_ingest_v1:")
+            || completion.key.len() == "source_ingest_v1:".len()
+        {
+            bail!("source completion ledger key must name a source_ingest_v1 observation");
+        }
+        let mut tx = self.conn.transaction()?;
+        tx.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![completion.key.as_str(), completion.observation.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub(crate) fn insert_conversations_batched_with_source_completion(
@@ -23476,18 +23677,67 @@ pub struct AgentArchivePurgeResult {
     pub messages_deleted: usize,
 }
 
-/// Result of a `cass forget` source-glob prune (#292 ask #2). On a dry run the
+/// Selectors for an explicit `cass forget` operation. Present selectors are
+/// intersected, and an empty selection request is refused. `before_ms` is an
+/// absolute, exclusive cutoff for the latest message timestamp; conversations
+/// with no messages or any unknown message timestamp are kept.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ForgetConversationsFilter<'a> {
+    pub source_glob: Option<&'a str>,
+    pub workspace_glob: Option<&'a str>,
+    pub before_ms: Option<i64>,
+}
+
+/// A durable session identity in a source that can hold multiple conversations.
+/// Agent/source provenance prevents a same-named session in a different store
+/// from inheriting another conversation's tombstone.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ForgottenConversationKey {
+    pub source_id: String,
+    pub agent_slug: String,
+    pub source_path: String,
+    pub external_id: String,
+}
+
+/// Result of a `cass forget` prune (#292 ask #2, GH #537). On a dry run the
 /// `*_deleted` fields are zero and the `*_matched` fields report what WOULD be
 /// removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ForgetConversationsResult {
+    /// The source glob, retained for existing report consumers; empty when
+    /// selection uses workspace or age alone.
     pub pattern: String,
+    pub source_glob: Option<String>,
+    pub workspace_glob: Option<String>,
+    pub before_ms: Option<i64>,
     pub dry_run: bool,
     pub conversations_matched: usize,
     pub messages_matched: usize,
     pub conversations_deleted: usize,
     /// Bounded (<= 20) sample of matched source paths, for operator review.
     pub sample_source_paths: Vec<String>,
+}
+
+/// Only the narrow envelope needed to select and tombstone a conversation.
+/// Message bodies and wide metadata never enter a forget preview.
+struct ForgetCandidate {
+    id: i64,
+    source_id: String,
+    agent_slug: String,
+    source_path: Option<String>,
+    external_id: Option<String>,
+    workspace: Option<String>,
+}
+
+fn source_path_is_shared_store(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["db", "sqlite", "sqlite3", "vscdb"]
+                .iter()
+                .any(|known| extension.eq_ignore_ascii_case(known))
+        })
 }
 
 /// A source file's size and modification time, as `cass forget` recorded it
@@ -45832,6 +46082,450 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             Some(max_message_id),
             "a no-op forget must not force a semantic re-embed"
         );
+    }
+
+    fn forget_fixture_conversation(
+        source_path: &str,
+        external_id: Option<&str>,
+        workspace: Option<&str>,
+        timestamps: &[Option<i64>],
+    ) -> Conversation {
+        Conversation {
+            id: None,
+            agent_slug: "opencode".into(),
+            workspace: workspace.map(PathBuf::from),
+            external_id: external_id.map(str::to_owned),
+            title: external_id.map(str::to_owned),
+            source_path: PathBuf::from(source_path),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_001),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: timestamps
+                .iter()
+                .enumerate()
+                .map(|(idx, timestamp)| Message {
+                    id: None,
+                    idx: i64::try_from(idx).unwrap(),
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: *timestamp,
+                    content: format!(
+                        "retained {} message {idx}",
+                        external_id.unwrap_or("unknown")
+                    ),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                })
+                .collect(),
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        }
+    }
+
+    fn seed_forget_fixture(storage: &FrankenStorage, conversation: &Conversation) -> Result<i64> {
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: conversation.agent_slug.clone(),
+            name: conversation.agent_slug.clone(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let workspace_id = conversation
+            .workspace
+            .as_deref()
+            .map(|path| storage.ensure_workspace(path, None))
+            .transpose()?;
+        Ok(storage.insert_conversations_batched_with_analytics(
+            &[(agent_id, workspace_id, conversation)],
+            true,
+        )?[0]
+            .conversation_id)
+    }
+
+    #[test]
+    fn forget_selectors_intersect_and_age_uses_known_message_timestamps() -> Result<()> {
+        let directory = TempDir::new()?;
+        let path = directory.path().join("selectors.db");
+        let storage = FrankenStorage::open(&path)?;
+        let base = 1_700_000_000_000;
+        let fixtures = [
+            (
+                "retire-a",
+                Some("/work/scratch"),
+                vec![Some(base + 20), Some(base + 40)],
+            ),
+            (
+                "recent",
+                Some("/work/scratch"),
+                vec![Some(base + 20), Some(base + 200)],
+            ),
+            ("boundary", Some("/work/scratch"), vec![Some(base + 100)]),
+            ("unknown", Some("/work/scratch"), vec![None]),
+            (
+                "partly-unknown",
+                Some("/work/scratch"),
+                vec![Some(base + 20), None],
+            ),
+            ("empty", Some("/work/scratch"), vec![]),
+            ("no-workspace", None, vec![Some(base + 20)]),
+            (
+                "production",
+                Some("/work/production"),
+                vec![Some(base + 20)],
+            ),
+        ];
+        for (id, workspace, timestamps) in &fixtures {
+            seed_forget_fixture(
+                &storage,
+                &forget_fixture_conversation(
+                    &format!("/fixtures/{id}.jsonl"),
+                    Some(id),
+                    *workspace,
+                    timestamps,
+                ),
+            )?;
+        }
+        assert_eq!(storage.total_conversation_count()?, 8);
+        let source = ForgetConversationsFilter {
+            source_glob: Some("**/retire-*.jsonl"),
+            ..Default::default()
+        };
+        let workspace = ForgetConversationsFilter {
+            workspace_glob: Some("/work/scr*"),
+            ..Default::default()
+        };
+        let age = ForgetConversationsFilter {
+            before_ms: Some(base + 100),
+            ..Default::default()
+        };
+        assert_eq!(
+            storage
+                .forget_conversations(&source, true)?
+                .conversations_matched,
+            1
+        );
+        assert_eq!(
+            storage
+                .forget_conversations(&workspace, true)?
+                .conversations_matched,
+            6
+        );
+        assert_eq!(
+            storage
+                .forget_conversations(&age, true)?
+                .conversations_matched,
+            3
+        );
+        assert_eq!(
+            storage
+                .forget_conversations(
+                    &ForgetConversationsFilter {
+                        workspace_glob: Some("*"),
+                        ..Default::default()
+                    },
+                    true
+                )?
+                .conversations_matched,
+            7,
+            "an unknown workspace is not the empty string"
+        );
+        for filter in [
+            ForgetConversationsFilter::default(),
+            ForgetConversationsFilter {
+                source_glob: Some("["),
+                ..Default::default()
+            },
+            ForgetConversationsFilter {
+                workspace_glob: Some("  "),
+                ..Default::default()
+            },
+        ] {
+            assert!(storage.forget_conversations(&filter, true).is_err());
+        }
+        let intersection = ForgetConversationsFilter {
+            source_glob: source.source_glob,
+            workspace_glob: workspace.workspace_glob,
+            before_ms: age.before_ms,
+        };
+        let preview = storage.forget_conversations(&intersection, true)?;
+        assert_eq!(preview.conversations_matched, 1);
+        assert_eq!(preview.messages_matched, 2);
+        assert_eq!(preview.conversations_deleted, 0);
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        assert!(storage.forgotten_conversation_keys()?.is_empty());
+        assert_eq!(storage.total_conversation_count()?, 8);
+        let applied = storage.forget_conversations(&intersection, false)?;
+        assert_eq!(applied.conversations_deleted, 1);
+        assert_eq!(applied.messages_matched, preview.messages_matched);
+        assert_eq!(applied.before_ms, Some(base + 100));
+        assert_eq!(applied.workspace_glob.as_deref(), Some("/work/scr*"));
+        assert_eq!(storage.total_conversation_count()?, 7);
+        assert_eq!(storage.total_message_count()?, 8);
+        assert_eq!(storage.forgotten_source_stamps()?.len(), 1);
+        assert!(storage.forgotten_conversation_keys()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn forget_shared_store_records_session_identity_without_suppressing_siblings() -> Result<()> {
+        let directory = TempDir::new()?;
+        let path = directory.path().join("shared-store.db");
+        let storage = FrankenStorage::open(&path)?;
+        let source = "/fixture/opencode.db";
+        let forgotten = forget_fixture_conversation(
+            source,
+            Some("same-id"),
+            Some("/work/retired"),
+            &[Some(10)],
+        );
+        seed_forget_fixture(&storage, &forgotten)?;
+        let sibling_id = seed_forget_fixture(
+            &storage,
+            &forget_fixture_conversation(
+                source,
+                Some("kept-id"),
+                Some("/work/current"),
+                &[Some(20)],
+            ),
+        )?;
+        let mut remote =
+            forget_fixture_conversation(source, Some("same-id"), Some("/work/remote"), &[Some(30)]);
+        remote.source_id = "remote-fixture".into();
+        remote.origin_host = Some("remote-fixture".into());
+        let remote_id = seed_forget_fixture(&storage, &remote)?;
+        let filter = ForgetConversationsFilter {
+            workspace_glob: Some("/work/retired"),
+            ..Default::default()
+        };
+        assert_eq!(
+            storage
+                .forget_conversations(&filter, true)?
+                .conversations_matched,
+            1
+        );
+        assert!(storage.forgotten_conversation_keys()?.is_empty());
+        assert_eq!(
+            storage
+                .forget_conversations(&filter, false)?
+                .conversations_deleted,
+            1
+        );
+        assert_eq!(storage.fetch_messages(sibling_id)?.len(), 1);
+        assert_eq!(storage.fetch_messages(remote_id)?.len(), 1);
+        assert!(
+            storage.forgotten_source_stamps()?.is_empty(),
+            "a whole-file stamp would also suppress kept sessions"
+        );
+        let expected = HashSet::from([ForgottenConversationKey {
+            source_id: LOCAL_SOURCE_ID.into(),
+            agent_slug: "opencode".into(),
+            source_path: source.into(),
+            external_id: "same-id".into(),
+        }]);
+        assert_eq!(storage.forgotten_conversation_keys()?, expected);
+        storage.clear_forgotten_sources(&[source.into()])?;
+        storage.close()?;
+        let reopened = FrankenStorage::open(&path)?;
+        assert_eq!(reopened.forgotten_conversation_keys()?, expected);
+        assert_eq!(reopened.total_conversation_count()?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_recognizes_shared_json_even_after_only_one_session_remains() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("shared-json.db"))?;
+        let source = "/fixture/conversations.json";
+        for (session, workspace) in [("one", "/work/one"), ("two", "/work/two")] {
+            seed_forget_fixture(
+                &storage,
+                &forget_fixture_conversation(source, Some(session), Some(workspace), &[Some(10)]),
+            )?;
+        }
+        storage.forget_conversations(
+            &ForgetConversationsFilter {
+                workspace_glob: Some("/work/one"),
+                ..Default::default()
+            },
+            false,
+        )?;
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), 1);
+        assert_eq!(storage.total_conversation_count()?, 1);
+        storage.forget_conversations_by_source_glob(source, false)?;
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), 2);
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        assert_eq!(storage.total_conversation_count()?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_partial_shared_source_without_identity_is_refused_atomically() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("missing-identity.db"))?;
+        let source = "/fixture/shared.sqlite";
+        seed_forget_fixture(
+            &storage,
+            &forget_fixture_conversation(source, None, Some("/work/retired"), &[Some(10)]),
+        )?;
+        seed_forget_fixture(
+            &storage,
+            &forget_fixture_conversation(source, Some("kept"), Some("/work/current"), &[Some(20)]),
+        )?;
+        let filter = ForgetConversationsFilter {
+            workspace_glob: Some("/work/retired"),
+            ..Default::default()
+        };
+        for dry_run in [true, false] {
+            let error = storage.forget_conversations(&filter, dry_run).unwrap_err();
+            assert!(error.to_string().contains("no stable external ID"));
+            assert_eq!(storage.total_conversation_count()?, 2);
+            assert_eq!(storage.total_message_count()?, 2);
+            assert!(storage.forgotten_source_stamps()?.is_empty());
+            assert!(storage.forgotten_conversation_keys()?.is_empty());
+        }
+        assert_eq!(
+            storage
+                .forget_conversations_by_source_glob(source, false)?
+                .conversations_deleted,
+            2
+        );
+        assert_eq!(storage.forgotten_source_stamps()?.len(), 1);
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_selection_continues_past_an_unmatched_page() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("paged-forget.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "fixture".into(),
+            name: "Fixture".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let mut tx = storage.raw().transaction()?;
+        for id in 1..=257_i64 {
+            let source = if id == 257 {
+                "/fixture/selected.jsonl"
+            } else {
+                "/fixture/kept.jsonl"
+            };
+            tx.execute_compat(
+                "INSERT INTO conversations(id, agent_id, source_path, external_id) VALUES(?1, ?2, ?3, ?4)",
+                fparams![id, agent_id, source, id.to_string()],
+            )?;
+            tx.execute_compat(
+                "INSERT INTO messages(conversation_id, idx, role, created_at, content) VALUES(?1, 0, 'user', 1, 'retained fixture')",
+                fparams![id],
+            )?;
+        }
+        tx.commit()?;
+        let preview = storage.forget_conversations_by_source_glob("**/selected.jsonl", true)?;
+        assert_eq!(preview.conversations_matched, 1);
+        assert_eq!(preview.messages_matched, 1);
+        assert_eq!(storage.total_conversation_count()?, 257);
+        let applied = storage.forget_conversations_by_source_glob("**/selected.jsonl", false)?;
+        assert_eq!(applied.conversations_deleted, 1);
+        assert_eq!(storage.total_conversation_count()?, 256);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_v23_migration_preserves_existing_tombstones_and_readonly_preview() -> Result<()> {
+        let directory = TempDir::new()?;
+        let path = directory.path().join("v22-forget.db");
+        let conn = FrankenConnection::open(path.to_string_lossy().into_owned())?;
+        run_attributed_migration_steps(&conn, BASE_MIGRATION_STEPS)?;
+        apply_conversation_tail_state_cache_migration(&conn)?;
+        let old_steps: Vec<_> = POST_TAIL_CACHE_MIGRATION_STEPS
+            .iter()
+            .copied()
+            .filter(|(version, _, _)| *version <= 22)
+            .collect();
+        run_attributed_migration_steps(&conn, &old_steps)?;
+        let storage = FrankenStorage::new(conn, path.clone());
+        storage.apply_config()?;
+        storage.sync_meta_schema_version(22)?;
+        seed_forget_fixture(
+            &storage,
+            &forget_fixture_conversation(
+                "/fixture/current.jsonl",
+                Some("current"),
+                Some("/work/retired"),
+                &[Some(10)],
+            ),
+        )?;
+        storage.raw().execute("INSERT INTO forgotten_sources(source_path, forgotten_at_ms) VALUES('/fixture/already-forgotten.jsonl', 1)")?;
+        storage.close()?;
+
+        let reader = FrankenStorage::open_strict_readonly(&path)?;
+        let filter = ForgetConversationsFilter {
+            workspace_glob: Some("/work/retired"),
+            ..Default::default()
+        };
+        assert_eq!(
+            reader
+                .forget_conversations(&filter, true)?
+                .conversations_matched,
+            1
+        );
+        assert_eq!(reader.schema_version()?, 22);
+        assert!(
+            reader
+                .raw()
+                .query("SELECT name FROM sqlite_master WHERE name = 'forgotten_conversations'")?
+                .is_empty()
+        );
+        reader.close_without_checkpoint()?;
+
+        let migrated = FrankenStorage::open(&path)?;
+        assert_eq!(migrated.schema_version()?, 23);
+        assert_eq!(migrated.total_conversation_count()?, 1);
+        assert_eq!(migrated.total_message_count()?, 1);
+        assert_eq!(migrated.forgotten_source_stamps()?.len(), 1);
+        assert!(migrated.forgotten_conversation_keys()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn forget_filtered_source_completion_is_durable_and_rejects_foreign_keys() -> Result<()> {
+        let directory = TempDir::new()?;
+        let path = directory.path().join("filtered-source.db");
+        let storage = FrankenStorage::open(&path)?;
+        let completion = SourceIngestLedgerEntry {
+            key: "source_ingest_v1:excluded".into(),
+            observation: "observed and intentionally excluded".into(),
+        };
+        assert!(
+            storage
+                .insert_conversations_batched_with_source_completion(&[], &completion)
+                .is_err()
+        );
+        storage.record_filtered_source_completion(&completion)?;
+        for key in ["schema_version", "source_ingest_v1:"] {
+            assert!(
+                storage
+                    .record_filtered_source_completion(&SourceIngestLedgerEntry {
+                        key: key.into(),
+                        observation: "invalid".into(),
+                    })
+                    .is_err()
+            );
+        }
+        assert_eq!(storage.schema_version()?, CURRENT_SCHEMA_VERSION);
+        storage.close()?;
+        let reopened = FrankenStorage::open(&path)?;
+        assert_eq!(
+            reopened
+                .source_ingest_ledger_entries()?
+                .get(&completion.key),
+            Some(&completion.observation)
+        );
+        assert_eq!(reopened.total_conversation_count()?, 0);
+        Ok(())
     }
 
     /// Regression for cass#202: a `Connection` dropped mid-transaction can
