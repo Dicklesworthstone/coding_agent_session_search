@@ -80,6 +80,86 @@ fn measured_usage(root: &Path) -> Result<u64> {
     Ok(total)
 }
 
+/// Mirror usage from `measured_usage`, shared by every capture in this
+/// process. A walk per capture made indexing quadratic in mirror files: at
+/// 13,500 sessions each capture stat-ed ~40,000 files and a full index slowed
+/// from 12 to 2.6 sessions/s. A walk is reused until it is older than
+/// max(60 s, 20 times its own duration), and a prune in this process drops it.
+/// Admissions add their reservations, which count 4 KiB per file and so
+/// overstate small files; the shared total therefore only admits (it can admit
+/// late, never early), and only with an eighth of the cap to spare. It refuses
+/// only when the walked bytes alone exceed the cap by that eighth. Every
+/// other decision walks first.
+static MEASURED_USAGE: OnceLock<Mutex<HashMap<PathBuf, MeasuredUsage>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy)]
+struct MeasuredUsage {
+    /// Bytes found by the last walk.
+    measured: u64,
+    /// Bytes reserved by admissions since that walk.
+    admitted: u64,
+    measured_at: std::time::Instant,
+    walk: Duration,
+    walks: u64,
+}
+
+fn measured_usage_cache() -> std::sync::MutexGuard<'static, HashMap<PathBuf, MeasuredUsage>> {
+    MEASURED_USAGE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Usage to admit `bytes` against under `policy`: the shared total when it
+/// decides clearly (see MEASURED_USAGE), otherwise a new walk.
+fn shared_usage(root: &Path, policy: RawMirrorRetentionPolicy, bytes: u64) -> Result<u64> {
+    let mut cache = measured_usage_cache();
+    let previous = cache.get(root).copied();
+    if let Some(entry) = previous {
+        let refresh_after = entry.walk.saturating_mul(20).max(Duration::from_secs(60));
+        let margin = policy.max_bytes / 8;
+        let request = bytes.saturating_add(4096);
+        let estimated = entry.measured.saturating_add(entry.admitted);
+        if entry.measured_at.elapsed() < refresh_after {
+            if estimated.saturating_add(request) < policy.max_bytes.saturating_sub(margin) {
+                return Ok(estimated);
+            }
+            if entry.measured.saturating_add(request) > policy.max_bytes.saturating_add(margin) {
+                return Ok(entry.measured);
+            }
+        }
+    }
+    let started = std::time::Instant::now();
+    let measured = measured_usage(root)?;
+    cache.insert(
+        root.to_path_buf(),
+        MeasuredUsage {
+            measured,
+            admitted: 0,
+            measured_at: std::time::Instant::now(),
+            walk: started.elapsed(),
+            walks: previous.map_or(0, |entry| entry.walks) + 1,
+        },
+    );
+    Ok(measured)
+}
+
+fn record_admitted_usage(root: &Path, used: u64) {
+    if let Some(entry) = measured_usage_cache().get_mut(root) {
+        entry.admitted = used.saturating_sub(entry.measured);
+    }
+}
+
+/// A prune in this process removes files, so the next admission walks again.
+pub(super) fn forget_measured_usage(root: &Path) {
+    measured_usage_cache().remove(root);
+}
+
+#[cfg(test)]
+fn measured_usage_walks(root: &Path) -> u64 {
+    measured_usage_cache().get(root).map_or(0, |entry| entry.walks)
+}
+
 struct Budget<'a> {
     root: &'a Path,
     policy: RawMirrorRetentionPolicy,
@@ -115,10 +195,12 @@ impl Budget<'_> {
     fn reserve(&mut self, bytes: u64) -> Result<()> {
         // A cache hit that makes no writes must not rescan the entire mirror.
         if !self.inventoried {
-            self.used = measured_usage(self.root)?;
+            self.used = shared_usage(self.root, self.policy, bytes)?;
             self.inventoried = true;
         }
-        self.reserve_with_available(bytes, fs2::available_space(self.root)?)
+        self.reserve_with_available(bytes, fs2::available_space(self.root)?)?;
+        record_admitted_usage(self.root, self.used);
+        Ok(())
     }
 }
 

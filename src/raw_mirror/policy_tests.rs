@@ -211,3 +211,59 @@ fn admission_refuses_symlinked_inventory_without_following_it() {
     assert!(measured_usage(&root).is_err());
     assert_eq!(fs::read(outside).unwrap(), b"private evidence");
 }
+
+/// Indexing captured every session after walking the whole mirror, which made
+/// a full index quadratic in mirror files. Captures far from the cap share one
+/// walk; the shared total still refuses past the cap.
+#[test]
+fn captures_far_from_the_cap_share_one_inventory_walk() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let cap = 1024 * 1024 * 1024;
+    for session in 0..40 {
+        let source = temp.path().join(format!("session-{session}.jsonl"));
+        fs::write(&source, transcript(session, 2 * 1024)).unwrap();
+        capture(input(&data, &source), CHUNK as u64, CHUNK, policy(cap)).unwrap();
+    }
+    let root = raw_mirror_root(&data);
+    assert_eq!(measured_usage_walks(&root), 1, "one walk for 40 new sessions");
+    assert_eq!(storage_summary(&data).manifest_count, 40);
+
+    // Admission close to the cap measures again, and refuses on the measured
+    // total rather than the shared one.
+    let used = measured_usage(&root).unwrap();
+    let source = temp.path().join("one-more.jsonl");
+    fs::write(&source, transcript(99, 16 * 1024)).unwrap();
+    let error = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(used + 8192)).unwrap_err();
+    let paused = error.downcast_ref::<RawMirrorCapturePaused>().expect("paused");
+    assert_eq!(paused.used_bytes, used);
+    assert_eq!(measured_usage_walks(&root), 2);
+
+    // A mirror already far over the cap refuses on the walked bytes without
+    // walking again: every capture of a paused archive used to walk it.
+    let error = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(used / 4)).unwrap_err();
+    assert_eq!(error.downcast_ref::<RawMirrorCapturePaused>().expect("paused").used_bytes, used);
+    assert_eq!(measured_usage_walks(&root), 2);
+}
+
+/// A prune in this process deletes files the shared total still counts, so the
+/// next admission must walk again instead of refusing on the stale total.
+#[test]
+fn a_prune_drops_the_shared_inventory() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let source = temp.path().join("session.jsonl");
+    fs::write(&source, transcript(0, 4 * 1024)).unwrap();
+    capture(input(&data, &source), CHUNK as u64, CHUNK, policy(1024 * 1024 * 1024)).unwrap();
+    let root = raw_mirror_root(&data);
+    assert_eq!(measured_usage_walks(&root), 1);
+    let report = prune(&data, RawMirrorPruneOptions {
+        older_than_ms: Some(0), max_size_bytes: None, providers: Vec::new(), source_path: None,
+        keep_tags: Vec::new(), keep_latest: None, safety_hold_down_ms: 0, apply: true,
+    }).unwrap();
+    assert_eq!(report.applied_manifest_count, 1, "{report:?}");
+    assert_eq!(measured_usage_walks(&root), 0, "the prune dropped the shared total");
+    fs::write(&source, transcript(1, 4 * 1024)).unwrap();
+    capture(input(&data, &source), CHUNK as u64, CHUNK, policy(1024 * 1024 * 1024)).unwrap();
+    assert_eq!(measured_usage_walks(&root), 1, "the next admission walked again");
+}

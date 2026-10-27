@@ -881,6 +881,7 @@ fn apply_prune_entries(
     audit_path: &Path,
     audit_file: &mut File,
 ) -> Result<()> {
+    policy::forget_measured_usage(root);
     append_prune_audit_records(audit_file, audit_path, &report.entries, "intent")?;
     for entry in &mut report.entries {
         let path = root.join(&entry.path);
