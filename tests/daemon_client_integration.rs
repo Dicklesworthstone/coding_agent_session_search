@@ -1332,12 +1332,13 @@ mod indexer_process_coexistence {
         }
 
         fn prepare_v21_schema(&self) -> Result<()> {
-            // V22 adds only this empty table. Remove the actual schema object
-            // as well as its ledger entry so the next open must really migrate.
+            // V22 and V23 add the source and session tombstone tables. Remove
+            // both objects and their ledger entries so this is really V21.
             let connection = Connection::open(self.db.to_string_lossy())?;
             connection.execute_batch(
-                "DROP TABLE forgotten_sources; \
-                 DELETE FROM _schema_migrations WHERE version = 22; \
+                "DROP TABLE forgotten_conversations; \
+                 DROP TABLE forgotten_sources; \
+                 DELETE FROM _schema_migrations WHERE version > 21; \
                  UPDATE meta SET value = '21' WHERE key = 'schema_version';",
             )?;
             assert_eq!(

@@ -1680,6 +1680,13 @@ mod tests {
                  VALUES('/fixture/retained-forget.jsonl', 12, 34, 56)",
             )?;
         }
+        if source_version >= 23 {
+            storage.raw().execute(
+                "INSERT INTO forgotten_conversations
+                    (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+                 VALUES('local', 'opencode', '/fixture/store.db', 'forgotten-session', 78)",
+            )?;
+        }
         drop(storage);
         if format_version == codec::SEQUENCE_VERSION {
             let writer = Connection::open(export::path_text(&source)?)?;
@@ -1962,6 +1969,58 @@ mod tests {
     }
 
     #[test]
+    fn exact_v23_restore_preserves_session_tombstones_and_retries_read_only() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let input = versioned_archive(root.path(), 23, false, false)?;
+        let destination = root.path().join("restored.db");
+        let outcome = import_compatible(&input, &destination, "reviewed-migration", false)?;
+        assert!(outcome.migration.is_none());
+        let storage = SqliteStorage::open_readonly(&destination)?;
+        let tombstones = storage.forgotten_conversation_keys()?;
+        assert_eq!(tombstones.len(), 1);
+        let key = tombstones
+            .iter()
+            .next()
+            .context("session tombstone missing")?;
+        assert_eq!(key.source_id, "local");
+        assert_eq!(key.agent_slug, "opencode");
+        assert_eq!(key.source_path, "/fixture/store.db");
+        assert_eq!(key.external_id, "forgotten-session");
+        assert_eq!(
+            storage
+                .raw()
+                .query_row("SELECT forgotten_at_ms FROM forgotten_conversations")?
+                .get_typed::<i64>(0)?,
+            78
+        );
+        drop(storage);
+        let before = database_files(&destination);
+        let repeated = import_compatible(&input, &destination, "reviewed-migration", true)?;
+        assert!(!repeated.created);
+        assert_eq!(before, database_files(&destination));
+        Ok(())
+    }
+
+    #[test]
+    fn v22_retry_refuses_new_session_tombstones_and_preserves_them() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let input = versioned_archive(root.path(), 22, false, false)?;
+        let destination = root.path().join("restored.db");
+        import_compatible(&input, &destination, "reviewed-migration", false)?;
+        let writer = Connection::open(export::path_text(&destination)?)?;
+        writer.execute(
+            "INSERT INTO forgotten_conversations
+                 (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+             VALUES('local', 'devin', '/sessions.db/session', 'session', 1)",
+        )?;
+        writer.close()?;
+        let before = database_files(&destination);
+        assert!(import_compatible(&input, &destination, "reviewed-migration", true).is_err());
+        assert_eq!(before, database_files(&destination));
+        Ok(())
+    }
+
+    #[test]
     fn reviewed_v3_migration_preserves_allocation_and_refuses_sequence_only_conflicts() -> Result<()>
     {
         for source_version in [20, 21, 22] {
@@ -2025,7 +2084,7 @@ mod tests {
 
     #[test]
     fn reviewed_retry_rejects_sparse_current_history_even_when_projection_matches() -> Result<()> {
-        for source in [20, 21] {
+        for source in [20, 21, 22] {
             let root = tempfile::tempdir()?;
             let input = versioned_archive(root.path(), source, false, false)?;
             let destination = root.path().join("restored.db");
