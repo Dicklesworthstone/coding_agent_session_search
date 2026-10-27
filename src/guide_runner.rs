@@ -31,6 +31,7 @@ pub struct GuideRunRequest<'a> {
     pub source_kind: &'a str,
     pub fixture_context: Option<&'a Value>,
     pub data_dir: &'a Path,
+    pub db_path: Option<&'a Path>,
 }
 
 #[derive(Clone, Copy)]
@@ -50,6 +51,7 @@ enum Adapter {
     SupportEvidence,
     KeyPolicy,
     SupportBundle,
+    LexicalRepair,
     ObservationOnly,
 }
 
@@ -112,7 +114,7 @@ const ALLOWLIST: &[AllowedCommand] = &[
     AllowedCommand {
         id: "doctor.rebuild-stale-assets",
         mutation_class: "derived-asset-mutation",
-        adapter: Adapter::ObservationOnly,
+        adapter: Adapter::LexicalRepair,
     },
     AllowedCommand {
         id: "privacy.preview-exposure",
@@ -168,12 +170,43 @@ fn has_shell_metacharacter(token: &str) -> bool {
     })
 }
 
-fn allowlisted_argv(command: AllowedCommand, data_dir: &Path) -> Option<Vec<String>> {
-    let data_dir = data_dir.display().to_string();
+fn allowlisted_argv(
+    command: AllowedCommand,
+    data_dir: &Path,
+    db_path: Option<&Path>,
+) -> Option<Vec<String>> {
+    let default_db = data_dir.join("agent_search.db");
+    let db = db_path.unwrap_or(&default_db).to_str()?;
+    let data_dir = data_dir.to_str()?;
     let argv = match command.adapter {
-        Adapter::Readiness => vec!["cass", "health", "--data-dir", &data_dir, "--json"],
-        Adapter::DoctorTruth => vec!["cass", "doctor", "check", "--data-dir", &data_dir, "--json"],
-        Adapter::SearchCoverage => vec!["cass", "status", "--data-dir", &data_dir, "--json"],
+        Adapter::Readiness => vec![
+            "cass",
+            "health",
+            "--data-dir",
+            data_dir,
+            "--db",
+            db,
+            "--json",
+        ],
+        Adapter::DoctorTruth => vec![
+            "cass",
+            "doctor",
+            "check",
+            "--data-dir",
+            data_dir,
+            "--db",
+            db,
+            "--json",
+        ],
+        Adapter::SearchCoverage => vec![
+            "cass",
+            "status",
+            "--data-dir",
+            data_dir,
+            "--db",
+            db,
+            "--json",
+        ],
         Adapter::ResourcePlan => vec![
             "cass",
             "swarm",
@@ -183,14 +216,35 @@ fn allowlisted_argv(command: AllowedCommand, data_dir: &Path) -> Option<Vec<Stri
             "--json",
         ],
         Adapter::PrivacyPreview => vec!["cass", "swarm", "privacy-preview", "--json"],
-        Adapter::SupportEvidence => vec!["cass", "health", "--data-dir", &data_dir, "--json"],
+        Adapter::SupportEvidence => vec![
+            "cass",
+            "health",
+            "--data-dir",
+            data_dir,
+            "--db",
+            db,
+            "--json",
+        ],
         Adapter::KeyPolicy => vec!["cass-internal", "confirm-key-policy"],
         Adapter::SupportBundle => vec![
             "cass",
             "doctor",
             "support-bundle",
             "--data-dir",
-            &data_dir,
+            data_dir,
+            "--db",
+            db,
+            "--json",
+        ],
+        Adapter::LexicalRepair => vec![
+            "cass",
+            "index",
+            "--force-rebuild",
+            "--data-dir",
+            data_dir,
+            "--db",
+            db,
+            "--no-progress-events",
             "--json",
         ],
         Adapter::ObservationOnly => return None,
@@ -298,7 +352,7 @@ fn evaluate_read_only_proof(
                 | Adapter::SupportEvidence
         )
     {
-        return evaluate_live_proof(command, request.data_dir, deadline);
+        return evaluate_live_proof(command, request.data_dir, request.db_path, deadline);
     }
     if let Some(passed) = (request.source_kind == "fixture")
         .then(|| fixture_proof(request.fixture_context, proof_gate))
@@ -384,14 +438,15 @@ fn evaluate_read_only_proof(
             source: "operator-and-preflight",
             detail: "requires an available key and exact privacy-tier acceptance".to_string(),
         },
-        Adapter::SearchCoverage | Adapter::SupportBundle | Adapter::ObservationOnly => {
-            ProofResult {
-                result: "not-run",
-                observation: None,
-                source: "none",
-                detail: "no automatic read-only proof adapter".to_string(),
-            }
-        }
+        Adapter::SearchCoverage
+        | Adapter::SupportBundle
+        | Adapter::LexicalRepair
+        | Adapter::ObservationOnly => ProofResult {
+            result: "not-run",
+            observation: None,
+            source: "none",
+            detail: "no automatic read-only proof adapter".to_string(),
+        },
     }
 }
 
@@ -421,6 +476,21 @@ impl CommandFailure {
 /// Run the installed binary, never another `cass` selected by PATH. The shared
 /// supervisor bounds both captured streams and terminates timed-out children.
 fn run_bounded_cass(argv: &[String], timeout: Duration) -> Result<Output, CommandFailure> {
+    run_bounded_cass_with_scope(argv, timeout, false)
+}
+
+fn run_bounded_canonical_repair(
+    argv: &[String],
+    timeout: Duration,
+) -> Result<Output, CommandFailure> {
+    run_bounded_cass_with_scope(argv, timeout, true)
+}
+
+fn run_bounded_cass_with_scope(
+    argv: &[String],
+    timeout: Duration,
+    require_canonical_rebuild: bool,
+) -> Result<Output, CommandFailure> {
     let args = argv
         .get(1..)
         .filter(|args| !args.is_empty())
@@ -444,6 +514,9 @@ fn run_bounded_cass(argv: &[String], timeout: Duration) -> Result<Output, Comman
         .stderr(Stdio::piped())
         .env("CASS_AUTO_REFRESH", "0")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    if require_canonical_rebuild {
+        child.env("CASS_INDEX_REQUIRE_CANONICAL_REBUILD", "1");
+    }
     crate::sources::configure_child_process_group(&mut child);
     let child = child
         .spawn()
@@ -462,11 +535,16 @@ fn unavailable_live_proof(detail: impl Into<String>) -> ProofResult {
     }
 }
 
-fn evaluate_live_proof(command: AllowedCommand, data_dir: &Path, deadline: Instant) -> ProofResult {
+fn evaluate_live_proof(
+    command: AllowedCommand,
+    data_dir: &Path,
+    db_path: Option<&Path>,
+    deadline: Instant,
+) -> ProofResult {
     let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
         return unavailable_live_proof("shared live proof deadline exhausted; no child started");
     };
-    let Some(argv) = allowlisted_argv(command, data_dir) else {
+    let Some(argv) = allowlisted_argv(command, data_dir, db_path) else {
         return unavailable_live_proof("no safe argv for live proof");
     };
     let output = match run_bounded_cass(&argv, timeout) {
@@ -694,9 +772,254 @@ fn execute_support_bundle(argv: &[String], data_dir: &Path) -> MutationResult {
     }
 }
 
-fn execute_mutation(command: AllowedCommand, argv: &[String], data_dir: &Path) -> MutationResult {
+/// A lexical repair has a narrower postcondition than overall archive health:
+/// optional semantic assets and source-scan freshness remain separate concerns.
+/// Check the actual checkpoint and corpus binding, never only `healthy=true`.
+fn lexical_matches_canonical(payload: &Value) -> bool {
+    [
+        "/index/exists",
+        "/index/checkpoint/completed",
+        "/index/checkpoint/db_matches",
+        "/index/checkpoint/schema_matches",
+        "/index/checkpoint/page_size_compatible",
+        "/index/fingerprint/matches_current_db_fingerprint",
+    ]
+    .into_iter()
+    .all(|path| payload.pointer(path).and_then(Value::as_bool) == Some(true))
+        && [
+            "/index/rebuilding",
+            "/index/engine_incompatible",
+            "/index/hollow",
+            "/index/partial",
+        ]
+        .into_iter()
+        .all(|path| payload.pointer(path).and_then(Value::as_bool) == Some(false))
+        && payload
+            .pointer("/index/manifest_source")
+            .and_then(Value::as_str)
+            == Some("current")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LexicalRepairSnapshot {
+    conversations: u64,
+    messages: u64,
+    canonical_fingerprint: String,
+    lexical_ready: bool,
+    source_fresh: Option<bool>,
+}
+
+fn lexical_repair_snapshot(
+    exit_code: Option<i32>,
+    payload: &Value,
+    db_path: &Path,
+) -> Result<LexicalRepairSnapshot, &'static str> {
+    if !matches!(exit_code, Some(0 | 1))
+        || payload.get("error").is_some_and(|value| !value.is_null())
+        || payload.get("err").is_some_and(|value| !value.is_null())
+    {
+        return Err("lexical repair status probe did not complete successfully");
+    }
+    if payload.pointer("/database/path").and_then(Value::as_str) != db_path.to_str()
+        || payload.pointer("/database/exists").and_then(Value::as_bool) != Some(true)
+        || payload.pointer("/database/opened").and_then(Value::as_bool) != Some(true)
+        || payload
+            .pointer("/database/open_skipped")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || payload
+            .pointer("/database/counts_skipped")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || payload
+            .pointer("/database/integrity")
+            .and_then(Value::as_str)
+            != Some("ok")
+    {
+        return Err(
+            "lexical repair requires a readable, classified canonical archive in the selected scope",
+        );
+    }
+    if payload.pointer("/rebuild/active").and_then(Value::as_bool) != Some(false)
+        || payload
+            .pointer("/pending/watch_active")
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return Err("lexical repair is deferred while another index or watch operation is active");
+    }
+    let conversations = payload
+        .pointer("/database/conversations")
+        .and_then(Value::as_u64)
+        .filter(|count| *count > 0)
+        .ok_or("lexical repair requires a populated canonical archive; initialize it with cass index --full")?;
+    let messages = payload
+        .pointer("/database/messages")
+        .and_then(Value::as_u64)
+        .ok_or("lexical repair cannot verify the canonical message count")?;
+    let canonical_fingerprint = payload
+        .pointer("/index/fingerprint/current_db_fingerprint")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 1024)
+        .ok_or("lexical repair cannot bind the canonical archive identity")?
+        .to_string();
+    Ok(LexicalRepairSnapshot {
+        conversations,
+        messages,
+        canonical_fingerprint,
+        lexical_ready: lexical_matches_canonical(payload),
+        source_fresh: payload.pointer("/index/fresh").and_then(Value::as_bool),
+    })
+}
+
+fn read_lexical_repair_snapshot(
+    argv: &[String],
+    db_path: &Path,
+) -> Result<LexicalRepairSnapshot, &'static str> {
+    let output = run_bounded_cass(argv, Duration::from_secs(15)).map_err(|error| error.detail)?;
+    let payload = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "lexical repair status probe did not return valid JSON")?;
+    lexical_repair_snapshot(output.status.code(), &payload, db_path)
+}
+
+fn lexical_repair_receipt(snapshot: &LexicalRepairSnapshot) -> Value {
+    json!({
+        "scope": "canonical-lexical",
+        "conversations": snapshot.conversations,
+        "messages": snapshot.messages,
+        "canonical_fingerprint_blake3": blake3::hash(snapshot.canonical_fingerprint.as_bytes()).to_hex().to_string(),
+        "lexical_ready": snapshot.lexical_ready,
+        "source_scan_fresh": snapshot.source_fresh,
+        "sources_scanned": false,
+        "semantic_rebuilt": false,
+        "canonical_rebuild_required": true
+    })
+}
+
+fn classify_lexical_rebuild(exit_code: Option<i32>, stdout: &[u8]) -> Result<(), &'static str> {
+    if exit_code != Some(0) {
+        return Err(
+            "lexical rebuild did not complete; inspect cass status before retrying, as resumable staging may remain",
+        );
+    }
+    let payload: Value = serde_json::from_slice(stdout)
+        .map_err(|_| "lexical rebuild returned malformed output; completion is unverified")?;
+    if payload.get("error").is_some_and(|value| !value.is_null())
+        || payload.get("err").is_some_and(|value| !value.is_null())
+        || payload.get("success").and_then(Value::as_bool) != Some(true)
+        || payload.get("force_rebuild").and_then(Value::as_bool) != Some(true)
+        || payload.get("full").and_then(Value::as_bool) != Some(false)
+        || payload
+            .get("lexical_update_deferred")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || payload
+            .pointer("/indexing_stats/scan_ms")
+            .and_then(Value::as_u64)
+            != Some(0)
+        || payload
+            .pointer("/indexing_stats/lexical_strategy_reason")
+            .and_then(Value::as_str)
+            != Some("force_rebuild_uses_readonly_authoritative_canonical_db_rebuild_only")
+    {
+        return Err("lexical rebuild did not attest a completed canonical-only repair");
+    }
+    Ok(())
+}
+
+fn verify_lexical_repair(
+    before: &LexicalRepairSnapshot,
+    after: &LexicalRepairSnapshot,
+) -> MutationResult {
+    if before.canonical_fingerprint != after.canonical_fingerprint
+        || before.conversations != after.conversations
+        || before.messages != after.messages
+    {
+        return failed_mutation(
+            true,
+            "canonical archive changed during lexical repair; the selected postcondition is unverified",
+        );
+    }
+    if !after.lexical_ready {
+        return failed_mutation(
+            true,
+            "lexical rebuild returned success but the fresh status probe did not verify a complete matching generation",
+        );
+    }
+    MutationResult {
+        status: "executed",
+        proof_result: "passed",
+        detail: "canonical lexical index rebuilt and independently checked against the same archive; source freshness and optional semantic assets are reported separately".to_string(),
+        started: true,
+        observation: Some(lexical_repair_receipt(after)),
+    }
+}
+
+fn execute_lexical_repair(data_dir: &Path, db_path: Option<&Path>) -> MutationResult {
+    let default_db = data_dir.join("agent_search.db");
+    let Ok(db_path) = db_path.unwrap_or(&default_db).canonicalize() else {
+        return failed_mutation(
+            false,
+            "lexical repair requires an existing canonical archive",
+        );
+    };
+    let Ok(data_dir) = data_dir.canonicalize() else {
+        return failed_mutation(false, "lexical repair data directory is unavailable");
+    };
+    let Some(status_command) = allowed_command("diag.search-coverage") else {
+        return failed_mutation(false, "lexical repair status adapter is unavailable");
+    };
+    let Some(status_argv) = allowlisted_argv(status_command, &data_dir, Some(&db_path)) else {
+        return failed_mutation(
+            false,
+            "lexical repair scope cannot be represented by safe argv",
+        );
+    };
+    let before = match read_lexical_repair_snapshot(&status_argv, &db_path) {
+        Ok(snapshot) => snapshot,
+        Err(detail) => return failed_mutation(false, detail),
+    };
+    if before.lexical_ready {
+        return MutationResult {
+            status: "already-ready",
+            proof_result: "passed",
+            detail: "canonical lexical assets already match the archive; no rebuild was started"
+                .to_string(),
+            started: false,
+            observation: Some(lexical_repair_receipt(&before)),
+        };
+    }
+    let Some(repair_command) = allowed_command("doctor.rebuild-stale-assets") else {
+        return failed_mutation(false, "lexical repair adapter is unavailable");
+    };
+    let Some(repair_argv) = allowlisted_argv(repair_command, &data_dir, Some(&db_path)) else {
+        return failed_mutation(
+            false,
+            "lexical repair scope cannot be represented by safe argv",
+        );
+    };
+    let output = match run_bounded_canonical_repair(&repair_argv, Duration::from_secs(120)) {
+        Ok(output) => output,
+        Err(error) => return failed_mutation(error.started, error.detail),
+    };
+    if let Err(detail) = classify_lexical_rebuild(output.status.code(), &output.stdout) {
+        return failed_mutation(true, detail);
+    }
+    match read_lexical_repair_snapshot(&status_argv, &db_path) {
+        Ok(after) => verify_lexical_repair(&before, &after),
+        Err(detail) => failed_mutation(true, detail),
+    }
+}
+
+fn execute_mutation(
+    command: AllowedCommand,
+    argv: &[String],
+    data_dir: &Path,
+    db_path: Option<&Path>,
+) -> MutationResult {
     match command.adapter {
         Adapter::SupportBundle => execute_support_bundle(argv, data_dir),
+        Adapter::LexicalRepair => execute_lexical_repair(data_dir, db_path),
         _ => MutationResult {
             status: "adapter-unavailable",
             proof_result: "not-run",
@@ -707,13 +1030,13 @@ fn execute_mutation(command: AllowedCommand, argv: &[String], data_dir: &Path) -
     }
 }
 
-fn mutation_contract(apply: bool, attempted: usize) -> Value {
+fn mutation_contract(apply: bool, attempted: usize, attempted_db_mutation: bool) -> Value {
     json!({
         "read_only": attempted == 0,
         "apply_mode": apply,
         "schedules_work": false,
         "mutates_files": attempted > 0,
-        "mutates_db": false,
+        "mutates_db": attempted_db_mutation,
         "touches_network": false,
         "per_step_confirmation_required": true,
         "shell_evaluation": false
@@ -898,6 +1221,7 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
     let mut automatic_read_only_count = 0usize;
     let mut applied_mutation_count = 0usize;
     let mut attempted_mutation_count = 0usize;
+    let mut attempted_db_mutation = false;
     let mut awaiting_confirmation = false;
     let mut blocked_step = false;
 
@@ -941,7 +1265,7 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
         };
         let class_mutates = is_mutating(command.mutation_class);
         let allowlist_consistent = class_mutates == declared_mutates;
-        let argv = allowlisted_argv(command, request.data_dir);
+        let argv = allowlisted_argv(command, request.data_dir, request.db_path);
         if !allowlist_consistent {
             transcript.push(json!({
                 "step": order,
@@ -975,6 +1299,20 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
                 "result": "planned",
                 "detail": "dry-run: no step executed"
             }));
+            if command.adapter == Adapter::LexicalRepair
+                && let Some(entry) = transcript.last_mut().and_then(Value::as_object_mut)
+            {
+                entry.insert(
+                    "execution_scope".to_string(),
+                    json!({
+                        "assets": "lexical",
+                        "canonical_rebuild_required": true,
+                        "source_scan": false,
+                        "semantic_rebuild": false,
+                        "timeout_seconds": 120
+                    }),
+                );
+            }
             continue;
         }
 
@@ -1064,15 +1402,17 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
                 command,
                 argv.as_deref().unwrap_or_default(),
                 request.data_dir,
+                request.db_path,
             );
             mutation_started = mutation.started;
             if mutation_started {
                 attempted_mutation_count += 1;
+                attempted_db_mutation |= command.adapter == Adapter::LexicalRepair;
             }
             mutation_observation = mutation.observation;
             if mutation.status == "executed" {
                 applied_mutation_count += 1;
-            } else {
+            } else if mutation.status != "already-ready" {
                 blocked_step = true;
             }
             (mutation.status, mutation.proof_result, mutation.detail)
@@ -1091,6 +1431,20 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
             "result": result,
             "detail": detail
         }));
+        if command.adapter == Adapter::LexicalRepair
+            && let Some(entry) = transcript.last_mut().and_then(Value::as_object_mut)
+        {
+            entry.insert(
+                "execution_scope".to_string(),
+                json!({
+                    "assets": "lexical",
+                    "canonical_rebuild_required": true,
+                    "source_scan": false,
+                    "semantic_rebuild": false,
+                    "timeout_seconds": 120
+                }),
+            );
+        }
         if request.source_kind != "fixture"
             && let Some(entry) = transcript.last_mut().and_then(Value::as_object_mut)
         {
@@ -1148,7 +1502,11 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
         );
         map.insert(
             "mutation_contract".to_string(),
-            mutation_contract(request.apply, attempted_mutation_count),
+            mutation_contract(
+                request.apply,
+                attempted_mutation_count,
+                attempted_db_mutation,
+            ),
         );
     }
     plan
@@ -1177,6 +1535,7 @@ mod tests {
             source_kind: "fixture",
             fixture_context: None,
             data_dir,
+            db_path: None,
         }
     }
 
@@ -1197,7 +1556,7 @@ mod tests {
         let Some(command) = allowed_command("search.readiness") else {
             return Err("search.readiness missing from allowlist".into());
         };
-        let Some(argv) = allowlisted_argv(command, Path::new("/tmp/cass-guide-test")) else {
+        let Some(argv) = allowlisted_argv(command, Path::new("/tmp/cass-guide-test"), None) else {
             return Err("search.readiness did not produce argv".into());
         };
         if argv.first().map(String::as_str) != Some("cass")
@@ -1383,6 +1742,7 @@ mod tests {
             let argv = allowlisted_argv(
                 allowed_command(id).expect("allowed"),
                 Path::new("/archive with spaces"),
+                None,
             )
             .expect("argv");
             assert!(argv.iter().any(|arg| arg == "/archive with spaces"));
@@ -1485,12 +1845,12 @@ mod tests {
         let error = super::CommandFailure::after_start("timeout");
         let result = super::failed_mutation(error.started, error.detail);
         assert_eq!(result.status, "failed");
-        let contract = super::mutation_contract(true, usize::from(result.started));
+        let contract = super::mutation_contract(true, usize::from(result.started), false);
         assert_eq!(contract["read_only"], false);
         assert_eq!(contract["mutates_files"], true);
         assert_eq!(contract["mutates_db"], false);
         let not_started = super::CommandFailure::before_start("spawn failure");
-        let contract = super::mutation_contract(true, usize::from(not_started.started));
+        let contract = super::mutation_contract(true, usize::from(not_started.started), false);
         assert_eq!(contract["read_only"], true);
         assert_eq!(contract["mutates_files"], false);
     }
@@ -1507,6 +1867,248 @@ mod tests {
                 Ok(_) => panic!("invalid command must not start"),
             }
         }
+    }
+
+    fn lexical_status_fixture() -> Value {
+        json!({
+            "healthy": false,
+            "database": {
+                "path": "/archive/custom.db",
+                "exists": true,
+                "opened": true,
+                "open_skipped": false,
+                "counts_skipped": false,
+                "integrity": "ok",
+                "conversations": 2,
+                "messages": 7
+            },
+            "rebuild": {"active": false},
+            "pending": {"watch_active": false},
+            "index": {
+                "exists": true,
+                "fresh": false,
+                "rebuilding": false,
+                "engine_incompatible": false,
+                "hollow": false,
+                "partial": false,
+                "manifest_source": "current",
+                "checkpoint": {
+                    "completed": true,
+                    "db_matches": true,
+                    "schema_matches": true,
+                    "page_size_compatible": true
+                },
+                "fingerprint": {
+                    "current_db_fingerprint": "content-v1:2:2:7",
+                    "matches_current_db_fingerprint": true
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn lexical_repair_preflight_requires_exact_scope_readable_counts_and_no_writer() {
+        let db = Path::new("/archive/custom.db");
+        let payload = lexical_status_fixture();
+        let snapshot =
+            super::lexical_repair_snapshot(Some(0), &payload, db).expect("classified archive");
+        assert!(snapshot.lexical_ready);
+        assert_eq!(snapshot.source_fresh, Some(false));
+        for (pointer, value) in [
+            ("/database/path", json!("/other/archive.db")),
+            ("/database/exists", json!(false)),
+            ("/database/opened", json!(false)),
+            ("/database/open_skipped", json!(true)),
+            ("/database/counts_skipped", json!(true)),
+            ("/database/integrity", json!("corrupt")),
+            ("/database/integrity", json!("unknown")),
+            ("/database/conversations", json!(0)),
+            ("/database/messages", Value::Null),
+            ("/rebuild/active", json!(true)),
+            ("/pending/watch_active", json!(true)),
+            ("/index/fingerprint/current_db_fingerprint", Value::Null),
+        ] {
+            let mut changed = payload.clone();
+            *changed.pointer_mut(pointer).expect("fixture pointer") = value;
+            assert!(
+                super::lexical_repair_snapshot(Some(0), &changed, db).is_err(),
+                "unsafe preflight accepted {pointer}"
+            );
+        }
+        assert!(super::lexical_repair_snapshot(Some(7), &payload, db).is_err());
+        assert!(super::lexical_repair_snapshot(None, &payload, db).is_err());
+        let mut error = payload;
+        error["err"] = json!({"message": "private diagnostic"});
+        assert!(super::lexical_repair_snapshot(Some(0), &error, db).is_err());
+    }
+
+    #[test]
+    fn lexical_repair_verifies_checkpoint_and_corpus_instead_of_overall_health() {
+        let db = Path::new("/archive/custom.db");
+        let ready = lexical_status_fixture();
+        let mut missing = ready.clone();
+        missing["index"]["exists"] = json!(false);
+        let before = super::lexical_repair_snapshot(Some(0), &missing, db).unwrap();
+        let after = super::lexical_repair_snapshot(Some(0), &ready, db).unwrap();
+        let result = super::verify_lexical_repair(&before, &after);
+        assert_eq!(result.status, "executed");
+        assert!(result.started);
+        let receipt = result.observation.unwrap();
+        assert_eq!(receipt["lexical_ready"], true);
+        assert_eq!(receipt["source_scan_fresh"], false);
+        assert_eq!(receipt["sources_scanned"], false);
+        assert_eq!(receipt["semantic_rebuilt"], false);
+        assert!(!receipt.to_string().contains("/archive"));
+        for pointer in [
+            "/index/exists",
+            "/index/checkpoint/completed",
+            "/index/checkpoint/db_matches",
+            "/index/checkpoint/schema_matches",
+            "/index/checkpoint/page_size_compatible",
+            "/index/fingerprint/matches_current_db_fingerprint",
+        ] {
+            let mut broken = ready.clone();
+            broken["healthy"] = json!(true);
+            *broken.pointer_mut(pointer).unwrap() = json!(false);
+            let broken = super::lexical_repair_snapshot(Some(0), &broken, db).unwrap();
+            assert_eq!(
+                super::verify_lexical_repair(&before, &broken).status,
+                "failed"
+            );
+        }
+        for pointer in [
+            "/index/rebuilding",
+            "/index/engine_incompatible",
+            "/index/hollow",
+            "/index/partial",
+        ] {
+            let mut broken = ready.clone();
+            *broken.pointer_mut(pointer).unwrap() = json!(true);
+            let broken = super::lexical_repair_snapshot(Some(0), &broken, db).unwrap();
+            assert_eq!(
+                super::verify_lexical_repair(&before, &broken).status,
+                "failed"
+            );
+        }
+        for source in [
+            Value::Null,
+            json!("previous_after_corrupt_current"),
+            json!("previous_after_missing_current"),
+        ] {
+            let mut broken = ready.clone();
+            broken["index"]["manifest_source"] = source;
+            let broken = super::lexical_repair_snapshot(Some(0), &broken, db).unwrap();
+            assert_eq!(
+                super::verify_lexical_repair(&before, &broken).status,
+                "failed"
+            );
+        }
+        for (pointer, value) in [
+            ("/database/conversations", json!(3)),
+            ("/database/messages", json!(8)),
+            (
+                "/index/fingerprint/current_db_fingerprint",
+                json!("content-v1:2:4:7"),
+            ),
+        ] {
+            let mut drifted = ready.clone();
+            *drifted.pointer_mut(pointer).unwrap() = value;
+            let drifted = super::lexical_repair_snapshot(Some(0), &drifted, db).unwrap();
+            assert_eq!(
+                super::verify_lexical_repair(&before, &drifted).status,
+                "failed"
+            );
+        }
+    }
+
+    #[test]
+    fn lexical_rebuild_exit_zero_alone_cannot_certify_repair() {
+        let complete = json!({
+            "success": true,
+            "force_rebuild": true,
+            "full": false,
+            "lexical_update_deferred": false,
+            "indexing_stats": {
+                "scan_ms": 0,
+                "lexical_strategy_reason": "force_rebuild_uses_readonly_authoritative_canonical_db_rebuild_only"
+            }
+        });
+        let bytes = serde_json::to_vec(&complete).unwrap();
+        assert!(super::classify_lexical_rebuild(Some(0), &bytes).is_ok());
+        for exit in [Some(1), Some(7), Some(130), None] {
+            assert!(super::classify_lexical_rebuild(exit, &bytes).is_err());
+        }
+        for (pointer, value) in [
+            ("/success", json!(false)),
+            ("/force_rebuild", json!(false)),
+            ("/full", json!(true)),
+            ("/lexical_update_deferred", json!(true)),
+            ("/indexing_stats/scan_ms", json!(1)),
+            (
+                "/indexing_stats/lexical_strategy_reason",
+                json!("source_scan"),
+            ),
+        ] {
+            let mut changed = complete.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                super::classify_lexical_rebuild(Some(0), &serde_json::to_vec(&changed).unwrap())
+                    .is_err()
+            );
+        }
+        assert!(super::classify_lexical_rebuild(Some(0), b"{}").is_err());
+        assert!(super::classify_lexical_rebuild(Some(0), b"not JSON").is_err());
+        let mut contradictory = complete;
+        contradictory["err"] = json!({"message": "failed after publishing"});
+        assert!(
+            super::classify_lexical_rebuild(Some(0), &serde_json::to_vec(&contradictory).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn lexical_repair_preview_binds_database_and_preserves_apply_gates() {
+        let plan = json!({"intent": {"recognized": true}, "readiness": "ready",
+            "plan": {"privacy_tier": "low", "cost_risk": {"risk_level": "low"},
+                "stop_conditions": [], "steps": [{"order": 3,
+                    "command": "doctor.rebuild-stale-assets", "mutates": true,
+                    "proof_gate": "lexical-ready", "rch_rule": "none"}]}});
+        let db = Path::new("/custom archive/canonical.db");
+        let mut request = request(Path::new("/archive with spaces"));
+        request.db_path = Some(db);
+        let preview = render_execution(plan.clone(), &request);
+        let row = &preview["execution"]["transcript"][0];
+        assert_eq!(row["result"], "planned");
+        assert_eq!(row["execution_scope"]["source_scan"], false);
+        assert_eq!(row["execution_scope"]["canonical_rebuild_required"], true);
+        let argv = row["argv"].as_array().unwrap();
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == [json!("--db"), json!("/custom archive/canonical.db")])
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg == "--full" || arg == "--semantic")
+        );
+        request.apply = true;
+        let unconfirmed = render_execution(plan.clone(), &request);
+        assert_eq!(
+            unconfirmed["execution"]["transcript"][0]["result"],
+            "awaiting-confirmation"
+        );
+        request.confirmed_steps = &[3];
+        let fixture = render_execution(plan, &request);
+        assert_eq!(
+            fixture["execution"]["transcript"][0]["result"],
+            "fixture-protected"
+        );
+        assert_eq!(fixture["execution"]["attempted_mutation_count"], 0);
+        assert_eq!(fixture["mutation_contract"]["read_only"], true);
+        let contract = super::mutation_contract(true, 1, true);
+        assert_eq!(contract["mutates_db"], true);
+        assert_eq!(contract["mutates_files"], true);
+        assert_eq!(contract["touches_network"], false);
     }
 
     #[test]

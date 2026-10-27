@@ -3081,6 +3081,33 @@ fn should_try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> bool {
         && opts.db_path.exists()
 }
 
+/// The guided repair adapter authorizes only an existing archive's lexical
+/// rebuild. Keep ordinary first-run `--force-rebuild` behavior, but enforce
+/// this production scope constraint under the index lock so an archive that
+/// disappears or becomes empty cannot turn the repair into source discovery.
+fn canonical_rebuild_required_from_env() -> Result<bool> {
+    match dotenvy::var("CASS_INDEX_REQUIRE_CANONICAL_REBUILD") {
+        Ok(value) => match value.trim() {
+            "1" => Ok(true),
+            "0" => Ok(false),
+            _ => anyhow::bail!("CASS_INDEX_REQUIRE_CANONICAL_REBUILD must be 0 or 1"),
+        },
+        Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => Ok(false),
+        Err(error) => {
+            Err(error).context("CASS_INDEX_REQUIRE_CANONICAL_REBUILD must be valid Unicode")
+        }
+    }
+}
+
+fn validate_canonical_rebuild_scope(opts: &IndexOptions, required: bool) -> Result<()> {
+    if required && (!should_try_readonly_canonical_force_rebuild(opts) || !opts.db_path.is_file()) {
+        anyhow::bail!(
+            "canonical-only lexical repair requires an existing archive and --force-rebuild without source-scan, watch or semantic options; no sources were scanned"
+        );
+    }
+    Ok(())
+}
+
 enum ReadonlyRebuildBoundary {
     Rebuild,
     ArchiveWrite,
@@ -3144,8 +3171,10 @@ fn open_readonly_rebuild_storage(
 fn try_readonly_canonical_force_rebuild(
     opts: &IndexOptions,
     progress_bump: &Arc<AtomicI64>,
+    require_canonical_rebuild: bool,
     mut before_boundary: impl FnMut(ReadonlyRebuildBoundary) -> Result<()>,
 ) -> Result<bool> {
+    validate_canonical_rebuild_scope(opts, require_canonical_rebuild)?;
     if !should_try_readonly_canonical_force_rebuild(opts) {
         return Ok(false);
     }
@@ -3167,6 +3196,11 @@ fn try_readonly_canonical_force_rebuild(
                 opts.db_path.display()
             )
         })?;
+        if require_canonical_rebuild {
+            anyhow::bail!(
+                "canonical-only lexical repair requires a populated archive; the archive is empty and no sources were scanned"
+            );
+        }
         return Ok(false);
     }
     let total_messages = count_total_messages_exact(&storage)?;
@@ -17339,6 +17373,8 @@ fn run_index_with_storage_ownership(
         job_kind,
         archive_admission,
     )?;
+    let require_canonical_rebuild = canonical_rebuild_required_from_env()?;
+    validate_canonical_rebuild_scope(&opts, require_canonical_rebuild)?;
     let _index_run_lock_heartbeat = IndexRunLockHeartbeat::start(
         opts.data_dir.clone(),
         index_run_lock_heartbeat_interval(),
@@ -17591,18 +17627,23 @@ fn run_index_with_storage_ownership(
             }
         }
     }
-    if try_readonly_canonical_force_rebuild(&opts, &progress_bump, |boundary| {
-        match boundary {
-            ReadonlyRebuildBoundary::Rebuild => work_phase!("lexical:rebuild"),
-            ReadonlyRebuildBoundary::ArchiveWrite => {
-                if let Some(progress) = opts.progress.as_ref() {
-                    progress.check_stop()?;
+    if try_readonly_canonical_force_rebuild(
+        &opts,
+        &progress_bump,
+        require_canonical_rebuild,
+        |boundary| {
+            match boundary {
+                ReadonlyRebuildBoundary::Rebuild => work_phase!("lexical:rebuild"),
+                ReadonlyRebuildBoundary::ArchiveWrite => {
+                    if let Some(progress) = opts.progress.as_ref() {
+                        progress.check_stop()?;
+                    }
+                    index_run_lock.acquire_archive_write_lease()?;
                 }
-                index_run_lock.acquire_archive_write_lease()?;
             }
-        }
-        Ok(())
-    })? {
+            Ok(())
+        },
+    )? {
         return Ok(());
     }
 

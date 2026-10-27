@@ -211,3 +211,183 @@ fn live_confirmed_capsule_returns_a_manifest_receipt_without_modifying_the_archi
     assert!(!output.to_string().contains(PRIVATE_BODY));
     assert_eq!(db_digest(&data_dir), before);
 }
+
+fn run_on_archive(home: &Path, data_dir: &Path, db: &Path, args: &[&str]) -> (bool, Value) {
+    run(cass(home).args(args).arg("--db").arg(db), data_dir)
+}
+
+#[test]
+fn live_confirmed_lexical_repair_verifies_the_selected_archive_without_ingesting_sources() {
+    let home = tempfile::tempdir().expect("home");
+    let data_dir = home.path().join("data with spaces");
+    let db_path = home.path().join("selected canonical.db");
+    std::fs::create_dir_all(&data_dir).expect("data directory");
+    util::seed_codex_session(
+        &home.path().join(".codex"),
+        "rollout-guide-repair.jsonl",
+        PRIVATE_BODY,
+        true,
+    );
+    let archive = |args: &[&str]| run_on_archive(home.path(), &data_dir, &db_path, args);
+    let (success, seeded) = archive(&["index", "--full", "--json"]);
+    assert!(success, "seed index failed: {seeded}");
+    let (_, before) = archive(&["status", "--json"]);
+    assert_eq!(before["database"]["conversations"], 1, "{before}");
+    let index_dir = coding_agent_search::search::tantivy::expected_index_dir(&data_dir);
+    std::fs::rename(&index_dir, home.path().join("preserved-lexical-generation"))
+        .expect("preserve lexical assets outside the active index directory");
+    util::seed_codex_session(
+        &home.path().join(".codex"),
+        "rollout-guide-pending.jsonl",
+        "guideunindexedpendingmarker",
+        true,
+    );
+
+    let (_, plan) = archive(&["guide", "repair-assets", "--json"]);
+    let planned = step(&plan, "doctor.rebuild-stale-assets");
+    assert_eq!(planned["result"], "planned");
+    assert_eq!(planned["execution_scope"]["source_scan"], false);
+    assert_eq!(planned["execution_scope"]["semantic_rebuild"], false);
+    assert!(!index_dir.join("MANIFEST").exists());
+    let cost = plan["plan"]["cost_risk"]["risk_level"]
+        .as_str()
+        .expect("cost risk");
+    let mut apply_args = vec![
+        "guide",
+        "repair-assets",
+        "--apply",
+        "--confirm-fact",
+        "disk_headroom_ok",
+        "--accept-cost-risk",
+        cost,
+        "--confirm-stop-conditions-clear",
+        "--json",
+    ];
+    let (_, unconfirmed) = archive(&apply_args);
+    assert_eq!(
+        step(&unconfirmed, "doctor.rebuild-stale-assets")["result"],
+        "awaiting-confirmation",
+        "{unconfirmed}"
+    );
+    assert_eq!(unconfirmed["execution"]["attempted_mutation_count"], 0);
+    assert!(!index_dir.join("MANIFEST").exists());
+
+    apply_args.extend(["--confirm-step", "3"]);
+    let (_, repaired) = archive(&apply_args);
+    let repair = step(&repaired, "doctor.rebuild-stale-assets");
+    assert_eq!(repair["result"], "executed", "{repaired}");
+    assert_eq!(repair["proof_gate"]["name"], "lexical-ready");
+    assert_eq!(repair["proof_gate"]["result"], "passed");
+    assert_eq!(repair["mutation_started"], true);
+    assert_eq!(repair["observation"]["lexical_ready"], true);
+    assert_eq!(repair["observation"]["sources_scanned"], false);
+    assert_eq!(repair["observation"]["semantic_rebuilt"], false);
+    assert_eq!(repaired["execution"]["applied_mutation_count"], 1);
+    assert_eq!(repaired["mutation_contract"]["mutates_db"], true);
+    assert_eq!(repaired["mutation_contract"]["mutates_files"], true);
+    assert_eq!(repaired["mutation_contract"]["touches_network"], false);
+    assert!(!repaired.to_string().contains(PRIVATE_BODY));
+    assert!(
+        !data_dir.join("agent_search.db").exists(),
+        "repair must honor the explicit archive override"
+    );
+
+    let (_, after) = archive(&["status", "--json"]);
+    for pointer in [
+        "/database/conversations",
+        "/database/messages",
+        "/index/fingerprint/current_db_fingerprint",
+    ] {
+        assert_eq!(
+            after.pointer(pointer),
+            before.pointer(pointer),
+            "canonical corpus changed at {pointer}: {after}"
+        );
+    }
+    assert_eq!(after["index"]["manifest_source"], "current");
+    assert_eq!(
+        after["index"]["fingerprint"]["matches_current_db_fingerprint"],
+        true
+    );
+    let (search_ok, searchable) = archive(&["search", PRIVATE_BODY, "--json"]);
+    assert!(
+        search_ok,
+        "repaired archive must be searchable: {searchable}"
+    );
+    assert!(
+        searchable["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty()),
+        "{searchable}"
+    );
+    let (_, pending) = archive(&["search", "guideunindexedpendingmarker", "--json"]);
+    assert_eq!(
+        pending["hits"].as_array().map(Vec::len),
+        Some(0),
+        "repair must not ingest pending sources: {pending}"
+    );
+
+    let (_, already_ready) = archive(&apply_args);
+    assert_eq!(
+        step(&already_ready, "doctor.rebuild-stale-assets")["result"],
+        "already-ready",
+        "{already_ready}"
+    );
+    assert_eq!(already_ready["execution"]["attempted_mutation_count"], 0);
+    assert_eq!(already_ready["mutation_contract"]["read_only"], true);
+}
+
+#[test]
+fn canonical_repair_guard_refuses_missing_and_empty_archives_without_source_discovery() {
+    for existing_empty in [false, true] {
+        let home = tempfile::tempdir().expect("home");
+        let data_dir = home.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data directory");
+        if existing_empty {
+            let (success, empty) = run(
+                cass(home.path()).args(["index", "--full", "--json"]),
+                &data_dir,
+            );
+            assert!(success, "initialize empty archive: {empty}");
+            assert_eq!(empty["conversations"], 0);
+        }
+        util::seed_codex_session(
+            &home.path().join(".codex"),
+            "rollout-guide-guard.jsonl",
+            "guidecanonicalguardmarker",
+            true,
+        );
+        let refused = cass(home.path())
+            .env("CASS_INDEX_REQUIRE_CANONICAL_REBUILD", "1")
+            .args(["index", "--force-rebuild", "--no-progress-events", "--json"])
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .output()
+            .expect("run guarded canonical repair");
+        assert!(
+            !refused.status.success(),
+            "scoped repair must refuse missing/empty archive: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        if existing_empty {
+            let (_, after) = run(cass(home.path()).args(["status", "--json"]), &data_dir);
+            assert_eq!(
+                after["database"]["conversations"], 0,
+                "guard must refuse before source discovery: {after}"
+            );
+        } else {
+            assert!(!data_dir.join("agent_search.db").exists());
+        }
+        // Ordinary first-run --force-rebuild keeps source discovery when the
+        // internal canonical-only scope requirement is absent.
+        let (success, ordinary) = run(
+            cass(home.path()).args(["index", "--force-rebuild", "--no-progress-events", "--json"]),
+            &data_dir,
+        );
+        assert!(
+            success,
+            "ordinary first-run force rebuild must still work: {ordinary}"
+        );
+        assert_eq!(ordinary["conversations"], 1, "{ordinary}");
+    }
+}

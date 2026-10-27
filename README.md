@@ -3108,7 +3108,7 @@ cass completions bash > ~/.bash_completion.d/cass
 | `search --robot` | JSON output for automation pipelines |
 | `pack --robot` | Deterministic cited answer packs for agent/human handoffs; reports health, freshness, privacy, and warnings |
 | `triage` / `ready` / `preflight` | One-shot agent preflight: readiness, exact next command, docs, schemas, workflows, and recoveries |
-| `guide [INTENT]` | Intent-to-command planner (fix-ci, investigate-search-miss, prepare-release, repair-assets, export-session, onboard-source, support-capsule); dry-run by default. With `--apply`, 8 of its 19 allowlisted operations have evaluating proof adapters; the other 11 are observation-only and are reported, not evaluated |
+| `guide [INTENT]` | Intent-to-command planner (fix-ci, investigate-search-miss, prepare-release, repair-assets, export-session, onboard-source, support-capsule); dry-run by default. With `--apply`, eight operations evaluate read-only proofs, and guarded adapters can create a support bundle or repair the lexical index. Unsupported operations are reported without being executed |
 | `status` / `state` | Health snapshot: index freshness, DB stats, recommended action |
 | `health` | Minimal health check (<50ms on a healthy archive; the strict, mutation-free owner-thread probe shared with `status` has a 30 s hard deadline and never checkpoints a dirty WAL), exit 0=healthy, 1=unhealthy |
 | `selftest` | Archive-independent executable probe for installers and binary-promotion gates; exercises an in-memory FrankenSQLite write/read round-trip |
@@ -3151,6 +3151,8 @@ Other subcommands (all present in the `Commands` enum in `src/lib.rs`):
 | `sources discover` | Auto-discover SSH hosts from `~/.ssh/config` |
 | `sources reingest` | Re-ingest an already-synced mirror into the canonical archive without re-running rsync |
 | `sources artifact-manifest` | Build or verify a lexical-artifact evidence manifest for remote exchange |
+
+`cass guide repair-assets --apply` can rebuild the lexical index from the selected canonical database after the plan's step confirmation, cost acceptance, resource checks and stop-condition acknowledgement. It uses the existing bounded rebuild path and refuses missing or empty archives before source discovery. A successful receipt requires a fresh, complete lexical generation with unchanged canonical identity and conversation/message counts. Already-current assets are reported as `already-ready`; semantic enrichment remains a separate operation. Inspect the dry-run plan first for the exact confirmation flags and step number.
 
 Five more commands are dispatched before the main parser (registered via `allow_external_subcommands` in `src/main.rs`); use their own `--help`:
 

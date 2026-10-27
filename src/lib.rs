@@ -86909,6 +86909,7 @@ fn run_guide(
 ) -> CliResult<()> {
     let mut intent = intent_words.join(" ");
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
 
     // Fixture mode: facts (and optionally a default intent) from a checked-in file.
     let (mut facts, source_kind, fixture_id, fixture_context): (
@@ -86948,7 +86949,6 @@ fn run_guide(
         (facts, "fixture", id, Some(parsed))
     } else {
         // Live mode: derive the determinable facts from one state snapshot.
-        let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
         let state = state_meta_json(&data_dir, &db_path, 300, true);
         let db_present = state
             .pointer("/database/exists")
@@ -87007,6 +87007,7 @@ fn run_guide(
             source_kind,
             fixture_context: fixture_context.as_ref(),
             data_dir: &data_dir,
+            db_path: Some(&db_path),
         },
     );
 

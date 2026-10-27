@@ -359,13 +359,14 @@ fn observed_stop_condition_cannot_be_overridden() -> TestResult {
 #[test]
 fn offloaded_mutation_requires_rch_and_exact_cost_acceptance() -> TestResult {
     let (_home_guard, home, data_dir) = isolated_home()?;
-    let mut context = healthy_context(json!({"db_present": true, "disk_headroom_ok": true}));
+    let mut context =
+        healthy_context(json!({"git_clean_or_known": true, "ci_logs_available": true}));
     let context_map = context
         .as_object_mut()
         .ok_or("healthy context must be an object")?;
     context_map.insert(
         "proof_results".to_string(),
-        json!({"assets-classified": true, "rebuild-planned": true}),
+        json!({"first-failure-found": true, "repro-confirmed": true}),
     );
     let (_fixture_guard, fixture) = fixture_file(&context)?;
     let payload = run(
@@ -373,7 +374,7 @@ fn offloaded_mutation_requires_rch_and_exact_cost_acceptance() -> TestResult {
         &data_dir,
         &fixture,
         &[
-            "repair-assets",
+            "fix-ci",
             "--apply",
             "--confirm-step",
             "3",
@@ -393,6 +394,40 @@ fn offloaded_mutation_requires_rch_and_exact_cost_acceptance() -> TestResult {
     ensure(
         mutation_step(&payload).and_then(|step| step.get("result")) == Some(&json!("blocked")),
         || "rch/cost gates must prevent mutation".to_string(),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn local_lexical_repair_requires_exact_cost_acceptance_without_build_offload() -> TestResult {
+    let (_home_guard, home, data_dir) = isolated_home()?;
+    let mut context = healthy_context(json!({"db_present": true, "disk_headroom_ok": true}));
+    context["proof_results"] = json!({"assets-classified": true, "rebuild-planned": true});
+    let (_fixture_guard, fixture) = fixture_file(&context)?;
+    let payload = run(
+        &home,
+        &data_dir,
+        &fixture,
+        &[
+            "repair-assets",
+            "--apply",
+            "--confirm-step",
+            "3",
+            "--accept-cost-risk",
+            "low",
+            "--confirm-stop-conditions-clear",
+        ],
+    )?;
+    ensure(gate_result(&payload, "rch") == Some("passed"), || {
+        "local archive repair must not require compiler offload".to_string()
+    })?;
+    ensure(
+        gate_result(&payload, "cost-risk") == Some("needs-confirmation"),
+        || "wrong cost-risk acceptance must not authorize archive repair".to_string(),
+    )?;
+    ensure(
+        mutation_step(&payload).and_then(|step| step.get("result")) == Some(&json!("blocked")),
+        || "cost gate must prevent archive repair".to_string(),
     )?;
     Ok(())
 }

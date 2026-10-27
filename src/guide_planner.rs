@@ -57,7 +57,7 @@ const INTENT_CATALOG: &[IntentMapping] = &[
     IntentMapping {
         intent: "repair-assets",
         macro_id: "repair-derived-assets",
-        summary: "Classify stale/corrupt derived assets, plan the rebuild, rebuild only the stale ones.",
+        summary: "Classify derived assets, rebuild canonical lexical search, and verify it; source ingestion and semantic setup are separate operations.",
     },
     IntentMapping {
         intent: "onboard-source",
