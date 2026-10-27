@@ -582,6 +582,19 @@ fn assert_shared_forget_survives_rescans(
 }
 
 fn indexed_opencode_archive(home: TempDir) -> TestResult<(Archive, PathBuf)> {
+    indexed_opencode_archive_with_sessions(
+        home,
+        &[
+            ("ses-forgotten", "/work/scratch/retired", FORGOTTEN_MARKER),
+            ("ses-kept", "/work/production", KEPT_MARKER),
+        ],
+    )
+}
+
+fn indexed_opencode_archive_with_sessions(
+    home: TempDir,
+    sessions: &[(&str, &str, &str)],
+) -> TestResult<(Archive, PathBuf)> {
     use coding_agent_search::franken_sync::{Connection, compat::ConnectionExt, params};
 
     let data_dir = home.path().join("cass-data");
@@ -605,10 +618,7 @@ fn indexed_opencode_archive(home: TempDir) -> TestResult<(Archive, PathBuf)> {
          );",
     )?;
     let timestamp = chrono::Utc::now().timestamp_millis() - 86_400_000;
-    for (session, workspace, marker) in [
-        ("ses-forgotten", "/work/scratch/retired", FORGOTTEN_MARKER),
-        ("ses-kept", "/work/production", KEPT_MARKER),
-    ] {
+    for &(session, workspace, marker) in sessions {
         conn.execute_compat(
             "INSERT INTO session
              (id, project_id, slug, directory, title, version, time_created, time_updated)
@@ -745,7 +755,7 @@ fn shared_session_reinclusion_requires_apply_and_preserves_other_exclusions() ->
     assert_eq!(preview["exclusions_matched"], 1);
     assert_eq!(preview["exclusions_removed"], 0);
     assert_eq!(preview["legacy_sources_removed"], 0);
-    assert_eq!(preview["recommended_next_command"], "cass index --full");
+    assert_eq!(preview["recommended_next_command"], "cass index");
     assert_eq!(derived_assets(&archive.data_dir)?, assets_before);
     assert_eq!(fs::read(&source)?, source_before);
 
@@ -774,6 +784,127 @@ fn shared_session_reinclusion_requires_apply_and_preserves_other_exclusions() ->
         original_captures,
         "the remaining sibling exclusion must keep the shared raw container blocked"
     );
+    assert_eq!(fs::read(&source)?, source_before);
+    Ok(())
+}
+
+#[test]
+fn reinclusion_recovers_unchanged_shared_session_with_incremental_index() -> TestResult {
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let (archive, source) = indexed_opencode_archive_with_sessions(
+        TempDir::new()?,
+        &[
+            ("ses-forgotten", "/work/scratch/retired", FORGOTTEN_MARKER),
+            ("ses-still-forgotten", "/work/scratch/other", SIBLING_MARKER),
+            ("ses-kept", "/work/production", KEPT_MARKER),
+        ],
+    )?;
+    let source_before = fs::read(&source)?;
+    assert_eq!(
+        archive.forget_selected(&["--workspace-glob", "/work/scratch/*"], true)?["conversations_deleted"],
+        2
+    );
+    // Retain one canonical conversation, so an empty-archive fallback cannot
+    // hide a stale connector cutoff. Record a successful suppressed-source pass.
+    archive.index(&[])?;
+    assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    assert!(archive.search_hit_paths(SIBLING_MARKER)?.is_empty());
+    assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+    let logical_source = source.join("ses-forgotten");
+    let selectors = [
+        "--reinclude",
+        "--source-path",
+        logical_source.to_str().ok_or("non-UTF-8 fixture path")?,
+        "--source-id",
+        "local",
+        "--agent",
+        "opencode",
+        "--external-id",
+        "ses-forgotten",
+    ];
+    let db_path = archive.data_dir.join("agent_search.db");
+    let database_before = fs::read(&db_path)?;
+    let assets_before = derived_assets(&archive.data_dir)?;
+    let preview = archive.forget_selected(&selectors, false)?;
+    assert_eq!(preview["exclusions_matched"], 1);
+    assert_eq!(preview["exclusions_removed"], 0);
+    assert_eq!(preview["reindex_required"], false);
+    assert_eq!(preview["conversations_restored"], 0);
+    assert_eq!(fs::read(&db_path)?, database_before);
+    assert_eq!(derived_assets(&archive.data_dir)?, assets_before);
+
+    let applied = archive.forget_selected(&selectors, true)?;
+    assert_eq!(applied["exclusions_removed"], 1);
+    assert_eq!(applied["legacy_sources_removed"], 0);
+    assert_eq!(applied["reindex_required"], true);
+    assert_eq!(applied["conversations_restored"], 0);
+    assert_eq!(
+        applied["next_command_argv"],
+        json!([
+            "cass",
+            "index",
+            "--db",
+            db_path,
+            "--data-dir",
+            archive.data_dir,
+            "--json"
+        ])
+    );
+    assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    archive.index(&[])?;
+    assert!(!archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    assert!(archive.search_hit_paths(SIBLING_MARKER)?.is_empty());
+    assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+    assert_eq!(fs::read(&source)?, source_before);
+    let storage = FrankenStorage::open_strict_readonly(&db_path)?;
+    assert_eq!(storage.total_conversation_count()?, 2);
+    assert_eq!(storage.forgotten_conversation_keys()?.len(), 1);
+    storage.close_without_checkpoint()?;
+    let no_op = archive.forget_selected(&selectors, true)?;
+    assert_eq!(no_op["exclusions_removed"], 0);
+    assert_eq!(no_op["source_observations_removed"], 0);
+    assert_eq!(no_op["reindex_required"], false);
+    assert_eq!(no_op["next_command_argv"], Value::Null);
+    archive.index(&["--full"])?;
+    assert!(archive.search_hit_paths(SIBLING_MARKER)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn reinclusion_recovers_unchanged_file_incrementally_and_honors_exclusions() -> TestResult {
+    let (archive, source) = indexed_archive(&[])?;
+    let source_path = source.to_str().ok_or("non-UTF-8 fixture path")?;
+    let source_before = fs::read(&source)?;
+    assert_eq!(
+        archive.forget(source_path, true)?["conversations_deleted"],
+        1
+    );
+    archive.index(&[])?;
+    let selectors = ["--reinclude", "--source-path", source_path];
+    let preview = archive.forget_selected(&selectors, false)?;
+    assert_eq!(preview["legacy_sources_matched"], 1);
+    assert_eq!(preview["legacy_sources_removed"], 0);
+    let applied = archive.forget_selected(&selectors, true)?;
+    assert_eq!(applied["legacy_sources_removed"], 1);
+    assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+
+    let mut excluded = archive.cmd();
+    excluded.env("CASS_EXCLUDE_PATHS", &source);
+    let output = archive.run_step(
+        "reinclude respects active source exclusion",
+        excluded,
+        &["index", "--json", "--no-progress-events"],
+    )?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    archive.index(&[])?;
+    assert!(!archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
     assert_eq!(fs::read(&source)?, source_before);
     Ok(())
 }

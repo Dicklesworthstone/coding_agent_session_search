@@ -126,7 +126,7 @@ commands:
   cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.
   cass forget [--source-glob '<glob>'] [--workspace-glob '<glob>'] [--older-than 90d] [--apply] [--json]  Require at least one selector; combine with AND. Preview matching sessions; --apply removes indexed copies and keeps source files. Shared-session tombstones persist until explicitly released.
   cass forget --list [--source-glob '<glob>' | --source-path PATH] [--source-id ID] [--agent SLUG] [--external-id ID] --json  Inspect recorded exclusions; historical records have no workspace or message-age metadata.
-  cass forget --reinclude [identity selectors] [--apply] --json  Preview explicit exclusion release; at least one selector is required. After apply, run cass index --full; current indexing policies still apply.
+  cass forget --reinclude [identity selectors] [--apply] --json  Preview explicit exclusion release; at least one selector is required. After apply, run cass index; current indexing policies still apply.
   cass mirror prune [--older-than 90d] [--max-size 100GB] [--keep-latest 1] [--keep-tag important] [--apply] [--json]  Plan or apply raw-mirror retention with an audit log.
   cass context <path> [--json]     Find related sessions for a given source path.
   cass export <path> [--format markdown] [--output FILE]  Export a conversation to markdown / other formats.

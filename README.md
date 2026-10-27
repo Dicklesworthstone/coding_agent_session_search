@@ -3143,7 +3143,7 @@ Other subcommands (all present in the `Commands` enum in `src/lib.rs`):
 | `onboarding` | Read-only first-run source onboarding + readiness wizard; `--json` for scripts, never launches the TUI |
 | `quarantine` | Inspect and manage the conversation-ingest quarantine: `list` (each excluded conversation, plus a `status` grouping by cause, version and retry eligibility with the next command), `retry` (bounded re-ingest plan; `--apply` runs it), `clear` |
 | `forget` | Prune archived conversations with `--source-glob '<glob>'`, `--workspace-glob '<glob>'`, and/or `--older-than 90d`; at least one selector is required, and supplied selectors are ANDed. Preview is strictly read-only; add `--apply` to delete canonical rows and rebuild FTS, analytics and the lexical index under the indexing maintenance lock. Age means the last message time, strictly before the reported `before_ms` cutoff; sessions with missing message times are kept. Shared stores such as OpenCode/Devin SQLite databases use durable session identities, so forgotten sessions stay out when siblings change while retained siblings keep updating. Single-session files retain size/mtime tombstones: an unchanged file stays forgotten across incremental/full indexing, and a changed file is indexed again. Source files and raw-mirror captures remain. Use `CASS_EXCLUDE_PATHS` or `CASS_EXCLUDE_WORKSPACES` for prospective exclusion, and `cass mirror prune` for explicit raw-capture retention. Semantic vectors are not rewritten: explicit semantic search reports `semantic-unavailable` and hybrid falls back to lexical until `cass index --semantic` catches up. A previously opened `cass serve` keeps its pinned snapshot until `reload`; the TUI drops forgotten hits on its next search. If lexical rebuilding fails, forget exits 5 (`lexical-rebuild`) and the next index repairs the derived data |
-| `forget --list` / `forget --reinclude` | Inspect recorded exclusions or explicitly release matching records. Use literal `--source-path`, `--source-glob`, or exact `--source-id`, `--agent`, and `--external-id` selectors; supplied selectors are ANDed. Re-inclusion requires a selector and previews by default; add `--apply`, then run `cass index --full`. Other exclusions and current workspace/path policies remain in force. Historical exclusion records cannot be selected by workspace or age. |
+| `forget --list` / `forget --reinclude` | Inspect recorded exclusions or explicitly release matching records. Use literal `--source-path`, `--source-glob`, or exact `--source-id`, `--agent`, and `--external-id` selectors; supplied selectors are ANDed. Re-inclusion requires a selector and previews by default; add `--apply`, then run `cass index`. Other exclusions and current workspace/path policies remain in force. Historical exclusion records cannot be selected by workspace or age. |
 | `fleet upgrade-rehearsal` | Fleet-safe upgrade rehearsal (dry run) with bounded post-upgrade verification; `--live` opts in to SSH probes of configured remotes |
 | `lessons list\|search` | Mine and query durable, redacted lessons from local evidence (commits, closed beads, proof manifests) |
 | `import chatgpt` | Split a ChatGPT web export (`conversations.json`) into files the ChatGPT connector can index |
@@ -3565,17 +3565,24 @@ cass forget --reinclude --source-path '/path/opencode.db/session-id' \
 
 cass forget --reinclude --source-path '/path/opencode.db/session-id' \
   --source-id local --agent opencode --external-id session-id --apply --json
-cass index --full --json
+cass index --json
 ```
 
 `--list` returns `exclusions` for durable shared-session identities and
 `legacy_sources` for ordinary-file stamps. Its selectors are optional.
 `--reinclude` requires at least one selector and defaults to a read-only preview;
-`--apply` removes the selected records and invalidates completed-source
-observations. Re-index with plain `index --full` to restore the preserved source
-sessions; `--force-rebuild` only rebuilds derived assets from existing canonical
-rows. Other session exclusions and active path, workspace or agent policies
-still apply.
+`--apply` removes the selected records and invalidates the matching source's
+completion evidence and replay cutoffs, including physical databases behind
+logical session paths. Unrelated source completions are retained. An ordinary
+`cass index` can then recover unchanged historical sources; `--force-rebuild`
+only rebuilds derived assets from existing canonical rows. Other session
+exclusions and active path, workspace or agent policies still apply.
+
+Re-inclusion itself restores zero conversations. JSON reports
+`conversations_restored: 0` and sets `reindex_required` only after an applied
+release. Its `next_command_argv` binds the follow-up index to the same database
+and data directory. Previews and repeated releases with no matches do not
+request reindexing or clear replay state.
 
 Both management modes accept either literal `--source-path` or `--source-glob`,
 plus exact `--source-id`, `--agent` and `--external-id` filters. Supplied filters

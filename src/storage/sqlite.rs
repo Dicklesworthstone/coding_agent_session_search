@@ -11295,7 +11295,7 @@ impl FrankenStorage {
 
     /// Explicitly release selected exclusions, leaving canonical rows and raw
     /// evidence untouched. The caller holds the maintenance lease for apply.
-    /// A subsequent plain `index --full` revisits preserved historical sources;
+    /// A subsequent ordinary `index` revisits preserved historical sources;
     /// current path/workspace exclusions continue to apply independently.
     pub fn reinclude_forget_exclusions(
         &self,
@@ -11332,17 +11332,82 @@ impl FrankenStorage {
             ..Default::default()
         };
         let has_matches = !listed.exclusions.is_empty() || !listed.legacy_sources.is_empty();
-        if has_matches {
-            let observations: i64 = tx.query_row_map(
-                "SELECT COUNT(*) FROM meta
-                 WHERE key >= 'source_ingest_v1:' AND key < 'source_ingest_v1;'",
-                fparams![],
-                |row| row.get_typed(0),
-            )?;
-            result.source_observations_matched =
-                usize::try_from(observations).context("invalid source observation count")?;
+        if !has_matches {
+            tx.rollback()?;
+            return Ok(result);
         }
-        if dry_run || !has_matches {
+        // Completion keys also include scan-root/provenance information. Match
+        // the saved observations, retaining unrelated sources' reuse evidence.
+        // Shared stores expose logical database/session handles; the ledger
+        // instead observes the physical database, possibly through an alias.
+        let affected_paths: BTreeSet<_> = listed
+            .exclusions
+            .iter()
+            .map(|record| record.key.source_path.clone())
+            .chain(
+                listed
+                    .legacy_sources
+                    .iter()
+                    .map(|record| record.source_path.clone()),
+            )
+            .collect();
+        let mut replay_paths: HashSet<PathBuf> = affected_paths.iter().map(PathBuf::from).collect();
+        for path in &affected_paths {
+            if let Some(source) = Path::new(path).ancestors().find(|path| path.is_file()) {
+                replay_paths.insert(source.to_path_buf());
+            }
+        }
+        let canonical_paths: HashSet<_> = replay_paths
+            .iter()
+            .filter_map(|path| dunce::canonicalize(path).ok())
+            .collect();
+        let affected = |path: &str| {
+            replay_paths.contains(Path::new(path))
+                || dunce::canonicalize(path)
+                    .ok()
+                    .is_some_and(|path| canonical_paths.contains(&path))
+        };
+        // A missing store can still be identified by its recorded primary.
+        // Never apply ancestor matching to dependencies: directory observations
+        // are shared with unrelated siblings and are not physical sources.
+        let primary_ancestors: HashSet<_> = affected_paths
+            .iter()
+            .flat_map(|path| Path::new(path).ancestors().skip(1))
+            .filter(|path| !path.is_dir())
+            .collect();
+        let mut completion_keys = Vec::new();
+        let mut cursor = "source_ingest_v1:".to_owned();
+        loop {
+            let page: Vec<(String, String)> = tx.query_map_collect(
+                "SELECT key, value FROM meta WHERE key > ?1 AND key < 'source_ingest_v1;'
+                 ORDER BY key LIMIT 256",
+                fparams![cursor.as_str()],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )?;
+            let Some(last) = page.last() else { break };
+            cursor = last.0.clone();
+            for (key, observation) in page {
+                let Ok(observation) = serde_json::from_str::<serde_json::Value>(&observation)
+                else {
+                    // Malformed evidence cannot suppress a source scan.
+                    continue;
+                };
+                if observation["primary"]["path"].as_str().is_some_and(|path| {
+                    affected(path) || primary_ancestors.contains(Path::new(path))
+                }) || observation["dependencies"]
+                    .as_array()
+                    .is_some_and(|dependencies| {
+                        dependencies
+                            .iter()
+                            .any(|dependency| dependency["path"].as_str().is_some_and(affected))
+                    })
+                {
+                    completion_keys.push(key);
+                }
+            }
+        }
+        result.source_observations_matched = completion_keys.len();
+        if dry_run {
             tx.rollback()?;
             return Ok(result);
         }
@@ -11371,12 +11436,71 @@ impl FrankenStorage {
                 fparams![record.source_path.as_str()],
             )?;
         }
-        // These keys include scan-root and mapping information absent from a
-        // tombstone. Clear the namespace rather than guess a partial identity.
-        // Do not clear connector cutoffs or unfinished derived-rebuild work.
-        result.source_observations_removed = tx.execute(
-            "DELETE FROM meta WHERE key >= 'source_ingest_v1:' AND key < 'source_ingest_v1;'",
+        for key in &completion_keys {
+            result.source_observations_removed +=
+                tx.execute_compat("DELETE FROM meta WHERE key = ?1", fparams![key.as_str()])?;
+        }
+        // Lifting a tombstone alone does not revisit old sessions: connector
+        // cutoffs and remote mirror fingerprints can still skip their store.
+        // Reset affected connectors atomically with the release. Source stamps
+        // predate provider metadata, so those require one full rediscovery.
+        let all_connectors = !listed.legacy_sources.is_empty();
+        let session_agents: HashSet<_> = listed
+            .exclusions
+            .iter()
+            .map(|record| record.key.agent_slug.trim().to_ascii_lowercase())
+            .collect();
+        let source_ids: HashSet<_> = listed
+            .exclusions
+            .iter()
+            .map(|record| record.key.source_id.as_str())
+            .collect();
+        let metadata_keys: Vec<String> = tx.query_map_collect(
+            "SELECT key FROM meta WHERE
+                (key >= 'last_scan_ts:connector:' AND key < 'last_scan_ts:connector;')
+                OR (key >= 'mirror_scan_fp:' AND key < 'mirror_scan_fp;')",
+            fparams![],
+            |row| row.get_typed(0),
         )?;
+        let mut connector_keys = BTreeSet::new();
+        let mut mirror_keys = Vec::new();
+        for key in metadata_keys {
+            if let Some(connector) = key.strip_prefix("last_scan_ts:connector:") {
+                if all_connectors
+                    || Self::connector_agent_slug_candidates(connector)
+                        .iter()
+                        .any(|agent| session_agents.contains(agent))
+                {
+                    connector_keys.insert(key);
+                }
+            } else if let Some(source_id) = key.strip_prefix("mirror_scan_fp:")
+                && (all_connectors || source_ids.contains(source_id))
+            {
+                mirror_keys.push(key);
+            }
+        }
+        for agent in &session_agents {
+            // Absence falls back to the global scan watermark. A present zero
+            // also covers a connector with no previous dedicated watermark.
+            connector_keys.insert(Self::connector_last_scan_ts_meta_key(agent));
+            if matches!(agent.as_str(), "claude" | "claude-code" | "claude_code") {
+                for alias in ["claude", "claude-code", "claude_code"] {
+                    connector_keys.insert(Self::connector_last_scan_ts_meta_key(alias));
+                }
+            }
+        }
+        for key in connector_keys {
+            tx.execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, '0')",
+                fparams![key.as_str()],
+            )?;
+        }
+        if all_connectors {
+            tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('last_scan_ts', '0')")?;
+        }
+        for key in mirror_keys {
+            tx.execute_compat("DELETE FROM meta WHERE key = ?1", fparams![key.as_str()])?;
+        }
         tx.commit()?;
         result.exclusions_removed = listed.exclusions.len();
         result.legacy_sources_removed = listed.legacy_sources.len();
@@ -47085,14 +47209,21 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 .conversations_deleted,
             4
         );
-        for key in ["source_ingest_v1:shared", "source_ingest_v1:other"] {
+        for (key, path) in [
+            ("source_ingest_v1:shared", source.as_str()),
+            ("source_ingest_v1:other", "/fixture/unrelated.db"),
+        ] {
             storage.raw().execute_compat(
-                "INSERT INTO meta(key, value) VALUES (?1, '{}')",
-                fparams![key],
+                "INSERT INTO meta(key, value) VALUES (?1, ?2)",
+                fparams![
+                    key,
+                    serde_json::json!({"primary": {"path": path}, "dependencies": []}).to_string()
+                ],
             )?;
         }
         storage.set_last_scan_ts(123)?;
         storage.set_connector_last_scan_ts("opencode", 456)?;
+        storage.set_connector_last_scan_ts("codex", 789)?;
         let before = storage.list_forget_exclusions(&ForgetExclusionSelector::default())?;
         assert_eq!(before.exclusions.len(), 4);
         assert!(before.legacy_sources.is_empty());
@@ -47149,7 +47280,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         let preview = storage.reinclude_forget_exclusions(&selector, true)?;
         assert_eq!(preview.exclusions_matched, 1);
         assert_eq!(preview.exclusions_removed, 0);
-        assert_eq!(preview.source_observations_matched, 2);
+        assert_eq!(preview.source_observations_matched, 1);
         assert_eq!(preview.source_observations_removed, 0);
         assert_eq!(preview.sample_sessions, listed.exclusions);
         assert_eq!(
@@ -47162,8 +47293,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         let applied = storage.reinclude_forget_exclusions(&selector, false)?;
         assert_eq!(applied.exclusions_removed, 1);
         assert_eq!(applied.legacy_sources_removed, 0);
-        assert_eq!(applied.source_observations_removed, 2);
-        assert!(storage.source_ingest_ledger_entries()?.is_empty());
+        assert_eq!(applied.source_observations_removed, 1);
+        let remaining_ledger = storage.source_ingest_ledger_entries()?;
+        assert_eq!(remaining_ledger.len(), 1);
+        assert!(remaining_ledger.contains_key("source_ingest_v1:other"));
         assert!(
             storage
                 .list_forget_exclusions(&selector)?
@@ -47174,7 +47307,8 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(storage.total_conversation_count()?, 1);
         assert_eq!(storage.fetch_messages(kept_id)?.len(), 1);
         assert_eq!(storage.get_last_scan_ts()?, Some(123));
-        assert_eq!(storage.get_connector_last_scan_ts("opencode")?, Some(456));
+        assert_eq!(storage.get_connector_last_scan_ts("opencode")?, Some(0));
+        assert_eq!(storage.get_connector_last_scan_ts("codex")?, Some(789));
         assert!(storage.forget_derived_rebuild_pending()?);
         storage.raw().execute(
             "INSERT INTO meta(key, value) VALUES ('source_ingest_v1:after-release', '{}')",
@@ -47183,7 +47317,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(no_match.exclusions_matched, 0);
         assert_eq!(no_match.exclusions_removed, 0);
         assert_eq!(no_match.source_observations_removed, 0);
-        assert_eq!(storage.source_ingest_ledger_entries()?.len(), 1);
+        assert_eq!(storage.source_ingest_ledger_entries()?.len(), 2);
         storage.close()?;
         let reopened = FrankenStorage::open_strict_readonly(&db_path)?;
         assert_eq!(
@@ -47196,6 +47330,175 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert!(reopened.forget_derived_rebuild_pending()?);
         reopened.close_without_checkpoint()?;
         assert_eq!(fs::read(provider)?, provider_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn reinclude_logical_handles_replay_physical_stores_without_invalidating_siblings() -> Result<()>
+    {
+        for (name, present) in [
+            ("opencode.db", true),
+            ("extensionless-store", true),
+            ("temporarily-missing-store", false),
+        ] {
+            let directory = TempDir::new()?;
+            let storage = FrankenStorage::open(&directory.path().join("archive.db"))?;
+            let source = directory.path().join(name);
+            let source_bytes = b"SQLite format 3\0unchanged source evidence";
+            if present {
+                fs::write(&source, source_bytes)?;
+            }
+            for session in ["ses-restored", "ses-kept"] {
+                storage.raw().execute_compat(
+                    "INSERT INTO forgotten_conversations
+                     (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+                     VALUES ('local', 'opencode', ?1, ?2, 1)",
+                    fparams![source.join(session).to_string_lossy().as_ref(), session],
+                )?;
+            }
+            let sibling = directory.path().join(format!("{name}-sibling"));
+            fs::write(&sibling, b"unrelated source")?;
+            for (key, observation) in [
+                (
+                    "physical-primary",
+                    serde_json::json!({"primary": {"path": source}, "dependencies": []}),
+                ),
+                (
+                    "physical-dependency",
+                    serde_json::json!({"primary": {"path": "/fixture/consumer"}, "dependencies": [{"path": source}]}),
+                ),
+                (
+                    "same-directory",
+                    serde_json::json!({"primary": {"path": sibling}, "dependencies": [{"path": directory.path()}]}),
+                ),
+                (
+                    "directory-primary",
+                    serde_json::json!({"primary": {"path": directory.path()}, "dependencies": []}),
+                ),
+            ] {
+                storage.record_filtered_source_completion(&SourceIngestLedgerEntry {
+                    key: format!("source_ingest_v1:{key}"),
+                    observation: observation.to_string(),
+                })?;
+            }
+            storage.set_last_scan_ts(900)?;
+            storage.set_connector_last_scan_ts("opencode", 800)?;
+            storage.set_connector_last_scan_ts("codex", 700)?;
+            let logical_path = source.join("ses-restored");
+            let selector = ForgetExclusionSelector {
+                source_path: Some(logical_path.to_str().context("UTF-8 selected source")?),
+                external_id: Some("ses-restored"),
+                ..Default::default()
+            };
+            let before = storage.source_ingest_ledger_entries()?;
+            let preview = storage.reinclude_forget_exclusions(&selector, true)?;
+            assert_eq!(preview.exclusions_matched, 1);
+            assert_eq!(
+                preview.source_observations_matched,
+                if present { 2 } else { 1 }
+            );
+            assert_eq!(preview.source_observations_removed, 0);
+            assert_eq!(storage.source_ingest_ledger_entries()?, before);
+            assert_eq!(storage.get_connector_last_scan_ts("opencode")?, Some(800));
+            let result = storage.reinclude_forget_exclusions(&selector, false)?;
+            assert_eq!(result.exclusions_removed, 1);
+            assert_eq!(
+                result.source_observations_removed,
+                if present { 2 } else { 1 }
+            );
+            let ledger = storage.source_ingest_ledger_entries()?;
+            assert!(!ledger.contains_key("source_ingest_v1:physical-primary"));
+            assert_eq!(
+                ledger.contains_key("source_ingest_v1:physical-dependency"),
+                !present
+            );
+            assert!(ledger.contains_key("source_ingest_v1:same-directory"));
+            assert!(ledger.contains_key("source_ingest_v1:directory-primary"));
+            assert_eq!(storage.get_connector_last_scan_ts("opencode")?, Some(0));
+            assert_eq!(storage.get_connector_last_scan_ts("codex")?, Some(700));
+            assert_eq!(storage.get_last_scan_ts()?, Some(900));
+            let retained = storage.forgotten_conversation_keys()?;
+            assert_eq!(retained.len(), 1);
+            assert!(retained.iter().all(|key| key.external_id == "ses-kept"));
+            if present {
+                assert_eq!(fs::read(&source)?, source_bytes);
+            } else {
+                assert!(!source.exists());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reinclude_logical_alias_resets_provider_aliases_and_only_its_remote_mirror() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("archive.db"))?;
+        let source = directory.path().join("physical-store");
+        let alias = directory.path().join("discovered-store.db");
+        fs::write(&source, b"SQLite format 3\0unchanged store")?;
+        symlink(&source, &alias)?;
+        let logical_path = alias.join("ses-restored");
+        storage.raw().execute_compat(
+            "INSERT INTO forgotten_conversations
+             (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+             VALUES ('remote-a', 'claude_code', ?1, 'ses-restored', 1)",
+            fparams![logical_path.to_string_lossy().as_ref()],
+        )?;
+        storage.record_filtered_source_completion(&SourceIngestLedgerEntry {
+            key: "source_ingest_v1:physical-store".into(),
+            observation: serde_json::json!({
+                "primary": {"path": source}, "dependencies": []
+            })
+            .to_string(),
+        })?;
+        storage.set_last_scan_ts(900)?;
+        storage.set_connector_last_scan_ts("claude", 800)?;
+        storage.set_connector_last_scan_ts("codex", 700)?;
+        storage.record_mirror_scan_fingerprint("remote-a", "selected-mirror")?;
+        storage.record_mirror_scan_fingerprint("remote-b", "unrelated-mirror")?;
+        let selector = ForgetExclusionSelector {
+            source_path: Some(logical_path.to_str().context("UTF-8 selected alias")?),
+            external_id: Some("ses-restored"),
+            ..Default::default()
+        };
+        let preview = storage.reinclude_forget_exclusions(&selector, true)?;
+        assert_eq!(preview.source_observations_matched, 1);
+        assert_eq!(storage.get_connector_last_scan_ts("claude")?, Some(800));
+        assert_eq!(
+            storage.read_mirror_scan_fingerprint("remote-a")?.as_deref(),
+            Some("selected-mirror")
+        );
+        let result = storage.reinclude_forget_exclusions(&selector, false)?;
+        assert_eq!(result.exclusions_removed, 1);
+        assert_eq!(result.source_observations_removed, 1);
+        assert!(storage.source_ingest_ledger_entries()?.is_empty());
+        for provider in ["claude", "claude-code", "claude_code"] {
+            assert_eq!(storage.get_connector_last_scan_ts(provider)?, Some(0));
+        }
+        assert_eq!(storage.get_connector_last_scan_ts("codex")?, Some(700));
+        assert_eq!(storage.get_last_scan_ts()?, Some(900));
+        assert_eq!(storage.read_mirror_scan_fingerprint("remote-a")?, None);
+        assert_eq!(
+            storage.read_mirror_scan_fingerprint("remote-b")?.as_deref(),
+            Some("unrelated-mirror")
+        );
+        storage.set_connector_last_scan_ts("claude", 1000)?;
+        storage.record_mirror_scan_fingerprint("remote-a", "new-completion")?;
+        assert_eq!(
+            storage
+                .reinclude_forget_exclusions(&selector, false)?
+                .exclusions_removed,
+            0
+        );
+        assert_eq!(storage.get_connector_last_scan_ts("claude")?, Some(1000));
+        assert_eq!(
+            storage.read_mirror_scan_fingerprint("remote-a")?.as_deref(),
+            Some("new-completion")
+        );
+        assert_eq!(fs::read(&alias)?, b"SQLite format 3\0unchanged store");
         Ok(())
     }
 
@@ -47217,9 +47520,17 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             "INSERT INTO forgotten_sources(source_path, size_bytes, mtime_ms, forgotten_at_ms)
              VALUES ('/fixture/blocked.db', 10, 20, 30)",
         )?;
-        storage
-            .raw()
-            .execute("INSERT INTO meta(key, value) VALUES ('source_ingest_v1:overlap', '{}')")?;
+        storage.record_filtered_source_completion(&SourceIngestLedgerEntry {
+            key: "source_ingest_v1:overlap".into(),
+            observation: serde_json::json!({
+                "primary": {"path": "/fixture/blocked.db"}, "dependencies": []
+            })
+            .to_string(),
+        })?;
+        storage.set_last_scan_ts(900)?;
+        storage.set_connector_last_scan_ts("opencode", 800)?;
+        storage.set_connector_last_scan_ts("codex", 700)?;
+        storage.record_mirror_scan_fingerprint("remote-fixture", "before-release")?;
         let selector = ForgetExclusionSelector {
             agent_slug: Some("opencode"),
             ..Default::default()
@@ -47242,6 +47553,8 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             before
         );
         assert_eq!(storage.source_ingest_ledger_entries()?.len(), 1);
+        assert_eq!(storage.get_last_scan_ts()?, Some(900));
+        assert_eq!(storage.get_connector_last_scan_ts("opencode")?, Some(800));
         let source_only = ForgetExclusionSelector {
             source_path: Some("/fixture/blocked.db"),
             ..Default::default()
@@ -47254,6 +47567,13 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(applied.exclusions_removed, 1);
         assert_eq!(applied.legacy_sources_removed, 1);
         assert_eq!(applied.source_observations_removed, 1);
+        assert_eq!(storage.get_last_scan_ts()?, Some(0));
+        assert_eq!(storage.get_connector_last_scan_ts("opencode")?, Some(0));
+        assert_eq!(storage.get_connector_last_scan_ts("codex")?, Some(0));
+        assert_eq!(
+            storage.read_mirror_scan_fingerprint("remote-fixture")?,
+            None
+        );
         assert_eq!(storage.forgotten_conversation_keys()?.len(), 1);
         assert!(storage.forgotten_source_stamps()?.is_empty());
         assert!(storage.forget_derived_rebuild_pending()?);
@@ -47274,9 +47594,13 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             "INSERT INTO forgotten_sources(source_path, forgotten_at_ms) VALUES (?1, 1)",
             fparams![source],
         )?;
-        storage
-            .raw()
-            .execute("INSERT INTO meta(key, value) VALUES ('source_ingest_v1:guarded', '{}')")?;
+        storage.record_filtered_source_completion(&SourceIngestLedgerEntry {
+            key: "source_ingest_v1:guarded".into(),
+            observation: serde_json::json!({
+                "primary": {"path": source}, "dependencies": []
+            })
+            .to_string(),
+        })?;
         storage.raw().execute(
             "CREATE TABLE reinclude_ledger_guard (
                 ledger_key TEXT PRIMARY KEY REFERENCES meta(key) ON DELETE RESTRICT

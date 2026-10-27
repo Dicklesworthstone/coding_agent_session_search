@@ -1708,7 +1708,7 @@ pub enum Commands {
         group(clap::ArgGroup::new("exclusion_action")
             .multiple(false)
             .args(["list", "reinclude"])),
-        after_long_help = "Globs match stored paths case-sensitively; * also matches /. A source path can be a logical database/session handle. Missing workspaces do not match --workspace-glob. Age uses the latest message timestamp, strictly before the reported cutoff; sessions with no messages or any missing message timestamp are kept.\n\nShared stores use durable per-session tombstones scoped by source provenance, agent, source path and external session ID. Edits, appends, sibling changes, --full and changes to CASS_EXCLUDE_WORKSPACES do not restore that identity. Inspect exclusions with --list, then preview an explicit release with --reinclude and --source-path, --source-glob, --source-id, --agent and/or --external-id. Add --apply to release the reviewed exclusions, then run cass index --full. Current workspace/path policies still apply.\n\nHistorical exclusions have no recorded workspace or message-age metadata, so --workspace-glob and --older-than cannot select --list or --reinclude records. Exact identity selectors never silently release a path-wide source exclusion; preview a source-only release if such an overlap is reported.\n\nOrdinary single-session files retain size/mtime tombstones: unchanged files stay forgotten, and a changed stamp makes the file eligible for indexing again. Source files and existing raw-mirror captures are kept. All deletion and re-inclusion is explicit; there is no automatic age pruning."
+        after_long_help = "Globs match stored paths case-sensitively; * also matches /. A source path can be a logical database/session handle. Missing workspaces do not match --workspace-glob. Age uses the latest message timestamp, strictly before the reported cutoff; sessions with no messages or any missing message timestamp are kept.\n\nShared stores use durable per-session tombstones scoped by source provenance, agent, source path and external session ID. Edits, appends, sibling changes, --full and changes to CASS_EXCLUDE_WORKSPACES do not restore that identity. Inspect exclusions with --list, then preview an explicit release with --reinclude and --source-path, --source-glob, --source-id, --agent and/or --external-id. Add --apply to release the reviewed exclusions, then run cass index. Current workspace/path policies still apply.\n\nHistorical exclusions have no recorded workspace or message-age metadata, so --workspace-glob and --older-than cannot select --list or --reinclude records. Exact identity selectors never silently release a path-wide source exclusion; preview a source-only release if such an overlap is reported.\n\nOrdinary single-session files retain size/mtime tombstones: unchanged files stay forgotten, and a changed stamp makes the file eligible for indexing again. Source files and existing raw-mirror captures are kept. All deletion and re-inclusion is explicit; there is no automatic age pruning."
     )]
     Forget {
         /// Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`).
@@ -1728,7 +1728,7 @@ pub enum Commands {
         #[arg(long, conflicts_with_all = ["reinclude", "apply"])]
         list: bool,
 
-        /// Preview releasing matching exclusions; add --apply, then index --full.
+        /// Preview releasing matching exclusions; add --apply, then index.
         #[arg(long, conflicts_with = "list")]
         reinclude: bool,
 
@@ -10643,6 +10643,8 @@ fn run_forget_exclusion_action(
         let report = storage
             .reinclude_forget_exclusions(&selector, !options.apply)
             .map_err(failure)?;
+        let reindex_required =
+            options.apply && (report.exclusions_removed > 0 || report.legacy_sources_removed > 0);
         let mut lines = vec![
             format!(
                 "CASS Re-inclusion ({})",
@@ -10682,24 +10684,45 @@ fn run_forget_exclusion_action(
                 report.legacy_sources_removed,
                 report.source_observations_removed,
             ));
-            lines.push(
-                "Run `cass index --full` to restore eligible sessions. Current workspace/path exclusions still apply."
-                    .to_string(),
-            );
+            if reindex_required {
+                lines.push(
+                    "Run `cass index` to restore eligible sessions. Current workspace/path exclusions still apply."
+                        .to_string(),
+                );
+            }
         } else {
             lines.push("Preview only. Add --apply to release the reviewed exclusions.".to_string());
         }
         let mut payload = serde_json::to_value(&report).map_err(|error| failure(error.into()))?;
         if let Some(object) = payload.as_object_mut() {
+            object.insert("recommended_next_command".to_string(), "cass index".into());
+            object.insert("reindex_required".to_string(), reindex_required.into());
+            object.insert("conversations_restored".to_string(), 0.into());
+            let data_dir = db_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(default_data_dir);
             object.insert(
-                "recommended_next_command".to_string(),
-                "cass index --full".into(),
+                "next_command_argv".to_string(),
+                if reindex_required {
+                    serde_json::json!([
+                        "cass",
+                        "index",
+                        "--db",
+                        db_path,
+                        "--data-dir",
+                        data_dir,
+                        "--json"
+                    ])
+                } else {
+                    serde_json::Value::Null
+                },
             );
         }
         (payload, lines)
     };
 
-    // Re-inclusion changes only exclusions and ingest observations. It must
+    // Re-inclusion changes only exclusions and ingest replay state. It must
     // leave outstanding forget repair markers and derived assets alone.
     if options.apply {
         if let Err(error) =
@@ -27757,7 +27780,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.".to_string(),
             "  cass forget [--source-glob '<glob>'] [--workspace-glob '<glob>'] [--older-than 90d] [--apply] [--json]  Require at least one selector; combine with AND. Preview matching sessions; --apply removes indexed copies and keeps source files. Shared-session tombstones persist until explicitly released.".to_string(),
             "  cass forget --list [--source-glob '<glob>' | --source-path PATH] [--source-id ID] [--agent SLUG] [--external-id ID] --json  Inspect recorded exclusions; historical records have no workspace or message-age metadata.".to_string(),
-            "  cass forget --reinclude [identity selectors] [--apply] --json  Preview explicit exclusion release; at least one selector is required. After apply, run cass index --full; current indexing policies still apply.".to_string(),
+            "  cass forget --reinclude [identity selectors] [--apply] --json  Preview explicit exclusion release; at least one selector is required. After apply, run cass index; current indexing policies still apply.".to_string(),
             "  cass mirror prune [--older-than 90d] [--max-size 100GB] [--keep-latest 1] [--keep-tag important] [--apply] [--json]  Plan or apply raw-mirror retention with an audit log.".to_string(),
             "  cass context <path> [--json]     Find related sessions for a given source path.".to_string(),
             "  cass export <path> [--format markdown] [--output FILE]  Export a conversation to markdown / other formats.".to_string(),

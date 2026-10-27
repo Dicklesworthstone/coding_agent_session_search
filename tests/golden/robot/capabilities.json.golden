@@ -3201,7 +3201,7 @@
         },
         {
           "name": "reinclude",
-          "description": "Preview releasing matching exclusions; add --apply, then index --full",
+          "description": "Preview releasing matching exclusions; add --apply, then index",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
