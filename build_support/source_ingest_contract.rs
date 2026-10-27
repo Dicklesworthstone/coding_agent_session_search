@@ -442,7 +442,12 @@ checksum = "original-checksum"
             ("Cargo.toml", MANIFEST, "2024", "2021"),
             ("Cargo.toml", MANIFEST, "1.0.0", "2.0.0"),
             ("Cargo.lock", LOCKFILE, "1.0.0", "2.0.0"),
-            ("Cargo.lock", LOCKFILE, "original-checksum", "changed-checksum"),
+            (
+                "Cargo.lock",
+                LOCKFILE,
+                "original-checksum",
+                "changed-checksum",
+            ),
             (
                 "Cargo.lock",
                 LOCKFILE,
@@ -450,7 +455,12 @@ checksum = "original-checksum"
                 "other.invalid/index",
             ),
             ("Cargo.lock", LOCKFILE, "registry+", "git+"),
-            ("Cargo.lock", LOCKFILE, "[\"parser\"]", "[\"parser\", \"other\"]"),
+            (
+                "Cargo.lock",
+                LOCKFILE,
+                "[\"parser\"]",
+                "[\"parser\", \"other\"]",
+            ),
             ("Cargo.lock", LOCKFILE, "version = 4", "version = 3"),
         ] {
             let fixture = Fixture::new();

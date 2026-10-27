@@ -121,7 +121,11 @@ impl SemanticIndexer {
         }
         // Do not keep a second native graph alive when admitting the prior one.
         drop(already_current);
-        if current.record_count().saturating_sub(previous.record_count()) > max_insertions {
+        if current
+            .record_count()
+            .saturating_sub(previous.record_count())
+            > max_insertions
+        {
             return Ok(HnswAppendDisposition::FullRebuildRequired {
                 reason: "append_budget_exceeded",
             });
@@ -236,7 +240,8 @@ mod incremental_tests {
     }
 
     fn install_graph(root: &Path, source: &VectorIndex) -> Result<()> {
-        HnswIndex::build_from_vector_index(source, HnswConfig::default())?.save(&graph_path(root))?;
+        HnswIndex::build_from_vector_index(source, HnswConfig::default())?
+            .save(&graph_path(root))?;
         Ok(())
     }
 
@@ -275,7 +280,9 @@ mod incremental_tests {
         let previous = generation(root.path(), "previous.fsvi", 1, BASE)?;
         let current = generation(root.path(), "current.fsvi", 2, ADDED)?;
         install_graph(root.path(), &previous)?;
-        let source_dir = root.path().join(crate::search::vector_index::VECTOR_INDEX_DIR);
+        let source_dir = root
+            .path()
+            .join(crate::search::vector_index::VECTOR_INDEX_DIR);
         let source_bytes = [
             fs::read(source_dir.join("previous.fsvi"))?,
             fs::read(source_dir.join("current.fsvi"))?,
@@ -289,12 +296,8 @@ mod incremental_tests {
             .context("current native graph")?;
         let model = HashEmbedder::new(384);
         for (id, text) in ADDED {
-            let (hits, stats) = graph.knn_search_with_stats_against(
-                &current,
-                &model.embed_sync(text)?,
-                1,
-                64,
-            )?;
+            let (hits, stats) =
+                graph.knn_search_with_stats_against(&current, &model.embed_sync(text)?, 1, 64)?;
             assert_eq!(hits[0].doc_id, document(*id));
             assert!(
                 stats.is_approximate,
@@ -388,7 +391,11 @@ mod incremental_tests {
             .join("pending.fsvi");
         let model = HashEmbedder::new(384);
         let mut writer = VectorIndex::create_with_revision(
-            &path, "fnv1a-384", "legacy", 384, Quantization::F16,
+            &path,
+            "fnv1a-384",
+            "legacy",
+            384,
+            Quantization::F16,
         )?;
         writer.write_record(&document(1), &model.embed_sync(BASE[0].1)?)?;
         writer.finish()?;
@@ -398,7 +405,8 @@ mod incremental_tests {
         }
         {
             let mut writer = VectorIndex::open_writer(&path)?;
-            writer.append_batch(&[(document(99), model.embed_sync("new durable WAL evidence")?)])?;
+            writer
+                .append_batch(&[(document(99), model.embed_sync("new durable WAL evidence")?)])?;
         }
         let pending = VectorIndex::open_read_only(&path)?;
         assert!(pending.wal_record_count() > 0);
@@ -422,8 +430,13 @@ mod incremental_tests {
         let previous = generation(root.path(), "previous.fsvi", 1, BASE)?;
         let current = generation(root.path(), "current.fsvi", 2, ADDED)?;
         install_graph(root.path(), &previous)?;
-        let dir = root.path().join(crate::search::vector_index::VECTOR_INDEX_DIR);
-        fs::rename(dir.join("previous.fsvi"), dir.join("retained-previous.fsvi"))?;
+        let dir = root
+            .path()
+            .join(crate::search::vector_index::VECTOR_INDEX_DIR);
+        fs::rename(
+            dir.join("previous.fsvi"),
+            dir.join("retained-previous.fsvi"),
+        )?;
         fs::rename(dir.join("current.fsvi"), dir.join("retained-current.fsvi"))?;
         let before = [
             fs::read(dir.join("retained-previous.fsvi"))?,
@@ -451,7 +464,11 @@ mod incremental_tests {
         std::os::unix::fs::symlink(&outside, graph_path(root.path()))?;
         assert!(append(root.path(), &previous, &current, 1).is_err());
         assert_eq!(fs::read(&outside)?, b"preserve unrelated contents");
-        assert!(fs::symlink_metadata(graph_path(root.path()))?.file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(graph_path(root.path()))?
+                .file_type()
+                .is_symlink()
+        );
         Ok(())
     }
 
@@ -502,7 +519,11 @@ mod incremental_tests {
             .join(crate::search::vector_index::VECTOR_INDEX_DIR)
             .join("legacy.fsvi");
         let mut writer = VectorIndex::create_with_revision(
-            &path, "fnv1a-384", "legacy", 384, Quantization::F16,
+            &path,
+            "fnv1a-384",
+            "legacy",
+            384,
+            Quantization::F16,
         )?;
         writer.write_record(&document(1), &HashEmbedder::new(384).embed_sync(BASE[0].1)?)?;
         writer.finish()?;
@@ -639,7 +660,12 @@ mod incremental_tests {
         ] {
             assert!(
                 SemanticIndexer::append_hnsw_generation(
-                    &previous, &current, &absent, name, 1, || Ok(())
+                    &previous,
+                    &current,
+                    &absent,
+                    name,
+                    1,
+                    || Ok(())
                 )
                 .is_err()
             );
