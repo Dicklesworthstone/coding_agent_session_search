@@ -10225,13 +10225,28 @@ fn run_forget_command(
             retryable: false,
         })?;
 
+    // A previous attempt may have committed deletion before rebuilding failed.
+    // Its durable marker must also trigger repair when this retry matches no
+    // canonical rows. Preview must not turn into a repair operation.
+    let rebuild_pending = apply
+        && storage
+            .forget_derived_rebuild_pending()
+            .map_err(|error| CliError {
+                code: 5,
+                kind: "forget",
+                message: format!("failed to read forget rebuild state: {error}"),
+                hint: Some("Retry the same forget command with --apply.".to_string()),
+                retryable: true,
+            })?;
+
     // After an actual deletion every derived surface that stores message text
     // or counts must stop serving the forgotten conversations, exactly as on
     // the agent-purge path. The Quill documents carry stored content, so
     // until the lexical generation is rebuilt a plain search kept returning
     // the forgotten text (2l1b0.50). Failures are typed errors: a warning
     // with exit 0 would report success while the text stays searchable.
-    let remaining_conversations = if apply && report.conversations_deleted > 0 {
+    let remaining_conversations = if apply && (report.conversations_deleted > 0 || rebuild_pending)
+    {
         let derived_error = |kind: CliErrorKind, surface: &str, error: anyhow::Error| {
             CliError {
             code: 5,
@@ -10241,10 +10256,10 @@ fn run_forget_command(
                 report.conversations_deleted
             ),
             hint: Some(
-                "The canonical rows are already deleted; run 'cass index --full' to rebuild derived search data."
+                "The canonical rows are already deleted; retry the same forget command with --apply to finish rebuilding derived search data, or run 'cass index --full'."
                     .to_string(),
             ),
-            retryable: false,
+            retryable: true,
         }
         };
         storage
@@ -10304,9 +10319,8 @@ fn run_forget_command(
     }
 
     if let Some(remaining_conversations) = remaining_conversations {
-        // Test failpoint: proves a failed purge is a typed error and that
-        // `cass index --full` finishes it. A plain incremental index does
-        // not: it never revisits documents whose rows were deleted.
+        // The marker stays set across this failure, including a retry whose
+        // selector no longer matches any canonical rows.
         let rebuilt = if dotenvy::var("CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE")
             .is_ok_and(|value| value == "1")
         {
@@ -10330,12 +10344,38 @@ fn run_forget_command(
                 report.conversations_deleted
             ),
             hint: Some(
-                "Run 'cass index --full': it rebuilds the lexical index from the canonical \
-                 database, which no longer holds the forgotten conversations."
+                "Retry the same forget command with --apply, or run 'cass index --full', \
+                 to rebuild the lexical index from the canonical database."
                     .to_string(),
             ),
-            retryable: false,
+            retryable: true,
         })?;
+
+        // Only a successfully published lexical generation completes the
+        // operation. Keep maintenance ownership while clearing the marker.
+        let storage = FrankenStorage::open(&db_path).map_err(|error| CliError {
+            code: 5,
+            kind: "forget",
+            message: format!("rebuilt derived assets but failed to reopen forget state: {error}"),
+            hint: Some("Retry the same forget command with --apply.".to_string()),
+            retryable: true,
+        })?;
+        storage
+            .clear_forget_derived_rebuild_pending()
+            .map_err(|error| CliError {
+                code: 5,
+                kind: "forget",
+                message: format!(
+                    "rebuilt derived assets but failed to finish forget state: {error}"
+                ),
+                hint: Some("Retry the same forget command with --apply.".to_string()),
+                retryable: true,
+            })?;
+        if let Err(error) =
+            crate::indexer::close_storage_with_wal_checkpoint(storage, &db_path, "forget-complete")
+        {
+            tracing::warn!(error = %format!("{error:#}"), "forget completion checkpoint did not finish");
+        }
     }
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {

@@ -34,6 +34,17 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Added
 
+- **Retryable selective-forget recovery and bounded exclusion lookups (#537).**
+  Canonical deletion records a durable pending-rebuild marker in the same
+  transaction. Retrying `forget --apply` finishes failed derived-index work
+  even when the selector now matches zero conversations. Indexing checks
+  only the current batch's session and source exclusions through indexed
+  lookups, avoiding repeated loading of all historical tombstones. The
+  published v23 schema and source-stamp re-inclusion behavior are preserved.
+  A four-provider diagnostic exercises unchanged and changed-session passes
+  with an opt-in 31,361-conversation, 1,710,000-message synthetic corpus;
+  its delivered-message counters do not claim to count internal parsing.
+
 - **Session previews for `cass forget` (#537).** Source, workspace and age
   selectors combine with AND and remain dry-run by default. Previews now show
   up to 20 session identities, workspaces and last-message times in both human

@@ -1074,6 +1074,78 @@ fn a_failed_lexical_purge_is_a_typed_error_and_the_next_index_completes_it() -> 
 }
 
 #[test]
+fn a_failed_lexical_purge_is_repaired_by_retrying_the_same_forget() -> TestResult {
+    let (archive, forgotten) = indexed_archive(&[])?;
+    let forgotten_str = forgotten.to_str().ok_or("non-utf8 fixture path")?;
+    let original = fs::read(&forgotten)?;
+    assert!(
+        archive
+            .search_hit_paths(FORGOTTEN_MARKER)?
+            .iter()
+            .any(|path| path == forgotten_str),
+        "negative control: the forgotten session must be searchable"
+    );
+    assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+
+    // A fresh process must retry the derived rebuild even after the first
+    // attempt deleted every canonical match. Keeping the failpoint enabled
+    // for a second attempt proves this is a repair, not a successful no-op.
+    for attempt in 1..=2 {
+        let mut failing = archive.cmd();
+        failing.env("CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE", "1");
+        let output = archive.run_step(
+            &format!("forget --apply (injected lexical failure, attempt {attempt})"),
+            failing,
+            &[
+                "forget",
+                "--source-glob",
+                forgotten_str,
+                "--apply",
+                "--json",
+            ],
+        )?;
+        assert_eq!(
+            output.status.code(),
+            Some(5),
+            "attempt {attempt} must reach lexical rebuilding: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let envelope: Value = serde_json::from_str(
+            stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .ok_or("no error envelope on stderr")?,
+        )?;
+        assert_eq!(envelope["error"]["kind"], "lexical-rebuild");
+        assert_eq!(
+            archive.forget(forgotten_str, false)?["conversations_matched"],
+            0,
+            "canonical deletion must survive each failed rebuild"
+        );
+    }
+
+    let repaired = archive.forget(forgotten_str, true)?;
+    assert_eq!(repaired["conversations_matched"], 0);
+    assert_eq!(repaired["conversations_deleted"], 0);
+    assert_eq!(repaired["applied"], true);
+
+    // Check freshness before any search can run its own recovery path.
+    let status = archive.succeed("status after forget retry", &["status", "--json"])?;
+    let status: Value = serde_json::from_slice(&status.stdout)?;
+    assert_eq!(status["index"]["stale"], false);
+    assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+
+    archive.index(&["--full"])?;
+    assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+    assert_eq!(fs::read(&forgotten)?, original);
+    Ok(())
+}
+
+#[test]
 fn a_forgotten_source_stays_forgotten_until_the_file_changes() -> TestResult {
     let (archive, forgotten) = indexed_archive(&[])?;
     let forgotten_str = forgotten.to_str().ok_or("non-utf8 fixture path")?;

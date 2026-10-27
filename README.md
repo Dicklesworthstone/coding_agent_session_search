@@ -3554,6 +3554,8 @@ Ordinary single-session files retain their existing size/mtime behavior for all 
 
 Forgetting is always an explicit operation. CASS does not automatically delete old archived conversations. Source files remain on disk, and raw-mirror captures are governed separately by `mirror prune`; captures of a source still on disk may be made again by a later scan.
 
+**Recovering a failed forget.** If canonical deletion succeeds but rebuilding a derived search asset fails, repeat the same command with `--apply`. A durable pending marker makes the retry finish rebuilding even when there are no matching canonical rows left. The marker is cleared only after the replacement lexical index is published. A preview remains read-only and does not perform this recovery. `cass index --full` also rebuilds the search assets from the remaining canonical conversations.
+
 - **Active session retries**: continuous watch mode retains paths skipped because they are still being written, including during startup, and retries them after the normal watch cooldown even without another filesystem event. `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` controls the recent-write window (default 120 seconds, maximum 3600); writer and advisory-lock checks still apply.
 
 - **Watch testing (dev only)**: `cass index --watch --watch-once path1,path2` triggers a single reindex without filesystem notify (also respects `CASS_TEST_WATCH_PATHS` for backward compatibility); useful for deterministic tests/smoke runs.

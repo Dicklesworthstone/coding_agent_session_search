@@ -37046,8 +37046,33 @@ pub mod persist {
         storage: &FrankenStorage,
         convs: &[NormalizedConversation],
     ) -> Result<Option<Vec<NormalizedConversation>>> {
-        let tombstones = storage.forgotten_source_stamps()?;
-        let forgotten_sessions = storage.forgotten_conversation_keys()?;
+        // Bound retention checks to this batch. Loading every historical
+        // exclusion for every source completion multiplies work on full scans.
+        let tombstones = {
+            let mut paths: Vec<_> = convs
+                .iter()
+                .map(|conv| conv.source_path.to_string_lossy().into_owned())
+                .collect();
+            paths.sort_unstable();
+            paths.dedup();
+            storage.forgotten_source_stamps_for(&paths)?
+        };
+        let forgotten_sessions = {
+            let candidate_keys: Vec<_> = convs
+                .iter()
+                .filter_map(|conv| {
+                    let external_id = conv.external_id.as_ref()?;
+                    let (source_id, _) = extract_provenance(&conv.metadata);
+                    Some(crate::storage::sqlite::ForgottenConversationKey {
+                        source_id,
+                        agent_slug: conv.agent_slug.clone(),
+                        source_path: conv.source_path.to_string_lossy().into_owned(),
+                        external_id: external_id.clone(),
+                    })
+                })
+                .collect();
+            storage.forgotten_conversation_keys_for(&candidate_keys)?
+        };
         let workspace_policy = WorkspaceExclusions::from_env()?;
         if tombstones.is_empty()
             && forgotten_sessions.is_empty()
@@ -42232,6 +42257,45 @@ mod tests {
         assert_eq!(other_identities.inserted_conversations, 2);
         assert_eq!(count_total_conversations_exact(&storage)?, 3);
         assert_eq!(storage.forgotten_conversation_keys()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn gh537_ingest_tombstone_reads_are_batch_scoped() -> Result<()> {
+        if !gh537_isolated_workspace_policy_test("gh537_ingest_tombstone_reads_are_batch_scoped")? {
+            return Ok(());
+        }
+        let tmp = TempDir::new()?;
+        let storage = FrankenStorage::open(&tmp.path().join("archive.db"))?;
+        // A whole-table decode cannot pass these unrelated malformed records.
+        // The real ingest entry points must query only the requested identities.
+        storage.raw().execute_batch(
+            "INSERT INTO forgotten_sources
+                (source_path, size_bytes, mtime_ms, forgotten_at_ms)
+             VALUES ('/unrelated/history.jsonl', X'FF', 1, 1);
+             INSERT INTO forgotten_conversations
+                (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+             VALUES (X'FF', 'opencode', '/unrelated/store.db', 'unrelated', 1);",
+        )?;
+        assert!(storage.forgotten_source_stamps().is_err());
+        assert!(storage.forgotten_conversation_keys().is_err());
+        let mut conversation = norm_conv(Some("kept-batch"), vec![norm_msg(0, 100)]);
+        conversation.source_path = tmp.path().join("kept.jsonl");
+        let outcome = persist::persist_conversations_batched(
+            &storage,
+            None,
+            std::slice::from_ref(&conversation),
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            false,
+        )?;
+        assert_eq!(outcome.inserted_conversations, 1);
+        assert_eq!(outcome.inserted_messages, 1);
+        conversation.external_id = Some("kept-single".into());
+        let mut index = TantivyIndex::open_or_create(&tmp.path().join("direct-index"))?;
+        persist::persist_conversation(&storage, &mut index, &conversation)?;
+        assert_eq!(count_total_conversations_exact(&storage)?, 2);
+        assert_eq!(count_total_messages_exact(&storage)?, 2);
         Ok(())
     }
 

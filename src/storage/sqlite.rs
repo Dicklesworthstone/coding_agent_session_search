@@ -11164,6 +11164,40 @@ impl FrankenStorage {
             .collect())
     }
 
+    /// Resolve only source paths in the current ingest batch. Ordinary-file
+    /// exclusions retain their nullable size/mtime and changed-file semantics;
+    /// the lookup does not enumerate unrelated forgotten transcripts.
+    pub fn forgotten_source_stamps_for(
+        &self,
+        paths: &[String],
+    ) -> Result<HashMap<String, SourceFileStamp>> {
+        if paths.is_empty() || !historical_table_exists(&self.conn, "forgotten_sources")? {
+            return Ok(HashMap::new());
+        }
+        let statement = self.conn.prepare(
+            "SELECT size_bytes, mtime_ms FROM forgotten_sources
+             INDEXED BY sqlite_autoindex_forgotten_sources_1
+             WHERE source_path = ?1 LIMIT 1",
+        )?;
+        let mut matched = HashMap::new();
+        for path in paths {
+            if matched.contains_key(path) {
+                continue;
+            }
+            let rows = statement.query_with_params(&[SqliteValue::Text(path.clone().into())])?;
+            if let Some(row) = rows.first() {
+                matched.insert(
+                    path.clone(),
+                    SourceFileStamp {
+                        size_bytes: row.get_typed(0)?,
+                        mtime_ms: row.get_typed(1)?,
+                    },
+                );
+            }
+        }
+        Ok(matched)
+    }
+
     /// Session tombstones survive changes to unrelated sessions in the same
     /// source store. They are independent of both canonical row IDs and file
     /// size/mtime, so neither a rescan nor a full index revives them.
@@ -11184,6 +11218,65 @@ impl FrankenStorage {
             )?
             .into_iter()
             .collect())
+    }
+
+    /// Resolve only the current ingest batch against the durable composite
+    /// identity index. Preparing one exact seek avoids loading every archived
+    /// exclusion for each batch, and keeps SQL/parameter/result sizes bounded
+    /// independently of the size of the exclusion archive.
+    pub fn forgotten_conversation_keys_for(
+        &self,
+        keys: &[ForgottenConversationKey],
+    ) -> Result<HashSet<ForgottenConversationKey>> {
+        if keys.is_empty() || !historical_table_exists(&self.conn, "forgotten_conversations")? {
+            return Ok(HashSet::new());
+        }
+        let statement = self.conn.prepare(
+            "SELECT 1 FROM forgotten_conversations
+             INDEXED BY sqlite_autoindex_forgotten_conversations_1
+             WHERE source_id = ?1 AND agent_slug = ?2
+               AND source_path = ?3 AND external_id = ?4
+             LIMIT 1",
+        )?;
+        let mut matched = HashSet::new();
+        for key in keys {
+            if matched.contains(key) {
+                continue;
+            }
+            let rows = statement.query_with_params(&[
+                SqliteValue::Text(key.source_id.clone().into()),
+                SqliteValue::Text(key.agent_slug.clone().into()),
+                SqliteValue::Text(key.source_path.clone().into()),
+                SqliteValue::Text(key.external_id.clone().into()),
+            ])?;
+            if !rows.is_empty() {
+                matched.insert(key.clone());
+            }
+        }
+        Ok(matched)
+    }
+
+    /// Canonical deletion commits before derived assets can be rebuilt. Keep
+    /// this marker until those assets have been published successfully, so an
+    /// identical retry repairs them even when no canonical rows still match.
+    pub fn forget_derived_rebuild_pending(&self) -> Result<bool> {
+        let pending: Option<String> = self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = 'forget_derived_rebuild_pending'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        Ok(pending.is_some())
+    }
+
+    /// The caller must hold the maintenance lease and clear this only after
+    /// canonical-derived and lexical rebuilding have both succeeded.
+    pub fn clear_forget_derived_rebuild_pending(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = 'forget_derived_rebuild_pending'")?;
+        Ok(())
     }
 
     /// Drops the tombstones of forgotten sources that changed since the
@@ -11433,6 +11526,9 @@ impl FrankenStorage {
             return Ok(report);
         }
 
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('forget_derived_rebuild_pending', '1')",
+        )?;
         let forgotten_at_ms = Self::now_millis();
         for key in &session_tombstones {
             tx.execute_compat(
@@ -46310,6 +46406,286 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
     }
 
     #[test]
+    fn forget_derived_rebuild_marker_is_atomic_durable_and_survives_empty_retry() -> Result<()> {
+        let directory = TempDir::new()?;
+        let path = directory.path().join("forget-retry.db");
+        let storage = FrankenStorage::open(&path)?;
+        let source = "/fixture/retry.sqlite";
+        let conversation_id = seed_forget_fixture(
+            &storage,
+            &forget_fixture_conversation(source, Some("retired"), Some("/work/old"), &[Some(10)]),
+        )?;
+        assert!(!storage.forget_derived_rebuild_pending()?);
+        assert_eq!(
+            storage
+                .forget_conversations_by_source_glob(source, true)?
+                .conversations_matched,
+            1
+        );
+        assert!(!storage.forget_derived_rebuild_pending()?);
+
+        // Force failure after the marker and session tombstone were written.
+        // Their rollback must be atomic with the canonical deletion attempt.
+        storage.raw().execute(
+            "CREATE TABLE forget_retry_guard (
+                conversation_id INTEGER PRIMARY KEY
+                    REFERENCES conversations(id) ON DELETE RESTRICT
+             )",
+        )?;
+        storage.raw().execute_compat(
+            "INSERT INTO forget_retry_guard(conversation_id) VALUES (?1)",
+            fparams![conversation_id],
+        )?;
+        assert!(
+            storage
+                .forget_conversations_by_source_glob(source, false)
+                .is_err()
+        );
+        assert_eq!(storage.total_conversation_count()?, 1);
+        assert_eq!(storage.total_message_count()?, 1);
+        assert!(storage.forgotten_conversation_keys()?.is_empty());
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        assert!(!storage.forget_derived_rebuild_pending()?);
+        storage.raw().execute("DELETE FROM forget_retry_guard")?;
+
+        assert_eq!(
+            storage
+                .forget_conversations_by_source_glob(source, false)?
+                .conversations_deleted,
+            1
+        );
+        assert!(storage.forget_derived_rebuild_pending()?);
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), 1);
+        storage.close()?;
+
+        let reopened = FrankenStorage::open(&path)?;
+        assert!(reopened.forget_derived_rebuild_pending()?);
+        for dry_run in [true, false] {
+            let retry = reopened.forget_conversations_by_source_glob(source, dry_run)?;
+            assert_eq!(retry.conversations_matched, 0);
+            assert_eq!(retry.conversations_deleted, 0);
+            assert!(
+                reopened.forget_derived_rebuild_pending()?,
+                "a no-match retry must preserve unfinished derived work"
+            );
+        }
+        reopened.clear_forget_derived_rebuild_pending()?;
+        assert!(!reopened.forget_derived_rebuild_pending()?);
+        reopened.close()?;
+        let reader = FrankenStorage::open_strict_readonly(&path)?;
+        assert!(!reader.forget_derived_rebuild_pending()?);
+        reader.close_without_checkpoint()?;
+        Ok(())
+    }
+
+    #[test]
+    fn forgotten_source_batch_lookup_is_indexed_bounded_and_observes_changes() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("batch-source-stamps.db"))?;
+        let mut fixtures = Vec::new();
+        let mut tx = storage.raw().transaction()?;
+        for index in 0..512_i64 {
+            let path = format!("/fixture/history/rollout-{index}.jsonl");
+            let stamp = SourceFileStamp {
+                size_bytes: (index % 3 != 0).then_some(index * 100),
+                mtime_ms: (index % 5 != 0).then_some(1_700_000_000_000 + index),
+            };
+            tx.execute_compat(
+                "INSERT INTO forgotten_sources
+                    (source_path, size_bytes, mtime_ms, forgotten_at_ms)
+                 VALUES (?1, ?2, ?3, 1)",
+                fparams![path.as_str(), stamp.size_bytes, stamp.mtime_ms],
+            )?;
+            fixtures.push((path, stamp));
+        }
+        tx.execute_compat(
+            "UPDATE forgotten_sources SET mtime_ms = 'unreadable unrelated stamp'
+             WHERE source_path = ?1",
+            fparams![fixtures[400].0.as_str()],
+        )?;
+        tx.commit()?;
+        assert!(
+            storage.forgotten_source_stamps().is_err(),
+            "negative control: full-table decoding encounters the unrelated malformed stamp"
+        );
+        assert!(storage.forgotten_source_stamps_for(&[])?.is_empty());
+
+        let request = [
+            fixtures[0].0.clone(),
+            fixtures[7].0.clone(),
+            fixtures[511].0.clone(),
+            fixtures[7].0.clone(),
+            format!("{}.sibling", fixtures[7].0),
+            "/fixture/history/not-archived.jsonl".into(),
+        ];
+        assert_eq!(
+            storage.forgotten_source_stamps_for(&request)?,
+            HashMap::from([
+                fixtures[0].clone(),
+                fixtures[7].clone(),
+                fixtures[511].clone()
+            ])
+        );
+        let many_paths: Vec<_> = fixtures[..260]
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            storage.forgotten_source_stamps_for(&many_paths)?,
+            fixtures[..260].iter().cloned().collect(),
+            "large requests must retain every requested nullable stamp"
+        );
+        let plan: Vec<String> = storage.raw().query_map_collect(
+            "EXPLAIN QUERY PLAN SELECT size_bytes, mtime_ms FROM forgotten_sources
+             INDEXED BY sqlite_autoindex_forgotten_sources_1
+             WHERE source_path = ?1 LIMIT 1",
+            fparams![fixtures[7].0.as_str()],
+            |row| row.get_typed(3),
+        )?;
+        assert!(
+            plan.iter().any(|detail| detail.contains("SEARCH")
+                && detail.contains("sqlite_autoindex_forgotten_sources_1")),
+            "ordinary-file admission must use exact source-path seeks: {plan:?}"
+        );
+
+        // Changed-file re-inclusion clears a stamp. The next bounded lookup
+        // must observe that durable removal, with no process-local cache.
+        storage.clear_forgotten_sources(&[fixtures[7].0.clone()])?;
+        assert_eq!(
+            storage.forgotten_source_stamps_for(&request)?,
+            HashMap::from([fixtures[0].clone(), fixtures[511].clone()])
+        );
+        assert!(!storage.forget_derived_rebuild_pending()?);
+        Ok(())
+    }
+
+    #[test]
+    fn forgotten_source_batch_lookup_accepts_readonly_pre_v22_without_migration() -> Result<()> {
+        let directory = TempDir::new()?;
+        let path = directory.path().join("v21-source-stamps.db");
+        let conn = FrankenConnection::open(path.to_string_lossy().into_owned())?;
+        run_attributed_migration_steps(&conn, BASE_MIGRATION_STEPS)?;
+        apply_conversation_tail_state_cache_migration(&conn)?;
+        let old_steps: Vec<_> = POST_TAIL_CACHE_MIGRATION_STEPS
+            .iter()
+            .copied()
+            .filter(|(version, _, _)| *version <= 21)
+            .collect();
+        run_attributed_migration_steps(&conn, &old_steps)?;
+        let storage = FrankenStorage::new(conn, path.clone());
+        storage.apply_config()?;
+        storage.sync_meta_schema_version(21)?;
+        storage.close()?;
+        let before = fs::read(&path)?;
+
+        let reader = FrankenStorage::open_strict_readonly(&path)?;
+        assert!(reader.forgotten_source_stamps_for(&[])?.is_empty());
+        assert!(
+            reader
+                .forgotten_source_stamps_for(&["/fixture/history/rollout.jsonl".into()])?
+                .is_empty()
+        );
+        assert_eq!(reader.schema_version()?, 21);
+        assert!(
+            reader
+                .raw()
+                .query("SELECT name FROM sqlite_master WHERE name = 'forgotten_sources'")?
+                .is_empty()
+        );
+        reader.close_without_checkpoint()?;
+        assert_eq!(fs::read(&path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn forgotten_conversation_batch_lookup_uses_exact_indexed_keys() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("batch-exclusions.db"))?;
+        let mut keys = Vec::new();
+        let mut tx = storage.raw().transaction()?;
+        for index in 0..512 {
+            let key = ForgottenConversationKey {
+                source_id: "local".into(),
+                agent_slug: "opencode".into(),
+                source_path: format!("/fixture/store-{}/sessions.db", index % 7),
+                external_id: format!("session-{index}"),
+            };
+            tx.execute_compat(
+                "INSERT INTO forgotten_conversations
+                    (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, 1)",
+                fparams![
+                    key.source_id.as_str(),
+                    key.agent_slug.as_str(),
+                    key.source_path.as_str(),
+                    key.external_id.as_str()
+                ],
+            )?;
+            keys.push(key);
+        }
+        // An unrelated malformed identity proves that admission does not
+        // decode the rest of the exclusion table to answer a small batch.
+        tx.execute(
+            "INSERT INTO forgotten_conversations
+                (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+             VALUES (X'FF', 'opencode', '/unrelated/store.db', 'unrelated', 1)",
+        )?;
+        tx.commit()?;
+        assert!(
+            storage.forgotten_conversation_keys().is_err(),
+            "negative control: a full-table decode reaches the malformed identity"
+        );
+        assert!(storage.forgotten_conversation_keys_for(&[])?.is_empty());
+
+        let mut other_source = keys[7].clone();
+        other_source.source_id = "remote-host".into();
+        let mut other_agent = keys[7].clone();
+        other_agent.agent_slug = "devin".into();
+        let mut other_path = keys[7].clone();
+        other_path.source_path.push_str("/sibling");
+        let mut other_session = keys[7].clone();
+        other_session.external_id = "not-archived".into();
+        let request = [
+            keys[7].clone(),
+            keys[511].clone(),
+            keys[7].clone(),
+            other_source,
+            other_agent,
+            other_path,
+            other_session,
+        ];
+        assert_eq!(
+            storage.forgotten_conversation_keys_for(&request)?,
+            HashSet::from([keys[7].clone(), keys[511].clone()])
+        );
+        assert_eq!(
+            storage.forgotten_conversation_keys_for(&keys[..260])?,
+            keys[..260].iter().cloned().collect()
+        );
+        let plan: Vec<String> = storage.raw().query_map_collect(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM forgotten_conversations
+             INDEXED BY sqlite_autoindex_forgotten_conversations_1
+             WHERE source_id = ?1 AND agent_slug = ?2
+               AND source_path = ?3 AND external_id = ?4
+             LIMIT 1",
+            fparams![
+                keys[7].source_id.as_str(),
+                keys[7].agent_slug.as_str(),
+                keys[7].source_path.as_str(),
+                keys[7].external_id.as_str()
+            ],
+            |row| row.get_typed(3),
+        )?;
+        assert!(
+            plan.iter().any(|detail| detail.contains("SEARCH")
+                && detail.contains("sqlite_autoindex_forgotten_conversations_1")),
+            "batch admission must use exact composite-key seeks: {plan:?}"
+        );
+        assert!(!storage.forget_derived_rebuild_pending()?);
+        Ok(())
+    }
+
+    #[test]
     fn forget_shared_store_records_session_identity_without_suppressing_siblings() -> Result<()> {
         let directory = TempDir::new()?;
         let path = directory.path().join("shared-store.db");
@@ -46641,6 +47017,17 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         storage.close()?;
 
         let reader = FrankenStorage::open_strict_readonly(&path)?;
+        assert!(
+            reader
+                .forgotten_conversation_keys_for(&[ForgottenConversationKey {
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    agent_slug: "opencode".into(),
+                    source_path: "/fixture/current.jsonl".into(),
+                    external_id: "current".into(),
+                }])?
+                .is_empty()
+        );
+        assert!(!reader.forget_derived_rebuild_pending()?);
         let filter = ForgetConversationsFilter {
             workspace_glob: Some("/work/retired"),
             ..Default::default()
