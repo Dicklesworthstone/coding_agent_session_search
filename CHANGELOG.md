@@ -34,6 +34,25 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Added
 
+- **Discoverable exclusions and explicit session re-inclusion (#537).**
+  `cass forget --list` reports durable shared-session exclusions and legacy
+  file stamps. `--reinclude` previews an explicit release and requires
+  `--apply` to commit it, followed by `cass index --full` to restore preserved
+  transcripts. Literal source paths, source provenance, provider and external
+  session IDs can select one identity without releasing its siblings. An
+  identity release that overlaps a path-wide legacy stamp refuses to apply;
+  a separately reviewed source-only release can remove both mechanisms.
+  Workspace/age filters remain deletion selectors because v23 exclusion
+  records do not retain that metadata. Indexing also suppresses new raw
+  snapshots of containers with durable session exclusions, including aliases
+  and SQLite sidecars, while retained canonical siblings continue updating.
+  Original sources and existing raw evidence are preserved. Automatic
+  age-based conversation deletion remains disabled.
+  GOLDEN-CHANGE: `robot/capabilities.json.golden` adds retention/exclusion
+  feature flags. Its command schema and `robot/introspect.json.golden` add
+  the explicit list/re-inclusion options; `robot_docs/commands.txt.golden`
+  documents those modes and the explicit shared-session release policy.
+
 - **Retryable selective-forget recovery and bounded exclusion lookups (#537).**
   Canonical deletion records a durable pending-rebuild marker in the same
   transaction. Retrying `forget --apply` finishes failed derived-index work
@@ -52,7 +71,7 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   make the permanent shared-session policy explicit: edits, appends, full
   rescans and changes to workspace exclusions do not restore a forgotten
   shared identity; ordinary single-session files retain size/mtime-based
-  re-inclusion. There is no automatic pruning or `unforget` command.
+  re-inclusion. There is no automatic age-based conversation pruning.
   GOLDEN-CHANGE: `robot_docs/commands.txt.golden` adds the selective forget
   command and its shared-session retention policy; existing capabilities and
   introspection descriptions are preserved.

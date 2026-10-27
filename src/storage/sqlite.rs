@@ -11174,6 +11174,15 @@ impl FrankenStorage {
         if paths.is_empty() || !historical_table_exists(&self.conn, "forgotten_sources")? {
             return Ok(HashMap::new());
         }
+        // Most archives have never forgotten a source. Bound that common
+        // case to one row probe instead of a failed seek for every candidate.
+        if self
+            .conn
+            .query("SELECT 1 FROM forgotten_sources LIMIT 1")?
+            .is_empty()
+        {
+            return Ok(HashMap::new());
+        }
         let statement = self.conn.prepare(
             "SELECT size_bytes, mtime_ms FROM forgotten_sources
              INDEXED BY sqlite_autoindex_forgotten_sources_1
@@ -11196,6 +11205,182 @@ impl FrankenStorage {
             }
         }
         Ok(matched)
+    }
+
+    /// Discover stored exclusions from one read snapshot. Old schemas lacking
+    /// either tombstone table are valid read-only inputs; listing never runs a
+    /// migration or consults provider transcripts for discarded metadata.
+    pub fn list_forget_exclusions(
+        &self,
+        selector: &ForgetExclusionSelector<'_>,
+    ) -> Result<ForgetExclusionList> {
+        let compiled = CompiledForgetExclusionSelector::new(selector, false)?;
+        let mut tx = self.conn.transaction()?;
+        let result = self.collect_forget_exclusions(&tx, &compiled)?;
+        tx.rollback()?;
+        Ok(result)
+    }
+
+    fn collect_forget_exclusions(
+        &self,
+        tx: &FrankenTransaction<'_>,
+        compiled: &CompiledForgetExclusionSelector<'_>,
+    ) -> Result<ForgetExclusionList> {
+        let mut exclusions = if historical_table_exists(&self.conn, "forgotten_conversations")? {
+            tx.query_map_collect(
+                "SELECT source_id, agent_slug, source_path, external_id, forgotten_at_ms
+                 FROM forgotten_conversations
+                 ORDER BY source_id, agent_slug, source_path, external_id",
+                fparams![],
+                |row| {
+                    Ok(ForgottenConversationExclusion {
+                        key: ForgottenConversationKey {
+                            source_id: row.get_typed(0)?,
+                            agent_slug: row.get_typed(1)?,
+                            source_path: row.get_typed(2)?,
+                            external_id: row.get_typed(3)?,
+                        },
+                        forgotten_at_ms: row.get_typed(4)?,
+                        blocked_by_source_stamp: false,
+                    })
+                },
+            )?
+        } else {
+            Vec::new()
+        };
+        exclusions.retain(|record| compiled.matches_session(&record.key));
+
+        let mut legacy_sources: Vec<ForgottenSourceExclusion> = if compiled.source_only()
+            && historical_table_exists(&self.conn, "forgotten_sources")?
+        {
+            tx.query_map_collect(
+                "SELECT source_path, size_bytes, mtime_ms, forgotten_at_ms
+                 FROM forgotten_sources ORDER BY source_path",
+                fparams![],
+                |row| {
+                    Ok(ForgottenSourceExclusion {
+                        source_path: row.get_typed(0)?,
+                        size_bytes: row.get_typed(1)?,
+                        mtime_ms: row.get_typed(2)?,
+                        forgotten_at_ms: row.get_typed(3)?,
+                    })
+                },
+            )?
+        } else {
+            Vec::new()
+        };
+        legacy_sources.retain(|record| compiled.matches_path(&record.source_path));
+        let legacy_paths: HashSet<String> = if compiled.source_only() {
+            legacy_sources
+                .iter()
+                .map(|record| record.source_path.clone())
+                .collect()
+        } else {
+            let paths: Vec<_> = exclusions
+                .iter()
+                .map(|record| record.key.source_path.clone())
+                .collect();
+            self.forgotten_source_stamps_for(&paths)?
+                .into_keys()
+                .collect()
+        };
+        for record in &mut exclusions {
+            record.blocked_by_source_stamp = legacy_paths.contains(&record.key.source_path);
+        }
+        Ok(ForgetExclusionList {
+            exclusions,
+            legacy_sources,
+        })
+    }
+
+    /// Explicitly release selected exclusions, leaving canonical rows and raw
+    /// evidence untouched. The caller holds the maintenance lease for apply.
+    /// A subsequent plain `index --full` revisits preserved historical sources;
+    /// current path/workspace exclusions continue to apply independently.
+    pub fn reinclude_forget_exclusions(
+        &self,
+        selector: &ForgetExclusionSelector<'_>,
+        dry_run: bool,
+    ) -> Result<ReincludeForgetExclusionsResult> {
+        let compiled = CompiledForgetExclusionSelector::new(selector, true)?;
+        let mut tx = self.conn.transaction()?;
+        let listed = self.collect_forget_exclusions(&tx, &compiled)?;
+        let blocked_by_source_stamps = if compiled.source_only() {
+            Vec::new()
+        } else {
+            listed
+                .exclusions
+                .iter()
+                .filter(|record| record.blocked_by_source_stamp)
+                .map(|record| record.key.source_path.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        let mut result = ReincludeForgetExclusionsResult {
+            dry_run,
+            exclusions_matched: listed.exclusions.len(),
+            legacy_sources_matched: listed.legacy_sources.len(),
+            blocked_by_source_stamps,
+            sample_sessions: listed.exclusions.iter().take(20).cloned().collect(),
+            sample_source_paths: listed
+                .legacy_sources
+                .iter()
+                .take(20)
+                .map(|record| record.source_path.clone())
+                .collect(),
+            ..Default::default()
+        };
+        let has_matches = !listed.exclusions.is_empty() || !listed.legacy_sources.is_empty();
+        if has_matches {
+            let observations: i64 = tx.query_row_map(
+                "SELECT COUNT(*) FROM meta
+                 WHERE key >= 'source_ingest_v1:' AND key < 'source_ingest_v1;'",
+                fparams![],
+                |row| row.get_typed(0),
+            )?;
+            result.source_observations_matched =
+                usize::try_from(observations).context("invalid source observation count")?;
+        }
+        if dry_run || !has_matches {
+            tx.rollback()?;
+            return Ok(result);
+        }
+        if !result.blocked_by_source_stamps.is_empty() {
+            bail!(
+                "cannot reinclude selected sessions while a source-wide exclusion also covers {}; preview a source-only --source-path or --source-glob release before applying it",
+                result.blocked_by_source_stamps.join(", ")
+            );
+        }
+        for record in &listed.exclusions {
+            tx.execute_compat(
+                "DELETE FROM forgotten_conversations
+                 WHERE source_id = ?1 AND agent_slug = ?2
+                   AND source_path = ?3 AND external_id = ?4",
+                fparams![
+                    record.key.source_id.as_str(),
+                    record.key.agent_slug.as_str(),
+                    record.key.source_path.as_str(),
+                    record.key.external_id.as_str()
+                ],
+            )?;
+        }
+        for record in &listed.legacy_sources {
+            tx.execute_compat(
+                "DELETE FROM forgotten_sources WHERE source_path = ?1",
+                fparams![record.source_path.as_str()],
+            )?;
+        }
+        // These keys include scan-root and mapping information absent from a
+        // tombstone. Clear the namespace rather than guess a partial identity.
+        // Do not clear connector cutoffs or unfinished derived-rebuild work.
+        result.source_observations_removed = tx.execute(
+            "DELETE FROM meta WHERE key >= 'source_ingest_v1:' AND key < 'source_ingest_v1;'",
+        )?;
+        tx.commit()?;
+        result.exclusions_removed = listed.exclusions.len();
+        result.legacy_sources_removed = listed.legacy_sources.len();
+        Ok(result)
     }
 
     /// Session tombstones survive changes to unrelated sessions in the same
@@ -11229,6 +11414,13 @@ impl FrankenStorage {
         keys: &[ForgottenConversationKey],
     ) -> Result<HashSet<ForgottenConversationKey>> {
         if keys.is_empty() || !historical_table_exists(&self.conn, "forgotten_conversations")? {
+            return Ok(HashSet::new());
+        }
+        if self
+            .conn
+            .query("SELECT 1 FROM forgotten_conversations LIMIT 1")?
+            .is_empty()
+        {
             return Ok(HashSet::new());
         }
         let statement = self.conn.prepare(
@@ -23795,12 +23987,140 @@ pub struct ForgetConversationsFilter<'a> {
 /// A durable session identity in a source that can hold multiple conversations.
 /// Agent/source provenance prevents a same-named session in a different store
 /// from inheriting another conversation's tombstone.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct ForgottenConversationKey {
     pub source_id: String,
     pub agent_slug: String,
     pub source_path: String,
     pub external_id: String,
+}
+
+/// Select already-forgotten identities without inferring the workspace or
+/// message times that v23 never stored. Exact identity predicates intersect;
+/// a literal source path and a source glob are mutually exclusive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ForgetExclusionSelector<'a> {
+    pub source_glob: Option<&'a str>,
+    pub source_path: Option<&'a str>,
+    pub source_id: Option<&'a str>,
+    pub agent_slug: Option<&'a str>,
+    pub external_id: Option<&'a str>,
+}
+
+impl ForgetExclusionSelector<'_> {
+    pub fn validate(&self, require_selector: bool) -> Result<()> {
+        CompiledForgetExclusionSelector::new(self, require_selector).map(|_| ())
+    }
+}
+
+struct CompiledForgetExclusionSelector<'a> {
+    selector: ForgetExclusionSelector<'a>,
+    source_glob: Option<glob::Pattern>,
+}
+
+impl<'a> CompiledForgetExclusionSelector<'a> {
+    fn new(selector: &ForgetExclusionSelector<'a>, require_selector: bool) -> Result<Self> {
+        if selector.source_glob.is_some() && selector.source_path.is_some() {
+            bail!("source-path and source-glob are mutually exclusive exclusion selectors");
+        }
+        let fields = [
+            ("source-glob", selector.source_glob),
+            ("source-path", selector.source_path),
+            ("source-id", selector.source_id),
+            ("agent", selector.agent_slug),
+            ("external-id", selector.external_id),
+        ];
+        if require_selector && fields.iter().all(|(_, value)| value.is_none()) {
+            bail!("reinclude requires at least one exclusion selector");
+        }
+        for (name, value) in fields {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                bail!("exclusion {name} selector cannot be empty");
+            }
+        }
+        let source_glob = selector
+            .source_glob
+            .map(|pattern| {
+                glob::Pattern::new(pattern.trim())
+                    .with_context(|| format!("invalid exclusion source-glob pattern: {pattern}"))
+            })
+            .transpose()?;
+        Ok(Self {
+            selector: *selector,
+            source_glob,
+        })
+    }
+
+    fn source_only(&self) -> bool {
+        self.selector.source_id.is_none()
+            && self.selector.agent_slug.is_none()
+            && self.selector.external_id.is_none()
+    }
+
+    fn matches_path(&self, path: &str) -> bool {
+        self.selector.source_path.is_none_or(|exact| exact == path)
+            && self
+                .source_glob
+                .as_ref()
+                .is_none_or(|pattern| pattern.matches(path))
+    }
+
+    fn matches_session(&self, key: &ForgottenConversationKey) -> bool {
+        self.matches_path(&key.source_path)
+            && self
+                .selector
+                .source_id
+                .is_none_or(|source_id| source_id == key.source_id)
+            && self
+                .selector
+                .agent_slug
+                .is_none_or(|agent| agent == key.agent_slug)
+            && self
+                .selector
+                .external_id
+                .is_none_or(|external_id| external_id == key.external_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForgottenConversationExclusion {
+    #[serde(flatten)]
+    pub key: ForgottenConversationKey,
+    pub forgotten_at_ms: i64,
+    /// A separate source-wide stamp also suppresses this path. Releasing one
+    /// session must not implicitly release unnamed siblings covered by it.
+    pub blocked_by_source_stamp: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForgottenSourceExclusion {
+    pub source_path: String,
+    pub size_bytes: Option<i64>,
+    pub mtime_ms: Option<i64>,
+    pub forgotten_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ForgetExclusionList {
+    pub exclusions: Vec<ForgottenConversationExclusion>,
+    /// Source stamps have no provider/provenance/session metadata. They are
+    /// listed only when no identity predicate asks us to infer those fields.
+    pub legacy_sources: Vec<ForgottenSourceExclusion>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ReincludeForgetExclusionsResult {
+    pub dry_run: bool,
+    pub exclusions_matched: usize,
+    pub exclusions_removed: usize,
+    pub legacy_sources_matched: usize,
+    pub legacy_sources_removed: usize,
+    pub source_observations_matched: usize,
+    pub source_observations_removed: usize,
+    pub blocked_by_source_stamps: Vec<String>,
+    pub sample_sessions: Vec<ForgottenConversationExclusion>,
+    /// Bounded sample of the separately selected legacy source stamps.
+    pub sample_source_paths: Vec<String>,
 }
 
 /// A bounded preview identifies the selected session even when several
@@ -46482,6 +46802,13 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
     fn forgotten_source_batch_lookup_is_indexed_bounded_and_observes_changes() -> Result<()> {
         let directory = TempDir::new()?;
         let storage = FrankenStorage::open(&directory.path().join("batch-source-stamps.db"))?;
+        // A nonempty request against an empty table must not cache absence:
+        // this same path is inserted below and must become visible afterward.
+        assert!(
+            storage
+                .forgotten_source_stamps_for(&["/fixture/history/rollout-7.jsonl".into()])?
+                .is_empty()
+        );
         let mut fixtures = Vec::new();
         let mut tx = storage.raw().transaction()?;
         for index in 0..512_i64 {
@@ -46580,6 +46907,20 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
 
         let reader = FrankenStorage::open_strict_readonly(&path)?;
         assert!(reader.forgotten_source_stamps_for(&[])?.is_empty());
+        assert_eq!(
+            reader.list_forget_exclusions(&ForgetExclusionSelector::default())?,
+            ForgetExclusionList::default()
+        );
+        let reinclude = reader.reinclude_forget_exclusions(
+            &ForgetExclusionSelector {
+                source_path: Some("/fixture/history/rollout.jsonl"),
+                ..Default::default()
+            },
+            true,
+        )?;
+        assert_eq!(reinclude.exclusions_matched, 0);
+        assert_eq!(reinclude.legacy_sources_matched, 0);
+        assert_eq!(reinclude.source_observations_removed, 0);
         assert!(
             reader
                 .forgotten_source_stamps_for(&["/fixture/history/rollout.jsonl".into()])?
@@ -46601,6 +46942,17 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
     fn forgotten_conversation_batch_lookup_uses_exact_indexed_keys() -> Result<()> {
         let directory = TempDir::new()?;
         let storage = FrankenStorage::open(&directory.path().join("batch-exclusions.db"))?;
+        assert!(
+            storage
+                .forgotten_conversation_keys_for(&[ForgottenConversationKey {
+                    source_id: "local".into(),
+                    agent_slug: "opencode".into(),
+                    source_path: "/fixture/store-0/sessions.db".into(),
+                    external_id: "session-7".into(),
+                }])?
+                .is_empty(),
+            "an initially empty table must not hide the same key after insertion below"
+        );
         let mut keys = Vec::new();
         let mut tx = storage.raw().transaction()?;
         for index in 0..512 {
@@ -46681,6 +47033,320 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 && detail.contains("sqlite_autoindex_forgotten_conversations_1")),
             "batch admission must use exact composite-key seeks: {plan:?}"
         );
+        assert!(!storage.forget_derived_rebuild_pending()?);
+        Ok(())
+    }
+
+    #[test]
+    fn reinclude_exact_session_preserves_provenance_siblings_and_pending_work() -> Result<()> {
+        let directory = TempDir::new()?;
+        let db_path = directory.path().join("reinclude.db");
+        let provider = directory.path().join("project[1]/sessions.db");
+        fs::create_dir_all(provider.parent().context("provider parent")?)?;
+        let provider_bytes = b"unchanged provider evidence";
+        fs::write(&provider, provider_bytes)?;
+        let source = provider.to_string_lossy().into_owned();
+        let storage = FrankenStorage::open(&db_path)?;
+        let local = forget_fixture_conversation(
+            &source,
+            Some("shared-id"),
+            Some("/work/retired"),
+            &[Some(10)],
+        );
+        seed_forget_fixture(&storage, &local)?;
+        let kept_id = seed_forget_fixture(
+            &storage,
+            &forget_fixture_conversation(
+                &source,
+                Some("kept-id"),
+                Some("/work/current"),
+                &[Some(20)],
+            ),
+        )?;
+        let mut remote = local.clone();
+        remote.source_id = "remote-fixture".into();
+        remote.origin_host = Some("remote-fixture".into());
+        seed_forget_fixture(&storage, &remote)?;
+        let mut other_agent = local.clone();
+        other_agent.agent_slug = "devin".into();
+        seed_forget_fixture(&storage, &other_agent)?;
+        let mut other_path = local;
+        other_path.source_path = directory.path().join("other.db");
+        seed_forget_fixture(&storage, &other_path)?;
+        assert_eq!(
+            storage
+                .forget_conversations(
+                    &ForgetConversationsFilter {
+                        workspace_glob: Some("/work/retired"),
+                        ..Default::default()
+                    },
+                    false,
+                )?
+                .conversations_deleted,
+            4
+        );
+        for key in ["source_ingest_v1:shared", "source_ingest_v1:other"] {
+            storage.raw().execute_compat(
+                "INSERT INTO meta(key, value) VALUES (?1, '{}')",
+                fparams![key],
+            )?;
+        }
+        storage.set_last_scan_ts(123)?;
+        storage.set_connector_last_scan_ts("opencode", 456)?;
+        let before = storage.list_forget_exclusions(&ForgetExclusionSelector::default())?;
+        assert_eq!(before.exclusions.len(), 4);
+        assert!(before.legacy_sources.is_empty());
+        let selector = ForgetExclusionSelector {
+            source_path: Some(&source),
+            source_id: Some(LOCAL_SOURCE_ID),
+            agent_slug: Some("opencode"),
+            external_id: Some("shared-id"),
+            ..Default::default()
+        };
+        let listed = storage.list_forget_exclusions(&selector)?;
+        assert_eq!(listed.exclusions.len(), 1);
+        assert!(!listed.exclusions[0].blocked_by_source_stamp);
+        assert_eq!(listed.exclusions[0].key.source_path, source);
+        assert!(listed.exclusions[0].forgotten_at_ms > 0);
+        let json = serde_json::to_value(&listed.exclusions[0])?;
+        assert_eq!(json["source_id"], LOCAL_SOURCE_ID);
+        assert!(json.get("workspace").is_none());
+        assert!(json.get("last_message_at").is_none());
+        assert!(
+            storage
+                .list_forget_exclusions(&ForgetExclusionSelector {
+                    source_glob: Some(&source),
+                    ..Default::default()
+                })?
+                .exclusions
+                .is_empty(),
+            "literal bracketed paths must use source-path rather than glob interpretation"
+        );
+        for invalid in [
+            ForgetExclusionSelector::default(),
+            ForgetExclusionSelector {
+                source_glob: Some("*"),
+                source_path: Some(&source),
+                ..Default::default()
+            },
+            ForgetExclusionSelector {
+                source_glob: Some("["),
+                ..Default::default()
+            },
+            ForgetExclusionSelector {
+                external_id: Some(" "),
+                ..Default::default()
+            },
+        ] {
+            for dry_run in [true, false] {
+                assert!(
+                    storage
+                        .reinclude_forget_exclusions(&invalid, dry_run)
+                        .is_err()
+                );
+            }
+        }
+        let preview = storage.reinclude_forget_exclusions(&selector, true)?;
+        assert_eq!(preview.exclusions_matched, 1);
+        assert_eq!(preview.exclusions_removed, 0);
+        assert_eq!(preview.source_observations_matched, 2);
+        assert_eq!(preview.source_observations_removed, 0);
+        assert_eq!(preview.sample_sessions, listed.exclusions);
+        assert_eq!(
+            storage.list_forget_exclusions(&ForgetExclusionSelector::default())?,
+            before
+        );
+        assert_eq!(storage.source_ingest_ledger_entries()?.len(), 2);
+        assert!(storage.forget_derived_rebuild_pending()?);
+
+        let applied = storage.reinclude_forget_exclusions(&selector, false)?;
+        assert_eq!(applied.exclusions_removed, 1);
+        assert_eq!(applied.legacy_sources_removed, 0);
+        assert_eq!(applied.source_observations_removed, 2);
+        assert!(storage.source_ingest_ledger_entries()?.is_empty());
+        assert!(
+            storage
+                .list_forget_exclusions(&selector)?
+                .exclusions
+                .is_empty()
+        );
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), 3);
+        assert_eq!(storage.total_conversation_count()?, 1);
+        assert_eq!(storage.fetch_messages(kept_id)?.len(), 1);
+        assert_eq!(storage.get_last_scan_ts()?, Some(123));
+        assert_eq!(storage.get_connector_last_scan_ts("opencode")?, Some(456));
+        assert!(storage.forget_derived_rebuild_pending()?);
+        storage.raw().execute(
+            "INSERT INTO meta(key, value) VALUES ('source_ingest_v1:after-release', '{}')",
+        )?;
+        let no_match = storage.reinclude_forget_exclusions(&selector, false)?;
+        assert_eq!(no_match.exclusions_matched, 0);
+        assert_eq!(no_match.exclusions_removed, 0);
+        assert_eq!(no_match.source_observations_removed, 0);
+        assert_eq!(storage.source_ingest_ledger_entries()?.len(), 1);
+        storage.close()?;
+        let reopened = FrankenStorage::open_strict_readonly(&db_path)?;
+        assert_eq!(
+            reopened
+                .list_forget_exclusions(&ForgetExclusionSelector::default())?
+                .exclusions
+                .len(),
+            3
+        );
+        assert!(reopened.forget_derived_rebuild_pending()?);
+        reopened.close_without_checkpoint()?;
+        assert_eq!(fs::read(provider)?, provider_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn reinclude_identity_scope_refuses_source_stamp_overlap_before_any_mutation() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("overlap.db"))?;
+        for (source, session) in [
+            ("/fixture/blocked.db", "blocked"),
+            ("/fixture/free.db", "free"),
+        ] {
+            seed_forget_fixture(
+                &storage,
+                &forget_fixture_conversation(source, Some(session), Some("/work/old"), &[Some(10)]),
+            )?;
+        }
+        storage.forget_conversations_by_source_glob("/fixture/*.db", false)?;
+        storage.raw().execute(
+            "INSERT INTO forgotten_sources(source_path, size_bytes, mtime_ms, forgotten_at_ms)
+             VALUES ('/fixture/blocked.db', 10, 20, 30)",
+        )?;
+        storage
+            .raw()
+            .execute("INSERT INTO meta(key, value) VALUES ('source_ingest_v1:overlap', '{}')")?;
+        let selector = ForgetExclusionSelector {
+            agent_slug: Some("opencode"),
+            ..Default::default()
+        };
+        let preview = storage.reinclude_forget_exclusions(&selector, true)?;
+        assert_eq!(preview.exclusions_matched, 2);
+        assert_eq!(preview.legacy_sources_matched, 0);
+        assert_eq!(preview.blocked_by_source_stamps, ["/fixture/blocked.db"]);
+        let before = storage.list_forget_exclusions(&ForgetExclusionSelector::default())?;
+        assert_eq!(before.legacy_sources.len(), 1);
+        assert!(
+            storage
+                .reinclude_forget_exclusions(&selector, false)
+                .unwrap_err()
+                .to_string()
+                .contains("source-wide exclusion")
+        );
+        assert_eq!(
+            storage.list_forget_exclusions(&ForgetExclusionSelector::default())?,
+            before
+        );
+        assert_eq!(storage.source_ingest_ledger_entries()?.len(), 1);
+        let source_only = ForgetExclusionSelector {
+            source_path: Some("/fixture/blocked.db"),
+            ..Default::default()
+        };
+        let preview = storage.reinclude_forget_exclusions(&source_only, true)?;
+        assert_eq!(preview.exclusions_matched, 1);
+        assert_eq!(preview.legacy_sources_matched, 1);
+        assert!(preview.blocked_by_source_stamps.is_empty());
+        let applied = storage.reinclude_forget_exclusions(&source_only, false)?;
+        assert_eq!(applied.exclusions_removed, 1);
+        assert_eq!(applied.legacy_sources_removed, 1);
+        assert_eq!(applied.source_observations_removed, 1);
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), 1);
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        assert!(storage.forget_derived_rebuild_pending()?);
+        Ok(())
+    }
+
+    #[test]
+    fn reinclude_ledger_failure_rolls_back_both_exclusion_kinds() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("reinclude-rollback.db"))?;
+        let source = "/fixture/rollback.db";
+        seed_forget_fixture(
+            &storage,
+            &forget_fixture_conversation(source, Some("session"), None, &[Some(10)]),
+        )?;
+        storage.forget_conversations_by_source_glob(source, false)?;
+        storage.raw().execute_compat(
+            "INSERT INTO forgotten_sources(source_path, forgotten_at_ms) VALUES (?1, 1)",
+            fparams![source],
+        )?;
+        storage
+            .raw()
+            .execute("INSERT INTO meta(key, value) VALUES ('source_ingest_v1:guarded', '{}')")?;
+        storage.raw().execute(
+            "CREATE TABLE reinclude_ledger_guard (
+                ledger_key TEXT PRIMARY KEY REFERENCES meta(key) ON DELETE RESTRICT
+             )",
+        )?;
+        storage.raw().execute(
+            "INSERT INTO reinclude_ledger_guard(ledger_key) VALUES ('source_ingest_v1:guarded')",
+        )?;
+        let selector = ForgetExclusionSelector {
+            source_path: Some(source),
+            ..Default::default()
+        };
+        let before = storage.list_forget_exclusions(&selector)?;
+        assert_eq!(before.exclusions.len(), 1);
+        assert_eq!(before.legacy_sources.len(), 1);
+        let preview = storage.reinclude_forget_exclusions(&selector, true)?;
+        assert_eq!(preview.exclusions_matched, 1);
+        assert_eq!(preview.legacy_sources_matched, 1);
+        assert_eq!(preview.source_observations_matched, 1);
+        assert!(
+            storage
+                .reinclude_forget_exclusions(&selector, false)
+                .is_err()
+        );
+        assert_eq!(storage.list_forget_exclusions(&selector)?, before);
+        assert_eq!(storage.source_ingest_ledger_entries()?.len(), 1);
+        assert!(storage.forget_derived_rebuild_pending()?);
+        storage
+            .raw()
+            .execute("DELETE FROM reinclude_ledger_guard")?;
+        let applied = storage.reinclude_forget_exclusions(&selector, false)?;
+        assert_eq!(applied.exclusions_removed, 1);
+        assert_eq!(applied.legacy_sources_removed, 1);
+        assert_eq!(applied.source_observations_removed, 1);
+        assert!(storage.source_ingest_ledger_entries()?.is_empty());
+        assert_eq!(storage.schema_version()?, 23);
+        assert!(storage.forget_derived_rebuild_pending()?);
+        Ok(())
+    }
+
+    #[test]
+    fn reinclude_preview_samples_do_not_limit_the_selected_release() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("reinclude-samples.db"))?;
+        let mut tx = storage.raw().transaction()?;
+        for index in 0..25 {
+            tx.execute_compat(
+                "INSERT INTO forgotten_conversations
+                    (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+                 VALUES ('local', 'opencode', '/fixture/shared.db', ?1, 1)",
+                fparams![format!("session-{index:02}")],
+            )?;
+        }
+        tx.commit()?;
+        let selector = ForgetExclusionSelector {
+            source_glob: Some("/fixture/*.db"),
+            ..Default::default()
+        };
+        assert_eq!(
+            storage.list_forget_exclusions(&selector)?.exclusions.len(),
+            25
+        );
+        let preview = storage.reinclude_forget_exclusions(&selector, true)?;
+        assert_eq!(preview.exclusions_matched, 25);
+        assert_eq!(preview.sample_sessions.len(), 20);
+        assert_eq!(preview.exclusions_removed, 0);
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), 25);
+        let applied = storage.reinclude_forget_exclusions(&selector, false)?;
+        assert_eq!(applied.exclusions_removed, 25);
+        assert!(storage.forgotten_conversation_keys()?.is_empty());
         assert!(!storage.forget_derived_rebuild_pending()?);
         Ok(())
     }
@@ -47028,6 +47694,38 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 .is_empty()
         );
         assert!(!reader.forget_derived_rebuild_pending()?);
+        let listed = reader.list_forget_exclusions(&ForgetExclusionSelector::default())?;
+        assert!(listed.exclusions.is_empty());
+        assert_eq!(listed.legacy_sources.len(), 1);
+        assert_eq!(
+            listed.legacy_sources[0].source_path,
+            "/fixture/already-forgotten.jsonl"
+        );
+        assert_eq!(listed.legacy_sources[0].forgotten_at_ms, 1);
+        let json = serde_json::to_value(&listed.legacy_sources[0])?;
+        assert!(json.get("source_id").is_none());
+        assert!(json.get("workspace").is_none());
+        assert!(
+            reader
+                .list_forget_exclusions(&ForgetExclusionSelector {
+                    source_id: Some(LOCAL_SOURCE_ID),
+                    ..Default::default()
+                })?
+                .legacy_sources
+                .is_empty(),
+            "legacy source stamps must not be assigned invented provenance"
+        );
+        let reinclude = reader.reinclude_forget_exclusions(
+            &ForgetExclusionSelector {
+                source_glob: Some("/fixture/already-*.jsonl"),
+                ..Default::default()
+            },
+            true,
+        )?;
+        assert_eq!(reinclude.exclusions_matched, 0);
+        assert_eq!(reinclude.legacy_sources_matched, 1);
+        assert_eq!(reinclude.legacy_sources_removed, 0);
+        assert_eq!(reader.forgotten_source_stamps()?.len(), 1);
         let filter = ForgetConversationsFilter {
             workspace_glob: Some("/work/retired"),
             ..Default::default()

@@ -8,6 +8,7 @@ pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;
 pub mod quarantine;
 pub mod quarantine_retry;
+mod raw_source_exclusions;
 pub mod redact_secrets;
 pub mod refresh_ledger;
 pub(crate) mod responsiveness;
@@ -19,6 +20,7 @@ mod source_writer_probe;
 pub(crate) mod staging_reclaim;
 
 use self::quarantine::{QuarantineKey, QuarantineState};
+use self::raw_source_exclusions::RawSourceExclusions;
 use self::refresh_ledger::{
     EquivalenceArtifacts as RefreshEquivalenceArtifacts, PhaseRecord, RefreshLedger,
     RefreshLedgerEvidence, RefreshPhase,
@@ -15011,6 +15013,7 @@ fn is_streaming_consumer_disconnected(error: &anyhow::Error) -> bool {
 #[derive(Clone)]
 struct StreamingProducerConfig {
     source_ledger: Arc<HashMap<String, String>>,
+    raw_source_exclusions: Arc<RawSourceExclusions>,
     flow_limiter: Arc<StreamingByteLimiter>,
     data_dir: PathBuf,
     additional_scan_roots: Vec<ScanRoot>,
@@ -15125,6 +15128,7 @@ where
                     &fallback_roots,
                     local_since_ts,
                     config.active_source_filter.as_ref(),
+                    &config.raw_source_exclusions,
                 );
             active_source_skipped |= preparse_active_source_skipped;
             match scan_with_durable_source_boundaries(
@@ -15153,6 +15157,7 @@ where
                         &local_origin,
                         None,
                         &mut conversation,
+                        &config.raw_source_exclusions,
                     );
                     // #332: each parsed conversation is live work even while the
                     // batch sender buffers it below publication thresholds — this
@@ -15249,6 +15254,7 @@ where
                     std::slice::from_ref(root),
                     root_since_ts,
                     config.active_source_filter.as_ref(),
+                    &config.raw_source_exclusions,
                 );
             active_source_skipped |= preparse_active_source_skipped;
             match scan_with_durable_source_boundaries(
@@ -15277,6 +15283,7 @@ where
                         &root.origin,
                         Some(root),
                         &mut conversation,
+                        &config.raw_source_exclusions,
                     );
 
                     if !was_detected && !is_discovered {
@@ -16216,6 +16223,7 @@ where
     // Create bounded channel for backpressure
     let (tx, rx) = bounded::<IndexMessage>(STREAMING_CHANNEL_SIZE);
     let producer_config = StreamingProducerConfig {
+        raw_source_exclusions: Arc::new(RawSourceExclusions::load(storage)?),
         source_ledger: Arc::new(
             if matches!(
                 lexical_strategy,
@@ -16527,6 +16535,7 @@ where
         progress.check_stop()?;
     }
     let data_dir = opts.data_dir.clone();
+    let raw_source_exclusions = RawSourceExclusions::load(storage)?;
     let active_source_filter = Arc::new(ActiveSessionSourceFilter::new(
         opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
     ));
@@ -16625,6 +16634,7 @@ where
                         &fallback_roots,
                         local_since_ts,
                         active_source_filter.as_ref(),
+                        &raw_source_exclusions,
                     );
                     active_source_skipped |= preparse_active_source_skipped;
                     let local_origin = Origin::local();
@@ -16652,6 +16662,7 @@ where
                             &local_origin,
                             None,
                             &mut conversation,
+                            &raw_source_exclusions,
                         );
                         convs.push(conversation);
                         Ok(())
@@ -16707,6 +16718,7 @@ where
                             std::slice::from_ref(root),
                             root_since_ts,
                             active_source_filter.as_ref(),
+                            &raw_source_exclusions,
                         );
                         active_source_skipped |= preparse_active_source_skipped;
                         if let Err(e) = conn.scan_with_callback(&ctx, &mut |mut conversation| {
@@ -16730,6 +16742,7 @@ where
                                 &root.origin,
                                 Some(root),
                                 &mut conversation,
+                                &raw_source_exclusions,
                             );
                             convs.push(conversation);
                             Ok(())
@@ -30806,6 +30819,11 @@ fn targeted_quarantine_retry_inner(
     conversation.external_id.clone_from(&source.external_id);
     conversation.workspace.clone_from(&source.workspace);
 
+    let db_path = data_dir.join("agent_search.db");
+    let storage = FrankenStorage::open(&db_path)
+        .with_context(|| format!("opening quarantine retry archive {}", db_path.display()))?;
+    storage.run_migrations()?;
+    let raw_source_exclusions = RawSourceExclusions::load(&storage)?;
     let origin = Origin::local();
     prepare_conversation_for_ingest(
         data_dir,
@@ -30813,16 +30831,13 @@ fn targeted_quarantine_retry_inner(
         &origin,
         Some(&root),
         &mut conversation,
+        &raw_source_exclusions,
     );
     anyhow::ensure!(
         poison_conversation_id(&conversation) == key.conversation_id,
         "targeted quarantine retry identity changed after canonical preparation"
     );
     let conversations = [conversation];
-    let db_path = data_dir.join("agent_search.db");
-    let storage = FrankenStorage::open(&db_path)
-        .with_context(|| format!("opening quarantine retry archive {}", db_path.display()))?;
-    storage.run_migrations()?;
     let index_path = index_dir(data_dir)?;
     let mut lexical = TantivyIndex::open_or_create(&index_path)?;
     let outcome = ingest_watch_batch_with_oom_split(
@@ -32080,6 +32095,12 @@ fn reindex_paths_with_semantic_delta(
         return Ok(0);
     }
 
+    let raw_source_exclusions = {
+        let storage = storage
+            .lock()
+            .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+        RawSourceExclusions::load(&storage)?
+    };
     let mut total_indexed = 0usize;
     let mut first_source_scan_error = None;
 
@@ -32187,6 +32208,7 @@ fn reindex_paths_with_semantic_delta(
                 std::slice::from_ref(&root),
                 since_ts,
                 active_source_filter,
+                &raw_source_exclusions,
             );
 
         // SCAN PHASE: IO-heavy, no locks held
@@ -32277,6 +32299,7 @@ fn reindex_paths_with_semantic_delta(
                 &root.origin,
                 Some(&root),
                 conv,
+                &raw_source_exclusions,
             );
         }
         // Watermark order for live watch; a total order (watermark, path,
@@ -34162,6 +34185,7 @@ fn prepare_conversation_for_ingest(
     origin: &Origin,
     workspace_rewrite_root: Option<&ScanRoot>,
     conv: &mut NormalizedConversation,
+    raw_source_exclusions: &RawSourceExclusions,
 ) {
     inject_provenance(conv, origin);
     canonicalize_claude_external_id(connector_name, conv);
@@ -34172,10 +34196,11 @@ fn prepare_conversation_for_ingest(
     if WorkspaceExclusions::from_env()
         .is_ok_and(|policy| !policy.excludes(conv.workspace.as_deref()))
     {
-        attach_raw_mirror_capture(data_dir, conv);
+        attach_raw_mirror_capture(data_dir, conv, raw_source_exclusions);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_connector_sources_before_parse(
     connector: &(dyn crate::connectors::Connector + Send),
     ctx: &crate::connectors::ScanContext,
@@ -34184,6 +34209,7 @@ fn capture_connector_sources_before_parse(
     fallback_roots: &[ScanRoot],
     since_ts: Option<i64>,
     active_source_filter: &ActiveSessionSourceFilter,
+    raw_source_exclusions: &RawSourceExclusions,
 ) -> (ConnectorIngestRun, bool) {
     // f3grf: raw-mirror captures use the slug the parsed conversations carry
     // (the manifest id hashes the provider). Under the registry name, `claude`
@@ -34202,7 +34228,8 @@ fn capture_connector_sources_before_parse(
             // A per-session transcript's workspace is known only after parse.
             // Defer its capture to prepare_conversation_for_ingest so excluded
             // transcripts do not create new mirror blobs. Shared databases and
-            // reconstruction sidecars remain source-level recovery evidence.
+            // reconstruction sidecars remain recovery evidence unless a
+            // permanent session exclusion suppresses their physical container.
             let workspace_exclusions_active = WorkspaceExclusions::from_env()
                 .map(|policy| !policy.patterns.is_empty())
                 .unwrap_or(true);
@@ -34234,7 +34261,12 @@ fn capture_connector_sources_before_parse(
                     observed_sources.push(source);
                     continue;
                 }
-                capture_discovered_source_file_before_parse(data_dir, mirror_provider, &source);
+                capture_discovered_source_file_before_parse(
+                    data_dir,
+                    mirror_provider,
+                    &source,
+                    raw_source_exclusions,
+                );
                 observed_sources.push(source);
             }
             (observed_sources, None)
@@ -34247,6 +34279,7 @@ fn capture_connector_sources_before_parse(
                     root,
                     since_ts,
                     active_source_filter,
+                    raw_source_exclusions,
                 );
             }
             (Vec::new(), None)
@@ -34264,6 +34297,7 @@ fn capture_connector_sources_before_parse(
                     root,
                     since_ts,
                     active_source_filter,
+                    raw_source_exclusions,
                 );
             }
             (Vec::new(), Some(error))
@@ -34310,6 +34344,7 @@ fn capture_discovered_source_file_before_parse(
     data_dir: &Path,
     provider: &str,
     source: &crate::connectors::DiscoveredSourceFile,
+    raw_source_exclusions: &RawSourceExclusions,
 ) {
     if !crate::raw_mirror::capture_enabled() {
         return;
@@ -34325,6 +34360,9 @@ fn capture_discovered_source_file_before_parse(
             reason,
             "refusing to raw-mirror discovered provider source outside its scan root"
         );
+        return;
+    }
+    if raw_source_exclusions.excludes(&source.source_path) {
         return;
     }
 
@@ -34435,6 +34473,7 @@ fn capture_scan_sources_before_parse(
     root: &ScanRoot,
     since_ts: Option<i64>,
     active_source_filter: &ActiveSessionSourceFilter,
+    raw_source_exclusions: &RawSourceExclusions,
 ) -> bool {
     let mut active_source_skipped = false;
     for capture_root in preparse_capture_roots(provider, root, since_ts) {
@@ -34443,6 +34482,7 @@ fn capture_scan_sources_before_parse(
             provider,
             &capture_root,
             active_source_filter,
+            raw_source_exclusions,
         );
     }
     active_source_skipped
@@ -34483,6 +34523,7 @@ fn capture_scan_root_file_before_parse(
     provider: &str,
     root: &ScanRoot,
     active_source_filter: &ActiveSessionSourceFilter,
+    raw_source_exclusions: &RawSourceExclusions,
 ) -> bool {
     if !root.path.is_file() {
         return false;
@@ -34490,7 +34531,16 @@ fn capture_scan_root_file_before_parse(
     if should_skip_active_session_source(active_source_filter, root.origin.kind, &root.path) {
         return true;
     }
-    if !crate::raw_mirror::capture_enabled() {
+    if !crate::raw_mirror::capture_enabled() || raw_source_exclusions.excludes(&root.path) {
+        return false;
+    }
+    // Failed/empty discovery cannot prove that this fallback file contains
+    // only admitted workspaces. Defer capture until a parsed conversation
+    // reaches the normal workspace gate, just as discovered transcripts do.
+    if WorkspaceExclusions::from_env()
+        .map(|policy| !policy.patterns.is_empty())
+        .unwrap_or(true)
+    {
         return false;
     }
     match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
@@ -34525,7 +34575,11 @@ fn capture_scan_root_file_before_parse(
     false
 }
 
-fn attach_raw_mirror_capture(data_dir: &Path, conv: &mut NormalizedConversation) {
+fn attach_raw_mirror_capture(
+    data_dir: &Path,
+    conv: &mut NormalizedConversation,
+    raw_source_exclusions: &RawSourceExclusions,
+) {
     // GH #506: CASS_RAW_MIRROR=off leaves the conversation without raw-mirror
     // metadata; the archive rows are written as usual.
     if !crate::raw_mirror::capture_enabled() {
@@ -34537,6 +34591,9 @@ fn attach_raw_mirror_capture(data_dir: &Path, conv: &mut NormalizedConversation)
             source_path = %conv.source_path.display(),
             "skipping raw-mirror capture for logical non-file parsed conversation source"
         );
+        return;
+    }
+    if raw_source_exclusions.excludes(&conv.source_path) {
         return;
     }
 
@@ -42308,17 +42365,280 @@ mod tests {
             return Ok(());
         }
         let _policy = set_env("CASS_EXCLUDE_WORKSPACES", "/workspace/demo");
+        let _capture = set_env("CASS_RAW_MIRROR", "1");
+        let _free_space = set_env("CASS_RAW_MIRROR_MIN_FREE_BYTES", "0");
+        let _budget = set_env("CASS_RAW_MIRROR_MAX_BYTES", "67108864");
         let tmp = TempDir::new()?;
         let data_dir = tmp.path().join("data");
         let source_path = tmp.path().join("session.jsonl");
         let source_bytes = b"{\"role\":\"user\",\"content\":\"keep source intact\"}\n";
         fs::write(&source_path, source_bytes)?;
+        let root = ScanRoot::local(source_path.clone());
+        let ctx = ScanContext::with_roots(data_dir.clone(), vec![root.clone()], None);
+        let (_diagnostics, active_skipped) = capture_connector_sources_before_parse(
+            &FailingDiscoveryConnector {
+                sources: Vec::new(),
+            },
+            &ctx,
+            &data_dir,
+            "codex",
+            &[root],
+            None,
+            &ActiveSessionSourceFilter::default(),
+            &RawSourceExclusions::default(),
+        );
+        assert!(
+            !active_skipped,
+            "workspace deferral must not hold the scan watermark"
+        );
+        assert!(
+            !data_dir.join("raw-mirror").exists(),
+            "empty discovery must not bypass workspace policy"
+        );
         let mut conv = norm_conv(Some("excluded-mirror"), vec![norm_msg(0, 100)]);
         conv.source_path = source_path.clone();
-        prepare_conversation_for_ingest(&data_dir, "codex", &Origin::local(), None, &mut conv);
+        prepare_conversation_for_ingest(
+            &data_dir,
+            "codex",
+            &Origin::local(),
+            None,
+            &mut conv,
+            &RawSourceExclusions::default(),
+        );
         assert!(conv.metadata.pointer("/cass/raw_mirror").is_none());
         assert!(!data_dir.join("raw-mirror").exists());
-        assert_eq!(fs::read(source_path)?, source_bytes);
+        assert_eq!(fs::read(&source_path)?, source_bytes);
+        conv.workspace = Some(PathBuf::from("/workspace/admitted"));
+        prepare_conversation_for_ingest(
+            &data_dir,
+            "codex",
+            &Origin::local(),
+            None,
+            &mut conv,
+            &RawSourceExclusions::default(),
+        );
+        assert!(
+            conv.metadata.pointer("/cass/raw_mirror").is_some(),
+            "an admitted fallback transcript is captured after workspace discovery"
+        );
+        assert_eq!(fs::read(&source_path)?, source_bytes);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn gh537_shared_raw_exclusions_preserve_sibling_ingest_and_completion() -> Result<()> {
+        if !gh537_isolated_workspace_policy_test(
+            "gh537_shared_raw_exclusions_preserve_sibling_ingest_and_completion",
+        )? {
+            return Ok(());
+        }
+        let _capture = set_env("CASS_RAW_MIRROR", "1");
+        let _free_space = set_env("CASS_RAW_MIRROR_MIN_FREE_BYTES", "0");
+        let _budget = set_env("CASS_RAW_MIRROR_MAX_BYTES", "67108864");
+        let _policy = set_env("CASS_EXCLUDE_WORKSPACES", "");
+        let temp = TempDir::new()?;
+        let data_dir = temp.path().join("mirror-data");
+        // The archive is intentionally not data_dir/agent_search.db: the
+        // snapshot must use the storage selected by the indexing operation.
+        let storage = FrankenStorage::open(&temp.path().join("custom-canonical.db"))?;
+        let source_path = temp.path().join("shared.db");
+        let wal = temp.path().join("shared.db-wal");
+        fs::write(&source_path, b"shared source with a forgotten session")?;
+        fs::write(&wal, b"shared source pending changes")?;
+        let control_data_dir = temp.path().join("capture-control");
+        capture_scan_root_file_before_parse(
+            &control_data_dir,
+            "opencode",
+            &ScanRoot::local(source_path.clone()),
+            &ActiveSessionSourceFilter::default(),
+            &RawSourceExclusions::default(),
+        );
+        assert!(
+            !raw_mirror_manifest_values(&control_data_dir).is_empty(),
+            "the fixture must be capturable without a permanent exclusion"
+        );
+        let mut forgotten = norm_conv(Some("forgotten-raw"), vec![norm_msg(0, 100)]);
+        forgotten.agent_slug = "opencode".into();
+        forgotten.workspace = Some(PathBuf::from("/workspace/retired"));
+        forgotten.source_path = source_path.clone();
+        let mut sibling = forgotten.clone();
+        sibling.external_id = Some("retained-raw".into());
+        sibling.workspace = Some(PathBuf::from("/workspace/active"));
+        persist::persist_conversations_batched(
+            &storage,
+            None,
+            &[forgotten.clone(), sibling.clone()],
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            false,
+        )?;
+        storage.forget_conversations(
+            &crate::storage::sqlite::ForgetConversationsFilter {
+                workspace_glob: Some("/workspace/retired"),
+                ..Default::default()
+            },
+            false,
+        )?;
+        let exclusions = RawSourceExclusions::load(&storage)?;
+        assert!(exclusions.excludes(&source_path));
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        let root = ScanRoot::local(temp.path().to_path_buf());
+        let source = discovered_test_source(
+            &root,
+            source_path.clone(),
+            crate::connectors::DiscoveredSourceRole::SqliteDatabase,
+        );
+        let connector = FailingDiscoveryConnector {
+            sources: vec![
+                source,
+                discovered_test_source(
+                    &root,
+                    wal.clone(),
+                    crate::connectors::DiscoveredSourceRole::MetadataSidecar,
+                ),
+            ],
+        };
+        let ctx = ScanContext::with_roots(data_dir.clone(), vec![root], None);
+        let (diagnostics, active_skipped) = capture_connector_sources_before_parse(
+            &connector,
+            &ctx,
+            &data_dir,
+            "opencode",
+            &[],
+            None,
+            &ActiveSessionSourceFilter::default(),
+            &exclusions,
+        );
+        assert!(
+            !active_skipped,
+            "raw suppression must not defer source progress"
+        );
+        assert_eq!(diagnostics.finish().summary.discovered, 2);
+        let fallback = ScanRoot::local(source_path.clone());
+        assert!(!capture_scan_sources_before_parse(
+            &data_dir,
+            "opencode",
+            &fallback,
+            None,
+            &ActiveSessionSourceFilter::default(),
+            &exclusions,
+        ));
+        fs::write(
+            &source_path,
+            b"shared source after the retained sibling changes",
+        )?;
+        sibling.messages.push(norm_msg(1, 200));
+        sibling.ended_at = Some(200);
+        prepare_conversation_for_ingest(
+            &data_dir,
+            "opencode",
+            &Origin::local(),
+            None,
+            &mut sibling,
+            &exclusions,
+        );
+        assert!(sibling.metadata.pointer("/cass/raw_mirror").is_none());
+        assert!(!data_dir.join("raw-mirror").exists());
+        let completion = crate::storage::sqlite::SourceIngestLedgerEntry {
+            key: "source_ingest_v1:shared-raw-excluded".into(),
+            observation: serde_json::json!({
+                "primary": source_file_observation(&source_path),
+                "dependencies": [],
+                "producer_contract": env!("CASS_SOURCE_INGEST_CONTRACT"),
+            })
+            .to_string(),
+        };
+        let outcome = persist::persist_conversations_batched_inner(
+            &storage,
+            None,
+            &[forgotten, sibling],
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            false,
+            false,
+            None,
+            persist::PersistHeartbeat::NONE,
+            Some(&completion),
+        )?;
+        assert_eq!(outcome.inserted_messages, 1);
+        assert_eq!(count_total_conversations_exact(&storage)?, 1);
+        assert_eq!(count_total_messages_exact(&storage)?, 2);
+        assert_eq!(
+            storage.source_ingest_ledger_entries()?.get(&completion.key),
+            Some(&completion.observation)
+        );
+        assert_eq!(
+            fs::read(source_path)?,
+            b"shared source after the retained sibling changes"
+        );
+        assert_eq!(fs::read(wal)?, b"shared source pending changes");
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn gh537_shared_raw_policy_preserves_changed_single_file_reingestion() -> Result<()> {
+        if !gh537_isolated_workspace_policy_test(
+            "gh537_shared_raw_policy_preserves_changed_single_file_reingestion",
+        )? {
+            return Ok(());
+        }
+        let _capture = set_env("CASS_RAW_MIRROR", "1");
+        let _free_space = set_env("CASS_RAW_MIRROR_MIN_FREE_BYTES", "0");
+        let _budget = set_env("CASS_RAW_MIRROR_MAX_BYTES", "67108864");
+        let temp = TempDir::new()?;
+        let data_dir = temp.path().join("data");
+        let storage = FrankenStorage::open(&temp.path().join("archive.db"))?;
+        let source_path = temp.path().join("ordinary.jsonl");
+        fs::write(&source_path, b"original ordinary transcript")?;
+        let mut conv = norm_conv(Some("ordinary-raw"), vec![norm_msg(0, 100)]);
+        conv.source_path = source_path.clone();
+        persist::persist_conversations_batched(
+            &storage,
+            None,
+            std::slice::from_ref(&conv),
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            false,
+        )?;
+        storage.forget_conversations(
+            &crate::storage::sqlite::ForgetConversationsFilter {
+                source_glob: Some(source_path.to_str().context("source path")?),
+                ..Default::default()
+            },
+            false,
+        )?;
+        assert_eq!(storage.forgotten_source_stamps()?.len(), 1);
+        assert!(storage.forgotten_conversation_keys()?.is_empty());
+        let exclusions = RawSourceExclusions::load(&storage)?;
+        assert!(!exclusions.excludes(&source_path));
+        fs::write(
+            &source_path,
+            b"ordinary transcript explicitly changed after forget",
+        )?;
+        conv.messages.push(norm_msg(1, 200));
+        conv.ended_at = Some(200);
+        prepare_conversation_for_ingest(
+            &data_dir,
+            "codex",
+            &Origin::local(),
+            None,
+            &mut conv,
+            &exclusions,
+        );
+        assert!(conv.metadata.pointer("/cass/raw_mirror").is_some());
+        let outcome = persist::persist_conversations_batched(
+            &storage,
+            None,
+            std::slice::from_ref(&conv),
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            false,
+        )?;
+        assert_eq!(outcome.inserted_conversations, 1);
+        assert_eq!(count_total_messages_exact(&storage)?, 2);
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        assert_eq!(
+            fs::read(source_path)?,
+            b"ordinary transcript explicitly changed after forget"
+        );
         Ok(())
     }
 
@@ -42352,7 +42672,7 @@ mod tests {
         };
         inject_provenance(&mut conv, &Origin::local());
 
-        attach_raw_mirror_capture(&data_dir, &mut conv);
+        attach_raw_mirror_capture(&data_dir, &mut conv, &RawSourceExclusions::default());
 
         let raw_mirror = &conv.metadata["cass"]["raw_mirror"];
         let manifest_id = raw_mirror["manifest_id"]
@@ -42405,7 +42725,13 @@ mod tests {
         let root = ScanRoot::local(source_path.clone());
 
         let active_filter = ActiveSessionSourceFilter::default();
-        capture_scan_root_file_before_parse(&data_dir, "codex", &root, &active_filter);
+        capture_scan_root_file_before_parse(
+            &data_dir,
+            "codex",
+            &root,
+            &active_filter,
+            &RawSourceExclusions::default(),
+        );
 
         let manifest_root = data_dir.join("raw-mirror/v1/manifests");
         let manifests = std::fs::read_dir(&manifest_root)
@@ -42447,7 +42773,14 @@ mod tests {
         let root = ScanRoot::local(codex_root);
 
         let active_filter = ActiveSessionSourceFilter::default();
-        capture_scan_sources_before_parse(&data_dir, "codex", &root, None, &active_filter);
+        capture_scan_sources_before_parse(
+            &data_dir,
+            "codex",
+            &root,
+            None,
+            &active_filter,
+            &RawSourceExclusions::default(),
+        );
 
         let manifest_root = data_dir.join("raw-mirror/v1/manifests");
         let manifests = std::fs::read_dir(&manifest_root)
@@ -42593,6 +42926,7 @@ mod tests {
             &[],
             None,
             &active_filter,
+            &RawSourceExclusions::default(),
         );
         assert!(
             connector.scan(&ctx).is_err(),
@@ -42655,6 +42989,7 @@ mod tests {
             &[],
             None,
             &ActiveSessionSourceFilter::default(),
+            &RawSourceExclusions::default(),
         );
 
         let mut conv = NormalizedConversation {
@@ -42669,7 +43004,7 @@ mod tests {
             messages: Vec::new(),
         };
         inject_provenance(&mut conv, &Origin::local());
-        attach_raw_mirror_capture(&data_dir, &mut conv);
+        attach_raw_mirror_capture(&data_dir, &mut conv, &RawSourceExclusions::default());
 
         let manifests = raw_mirror_manifest_values(&data_dir);
         let providers: Vec<_> = manifests
@@ -42724,6 +43059,7 @@ mod tests {
             &[],
             None,
             &active_filter,
+            &RawSourceExclusions::default(),
         );
 
         assert!(
@@ -42771,6 +43107,7 @@ mod tests {
             &[],
             None,
             &active_filter,
+            &RawSourceExclusions::default(),
         );
 
         assert!(
@@ -42819,6 +43156,7 @@ mod tests {
             &[],
             None,
             &active_filter,
+            &RawSourceExclusions::default(),
         );
 
         assert!(
@@ -42863,6 +43201,7 @@ mod tests {
             &[],
             None,
             &active_filter,
+            &RawSourceExclusions::default(),
         );
 
         assert!(
@@ -42912,6 +43251,7 @@ mod tests {
             &[],
             None,
             &active_filter,
+            &RawSourceExclusions::default(),
         );
 
         let manifests = raw_mirror_manifest_values(&data_dir);
@@ -42972,6 +43312,7 @@ mod tests {
             &[],
             None,
             &active_filter,
+            &RawSourceExclusions::default(),
         );
 
         let manifests = raw_mirror_manifest_values(&data_dir);
@@ -43035,7 +43376,7 @@ mod tests {
             }],
         };
 
-        attach_raw_mirror_capture(&data_dir, &mut conv);
+        attach_raw_mirror_capture(&data_dir, &mut conv, &RawSourceExclusions::default());
 
         assert!(
             conv.metadata
@@ -43108,6 +43449,7 @@ mod tests {
             &[],
             None,
             &active_filter,
+            &RawSourceExclusions::default(),
         );
 
         assert!(
@@ -43155,6 +43497,7 @@ mod tests {
             &[],
             None,
             &active_filter,
+            &RawSourceExclusions::default(),
         );
 
         assert!(
@@ -43177,7 +43520,13 @@ mod tests {
         let root = ScanRoot::local(source_path.clone());
 
         let active_filter = ActiveSessionSourceFilter::default();
-        capture_scan_root_file_before_parse(&data_dir, "codex", &root, &active_filter);
+        capture_scan_root_file_before_parse(
+            &data_dir,
+            "codex",
+            &root,
+            &active_filter,
+            &RawSourceExclusions::default(),
+        );
 
         let mut conv = NormalizedConversation {
             agent_slug: "codex".to_string(),
@@ -43200,7 +43549,7 @@ mod tests {
             }],
         };
         inject_provenance(&mut conv, &Origin::local());
-        attach_raw_mirror_capture(&data_dir, &mut conv);
+        attach_raw_mirror_capture(&data_dir, &mut conv, &RawSourceExclusions::default());
 
         let manifest_root = data_dir.join("raw-mirror/v1/manifests");
         let manifests = std::fs::read_dir(&manifest_root)
@@ -43255,7 +43604,7 @@ mod tests {
             }],
         };
         inject_provenance(&mut conv, &Origin::local());
-        attach_raw_mirror_capture(&data_dir, &mut conv);
+        attach_raw_mirror_capture(&data_dir, &mut conv, &RawSourceExclusions::default());
         let manifest_relative = conv.metadata["cass"]["raw_mirror"]["manifest_relative_path"]
             .as_str()
             .expect("manifest relative path")
@@ -55901,6 +56250,7 @@ mod tests {
             tx,
             StreamingProducerConfig {
                 source_ledger: Arc::new(HashMap::new()),
+                raw_source_exclusions: Arc::new(RawSourceExclusions::default()),
                 flow_limiter: flow_limiter.clone(),
                 data_dir: data_dir.clone(),
                 additional_scan_roots: vec![ScanRoot::remote(
@@ -56821,6 +57171,7 @@ mod tests {
             tx,
             StreamingProducerConfig {
                 source_ledger: Arc::new(HashMap::new()),
+                raw_source_exclusions: Arc::new(RawSourceExclusions::default()),
                 flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
                 data_dir,
                 additional_scan_roots: vec![ScanRoot::remote(
@@ -69394,7 +69745,14 @@ c.close()
             }
         });
 
-        prepare_conversation_for_ingest(&data_dir, "codex", &Origin::local(), None, &mut conv);
+        prepare_conversation_for_ingest(
+            &data_dir,
+            "codex",
+            &Origin::local(),
+            None,
+            &mut conv,
+            &RawSourceExclusions::default(),
+        );
 
         let extra = &conv.messages[0].extra;
         assert_eq!(

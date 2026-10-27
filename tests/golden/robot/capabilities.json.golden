@@ -23,6 +23,11 @@
     "request_id",
     "answer_pack_command",
     "dry_run",
+    "session_retention_selectors",
+    "durable_session_exclusions",
+    "exclusion_listing",
+    "explicit_session_reinclusion",
+    "raw_capture_session_exclusions",
     "query_explain",
     "view_command",
     "status_command",
@@ -3161,7 +3166,7 @@
     },
     {
       "name": "forget",
-      "description": "Prune archived conversations by source path, workspace, or age (dry-run by default; `--apply` to commit). At least one selector is required; supplied selectors are ANDed. Rebuilds derived search and analytics assets while keeping source files. Forgotten sessions in shared stores stay forgotten when other sessions change",
+      "description": "Prune archived conversations by source path, workspace, or age (dry-run by default; `--apply` to commit). At least one selector is required; supplied selectors are ANDed. Rebuilds derived search and analytics assets while keeping source files. Forgotten sessions in shared stores stay forgotten until explicitly released with --reinclude. Use --list to inspect recorded exclusions without changing the archive",
       "arguments": [
         {
           "name": "source-glob",
@@ -3185,6 +3190,54 @@
           "required": false
         },
         {
+          "name": "list",
+          "description": "List durable session and legacy source exclusions without changing them",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "reinclude",
+          "description": "Preview releasing matching exclusions; add --apply, then index --full",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "source-path",
+          "description": "Exact stored source path for --list/--reinclude (no glob expansion)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "source-id",
+          "description": "Exact source/provenance ID for --list/--reinclude (e.g. local)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "agent",
+          "description": "Exact provider slug for --list/--reinclude (e.g. opencode)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "external-id",
+          "description": "Exact provider session ID for --list/--reinclude",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
           "name": "db",
           "description": "Override db path",
           "arg_type": "option",
@@ -3193,7 +3246,7 @@
         },
         {
           "name": "apply",
-          "description": "Actually delete the matching conversations. Without this, runs as a dry-run (inspect only)",
+          "description": "Apply the selected forget or re-inclusion. Otherwise preview only",
           "arg_type": "flag",
           "required": false,
           "default": "false",

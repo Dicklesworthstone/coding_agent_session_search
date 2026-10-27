@@ -478,6 +478,7 @@ fn gh512_real_connectors_complete_during_growth_without_redundant_discovery() ->
         let limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
         let mut config = StreamingProducerConfig {
             source_ledger: Arc::new(HashMap::new()),
+            raw_source_exclusions: Arc::new(RawSourceExclusions::default()),
             flow_limiter: Arc::clone(&limiter),
             data_dir,
             additional_scan_roots: Vec::new(),
@@ -810,6 +811,7 @@ fn gh512_real_sidecar_appearance_before_admission_cannot_certify_an_untracked_fi
     );
     let mut config = StreamingProducerConfig {
         source_ledger: Arc::new(HashMap::new()),
+        raw_source_exclusions: Arc::new(RawSourceExclusions::default()),
         flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
         data_dir,
         additional_scan_roots: Vec::new(),

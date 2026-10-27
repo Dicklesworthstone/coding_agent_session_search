@@ -448,6 +448,60 @@ fn assert_shared_session_tombstone(archive: &Archive, source: &Path, provider: &
     Ok(())
 }
 
+fn index_shared_with_raw_capture(archive: &Archive, extra: &[&str]) -> TestResult {
+    let mut cmd = archive.cmd();
+    cmd.env("CASS_RAW_MIRROR", "1")
+        .env("CASS_RAW_MIRROR_AUTO_PRUNE", "0")
+        .env("CASS_RAW_MIRROR_MIN_FREE_BYTES", "0")
+        .env("CASS_RAW_MIRROR_MAX_BYTES", "67108864");
+    let mut args = vec!["index", "--json", "--no-progress-events"];
+    args.extend_from_slice(extra);
+    let output = archive.run_step("index shared store with raw capture enabled", cmd, &args)?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+/// Capture identities for a physical database and its SQLite sidecars.
+/// Existing manifests may gain links; only a new capture violates exclusion.
+fn raw_source_manifest_ids(data_dir: &Path, source: &Path) -> TestResult<BTreeMap<String, String>> {
+    let root = data_dir.join("raw-mirror/v1/manifests");
+    let mut captures = BTreeMap::new();
+    if !root.exists() {
+        return Ok(captures);
+    }
+    let source = source.to_string_lossy();
+    for entry in WalkDir::new(root) {
+        let entry = entry?;
+        if !entry.file_type().is_file()
+            || entry
+                .path()
+                .extension()
+                .is_none_or(|extension| extension != "json")
+        {
+            continue;
+        }
+        let manifest: Value = serde_json::from_slice(&fs::read(entry.path())?)?;
+        let original_path = manifest["original_path"]
+            .as_str()
+            .ok_or("raw manifest has no original_path")?;
+        if original_path == source.as_ref()
+            || original_path
+                .strip_prefix(source.as_ref())
+                .is_some_and(|suffix| matches!(suffix, "-wal" | "-shm" | "-journal"))
+        {
+            let id = manifest["manifest_id"]
+                .as_str()
+                .ok_or("raw manifest has no manifest_id")?;
+            captures.insert(id.to_string(), original_path.to_string());
+        }
+    }
+    Ok(captures)
+}
+
 fn apply_shared_session_forget(
     archive: &Archive,
     source: &Path,
@@ -455,6 +509,14 @@ fn apply_shared_session_forget(
 ) -> TestResult<Vec<u8>> {
     assert!(!archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
     assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+    assert!(
+        raw_source_manifest_ids(&archive.data_dir, source)?
+            .values()
+            .any(|path| path.as_str() == source.to_string_lossy().as_ref()),
+        "negative control: the physical shared database must have been raw-captured"
+    );
+    assert!(raw_mirror_holds(&archive.data_dir, FORGOTTEN_MARKER)?);
+    assert!(raw_mirror_holds(&archive.data_dir, KEPT_MARKER)?);
     let source_before = fs::read(source)?;
     let assets_before = derived_assets(&archive.data_dir)?;
     let selectors = ["--workspace-glob", "/work/scratch/*"];
@@ -480,9 +542,14 @@ fn apply_shared_session_forget(
     Ok(source_before)
 }
 
-fn assert_shared_forget_survives_rescans(archive: &Archive) -> TestResult {
+fn assert_shared_forget_survives_rescans(
+    archive: &Archive,
+    source: &Path,
+    original_captures: &BTreeMap<String, String>,
+) -> TestResult {
+    let source_before = fs::read(source)?;
     for extra in [&[][..], &["--full"][..]] {
-        archive.index(extra)?;
+        index_shared_with_raw_capture(archive, extra)?;
         assert!(
             archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty(),
             "index {extra:?} resurrected a forgotten shared-store session"
@@ -498,17 +565,25 @@ fn assert_shared_forget_survives_rescans(archive: &Archive) -> TestResult {
             !archive.search_hit_paths(LATE_MARKER)?.is_empty(),
             "index {extra:?} suppressed the retained sibling's new message"
         );
+        assert_eq!(
+            raw_source_manifest_ids(&archive.data_dir, source)?,
+            *original_captures,
+            "index {extra:?} recaptured a database containing a forgotten session"
+        );
+        for marker in [LATE_MARKER, FORGOTTEN_APPEND_MARKER] {
+            assert!(
+                !raw_mirror_holds(&archive.data_dir, marker)?,
+                "index {extra:?} raw-captured changed shared-store bytes"
+            );
+        }
+        assert_eq!(fs::read(source)?, source_before);
     }
     Ok(())
 }
 
-/// The real shared-store negative control from GH #537: a retained sibling
-/// changes the database's file stamp, but must not resurrect the forgotten ID.
-#[test]
-fn forgotten_opencode_session_stays_out_when_sibling_changes() -> TestResult {
+fn indexed_opencode_archive(home: TempDir) -> TestResult<(Archive, PathBuf)> {
     use coding_agent_search::franken_sync::{Connection, compat::ConnectionExt, params};
 
-    let home = TempDir::new()?;
     let data_dir = home.path().join("cass-data");
     let source = home.path().join(".local/share/opencode/opencode.db");
     fs::create_dir_all(source.parent().ok_or("source has no parent")?)?;
@@ -546,8 +621,19 @@ fn forgotten_opencode_session_stays_out_when_sibling_changes() -> TestResult {
     drop(conn);
 
     let archive = Archive { home, data_dir };
-    archive.index(&["--full"])?;
+    index_shared_with_raw_capture(&archive, &["--full"])?;
+    Ok((archive, source))
+}
+
+/// The real shared-store negative control from GH #537: a retained sibling
+/// changes the database's file stamp, but must not resurrect the forgotten ID.
+#[test]
+fn forgotten_opencode_session_stays_out_when_sibling_changes() -> TestResult {
+    use coding_agent_search::franken_sync::Connection;
+
+    let (archive, source) = indexed_opencode_archive(TempDir::new()?)?;
     let source_before = apply_shared_session_forget(&archive, &source, "opencode")?;
+    let original_captures = raw_source_manifest_ids(&archive.data_dir, &source)?;
 
     let conn = Connection::open(source.to_string_lossy().as_ref())?;
     insert_opencode_message(
@@ -565,7 +651,7 @@ fn forgotten_opencode_session_stays_out_when_sibling_changes() -> TestResult {
         source_before,
         "sibling must actually change the store"
     );
-    assert_shared_forget_survives_rescans(&archive)?;
+    assert_shared_forget_survives_rescans(&archive, &source, &original_captures)?;
 
     let conn = Connection::open(source.to_string_lossy().as_ref())?;
     insert_opencode_message(
@@ -577,8 +663,226 @@ fn forgotten_opencode_session_stays_out_when_sibling_changes() -> TestResult {
     )?;
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
     drop(conn);
-    assert_shared_forget_survives_rescans(&archive)?;
+    assert_shared_forget_survives_rescans(&archive, &source, &original_captures)?;
     assert_shared_session_tombstone(&archive, &source, "opencode")?;
+    Ok(())
+}
+
+#[test]
+fn shared_session_reinclusion_requires_apply_and_preserves_other_exclusions() -> TestResult {
+    let home = tempfile::Builder::new()
+        .prefix("cass-reinclude-[literal]-")
+        .tempdir()?;
+    let (archive, source) = indexed_opencode_archive(home)?;
+    let source_before = apply_shared_session_forget(&archive, &source, "opencode")?;
+    assert_eq!(
+        archive.forget_selected(&["--workspace-glob", "/work/production"], true)?["conversations_deleted"],
+        1
+    );
+    let all = archive.forget_selected(&["--list"], false)?;
+    assert_eq!(all["schema_version"], 1);
+    assert_eq!(all["mode"], "list");
+    assert_eq!(all["applied"], false);
+    assert_eq!(all["exclusions_count"], 2);
+    assert_eq!(all["legacy_sources_count"], 0);
+    assert_eq!(
+        all["exclusions"]
+            .as_array()
+            .ok_or("no exclusions array")?
+            .len(),
+        2
+    );
+    assert_eq!(all["legacy_sources"], json!([]));
+
+    let logical_source = source.join("ses-forgotten");
+    let logical_source = logical_source.to_str().ok_or("non-utf8 logical source")?;
+    let selectors = [
+        "--source-path",
+        logical_source,
+        "--source-id",
+        "local",
+        "--agent",
+        "opencode",
+        "--external-id",
+        "ses-forgotten",
+    ];
+    let mut list = vec!["--list"];
+    list.extend_from_slice(&selectors);
+    let assets_before = derived_assets(&archive.data_dir)?;
+    let selected = archive.forget_selected(&list, false)?;
+    let sessions = selected["exclusions"]
+        .as_array()
+        .ok_or("no exclusions array")?;
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["source_path"], logical_source);
+    assert_eq!(sessions[0]["source_id"], "local");
+    assert_eq!(sessions[0]["agent_slug"], "opencode");
+    assert_eq!(sessions[0]["external_id"], "ses-forgotten");
+    assert_eq!(sessions[0]["blocked_by_source_stamp"], false);
+    assert!(sessions[0]["forgotten_at_ms"].is_i64());
+    assert_eq!(
+        selected["selector"],
+        json!({
+            "source_glob": null,
+            "source_path": logical_source,
+            "source_id": "local",
+            "agent_slug": "opencode",
+            "external_id": "ses-forgotten"
+        })
+    );
+    assert_eq!(
+        archive.forget_selected(&["--list", "--source-id", "remote-other"], false)?["exclusions"],
+        json!([])
+    );
+
+    let mut reinclude = vec!["--reinclude"];
+    reinclude.extend_from_slice(&selectors);
+    let preview = archive.forget_selected(&reinclude, false)?;
+    assert_eq!(preview["schema_version"], 1);
+    assert_eq!(preview["mode"], "reinclude");
+    assert_eq!(preview["applied"], false);
+    assert_eq!(preview["dry_run"], true);
+    assert_eq!(preview["exclusions_matched"], 1);
+    assert_eq!(preview["exclusions_removed"], 0);
+    assert_eq!(preview["legacy_sources_removed"], 0);
+    assert_eq!(preview["recommended_next_command"], "cass index --full");
+    assert_eq!(derived_assets(&archive.data_dir)?, assets_before);
+    assert_eq!(fs::read(&source)?, source_before);
+
+    index_shared_with_raw_capture(&archive, &["--full"])?;
+    assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    assert!(archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+    let original_captures = raw_source_manifest_ids(&archive.data_dir, &source)?;
+    let applied = archive.forget_selected(&reinclude, true)?;
+    assert_eq!(applied["applied"], true);
+    assert_eq!(applied["dry_run"], false);
+    assert_eq!(applied["exclusions_matched"], 1);
+    assert_eq!(applied["exclusions_removed"], 1);
+    assert_eq!(applied["legacy_sources_removed"], 0);
+    let remaining = archive.forget_selected(&["--list"], false)?;
+    let remaining = remaining["exclusions"]
+        .as_array()
+        .ok_or("no exclusions array")?;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0]["external_id"], "ses-kept");
+
+    index_shared_with_raw_capture(&archive, &["--full"])?;
+    assert!(!archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    assert!(archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+    assert_eq!(
+        raw_source_manifest_ids(&archive.data_dir, &source)?,
+        original_captures,
+        "the remaining sibling exclusion must keep the shared raw container blocked"
+    );
+    assert_eq!(fs::read(&source)?, source_before);
+    Ok(())
+}
+
+#[test]
+fn identity_reinclusion_refuses_an_overlapping_legacy_source_stamp() -> TestResult {
+    use coding_agent_search::franken_sync::{compat::ConnectionExt, params};
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let (archive, source) = indexed_opencode_archive(TempDir::new()?)?;
+    let source_before = apply_shared_session_forget(&archive, &source, "opencode")?;
+    let logical_source = source.join("ses-forgotten");
+    let logical_source = logical_source.to_str().ok_or("non-utf8 logical source")?;
+    let storage = FrankenStorage::open(&archive.data_dir.join("agent_search.db"))?;
+    storage.raw().execute_compat(
+        "INSERT INTO forgotten_sources(source_path, size_bytes, mtime_ms, forgotten_at_ms)
+         VALUES (?1, NULL, NULL, 1)",
+        params![logical_source],
+    )?;
+    storage.close()?;
+
+    let selectors = [
+        "--reinclude",
+        "--source-path",
+        logical_source,
+        "--external-id",
+        "ses-forgotten",
+    ];
+    let preview = archive.forget_selected(&selectors, false)?;
+    assert_eq!(preview["exclusions_matched"], 1);
+    assert_eq!(preview["exclusions_removed"], 0);
+    assert_eq!(preview["legacy_sources_matched"], 0);
+    assert_eq!(preview["blocked_by_source_stamps"], json!([logical_source]));
+    let before = archive.forget_selected(&["--list"], false)?;
+    assert_eq!(before["exclusions"][0]["blocked_by_source_stamp"], true);
+    let assets_before = derived_assets(&archive.data_dir)?;
+    let mut args = vec!["forget", "--json", "--apply"];
+    args.extend_from_slice(&selectors);
+    let refused = archive.run_step(
+        "identity release blocked by source stamp",
+        archive.cmd(),
+        &args,
+    )?;
+    assert_eq!(refused.status.code(), Some(5));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let envelope: Value = serde_json::from_str(
+        stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .ok_or("no exclusion refusal envelope on stderr")?,
+    )?;
+    assert_eq!(envelope["error"]["kind"], "forget-exclusions");
+    let after = archive.forget_selected(&["--list"], false)?;
+    assert_eq!(after["exclusions"], before["exclusions"]);
+    assert_eq!(after["legacy_sources"], before["legacy_sources"]);
+    assert_eq!(derived_assets(&archive.data_dir)?, assets_before);
+
+    // A source-only request explicitly selects both exclusion mechanisms.
+    let released =
+        archive.forget_selected(&["--reinclude", "--source-path", logical_source], true)?;
+    assert_eq!(released["exclusions_removed"], 1);
+    assert_eq!(released["legacy_sources_removed"], 1);
+    index_shared_with_raw_capture(&archive, &["--full"])?;
+    assert!(!archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+    assert_eq!(fs::read(&source)?, source_before);
+    Ok(())
+}
+
+#[test]
+fn exclusion_management_rejects_ambiguous_or_unsupported_selectors() -> TestResult {
+    let home = TempDir::new()?;
+    let data_dir = home.path().join("cass-data");
+    let archive = Archive { home, data_dir };
+    for args in [
+        vec!["forget", "--list", "--apply", "--json"],
+        vec!["forget", "--list", "--workspace-glob", "/work/*", "--json"],
+        vec!["forget", "--list", "--older-than", "30d", "--json"],
+        vec!["forget", "--reinclude", "--json"],
+        vec![
+            "forget",
+            "--reinclude",
+            "--workspace-glob",
+            "/work/*",
+            "--json",
+        ],
+        vec!["forget", "--reinclude", "--older-than", "30d", "--json"],
+        vec!["forget", "--source-path", "/transcript.jsonl", "--json"],
+        vec!["forget", "--source-id", "local", "--json"],
+        vec!["forget", "--agent", "opencode", "--json"],
+        vec!["forget", "--external-id", "session", "--json"],
+        vec![
+            "forget",
+            "--list",
+            "--source-path",
+            "/transcript.jsonl",
+            "--source-glob",
+            "*",
+            "--json",
+        ],
+    ] {
+        let output = archive.run_step("reject invalid exclusion mode", archive.cmd(), &args)?;
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "arguments must be rejected: {args:?}"
+        );
+    }
     Ok(())
 }
 
@@ -660,8 +964,9 @@ fn forgotten_devin_session_stays_out_when_sibling_or_own_messages_change() -> Te
     drop(conn);
 
     let archive = Archive { home, data_dir };
-    archive.index(&["--full"])?;
+    index_shared_with_raw_capture(&archive, &["--full"])?;
     let source_before = apply_shared_session_forget(&archive, &source, "devin")?;
+    let original_captures = raw_source_manifest_ids(&archive.data_dir, &source)?;
     let conn = Connection::open(source.to_string_lossy().as_ref())?;
     insert_devin_message(
         &conn,
@@ -680,7 +985,7 @@ fn forgotten_devin_session_stays_out_when_sibling_or_own_messages_change() -> Te
         source_before,
         "sibling must actually change the store"
     );
-    assert_shared_forget_survives_rescans(&archive)?;
+    assert_shared_forget_survives_rescans(&archive, &source, &original_captures)?;
 
     let conn = Connection::open(source.to_string_lossy().as_ref())?;
     insert_devin_message(
@@ -693,7 +998,7 @@ fn forgotten_devin_session_stays_out_when_sibling_or_own_messages_change() -> Te
     )?;
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
     drop(conn);
-    assert_shared_forget_survives_rescans(&archive)?;
+    assert_shared_forget_survives_rescans(&archive, &source, &original_captures)?;
     assert_shared_session_tombstone(&archive, &source, "devin")?;
     Ok(())
 }

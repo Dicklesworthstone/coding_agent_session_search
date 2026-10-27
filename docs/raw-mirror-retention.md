@@ -1,5 +1,9 @@
 # Raw-mirror budgets and automatic retention
 
+Automatic mirror maintenance preserves source evidence under the policy below.
+It does not enable automatic age-based deletion of canonical conversations;
+`cass forget` remains an explicit operation with a read-only preview default.
+
 CASS retains the existing `whole_blob_v1` and `fixed_chunks_v1` formats. JSONL
 and NDJSON transcripts use 256 KiB chunks once they reach 256 KiB. Complete
 chunks are content-addressed and reused; an append replaces only its incomplete
@@ -48,6 +52,34 @@ live index transaction. The capture budget remains active throughout watch mode.
 Restarting watch performs another safe retention pass. Library callers can use
 `raw_mirror::maintain_before_index` before acquiring their index lease; merely
 calling the library indexer does not invoke the binary's startup hook.
+
+## Shared stores and durable session exclusions
+
+An applied workspace or age forget can exclude one session from a shared
+OpenCode or Devin SQLite store while its retained siblings continue updating
+in the canonical archive. The durable exclusion survives changes to either
+session, incremental scans and full scans. Source files remain untouched.
+
+Indexing suppresses new raw captures of a shared container while any durable
+session exclusion refers to it. This covers the physical database, virtual
+database/session paths, resolved aliases and SQLite `-wal`, `-shm` and
+`-journal` sidecars. The check applies before parsing and to captures of kept
+siblings after parsing. A verbatim shared snapshot cannot leave out only the
+excluded session.
+
+Existing captures remain. Inspect them with the separate `cass mirror prune`
+preview and review the retention policy before applying it; a shared capture
+can also preserve retained sessions or provider data. No background deletion
+of those captures is introduced by forgetting a session.
+
+`cass forget --list --json` shows durable exclusions. Use `--reinclude` with
+an exact stored `--source-path` and optional `--source-id`, `--agent` and
+`--external-id` selectors to preview a release. After applying the reviewed
+release, `cass index --full` can restore that session from its preserved source.
+Active workspace/path rules and other durable exclusions still apply. New
+shared-container captures become eligible only after every relevant durable
+identity exclusion is released. Ordinary-file size/mtime stamps retain their
+existing behavior.
 
 ## What automatic retirement may remove
 

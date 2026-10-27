@@ -3143,6 +3143,7 @@ Other subcommands (all present in the `Commands` enum in `src/lib.rs`):
 | `onboarding` | Read-only first-run source onboarding + readiness wizard; `--json` for scripts, never launches the TUI |
 | `quarantine` | Inspect and manage the conversation-ingest quarantine: `list` (each excluded conversation, plus a `status` grouping by cause, version and retry eligibility with the next command), `retry` (bounded re-ingest plan; `--apply` runs it), `clear` |
 | `forget` | Prune archived conversations with `--source-glob '<glob>'`, `--workspace-glob '<glob>'`, and/or `--older-than 90d`; at least one selector is required, and supplied selectors are ANDed. Preview is strictly read-only; add `--apply` to delete canonical rows and rebuild FTS, analytics and the lexical index under the indexing maintenance lock. Age means the last message time, strictly before the reported `before_ms` cutoff; sessions with missing message times are kept. Shared stores such as OpenCode/Devin SQLite databases use durable session identities, so forgotten sessions stay out when siblings change while retained siblings keep updating. Single-session files retain size/mtime tombstones: an unchanged file stays forgotten across incremental/full indexing, and a changed file is indexed again. Source files and raw-mirror captures remain. Use `CASS_EXCLUDE_PATHS` or `CASS_EXCLUDE_WORKSPACES` for prospective exclusion, and `cass mirror prune` for explicit raw-capture retention. Semantic vectors are not rewritten: explicit semantic search reports `semantic-unavailable` and hybrid falls back to lexical until `cass index --semantic` catches up. A previously opened `cass serve` keeps its pinned snapshot until `reload`; the TUI drops forgotten hits on its next search. If lexical rebuilding fails, forget exits 5 (`lexical-rebuild`) and the next index repairs the derived data |
+| `forget --list` / `forget --reinclude` | Inspect recorded exclusions or explicitly release matching records. Use literal `--source-path`, `--source-glob`, or exact `--source-id`, `--agent`, and `--external-id` selectors; supplied selectors are ANDed. Re-inclusion requires a selector and previews by default; add `--apply`, then run `cass index --full`. Other exclusions and current workspace/path policies remain in force. Historical exclusion records cannot be selected by workspace or age. |
 | `fleet upgrade-rehearsal` | Fleet-safe upgrade rehearsal (dry run) with bounded post-upgrade verification; `--live` opts in to SSH probes of configured remotes |
 | `lessons list\|search` | Mine and query durable, redacted lessons from local evidence (commits, closed beads, proof manifests) |
 | `import chatgpt` | Split a ChatGPT web export (`conversations.json`) into files the ChatGPT connector can index |
@@ -3548,11 +3549,50 @@ cass mirror prune --older-than 90d --json
 
 **Selection and previews.** All supplied selectors must match. Globs are case-sensitive and `*` also matches `/`; quote them so the shell passes them unchanged. They match the stored path, which for a shared store may be a logical handle such as `.../opencode.db/<session-id>`. A missing workspace never matches `--workspace-glob`. Age uses the maximum message timestamp, strictly before the reported `before_ms` cutoff; equality, empty sessions and sessions with even one missing message timestamp are kept. Each invocation resolves the duration once. JSON previews include up to 20 `sample_sessions`, each with `source_path`, `external_id`, `workspace` and `last_message_at`, alongside the existing counts and `sample_source_paths`. Human output shows the same session details, so sessions in one shared store can be distinguished before applying.
 
-**Changed sessions and re-inclusion.** A forgotten shared-store session remains suppressed for the same source provenance, agent, stored source path and external session ID. This is a permanent identity tombstone: appending to or editing the forgotten session itself does not restore it, and neither do sibling changes, a full rescan or changes to workspace exclusions. There is currently no `unforget` command. To recover a forgotten shared identity, restore a pre-forget archive backup or build a fresh archive from the preserved source files. Removing `CASS_EXCLUDE_WORKSPACES` only changes prospective admission; it does not undo an applied forget.
+**Changed sessions and re-inclusion.** A forgotten shared-store session remains suppressed for the same source provenance, agent, stored source path and external session ID until its exclusion is explicitly released. Appending to or editing the forgotten session itself does not restore it, and neither do sibling changes, a full rescan or changes to workspace exclusions. Removing `CASS_EXCLUDE_WORKSPACES` only changes prospective admission; it does not undo an applied forget.
+
+Inspect the durable records and preview an explicit release before applying it:
+
+```bash
+cass forget --list --json
+
+# Copy the complete stored source_path and session identity from the list.
+# --source-path is literal, including any glob characters in the filename.
+cass forget --reinclude --source-path '/path/opencode.db/session-id' \
+  --source-id local --agent opencode --external-id session-id --json
+
+cass forget --reinclude --source-path '/path/opencode.db/session-id' \
+  --source-id local --agent opencode --external-id session-id --apply --json
+cass index --full --json
+```
+
+`--list` returns `exclusions` for durable shared-session identities and
+`legacy_sources` for ordinary-file stamps. Its selectors are optional.
+`--reinclude` requires at least one selector and defaults to a read-only preview;
+`--apply` removes the selected records and invalidates completed-source
+observations. Re-index with plain `index --full` to restore the preserved source
+sessions; `--force-rebuild` only rebuilds derived assets from existing canonical
+rows. Other session exclusions and active path, workspace or agent policies
+still apply.
+
+Both management modes accept either literal `--source-path` or `--source-glob`,
+plus exact `--source-id`, `--agent` and `--external-id` filters. Supplied filters
+are ANDed. These exact selectors are available only with `--list` or
+`--reinclude`. Workspace and age selectors are rejected in these modes because
+the existing v23 exclusion records do not store that metadata. Preview JSON
+reports matched and removed counts separately; a dry run always removes zero.
+
+Identity filters do not release path-wide source stamps. If a selected session
+also has a legacy stamp at its stored source path, listing marks it
+`blocked_by_source_stamp` and the release preview names the path in
+`blocked_by_source_stamps`. Applying that identity-only release refuses the
+whole request. To release both mechanisms, preview a source-only request with
+`--reinclude --source-path '<stored path>'`, review every selected record, then
+repeat with `--apply`.
 
 Ordinary single-session files retain their existing size/mtime behavior for all selectors: unchanged files stay forgotten across incremental and full scans, while a changed size or modification time makes the file eligible for indexing again. Editing a file without changing that stamp does not clear its tombstone.
 
-Forgetting is always an explicit operation. CASS does not automatically delete old archived conversations. Source files remain on disk, and raw-mirror captures are governed separately by `mirror prune`; captures of a source still on disk may be made again by a later scan.
+Forgetting is always an explicit operation. CASS does not automatically delete old archived conversations. Source files remain on disk, and existing raw-mirror captures are governed separately by `mirror prune`. While any durable session exclusion refers to a shared container, indexing suppresses new raw captures of that container and its SQLite sidecars, including known path aliases. Kept siblings still update in the canonical archive. A shared snapshot cannot omit only the forgotten session, so it remains blocked until the last relevant identity exclusion is released. Ordinary-file stamps retain their existing capture policy.
 
 **Recovering a failed forget.** If canonical deletion succeeds but rebuilding a derived search asset fails, repeat the same command with `--apply`. A durable pending marker makes the retry finish rebuilding even when there are no matching canonical rows left. The marker is cleared only after the replacement lexical index is published. A preview remains read-only and does not perform this recovery. `cass index --full` also rebuilds the search assets from the remaining canonical conversations.
 
