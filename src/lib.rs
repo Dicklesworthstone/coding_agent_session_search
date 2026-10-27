@@ -1699,10 +1699,13 @@ pub enum Commands {
     /// required; supplied selectors are ANDed. Rebuilds derived search and
     /// analytics assets while keeping source files. Forgotten sessions in
     /// shared stores stay forgotten when other sessions change.
-    #[command(group(clap::ArgGroup::new("forget_selectors")
-        .required(true)
-        .multiple(true)
-        .args(["source_glob", "workspace_glob", "older_than"])))]
+    #[command(
+        group(clap::ArgGroup::new("forget_selectors")
+            .required(true)
+            .multiple(true)
+            .args(["source_glob", "workspace_glob", "older_than"])),
+        after_long_help = "Globs match stored paths case-sensitively; * also matches /. A source path can be a logical database/session handle. Missing workspaces do not match --workspace-glob. Age uses the latest message timestamp, strictly before the reported cutoff; sessions with no messages or any missing message timestamp are kept.\n\nShared stores use permanent per-session tombstones scoped by source provenance, agent, source path and external session ID. Changes to siblings or to the forgotten session itself, including edits and appends, do not restore that identity. Neither --full nor changing CASS_EXCLUDE_WORKSPACES clears these tombstones. There is no unforget command; recovery requires a pre-forget archive backup or a fresh archive.\n\nOrdinary single-session files retain size/mtime tombstones: unchanged files stay forgotten, and a changed stamp makes the file eligible for indexing again. Source files and raw-mirror captures are kept. Forget is an explicit operation, with no automatic age pruning."
+    )]
     Forget {
         /// Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`).
         #[arg(long = "source-glob")]
@@ -10386,15 +10389,35 @@ fn run_forget_command(
         "Matched conversations: {} ({} messages)",
         report.conversations_matched, report.messages_matched
     );
-    if !report.sample_source_paths.is_empty() {
-        println!("Sample matches:");
-        for path in &report.sample_source_paths {
-            println!("  {path}");
+    if !report.sample_sessions.is_empty() {
+        println!("Sample matching sessions:");
+        for session in &report.sample_sessions {
+            let last_message_at = session
+                .last_message_at
+                .map(|timestamp| {
+                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp)
+                        .map(|time| time.to_rfc3339())
+                        .unwrap_or_else(|| format!("{timestamp} ms since the Unix epoch"))
+                })
+                .unwrap_or_else(|| "<unknown>".to_string());
+            println!(
+                "  Source: {}",
+                session.source_path.as_deref().unwrap_or("<unknown>")
+            );
+            println!(
+                "    Session: {}",
+                session.external_id.as_deref().unwrap_or("<unknown>")
+            );
+            println!(
+                "    Workspace: {}",
+                session.workspace.as_deref().unwrap_or("<unknown>")
+            );
+            println!("    Last known message: {last_message_at}");
         }
-        if report.conversations_matched > report.sample_source_paths.len() {
+        if report.conversations_matched > report.sample_sessions.len() {
             println!(
                 "  ... and {} more",
-                report.conversations_matched - report.sample_source_paths.len()
+                report.conversations_matched - report.sample_sessions.len()
             );
         }
     }
@@ -27419,6 +27442,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass expand <path> --message-index N [--source ID] [--conversation-id ID] [-C CONTEXT] [--json]  Follow search line_number; --line is for raw JSONL.".to_string(),
             "  cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.".to_string(),
             "  cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.".to_string(),
+            "  cass forget [--source-glob '<glob>'] [--workspace-glob '<glob>'] [--older-than 90d] [--apply] [--json]  Require at least one selector; combine with AND. Preview matching sessions; --apply removes indexed copies and keeps source files. Shared-session tombstones persist even when that session changes.".to_string(),
             "  cass mirror prune [--older-than 90d] [--max-size 100GB] [--keep-latest 1] [--keep-tag important] [--apply] [--json]  Plan or apply raw-mirror retention with an audit log.".to_string(),
             "  cass context <path> [--json]     Find related sessions for a given source path.".to_string(),
             "  cass export <path> [--format markdown] [--output FILE]  Export a conversation to markdown / other formats.".to_string(),

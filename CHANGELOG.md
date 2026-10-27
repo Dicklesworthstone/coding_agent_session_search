@@ -34,6 +34,18 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Added
 
+- **Session previews for `cass forget` (#537).** Source, workspace and age
+  selectors combine with AND and remain dry-run by default. Previews now show
+  up to 20 session identities, workspaces and last-message times in both human
+  output and the additive JSON `sample_sessions` field. Help and the README
+  make the permanent shared-session policy explicit: edits, appends, full
+  rescans and changes to workspace exclusions do not restore a forgotten
+  shared identity; ordinary single-session files retain size/mtime-based
+  re-inclusion. There is no automatic pruning or `unforget` command.
+  GOLDEN-CHANGE: `robot_docs/commands.txt.golden` adds the selective forget
+  command and its shared-session retention policy; existing capabilities and
+  introspection descriptions are preserved.
+
 - **Continue sessions are indexed.** Continue's IDE extension and CLI keep one
   JSON snapshot per session under `~/.continue/sessions` (or
   `$CONTINUE_GLOBAL_DIR/sessions`). A full index picks them up. `cass index

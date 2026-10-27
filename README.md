@@ -3546,7 +3546,14 @@ CASS_EXCLUDE_WORKSPACES='/work/scratch/*' cass index --json
 cass mirror prune --older-than 90d --json
 ```
 
+**Selection and previews.** All supplied selectors must match. Globs are case-sensitive and `*` also matches `/`; quote them so the shell passes them unchanged. They match the stored path, which for a shared store may be a logical handle such as `.../opencode.db/<session-id>`. A missing workspace never matches `--workspace-glob`. Age uses the maximum message timestamp, strictly before the reported `before_ms` cutoff; equality, empty sessions and sessions with even one missing message timestamp are kept. Each invocation resolves the duration once. JSON previews include up to 20 `sample_sessions`, each with `source_path`, `external_id`, `workspace` and `last_message_at`, alongside the existing counts and `sample_source_paths`. Human output shows the same session details, so sessions in one shared store can be distinguished before applying.
+
+**Changed sessions and re-inclusion.** A forgotten shared-store session remains suppressed for the same source provenance, agent, stored source path and external session ID. This is a permanent identity tombstone: appending to or editing the forgotten session itself does not restore it, and neither do sibling changes, a full rescan or changes to workspace exclusions. There is currently no `unforget` command. To recover a forgotten shared identity, restore a pre-forget archive backup or build a fresh archive from the preserved source files. Removing `CASS_EXCLUDE_WORKSPACES` only changes prospective admission; it does not undo an applied forget.
+
+Ordinary single-session files retain their existing size/mtime behavior for all selectors: unchanged files stay forgotten across incremental and full scans, while a changed size or modification time makes the file eligible for indexing again. Editing a file without changing that stamp does not clear its tombstone.
+
 Forgetting is always an explicit operation. CASS does not automatically delete old archived conversations. Source files remain on disk, and raw-mirror captures are governed separately by `mirror prune`; captures of a source still on disk may be made again by a later scan.
+
 - **Active session retries**: continuous watch mode retains paths skipped because they are still being written, including during startup, and retries them after the normal watch cooldown even without another filesystem event. `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` controls the recent-write window (default 120 seconds, maximum 3600); writer and advisory-lock checks still apply.
 
 - **Watch testing (dev only)**: `cass index --watch --watch-once path1,path2` triggers a single reindex without filesystem notify (also respects `CASS_TEST_WATCH_PATHS` for backward compatibility); useful for deterministic tests/smoke runs.

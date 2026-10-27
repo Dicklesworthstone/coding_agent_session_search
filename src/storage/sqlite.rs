@@ -11341,6 +11341,14 @@ impl FrankenStorage {
                             report.sample_source_paths.push(path.clone());
                         }
                     }
+                    if report.sample_sessions.len() < 20 {
+                        report.sample_sessions.push(ForgetSessionSample {
+                            source_path: candidate.source_path.clone(),
+                            external_id: candidate.external_id.clone(),
+                            workspace: candidate.workspace.clone(),
+                            last_message_at: latest,
+                        });
+                    }
                     matched.push(candidate);
                 }
             }
@@ -23699,6 +23707,17 @@ pub struct ForgottenConversationKey {
     pub external_id: String,
 }
 
+/// A bounded preview identifies the selected session even when several
+/// conversations share the same source path. `last_message_at` is the latest
+/// known message timestamp; age selection still keeps partly undated sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForgetSessionSample {
+    pub source_path: Option<String>,
+    pub external_id: Option<String>,
+    pub workspace: Option<String>,
+    pub last_message_at: Option<i64>,
+}
+
 /// Result of a `cass forget` prune (#292 ask #2, GH #537). On a dry run the
 /// `*_deleted` fields are zero and the `*_matched` fields report what WOULD be
 /// removed.
@@ -23716,6 +23735,8 @@ pub struct ForgetConversationsResult {
     pub conversations_deleted: usize,
     /// Bounded (<= 20) sample of matched source paths, for operator review.
     pub sample_source_paths: Vec<String>,
+    /// Bounded (<= 20) sample of the actual sessions selected for deletion.
+    pub sample_sessions: Vec<ForgetSessionSample>,
 }
 
 /// Only the narrow envelope needed to select and tombstone a conversation.
@@ -23730,14 +23751,35 @@ struct ForgetCandidate {
 }
 
 fn source_path_is_shared_store(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            ["db", "sqlite", "sqlite3", "vscdb"]
-                .iter()
-                .any(|known| extension.eq_ignore_ascii_case(known))
-        })
+    use std::io::Read as _;
+
+    // Devin uses a virtual `<database>/<session-id>` source path. Inspect
+    // file ancestors as well as the final component, but a real directory
+    // named `project.db` does not make its ordinary transcripts shared stores.
+    Path::new(path).ancestors().any(|candidate| {
+        if candidate.is_dir() {
+            return false;
+        }
+        if candidate
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                ["db", "sqlite", "sqlite3", "vscdb"]
+                    .iter()
+                    .any(|known| extension.eq_ignore_ascii_case(known))
+            })
+        {
+            return true;
+        }
+        if !candidate.is_file() {
+            return false;
+        }
+        let Ok(mut file) = fs::File::open(candidate) else {
+            return false;
+        };
+        let mut header = [0_u8; 16];
+        file.read_exact(&mut header).is_ok() && &header == b"SQLite format 3\0"
+    })
 }
 
 /// A source file's size and modification time, as `cass forget` recorded it
@@ -46298,11 +46340,16 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             workspace_glob: Some("/work/retired"),
             ..Default::default()
         };
+        let preview = storage.forget_conversations(&filter, true)?;
+        assert_eq!(preview.conversations_matched, 1);
         assert_eq!(
-            storage
-                .forget_conversations(&filter, true)?
-                .conversations_matched,
-            1
+            preview.sample_sessions,
+            vec![ForgetSessionSample {
+                source_path: Some(source.into()),
+                external_id: Some("same-id".into()),
+                workspace: Some("/work/retired".into()),
+                last_message_at: Some(10),
+            }]
         );
         assert!(storage.forgotten_conversation_keys()?.is_empty());
         assert_eq!(
@@ -46329,6 +46376,138 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         let reopened = FrankenStorage::open(&path)?;
         assert_eq!(reopened.forgotten_conversation_keys()?, expected);
         assert_eq!(reopened.total_conversation_count()?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_shared_store_detection_checks_virtual_paths_and_sqlite_headers() -> Result<()> {
+        let directory = TempDir::new()?;
+        let database = directory.path().join("sessions.db");
+        let header_only = directory.path().join("opaque-store");
+        let ordinary_directory = directory.path().join("project.db");
+        fs::create_dir(&ordinary_directory)?;
+        let ordinary_file = ordinary_directory.join("rollout.jsonl");
+        fs::write(&database, b"SQLite format 3\0fixture")?;
+        fs::write(&header_only, b"SQLite format 3\0fixture")?;
+        fs::write(&ordinary_file, b"ordinary session transcript")?;
+
+        for source in [
+            database.clone(),
+            database.join("devin-session"),
+            header_only.clone(),
+            header_only.join("virtual-session"),
+            directory.path().join("missing.SQLITE3"),
+        ] {
+            assert!(
+                source_path_is_shared_store(source.to_str().context("UTF-8 source path")?),
+                "{} must use session identity",
+                source.display()
+            );
+        }
+        for source in [
+            ordinary_directory,
+            ordinary_file,
+            directory.path().join("missing.jsonl"),
+        ] {
+            assert!(
+                !source_path_is_shared_store(source.to_str().context("UTF-8 source path")?),
+                "{} must retain ordinary file behavior",
+                source.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn forget_virtual_and_header_only_stores_use_permanent_session_keys() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("archive.db"))?;
+        let database = directory.path().join("sessions.db");
+        let header_only = directory.path().join("opaque-store");
+        let source_bytes = b"SQLite format 3\0source evidence";
+        fs::write(&database, source_bytes)?;
+        fs::write(&header_only, source_bytes)?;
+        let sources = [
+            (database.join("session-devin"), "devin"),
+            (header_only.clone(), "opencode"),
+            (header_only.join("session-virtual"), "devin"),
+        ];
+        for (index, (source, agent)) in sources.iter().enumerate() {
+            let external_id = format!("session-{index}");
+            let mut conversation = forget_fixture_conversation(
+                source.to_str().context("UTF-8 source path")?,
+                Some(&external_id),
+                Some("/work/retired"),
+                &[Some(10)],
+            );
+            conversation.agent_slug = (*agent).into();
+            seed_forget_fixture(&storage, &conversation)?;
+        }
+        let filter = ForgetConversationsFilter {
+            workspace_glob: Some("/work/retired"),
+            ..Default::default()
+        };
+        let preview = storage.forget_conversations(&filter, true)?;
+        assert_eq!(preview.conversations_matched, 3);
+        assert_eq!(preview.sample_sessions.len(), 3);
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        assert!(storage.forgotten_conversation_keys()?.is_empty());
+        let applied = storage.forget_conversations(&filter, false)?;
+        assert_eq!(applied.conversations_deleted, 3);
+        assert_eq!(applied.sample_sessions, preview.sample_sessions);
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        let keys = storage.forgotten_conversation_keys()?;
+        assert_eq!(keys.len(), 3);
+        for (index, (source, agent)) in sources.iter().enumerate() {
+            assert!(keys.contains(&ForgottenConversationKey {
+                source_id: LOCAL_SOURCE_ID.into(),
+                agent_slug: (*agent).into(),
+                source_path: source.to_string_lossy().into_owned(),
+                external_id: format!("session-{index}"),
+            }));
+        }
+        assert_eq!(fs::read(database)?, source_bytes);
+        assert_eq!(fs::read(header_only)?, source_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_session_preview_is_bounded_without_truncating_counts() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("preview.db"))?;
+        for index in 0..21 {
+            seed_forget_fixture(
+                &storage,
+                &forget_fixture_conversation(
+                    "/fixture/sessions.db",
+                    Some(&format!("session-{index}")),
+                    Some("/work/retired"),
+                    &[Some(index), Some(index + 1)],
+                ),
+            )?;
+        }
+        let preview = storage.forget_conversations(
+            &ForgetConversationsFilter {
+                workspace_glob: Some("/work/retired"),
+                ..Default::default()
+            },
+            true,
+        )?;
+        assert_eq!(preview.conversations_matched, 21);
+        assert_eq!(preview.messages_matched, 42);
+        assert_eq!(preview.sample_sessions.len(), 20);
+        assert_eq!(
+            preview.sample_sessions[0].external_id.as_deref(),
+            Some("session-0")
+        );
+        assert_eq!(preview.sample_sessions[0].last_message_at, Some(1));
+        assert_eq!(
+            preview.sample_sessions[19].external_id.as_deref(),
+            Some("session-19")
+        );
+        assert_eq!(preview.sample_sessions[19].last_message_at, Some(20));
+        assert_eq!(storage.total_conversation_count()?, 21);
+        assert!(storage.forgotten_conversation_keys()?.is_empty());
         Ok(())
     }
 

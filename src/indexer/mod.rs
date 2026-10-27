@@ -36736,6 +36736,12 @@ pub mod persist {
         t_index: &mut TantivyIndex,
         conv: &NormalizedConversation,
     ) -> Result<()> {
+        if retain_admitted_conversations(storage, std::slice::from_ref(conv))?
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        {
+            return Ok(());
+        }
         tracing::info!(agent = %conv.agent_slug, messages = conv.messages.len(), "persist_conversation");
         prepare_cursor_workspace_repair(storage, None, std::slice::from_ref(conv))?;
         prepare_codebuff_canonical_repair(
@@ -42203,6 +42209,18 @@ mod tests {
         let outcome = persist(&[forgotten.clone(), sibling.clone()])?;
         assert_eq!(outcome.inserted_conversations, 0);
         assert_eq!(outcome.inserted_messages, 1);
+        assert_eq!(count_total_conversations_exact(&storage)?, 1);
+        assert_eq!(count_total_messages_exact(&storage)?, 2);
+
+        // Session identities remain forgotten even if that session's own
+        // messages change. Both public persistence paths honor the policy.
+        forgotten.messages.push(norm_msg(1, 300));
+        forgotten.ended_at = Some(300);
+        let mut index = TantivyIndex::open_or_create(&tmp.path().join("direct-index"))?;
+        persist::persist_conversation(&storage, &mut index, &forgotten)?;
+        let replay = persist(std::slice::from_ref(&forgotten))?;
+        assert_eq!(replay.inserted_conversations, 0);
+        assert_eq!(replay.inserted_messages, 0);
         assert_eq!(count_total_conversations_exact(&storage)?, 1);
         assert_eq!(count_total_messages_exact(&storage)?, 2);
 
