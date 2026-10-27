@@ -857,7 +857,7 @@ fn reinclusion_recovers_unchanged_shared_session_with_incremental_index() -> Tes
     assert!(archive.search_hit_paths(SIBLING_MARKER)?.is_empty());
     assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
     assert_eq!(fs::read(&source)?, source_before);
-    let storage = FrankenStorage::open_strict_readonly(&db_path)?;
+    let storage = FrankenStorage::open_readonly(&db_path)?;
     assert_eq!(storage.total_conversation_count()?, 2);
     assert_eq!(storage.forgotten_conversation_keys()?.len(), 1);
     storage.close_without_checkpoint()?;
