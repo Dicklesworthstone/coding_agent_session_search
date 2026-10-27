@@ -72,6 +72,443 @@ fn count_pattern(html: &str, pattern: &str) -> usize {
     re.find_iter(html).count()
 }
 
+const EXPORT_PRIVACY_SECRET: &str = "synthetic-export-credential-a81b4e9d";
+
+fn export_privacy_command(root: &Path) -> Command {
+    let mut cmd = base_cmd();
+    cmd.current_dir(root)
+        .env("CASS_DATA_DIR", root.join("data"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_INDEX_REDACTION", "full")
+        .env_remove("CASS_DB_PATH")
+        .env_remove("CASS_IGNORE_SOURCES_CONFIG")
+        .env_remove("CASS_EXCLUDE_PATHS")
+        .env_remove("CASS_EXCLUDE_WORKSPACES")
+        .env_remove("CASS_OUTPUT_FORMAT")
+        .env_remove("TOON_DEFAULT_FORMAT")
+        .timeout(std::time::Duration::from_secs(60));
+    cmd
+}
+
+fn export_privacy_session(root: &Path) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let config = root.join("config/cass");
+    fs::create_dir_all(&config)?;
+    fs::write(
+        config.join("sources.toml"),
+        "[[sources]]\nname = \"fixture\"\ntype = \"ssh\"\nhost = \"fixture.invalid\"\npaths = [\"~/.codex/sessions\"]\nsync_schedule = \"manual\"\n",
+    )?;
+    // Reingest supplies an empty default-local-root map and reads only this
+    // mirror. It neither discovers the operator's homes nor opens SSH.
+    let mirror = root.join("data/remotes/fixture/mirror").join(
+        coding_agent_search::sources::sync::path_to_safe_dirname("~/.codex/sessions"),
+    );
+    fs::create_dir_all(&mirror)?;
+    let session = mirror.join("rollout-export-privacy.jsonl");
+    let records = [
+        serde_json::json!({"timestamp":"2026-10-27T12:00:00Z","type":"session_meta","payload":{"id":"export-privacy-84","cwd":"/synthetic/export-privacy","originator":"codex_cli_rs"}}),
+        serde_json::json!({"timestamp":"2026-10-27T12:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("exportprivacycanary café 界 password={EXPORT_PRIVACY_SECRET}")}]}}),
+        serde_json::json!({"timestamp":"2026-10-27T12:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"exportprivacycanary ordinary-kept-marker; discuss password rotation"}]}}),
+    ];
+    let mut bytes = Vec::new();
+    for record in records {
+        serde_json::to_writer(&mut bytes, &record)?;
+        bytes.push(b'\n');
+    }
+    fs::write(&session, bytes)?;
+    Ok(session)
+}
+
+fn export_privacy_html(
+    root: &Path,
+    session: &Path,
+    source: Option<&str>,
+    include_secrets: bool,
+    encrypt: bool,
+) -> Result<(Value, String), Box<dyn std::error::Error>> {
+    let mut cmd = export_privacy_command(root);
+    cmd.arg("export-html")
+        .arg(session)
+        .arg("--output-dir")
+        .arg(root.join("exports"))
+        .arg("--json");
+    if let Some(source) = source {
+        cmd.args(["--source", source]);
+    }
+    if include_secrets {
+        cmd.arg("--include-secrets");
+    }
+    if encrypt {
+        cmd.args(["--encrypt", "--password-stdin"])
+            .write_stdin("export privacy regression passphrase\n");
+    }
+    let output = cmd.output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(receipt["privacy"]["sensitive_output"], include_secrets);
+    assert!(receipt["privacy"]["redaction_applied"].is_boolean());
+    if include_secrets {
+        assert_eq!(receipt["privacy"]["redaction_applied"], false);
+    }
+    assert_eq!(
+        receipt["privacy"]["policy"],
+        if include_secrets {
+            "include-secrets"
+        } else {
+            "redact-secrets"
+        }
+    );
+    let html = fs::read_to_string(
+        receipt["exported"]["output_path"]
+            .as_str()
+            .ok_or("output path")?,
+    )?;
+    Ok((receipt, html))
+}
+
+#[test]
+fn export_redaction_parity_for_live_and_archived_sources() -> Result<(), Box<dyn std::error::Error>>
+{
+    let root = TempDir::new()?;
+    let session = export_privacy_session(root.path())?;
+    let source_bytes = fs::read(&session)?;
+    for plan_flag in ["--dry-run", "--explain"] {
+        let output = export_privacy_command(root.path())
+            .arg("export-html")
+            .arg(&session)
+            .args(["--json", plan_flag])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let plan: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(plan["privacy"]["policy"], "redact-secrets");
+        assert_eq!(plan["privacy"]["redaction_applied"], true);
+        assert!(!plan.to_string().contains(EXPORT_PRIVACY_SECRET));
+    }
+    let indexed = export_privacy_command(root.path())
+        .args([
+            "sources", "reingest", "--source", "fixture", "--full", "--json",
+        ])
+        .output()?;
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let indexed_receipt: Value = serde_json::from_slice(&indexed.stdout)?;
+    assert_eq!(indexed_receipt["indexing"]["conversations"], 1);
+    let query = export_privacy_command(root.path())
+        .args([
+            "search",
+            "exportprivacycanary",
+            "--mode",
+            "lexical",
+            "--no-maintenance",
+            "--robot",
+        ])
+        .output()?;
+    assert!(
+        query.status.success(),
+        "{}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    let hits: Value = serde_json::from_slice(&query.stdout)?;
+    assert!(hits["hits"].as_array().is_some_and(|hits| !hits.is_empty()));
+    assert!(!String::from_utf8_lossy(&query.stdout).contains(EXPORT_PRIVACY_SECRET));
+
+    let db_path = root.path().join("data/agent_search.db");
+    let db_before = fs::read(&db_path)?;
+    let wal_path = root.path().join("data/agent_search.db-wal");
+    let wal_before = fs::read(&wal_path).ok();
+    for (label, source) in [("live", None), ("archive", Some("fixture"))] {
+        for format in ["markdown", "text", "json", "html"] {
+            let output_path = root.path().join(format!("{label}-{format}.out"));
+            let mut cmd = export_privacy_command(root.path());
+            cmd.arg("export")
+                .arg(&session)
+                .args(["--format", format, "--include-tools"])
+                .arg("--output")
+                .arg(&output_path);
+            if let Some(source) = source {
+                cmd.args(["--source", source]);
+            }
+            // Index-time configuration cannot opt a sharing command in.
+            cmd.env("CASS_INDEX_REDACTION", "off");
+            let output = cmd.output()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let exported = fs::read_to_string(output_path)?;
+            assert!(
+                !exported.contains(EXPORT_PRIVACY_SECRET),
+                "{label}/{format} leaked a credential"
+            );
+            assert!(
+                exported.contains("ordinary-kept-marker"),
+                "{label}/{format} lost benign content"
+            );
+            assert!(exported.contains("password rotation"));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("redact-secrets"));
+        }
+        let (receipt, html) = export_privacy_html(root.path(), &session, source, false, false)?;
+        assert!(
+            !html.contains(EXPORT_PRIVACY_SECRET),
+            "{label}/HTML leaked a credential"
+        );
+        assert!(!receipt.to_string().contains(EXPORT_PRIVACY_SECRET));
+        assert!(html.contains("ordinary-kept-marker"));
+        assert!(html.contains("café 界"));
+    }
+    assert_eq!(fs::read(&session)?, source_bytes);
+    assert_eq!(fs::read(&db_path)?, db_before);
+    assert_eq!(fs::read(&wal_path).ok(), wal_before);
+    Ok(())
+}
+
+#[test]
+fn export_redaction_covers_tool_arguments_results_and_nested_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TempDir::new()?;
+    let session = root.path().join("tool-session.jsonl");
+    let events = [
+        serde_json::json!({"type":"user","message":{"role":"user","content":"ordinary-kept-marker café 界"}}),
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[
+            {"type":"tool_use","id":"call-84","name":"Read","input":{"path":"src/lib.rs","authorization":EXPORT_PRIVACY_SECRET}}
+        ]},"metadata":{"nested":{"passphrase":EXPORT_PRIVACY_SECRET},"token_count":42}}),
+        serde_json::json!({"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"call-84","content":format!("tool-result-kept password={EXPORT_PRIVACY_SECRET}")}
+        ]}}),
+    ];
+    let mut bytes = Vec::new();
+    for event in events {
+        serde_json::to_writer(&mut bytes, &event)?;
+        bytes.push(b'\n');
+    }
+    fs::write(&session, &bytes)?;
+    for include_secrets in [false, true] {
+        for format in ["markdown", "text", "json", "html"] {
+            let mut cmd = export_privacy_command(root.path());
+            cmd.arg("export")
+                .arg(&session)
+                .args(["--format", format, "--include-tools"]);
+            if include_secrets {
+                cmd.arg("--include-secrets");
+            }
+            let output = cmd.output()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let exported = String::from_utf8(output.stdout)?;
+            assert_eq!(exported.contains(EXPORT_PRIVACY_SECRET), include_secrets);
+            assert!(exported.contains("tool-result-kept"));
+            if format == "json" {
+                let messages: Value = serde_json::from_str(&exported)?;
+                assert_eq!(messages[1]["metadata"]["token_count"], 42);
+                assert_eq!(messages[1]["message"]["content"][0]["id"], "call-84");
+            }
+        }
+        let (_, html) =
+            export_privacy_html(root.path(), &session, None, include_secrets, false)?;
+        assert_eq!(html.contains(EXPORT_PRIVACY_SECRET), include_secrets);
+        assert!(html.contains("tool-result-kept"));
+        assert!(html.contains("src/lib.rs"));
+    }
+    assert_eq!(fs::read(&session)?, bytes);
+    Ok(())
+}
+
+#[test]
+fn export_redaction_covers_unredacted_archive_with_never_created_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use coding_agent_search::storage::sqlite::SqliteStorage;
+
+    let root = TempDir::new()?;
+    let absent = root.path().join("never-created.jsonl");
+    let db_path = root.path().join("data/agent_search.db");
+    fs::create_dir_all(db_path.parent().ok_or("database directory")?)?;
+    let storage = SqliteStorage::open(&db_path)?;
+    let agent_id = storage.ensure_agent(&Agent {
+        id: None,
+        slug: "codex".into(),
+        name: "Codex".into(),
+        version: None,
+        kind: AgentKind::Cli,
+    })?;
+    // This archive deliberately predates ingest redaction. Its source path has
+    // never existed; fallback is exercised without deleting or moving a file.
+    let conversation = Conversation {
+        id: None,
+        agent_slug: "codex".into(),
+        workspace: None,
+        external_id: Some("export-privacy-archive-only".into()),
+        title: Some(format!("password={EXPORT_PRIVACY_SECRET}")),
+        source_path: absent.clone(),
+        started_at: None,
+        ended_at: None,
+        approx_tokens: None,
+        metadata_json: serde_json::json!({}),
+        messages: vec![
+            Message {
+                id: None,
+                idx: 7,
+                role: MessageRole::User,
+                author: None,
+                created_at: None,
+                content: format!("café 界 password={EXPORT_PRIVACY_SECRET}"),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            },
+            Message {
+                id: None,
+                idx: 9,
+                role: MessageRole::Agent,
+                author: None,
+                created_at: None,
+                content: "ordinary-kept-marker; discuss password rotation".into(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            },
+        ],
+        source_id: "local".into(),
+        origin_host: None,
+    };
+    storage.insert_conversation_tree(agent_id, None, &conversation)?;
+    drop(storage);
+    let db_before = fs::read(&db_path)?;
+    let wal_path = root.path().join("data/agent_search.db-wal");
+    let wal_before = fs::read(&wal_path).ok();
+    for include_secrets in [false, true] {
+        for format in ["markdown", "text", "json", "html"] {
+            let mut cmd = export_privacy_command(root.path());
+            cmd.arg("export")
+                .arg(&absent)
+                .args(["--source", "local", "--format", format]);
+            if include_secrets {
+                cmd.arg("--include-secrets");
+            }
+            let output = cmd.output()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let exported = String::from_utf8(output.stdout)?;
+            assert_eq!(exported.contains(EXPORT_PRIVACY_SECRET), include_secrets);
+            assert!(exported.contains("ordinary-kept-marker"));
+            assert!(exported.contains("café 界"));
+        }
+        let (receipt, html) =
+            export_privacy_html(root.path(), &absent, Some("local"), include_secrets, false)?;
+        assert_eq!(html.contains(EXPORT_PRIVACY_SECRET), include_secrets);
+        assert_eq!(
+            receipt.to_string().contains(EXPORT_PRIVACY_SECRET),
+            include_secrets
+        );
+        assert!(html.contains("ordinary-kept-marker"));
+        assert!(html.contains("café 界"));
+    }
+    assert!(!absent.exists());
+    assert_eq!(fs::read(&db_path)?, db_before);
+    assert_eq!(fs::read(&wal_path).ok(), wal_before);
+    Ok(())
+}
+
+#[test]
+fn export_redaction_raw_fidelity_requires_explicit_sensitive_option()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TempDir::new()?;
+    let session = export_privacy_session(root.path())?;
+    for format in ["markdown", "text", "json", "html"] {
+        let output = export_privacy_command(root.path())
+            .arg("export")
+            .arg(&session)
+            .args(["--format", format, "--include-secrets"])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(EXPORT_PRIVACY_SECRET));
+        let policy = String::from_utf8_lossy(&output.stderr);
+        assert!(policy.contains("include-secrets"));
+        assert!(policy.contains("\"sensitive_output\":true"));
+    }
+    let (receipt, html) = export_privacy_html(root.path(), &session, None, true, false)?;
+    assert!(html.contains(EXPORT_PRIVACY_SECRET));
+    assert!(
+        receipt["exported"]["title"]
+            .as_str()
+            .is_some_and(|title| title.contains(EXPORT_PRIVACY_SECRET))
+    );
+    assert!(!root.path().join("data/agent_search.db").exists());
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "encryption")]
+fn export_redaction_policy_applies_before_encryption() -> Result<(), Box<dyn std::error::Error>> {
+    use aes_gcm::{
+        Aes256Gcm, Nonce,
+        aead::{Aead, KeyInit},
+    };
+    use base64::Engine as _;
+    use base64::prelude::BASE64_STANDARD;
+    use ring::pbkdf2;
+    use std::num::NonZeroU32;
+
+    let root = TempDir::new()?;
+    let session = export_privacy_session(root.path())?;
+    let carrier = Regex::new(r#"(?s)<div id="encrypted-content" hidden>(.*?)</div>"#)?;
+    for include_secrets in [false, true] {
+        let (receipt, html) =
+            export_privacy_html(root.path(), &session, None, include_secrets, true)?;
+        let payload = carrier
+            .captures(&html)
+            .and_then(|caps| caps.get(1))
+            .ok_or("encrypted payload")?;
+        let encrypted: Value = serde_json::from_str(payload.as_str())?;
+        let salt = BASE64_STANDARD.decode(encrypted["salt"].as_str().ok_or("salt")?)?;
+        let iv = BASE64_STANDARD.decode(encrypted["iv"].as_str().ok_or("nonce")?)?;
+        let ciphertext =
+            BASE64_STANDARD.decode(encrypted["ciphertext"].as_str().ok_or("ciphertext")?)?;
+        let iterations = u32::try_from(encrypted["iterations"].as_u64().ok_or("KDF work")?)?;
+        let mut key = [0u8; 32];
+        pbkdf2::derive(
+            pbkdf2::PBKDF2_HMAC_SHA256,
+            NonZeroU32::new(iterations).ok_or("nonzero KDF work")?,
+            &salt,
+            b"export privacy regression passphrase",
+            &mut key,
+        );
+        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "AES key")?;
+        let nonce = Nonce::try_from(iv.as_slice()).map_err(|_| "AES nonce")?;
+        let plaintext = cipher
+            .decrypt(&nonce, ciphertext.as_ref())
+            .map_err(|_| "decrypt")?;
+        let plaintext = String::from_utf8(plaintext)?;
+        assert!(plaintext.contains("ordinary-kept-marker"));
+        assert_eq!(plaintext.contains(EXPORT_PRIVACY_SECRET), include_secrets);
+        if !include_secrets {
+            assert!(!receipt.to_string().contains(EXPORT_PRIVACY_SECRET));
+            assert!(!html.contains(EXPORT_PRIVACY_SECRET));
+        }
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Structure Validation Tests
 // ============================================================================

@@ -4,6 +4,20 @@
     "success": {
       "type": "boolean"
     },
+    "privacy": {
+      "type": "object",
+      "properties": {
+        "policy": {
+          "type": "string"
+        },
+        "redaction_applied": {
+          "type": "boolean"
+        },
+        "sensitive_output": {
+          "type": "boolean"
+        }
+      }
+    },
     "exported": {
       "type": "object",
       "properties": {

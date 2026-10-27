@@ -11,6 +11,61 @@ use std::borrow::Cow;
 
 use crate::search::query::SearchHit;
 
+/// Sharing policy applied before raw or archived conversation data is rendered.
+/// Export policy is independent of index-time settings: an archive built with
+/// redaction disabled must still be safe to share by default.
+pub(crate) struct ExportPrivacy {
+    include_secrets: bool,
+    redaction_applied: bool,
+}
+
+impl ExportPrivacy {
+    pub(crate) fn new(include_secrets: bool) -> Self {
+        Self {
+            include_secrets,
+            redaction_applied: false,
+        }
+    }
+
+    pub(crate) fn redact_messages(&mut self, messages: &mut [Value]) {
+        if self.include_secrets {
+            return;
+        }
+        for message in messages {
+            let redacted = crate::indexer::redact_secrets::redact_json(message);
+            self.redaction_applied |= redacted != *message;
+            *message = redacted;
+        }
+    }
+
+    pub(crate) fn redact_optional_text(&mut self, text: &mut Option<String>) {
+        if let Some(text) = text {
+            self.redact_text(text);
+        }
+    }
+
+    pub(crate) fn redact_text(&mut self, text: &mut String) {
+        if !self.include_secrets
+            && let Cow::Owned(redacted) = crate::indexer::redact_secrets::redact_text(text)
+        {
+            *text = redacted;
+            self.redaction_applied = true;
+        }
+    }
+
+    pub(crate) fn metadata(&self) -> Value {
+        serde_json::json!({
+            "policy": if self.include_secrets { "include-secrets" } else { "redact-secrets" },
+            "redaction_applied": self.redaction_applied,
+            "sensitive_output": self.include_secrets,
+        })
+    }
+
+    pub(crate) fn announce(&self) {
+        eprintln!("note: export privacy: {}", self.metadata());
+    }
+}
+
 /// Whole-message skill and hook injections excluded from handoffs and exports
 /// unless the caller explicitly opts in. Inspect the full message before any
 /// excerpt truncation so a retained suffix cannot hide its injection marker.
@@ -426,6 +481,60 @@ fn truncate_text(text: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_privacy_redacts_nested_credentials_and_preserves_message_identity() {
+        let original = serde_json::json!({
+            "role": "assistant",
+            "message_index": 7,
+            "content": "Keep café 界 and password=synthetic-secret-84 visible only with consent",
+            "tool": {"name": "Read", "input": {"passphrase": "short", "path": "src/lib.rs"}},
+            "metadata": {"authorization": "short", "answer": 42}
+        });
+        let mut messages = [original.clone()];
+        let mut title = Some("Title password=synthetic-title-84".to_string());
+        let mut privacy = ExportPrivacy::new(false);
+        privacy.redact_messages(&mut messages);
+        privacy.redact_optional_text(&mut title);
+
+        assert_eq!(messages[0]["message_index"], 7);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool"]["name"], "Read");
+        assert_eq!(messages[0]["tool"]["input"]["path"], "src/lib.rs");
+        assert_eq!(messages[0]["tool"]["input"]["passphrase"], "[REDACTED]");
+        assert_eq!(messages[0]["metadata"]["authorization"], "[REDACTED]");
+        assert_eq!(messages[0]["metadata"]["answer"], 42);
+        assert_eq!(
+            messages[0]["content"],
+            "Keep café 界 and [REDACTED] visible only with consent"
+        );
+        assert_eq!(title.as_deref(), Some("Title [REDACTED]"));
+        assert_eq!(privacy.metadata()["redaction_applied"], true);
+        assert_eq!(privacy.metadata()["sensitive_output"], false);
+        assert_eq!(original["tool"]["input"]["passphrase"], "short");
+    }
+
+    #[test]
+    fn export_privacy_preserves_benign_text_and_marks_explicit_raw_output() {
+        let benign = serde_json::json!({"content": "Discuss password rotation; café 界", "idx": 3});
+        let mut messages = [benign.clone()];
+        let mut privacy = ExportPrivacy::new(false);
+        privacy.redact_messages(&mut messages);
+        assert_eq!(messages[0], benign);
+        assert_eq!(privacy.metadata()["redaction_applied"], false);
+
+        let raw = serde_json::json!({"content": "password=synthetic-explicit-84"});
+        let mut messages = [raw.clone()];
+        let mut title = Some("password=synthetic-title-84".to_string());
+        let mut privacy = ExportPrivacy::new(true);
+        privacy.redact_messages(&mut messages);
+        privacy.redact_optional_text(&mut title);
+        assert_eq!(messages[0], raw);
+        assert_eq!(title.as_deref(), Some("password=synthetic-title-84"));
+        assert_eq!(privacy.metadata()["policy"], "include-secrets");
+        assert_eq!(privacy.metadata()["sensitive_output"], true);
+        assert_eq!(privacy.metadata()["redaction_applied"], false);
+    }
 
     #[test]
     fn skill_injection_policy_preserves_ordinary_discussion() {

@@ -49,6 +49,70 @@ fn receipt(output: Output) -> Value {
     serde_json::from_slice(&output.stdout).expect("one JSON success receipt")
 }
 
+#[test]
+fn delegated_archive_error_schema_keeps_missing_hint_and_classification() {
+    let root = tempfile::tempdir().expect("isolated archive error fixture");
+    let missing = root.path().join("absent.jsonl");
+    let malformed = root.path().join("malformed.jsonl");
+    fs::write(&malformed, b"not a logical archive\n").expect("malformed wire fixture");
+    let entries = fs::read_dir(root.path())
+        .expect("fixture directory")
+        .count();
+
+    for (input, expected_code, expected_kind, retryable) in [
+        (&missing, 14, "logical-archive-io", true),
+        (&malformed, 5, "logical-archive-integrity", false),
+    ] {
+        let output = command(root.path())
+            .args(["archive", "verify"])
+            .arg(input)
+            .output()
+            .expect("run real archive verifier");
+        assert_eq!(output.status.code(), Some(expected_code));
+        assert!(output.stdout.is_empty(), "fatal errors belong on stderr");
+        let payload: Value = serde_json::from_slice(&output.stderr)
+            .expect("exactly one structured diagnostic, with no extra prose");
+        let error = payload["error"].as_object().expect("error object");
+        assert_eq!(error.len(), 5);
+        assert_eq!(error["code"], expected_code);
+        assert_eq!(error["kind"], expected_kind);
+        assert!(error["message"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(
+            error.contains_key("hint"),
+            "nullable hint must not disappear"
+        );
+        assert!(error["hint"].is_null());
+        assert_eq!(error["retryable"], retryable);
+    }
+
+    assert_eq!(
+        fs::read_dir(root.path())
+            .expect("fixture directory")
+            .count(),
+        entries
+    );
+    assert!(!missing.exists());
+    assert!(!root.path().join("unused-default").exists());
+    assert_eq!(
+        fs::read(&malformed).expect("wire fixture remains"),
+        b"not a logical archive\n"
+    );
+
+    let ordinary_root = tempfile::tempdir().expect("isolated ordinary error control");
+    let output = command(ordinary_root.path())
+        .args(["search", "needle", "--robot", "--no-maintenance"])
+        .output()
+        .expect("ordinary command error control");
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    let ordinary: Value = serde_json::from_slice(&output.stderr).expect("ordinary error envelope");
+    let error = ordinary["error"]
+        .as_object()
+        .expect("ordinary error object");
+    assert_eq!(error.len(), 5);
+    assert!(error["hint"].is_string());
+}
+
 fn export(home: &Path, source: &Path, output: &Path) -> Value {
     export_version(home, source, output, None)
 }

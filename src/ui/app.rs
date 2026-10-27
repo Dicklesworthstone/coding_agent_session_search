@@ -11078,10 +11078,12 @@ impl CassApp {
 
         let downloads = get_downloads_dir();
         let fallback_title = if let Some(title) = hit_title_display(hit) {
-            smart_truncate(title, 60)
+            smart_truncate(&crate::indexer::redact_secrets::redact_text(title), 60)
         } else {
             search_hit_snippet_fallback_text_opt(hit)
-                .map(|text| smart_truncate(text, 60))
+                .map(|text| {
+                    smart_truncate(&crate::indexer::redact_secrets::redact_text(text), 60)
+                })
                 .unwrap_or_else(|| "Untitled Session".to_string())
         };
         let created_date = hit
@@ -11094,8 +11096,11 @@ impl CassApp {
             .map(|dt| dt.format("%b %d, %Y at %I:%M %p").to_string())
             .unwrap_or_else(|| "Unknown date".to_string());
 
-        let agent_name = hit.agent.trim().to_string();
-        let workspace = hit.workspace.trim().to_string();
+        let mut agent_name = hit.agent.trim().to_string();
+        let mut workspace = hit.workspace.trim().to_string();
+        let mut privacy = crate::export::ExportPrivacy::new(false);
+        privacy.redact_text(&mut agent_name);
+        privacy.redact_text(&mut workspace);
 
         let metadata = FilenameMetadata {
             agent: (!agent_name.is_empty()).then(|| agent_name.clone()),
@@ -23195,38 +23200,41 @@ fn export_session_task(
         None
     };
 
-    let messages: Vec<HtmlMessage> = if let Some(view) = indexed_view {
+    let mut messages: Vec<HtmlMessage> = if let Some(view) = indexed_view {
         html_messages_from_view(view)
     } else if allow_direct_file && session_path.exists() {
         match load_local_export_raw_messages(session_path) {
-            Ok((raw_messages, _, _)) => raw_messages
-                .into_iter()
-                .enumerate()
-                .filter_map(|(idx, msg)| {
-                    let role = crate::extract_role(&msg);
-                    let content = crate::extract_text_content(&msg);
-                    if content.is_empty() && !include_tools {
-                        return None;
-                    }
+            Ok((mut raw_messages, _, _)) => {
+                crate::export::ExportPrivacy::new(false).redact_messages(&mut raw_messages);
+                raw_messages
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(idx, msg)| {
+                        let role = crate::extract_role(&msg);
+                        let content = crate::extract_text_content(&msg);
+                        if content.is_empty() && !include_tools {
+                            return None;
+                        }
 
-                    let timestamp = crate::extract_message_timestamp(&msg).and_then(|ts| {
-                        DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
-                    });
-                    let author = msg
-                        .get("author")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string);
+                        let timestamp = crate::extract_message_timestamp(&msg).and_then(|ts| {
+                            DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
+                        });
+                        let author = msg
+                            .get("author")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string);
 
-                    Some(HtmlMessage {
-                        role,
-                        content,
-                        timestamp,
-                        tool_call: None,
-                        index: Some(idx),
-                        author,
+                        Some(HtmlMessage {
+                            role,
+                            content,
+                            timestamp,
+                            tool_call: None,
+                            index: Some(idx),
+                            author,
+                        })
                     })
-                })
-                .collect(),
+                    .collect()
+            }
             Err(local_err) => match load_indexed_export_view(db_path, hit) {
                 Ok(Some(view)) => html_messages_from_view(view),
                 Ok(None) => return CassMsg::ExportFailed(local_err),
@@ -23244,6 +23252,18 @@ fn export_session_task(
     if messages.is_empty() {
         return CassMsg::ExportFailed("No messages found in session".to_string());
     }
+
+    let mut privacy = crate::export::ExportPrivacy::new(false);
+    for message in &mut messages {
+        privacy.redact_text(&mut message.content);
+        privacy.redact_optional_text(&mut message.author);
+    }
+    let mut title = Some(title.to_string());
+    privacy.redact_optional_text(&mut title);
+    let title = title.as_deref().unwrap_or("Conversation Export");
+    let mut agent_name = Some(agent_name.to_string());
+    privacy.redact_optional_text(&mut agent_name);
+    let agent_name = agent_name.as_deref().unwrap_or("AI Assistant");
 
     let options = HtmlExportOptions {
         title: Some(title.to_string()),
@@ -23309,7 +23329,7 @@ fn export_session_markdown_task(
         )
     };
 
-    let (messages, mut session_title, session_start) = if prefer_direct_file {
+    let (mut messages, mut session_title, session_start) = if prefer_direct_file {
         match load_local_export_raw_messages(session_path) {
             Ok(loaded) => loaded,
             Err(local_err) => match load_indexed_export_view(db_path, hit) {
@@ -23369,6 +23389,10 @@ fn export_session_markdown_task(
     if session_title.is_none() && !hit.title.trim().is_empty() {
         session_title = Some(hit.title.trim().to_string());
     }
+
+    let mut privacy = crate::export::ExportPrivacy::new(false);
+    privacy.redact_messages(&mut messages);
+    privacy.redact_optional_text(&mut session_title);
 
     if session_title.is_none() {
         for message in &messages {
@@ -31242,6 +31266,50 @@ mod tests {
     }
 
     #[test]
+    fn export_redaction_tui_html_and_markdown_keep_raw_source_credentials_private() {
+        let temp = tempfile::TempDir::new().expect("isolated TUI export");
+        let session = temp.path().join("privacy.jsonl");
+        let secret = "synthetic-tui-export-credential-84";
+        let title = format!("Title password={secret}");
+        let events = [
+            serde_json::json!({"role":"user","content":"ordinary-kept-marker café 界"}),
+            serde_json::json!({"role":"assistant","content":format!("Discuss password rotation; password={secret}"),"metadata":{"authorization":secret}}),
+        ];
+        let bytes = events
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect::<String>();
+        std::fs::write(&session, &bytes).unwrap();
+        let db = temp.path().join("absent.db");
+        let mut hit = make_exact_hit(&session.display().to_string(), "local", 1, "fixture");
+        hit.title.clone_from(&title);
+        let markdown = export_session_markdown_task(&db, &hit, &temp.path().join("safe.md"), true);
+        let html = export_session_task(
+            &db,
+            &hit,
+            &temp.path().join("safe.html"),
+            false,
+            None,
+            false,
+            true,
+            &title,
+            "Codex",
+        );
+        for result in [markdown, html] {
+            let CassMsg::ExportCompleted { output_path, .. } = result else {
+                panic!("export did not complete: {result:?}");
+            };
+            let output = std::fs::read_to_string(output_path).unwrap();
+            assert!(!output.contains(secret));
+            assert!(output.contains("ordinary-kept-marker"));
+            assert!(output.contains("café 界"));
+            assert!(output.contains("password rotation"));
+        }
+        assert_eq!(std::fs::read_to_string(&session).unwrap(), bytes);
+        assert!(!db.exists());
+    }
+
+    #[test]
     fn export_session_markdown_task_prefers_local_jsonl_over_stale_index() {
         use crate::storage::sqlite::FrankenStorage;
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -33557,6 +33625,22 @@ not jsonl",
                 .contains("export preview content fallback"),
             "export title preview should reuse the same fallback excerpt the user already sees"
         );
+    }
+
+    #[test]
+    fn export_redaction_tui_default_filename_uses_safe_title_and_workspace() {
+        let app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.title = "Session password=synthetic-export-title-84".into();
+        hit.workspace = "/tmp/password=synthetic-export-workspace-84".into();
+        let before = hit.clone();
+        let state = app.detail_export_state_for_hit(&hit);
+        assert!(state.title_preview.contains("[REDACTED]"));
+        for value in [state.title_preview, state.workspace, state.filename_preview] {
+            assert!(!value.contains("synthetic-export"));
+        }
+        assert_eq!(hit.title, before.title);
+        assert_eq!(hit.workspace, before.workspace);
     }
 
     #[test]

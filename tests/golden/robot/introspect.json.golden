@@ -2900,6 +2900,16 @@
             "true",
             "false"
           ]
+        },
+        {
+          "name": "include-secrets",
+          "description": "Include credentials from the source text (sensitive output). By default exports redact recognized secrets, regardless of index settings",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
         }
       ],
       "has_json_output": false
@@ -2993,6 +3003,16 @@
         {
           "name": "include-skills",
           "description": "Include skill content in export (default: stripped for privacy). Skills injected by Claude Code/Codex contain proprietary SKILL.md content that should not appear in shared/published exports",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "include-secrets",
+          "description": "Include credentials from the source text (sensitive output, even when encrypted). By default exports redact recognized secrets, regardless of index settings",
           "arg_type": "flag",
           "required": false,
           "enum_values": [

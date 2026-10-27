@@ -1423,6 +1423,10 @@ pub enum Commands {
         /// Include skill content in export (default: stripped for privacy)
         #[arg(long)]
         include_skills: bool,
+        /// Include credentials from the source text (sensitive output).
+        /// By default exports redact recognized secrets, regardless of index settings.
+        #[arg(long)]
+        include_secrets: bool,
     },
     /// Export session as beautiful, self-contained HTML (with optional encryption)
     #[command(name = "export-html")]
@@ -1483,6 +1487,11 @@ pub enum Commands {
         /// content that should not appear in shared/published exports.
         #[arg(long)]
         include_skills: bool,
+
+        /// Include credentials from the source text (sensitive output, even when encrypted).
+        /// By default exports redact recognized secrets, regardless of index settings.
+        #[arg(long)]
+        include_secrets: bool,
 
         /// Default theme (dark or light)
         #[arg(long, default_value = "dark", value_parser = ["dark", "light"])]
@@ -3432,6 +3441,19 @@ impl std::fmt::Display for CliError {
 impl std::error::Error for CliError {}
 
 impl CliError {
+    /// Stable robot error shape shared by ordinary and delegated commands.
+    pub fn json_envelope(&self) -> serde_json::Value {
+        serde_json::json!({
+            "error": {
+                "code": self.code,
+                "kind": self.kind,
+                "message": self.message,
+                "hint": self.hint,
+                "retryable": self.retryable,
+            }
+        })
+    }
+
     pub fn already_reported(code: i32, kind: &'static str, retryable: bool) -> Self {
         CliError {
             code,
@@ -9326,6 +9348,7 @@ async fn execute_cli(
                     clipboard,
                     include_tools,
                     include_skills,
+                    include_secrets,
                 } => {
                     run_export(
                         &path,
@@ -9336,6 +9359,7 @@ async fn execute_cli(
                         clipboard,
                         include_tools,
                         include_skills,
+                        include_secrets,
                     )?;
                 }
                 Commands::ExportHtml {
@@ -9349,6 +9373,7 @@ async fn execute_cli(
                     show_timestamps,
                     no_cdns,
                     include_skills,
+                    include_secrets,
                     theme,
                     dry_run,
                     explain,
@@ -9368,6 +9393,7 @@ async fn execute_cli(
                         show_timestamps,
                         !no_cdns,
                         include_skills,
+                        include_secrets,
                         &theme,
                         dry_run,
                         explain,
@@ -114014,6 +114040,7 @@ fn run_export(
     clipboard: bool,
     include_tools: bool,
     include_skills: bool,
+    include_secrets: bool,
 ) -> CliResult<()> {
     use std::fs::File;
     use std::io::Write;
@@ -114168,6 +114195,10 @@ fn run_export(
         });
     }
 
+    let mut privacy = crate::export::ExportPrivacy::new(include_secrets);
+    privacy.redact_messages(&mut messages);
+    privacy.redact_optional_text(&mut session_title);
+
     if !include_skills {
         messages.retain(|msg| {
             let content = extract_text_content(msg);
@@ -114205,6 +114236,7 @@ fn run_export(
         }
     }
 
+    privacy.announce();
     let formatted = match format {
         ConvExportFormat::Markdown => {
             format_as_markdown(&messages, &session_title, session_start, include_tools)
@@ -114523,6 +114555,7 @@ fn run_export_html(
     show_timestamps: bool,
     enable_cdns: bool,
     include_skills: bool,
+    include_secrets: bool,
     theme: &str,
     dry_run: bool,
     explain: bool,
@@ -114850,6 +114883,12 @@ fn run_export_html(
         return Err(err);
     }
 
+    let mut privacy = crate::export::ExportPrivacy::new(include_secrets);
+    privacy.redact_messages(&mut raw_messages);
+    privacy.redact_optional_text(&mut session_title);
+    privacy.redact_optional_text(&mut workspace);
+    privacy.redact_optional_text(&mut agent_name);
+
     // Find title from first user message
     if session_title.is_none() {
         for msg in &raw_messages {
@@ -115121,7 +115160,8 @@ fn run_export_html(
                     "default_theme": theme
                 }
             },
-            "warnings": []
+            "warnings": [],
+            "privacy": privacy.metadata()
         });
         println!(
             "{}",
@@ -115139,7 +115179,8 @@ fn run_export_html(
             "output_path": output_path.display().to_string(),
             "messages": message_count,
             "encrypted": encrypt,
-            "estimated_size_bytes": estimated_size
+            "estimated_size_bytes": estimated_size,
+            "privacy": privacy.metadata()
         });
         println!(
             "{}",
@@ -115162,6 +115203,8 @@ fn run_export_html(
         show_timestamps,
         show_tool_calls: include_tools,
     };
+
+    privacy.announce();
 
     // --- Export ---
     let exporter = HtmlExporter::with_options(export_options);
@@ -115274,6 +115317,7 @@ fn run_export_html(
     if let Some(_fmt) = structured_format {
         let result = serde_json::json!({
             "success": true,
+            "privacy": privacy.metadata(),
             "exported": {
                 "session_path": session_path.display().to_string(),
                 "output_path": output_path.display().to_string(),
@@ -116302,6 +116346,7 @@ mod export_timestamp_tests {
             true,
             false,
             false,
+            false,
             "system",
             false,
             false,
@@ -116347,6 +116392,7 @@ mod export_timestamp_tests {
             false,
             true,
             true,
+            false,
             false,
             false,
             "system",
@@ -116468,6 +116514,7 @@ mod export_timestamp_tests {
             false,
             true,
             true,
+            false,
             false,
             false,
             "system",
@@ -117707,6 +117754,7 @@ mod indexed_conversation_fallback_tests {
             false, // clipboard
             false,
             true,
+            false, // include_secrets
         )
         .expect("run export");
 
@@ -117777,6 +117825,7 @@ mod indexed_conversation_fallback_tests {
             false, // clipboard
             false,
             true,
+            false, // include_secrets
         )
         .expect("export should prefer the local JSONL file over stale indexed content");
 
@@ -117857,6 +117906,7 @@ mod indexed_conversation_fallback_tests {
             true,
             true,
             false,
+            false,
             "system",
             false,
             false,
@@ -117907,6 +117957,7 @@ mod indexed_conversation_fallback_tests {
             true,
             true,
             false,
+            false,
             "system",
             false,
             false,
@@ -117956,6 +118007,7 @@ mod indexed_conversation_fallback_tests {
             false,
             true,
             true,
+            false,
             false,
             "system",
             false,
@@ -118330,6 +118382,7 @@ This is not JSONL.
             false, // clipboard
             false,
             true,
+            false, // include_secrets
         )
         .expect("export should fall back to indexed content when the local JSONL is invalid");
 
@@ -118400,6 +118453,7 @@ This should stay behind the indexed export.
             false, // clipboard
             false,
             true,
+            false, // include_secrets
         )
         .expect("export should prefer indexed content for local markdown-backed sessions");
 
@@ -118470,6 +118524,7 @@ This should stay behind the indexed export.
             false,
             true,
             true,
+            false,
             false,
             "system",
             false,
@@ -118550,6 +118605,7 @@ This should stay behind the indexed html export.
             false,
             true,
             true,
+            false,
             false,
             "system",
             false,
@@ -118868,6 +118924,7 @@ This should stay behind the indexed html export.
             true,
             true,
             false,
+            false,
             "system",
             false,
             false,
@@ -119007,6 +119064,7 @@ This should stay behind the indexed html export.
                 false,
                 true,
                 true,
+                false,
                 false,
                 "system",
                 false,
@@ -119183,6 +119241,7 @@ This should stay behind the indexed html export.
                 include_tools,
                 true,
                 true,
+                false,
                 false,
                 "system",
                 false,

@@ -164,12 +164,12 @@ fn timestamp_to_utc(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
 impl ExportModalState {
     /// Create new export modal state from a search hit and conversation view.
     pub fn from_hit(hit: &SearchHit, view: &ConversationView) -> Self {
-        let agent = if view.convo.agent_slug.trim().is_empty() {
+        let mut agent = if view.convo.agent_slug.trim().is_empty() {
             hit.agent.trim().to_string()
         } else {
             view.convo.agent_slug.trim().to_string()
         };
-        let workspace = view
+        let mut workspace = view
             .workspace
             .as_ref()
             .map(|ws| ws.path.display().to_string())
@@ -190,7 +190,7 @@ impl ExportModalState {
 
         // Prefer stable session metadata over first-message text so export titles and
         // filenames do not drift when the indexed conversation already has a real title.
-        let title_preview = view
+        let mut title_preview = view
             .convo
             .title
             .as_deref()
@@ -203,7 +203,7 @@ impl ExportModalState {
             })
             .or_else(|| {
                 view.messages.first().map(|m| {
-                    let content = m.content.trim();
+                    let content = crate::indexer::redact_secrets::redact_text(m.content.trim());
                     // Use char_indices to safely truncate at UTF-8 boundary (57 chars + "...")
                     if content.chars().count() > 60 {
                         let end_idx = content
@@ -219,6 +219,11 @@ impl ExportModalState {
             })
             .filter(|title| !title.trim().is_empty())
             .unwrap_or_else(|| "Untitled Session".to_string());
+
+        let mut privacy = crate::export::ExportPrivacy::new(false);
+        privacy.redact_text(&mut title_preview);
+        privacy.redact_text(&mut agent);
+        privacy.redact_text(&mut workspace);
 
         // Format date for filename
         let started_dt = started_at.and_then(timestamp_to_utc);
@@ -539,6 +544,26 @@ mod tests {
                 || state.filename_preview.contains("canonical"),
             "filename should use canonical workspace metadata"
         );
+    }
+
+    #[test]
+    fn export_redaction_tui_modal_default_filename_uses_safe_canonical_metadata() {
+        let mut hit = make_hit(None);
+        hit.title.clear();
+        let mut view = make_view(None, Some(1_700_000_000));
+        view.convo.title = Some("Session password=synthetic-export-title-84".into());
+        view.convo.workspace = Some(PathBuf::from("/tmp/password=synthetic-export-workspace-84"));
+        let state = ExportModalState::from_hit(&hit, &view);
+        assert!(state.title_preview.contains("[REDACTED]"));
+        for value in [state.title_preview, state.workspace, state.filename_preview] {
+            assert!(!value.contains("synthetic-export"));
+        }
+        view.convo.title = None;
+        view.messages[0].content = format!("{}password=synthetic-export-body-84", "hello ".repeat(7));
+        let state = ExportModalState::from_hit(&hit, &view);
+        assert!(state.title_preview.contains("[REDACTED]"));
+        assert!(!state.filename_preview.contains("synthetic-export"));
+        assert!(view.messages[0].content.contains("synthetic-export-body-84"));
     }
 
     #[test]

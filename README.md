@@ -367,6 +367,7 @@ Export conversations as styled, portable HTML files with optional encryption:
 - **Rich Styling**: Dark/light themes, syntax-highlighted code blocks, collapsible tool calls
 - **Print-Friendly**: Optimized print styles with page breaks and footers
 - **Searchable**: Built-in search functionality within the exported document
+- **Credential redaction**: HTML and generic conversation exports redact recognized credentials by default, including raw source files and archives indexed with redaction disabled. `--include-secrets` explicitly preserves source credentials and marks the output as sensitive. Encryption uses the same sharing policy.
 
 **TUI Usage**: Press `Ctrl+E` in the detail view to open the export modal, or `Ctrl+Shift+E` to export Markdown immediately with defaults. On the detail pane's Export tab, `e`/`h` open the HTML export modal and `m` runs the Markdown export.
 
@@ -377,6 +378,9 @@ cass export-html /path/to/session.jsonl
 
 # With encryption
 printf '%s\n' "secret" | cass export-html /path/to/session.jsonl --encrypt --password-stdin
+
+# Explicit raw-fidelity export (contains credentials; handle as sensitive)
+cass export-html /path/to/session.jsonl --include-secrets --json
 
 # Custom output location
 cass export-html session.jsonl --output-dir ~/exports --filename "my-session"
@@ -3368,6 +3372,18 @@ title, snippet and metadata blob before anything reaches SQLite or the lexical
 index, so search results, exports and robot output never repeat them. (The
 original session files and the raw-mirror blobs keep the raw text on the same
 disk; redaction protects the queryable surfaces, not disk-at-rest secrecy.)
+
+Conversation exports apply the same credential redactor independently of ingest
+settings, before rendering titles, messages, tool data and metadata. This also
+protects a direct export of a readable source file or an archive indexed with
+`CASS_INDEX_REDACTION=off`. Both `cass export` and `cass export-html` accept
+`--include-secrets` for an intentional raw-fidelity export; it does not recover
+credentials already removed from an archived record. The effective policy is
+reported on stderr, and HTML export JSON (including dry runs and explain plans)
+includes `privacy.{policy,redaction_applied,sensitive_output}`. An encrypted export
+also redacts by default; encryption alone does not opt into raw credentials.
+TUI HTML and Markdown exports, including suggested filenames, use the default
+redaction policy; intentional raw-fidelity exports use the CLI option.
 
 **What is recognized.** Thirteen pattern families: AWS access key IDs, AWS
 secret keys and session tokens in assignment context, GitHub tokens (classic and

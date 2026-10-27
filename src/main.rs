@@ -165,15 +165,7 @@ fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
         eprintln!("{}", err.message);
     } else if is_robot_mode_args() {
         // Wrap unstructured error for robot consumers.
-        let payload = serde_json::json!({
-            "error": {
-                "code": err.code,
-                "kind": err.kind,
-                "message": err.message,
-                "hint": err.hint,
-                "retryable": err.retryable,
-            }
-        });
+        let payload = err.json_envelope();
         eprintln!("{payload}");
     } else {
         // Human-readable output stays on stderr per Unix convention. The
@@ -346,14 +338,14 @@ fn main() -> anyhow::Result<()> {
             Ok(()) => Ok(()),
             Err(error) => {
                 let (code, kind, retryable) = logical_archive::classify_failure(&error);
-                let payload = serde_json::json!({
-                    "error": {
-                        "code": code,
-                        "kind": kind,
-                        "message": error.to_string(),
-                        "retryable": retryable
-                    }
-                });
+                let payload = coding_agent_search::CliError {
+                    code,
+                    kind,
+                    message: error.to_string(),
+                    hint: None,
+                    retryable,
+                }
+                .json_envelope();
                 eprintln!("{payload}");
                 std::process::exit(code);
             }

@@ -31519,7 +31519,7 @@ impl ConnectorKind {
             Self::Hermes => Box::new(franken_agent_detection::HermesConnector::new()),
             Self::Codebuff => Box::new(crate::connectors::codebuff::CodebuffConnector::new()),
             Self::PiDurable => Box::new(franken_agent_detection::PiDurableConnector::new()),
-            Self::Continue => Box::new(franken_agent_detection::ContinueConnector::new()),
+            Self::Continue => Box::new(crate::connectors::continue_dev::ContinueConnector::new()),
         }
     }
 }
@@ -73596,6 +73596,133 @@ c.close()
                 );
             }
         }
+    }
+
+    #[test]
+    #[serial]
+    fn continue_operational_routes_honor_ledger_admission_before_global_cutoff() {
+        use franken_agent_detection::connectors::SourceScanHooks;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("old.json");
+        fs::write(
+            &file,
+            serde_json::to_vec(&serde_json::json!({
+                "sessionId": "old",
+                "title": "Continue operational route",
+                "history": [{"message": {"role": "user", "content": "retry this question"}}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::File::open(&file)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(100))
+            .unwrap();
+        let _paths = unset_env_var("CASS_EXCLUDE_PATHS");
+        let _workspaces = unset_env_var("CASS_EXCLUDE_WORKSPACES");
+        let _sources = ignore_sources_config();
+        let configured_factory = configured_connector_factories()
+            .into_iter()
+            .find(|(name, _)| *name == "continue")
+            .unwrap()
+            .1;
+        let ctx = ScanContext::with_roots(
+            temp.path().join("data"),
+            vec![ScanRoot::local(temp.path().to_path_buf())],
+            Some(200_000),
+        );
+        for connector in [
+            configured_factory(),
+            ConnectorKind::Continue.create_connector(None),
+        ] {
+            let mut admitted = Vec::new();
+            let mut completed = Vec::new();
+            let mut conversations = Vec::new();
+            connector
+                .scan_with_source_boundaries(
+                    &ctx,
+                    &mut SourceScanHooks {
+                        should_scan_source: Some(&mut |source| {
+                            admitted.push(source.clone());
+                            true
+                        }),
+                        on_source_complete: Some(&mut |completion| {
+                            completed.push(completion.source.clone());
+                            Ok(())
+                        }),
+                    },
+                    &mut |conversation| {
+                        conversations.push(conversation);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(admitted.len(), 1);
+            assert_eq!(admitted[0].source_path, file);
+            assert_eq!(completed, admitted);
+            assert_eq!(conversations.len(), 1);
+            assert_eq!(conversations[0].external_id.as_deref(), Some("old"));
+            assert_eq!(conversations[0].messages[0].content, "retry this question");
+        }
+        assert_eq!(ctx.since_ts, Some(200_000));
+    }
+
+    #[test]
+    #[serial]
+    fn continue_operational_routes_refuse_incomplete_admitted_snapshots() {
+        use franken_agent_detection::connectors::SourceScanHooks;
+
+        let temp = TempDir::new().unwrap();
+        let invalid = temp.path().join("invalid.json");
+        fs::write(&invalid, b"{invalid").unwrap();
+        let _paths = unset_env_var("CASS_EXCLUDE_PATHS");
+        let _workspaces = unset_env_var("CASS_EXCLUDE_WORKSPACES");
+        let ctx = ScanContext::with_roots(
+            temp.path().join("data"),
+            vec![ScanRoot::local(temp.path().to_path_buf())],
+            None,
+        );
+        let connector = ConnectorKind::Continue.create_connector(None);
+        let error = connector
+            .scan_with_source_boundaries(
+                &ctx,
+                &mut SourceScanHooks {
+                    should_scan_source: Some(&mut |_| true),
+                    on_source_complete: Some(&mut |_| panic!("invalid snapshot completed")),
+                },
+                &mut |_| panic!("invalid snapshot emitted a conversation"),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("1 admitted snapshot(s) did not complete")
+        );
+        assert!(error.to_string().contains("invalid.json"));
+        connector
+            .scan_with_source_boundaries(
+                &ctx,
+                &mut SourceScanHooks {
+                    should_scan_source: Some(&mut |_| false),
+                    on_source_complete: Some(&mut |_| panic!("rejected snapshot completed")),
+                },
+                &mut |_| panic!("rejected snapshot emitted a conversation"),
+            )
+            .unwrap();
+        let _excluded = set_env_var("CASS_EXCLUDE_PATHS", invalid.to_string_lossy());
+        connector
+            .scan_with_source_boundaries(
+                &ctx,
+                &mut SourceScanHooks {
+                    should_scan_source: Some(&mut |_| panic!("excluded snapshot admitted")),
+                    on_source_complete: Some(&mut |_| panic!("excluded snapshot completed")),
+                },
+                &mut |_| panic!("excluded snapshot parsed"),
+            )
+            .unwrap();
+        assert_eq!(fs::read(&invalid).unwrap(), b"{invalid");
     }
 
     #[test]
