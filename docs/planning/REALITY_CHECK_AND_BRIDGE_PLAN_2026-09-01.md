@@ -1,4 +1,211 @@
-# Reality Check and Bridge Plan — refreshed 2026-10-27
+# Reality Check and Bridge Plan — refreshed 2026-10-28
+
+## Release qualification follow-up: 2026-10-28 (#537 / #530)
+
+**Release verdict: BLOCKED. No corrected release or release candidate was built
+or published in this follow-up.** The latest GitHub release remains
+[`v0.10.0`](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.10.0),
+published `2026-10-02T02:54:21Z`. There is no first released version containing
+the subsequent #530 corrections to recommend, and no justified release date.
+`release-bar-decision-hutyl` remains an unresolved owner decision; its proposed
+"no worse than v0.10.0" bar is not approval to remove prerequisites.
+
+This is an additive qualification and operator-guidance update. It supersedes
+the older assessment's uncertainty about the probed Linux executable's release
+provenance, and its description of `.84` / `.85` as still unimplemented. It does
+not supersede the existing release requirements or certify current source.
+No production code, dependency, test assertion, skip, scanner policy, or bead
+status is changed by this documentation update.
+
+### Identity and new evidence
+
+The reviewed source and tracker snapshot are `main` at
+`19207dcf912fb8d6e104116cde6976eeb701c1d4`. The issue discussions include
+[the Oct27 freshness report](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/537#issuecomment-6456648306),
+[the existing qualification follow-up](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/537#issuecomment-6460007754),
+and [the #530 correction history](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/530#issuecomment-6378296003).
+Already landed corrections include surplus-document refusal (`b605426e`), archive
+writer admission (`35fcb9d1`), append-safe targeted recovery (`bef5ae45`), and
+avoiding whole-history semantic preparation (`fbff882b`). Workspace exclusions
+and selective history retention are also implemented and tested in source; their
+presence on `main` does not make them available in v0.10.0.
+
+The actual published Linux amd64 archive was downloaded and matched its GitHub
+asset digest, `SHA256SUMS`, and release manifest:
+
+- Archive SHA-256: `638ea8a8a9023c2e046bf8868392e6191218b89cf006e81af3ca205b546c4681`.
+- Extracted executable SHA-256: `d221153d8e0a79ae37eb492855d32cd2aadb98e707c74c37445f779a46c626dd`.
+- Release source commit: `2bfe708d35734656f0d34eab112bf051e354519c`.
+
+The executable is byte-identical to the previously probed binary whose provenance
+was unknown. This establishes that executable's identity as the published Linux
+asset; its own `build_commit: unknown` is still not candidate source attestation.
+Its in-memory selftest succeeded without accessing an archive. Other platforms'
+listed digests were inspected, but their binaries were not downloaded or run.
+
+| Execution or check | Observed result | Evidence boundary |
+|---|---|---|
+| Published v0.10.0, isolated Claude JSONL, 40 conversations / 800 messages | Initial index exit 0, 5.393 s, kernel peak RSS 137,652 KiB; native status shows 800 canonical / live / checkpoint messages and matching completed fingerprints; unique tail search succeeds | Small released-binary baseline, not current-source or large-archive qualification |
+| Same baseline through the proposed qualification lane | `NO_VERDICT`: released JSON lacks `indexing_stats.deferred_active_sources` | Missing candidate evidence is not silently treated as zero deferred sources |
+| 31k / 1.71m synthetic released-binary baseline | Externally stopped with SIGKILL after 808.181 s when shared-host free space crossed the guard's 3 GiB threshold; kernel peak RSS 616,124 KiB; sampled logical reads 31,502,555,478 bytes | Initial full build incomplete; **NO_VERDICT**, not the reporter's incremental workload or a candidate pass |
+| Proposed qualification runner's own controls | 28 tests pass, including actual child timeout, memory-budget rejection, and process reaping | Tests the runner's evidence handling; does not execute the CASS Rust integration tests |
+| Proposed freshness change, pinned nightly rustfmt | Parse/format check exit 0; `git diff --check` exit 0 | No compiler, Clippy, or Rust runtime verdict |
+| Frozen proposed Rust files, pinned strict UBS with AST engine | Exit 1: 46 critical / 10,442 warning / 2,873 informational findings | Red; all 46 critical sites are unchanged baseline code, but the warning set is not fully dispositioned |
+| Frozen qualification runner and controls, pinned strict UBS | Exit 1: 0 critical / 2 warning / 162 informational findings | Red; narrow review found no control transfer in the flagged `finally` and confirmed `wait4` reaping, but no scanner-policy correction was qualified |
+| Required `scripts/gate.sh --docs-truth` with indexing, archive, privacy, robot, Pages and search integration targets | `STAGE=rch EXIT=127`; source/fmt/Clippy/test/golden/UBS terminal receipts missing | RCH is unavailable in this execution environment. **NO_VERDICT on current-source validation**, not a failing Rust test result |
+
+The full-size fixture has exactly 31,000 conversations, 1,710,000 messages,
+1,397,449,788 source bytes, and one 32,768-message conversation. Its inventory
+SHA-256 is `4289a86d2fcb17dece7a711bd6eae7a3428774bf5d912cf098246fc0526d91b0`.
+It contains mixed natural-language/code sizes and dates, but only Claude JSONL;
+it does not reproduce the reporter's provider mix, shared databases, existing
+canonical size, or raw-mirror history. The binary's actual exclusion event confirms
+exactly one enabled connector; the retained invocation environment supplies its
+explicit synthetic Claude root. The process used a 6 GiB RSS
+observation limit and 1,200-second initial-build deadline; resource readings are
+for the measured child, not a hard process-tree/cgroup memory proof. Sampled
+`/proc` I/O counters are lower bounds, and cache state was not controlled.
+The scale run started before the runner's final self-identity check was added;
+its retained raw observations cannot qualify the final runner. Concurrent writers,
+incremental passes, crash recovery and candidate search continuity did not run
+in that baseline lane.
+
+The disk guard verified the executable and process identity (PID 32270) before
+signaling only that owned synthetic benchmark process group at
+`2026-10-28T20:31:45Z`. Its observation was 3,114,962,944 free bytes against a
+3,221,225,472-byte threshold. The raw runner receipt is preserved as
+`indexing_verdict: FAIL`, `initial: exit -9`, `release_verdict: NO_VERDICT`; the
+known external resource stop means there is no completed product qualification
+verdict. It is neither an application crash diagnosis nor a reproduced scheduled
+incremental timeout. The whole shared-host free-space decline is not attributed
+to CASS. The measured CASS child's sampled I/O also records 310,702,080 physical
+read bytes and 8,939,986,944 write bytes; these are incomplete-run observations,
+not a completed build cost or an incremental budget.
+After the stop, all 31,000 original source files were independently checked against
+the retained inventory: sizes and SHA-256 values were unchanged. The fixture's
+data directory occupied 11,622,572,032 allocated bytes at that observation. This
+establishes source preservation and a file-footprint observation, not canonical
+integrity, cleanup completion, or a safe steady-state storage bound.
+
+### Successful indexing with a stale timestamp
+
+`persist_final_index_run_metadata_with_writer` deliberately preserves a successful
+indexing result when the final metadata write fails, logging the failure instead
+of discarding already durable indexing work. Consequently, exit 0 with an
+unchanged `last_indexed_at` is a real possible outcome. This explains a class of
+the reported symptom; it is **not a demonstrated root cause on the reporter's
+host**. The two metadata writes are not atomic: a scan marker can commit before
+the indexed marker fails, and a close failure need not imply rollback.
+
+A focused, uncommitted correction has been prepared to expose an optional
+`indexing_stats.freshness_metadata` receipt with `status: persisted | deferred`,
+the attempted indexed timestamp, and the confirmed durable scan/indexed values.
+On failure, confirmed values are null: they are unconfirmed, not proof of absence
+or rollback. A run with no write attempt has no receipt. The receipt is cleared
+when a reused progress object starts another run. This preserves the existing
+durable-index success policy while making monitoring distinguish a completed
+indexing operation from confirmed freshness persistence.
+
+Prepared Rust controls cover actual read-only write refusal, partial metadata
+writes and successful retry, denied archive-writer admission, reuse of progress
+across runs, two unchanged CLI passes, canonical-only force rebuilds, and held-open
+source deferral followed by catch-up. They have **not been compiled or executed**
+here. Neither this code nor the new runner is committed by this update: the
+required current-source gate is unavailable and their strict scans are red.
+
+Keep the existing meanings distinct: `last_scan_ts` can remain unchanged when
+sources are deferred; canonical-only rebuilds must not imply a source scan; empty
+watch callbacks must not manufacture freshness. A fresh timestamp also does not
+prove every active source was ingested. On the reviewed source, reusing an
+`--idempotency-key` can replay a cached successful result instead of retrying a
+deferred metadata write; it is not a recovery mechanism. The reporter's examples
+do not establish that this option was involved.
+
+### Requirements that still block release
+
+These are acceptance obligations, not a request to remove safeguards:
+
+| Requirement / owner | Outstanding acceptance |
+|---|---|
+| Exact-source gate: `55wh0`, `5v57k`, `yrjna`, `.25` | Run the complete required RCH gate on one frozen source identity with positive test counts and terminal receipts; resolve real failures and qualify any justified scanner correction with controls. The prior retained full selected run reports 12 HNSW failures and 106 critical / 20,722 UBS warnings; those are prior-snapshot findings, not new executions or directly comparable to this two-file scan. |
+| Indexing cost and integrity: `3zq55`, `irqgt`, `p3gh0`, `.46`, `.72`, `iify0`, `.24` | On a current-source release candidate, run the full 31k / 1.71m archive, unchanged passes, append, and concurrent writer cases. Measure end-to-end RSS, I/O, disk growth and elapsed time, including startup/finalization; prove no duplicate/missing messages, no unnecessary rebuild, honest active-source deferral and eventual catch-up. The earlier 31k-conversation incremental fixture contained 310k messages, so it is not a 1.71m-message qualification. |
+| Lexical generation and recovery: #530, `h3jnv`, `lndgg`, `.48` | Preserve equality between canonical snapshot fingerprints, checkpoint counts and the published live generation; refuse surplus/stale generations. Kill at the staged commit/checkpoint gap, resume without source loss or duplicate publication, and keep the previously published generation searchable during rebuild. All of this requires actual concurrent execution, not merely test definitions. |
+| Native logical-archive recovery: `svhcf`, `p94yt`, `.34` | Run the original populated probes without their current skips on approved, uniformly pinned released dependencies. `publication_materializes_wal_rows_without_borrowing_replay_sidecars` is blocked by the 0.4.12 read-only freelist-integrity false rejection; `explicit_or_unattested_collations_keep_binary_order_and_verify` is blocked by PK/collation introspection. Preserve WAL materialization, integrity checks, no-clobber publication and source immutability. Latest upstream release was freshly checked as v0.4.12; the known upstream main fix is not yet in an adoptable tagged update. |
+| Semantic/native ANN: `of9i7`, `ds7uy.3.3`, `fdvur` | Resolve the identity-complete FSVI v2/native-reader mismatch and qualify actual owner-supported incremental graph updates and tombstone admission. Do not downgrade fixtures, drop identity checks, use private upstream layout, or call a full rebuild incremental. |
+| Privacy and robot errors: `.84`, `.85`, `.23` | The shared export privacy boundary and shared archive error envelope are implemented. Retained native evidence for compile inputs verified identical at `870797c0` includes five CLI privacy controls, a decrypted encrypted-payload check, source/DB/WAL immutability controls, and the archive error negative. The later rerun is self-verification, not a new full-gate pass. These fixes remain gate-blocked rather than unimplemented. Requalify the exact candidate, raw/canonical HTML and generic exports, TUI policy parity and explicit sensitive-output receipts; `.23` separately retains browser/publication recovery acceptance. |
+| Historical archive and platform acceptance: `.2`, `.4`, `.41`, `.45`, `.47`, `scohn`, `aegfi`, `yviq2` | Obtain the required damaged/historical archive, orphan/legacy-FTS writer-reader, and Windows writer evidence; finish DSR cross-platform build/install/artifact acceptance. DSR is not available here. The previously recorded macOS disk-floor failure is historical evidence, not a fresh fleet-health measurement. |
+
+The durable release graph still lists nonclosed blocking dependencies of `yrjna`:
+`55wh0`, `5v57k`, `irqgt`, `p3gh0`. The `.25` acceptance bead additionally retains
+`.11`, `.2`, `.20`, `.22`, `.23`, `.24`, `.4`, `.41`, `.45`, `.47`, `.84`, `aegfi`,
+`iify0`, `scohn`, and `yviq2`. Retrieval, answer-pack, terminal, privacy and sync
+acceptance cannot be silently reclassified as optional to ship this fix.
+The `yviq2` title is stale about missing configuration: the DSR project exists;
+its remaining acceptance is the blocker. GitHub Actions requirements in historical
+text are superseded by the permanent Actions ban. The FAD git dependency blocks
+crates.io publication of this manifest, not by itself the locked-source GitHub
+binary channel. Neither distinction clears the actual release gates.
+
+### Supported guidance while deployments require released binaries
+
+- There is no released upgrade containing these corrections yet. Do not recommend
+  a main-branch build, an unqualified candidate, a fabricated version number, or a
+  release date to a released-only deployment.
+- Serialize scheduled indexing so one invocation owns the work. Provide a quiet
+  maintenance window long enough for one complete pass; avoid a loop of forced
+  rebuilds killed at every scheduled deadline. This is operational mitigation,
+  not a claim that v0.10.0 can meet the reporter's 20-minute window.
+- `CASS_AUTO_REFRESH=0` and lexical search with `--no-maintenance` can stop
+  read-triggered maintenance while investigating; they do not disable OS-scheduled
+  index jobs. For example, `CASS_AUTO_REFRESH=0 cass search '<known recent term>'
+  --mode lexical --no-maintenance --robot --robot-meta` observes lexical coverage
+  without establishing canonical archive integrity.
+- Retain stdout JSON, stderr, exit status, start/end time, `status` / `health`, the
+  JSON `last_indexed_at` and its age, and searches for known recent messages.
+  Compare the timestamp across invocations. Exit 0 and a convenience freshness
+  boolean alone do not establish successful catch-up. The new deferred-source and
+  metadata receipts described above are unavailable in v0.10.0.
+- v0.10.0 supports `cass forget --source-glob '<reviewed-glob>' --json` to preview
+  deletion selection, followed by `--apply` only after scope review and a verified
+  backup. Preview does not apply the requested deletions, but the tag opens the
+  archive through the ordinary writable storage opener; do not describe it as a
+  guaranteed mutation-free inspection. Glob matching crosses directories, and
+  shared stores cannot be separated into individual workspaces by a file glob.
+  This removes CASS history, not source files. Universal workspace exclusion and
+  workspace/age-selective forgetting on main are not released options. Apply can
+  rebuild derived indexes, and a later change to a shared source can reintroduce
+  its forgotten conversations unless the supported source scope is excluded.
+- `CASS_EXCLUDE_PATHS` in v0.10.0 applies to Claude, Codex and Pi, not every
+  connector. Validate the installed provider's supported scope before relying on
+  it to prevent re-ingestion of forgotten history.
+- `cass mirror prune --older-than 30d --json` previews eligible raw-mirror removal;
+  use its provider/source-path selectors and inspect the result before `--apply`.
+  Do not prune the only surviving evidence needed for recovery. Raw-mirror
+  retention is separate from canonical history and lexical freshness. Disabling
+  new mirror capture reduces recoverability and is not a general indexing fix.
+- The demonstrated default raw-source export privacy defect remains in v0.10.0.
+  Keep its HTML/generic exports private until contents, titles, filenames and
+  receipts have been inspected and redacted in a separate sharing copy. Index-time
+  redaction and encryption do not make a secret-bearing exported payload safe to
+  share. Preserve the original source evidence.
+- For suspected corruption, preserve a consistent archive backup including
+  committed WAL and original sources; use the supported `cass doctor check
+  --json`, `cass doctor repair --dry-run --json`, and backup list/verify/restore
+  rehearsal workflow before approving repairs. Do not hand-delete DB, lexical,
+  mirror, lock, WAL or SHM files. Avoid stock `sqlite3` against the live v0.10.0
+  archive: the known old-engine interoperability failure can leave later writes
+  refusing admission. Inspect a consistent copy when a stock-engine comparison
+  is needed, including for stock `sqlite3 -readonly`; it is not a substitute for
+  native recovery acceptance. v0.10.0's ordinary native read-only opener can also
+  perform recovery writes, so deeper doctor diagnostics are not promised to be
+  mutation-free. A large archive can return integrity unverified/deferred; open
+  success and row counts are not an integrity certificate.
+
+Release delivery can resume after the applicable requirements above have positive
+exact-candidate evidence and the DSR artifacts pass checksum, identity, installation
+and platform smoke verification. Then name the actual first tag containing the
+fixes and provide upgrade/rollback instructions tied to those artifacts. This
+follow-up records no permission to lower that bar.
 
 ## Assessment: 2026-10-27 (QuietPond)
 
