@@ -285,7 +285,7 @@ fn export_redaction_covers_tool_arguments_results_and_nested_metadata()
             {"type":"tool_use","id":"call-84","name":"Read","input":{"path":"src/lib.rs","authorization":EXPORT_PRIVACY_SECRET}}
         ]},"metadata":{"nested":{"passphrase":EXPORT_PRIVACY_SECRET},"token_count":42}}),
         serde_json::json!({"type":"user","message":{"role":"user","content":[
-            {"type":"tool_result","tool_use_id":"call-84","content":format!("tool-result-kept password={EXPORT_PRIVACY_SECRET}")}
+            {"type":"tool_result","tool_use_id":"call-84","content":format!("tool-result-kept password={EXPORT_PRIVACY_SECRET} <script>synthetic_tool_markup()</script>")}
         ]}}),
     ];
     let mut bytes = Vec::new();
@@ -310,8 +310,19 @@ fn export_redaction_covers_tool_arguments_results_and_nested_metadata()
                 String::from_utf8_lossy(&output.stderr)
             );
             let exported = String::from_utf8(output.stdout)?;
-            assert_eq!(exported.contains(EXPORT_PRIVACY_SECRET), include_secrets);
-            assert!(exported.contains("tool-result-kept"));
+            assert_eq!(
+                exported.contains(EXPORT_PRIVACY_SECRET),
+                include_secrets,
+                "{format}, include_secrets={include_secrets}"
+            );
+            assert!(
+                exported.contains("tool-result-kept"),
+                "{format}, include_secrets={include_secrets} lost tool output"
+            );
+            if format == "html" {
+                assert!(!exported.contains("<script>synthetic_tool_markup()</script>"));
+                assert!(exported.contains("&lt;script&gt;synthetic_tool_markup()&lt;/script&gt;"));
+            }
             if format == "json" {
                 let messages: Value = serde_json::from_str(&exported)?;
                 assert_eq!(messages[1]["metadata"]["token_count"], 42);
@@ -322,6 +333,19 @@ fn export_redaction_covers_tool_arguments_results_and_nested_metadata()
         assert_eq!(html.contains(EXPORT_PRIVACY_SECRET), include_secrets);
         assert!(html.contains("tool-result-kept"));
         assert!(html.contains("src/lib.rs"));
+        assert!(!html.contains("<script>synthetic_tool_markup()</script>"));
+    }
+    for format in ["markdown", "text", "html"] {
+        let output = export_privacy_command(root.path())
+            .arg("export")
+            .arg(&session)
+            .args(["--format", format])
+            .output()?;
+        assert!(output.status.success());
+        assert!(
+            !String::from_utf8(output.stdout)?.contains("tool-result-kept"),
+            "{format} must require --include-tools for structured results"
+        );
     }
     assert_eq!(fs::read(&session)?, bytes);
     Ok(())

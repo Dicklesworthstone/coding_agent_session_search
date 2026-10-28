@@ -120266,6 +120266,13 @@ fn format_as_text(messages: &[serde_json::Value], include_tools: bool) -> String
                     {
                         let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                         text.push_str(&format!("[Tool: {}]\n", name));
+                    } else if block.get("type").and_then(serde_json::Value::as_str)
+                        == Some("tool_result")
+                        && let Some(output) = block.get("content")
+                    {
+                        text.push_str("[Tool Result]\n");
+                        text.push_str(&stringify_tool_value(output));
+                        text.push_str("\n\n");
                     }
                 }
             }
@@ -120366,6 +120373,15 @@ fn format_as_html(
             if let Some(arr) = content_val.and_then(|c| c.as_array()) {
                 let mut tool_badges = Vec::new();
                 for block in arr {
+                    if block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
+                        && let Some(output) = block.get("content")
+                    {
+                        html.push_str(
+                            "<div class=\"tool-result\"><strong>Tool Result:</strong><pre>",
+                        );
+                        html.push_str(&html_escape(&stringify_tool_value(output)));
+                        html.push_str("</pre></div>");
+                    }
                     if let Some("tool_use") = block.get("type").and_then(|t| t.as_str()) {
                         let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                         let icon = match name.to_lowercase().as_str() {
