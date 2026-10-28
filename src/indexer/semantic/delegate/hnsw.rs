@@ -3,7 +3,8 @@
 //! backfill/rebuild/recovery. The caller still owns canonical source selection.
 
 use super::*;
-use frankensearch::index::{HnswAppendDisposition, HnswIndex};
+use frankensearch::index::HnswIndex;
+use frankensearch::index::hnsw::HnswAppendDisposition;
 
 pub(super) fn run(
     indexer: &SemanticIndexer,
