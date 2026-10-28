@@ -236,7 +236,7 @@ fn emit_toml(update: &mut impl FnMut(&[u8]), value: &Value) {
             update(b"t");
             update(&(values.len() as u64).to_le_bytes());
             let mut entries: Vec<_> = values.iter().collect();
-            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_unstable_by_key(|(name, _)| *name);
             for (name, value) in entries {
                 emit_field(update, name.as_bytes());
                 emit_toml(update, value);

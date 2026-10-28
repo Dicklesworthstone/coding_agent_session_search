@@ -318,8 +318,7 @@ fn export_redaction_covers_tool_arguments_results_and_nested_metadata()
                 assert_eq!(messages[1]["message"]["content"][0]["id"], "call-84");
             }
         }
-        let (_, html) =
-            export_privacy_html(root.path(), &session, None, include_secrets, false)?;
+        let (_, html) = export_privacy_html(root.path(), &session, None, include_secrets, false)?;
         assert_eq!(html.contains(EXPORT_PRIVACY_SECRET), include_secrets);
         assert!(html.contains("tool-result-kept"));
         assert!(html.contains("src/lib.rs"));

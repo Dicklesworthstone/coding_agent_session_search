@@ -559,11 +559,16 @@ mod tests {
             assert!(!value.contains("synthetic-export"));
         }
         view.convo.title = None;
-        view.messages[0].content = format!("{}password=synthetic-export-body-84", "hello ".repeat(7));
+        view.messages[0].content =
+            format!("{}password=synthetic-export-body-84", "hello ".repeat(7));
         let state = ExportModalState::from_hit(&hit, &view);
         assert!(state.title_preview.contains("[REDACTED]"));
         assert!(!state.filename_preview.contains("synthetic-export"));
-        assert!(view.messages[0].content.contains("synthetic-export-body-84"));
+        assert!(
+            view.messages[0]
+                .content
+                .contains("synthetic-export-body-84")
+        );
     }
 
     #[test]

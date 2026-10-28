@@ -11081,9 +11081,7 @@ impl CassApp {
             smart_truncate(&crate::indexer::redact_secrets::redact_text(title), 60)
         } else {
             search_hit_snippet_fallback_text_opt(hit)
-                .map(|text| {
-                    smart_truncate(&crate::indexer::redact_secrets::redact_text(text), 60)
-                })
+                .map(|text| smart_truncate(&crate::indexer::redact_secrets::redact_text(text), 60))
                 .unwrap_or_else(|| "Untitled Session".to_string())
         };
         let created_date = hit
