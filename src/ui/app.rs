@@ -31267,7 +31267,7 @@ mod tests {
     fn export_redaction_tui_html_and_markdown_keep_raw_source_credentials_private() {
         let temp = tempfile::TempDir::new().expect("isolated TUI export");
         let session = temp.path().join("privacy.jsonl");
-        let secret = "synthetic-tui-export-credential-84";
+        let secret = "synthetic-tui-export-credential-84"; // ubs:ignore[rust.security.hardcoded-secrets] — Synthetic regression sentinel, never an authentication credential.
         let title = format!("Title password={secret}");
         let events = [
             serde_json::json!({"role":"user","content":"ordinary-kept-marker café 界"}),

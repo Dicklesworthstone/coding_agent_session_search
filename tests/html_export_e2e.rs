@@ -72,7 +72,7 @@ fn count_pattern(html: &str, pattern: &str) -> usize {
     re.find_iter(html).count()
 }
 
-const EXPORT_PRIVACY_SECRET: &str = "synthetic-export-credential-a81b4e9d";
+const EXPORT_PRIVACY_SECRET: &str = "synthetic-export-credential-a81b4e9d"; // ubs:ignore[rust.security.hardcoded-secrets] — Synthetic regression sentinel, never an authentication credential.
 
 fn export_privacy_command(root: &Path) -> Command {
     let mut cmd = base_cmd();
