@@ -73611,6 +73611,7 @@ c.close()
             serde_json::to_vec(&serde_json::json!({
                 "sessionId": "old",
                 "title": "Continue operational route",
+                "workspaceDirectory": "/synthetic/continue",
                 "history": [{"message": {"role": "user", "content": "retry this question"}}]
             }))
             .unwrap(),
