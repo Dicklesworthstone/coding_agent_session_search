@@ -101,6 +101,287 @@ fn db_digest(data_dir: &Path) -> blake3::Hash {
     blake3::hash(&std::fs::read(data_dir.join("agent_search.db")).expect("archive bytes"))
 }
 
+fn configure_remote(home: &Path, remote_path: &str) -> std::path::PathBuf {
+    use coding_agent_search::sources::config::{SourceDefinition, SourcesConfig};
+    let config_dir = home.join("xdg-config/cass");
+    std::fs::create_dir_all(&config_dir).expect("config directory");
+    let mut source = SourceDefinition::ssh("guide-remote", "fixture.invalid");
+    source.paths = vec![remote_path.into()];
+    let config = SourcesConfig {
+        sources: vec![source],
+        ..Default::default()
+    };
+    let path = config_dir.join("sources.toml");
+    std::fs::write(&path, toml::to_string(&config).expect("source TOML"))
+        .expect("source configuration");
+    path
+}
+
+fn onboard(home: &Path, data_dir: &Path, db: &Path, confirm: bool) -> Value {
+    let (_, plan) = run(
+        cass(home)
+            .env_remove("CASS_IGNORE_SOURCES_CONFIG")
+            .args(["guide", "onboard-source", "--json"])
+            .arg("--db")
+            .arg(db),
+        data_dir,
+    );
+    let privacy = plan["plan"]["privacy_tier"].as_str().expect("privacy");
+    let cost = plan["plan"]["cost_risk"]["risk_level"]
+        .as_str()
+        .expect("cost");
+    let mut command = cass(home);
+    command
+        .env_remove("CASS_IGNORE_SOURCES_CONFIG")
+        // Any SSH/rsync invocation would fail: onboarding consumes staged files.
+        .env("PATH", home.join("empty-path"))
+        .args([
+            "guide",
+            "onboard-source",
+            "--apply",
+            "--confirm-fact",
+            "sources_config_writable",
+            "--accept-privacy-tier",
+            privacy,
+            "--accept-cost-risk",
+            cost,
+            "--confirm-stop-conditions-clear",
+            "--json",
+        ])
+        .arg("--db")
+        .arg(db);
+    if confirm {
+        command.args(["--confirm-step", "3"]);
+    }
+    run(&mut command, data_dir).1
+}
+
+#[test]
+fn live_onboarding_indexes_a_staged_remote_only_after_explicit_confirmation() {
+    let home = tempfile::tempdir().expect("home");
+    let data_dir = home.path().join("data with spaces");
+    let db = home.path().join("selected archive.db");
+    let config = configure_remote(home.path(), "~/.codex");
+    let mirror = data_dir.join("remotes/guide-remote/mirror").join(
+        coding_agent_search::sources::sync::path_to_safe_dirname("~/.codex"),
+    );
+    util::seed_codex_session(&mirror, "rollout-guide-remote.jsonl", PRIVATE_BODY, true);
+    let config_before = std::fs::read(&config).expect("config bytes");
+    let unconfirmed = onboard(home.path(), &data_dir, &db, false);
+    let preview = step(&unconfirmed, "sources.dry-sync");
+    assert_eq!(preview["proof_gate"]["result"], "passed", "{unconfirmed}");
+    assert_eq!(preview["observation"]["transport_started"], false);
+    assert_eq!(preview["observation"]["sources_registered"], false);
+    assert_eq!(
+        preview["environment"]["CASS_DATA_DIR"],
+        data_dir.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        step(&unconfirmed, "index.incremental")["result"],
+        "awaiting-confirmation"
+    );
+    assert_eq!(unconfirmed["execution"]["attempted_mutation_count"], 0);
+    assert!(!db.exists());
+
+    let output = onboard(home.path(), &data_dir, &db, true);
+    let indexed = step(&output, "index.incremental");
+    assert_eq!(indexed["result"], "executed", "{output}");
+    assert_eq!(indexed["proof_gate"]["result"], "passed");
+    assert_eq!(indexed["observation"]["conversations"], 1);
+    assert_eq!(indexed["observation"]["lexical_ready"], true);
+    assert_eq!(indexed["observation"]["source_scan_fresh"], true);
+    assert_eq!(indexed["execution_scope"]["remote_sync"], false);
+    assert_eq!(output["execution"]["applied_mutation_count"], 1);
+    assert_eq!(output["mutation_contract"]["mutates_db"], true);
+    assert_eq!(output["mutation_contract"]["touches_network"], false);
+    assert_eq!(std::fs::read(&config).expect("config after"), config_before);
+    assert!(!data_dir.join("agent_search.db").exists());
+    assert!(!output.to_string().contains(PRIVATE_BODY));
+    let (success, hits) = run_on_archive(
+        home.path(),
+        &data_dir,
+        &db,
+        &[
+            "search",
+            PRIVATE_BODY,
+            "--mode",
+            "lexical",
+            "--source",
+            "guide-remote",
+            "--json",
+        ],
+    );
+    assert!(success, "{hits}");
+    assert!(
+        hits["hits"].as_array().is_some_and(|hits| !hits.is_empty()),
+        "{hits}"
+    );
+}
+
+#[test]
+fn live_onboarding_refuses_missing_or_invalid_config_and_unstaged_mirrors() {
+    for scenario in ["missing-config", "invalid-path", "missing-mirror"] {
+        let home = tempfile::tempdir().expect("home");
+        let data_dir = home.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data directory");
+        if scenario != "missing-config" {
+            configure_remote(
+                home.path(),
+                if scenario == "invalid-path" {
+                    ""
+                } else {
+                    "~/.codex"
+                },
+            );
+        }
+        let db = data_dir.join("agent_search.db");
+        let output = onboard(home.path(), &data_dir, &db, true);
+        let preview = step(&output, "sources.dry-sync");
+        assert_eq!(
+            preview["proof_gate"]["result"],
+            if scenario == "missing-mirror" {
+                "passed"
+            } else {
+                "failed"
+            },
+            "{scenario}: {output}"
+        );
+        assert_ne!(
+            step(&output, "index.incremental")["result"],
+            "executed",
+            "{output}"
+        );
+        assert_eq!(
+            output["execution"]["attempted_mutation_count"], 0,
+            "{output}"
+        );
+        assert!(!db.exists());
+    }
+}
+
+#[test]
+fn live_onboarding_preserves_the_archive_when_another_indexer_holds_the_lock() {
+    let home = tempfile::tempdir().expect("home");
+    let data_dir = home.path().join("data");
+    seed_archive(home.path(), &data_dir);
+    configure_remote(home.path(), "~/.codex");
+    let mirror = data_dir.join("remotes/guide-remote/mirror").join(
+        coding_agent_search::sources::sync::path_to_safe_dirname("~/.codex"),
+    );
+    util::seed_codex_session(
+        &mirror,
+        "rollout-guide-locked.jsonl",
+        "guidependingremote",
+        true,
+    );
+    let before = db_digest(&data_dir);
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(data_dir.join("index-run.lock"))
+        .expect("existing index lock");
+    fs2::FileExt::try_lock_exclusive(&holder).expect("hold actual index lock");
+    let output = onboard(
+        home.path(),
+        &data_dir,
+        &data_dir.join("agent_search.db"),
+        true,
+    );
+    let indexed = step(&output, "index.incremental");
+    assert_eq!(indexed["result"], "failed", "{output}");
+    assert_eq!(indexed["observation"]["index_busy"], true);
+    assert_eq!(indexed["observation"]["exit_code"], 7);
+    assert_eq!(output["execution"]["applied_mutation_count"], 0);
+    assert_eq!(db_digest(&data_dir), before);
+    fs2::FileExt::unlock(&holder).expect("release actual index lock");
+}
+
+#[test]
+fn live_onboarding_reports_partial_progress_when_a_session_has_an_active_writer() {
+    let home = tempfile::tempdir().expect("home");
+    let data_dir = home.path().join("data");
+    let db = data_dir.join("agent_search.db");
+    configure_remote(home.path(), "~/.codex");
+    let mirror = data_dir.join("remotes/guide-remote/mirror").join(
+        coding_agent_search::sources::sync::path_to_safe_dirname("~/.codex"),
+    );
+    util::seed_codex_session(
+        &mirror,
+        "rollout-available.jsonl",
+        "guideavailablemarker",
+        true,
+    );
+    // Mirrors are intentionally immutable snapshots for the active-source
+    // policy. Hold a real local writer while the staged remote stays readable.
+    let local = home.path().join(".codex");
+    util::seed_codex_session(&local, "rollout-active.jsonl", "guideactivemarker", true);
+    let active = local.join("sessions/2026/04/23/rollout-active.jsonl");
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&active)
+        .expect("active session");
+    fs2::FileExt::try_lock_exclusive(&holder).expect("active writer lock");
+    let output = onboard(home.path(), &data_dir, &db, true);
+    let indexed = step(&output, "index.incremental");
+    assert_eq!(indexed["result"], "failed", "{output}");
+    assert_eq!(indexed["mutation_started"], true);
+    assert_eq!(indexed["observation"]["deferred_active_sources"], 1);
+    assert_eq!(indexed["observation"]["state_may_have_changed"], true);
+    assert_eq!(output["execution"]["applied_mutation_count"], 0);
+    assert_eq!(output["mutation_contract"]["read_only"], false);
+    let (_, status) = run_on_archive(home.path(), &data_dir, &db, &["status", "--json"]);
+    assert_eq!(status["database"]["conversations"], 1, "{status}");
+    let (success, hits) = run_on_archive(
+        home.path(),
+        &data_dir,
+        &db,
+        &[
+            "search",
+            "guideavailablemarker",
+            "--mode",
+            "lexical",
+            "--json",
+        ],
+    );
+    assert!(success, "{hits}");
+    assert!(hits["hits"].as_array().is_some_and(|hits| !hits.is_empty()));
+    fs2::FileExt::unlock(&holder).expect("release active writer lock");
+    drop(holder);
+    let retried = onboard(home.path(), &data_dir, &db, true);
+    assert_eq!(
+        step(&retried, "index.incremental")["result"],
+        "executed",
+        "{retried}"
+    );
+    assert_eq!(
+        step(&retried, "index.incremental")["observation"]["conversations"],
+        2
+    );
+    let retry_counts = &step(&retried, "index.incremental")["observation"]["index_observations"];
+    assert_eq!(retry_counts["conversations"], 1);
+    let (success, active_hits) = run_on_archive(
+        home.path(),
+        &data_dir,
+        &db,
+        &["search", "guideactivemarker", "--mode", "lexical", "--json"],
+    );
+    assert!(success, "{active_hits}");
+    assert!(
+        active_hits["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty())
+    );
+    let no_op = onboard(home.path(), &data_dir, &db, true);
+    let indexed = step(&no_op, "index.incremental");
+    assert_eq!(indexed["result"], "executed", "{no_op}");
+    assert_eq!(indexed["observation"]["conversations"], 2);
+    assert_eq!(
+        indexed["observation"]["index_observations"]["conversations"],
+        0
+    );
+}
+
 #[test]
 fn live_missing_archive_fails_readiness_without_creating_an_archive() {
     let home = tempfile::tempdir().expect("home");

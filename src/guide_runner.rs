@@ -52,6 +52,8 @@ enum Adapter {
     KeyPolicy,
     SupportBundle,
     LexicalRepair,
+    SourcesDrySync,
+    IncrementalIndex,
     ObservationOnly,
 }
 
@@ -124,12 +126,12 @@ const ALLOWLIST: &[AllowedCommand] = &[
     AllowedCommand {
         id: "sources.dry-sync",
         mutation_class: "read-only-proof",
-        adapter: Adapter::ObservationOnly,
+        adapter: Adapter::SourcesDrySync,
     },
     AllowedCommand {
         id: "index.incremental",
         mutation_class: "index-mutation",
-        adapter: Adapter::ObservationOnly,
+        adapter: Adapter::IncrementalIndex,
     },
     AllowedCommand {
         id: "export.confirm-key-policy",
@@ -247,6 +249,24 @@ fn allowlisted_argv(
             "--no-progress-events",
             "--json",
         ],
+        Adapter::SourcesDrySync => vec![
+            "cass",
+            "sources",
+            "sync",
+            "--dry-run",
+            "--no-index",
+            "--json",
+        ],
+        Adapter::IncrementalIndex => vec![
+            "cass",
+            "index",
+            "--data-dir",
+            data_dir,
+            "--db",
+            db,
+            "--no-progress-events",
+            "--json",
+        ],
         Adapter::ObservationOnly => return None,
     };
     let tokens = argv.into_iter().map(str::to_string).collect::<Vec<_>>();
@@ -343,6 +363,9 @@ fn evaluate_read_only_proof(
     cost_accepted: bool,
     deadline: Instant,
 ) -> ProofResult {
+    if request.source_kind != "fixture" && command.adapter == Adapter::SourcesDrySync {
+        return evaluate_sources_dry_sync(command, request, deadline);
+    }
     if request.source_kind != "fixture"
         && matches!(
             command.adapter,
@@ -441,6 +464,8 @@ fn evaluate_read_only_proof(
         Adapter::SearchCoverage
         | Adapter::SupportBundle
         | Adapter::LexicalRepair
+        | Adapter::SourcesDrySync
+        | Adapter::IncrementalIndex
         | Adapter::ObservationOnly => ProofResult {
             result: "not-run",
             observation: None,
@@ -476,20 +501,21 @@ impl CommandFailure {
 /// Run the installed binary, never another `cass` selected by PATH. The shared
 /// supervisor bounds both captured streams and terminates timed-out children.
 fn run_bounded_cass(argv: &[String], timeout: Duration) -> Result<Output, CommandFailure> {
-    run_bounded_cass_with_scope(argv, timeout, false)
+    run_bounded_cass_with_scope(argv, timeout, false, None)
 }
 
 fn run_bounded_canonical_repair(
     argv: &[String],
     timeout: Duration,
 ) -> Result<Output, CommandFailure> {
-    run_bounded_cass_with_scope(argv, timeout, true)
+    run_bounded_cass_with_scope(argv, timeout, true, None)
 }
 
 fn run_bounded_cass_with_scope(
     argv: &[String],
     timeout: Duration,
     require_canonical_rebuild: bool,
+    source_data_dir: Option<&Path>,
 ) -> Result<Output, CommandFailure> {
     let args = argv
         .get(1..)
@@ -514,6 +540,9 @@ fn run_bounded_cass_with_scope(
         .stderr(Stdio::piped())
         .env("CASS_AUTO_REFRESH", "0")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    if let Some(data_dir) = source_data_dir {
+        child.env("CASS_DATA_DIR", data_dir);
+    }
     if require_canonical_rebuild {
         child.env("CASS_INDEX_REQUIRE_CANONICAL_REBUILD", "1");
     }
@@ -533,6 +562,144 @@ fn unavailable_live_proof(detail: impl Into<String>) -> ProofResult {
         detail: detail.into(),
         observation: None,
     }
+}
+
+fn sources_fingerprint() -> Result<String, &'static str> {
+    if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_ok() {
+        return Err("source onboarding cannot run while CASS_IGNORE_SOURCES_CONFIG is set");
+    }
+    let config = crate::sources::config::SourcesConfig::load()
+        .map_err(|_| "configured sources could not be loaded and validated")?;
+    fingerprint_sources(&config)
+}
+
+fn fingerprint_sources(
+    config: &crate::sources::config::SourcesConfig,
+) -> Result<String, &'static str> {
+    let bytes = serde_json::to_vec(config)
+        .map_err(|_| "configured source scope could not be identified")?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn failed_sources_proof(detail: impl Into<String>) -> ProofResult {
+    ProofResult {
+        result: "failed",
+        source: "source-config",
+        detail: detail.into(),
+        observation: None,
+    }
+}
+
+/// A dry sync proves a locally valid plan, never remote reachability, transfer
+/// completion, or registration. In particular its path successes must be null.
+fn classify_sources_dry_sync(exit_code: Option<i32>, payload: &Value) -> ProofResult {
+    if exit_code != Some(0)
+        || payload.get("status").and_then(Value::as_str) != Some("complete")
+        || payload.get("dry_run").and_then(Value::as_bool) != Some(true)
+        || payload.get("will_reindex").and_then(Value::as_bool) != Some(false)
+        || [
+            "sources_attempted",
+            "sources_with_failures",
+            "sources_fully_failed",
+            "total_files",
+            "total_bytes",
+        ]
+        .into_iter()
+        .any(|key| payload.get(key).and_then(Value::as_u64) != Some(0))
+        || ["error", "err"]
+            .into_iter()
+            .any(|key| payload.get(key).is_some_and(|v| !v.is_null()))
+    {
+        return failed_sources_proof(
+            "dry sync requires configured remote sources and a complete, non-mutating preview",
+        );
+    }
+    let Some(sources) = payload
+        .get("sources")
+        .and_then(Value::as_array)
+        .filter(|s| !s.is_empty())
+    else {
+        return failed_sources_proof(
+            "configure a remote source with cass sources add before onboarding",
+        );
+    };
+    let mut path_count = 0usize;
+    for source in sources {
+        let Some(paths) = source
+            .get("paths")
+            .and_then(Value::as_array)
+            .filter(|p| !p.is_empty())
+        else {
+            return failed_sources_proof("configured source has no previewable paths");
+        };
+        if source.get("status").and_then(Value::as_str) != Some("dry_run")
+            || source.get("method").and_then(Value::as_str) != Some("not_run")
+            || paths.iter().any(|path| {
+                !path.get("success").is_some_and(Value::is_null)
+                    || !path.get("error").is_some_and(Value::is_null)
+                    || !path.get("failure_reason").is_some_and(Value::is_null)
+                    || path.get("files").and_then(Value::as_u64) != Some(0)
+                    || path.get("bytes").and_then(Value::as_u64) != Some(0)
+            })
+        {
+            return failed_sources_proof(
+                "source preview contains invalid paths or an executed transport",
+            );
+        }
+        path_count = path_count.saturating_add(paths.len());
+    }
+    ProofResult {
+        result: "passed",
+        source: "live-command",
+        detail: "configured-source sync plan validated locally; no source registered, SSH attempted or files transferred".into(),
+        observation: Some(json!({
+            "configured_remote_sources": sources.len(),
+            "configured_paths": path_count,
+            "transport_started": false,
+            "sources_registered": false,
+            "files_transferred": 0,
+            "reindexed": false
+        })),
+    }
+}
+
+fn evaluate_sources_dry_sync(
+    command: AllowedCommand,
+    request: &GuideRunRequest<'_>,
+    deadline: Instant,
+) -> ProofResult {
+    let before = match sources_fingerprint() {
+        Ok(value) => value,
+        Err(detail) => return failed_sources_proof(detail),
+    };
+    let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
+        return unavailable_live_proof("source preview deadline exhausted; no child started");
+    };
+    let Some(argv) = allowlisted_argv(command, request.data_dir, request.db_path) else {
+        return failed_sources_proof(
+            "configured source preview scope cannot be represented by safe argv",
+        );
+    };
+    let output = match run_bounded_cass_with_scope(&argv, timeout, false, Some(request.data_dir)) {
+        Ok(output) => output,
+        Err(error) => return failed_sources_proof(error.detail),
+    };
+    let payload = match serde_json::from_slice(&output.stdout) {
+        Ok(payload) => payload,
+        Err(_) => {
+            return failed_sources_proof(
+                "dry sync returned malformed output; preview is unverified",
+            );
+        }
+    };
+    if sources_fingerprint().as_ref() != Ok(&before) {
+        return failed_sources_proof("configured sources changed during preview; rerun the guide");
+    }
+    let mut proof = classify_sources_dry_sync(output.status.code(), &payload);
+    if let Some(observation) = proof.observation.as_mut().and_then(Value::as_object_mut) {
+        observation.insert("source_config_blake3".into(), json!(before));
+    }
+    proof
 }
 
 fn evaluate_live_proof(
@@ -564,7 +731,46 @@ fn evaluate_live_proof(
 /// degraded health report is useful support evidence, but cannot pass readiness.
 /// Receipts contain only typed measurements: no paths, messages, or raw stderr.
 fn classify_live_proof(adapter: Adapter, exit_code: Option<i32>, payload: &Value) -> ProofResult {
-    if !matches!(exit_code, Some(0 | 1)) {
+    // Doctor's exit 5 also represents a completed check with a failed asset
+    // check. That is evidence for classification, never a readiness pass or
+    // permission to repair. Require its exact read-only contract; generic
+    // exit-5 errors and mutating doctor reports still fail closed.
+    let classified_doctor_failure = adapter == Adapter::DoctorTruth
+        && exit_code == Some(5)
+        && payload.get("schema_version").and_then(Value::as_u64) == Some(2)
+        && payload
+            .get("doctor_contract_version")
+            .and_then(Value::as_u64)
+            == Some(1)
+        && payload.get("status").and_then(Value::as_str) == Some("unhealthy")
+        && payload.get("healthy").and_then(Value::as_bool) == Some(false)
+        && payload
+            .get("failures")
+            .and_then(Value::as_u64)
+            .is_some_and(|n| n > 0)
+        && payload.get("issues_fixed").and_then(Value::as_u64) == Some(0)
+        && payload.get("auto_fix_applied").and_then(Value::as_bool) == Some(false)
+        && payload
+            .pointer("/doctor_command/execution_mode")
+            .and_then(Value::as_str)
+            == Some("read-only-check")
+        && payload
+            .pointer("/doctor_command/read_only")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && payload
+            .pointer("/doctor_command/mutation_allowed")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && payload
+            .get("checks")
+            .and_then(Value::as_array)
+            .is_some_and(|checks| {
+                checks
+                    .iter()
+                    .any(|check| check.get("status").and_then(Value::as_str) == Some("fail"))
+            });
+    if !matches!(exit_code, Some(0 | 1)) && !classified_doctor_failure {
         return ProofResult {
             result: "failed",
             source: "live-command",
@@ -1011,15 +1217,231 @@ fn execute_lexical_repair(data_dir: &Path, db_path: Option<&Path>) -> MutationRe
     }
 }
 
+/// Indexing may have changed canonical data even when its lexical update was
+/// deferred. Require its actual completion receipt and a fresh scope-bound
+/// status probe before reporting that the onboarding operation was verified.
+fn classify_incremental_index(
+    exit_code: Option<i32>,
+    payload: &Value,
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<Value, &'static str> {
+    if exit_code != Some(0)
+        || payload.get("success").and_then(Value::as_bool) != Some(true)
+        || payload.get("full").and_then(Value::as_bool) != Some(false)
+        || payload.get("force_rebuild").and_then(Value::as_bool) != Some(false)
+        || payload
+            .get("lexical_update_deferred")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || payload
+            .get("quarantined_conversations")
+            .and_then(Value::as_u64)
+            != Some(0)
+        || payload
+            .pointer("/indexing_stats/scan_had_errors")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || payload
+            .pointer("/indexing_stats/deferred_active_sources")
+            .and_then(Value::as_u64)
+            != Some(0)
+        || payload.get("data_dir").and_then(Value::as_str) != data_dir.to_str()
+        || payload.get("db_path").and_then(Value::as_str) != db_path.to_str()
+        || ["error", "err"]
+            .into_iter()
+            .any(|key| payload.get(key).is_some_and(|v| !v.is_null()))
+    {
+        return Err(
+            "incremental indexing did not attest a complete, non-deferred scan in the selected scope",
+        );
+    }
+    let conversations = payload
+        .get("conversations")
+        .and_then(Value::as_u64)
+        .ok_or("incremental indexing did not report conversation observations")?;
+    let messages = payload
+        .get("messages")
+        .and_then(Value::as_u64)
+        .ok_or("incremental indexing did not report message observations")?;
+    Ok(json!({
+        "exit_code": exit_code,
+        "index_observations": {
+            "conversations": conversations,
+            "messages": messages
+        },
+        "source_scan_completed": true,
+        "lexical_update_deferred": false,
+        "semantic_rebuilt": false,
+        "transport_started": false
+    }))
+}
+
+fn verify_incremental_index(
+    mut observation: Value,
+    after: &LexicalRepairSnapshot,
+    source_fingerprint: &str,
+) -> MutationResult {
+    if !after.lexical_ready || after.source_fresh != Some(true) {
+        return failed_mutation(
+            true,
+            "fresh status did not verify the indexed corpus and complete lexical generation",
+        );
+    }
+    // The public index receipt can contain this run's observations instead
+    // of archive totals. Only the fresh selected-archive probe supplies those
+    // totals; equating the two rejects legitimate incremental and no-op runs.
+    observation["conversations"] = json!(after.conversations);
+    observation["messages"] = json!(after.messages);
+    observation["source_config_blake3"] = json!(source_fingerprint);
+    observation["canonical_fingerprint_blake3"] = json!(
+        blake3::hash(after.canonical_fingerprint.as_bytes())
+            .to_hex()
+            .to_string()
+    );
+    observation["lexical_ready"] = json!(true);
+    observation["source_scan_fresh"] = json!(true);
+    MutationResult {
+        status: "executed",
+        proof_result: "passed",
+        detail: "configured-source incremental indexing completed and fresh canonical/lexical status matched; no remote transfer or semantic build was performed".into(),
+        started: true,
+        observation: Some(observation),
+    }
+}
+
+fn execute_incremental_index(
+    data_dir: &Path,
+    db_path: Option<&Path>,
+    source_preview_fingerprint: Option<&str>,
+) -> MutationResult {
+    let Some(expected) = source_preview_fingerprint else {
+        return failed_mutation(
+            false,
+            "incremental indexing requires a verified configured-source preview",
+        );
+    };
+    if sources_fingerprint().as_deref() != Ok(expected) {
+        return failed_mutation(
+            false,
+            "configured sources changed after preview; no indexing started",
+        );
+    }
+    let data_dir = match data_dir
+        .canonicalize()
+        .or_else(|_| std::path::absolute(data_dir))
+    {
+        Ok(path) => path,
+        Err(_) => return failed_mutation(false, "index data directory cannot be resolved"),
+    };
+    let config = match crate::sources::config::SourcesConfig::load() {
+        Ok(config) => config,
+        Err(_) => return failed_mutation(false, "configured sources could not be revalidated"),
+    };
+    if fingerprint_sources(&config).as_deref() != Ok(expected) {
+        return failed_mutation(
+            false,
+            "configured source scope changed; no indexing started",
+        );
+    }
+    for source in config.remote_sources() {
+        for path in &source.paths {
+            let mirror = data_dir
+                .join("remotes")
+                .join(&source.name)
+                .join("mirror")
+                .join(crate::sources::sync::path_to_safe_dirname(path));
+            if std::fs::read_dir(&mirror).is_err() {
+                return failed_mutation(
+                    false,
+                    "a configured source mirror is unavailable; run cass sources sync before indexing",
+                );
+            }
+        }
+    }
+    let default_db = data_dir.join("agent_search.db");
+    let requested_db = db_path.unwrap_or(&default_db);
+    let db_path = match requested_db
+        .canonicalize()
+        .or_else(|_| std::path::absolute(requested_db))
+    {
+        Ok(path) => path,
+        Err(_) => return failed_mutation(false, "selected index archive cannot be resolved"),
+    };
+    let Some(command) = allowed_command("index.incremental") else {
+        return failed_mutation(false, "incremental indexing adapter is unavailable");
+    };
+    let Some(argv) = allowlisted_argv(command, &data_dir, Some(&db_path)) else {
+        return failed_mutation(
+            false,
+            "incremental indexing scope cannot be represented by safe argv",
+        );
+    };
+    let output = match run_bounded_cass(&argv, Duration::from_secs(120)) {
+        Ok(output) => output,
+        Err(error) => return failed_mutation(error.started, error.detail),
+    };
+    let payload = match serde_json::from_slice(&output.stdout) {
+        Ok(payload) => payload,
+        Err(_) => {
+            return failed_mutation(
+                true,
+                "incremental indexing returned malformed output; state is unverified",
+            );
+        }
+    };
+    let observation = match classify_incremental_index(
+        output.status.code(),
+        &payload,
+        &data_dir,
+        &db_path,
+    ) {
+        Ok(observation) => observation,
+        Err(detail) => {
+            let mut failed = failed_mutation(true, detail);
+            failed.observation = Some(json!({
+                "exit_code": output.status.code(),
+                "index_busy": output.status.code() == Some(7),
+                "lexical_update_deferred": payload.get("lexical_update_deferred").and_then(Value::as_bool),
+                "scan_had_errors": payload.pointer("/indexing_stats/scan_had_errors").and_then(Value::as_bool),
+                "deferred_active_sources": payload.pointer("/indexing_stats/deferred_active_sources").and_then(Value::as_u64),
+                "quarantined_conversations": payload.get("quarantined_conversations").and_then(Value::as_u64),
+                "state_may_have_changed": true
+            }));
+            return failed;
+        }
+    };
+    if sources_fingerprint().as_deref() != Ok(expected) {
+        return failed_mutation(
+            true,
+            "configured sources changed during indexing; completion is unverified",
+        );
+    }
+    let Some(status) = allowed_command("diag.search-coverage")
+        .and_then(|command| allowlisted_argv(command, &data_dir, Some(&db_path)))
+    else {
+        return failed_mutation(true, "post-index status scope is unavailable");
+    };
+    let after = match read_lexical_repair_snapshot(&status, &db_path) {
+        Ok(snapshot) => snapshot,
+        Err(detail) => return failed_mutation(true, detail),
+    };
+    verify_incremental_index(observation, &after, expected)
+}
+
 fn execute_mutation(
     command: AllowedCommand,
     argv: &[String],
     data_dir: &Path,
     db_path: Option<&Path>,
+    source_preview_fingerprint: Option<&str>,
 ) -> MutationResult {
     match command.adapter {
         Adapter::SupportBundle => execute_support_bundle(argv, data_dir),
         Adapter::LexicalRepair => execute_lexical_repair(data_dir, db_path),
+        Adapter::IncrementalIndex => {
+            execute_incremental_index(data_dir, db_path, source_preview_fingerprint)
+        }
         _ => MutationResult {
             status: "adapter-unavailable",
             proof_result: "not-run",
@@ -1028,6 +1450,19 @@ fn execute_mutation(
             observation: None,
         },
     }
+}
+
+fn incremental_index_scope() -> Value {
+    json!({
+        "assets": "canonical-and-lexical",
+        "source_scope": "configured-sources-and-local-discovery",
+        "source_scan": true,
+        "source_registration": false,
+        "remote_sync": false,
+        "requires_staged_mirrors": true,
+        "semantic_rebuild": false,
+        "timeout_seconds": 120
+    })
 }
 
 fn mutation_contract(apply: bool, attempted: usize, attempted_db_mutation: bool) -> Value {
@@ -1224,6 +1659,7 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
     let mut attempted_db_mutation = false;
     let mut awaiting_confirmation = false;
     let mut blocked_step = false;
+    let mut source_preview_fingerprint = None;
 
     let proof_deadline = Instant::now() + Duration::from_secs(15);
     for step in &steps {
@@ -1313,6 +1749,19 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
                     }),
                 );
             }
+            if command.adapter == Adapter::IncrementalIndex
+                && let Some(entry) = transcript.last_mut().and_then(Value::as_object_mut)
+            {
+                entry.insert("execution_scope".into(), incremental_index_scope());
+            }
+            if command.adapter == Adapter::SourcesDrySync
+                && let Some(entry) = transcript.last_mut().and_then(Value::as_object_mut)
+            {
+                entry.insert(
+                    "environment".into(),
+                    json!({"CASS_DATA_DIR": request.data_dir}),
+                );
+            }
             continue;
         }
 
@@ -1337,6 +1786,14 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
                 "proof-unavailable"
             };
             prior_proofs_passed &= proof.result == "passed";
+            if command.adapter == Adapter::SourcesDrySync && proof.result == "passed" {
+                source_preview_fingerprint = proof
+                    .observation
+                    .as_ref()
+                    .and_then(|value| value.get("source_config_blake3"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
             transcript.push(json!({
                 "step": order,
                 "structured_command": structured,
@@ -1354,6 +1811,14 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
                 && let Some(entry) = transcript.last_mut().and_then(Value::as_object_mut)
             {
                 entry.insert("observation".to_string(), observation);
+            }
+            if command.adapter == Adapter::SourcesDrySync
+                && let Some(entry) = transcript.last_mut().and_then(Value::as_object_mut)
+            {
+                entry.insert(
+                    "environment".into(),
+                    json!({"CASS_DATA_DIR": request.data_dir}),
+                );
             }
             continue;
         }
@@ -1403,11 +1868,15 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
                 argv.as_deref().unwrap_or_default(),
                 request.data_dir,
                 request.db_path,
+                source_preview_fingerprint.as_deref(),
             );
             mutation_started = mutation.started;
             if mutation_started {
                 attempted_mutation_count += 1;
-                attempted_db_mutation |= command.adapter == Adapter::LexicalRepair;
+                attempted_db_mutation |= matches!(
+                    command.adapter,
+                    Adapter::LexicalRepair | Adapter::IncrementalIndex
+                );
             }
             mutation_observation = mutation.observation;
             if mutation.status == "executed" {
@@ -1452,6 +1921,11 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
             if let Some(observation) = mutation_observation {
                 entry.insert("observation".to_string(), observation);
             }
+        }
+        if command.adapter == Adapter::IncrementalIndex
+            && let Some(entry) = transcript.last_mut().and_then(Value::as_object_mut)
+        {
+            entry.insert("execution_scope".into(), incremental_index_scope());
         }
     }
 
@@ -1567,6 +2041,177 @@ mod tests {
         Ok(())
     }
 
+    fn dry_sync_receipt() -> Value {
+        json!({
+            "status": "complete", "dry_run": true, "will_reindex": false,
+            "sources_attempted": 0, "sources_with_failures": 0, "sources_fully_failed": 0,
+            "total_files": 0, "total_bytes": 0,
+            "sources": [{"status": "dry_run", "method": "not_run", "paths": [{
+                "success": null, "error": null, "failure_reason": null, "files": 0, "bytes": 0
+            }]}]
+        })
+    }
+
+    #[test]
+    fn dry_sync_requires_an_unexecuted_valid_path_plan() {
+        let valid = dry_sync_receipt();
+        let proof = super::classify_sources_dry_sync(Some(0), &valid);
+        assert_eq!(proof.result, "passed");
+        assert_eq!(
+            proof.observation.expect("measurement")["transport_started"],
+            false
+        );
+        for (pointer, value) in [
+            ("/status", json!("no_sources")),
+            ("/dry_run", json!(false)),
+            ("/will_reindex", json!(true)),
+            ("/sources_attempted", json!(1)),
+            ("/sources", json!([])),
+            ("/sources/0/status", json!("invalid_config")),
+            ("/sources/0/method", json!("rsync")),
+            ("/sources/0/paths", json!([])),
+            ("/sources/0/paths/0/success", json!(true)),
+            ("/sources/0/paths/0/error", json!("unreadable")),
+            ("/sources/0/paths/0/failure_reason", json!("invalid_config")),
+            ("/sources/0/paths/0/files", json!(1)),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid.pointer_mut(pointer).expect("receipt field") = value;
+            assert_eq!(
+                super::classify_sources_dry_sync(Some(0), &invalid).result,
+                "failed",
+                "{pointer}"
+            );
+        }
+        for code in [None, Some(1), Some(7)] {
+            assert_eq!(
+                super::classify_sources_dry_sync(code, &valid).result,
+                "failed"
+            );
+        }
+        for incomplete in [Value::Null, json!({}), json!({"status": "complete"})] {
+            assert_eq!(
+                super::classify_sources_dry_sync(Some(0), &incomplete).result,
+                "failed"
+            );
+        }
+    }
+
+    #[test]
+    fn source_binding_detects_path_host_and_exclusion_changes() {
+        use crate::sources::config::{SourceDefinition, SourcesConfig};
+        let mut source = SourceDefinition::ssh("example", "fixture.invalid");
+        source.paths = vec!["~/.codex".into()];
+        let config = SourcesConfig {
+            sources: vec![source],
+            ..Default::default()
+        };
+        let before = super::fingerprint_sources(&config).expect("preview identity");
+        // Bind semantic configuration, so harmless TOML formatting is not drift.
+        let round_trip: SourcesConfig =
+            toml::from_str(&toml::to_string(&config).expect("TOML")).expect("same scope");
+        assert_eq!(
+            super::fingerprint_sources(&round_trip).expect("same identity"),
+            before
+        );
+        let mut changed = config.clone();
+        changed.sources[0].paths.push("~/.claude".into());
+        assert_ne!(
+            super::fingerprint_sources(&changed).expect("path change"),
+            before
+        );
+        let mut changed = config.clone();
+        changed.sources[0].host = Some("different.invalid".into());
+        assert_ne!(
+            super::fingerprint_sources(&changed).expect("host change"),
+            before
+        );
+        let mut changed = config;
+        changed.disabled_agents.push("codex".into());
+        assert_ne!(
+            super::fingerprint_sources(&changed).expect("exclusion change"),
+            before
+        );
+    }
+
+    #[test]
+    fn incremental_receipt_requires_complete_scanning_in_the_selected_scope() {
+        let root = tempfile::tempdir().expect("scope");
+        let data = root.path().join("data");
+        let db = root.path().join("selected.db");
+        let valid = json!({
+            "success": true, "full": false, "force_rebuild": false,
+            "lexical_update_deferred": false, "quarantined_conversations": 0,
+            "indexing_stats": {"scan_had_errors": false, "deferred_active_sources": 0},
+            "data_dir": data, "db_path": db, "conversations": 5, "messages": 12
+        });
+        let classify =
+            |code, payload: &Value| super::classify_incremental_index(code, payload, &data, &db);
+        let measured = classify(Some(0), &valid).expect("complete scan");
+        assert_eq!(measured["index_observations"]["conversations"], 5);
+        for (pointer, value) in [
+            ("/success", json!(false)),
+            ("/full", json!(true)),
+            ("/force_rebuild", json!(true)),
+            ("/lexical_update_deferred", json!(true)),
+            ("/quarantined_conversations", json!(1)),
+            ("/indexing_stats/scan_had_errors", json!(true)),
+            ("/indexing_stats/deferred_active_sources", json!(1)),
+            ("/data_dir", json!("different")),
+            ("/db_path", json!("different.db")),
+            ("/messages", Value::Null),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid.pointer_mut(pointer).expect("receipt field") = value;
+            assert!(classify(Some(0), &invalid).is_err(), "{pointer}");
+        }
+        for code in [None, Some(1), Some(7)] {
+            assert!(classify(code, &valid).is_err());
+        }
+        assert!(classify(Some(0), &json!({"success": true})).is_err());
+        let missing_preview = super::execute_incremental_index(&data, Some(&db), None);
+        assert!(!missing_preview.started);
+        assert_eq!(missing_preview.status, "failed");
+        assert!(!db.exists());
+        assert!(!data.exists());
+    }
+
+    #[test]
+    fn incremental_postconditions_distinguish_run_observations_from_archive_totals() {
+        let mut after = super::LexicalRepairSnapshot {
+            conversations: 2,
+            messages: 4,
+            canonical_fingerprint: "selected-corpus".into(),
+            lexical_ready: true,
+            source_fresh: Some(true),
+        };
+        for indexed in [0, 1] {
+            let observation = json!({"index_observations": {
+                "conversations": indexed, "messages": indexed * 2
+            }});
+            let result = super::verify_incremental_index(observation, &after, "source-scope");
+            assert_eq!(result.status, "executed");
+            let receipt = result.observation.expect("verified counts");
+            assert_eq!(receipt["conversations"], 2);
+            assert_eq!(receipt["messages"], 4);
+            assert_eq!(receipt["index_observations"]["conversations"], indexed);
+        }
+        let observation = json!({"index_observations": {"conversations": 1, "messages": 2}});
+        after.lexical_ready = false;
+        assert_eq!(
+            super::verify_incremental_index(observation.clone(), &after, "scope").status,
+            "failed"
+        );
+        after.lexical_ready = true;
+        for fresh in [None, Some(false)] {
+            after.source_fresh = fresh;
+            assert_eq!(
+                super::verify_incremental_index(observation.clone(), &after, "scope").status,
+                "failed"
+            );
+        }
+    }
+
     #[test]
     fn dry_run_never_executes_steps() -> Result<(), String> {
         let facts = json!({"db_present": true});
@@ -1643,6 +2288,58 @@ mod tests {
         );
         assert_ne!(
             classify_live_proof(Adapter::SearchCoverage, Some(0), &json!({"healthy": true})).result,
+            "passed"
+        );
+    }
+
+    #[test]
+    fn doctor_failed_check_is_classification_only_when_its_read_only_contract_is_complete() {
+        use super::{Adapter, classify_live_proof};
+        let complete = json!({
+            "schema_version": 2, "doctor_contract_version": 1,
+            "status": "unhealthy", "healthy": false, "failures": 1,
+            "issues_fixed": 0, "auto_fix_applied": false,
+            "doctor_command": {"execution_mode": "read-only-check", "read_only": true, "mutation_allowed": false},
+            "checks": [{"name": "index", "status": "fail"}]
+        });
+        assert_eq!(
+            classify_live_proof(Adapter::DoctorTruth, Some(5), &complete).result,
+            "passed"
+        );
+        for adapter in [
+            Adapter::Readiness,
+            Adapter::SearchCoverage,
+            Adapter::SupportEvidence,
+        ] {
+            assert_ne!(
+                classify_live_proof(adapter, Some(5), &complete).result,
+                "passed"
+            );
+        }
+        for (pointer, value) in [
+            ("/doctor_contract_version", Value::Null),
+            ("/status", json!("error")),
+            ("/healthy", json!(true)),
+            ("/failures", json!(0)),
+            ("/issues_fixed", json!(1)),
+            ("/auto_fix_applied", json!(true)),
+            ("/doctor_command/execution_mode", json!("repair")),
+            ("/doctor_command/read_only", json!(false)),
+            ("/doctor_command/mutation_allowed", json!(true)),
+            ("/checks", json!([])),
+        ] {
+            let mut invalid = complete.clone();
+            *invalid.pointer_mut(pointer).expect("doctor field") = value;
+            assert_ne!(
+                classify_live_proof(Adapter::DoctorTruth, Some(5), &invalid).result,
+                "passed",
+                "{pointer}"
+            );
+        }
+        let mut error = complete;
+        error["error"] = json!({"message": "failure"});
+        assert_ne!(
+            classify_live_proof(Adapter::DoctorTruth, Some(5), &error).result,
             "passed"
         );
     }

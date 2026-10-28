@@ -431,3 +431,50 @@ fn local_lexical_repair_requires_exact_cost_acceptance_without_build_offload() -
     )?;
     Ok(())
 }
+
+#[test]
+fn confirmed_onboarding_fixture_cannot_run_the_live_index_adapter() -> TestResult {
+    let (_home_guard, home, data_dir) = isolated_home()?;
+    let mut context = healthy_context(json!({"sources_config_writable": true}));
+    context["proof_results"] = json!({"exposure-reviewed": true, "dry-sync-ok": true});
+    let (_fixture_guard, fixture) = fixture_file(&context)?;
+    let planned = run(&home, &data_dir, &fixture, &["onboard-source"])?;
+    let privacy = planned
+        .pointer("/plan/privacy_tier")
+        .and_then(Value::as_str)
+        .ok_or("privacy")?;
+    let cost = planned
+        .pointer("/plan/cost_risk/risk_level")
+        .and_then(Value::as_str)
+        .ok_or("cost")?;
+    let payload = run(
+        &home,
+        &data_dir,
+        &fixture,
+        &[
+            "onboard-source",
+            "--apply",
+            "--confirm-step",
+            "3",
+            "--accept-privacy-tier",
+            privacy,
+            "--accept-cost-risk",
+            cost,
+            "--confirm-stop-conditions-clear",
+        ],
+    )?;
+    ensure(gate_result(&payload, "rch") == Some("passed"), || {
+        "installed local index adapter must not require compiler offload".into()
+    })?;
+    ensure(
+        mutation_step(&payload).and_then(|step| step.get("result"))
+            == Some(&json!("fixture-protected")),
+        || format!("fixture must never ingest sources: {payload}"),
+    )?;
+    ensure(
+        payload.pointer("/execution/attempted_mutation_count") == Some(&json!(0))
+            && !data_dir.join("agent_search.db").exists(),
+        || "fixture started live indexing".into(),
+    )?;
+    Ok(())
+}

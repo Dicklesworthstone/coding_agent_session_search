@@ -78,9 +78,6 @@ fn prepare_isolated_home(root: &Path) -> TestResult<(PathBuf, PathBuf)> {
         &home.join("xdg-data"),
         &home.join("xdg-config"),
         &home.join("xdg-cache"),
-        &home.join(".codex-empty"),
-        &home.join(".claude-empty"),
-        &home.join(".gemini-empty"),
     ] {
         fs::create_dir_all(path)?;
     }
@@ -89,6 +86,21 @@ fn prepare_isolated_home(root: &Path) -> TestResult<(PathBuf, PathBuf)> {
 
 fn cass_command(home: &Path, args: &[String]) -> Command {
     let mut command = Command::new(cargo_bin("cass"));
+    command.env_clear();
+    for key in [
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "TMP",
+        "TEMP",
+        "TMPDIR",
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
     command
         .args(args)
         .current_dir(home)
@@ -101,6 +113,8 @@ fn cass_command(home: &Path, args: &[String]) -> Command {
         .env("GEMINI_HOME", home.join(".gemini-empty"))
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         .env("CASS_SEMANTIC_EMBEDDER", "hash")
+        .env("RUST_MIN_STACK", "134217728")
+        .env("CASS_AUTO_REFRESH", "0")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("NO_COLOR", "1")
         .env_remove("CLAUDE_CONFIG_DIR");
@@ -391,6 +405,60 @@ fn docs_contract() -> String {
          All commands run against an isolated HOME and data directory. The before/after tree snapshot must be byte-identical. Private fixture markers must be absent from stdout, stderr, parsed JSON, and audit summaries. Recommended commands must pass the independent robot-safe allowlist.\n\n\
          Dependency graph evidence: `bv --robot-insights --force-full-analysis --format json` at {CYCLE_EVIDENCE_AT} reported `cycle_break.status=available`, `cycle_count=0`, and `No cycles detected - dependency graph is a proper DAG.`\n"
     )
+}
+
+#[test]
+fn onboarding_fixture_distinguishes_absent_and_empty_provider_homes() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let (home, data) = prepare_isolated_home(temp.path())?;
+    let args = vec![
+        "onboarding".to_string(),
+        "--json".to_string(),
+        "--data-dir".to_string(),
+        data.to_string_lossy().into_owned(),
+    ];
+    let absent = run_scenario(
+        "absent-provider-homes",
+        "cass onboarding --json",
+        &home,
+        &data,
+        args.clone(),
+    )?;
+    ensure(
+        absent.parsed["recommended_action"] == "discover_sources",
+        || format!("absent roots must recommend discovery: {}", absent.parsed),
+    )?;
+    fs::create_dir_all(home.join(".gemini-empty"))?;
+    let detected = run_scenario(
+        "existing-empty-provider-home",
+        "cass onboarding --json",
+        &home,
+        &data,
+        args,
+    )?;
+    ensure(
+        detected.parsed["recommended_action"] == "run_first_index",
+        || {
+            format!(
+                "detected roots with unknown session estimates remain indexable: {}",
+                detected.parsed
+            )
+        },
+    )?;
+    ensure(
+        detected.parsed["providers"]
+            .as_array()
+            .is_some_and(|providers| {
+                providers
+                    .iter()
+                    .any(|provider| provider["name"] == "gemini")
+            }),
+        || "negative control must actually detect Gemini".into(),
+    )?;
+    ensure(!data.join("agent_search.db").exists(), || {
+        "onboarding must remain read-only".into()
+    })?;
+    Ok(())
 }
 
 #[test]
