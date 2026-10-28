@@ -114712,7 +114712,7 @@ fn run_export_html(
     };
 
     // --- Load session messages ---
-    let raw_messages: Vec<serde_json::Value>;
+    let mut raw_messages: Vec<serde_json::Value>;
     let indexed_title = indexed_view
         .as_ref()
         .and_then(|view| view.convo.title.clone());
