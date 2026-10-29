@@ -105,6 +105,31 @@ RECEIPT
     check_exit nonterminal-job-complete 1 bash "$gate" --verify-receipt "$proof_dir/not-terminal.txt" 0 "${expected[@]}"
     check_exit stale-docs-binary 1 bash "$gate" --verify-receipt "$receipt" 0 "${expected[@]}" docs-build docs-binary-identity docs-truth
 
+    # Exercise the actual scope builder without a fleet admission. Retained
+    # scanner downloads must not make the gate scan itself; production and
+    # test sources, including a deliberately bad unwrap, must remain selected.
+    scope_root="$proof_dir/scope"
+    mkdir -p "$scope_root/scripts" "$scope_root/src" "$scope_root/tests" \
+        "$scope_root/.rch-tmp/cass-gate-ubs.example/modules"
+    cp "$gate" "$scope_root/scripts/gate.sh"
+    cp "$PROJECT_ROOT/.ubsignore" "$scope_root/.ubsignore"
+    printf '%s\n' 'pub fn parse(raw: &str) -> u64 { raw.parse().unwrap() }' > "$scope_root/src/production.rs"
+    printf '%s\n' '#[test] fn selected_test() { assert!(true); }' > "$scope_root/tests/selected.rs"
+    printf '%s\n' 'raise RuntimeError("downloaded scanner fixture")' > "$scope_root/.rch-tmp/cass-gate-ubs.example/modules/scanner.py"
+    git -C "$scope_root" init -q --initial-branch=main
+    git -C "$scope_root" add scripts/gate.sh .ubsignore
+    git -C "$scope_root" -c user.name=gate-test -c user.email=gate-test@example.invalid \
+        -c commit.gpgsign=false commit -q -m 'isolated gate scope baseline'
+    check_exit inspect-real-batch 0 env GATE_BASE=HEAD bash "$scope_root/scripts/gate.sh" \
+        --no-lib --no-bin --no-goldens --integration '' --print-remote-script
+    check_exit printed-batch-is-shell 0 bash -n "$proof_dir/inspect-real-batch.log"
+    check_exit production-unwrap-still-selected 0 grep -F './src/production.rs' "$proof_dir/inspect-real-batch.log"
+    check_exit test-source-still-selected 0 grep -F './tests/selected.rs' "$proof_dir/inspect-real-batch.log"
+    # check_exit combines stdout/stderr, so select the actual invocation line
+    # rather than the separate receipt announcing the ignored cache path.
+    awk '/; echo STAGE=ubs EXIT=/ { print }' "$proof_dir/inspect-real-batch.log" > "$proof_dir/scope-invocation.txt"
+    check_exit acquired-scanner-not-selected 1 grep -F './.rch-tmp/' "$proof_dir/scope-invocation.txt"
+
     printf 'running 3 tests\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out\n' > "$proof_dir/tests-positive.txt"
     printf 'running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out\n' > "$proof_dir/tests-empty.txt"
     printf 'running 3 tests\n' > "$proof_dir/tests-truncated.txt"

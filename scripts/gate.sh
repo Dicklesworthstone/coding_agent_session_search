@@ -20,6 +20,7 @@
 #   scripts/gate.sh --no-lib        # skip the lib suite (e.g. while bet45 wedge is open)
 #   scripts/gate.sh --no-bin        # skip the cass bin's own unit tests (stage bin-cass)
 #   scripts/gate.sh --local         # run stages locally (only where rch is not required)
+#   scripts/gate.sh --print-remote-script  # inspect the batch without admitting or executing it
 #   GATE_RETRIES=40 GATE_RETRY_SLEEP=90 scripts/gate.sh   # keep retrying fleet refusals
 #
 # Exit code: 0 when every stage exited 0, 1 otherwise, 103 if the fleet refused
@@ -208,6 +209,7 @@ RUN_GOLDENS=1
 LOCAL=0
 REGEN_GOLDENS=0
 RUN_DOCS_TRUTH=0
+PRINT_REMOTE_SCRIPT=0
 UBS_FILES=()
 # Each entry is `<test-binary>` or `<test-binary>:<filter words>`; the filter
 # is passed after `--` so one admission can run only the tests a change touches.
@@ -242,6 +244,7 @@ while [ $# -gt 0 ]; do
         # and env vars, checked with the debug binary the integration stage
         # just built. Opt-in until the README is clean against main.
         --docs-truth) RUN_DOCS_TRUTH=1; shift ;;
+        --print-remote-script) PRINT_REMOTE_SCRIPT=1; shift ;;
         -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -286,7 +289,7 @@ if [ -f .ubsignore ] && [ "${#UBS_FILES[@]}" -gt 0 ]; then
     ubs_kept=()
     for path in "${UBS_FILES[@]}"; do
         if [ -n "${ubs_ignored[${path#./}]:-}" ]; then
-            echo "gate: UBS skips .ubsignore path ${path}"
+            echo "gate: UBS skips .ubsignore path ${path}" >&2
         else
             ubs_kept+=("$path")
         fi
@@ -529,6 +532,11 @@ run_ubs ${UBS_FILES_ARG}; echo STAGE=ubs EXIT=\$?; echo STAGE=job-complete EXIT=
 # Scan after behavioral validation: a slow scanner must not consume the whole
 # admission before any product test runs. UBS remains mandatory and blocking.
 EXPECTED_STAGES+=(ubs job-complete)
+
+if [ "$PRINT_REMOTE_SCRIPT" = 1 ]; then
+    printf '%s\n' "$REMOTE_SCRIPT"
+    exit 0
+fi
 
 run_once() {
     # Match .cargo/config.toml: storage futures have exceeded a 16 MiB stack.
