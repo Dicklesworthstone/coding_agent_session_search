@@ -34,6 +34,25 @@ fn assert_staging_empty(data: &Path) {
     if tmp.exists() { assert_eq!(fs::read_dir(tmp).unwrap().count(), 0); }
 }
 
+fn run_usage_peer(test_name: &str, root_variable: &str, fixture: &Path) -> Result<()> {
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .args(["--exact", test_name, "--nocapture"])
+        .env(root_variable, fixture)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    crate::sources::configure_child_process_group(&mut command);
+    let output = crate::sources::wait_for_child_output_with_limit(
+        command.spawn()?, Duration::from_secs(30), Some(1024 * 1024),
+    )?.ok_or_else(|| anyhow!("peer operation exceeded its deadline"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "peer operation failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("1 passed; 0 failed"), "peer test did not run: {stdout}");
+    Ok(())
+}
+
 #[test]
 fn frequent_appends_reuse_chunks_and_preserve_every_published_snapshot() {
     let temp = tempfile::tempdir().unwrap();
@@ -244,6 +263,233 @@ fn captures_far_from_the_cap_share_one_inventory_walk() {
     let error = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(used / 4)).unwrap_err();
     assert_eq!(error.downcast_ref::<RawMirrorCapturePaused>().expect("paused").used_bytes, used);
     assert_eq!(measured_usage_walks(&root), 2);
+}
+
+/// A separate writer must invalidate a long-lived process's low inventory.
+/// Exercise real capture/publication in both processes, not a synthetic total.
+#[test]
+fn a_peer_capture_refreshes_usage_before_admitting_another_snapshot() -> Result<()> {
+    const PEER_ROOT: &str = "CASS_TEST_RAW_MIRROR_USAGE_PEER_ROOT";
+    let peer_root = match dotenvy::var(PEER_ROOT) {
+        Ok(path) => Some(PathBuf::from(path)),
+        Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(fixture) = peer_root {
+        let data = fixture.join("data");
+        let source = fixture.join("peer.jsonl");
+        capture(input(&data, &source), CHUNK as u64, CHUNK, policy(1024 * 1024 * 1024))?;
+        assert_eq!(storage_summary(&data).manifest_count, 2);
+        return Ok(());
+    }
+
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let source = temp.path().join("original.jsonl");
+    let original = transcript(0, 1024);
+    fs::write(&source, &original)?;
+    let first = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(96 * 1024))?;
+    let root = raw_mirror_root(&data);
+    assert_eq!(measured_usage_walks(&root), 1);
+    fs::write(temp.path().join("peer.jsonl"), transcript(1, 192 * 1024))?;
+
+    run_usage_peer(
+        "raw_mirror::store::policy::tests::a_peer_capture_refreshes_usage_before_admitting_another_snapshot",
+        PEER_ROOT, temp.path(),
+    )?;
+
+    let after_peer = measured_usage(&root)?;
+    assert!(after_peer > 96 * 1024, "peer must exceed the parent's admission cap");
+    let next = temp.path().join("next.jsonl");
+    let next_bytes = transcript(2, 1024);
+    fs::write(&next, &next_bytes)?;
+    let error = capture(input(&data, &next), CHUNK as u64, CHUNK, policy(96 * 1024))
+        .expect_err("a peer's bytes must count before another snapshot is admitted");
+    let paused = error.downcast_ref::<RawMirrorCapturePaused>()
+        .ok_or_else(|| anyhow!("expected budget refusal, got {error:#}"))?;
+    assert_eq!(paused.used_bytes, after_peer);
+    assert_eq!(storage_summary(&data).manifest_count, 2);
+    assert_eq!(contents(&data, &first), original);
+    assert_eq!(measured_usage_walks(&root), 2, "handoff requires a fresh inventory");
+    assert_staging_empty(&data);
+
+    let admitted = capture(input(&data, &next), CHUNK as u64, CHUNK, policy(1024 * 1024 * 1024))?;
+    assert_eq!(contents(&data, &admitted), next_bytes);
+    assert_eq!(storage_summary(&data).manifest_count, 3);
+    assert_eq!(measured_usage_walks(&root), 2, "same-process capture reuses the new total");
+    Ok(())
+}
+
+#[test]
+fn a_path_alias_cannot_reuse_another_inventory_of_the_same_store() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let source = temp.path().join("first.jsonl");
+    let original = transcript(0, 1024);
+    fs::write(&source, &original)?;
+    let first = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(96 * 1024))?;
+    let peer = temp.path().join("alias.jsonl");
+    fs::write(&peer, transcript(1, 192 * 1024))?;
+    let alias = data.join("..").join("data");
+    capture(input(&alias, &peer), CHUNK as u64, CHUNK, policy(1024 * 1024 * 1024))?;
+    let used = measured_usage(&raw_mirror_root(&data))?;
+    assert!(used > 96 * 1024);
+    let next = temp.path().join("next.jsonl");
+    fs::write(&next, transcript(2, 1024))?;
+    let error = capture(input(&data, &next), CHUNK as u64, CHUNK, policy(96 * 1024))
+        .expect_err("an alias must not hide another writer's bytes");
+    let paused = error.downcast_ref::<RawMirrorCapturePaused>()
+        .ok_or_else(|| anyhow!("expected budget refusal: {error:#}"))?;
+    assert_eq!(paused.used_bytes, used);
+    assert_eq!(storage_summary(&data).manifest_count, 2);
+    assert_eq!(contents(&data, &first), original);
+    Ok(())
+}
+
+#[test]
+fn a_peer_prune_refreshes_a_cached_refusal_before_the_next_capture() -> Result<()> {
+    const PEER_ROOT: &str = "CASS_TEST_RAW_MIRROR_PRUNE_PEER_ROOT";
+    let peer_root = match dotenvy::var(PEER_ROOT) {
+        Ok(path) => Some(PathBuf::from(path)),
+        Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(fixture) = peer_root {
+        let report = prune(&fixture.join("data"), RawMirrorPruneOptions {
+            older_than_ms: Some(0), max_size_bytes: None, providers: Vec::new(),
+            source_path: None, keep_tags: Vec::new(), keep_latest: None,
+            safety_hold_down_ms: 0, apply: true,
+        })?;
+        assert_eq!(report.applied_manifest_count, 1);
+        return Ok(());
+    }
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let source = temp.path().join("first.jsonl");
+    fs::write(&source, transcript(0, 192 * 1024))?;
+    capture(input(&data, &source), CHUNK as u64, CHUNK, policy(1024 * 1024 * 1024))?;
+    let next = temp.path().join("next.jsonl");
+    let next_bytes = transcript(1, 1024);
+    fs::write(&next, &next_bytes)?;
+    let error = capture(input(&data, &next), CHUNK as u64, CHUNK, policy(96 * 1024))
+        .expect_err("prime an actual over-budget inventory");
+    assert!(error.is::<RawMirrorCapturePaused>());
+    run_usage_peer(
+        "raw_mirror::store::policy::tests::a_peer_prune_refreshes_a_cached_refusal_before_the_next_capture",
+        PEER_ROOT, temp.path(),
+    )?;
+    let root = raw_mirror_root(&data);
+    assert!(measured_usage(&root)? < 96 * 1024);
+    assert_eq!(storage_summary(&data).manifest_count, 0);
+    let captured = capture(input(&data, &next), CHUNK as u64, CHUNK, policy(96 * 1024))?;
+    assert_eq!(contents(&data, &captured), next_bytes);
+    assert_eq!(storage_summary(&data).manifest_count, 1);
+    assert!(measured_usage(&root)? <= 96 * 1024);
+    Ok(())
+}
+
+#[test]
+fn direct_manifest_link_growth_counts_before_the_next_admission() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let source = temp.path().join("first.jsonl");
+    let original = transcript(0, 1024);
+    fs::write(&source, &original)?;
+    let first = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(96 * 1024))?;
+    let links = (1..=2048).map(|id| RawMirrorDbLink {
+        conversation_id: Some(id), message_count: Some(1), source_path: None,
+        started_at_ms: None,
+    }).collect::<Vec<_>>();
+    merge_manifest_db_links(&data, &first.manifest_relative_path, &links)?;
+    let root = raw_mirror_root(&data);
+    let used = measured_usage(&root)?;
+    assert!(used > 96 * 1024, "the real metadata update must exceed the cap");
+    let next = temp.path().join("next.jsonl");
+    fs::write(&next, transcript(1, 1024))?;
+    let error = capture(input(&data, &next), CHUNK as u64, CHUNK, policy(96 * 1024))
+        .expect_err("metadata growth must count against capture admission");
+    let paused = error.downcast_ref::<RawMirrorCapturePaused>()
+        .ok_or_else(|| anyhow!("expected budget refusal: {error:#}"))?;
+    assert_eq!(paused.used_bytes, used);
+    assert_eq!(measured_usage_walks(&root), 2);
+    assert_eq!(storage_summary(&data).manifest_count, 1);
+    assert_eq!(contents(&data, &first), original);
+    Ok(())
+}
+
+#[test]
+fn malformed_or_exhausted_usage_generations_preserve_existing_snapshots() -> Result<()> {
+    let mut exhausted = b"CASSRMU1".to_vec();
+    exhausted.extend_from_slice(&u64::MAX.to_le_bytes());
+    for invalid in [b"bad".to_vec(), b"WRONGTAG00000000".to_vec(), exhausted] {
+        let temp = tempfile::tempdir()?;
+        let data = temp.path().join("data");
+        let source = temp.path().join("first.jsonl");
+        let original = transcript(0, 1024);
+        fs::write(&source, &original)?;
+        let first = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(1024 * 1024))?;
+        let path = raw_mirror_root(&data).join(USAGE_GENERATION_FILE);
+        fs::write(&path, &invalid)?;
+        let error = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(1024 * 1024))
+            .expect_err("an invalid coordination record cannot authorize mutation");
+        assert!(error.to_string().contains("raw-mirror usage generation"), "{error:#}");
+        assert_eq!(fs::read(&path)?, invalid, "invalid evidence must stay intact");
+        assert_eq!(contents(&data, &first), original);
+        assert_eq!(storage_summary(&data).manifest_count, 1);
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlinked_usage_generation_is_refused_and_preserves_its_target() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let source = temp.path().join("first.jsonl");
+    let original = transcript(0, 1024);
+    fs::write(&source, &original)?;
+    let first = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(1024 * 1024))?;
+    let root = raw_mirror_root(&data);
+    let generation = root.join(USAGE_GENERATION_FILE);
+    fs::rename(&generation, root.join("generation-retained"))?;
+    let outside = temp.path().join("outside-evidence");
+    let mut bytes = b"CASSRMU1".to_vec();
+    bytes.extend_from_slice(&41_u64.to_le_bytes());
+    fs::write(&outside, &bytes)?;
+    std::os::unix::fs::symlink(&outside, &generation)?;
+    let error = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(1024 * 1024))
+        .expect_err("coordination cannot follow a symlink");
+    assert!(error.to_string().contains("raw-mirror usage generation"), "{error:#}");
+    assert_eq!(fs::read(&outside)?, bytes);
+    assert_eq!(contents(&data, &first), original);
+    assert_eq!(storage_summary(&data).manifest_count, 1);
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn replacing_a_hardlinked_usage_generation_preserves_the_other_file() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let source = temp.path().join("first.jsonl");
+    let original = transcript(0, 1024);
+    fs::write(&source, &original)?;
+    let first = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(1024 * 1024))?;
+    let root = raw_mirror_root(&data);
+    let generation = root.join(USAGE_GENERATION_FILE);
+    fs::rename(&generation, root.join("generation-retained"))?;
+    let outside = temp.path().join("outside-evidence");
+    let mut bytes = b"CASSRMU1".to_vec();
+    bytes.extend_from_slice(&41_u64.to_le_bytes());
+    fs::write(&outside, &bytes)?;
+    fs::hard_link(&outside, &generation)?;
+    fs::write(&source, transcript(1, 2048))?;
+    capture(input(&data, &source), CHUNK as u64, CHUNK, policy(1024 * 1024))?;
+    assert_eq!(fs::read(&outside)?, bytes, "publication must never write through a hard link");
+    assert_ne!(fs::read(&generation)?, bytes);
+    assert_eq!(contents(&data, &first), original);
+    assert_eq!(storage_summary(&data).manifest_count, 2);
+    Ok(())
 }
 
 /// A prune in this process deletes files the shared total still counts, so the

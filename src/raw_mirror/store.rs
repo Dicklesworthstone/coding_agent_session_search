@@ -864,6 +864,7 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         // fails, the audit still contains a durable intent record for every
         // target that may have been touched.
         if !report.entries.is_empty() {
+            policy::note_mutation(&root)?;
             let (audit_path, mut audit_file) = open_prune_audit_log(&root)?;
             report.audit_log_path = Some(audit_path.display().to_string());
             apply_prune_entries(&root, &mut report, &audit_path, &mut audit_file)?;
@@ -1843,6 +1844,7 @@ pub fn merge_manifest_db_links(
     let root = raw_mirror_root(data_dir);
     let _mutation_lock = acquire_raw_mirror_mutation_lock(&root)?;
     let manifest_path = raw_mirror_manifest_path_from_relative(&root, manifest_relative_path)?;
+    policy::note_mutation(&root)?;
     merge_raw_mirror_manifest_db_links(&root, &manifest_path, links, None)
 }
 
@@ -2174,44 +2176,62 @@ fn merge_raw_mirror_manifest_db_links(
             RAW_MIRROR_MANIFEST_MAX_BYTES
         ));
     }
-    replace_manifest_bytes(root, manifest_path, &manifest_bytes)
+    replace_raw_mirror_bytes(root, manifest_path, &manifest_bytes)
 }
 
-fn replace_manifest_bytes(root: &Path, manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()> {
-    ensure_private_dir_descendant(
-        root,
-        manifest_path
-            .parent()
-            .ok_or_else(|| anyhow!("raw mirror manifest path has no parent"))?,
-    )?;
-    let temp_dir = unique_capture_temp_dir(root);
-    ensure_private_dir_descendant(root, &temp_dir)?;
-    let temp_path = unique_temp_path(&temp_dir, "manifest-update");
-    let mut temp = private_create_new_file(&temp_path)?;
-    temp.write_all(manifest_bytes).with_context(|| {
-        format!(
-            "write raw mirror manifest update temp {}",
-            temp_path.display()
-        )
-    })?;
-    sync_open_file_if_required(&temp, || {
-        format!(
-            "sync raw mirror manifest update temp {}",
-            temp_path.display()
-        )
-    })?;
-    drop(temp);
+fn replace_raw_mirror_bytes(root: &Path, manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()> {
+    let previous_size = match fs::symlink_metadata(manifest_path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error).context("inspect raw mirror replacement size"),
+    };
+    let result = (|| -> Result<()> {
+        ensure_private_dir_descendant(
+            root,
+            manifest_path
+                .parent()
+                .ok_or_else(|| anyhow!("raw mirror manifest path has no parent"))?,
+        )?;
+        let temp_dir = unique_capture_temp_dir(root);
+        ensure_private_dir_descendant(root, &temp_dir)?;
+        let temp_path = unique_temp_path(&temp_dir, "manifest-update");
+        let mut temp = private_create_new_file(&temp_path)?;
+        temp.write_all(manifest_bytes).with_context(|| {
+            format!(
+                "write raw mirror manifest update temp {}",
+                temp_path.display()
+            )
+        })?;
+        sync_open_file_if_required(&temp, || {
+            format!(
+                "sync raw mirror manifest update temp {}",
+                temp_path.display()
+            )
+        })?;
+        drop(temp);
 
-    fs::rename(&temp_path, manifest_path).with_context(|| {
-        format!(
-            "replace raw mirror manifest {} from {}",
-            manifest_path.display(),
-            temp_path.display()
-        )
-    })?;
-    sync_parent(manifest_path)?;
-    remove_empty_temp_dir_best_effort(&temp_dir);
-    Ok(())
+        fs::rename(&temp_path, manifest_path).with_context(|| {
+            format!(
+                "replace raw mirror manifest {} from {}",
+                manifest_path.display(),
+                temp_path.display()
+            )
+        })?;
+        sync_parent(manifest_path)?;
+        remove_empty_temp_dir_best_effort(&temp_dir);
+        Ok(())
+    })();
+    if result.is_ok() {
+        policy::record_file_growth(
+            root,
+            (manifest_bytes.len() as u64).saturating_sub(previous_size),
+        );
+    } else {
+        // Failed replacement may leave retained staging bytes. Never reuse a
+        // total that cannot account for the actual error outcome.
+        policy::forget_measured_usage(root);
+    }
+    result
 }
 
 fn raw_mirror_manifest_path_from_relative(root: &Path, relative_path: &str) -> Result<PathBuf> {

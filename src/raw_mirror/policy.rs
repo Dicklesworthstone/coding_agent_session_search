@@ -98,9 +98,10 @@ struct MeasuredUsage {
     measured: u64,
     /// Bytes reserved by admissions since that walk.
     admitted: u64,
-    measured_at: std::time::Instant,
+    measured_at: Option<std::time::Instant>,
     walk: Duration,
     walks: u64,
+    mutation_generation: u64,
 }
 
 fn measured_usage_cache() -> std::sync::MutexGuard<'static, HashMap<PathBuf, MeasuredUsage>> {
@@ -110,17 +111,81 @@ fn measured_usage_cache() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Mea
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+const USAGE_GENERATION_FILE: &str = ".usage-generation";
+
+/// Fence cached usage before a writer changes the mirror. The caller holds
+/// the existing mutation lock. Previews must never call this function.
+/// All cooperating writers must use this protocol; older writers cannot
+/// invalidate another process's in-memory inventory.
+pub(super) fn note_mutation(root: &Path) -> Result<()> {
+    let path = root.join(USAGE_GENERATION_FILE);
+    let previous = match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() == 16,
+                "invalid raw-mirror usage generation"
+            );
+            let mut file = open_stable_source_file(&path, &metadata)?;
+            let mut bytes = [0_u8; 16];
+            file.read_exact(&mut bytes)?;
+            let (magic, value) = bytes.split_at(8);
+            anyhow::ensure!(magic == b"CASSRMU1", "invalid raw-mirror usage generation");
+            let mut value_bytes = [0_u8; 8];
+            value_bytes.copy_from_slice(value);
+            u64::from_le_bytes(value_bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error).context("inspect raw-mirror usage generation"),
+    };
+    let next = previous
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("raw-mirror usage generation exhausted"))?;
+    let mut bytes = [0_u8; 16];
+    let (magic, value) = bytes.split_at_mut(8);
+    magic.copy_from_slice(b"CASSRMU1");
+    value.copy_from_slice(&next.to_le_bytes());
+    // Atomic replacement never writes through a hard-linked destination.
+    // A crash may invalidate a cache unnecessarily, but cannot publish data
+    // under a generation that was never made visible.
+    replace_raw_mirror_bytes(root, &path, &bytes)?;
+    let mut cache = measured_usage_cache();
+    let entry = cache.entry(root.to_path_buf()).or_insert(MeasuredUsage {
+        measured: 0,
+        admitted: 0,
+        measured_at: None,
+        walk: Duration::ZERO,
+        walks: 0,
+        mutation_generation: previous,
+    });
+    if entry.mutation_generation != previous {
+        entry.measured_at = None;
+        entry.admitted = 0;
+    }
+    entry.mutation_generation = next;
+    Ok(())
+}
+
+/// Direct DB-link updates can grow a manifest outside a capture's Budget.
+/// Count positive growth conservatively; shrinkage waits for the next walk.
+pub(super) fn record_file_growth(root: &Path, bytes: u64) {
+    if let Some(entry) = measured_usage_cache().get_mut(root) {
+        entry.admitted = entry.admitted.saturating_add(bytes);
+    }
+}
+
 /// Usage to admit `bytes` against under `policy`: the shared total when it
 /// decides clearly (see MEASURED_USAGE), otherwise a new walk.
 fn shared_usage(root: &Path, policy: RawMirrorRetentionPolicy, bytes: u64) -> Result<u64> {
     let mut cache = measured_usage_cache();
     let previous = cache.get(root).copied();
-    if let Some(entry) = previous {
+    if let Some(entry) = previous
+        && let Some(measured_at) = entry.measured_at
+    {
         let refresh_after = entry.walk.saturating_mul(20).max(Duration::from_secs(60));
         let margin = policy.max_bytes / 8;
         let request = bytes.saturating_add(4096);
         let estimated = entry.measured.saturating_add(entry.admitted);
-        if entry.measured_at.elapsed() < refresh_after {
+        if measured_at.elapsed() < refresh_after {
             if estimated.saturating_add(request) < policy.max_bytes.saturating_sub(margin) {
                 return Ok(estimated);
             }
@@ -136,9 +201,10 @@ fn shared_usage(root: &Path, policy: RawMirrorRetentionPolicy, bytes: u64) -> Re
         MeasuredUsage {
             measured,
             admitted: 0,
-            measured_at: std::time::Instant::now(),
+            measured_at: Some(std::time::Instant::now()),
             walk: started.elapsed(),
             walks: previous.map_or(0, |entry| entry.walks) + 1,
+            mutation_generation: previous.map_or(0, |entry| entry.mutation_generation),
         },
     );
     Ok(measured)
@@ -503,6 +569,7 @@ pub(crate) fn capture(
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         anyhow::bail!("raw mirror source changed identity while waiting for capture");
     }
+    note_mutation(&root)?;
     let mut budget = Budget {
         root: &root,
         policy,

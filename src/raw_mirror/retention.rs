@@ -278,6 +278,7 @@ fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> 
         .fold(0, u64::saturating_add);
     for entry in &report.entries { validate_prune_target_file(&root, &root.join(&entry.path))?; }
     if !report.entries.is_empty() {
+        note_mutation(&root)?;
         // Preserve DB links before retiring descriptors. A failed merge leaves
         // every old descriptor intact; a crash can only add redundant links.
         for (id, successor) in &selected {
