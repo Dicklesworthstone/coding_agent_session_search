@@ -577,6 +577,114 @@ fn incremental_index_reads_committed_chat_from_live_wal() -> Result<()> {
 }
 
 #[test]
+fn watch_once_reads_committed_wal_without_scanning_adjacent_workspaces() -> Result<()> {
+    for streaming in ["0", "1"] {
+        let home = tempfile::tempdir()?;
+        let directory = workspace(home.path(), "workspace-targeted-wal")?;
+        let path = database(
+            &directory,
+            &json!([session("checkpointed", "copilottargetedseed")]),
+            true,
+        )?;
+        let writer = Connection::open(path.to_string_lossy().as_ref())?;
+        writer.execute("PRAGMA journal_mode = WAL")?;
+        writer.execute("PRAGMA wal_autocheckpoint = 0")?;
+        let checkpoint_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        fs::File::options()
+            .write(true)
+            .open(&path)?
+            .set_times(fs::FileTimes::new().set_modified(checkpoint_mtime))?;
+        let data = home.path().join("cass-data");
+        let mut initial = command(home.path(), &data);
+        initial
+            .env("CASS_STREAMING_INDEX", streaming)
+            .args(["index", "--full", "--json"]);
+        assert_cmd::Command::from_std(initial)
+            .timeout(Duration::from_secs(120))
+            .assert()
+            .success();
+        let adjacent = workspace(home.path(), "workspace-adjacent")?;
+        let adjacent_path = database(
+            &adjacent,
+            &json!([session("adjacent", "copilottargetedneighbor")]),
+            false,
+        )?;
+        let adjacent_before = bundle(&adjacent_path)?;
+        let checkpoint = bundle(&path)?;
+        let search = |needle: &str| -> Result<Value> {
+            let output = assert_cmd::Command::from_std(command(home.path(), &data))
+                .args([
+                    "search",
+                    needle,
+                    "--mode",
+                    "lexical",
+                    "--json",
+                    "--no-maintenance",
+                ])
+                .timeout(Duration::from_secs(30))
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "targeted WAL search failed: {output:?}"
+            );
+            Ok(serde_json::from_slice(&output.stdout)?)
+        };
+        let wal = path.with_file_name("state.vscdb-wal");
+        for (trigger, id, needle) in [
+            (&path, "primary", "copilottargetedprimary"),
+            (&wal, "wal", "copilottargetedwal"),
+        ] {
+            std::thread::sleep(Duration::from_millis(1_200));
+            let payload = json!([
+                session("checkpointed", "copilottargetedseed"),
+                session(id, needle),
+            ])
+            .to_string();
+            writer.execute_compat(
+                "UPDATE ItemTable SET value = ?1 WHERE key = 'interactive.sessions'",
+                &[ParamValue::from(payload.as_str())],
+            )?;
+            let before = bundle(&path)?;
+            assert_eq!(before[0], checkpoint[0], "only the WAL may change");
+            assert!(before[1].as_ref().is_some_and(|(bytes, _)| !bytes.is_empty()));
+            let mut targeted = command(home.path(), &data);
+            targeted.env("CASS_STREAMING_INDEX", streaming)
+                .args(["index", "--watch-once"])
+                .arg(trigger)
+                .arg("--json");
+            assert_cmd::Command::from_std(targeted)
+                .timeout(Duration::from_secs(120))
+                .assert()
+                .success();
+            let value = search(needle)?;
+            let hits = value["hits"].as_array().expect("search hits");
+            assert_eq!(hits.len(), 1, "{streaming}/{id}: {value}");
+            assert_eq!(hits[0]["agent"], "copilot");
+            assert_eq!(hits[0]["source_id"], "local");
+            assert_eq!(hits[0]["source_path"], path.to_string_lossy().as_ref());
+            assert_eq!(
+                search("copilottargetedneighbor")?["hits"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(0)
+            );
+            assert_eq!(
+                bundle(&path)?,
+                before,
+                "targeted scan changed provider state"
+            );
+            assert_eq!(
+                bundle(&adjacent_path)?,
+                adjacent_before,
+                "targeted scan changed neighbor"
+            );
+        }
+        writer.close()?;
+    }
+    Ok(())
+}
+
+#[test]
 fn wal_fallback_preserves_generation_precedence_scope_and_origin() -> Result<()> {
     use coding_agent_search::connectors::Origin;
 
