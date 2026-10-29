@@ -349,3 +349,107 @@ fn standard_cli_indexes_and_searches_copilot_sqlite_history() -> Result<()> {
     );
     Ok(())
 }
+
+fn captured_fixture_sources(data: &Path, home: &Path) -> Result<Vec<PathBuf>> {
+    let manifests = match fs::read_dir(data.join("raw-mirror/v1/manifests")) {
+        Ok(manifests) => manifests,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut paths = Vec::new();
+    for entry in manifests {
+        let value: Value = serde_json::from_slice(&fs::read(entry?.path())?)?;
+        let original = value["original_path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("capture must name its original source"))?;
+        let path = PathBuf::from(original);
+        if path.starts_with(home) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn chat_free_workspace_then_first_chat(streaming: &str) -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let directory = workspace(home.path(), "workspace-without-chat")?;
+    let path = directory.join("state.vscdb");
+    let conn = Connection::open(path.to_string_lossy().as_ref())?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB);
+         INSERT INTO ItemTable VALUES ('unrelated.extension', 'private workspace state');",
+    )?;
+    conn.close()?;
+    let before = bundle(&path)?;
+    let data = home.path().join("cass-data");
+    let index = |full: bool| {
+        let mut cmd = command(home.path(), &data);
+        cmd.env("CASS_STREAMING_INDEX", streaming)
+            .args(["index", "--json"]);
+        if full {
+            cmd.arg("--full");
+        }
+        assert_cmd::Command::from_std(cmd)
+            .timeout(Duration::from_secs(120))
+            .assert()
+            .success();
+    };
+    index(true);
+    assert!(
+        captured_fixture_sources(&data, home.path())?.is_empty(),
+        "a workspace without chat must not create raw recovery copies of VS Code state"
+    );
+    assert_eq!(bundle(&path)?, before, "inspection changed VS Code state");
+
+    let conn = Connection::open(path.to_string_lossy().as_ref())?;
+    let payload = json!([session("first-chat", "copilotfirstchatneedle")]).to_string();
+    conn.execute_compat(
+        "INSERT INTO ItemTable VALUES ('interactive.sessions', ?1)",
+        &[ParamValue::from(payload.as_str())],
+    )?;
+    conn.close()?;
+    let with_chat = bundle(&path)?;
+    index(false);
+    let mut expected = vec![path.clone(), directory.join("workspace.json")];
+    expected.sort();
+    assert_eq!(captured_fixture_sources(&data, home.path())?, expected);
+    let output = assert_cmd::Command::from_std(command(home.path(), &data))
+        .args([
+            "search",
+            "copilotfirstchatneedle",
+            "--mode",
+            "lexical",
+            "--json",
+            "--no-maintenance",
+        ])
+        .timeout(Duration::from_secs(30))
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "first-chat search failed: {output:?}"
+    );
+    let value: Value = serde_json::from_slice(&output.stdout)?;
+    assert!(
+        value["hits"].as_array().is_some_and(|hits| {
+            hits.iter().any(|hit| {
+                hit["agent"].as_str() == Some("copilot")
+                    && hit["source_path"].as_str() == path.to_str()
+            })
+        }),
+        "the first real chat must be indexed on the next incremental pass: {value}"
+    );
+    assert_eq!(bundle(&path)?, with_chat, "capture changed VS Code state");
+    Ok(())
+}
+
+#[test]
+fn chat_free_workspace_is_not_mirrored_and_first_chat_is_captured_buffered() -> Result<()> {
+    chat_free_workspace_then_first_chat("0")
+}
+
+#[test]
+fn chat_free_workspace_is_not_mirrored_and_first_chat_is_captured_streaming() -> Result<()> {
+    chat_free_workspace_then_first_chat("1")
+}
