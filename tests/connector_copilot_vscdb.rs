@@ -371,7 +371,10 @@ fn captured_fixture_sources(data: &Path, home: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn chat_free_workspace_then_first_chat(streaming: &str) -> Result<()> {
+fn chat_free_workspace_then_first_chat(
+    streaming: &str,
+    initial_payload: Option<&str>,
+) -> Result<()> {
     let home = tempfile::tempdir()?;
     let directory = workspace(home.path(), "workspace-without-chat")?;
     let path = directory.join("state.vscdb");
@@ -381,6 +384,12 @@ fn chat_free_workspace_then_first_chat(streaming: &str) -> Result<()> {
          CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB);
          INSERT INTO ItemTable VALUES ('unrelated.extension', 'private workspace state');",
     )?;
+    if let Some(payload) = initial_payload {
+        conn.execute_compat(
+            "INSERT INTO ItemTable VALUES ('interactive.sessions', CAST(?1 AS BLOB))",
+            &[ParamValue::from(payload)],
+        )?;
+    }
     conn.close()?;
     let before = bundle(&path)?;
     let data = home.path().join("cass-data");
@@ -406,7 +415,7 @@ fn chat_free_workspace_then_first_chat(streaming: &str) -> Result<()> {
     let conn = Connection::open(path.to_string_lossy().as_ref())?;
     let payload = json!([session("first-chat", "copilotfirstchatneedle")]).to_string();
     conn.execute_compat(
-        "INSERT INTO ItemTable VALUES ('interactive.sessions', ?1)",
+        "INSERT OR REPLACE INTO ItemTable VALUES ('interactive.sessions', ?1)",
         &[ParamValue::from(payload.as_str())],
     )?;
     conn.close()?;
@@ -446,10 +455,20 @@ fn chat_free_workspace_then_first_chat(streaming: &str) -> Result<()> {
 
 #[test]
 fn chat_free_workspace_is_not_mirrored_and_first_chat_is_captured_buffered() -> Result<()> {
-    chat_free_workspace_then_first_chat("0")
+    chat_free_workspace_then_first_chat("0", None)
 }
 
 #[test]
 fn chat_free_workspace_is_not_mirrored_and_first_chat_is_captured_streaming() -> Result<()> {
-    chat_free_workspace_then_first_chat("1")
+    chat_free_workspace_then_first_chat("1", None)
+}
+
+#[test]
+fn empty_legacy_chat_payload_is_not_mirrored_and_first_chat_is_captured() -> Result<()> {
+    for streaming in ["0", "1"] {
+        for payload in ["[]", "{}", "[ \n\t\r ]", "{ \n\t\r }"] {
+            chat_free_workspace_then_first_chat(streaming, Some(payload))?;
+        }
+    }
+    Ok(())
 }

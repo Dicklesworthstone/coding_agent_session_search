@@ -10,8 +10,8 @@ use super::{
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-/// Omit only VS Code state conclusively unrelated to legacy chat. Query
-/// failures and existing chat keys keep the normal capture-before-parse path.
+/// Omit only VS Code state with no legacy chat key or a known empty JSON
+/// container. Ambiguous data keeps the normal capture-before-parse path.
 pub(crate) fn source_is_proven_chat_free(path: &Path) -> bool {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return false;
@@ -20,7 +20,7 @@ pub(crate) fn source_is_proven_chat_free(path: &Path) -> bool {
         return false;
     }
     if path.file_name().is_some_and(|name| name == "state.vscdb") {
-        return legacy_store_has_no_chat_key(path);
+        return legacy_store_is_proven_chat_free(path);
     }
     if path.file_name().is_none_or(|name| name != "workspace.json") {
         return false;
@@ -32,7 +32,7 @@ pub(crate) fn source_is_proven_chat_free(path: &Path) -> bool {
         .parent()
         .and_then(Path::file_name)
         .is_none_or(|name| name != "workspaceStorage")
-        || !legacy_store_has_no_chat_key(&workspace.join("state.vscdb"))
+        || !legacy_store_is_proven_chat_free(&workspace.join("state.vscdb"))
     {
         return false;
     }
@@ -65,7 +65,7 @@ pub(crate) fn source_is_proven_chat_free(path: &Path) -> bool {
     true
 }
 
-fn legacy_store_has_no_chat_key(path: &Path) -> bool {
+fn legacy_store_is_proven_chat_free(path: &Path) -> bool {
     use crate::franken_sync::compat::{OpenFlags, RowExt, open_with_flags};
 
     match std::fs::symlink_metadata(path) {
@@ -79,13 +79,26 @@ fn legacy_store_has_no_chat_key(path: &Path) -> bool {
     let Ok(connection) = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
         return false;
     };
-    // Ask only whether the legacy key exists. Even a NULL, malformed, empty
-    // or foreign-provider payload remains evidence; this is not a parser.
-    let query = "SELECT COUNT(*) FROM ItemTable WHERE key = 'interactive.sessions'";
-    let Ok(row) = connection.query_row(query) else {
+    // Inspect only small payloads, using the same BLOB-to-text conversion as
+    // the legacy reader. Never deserialize a whole large history just to
+    // decide whether to preserve it. Two rows prove an ambiguous duplicate
+    // key; no row, NULL, malformed JSON and unknown shapes remain distinct.
+    let query = "SELECT CASE WHEN length(value) <= 4096 THEN CAST(value AS TEXT) ELSE NULL END \
+                 FROM ItemTable WHERE key = 'interactive.sessions' LIMIT 2";
+    let Ok(rows) = connection.query(query) else {
         return false;
     };
-    matches!(row.get_typed::<i64>(0), Ok(0))
+    let [row] = rows.as_slice() else {
+        return rows.is_empty();
+    };
+    let Ok(raw) = row.get_typed::<String>(0) else {
+        return false;
+    };
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(serde_json::Value::Array(items)) => items.is_empty(),
+        Ok(serde_json::Value::Object(items)) => items.is_empty(),
+        _ => false,
+    }
 }
 
 /// GitHub Copilot Chat (VS Code, VS Code Insiders, VSCodium).
@@ -288,6 +301,74 @@ mod tests {
             &workspace.join("workspace.json")
         ));
         assert!(!source_is_proven_chat_free(&transcript));
+        let database = workspace.join("state.vscdb");
+        let connection = crate::franken_sync::Connection::open(database.to_str().unwrap())?;
+        connection.execute("INSERT INTO ItemTable VALUES ('interactive.sessions', '[]')")?;
+        connection.close()?;
+        assert!(source_is_proven_chat_free(&workspace.join("state.vscdb")));
+        assert!(!source_is_proven_chat_free(
+            &workspace.join("workspace.json")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_legacy_payloads_are_omitted_and_unknown_values_are_preserved() -> Result<()> {
+        use crate::franken_sync::compat::{ConnectionExt, ParamValue};
+
+        let home = tempfile::tempdir()?;
+        let workspace = empty_legacy_workspace(home.path())?;
+        let database = workspace.join("state.vscdb");
+        let oversized = format!("[{}]", " ".repeat(4096));
+        for (payload, chat_free) in [
+            ("[]", true),
+            ("{}", true),
+            ("[ \n\t\r ]", true),
+            ("{ \n\t\r }", true),
+            ("null", false),
+            ("true", false),
+            ("\"[]\"", false),
+            ("[null]", false),
+            ("{\"future\":{}}", false),
+            ("{malformed", false),
+            (oversized.as_str(), false),
+        ] {
+            let connection = crate::franken_sync::Connection::open(database.to_str().unwrap())?;
+            connection.execute_compat(
+                "INSERT OR REPLACE INTO ItemTable VALUES ('interactive.sessions', ?1)",
+                &[ParamValue::from(payload)],
+            )?;
+            connection.close()?;
+            let before = std::fs::read(&database)?;
+            let modified = std::fs::metadata(&database)?.modified()?;
+            assert_eq!(
+                source_is_proven_chat_free(&database),
+                chat_free,
+                "{payload}"
+            );
+            assert_eq!(
+                source_is_proven_chat_free(&workspace.join("workspace.json")),
+                chat_free,
+                "{payload}"
+            );
+            assert_eq!(std::fs::read(&database)?, before);
+            assert_eq!(std::fs::metadata(&database)?.modified()?, modified);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_legacy_chat_keys_remain_ambiguous() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let database = home.path().join("state.vscdb");
+        let connection = crate::franken_sync::Connection::open(database.to_str().unwrap())?;
+        connection.execute("CREATE TABLE ItemTable (key TEXT, value BLOB)")?;
+        connection.execute("INSERT INTO ItemTable VALUES ('interactive.sessions', '[]')")?;
+        connection.execute("INSERT INTO ItemTable VALUES ('interactive.sessions', '{}')")?;
+        connection.close()?;
+        let before = std::fs::read(&database)?;
+        assert!(!source_is_proven_chat_free(&database));
+        assert_eq!(std::fs::read(database)?, before);
         Ok(())
     }
 
