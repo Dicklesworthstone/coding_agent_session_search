@@ -34406,6 +34406,11 @@ fn capture_discovered_source_file_before_parse(
     if raw_source_exclusions.excludes(&source.source_path) {
         return;
     }
+    if provider == "copilot"
+        && crate::connectors::copilot::source_is_proven_chat_free(&source.source_path)
+    {
+        return;
+    }
 
     match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
         data_dir,
@@ -34584,6 +34589,9 @@ fn capture_scan_root_file_before_parse(
     {
         return false;
     }
+    if provider == "copilot" && crate::connectors::copilot::source_is_proven_chat_free(&root.path) {
+        return false;
+    }
     match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
         data_dir,
         provider,
@@ -34600,7 +34608,7 @@ fn capture_scan_root_file_before_parse(
                 manifest_id = %record.manifest_id,
                 blob_blake3 = %record.blob_blake3,
                 already_present = record.already_present,
-                "captured explicit scan-root source into raw mirror before connector parse"
+            "captured explicit scan-root source into raw mirror before connector parse"
             );
         }
         Err(error) => {
@@ -42998,6 +43006,61 @@ mod tests {
             std::fs::read(&source_path).expect("source remains untouched"),
             source_bytes
         );
+    }
+
+    #[test]
+    fn raw_mirror_capture_preserves_unreadable_copilot_state_before_parse() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let source_path = temp.path().join("state.vscdb");
+        let source_bytes = b"unreadable legacy chat database evidence";
+        std::fs::write(&source_path, source_bytes)?;
+        for (kind, discovered) in [("discovered", true), ("explicit", false)] {
+            let data_dir = temp.path().join(kind);
+            if discovered {
+                let root = ScanRoot::local(temp.path().to_path_buf());
+                let source = DiscoveredSourceFile::new(
+                    "copilot",
+                    &root,
+                    source_path.clone(),
+                    crate::connectors::DiscoveredSourceRole::SqliteDatabase,
+                    true,
+                );
+                capture_discovered_source_file_before_parse(
+                    &data_dir,
+                    "copilot",
+                    &source,
+                    &RawSourceExclusions::default(),
+                );
+            } else {
+                capture_scan_root_file_before_parse(
+                    &data_dir,
+                    "copilot",
+                    &ScanRoot::local(source_path.clone()),
+                    &ActiveSessionSourceFilter::default(),
+                    &RawSourceExclusions::default(),
+                );
+            }
+            let manifests = raw_mirror_manifest_values(&data_dir);
+            assert_eq!(
+                manifests.len(),
+                1,
+                "ambiguous state must be preserved before parse"
+            );
+            let blob = manifests[0]["blob_relative_path"].as_str().unwrap();
+            assert_eq!(
+                std::fs::read(data_dir.join("raw-mirror/v1").join(blob))?,
+                source_bytes
+            );
+        }
+        let ctx = ScanContext::with_roots(
+            temp.path().to_path_buf(),
+            vec![ScanRoot::local(source_path.clone())],
+            None,
+        );
+        let parsed = CopilotConnector::new().scan(&ctx);
+        assert!(parsed.is_err() || parsed.is_ok_and(|conversations| conversations.is_empty()));
+        assert_eq!(std::fs::read(source_path)?, source_bytes);
+        Ok(())
     }
 
     /// f3grf: the Claude connector registers as `claude` and its conversations

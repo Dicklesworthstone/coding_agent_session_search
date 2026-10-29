@@ -1,14 +1,92 @@
 //! Connector for GitHub Copilot Chat session logs.
 //!
-//! Parsing lives in `franken_agent_detection::connectors::copilot`. CASS wraps
-//! it only to widen detection (see [`CopilotConnector::detect`]).
+//! Parsing lives in `franken_agent_detection::connectors::copilot`. CASS
+//! handles detection and preservation of shared VS Code stores here.
 
 use super::{
     Connector, DetectionResult, DiscoveredSourceFile, DiscoveredSourceRole, NormalizedConversation,
     ScanContext,
 };
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Omit only VS Code state conclusively unrelated to legacy chat. Query
+/// failures and existing chat keys keep the normal capture-before-parse path.
+pub(crate) fn source_is_proven_chat_free(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    if path.file_name().is_some_and(|name| name == "state.vscdb") {
+        return legacy_store_has_no_chat_key(path);
+    }
+    if path.file_name().is_none_or(|name| name != "workspace.json") {
+        return false;
+    }
+    let Some(workspace) = path.parent() else {
+        return false;
+    };
+    if workspace
+        .parent()
+        .and_then(Path::file_name)
+        .is_none_or(|name| name != "workspaceStorage")
+        || !legacy_store_has_no_chat_key(&workspace.join("state.vscdb"))
+    {
+        return false;
+    }
+    // This sidecar also resolves workspaces for native JSON/JSONL history.
+    // Keep it whenever a transcript might exist or the directory is unsafe.
+    let sessions = workspace.join("chatSessions");
+    match std::fs::symlink_metadata(&sessions) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        _ => return false,
+    }
+    let Ok(entries) = std::fs::read_dir(sessions) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        if entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("json") || extension.eq_ignore_ascii_case("jsonl")
+            })
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn legacy_store_has_no_chat_key(path: &Path) -> bool {
+    use crate::franken_sync::compat::{OpenFlags, RowExt, open_with_flags};
+
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        _ => return false,
+    }
+    let Some(path) = path.to_str() else {
+        return false;
+    };
+    let Ok(connection) = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return false;
+    };
+    // Ask only whether the legacy key exists. Even a NULL, malformed, empty
+    // or foreign-provider payload remains evidence; this is not a parser.
+    let query = "SELECT COUNT(*) FROM ItemTable WHERE key = 'interactive.sessions'";
+    let Ok(row) = connection.query_row(query) else {
+        return false;
+    };
+    matches!(row.get_typed::<i64>(0), Ok(0))
+}
 
 /// GitHub Copilot Chat (VS Code, VS Code Insiders, VSCodium).
 #[derive(Default)]
@@ -145,5 +223,111 @@ mod tests {
                 .native_store_detection(&scan_home(home.path()))
                 .detected
         );
+    }
+
+    fn empty_legacy_workspace(home: &Path) -> Result<PathBuf> {
+        let workspace = home.join(".config/Code/User/workspaceStorage/empty-workspace");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::write(
+            workspace.join("workspace.json"),
+            br#"{"folder":"file:///w"}"#,
+        )?;
+        let database = workspace.join("state.vscdb");
+        let connection = crate::franken_sync::Connection::open(database.to_str().unwrap())?;
+        connection.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)")?;
+        connection
+            .execute("INSERT INTO ItemTable VALUES ('unrelated.extension', 'workspace state')")?;
+        connection.close()?;
+        Ok(workspace)
+    }
+
+    #[test]
+    fn chat_free_probe_is_read_only_and_keeps_existing_chat_keys() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let workspace = empty_legacy_workspace(home.path())?;
+        let database = workspace.join("state.vscdb");
+        let before = std::fs::read(&database)?;
+        let modified = std::fs::metadata(&database)?.modified()?;
+        assert!(source_is_proven_chat_free(&database));
+        assert!(source_is_proven_chat_free(
+            &workspace.join("workspace.json")
+        ));
+        assert_eq!(std::fs::read(&database)?, before);
+        assert_eq!(std::fs::metadata(&database)?.modified()?, modified);
+
+        let connection = crate::franken_sync::Connection::open(database.to_str().unwrap())?;
+        connection.execute("INSERT INTO ItemTable VALUES ('interactive.sessions', NULL)")?;
+        connection.close()?;
+        assert!(!source_is_proven_chat_free(&database));
+        assert!(!source_is_proven_chat_free(
+            &workspace.join("workspace.json")
+        ));
+
+        let connection = crate::franken_sync::Connection::open(database.to_str().unwrap())?;
+        connection.execute(
+            "UPDATE ItemTable SET value = 'malformed chat payload' WHERE key = 'interactive.sessions'",
+        )?;
+        connection.close()?;
+        assert!(!source_is_proven_chat_free(&database));
+        Ok(())
+    }
+
+    #[test]
+    fn native_transcript_keeps_its_workspace_sidecar_even_without_legacy_chat() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let workspace = empty_legacy_workspace(home.path())?;
+        let sessions = workspace.join("chatSessions");
+        std::fs::create_dir_all(&sessions)?;
+        let transcript = sessions.join("unparsed.jsonl");
+        std::fs::write(
+            &transcript,
+            b"{malformed transcript preserved before parsing\n",
+        )?;
+        assert!(source_is_proven_chat_free(&workspace.join("state.vscdb")));
+        assert!(!source_is_proven_chat_free(
+            &workspace.join("workspace.json")
+        ));
+        assert!(!source_is_proven_chat_free(&transcript));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_and_corrupt_stores_never_prove_an_empty_legacy_database() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let path = home.path().join("state.vscdb");
+        assert!(!source_is_proven_chat_free(&path));
+        let bytes = b"unreadable legacy chat evidence";
+        std::fs::write(&path, bytes)?;
+        assert!(!source_is_proven_chat_free(&path));
+        assert_eq!(std::fs::read(&path)?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn committed_chat_key_in_a_live_wal_is_never_treated_as_chat_free() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let workspace = empty_legacy_workspace(home.path())?;
+        let database = workspace.join("state.vscdb");
+        let writer = crate::franken_sync::Connection::open(database.to_str().unwrap())?;
+        writer.execute("PRAGMA journal_mode = WAL")?;
+        writer.execute("PRAGMA wal_autocheckpoint = 0")?;
+        let primary_before = std::fs::read(&database)?;
+        writer.execute("INSERT INTO ItemTable VALUES ('interactive.sessions', 'unparsed chat')")?;
+        let wal = workspace.join("state.vscdb-wal");
+        let wal_before = std::fs::read(&wal)?;
+        assert!(
+            wal_before.len() > 32,
+            "the provider must have a committed WAL"
+        );
+        assert_eq!(std::fs::read(&database)?, primary_before);
+        assert!(!source_is_proven_chat_free(&database));
+        assert_eq!(std::fs::read(&database)?, primary_before);
+        assert_eq!(
+            std::fs::read(wal)?,
+            wal_before,
+            "the probe must not rewrite the WAL"
+        );
+        writer.close()?;
+        Ok(())
     }
 }
