@@ -5,9 +5,10 @@
 
 use super::{
     Connector, DetectionResult, DiscoveredSourceFile, DiscoveredSourceRole, NormalizedConversation,
-    ScanContext,
+    ScanContext, ScanRoot, file_modified_since,
 };
 use anyhow::Result;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Omit only VS Code state with no legacy chat key or a known empty JSON
@@ -113,6 +114,43 @@ impl CopilotConnector {
         Self::default()
     }
 
+    /// FAD's native reader filters the primary mtime, but VS Code can commit
+    /// chat changes into a live WAL without touching that file. Discover only
+    /// those skipped stores and their existing metadata; parsing stays in FAD.
+    fn wal_only_sources(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        if ctx.since_ts.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut full = ctx.clone();
+        full.since_ts = None;
+        let mut sources = self.inner.discover_source_files(&full)?;
+        let databases: HashSet<PathBuf> = sources
+            .iter()
+            .filter(|source| {
+                if source.role != DiscoveredSourceRole::SqliteDatabase
+                    || file_modified_since(&source.source_path, ctx.since_ts)
+                {
+                    return false;
+                }
+                let mut wal = source.source_path.as_os_str().to_owned();
+                wal.push("-wal");
+                let wal = PathBuf::from(wal);
+                wal.is_file() && file_modified_since(&wal, ctx.since_ts)
+            })
+            .map(|source| source.source_path.clone())
+            .collect();
+        let parents: HashSet<&Path> = databases.iter().filter_map(|path| path.parent()).collect();
+        sources.retain(|source| {
+            databases.contains(&source.source_path)
+                || (source.role == DiscoveredSourceRole::MetadataSidecar
+                    && source
+                        .source_path
+                        .parent()
+                        .is_some_and(|parent| parents.contains(parent)))
+        });
+        Ok(sources)
+    }
+
     /// Native VS Code chat stores the upstream connector would scan in `ctx`:
     /// `workspaceStorage/*/chatSessions`, the empty-window and transferred
     /// session stores, and legacy `state.vscdb` sessions. Not detected when
@@ -167,11 +205,61 @@ impl Connector for CopilotConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        self.inner.scan(ctx)
+        let pending = self.wal_only_sources(ctx)?;
+        let mut conversations = self.inner.scan(ctx)?;
+        if pending.is_empty() {
+            return Ok(conversations);
+        }
+        let mut seen: HashSet<String> = conversations
+            .iter()
+            .filter_map(|conversation| conversation.external_id.clone())
+            .collect();
+        // Ordinary extension/native results outrank these older SQLite
+        // primaries. Full discovery retains FAD's mtime ordering between the
+        // supplemental stores, so deduplication keeps its generation priority.
+        for source in pending {
+            if source.role != DiscoveredSourceRole::SqliteDatabase {
+                continue;
+            }
+            let mut scoped = ctx.clone();
+            scoped.since_ts = None;
+            let root = ctx
+                .scan_roots
+                .iter()
+                .find(|root| root.path == source.scan_root)
+                .cloned()
+                .unwrap_or_else(|| ScanRoot::local(source.scan_root.clone()));
+            scoped.scan_roots = vec![root.with_path(source.source_path)];
+            for conversation in self.inner.scan(&scoped)? {
+                if conversation
+                    .external_id
+                    .as_ref()
+                    .is_some_and(|id| !seen.insert(id.clone()))
+                {
+                    continue;
+                }
+                conversations.push(conversation);
+            }
+        }
+        Ok(conversations)
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        self.inner.discover_source_files(ctx)
+        let pending = self.wal_only_sources(ctx)?;
+        let mut sources = self.inner.discover_source_files(ctx)?;
+        if pending.is_empty() {
+            return Ok(sources);
+        }
+        let mut paths: HashSet<PathBuf> = sources
+            .iter()
+            .map(|source| source.source_path.clone())
+            .collect();
+        for source in pending {
+            if paths.insert(source.source_path.clone()) {
+                sources.push(source);
+            }
+        }
+        Ok(sources)
     }
 }
 

@@ -575,3 +575,122 @@ fn incremental_index_reads_committed_chat_from_live_wal() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn wal_fallback_preserves_generation_precedence_scope_and_origin() -> Result<()> {
+    use coding_agent_search::connectors::Origin;
+
+    let home = tempfile::tempdir()?;
+    let directory = workspace(home.path(), "workspace-wal-priority")?;
+    let path = database(&directory, &json!([session("seed", "checkpoint")]), false)?;
+    let writer = Connection::open(path.to_string_lossy().as_ref())?;
+    writer.execute("PRAGMA journal_mode = WAL")?;
+    writer.execute("PRAGMA wal_autocheckpoint = 0")?;
+    fs::File::options()
+        .write(true)
+        .open(&path)?
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))?;
+    let payload = json!([
+        session("shared", "obsolete sqlite log copy"),
+        session("flat-wins", "obsolete sqlite flat copy"),
+        session("recent-wins", "older sqlite copy"),
+        session("export-wins", "obsolete sqlite export copy"),
+        session("wal-only", "unique committed WAL chat")
+    ])
+    .to_string();
+    writer.execute_compat(
+        "UPDATE ItemTable SET value = ?1 WHERE key = 'interactive.sessions'",
+        &[ParamValue::from(payload.as_str())],
+    )?;
+    let wal = path.with_file_name("state.vscdb-wal");
+    let since = i64::try_from(
+        fs::metadata(&wal)?
+            .modified()?
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    let sessions = directory.join("chatSessions");
+    fs::create_dir_all(&sessions)?;
+    fs::write(
+        sessions.join("shared.jsonl"),
+        format!(
+            "{}\n",
+            json!({"kind": 0, "v": session("shared", "append log wins")})
+        ),
+    )?;
+    fs::write(
+        sessions.join("flat.json"),
+        session("flat-wins", "flat JSON wins").to_string(),
+    )?;
+    let recent = workspace(home.path(), "workspace-newer-primary")?;
+    database(
+        &recent,
+        &json!([session("recent-wins", "recent primary wins")]),
+        false,
+    )?;
+    let exports = home
+        .path()
+        .join(".config/Code/User/globalStorage/github.copilot-chat");
+    fs::create_dir_all(&exports)?;
+    fs::write(
+        exports.join("conversations.json"),
+        json!([{
+            "id": "export-wins",
+            "turns": [{"request": {"message": "extension export wins"}}]
+        }])
+        .to_string(),
+    )?;
+    let before = bundle(&path)?;
+    let mut ctx = context(home.path(), home.path());
+    ctx.since_ts = Some(since);
+    let conversations = connector().scan(&ctx)?;
+    assert_eq!(conversations.len(), 5);
+    for (id, content) in [
+        ("shared", "append log wins"),
+        ("flat-wins", "flat JSON wins"),
+        ("recent-wins", "recent primary wins"),
+        ("export-wins", "extension export wins"),
+        ("wal-only", "unique committed WAL chat"),
+    ] {
+        let matches: Vec<_> = conversations
+            .iter()
+            .filter(|conversation| conversation.external_id.as_deref() == Some(id))
+            .collect();
+        assert_eq!(matches.len(), 1, "{id}");
+        assert_eq!(matches[0].messages[0].content, content);
+    }
+    let mut scoped = context(home.path(), &path);
+    scoped.since_ts = Some(since);
+    let selected = connector().scan(&scoped)?;
+    assert_eq!(selected.len(), 5);
+    assert!(
+        selected
+            .iter()
+            .all(|conversation| conversation.source_path == path)
+    );
+    let origin = Origin::remote_with_host("fixture-mirror", "fixture-host");
+    ctx.scan_roots = vec![ScanRoot::remote(
+        home.path().to_path_buf(),
+        origin.clone(),
+        None,
+    )];
+    let sources = connector().discover_source_files(&ctx)?;
+    for source_path in [path.clone(), directory.join("workspace.json")] {
+        let source = sources
+            .iter()
+            .find(|source| source.source_path == source_path)
+            .expect("WAL source and declared workspace metadata must be discovered");
+        assert_eq!(source.origin, origin);
+        assert_eq!(source.scan_root, home.path());
+    }
+    ctx.since_ts = Some(since.saturating_add(60_000));
+    assert!(connector().scan(&ctx)?.is_empty());
+    assert!(connector().discover_source_files(&ctx)?.is_empty());
+    assert_eq!(
+        bundle(&path)?,
+        before,
+        "all probes must preserve provider state"
+    );
+    writer.close()?;
+    Ok(())
+}
