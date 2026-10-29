@@ -472,3 +472,106 @@ fn empty_legacy_chat_payload_is_not_mirrored_and_first_chat_is_captured() -> Res
     }
     Ok(())
 }
+
+#[test]
+fn incremental_index_reads_committed_chat_from_live_wal() -> Result<()> {
+    for streaming in ["0", "1"] {
+        let home = tempfile::tempdir()?;
+        let directory = workspace(home.path(), "workspace-live-wal")?;
+        let path = database(
+            &directory,
+            &json!([session("checkpointed", "copilotcheckpointedneedle")]),
+            true,
+        )?;
+        let writer = Connection::open(path.to_string_lossy().as_ref())?;
+        writer.execute("PRAGMA journal_mode = WAL")?;
+        writer.execute("PRAGMA wal_autocheckpoint = 0")?;
+        let checkpoint_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        fs::File::options()
+            .write(true)
+            .open(&path)?
+            .set_times(fs::FileTimes::new().set_modified(checkpoint_mtime))?;
+        let data = home.path().join("cass-data");
+        let index = |full: bool| {
+            let mut cmd = command(home.path(), &data);
+            cmd.env("CASS_STREAMING_INDEX", streaming)
+                .args(["index", "--json"]);
+            if full {
+                cmd.arg("--full");
+            }
+            assert_cmd::Command::from_std(cmd)
+                .timeout(Duration::from_secs(120))
+                .assert()
+                .success();
+        };
+        let search = |needle: &str| -> Result<Value> {
+            let output = assert_cmd::Command::from_std(command(home.path(), &data))
+                .args([
+                    "search",
+                    needle,
+                    "--mode",
+                    "lexical",
+                    "--json",
+                    "--no-maintenance",
+                ])
+                .timeout(Duration::from_secs(30))
+                .output()?;
+            ensure!(output.status.success(), "WAL search failed: {output:?}");
+            Ok(serde_json::from_slice(&output.stdout)?)
+        };
+        index(true);
+        assert_eq!(
+            search("copilotcheckpointedneedle")?["hits"]
+                .as_array()
+                .map(Vec::len),
+            Some(1),
+            "the initial real CLI run must index the fixture"
+        );
+        // Keep the primary older than the overlap used by timestamp-based
+        // discovery. The next write must advance only the committed WAL.
+        std::thread::sleep(Duration::from_millis(1_200));
+        let primary_before = bundle(&path)?[0].clone();
+        let payload = json!([
+            session("checkpointed", "copilotcheckpointedneedle"),
+            session("wal-only", "copilotcommittedwalneedle")
+        ])
+        .to_string();
+        writer.execute_compat(
+            "UPDATE ItemTable SET value = CAST(?1 AS BLOB) WHERE key = 'interactive.sessions'",
+            &[ParamValue::from(payload.as_str())],
+        )?;
+        let with_chat = bundle(&path)?;
+        assert_eq!(with_chat[0], primary_before, "write must stay in the WAL");
+        assert!(
+            with_chat[1]
+                .as_ref()
+                .is_some_and(|(bytes, _)| bytes.len() > 32),
+            "fixture must contain a committed live WAL"
+        );
+        assert_eq!(
+            connector().scan(&context(home.path(), &path))?.len(),
+            2,
+            "an unrestricted real provider scan must read both committed chats"
+        );
+        assert_eq!(
+            bundle(&path)?,
+            with_chat,
+            "provider scan changed source state"
+        );
+        index(false);
+        let value = search("copilotcommittedwalneedle")?;
+        assert_eq!(value["hits"].as_array().map(Vec::len), Some(1));
+        assert!(
+            value["hits"].as_array().is_some_and(|hits| {
+                hits.iter().any(|hit| {
+                    hit["agent"].as_str() == Some("copilot")
+                        && hit["source_path"].as_str() == path.to_str()
+                })
+            }),
+            "incremental indexing must admit a committed WAL-only chat ({streaming}): {value}"
+        );
+        assert_eq!(bundle(&path)?, with_chat, "indexing changed provider state");
+        writer.close()?;
+    }
+    Ok(())
+}
