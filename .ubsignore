@@ -4,6 +4,10 @@
 # Build artifacts
 target/
 
+# RCH's retained staging and pinned UBS acquisition cache. These generated
+# third-party scanner modules are not project sources or compiler inputs.
+.rch-tmp/
+
 # AI coding tool artifacts
 .aider.chat.history.md
 .aider.input.history
