@@ -646,9 +646,14 @@ fn watch_once_reads_committed_wal_without_scanning_adjacent_workspaces() -> Resu
             )?;
             let before = bundle(&path)?;
             assert_eq!(before[0], checkpoint[0], "only the WAL may change");
-            assert!(before[1].as_ref().is_some_and(|(bytes, _)| !bytes.is_empty()));
+            assert!(
+                before[1]
+                    .as_ref()
+                    .is_some_and(|(bytes, _)| !bytes.is_empty())
+            );
             let mut targeted = command(home.path(), &data);
-            targeted.env("CASS_STREAMING_INDEX", streaming)
+            targeted
+                .env("CASS_STREAMING_INDEX", streaming)
                 .args(["index", "--watch-once"])
                 .arg(trigger)
                 .arg("--json");
@@ -679,6 +684,15 @@ fn watch_once_reads_committed_wal_without_scanning_adjacent_workspaces() -> Resu
                 "targeted scan changed neighbor"
             );
         }
+        let captures = captured_fixture_sources(&data, home.path())?;
+        assert!(
+            captures.contains(&path),
+            "fixture raw mirroring must be active"
+        );
+        assert!(
+            captures.iter().all(|source| !source.starts_with(&adjacent)),
+            "targeted indexing must not mirror the adjacent workspace"
+        );
         writer.close()?;
     }
     Ok(())

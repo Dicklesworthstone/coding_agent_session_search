@@ -33600,6 +33600,19 @@ fn explicit_watch_once_scan_path(
     requested: &Path,
     canonical: &Path,
 ) -> PathBuf {
+    // Copilot's native reader recognizes state.vscdb, not its WAL. Keep the
+    // targeted scan on that one database; scanning the parent would also
+    // admit unrelated workspaces. Its connector checks the WAL's freshness.
+    if kind == ConnectorKind::Copilot
+        && canonical
+            .file_name()
+            .is_some_and(|name| name == "state.vscdb-wal")
+    {
+        let database = canonical.with_file_name("state.vscdb");
+        if database.is_file() {
+            return database;
+        }
+    }
     if kind != ConnectorKind::Omp {
         return canonical.to_path_buf();
     }
@@ -65257,6 +65270,62 @@ c.close()
         // The plain spelling a scan records, not Windows' verbatim `\\?\`
         // (9v9xi); std::fs::canonicalize everywhere else.
         assert_eq!(classified[0].1.path, dunce::canonicalize(session).unwrap());
+    }
+
+    #[test]
+    fn classify_paths_copilot_wal_retains_scope_origin_and_coalesces_primary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let database = workspace.join("state.vscdb");
+        let wal = workspace.join("state.vscdb-wal");
+        std::fs::write(&database, b"SQLite format 3\0").unwrap();
+        std::fs::write(&wal, b"a changed WAL event").unwrap();
+        let origin = Origin::remote_with_host("fixture-mirror", "fixture-host");
+        let root = ScanRoot::remote(tmp.path().to_path_buf(), origin.clone(), None);
+        let roots = vec![(ConnectorKind::Copilot, root.clone())];
+
+        let classified = classify_paths(vec![wal.clone(), database.clone()], &roots, true);
+        assert_eq!(
+            classified.len(),
+            1,
+            "primary and WAL are one targeted store"
+        );
+        assert_eq!(classified[0].0, ConnectorKind::Copilot);
+        assert_eq!(
+            classified[0].1.path,
+            dunce::canonicalize(&database).unwrap()
+        );
+        assert_eq!(classified[0].1.origin, origin);
+        assert!(classified[0].2.is_some());
+        assert!(classified[0].3.is_some());
+
+        // Live events retain the configured root and its provenance.
+        let live = classify_paths(vec![wal.clone()], &roots, false);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].1.path, root.path);
+        assert_eq!(live[0].1.origin, origin);
+        let other_provider = classify_paths(vec![wal], &[(ConnectorKind::Claude, root)], true);
+        assert_eq!(other_provider.len(), 1);
+        assert_eq!(
+            other_provider[0].1.path,
+            dunce::canonicalize(workspace.join("state.vscdb-wal")).unwrap()
+        );
+
+        let missing = tmp.path().join("missing/state.vscdb-wal");
+        std::fs::create_dir_all(missing.parent().unwrap()).unwrap();
+        for path in [
+            missing,
+            workspace.join("another.db-wal"),
+            workspace.join("state.vscdb-shm"),
+            workspace.join("native.json"),
+        ] {
+            std::fs::write(&path, b"{}").unwrap();
+            let selected = classify_paths(vec![path.clone()], &roots, true);
+            assert_eq!(selected.len(), 1);
+            assert_eq!(selected[0].1.path, dunce::canonicalize(path).unwrap());
+            assert_eq!(selected[0].1.origin, origin);
+        }
     }
 
     #[test]
