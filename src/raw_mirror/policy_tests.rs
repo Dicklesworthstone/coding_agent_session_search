@@ -107,6 +107,205 @@ fn an_unchanged_capture_at_the_cap_is_not_an_outage() {
 }
 
 #[test]
+#[cfg(unix)]
+fn gh538_unchanged_watch_captures_do_not_mutate_the_mirror() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let source = temp.path().join("session.jsonl");
+    fs::write(&source, transcript(0, 32 * 1024))?;
+    let first = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(1024 * 1024))?;
+    let root = raw_mirror_root(&data);
+    let generation_path = root.join(USAGE_GENERATION_FILE);
+    let generation = fs::read(&generation_path)?;
+    let manifest_path = root.join(&first.manifest_relative_path);
+    let manifest = fs::read(&manifest_path)?;
+    let manifest_metadata = fs::metadata(&manifest_path)?;
+    let tmp_metadata = fs::metadata(root.join("tmp"))?;
+    let cache_key = raw_mirror_blob_cache_key(&input(&data, &source), &fs::metadata(&source)?, CHUNK as u64, CHUNK);
+    let cache_path = raw_mirror_blob_cache_path(&root, &cache_key).ok_or_else(|| anyhow!("cache path"))?;
+    let cache_metadata = fs::metadata(&cache_path)?;
+    let walks = measured_usage_walks(&root);
+
+    for _ in 0..24 {
+        // A zero budget proves the cached read cannot fall back to writing.
+        let again = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(0))?;
+        assert!(again.already_present);
+        assert_eq!(again.manifest_id, first.manifest_id);
+    }
+    assert_eq!(fs::read(generation_path)?, generation, "no-op captures must not fence nonexistent mutations");
+    assert_eq!(fs::read(manifest_path)?, manifest);
+    assert_eq!(fs::metadata(root.join(&first.manifest_relative_path))?.modified()?, manifest_metadata.modified()?);
+    assert_eq!(fs::metadata(root.join("tmp"))?.modified()?, tmp_metadata.modified()?, "no-op capture must not churn staging directories");
+    assert_eq!(fs::metadata(cache_path)?.modified()?, cache_metadata.modified()?);
+    assert_eq!(measured_usage_walks(&root), walks);
+    assert_eq!(contents(&data, &first), fs::read(source)?);
+    Ok(())
+}
+
+/// Match the reporter's filesystem cardinality and logical mirror size without
+/// allocating 11 GiB: valid manifests share a verified small blob, and sparse
+/// abandoned staging represents recoverable work from interrupted captures.
+/// The real capture path must account for all of it, not parse or hash it.
+#[test]
+#[cfg(unix)]
+fn gh538_large_mirror_near_cap_reuses_inventory_across_watch_cycles() -> Result<()> {
+    const FILES: usize = 20_816;
+    const MANIFESTS: usize = 9_523;
+    const MIRROR_BYTES: u64 = 11 * 1024 * 1024 * 1024;
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let source = temp.path().join("session.jsonl");
+    let original = transcript(0, 1024);
+    fs::write(&source, &original)?;
+    let first = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(u64::MAX))?;
+    let root = raw_mirror_root(&data);
+    let template = read_validated_raw_mirror_manifest(&root, &first.manifest_id)?;
+    for index in 1..MANIFESTS {
+        let mut manifest = template.clone();
+        manifest.original_path = temp.path().join(format!("historical-{index}.jsonl")).display().to_string();
+        manifest.original_path_blake3 = raw_mirror_original_path_blake3(&manifest.original_path);
+        manifest.manifest_id = raw_mirror_manifest_id(&manifest.provider, &manifest.source_id,
+            &manifest.origin_kind, manifest.origin_host.as_deref(), &manifest.original_path_blake3,
+            &manifest.blob_blake3);
+        manifest.manifest_blake3 = Some(raw_mirror_manifest_blake3(&manifest));
+        fs::write(root.join(raw_mirror_manifest_relative_path(&manifest.manifest_id)), serde_json::to_vec(&manifest)?)?;
+    }
+    let existing_files = walkdir::WalkDir::new(&root).into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter().filter(|entry| entry.file_type().is_file()).count();
+    let additional_files = FILES.checked_sub(existing_files).ok_or_else(|| anyhow!("fixture exceeds file target"))?;
+    let remaining = MIRROR_BYTES.checked_sub(measured_usage(&root)?).ok_or_else(|| anyhow!("fixture exceeds byte target"))?;
+    let abandoned = root.join("tmp/capture.538.1793331900000000000.0");
+    fs::create_dir(&abandoned)?;
+    for index in 0..additional_files {
+        let size = remaining / additional_files as u64
+            + u64::from((index as u64) < remaining % additional_files as u64);
+        File::create(abandoned.join(format!(".blob.538.{index}.0.tmp")))?.set_len(size)?;
+    }
+    assert_eq!(measured_usage(&root)?, MIRROR_BYTES);
+    let summary = storage_summary(&data);
+    assert_eq!(summary.manifest_count, MANIFESTS as u64);
+    assert_eq!(summary.invalid_manifest_count, 0);
+    forget_measured_usage(&root);
+
+    // Less than 1/8 of the cap remains: the old margin forced a complete walk
+    // before every one of these tiny writes despite the conservative budget.
+    let cap = MIRROR_BYTES + 128 * 1024 * 1024;
+    let mut expected = original.clone();
+    let started = std::time::Instant::now();
+    for cycle in 1..=12 {
+        let append = transcript(cycle, 1024);
+        OpenOptions::new().append(true).open(&source)?.write_all(&append)?;
+        expected.extend(append);
+        let record = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(cap))?;
+        assert_eq!(contents(&data, &record), expected, "cycle {cycle} must preserve the complete source");
+        let generation = fs::read(root.join(USAGE_GENERATION_FILE))?;
+        let again = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(cap))?;
+        assert_eq!(again.manifest_id, record.manifest_id);
+        assert_eq!(fs::read(root.join(USAGE_GENERATION_FILE))?, generation);
+    }
+    assert_eq!(measured_usage_walks(&root), 1, "near-cap watch cycles must reuse the proven upper bound");
+    assert_eq!(contents(&data, &first), original, "old recovery evidence survives all cycles");
+    assert!(measured_usage(&root)? < cap);
+
+    let used = measured_usage(&root)?;
+    let refused_source = temp.path().join("refused.jsonl");
+    fs::write(&refused_source, transcript(99, 8192))?;
+    for cycle in 0..12 {
+        let error = capture(input(&data, &refused_source), CHUNK as u64, CHUNK, policy(used + 512))
+            .expect_err("a near-cap capture must preserve the resource limit");
+        assert!(error.is::<RawMirrorCapturePaused>(), "cycle {cycle}: {error:#}");
+    }
+    assert_eq!(measured_usage_walks(&root), 2, "one exact refresh must serve repeated proven refusals");
+    assert_eq!(measured_usage(&root)?, used, "refused captures must not grow the mirror");
+    assert_eq!(fs::read_dir(root.join("tmp"))?.count(), 1, "only the original interrupted capture remains");
+    eprintln!("GH538 inventory regression: {FILES} seed files, {MANIFESTS} seed manifests, {MIRROR_BYTES} logical bytes; 12 append/no-op cycles and 12 refusals; 2 inventory walks; elapsed={:?}", started.elapsed());
+    Ok(())
+}
+
+#[test]
+fn gh538_replacement_shrink_invalidates_a_cached_lower_bound() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let source = temp.path().join("session.jsonl");
+    fs::write(&source, transcript(0, 1024))?;
+    capture(input(&data, &source), CHUNK as u64, CHUNK, policy(1024 * 1024))?;
+    let root = raw_mirror_root(&data);
+    let auxiliary = root.join("replaceable-cache");
+    let _mutation = acquire_raw_mirror_mutation_lock(&root)?;
+    note_mutation(&root)?;
+    replace_raw_mirror_bytes(&root, &auxiliary, &vec![b'x'; 192 * 1024])?;
+    let over_cap = shared_usage(&root, policy(96 * 1024), 4096)?;
+    assert!(over_cap > 96 * 1024);
+    replace_raw_mirror_bytes(&root, &auxiliary, b"small")?;
+    let after = measured_usage(&root)?;
+    let cached = shared_usage(&root, policy(96 * 1024), 4096)?;
+    assert!(cached >= after, "the admitted total must remain a conservative upper bound");
+    assert!(cached + 8192 <= 96 * 1024, "a removed cache payload cannot cause a stale refusal");
+    Ok(())
+}
+
+#[test]
+fn gh538_inventory_rejects_excessive_depth_without_unbounded_descriptors() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut nested = temp.path().to_path_buf();
+    for _ in 0..65 {
+        nested.push("d");
+        fs::create_dir(&nested)?;
+    }
+    let error = measured_usage(temp.path()).expect_err("hostile depth must be bounded");
+    assert!(error.to_string().contains("64 directory levels"), "{error:#}");
+    Ok(())
+}
+
+#[test]
+fn gh538_cancelled_inventory_is_not_cached_and_does_not_hold_global_mutex() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = ensure_raw_mirror_root(temp.path())?;
+    for index in 0..1024 {
+        fs::write(root.join(format!("fixture-{index}")), b"x")?;
+    }
+    let _mutation = acquire_raw_mirror_mutation_lock(&root)?;
+    note_mutation(&root)?;
+    let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cache_was_locked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let progress_counter = std::sync::Arc::clone(&completed);
+    let cancelled_counter = std::sync::Arc::clone(&completed);
+    let locked = std::sync::Arc::clone(&cache_was_locked);
+    let (try_cache_tx, try_cache_rx) = std::sync::mpsc::channel();
+    let (cache_ready_tx, cache_ready_rx) = std::sync::mpsc::channel();
+    let cache_ready_rx = Mutex::new(cache_ready_rx);
+    let cache_worker = std::thread::spawn(move || {
+        try_cache_rx.recv_timeout(Duration::from_secs(10)).expect("inventory start");
+        let _cache = measured_usage_cache();
+        cache_ready_tx.send(()).expect("report cache availability");
+    });
+    let scope = observe_raw_mirror_io(
+        std::sync::Arc::new(move || {
+            if progress_counter.fetch_add(1, Ordering::Relaxed) == 0 {
+                try_cache_tx.send(()).expect("request independent cache access");
+                let available = cache_ready_rx.lock().expect("cache probe receiver")
+                    .recv_timeout(Duration::from_secs(5)).is_ok();
+                locked.store(!available, Ordering::Relaxed);
+            }
+        }),
+        std::sync::Arc::new(move || cancelled_counter.load(Ordering::Relaxed) >= 32),
+    );
+    let error = shared_usage(&root, policy(1024 * 1024), 1)
+        .expect_err("inventory must honor cancellation between filesystem operations");
+    cache_worker.join().expect("cache access probe");
+    assert!(error.chain().any(|cause| cause.downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::Interrupted)), "{error:#}");
+    assert_eq!(completed.load(Ordering::Relaxed), 32);
+    assert!(!cache_was_locked.load(Ordering::Relaxed), "slow filesystem I/O must not hold the process-wide usage mutex");
+    assert!(measured_usage_cache().get(&root).is_none_or(|entry| entry.measured_at.is_none()));
+    drop(scope);
+    assert_eq!(shared_usage(&root, policy(1024 * 1024), 1)?, 1024 + 16);
+    assert_eq!(measured_usage_walks(&root), 1, "restart must measure all bytes, not reuse a partial walk");
+    Ok(())
+}
+
+#[test]
 fn refused_append_leaves_the_last_recovery_copy_intact() {
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().join("data");

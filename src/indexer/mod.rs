@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Seek, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -15075,6 +15075,7 @@ where
     F: Fn() -> Box<dyn Connector + Send> + Send + 'static,
 {
     thread::spawn(move || {
+        let _raw_mirror_io = observe_index_raw_mirror_io(config.progress.as_ref());
         let scan_start = std::time::Instant::now();
         let conn = factory();
         let detect = detect_for_local_scan(&config.local_connector_roots, || conn.detect());
@@ -16590,6 +16591,7 @@ where
         connector_factories
             .into_par_iter()
             .filter_map(|(name, factory)| {
+                let _raw_mirror_io = observe_index_raw_mirror_io(progress_ref);
                 if progress_ref.is_some_and(|progress| progress.stop_requested()) {
                     return None;
                 }
@@ -17313,6 +17315,7 @@ fn run_index_with_storage_ownership(
     local_connector_roots: LocalConnectorRootsOverride,
     mirror_source_ids: Option<Vec<String>>,
 ) -> Result<()> {
+    let _raw_mirror_io = observe_index_raw_mirror_io(opts.progress.as_ref());
     // Reject malformed configuration before opening storage or capturing any
     // source evidence. Every persistence entry also validates the policy.
     WorkspaceExclusions::from_env()?;
@@ -20177,6 +20180,7 @@ fn run_index_with_storage_ownership(
             watch_roots.clone(),
             event_channel,
             stale_detector,
+            opts.progress.as_ref(),
             opts.watch_interval_secs,
             deferred_watch_sources,
             move |paths, roots, is_rebuild| {
@@ -29438,6 +29442,7 @@ fn conversations_payload_watermark_ms(convs: &[NormalizedConversation]) -> Optio
         .max()
 }
 
+#[cfg(test)]
 fn sort_watch_conversations_for_watermark(convs: &mut [NormalizedConversation]) {
     convs.sort_by(|left, right| {
         conversation_payload_watermark_ms(left)
@@ -29656,36 +29661,18 @@ fn clear_watch_nomem_deferrals(data_dir: &Path, convs: &[NormalizedConversation]
     }
 }
 
-/// Hold back conversations still inside their deferral backoff and return
-/// how many were held. The caller counts them as deferred, so the watch
-/// watermark stays where it is and they are scanned again later.
-fn retain_watch_conversations_past_nomem_backoff(
-    data_dir: &Path,
-    convs: &mut Vec<NormalizedConversation>,
+/// A held conversation still counts as deferred, so the watch watermark
+/// stays behind it. Load the ledger once per scan, not once per payload.
+fn watch_conversation_in_nomem_backoff(
+    ledger: &WatchNomemDeferrals,
+    conv: &NormalizedConversation,
     now_ms: i64,
-) -> usize {
-    if !WatchNomemDeferrals::path(data_dir).exists() {
-        return 0;
-    }
-    let ledger = WatchNomemDeferrals::load(data_dir);
-    if ledger.entries.is_empty() {
-        return 0;
-    }
-    let before = convs.len();
-    convs.retain(|conv| {
-        ledger
+) -> bool {
+    !ledger.entries.is_empty()
+        && ledger
             .entries
             .get(&watch_nomem_deferral_key(conv))
-            .is_none_or(|entry| entry.next_retry_at_ms <= now_ms)
-    });
-    let held = before - convs.len();
-    if held > 0 {
-        tracing::debug!(
-            held,
-            "watch conversations are waiting out their NoMem deferral backoff (GH#510)"
-        );
-    }
-    held
+            .is_some_and(|entry| entry.next_retry_at_ms > now_ms)
 }
 
 fn error_message_is_exact_out_of_memory(message: &str) -> bool {
@@ -31544,6 +31531,371 @@ fn watch_ingest_chunk_size() -> usize {
     }
 }
 
+fn observe_index_raw_mirror_io(
+    progress: Option<&Arc<IndexingProgress>>,
+) -> Option<crate::raw_mirror::RawMirrorIoScope> {
+    progress.map(|progress| {
+        let progress_tick = Arc::clone(progress);
+        let cancellation = Arc::clone(progress);
+        crate::raw_mirror::observe_raw_mirror_io(
+            Arc::new(move || progress_tick.tick_activity()),
+            Arc::new(move || cancellation.stop_requested()),
+        )
+    })
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct WatchConversationSortKey {
+    watermark: Option<i64>,
+    source_path: PathBuf,
+    external_id: Option<String>,
+}
+
+enum WatchConversationPayload {
+    Memory(Box<NormalizedConversation>),
+    Spilled { offset: u64, length: u64 },
+}
+
+struct WatchConversationEntry {
+    key: WatchConversationSortKey,
+    retained_bytes: usize,
+    payload: WatchConversationPayload,
+    non_utf8_paths: Vec<WatchSpoolPath>,
+}
+
+enum WatchSpoolPath {
+    Source(PathBuf),
+    Workspace(PathBuf),
+    Snippet {
+        message: usize,
+        snippet: usize,
+        path: PathBuf,
+    },
+}
+
+impl WatchSpoolPath {
+    fn restore(&self, conversation: &mut NormalizedConversation) {
+        match self {
+            Self::Source(path) => conversation.source_path.clone_from(path),
+            Self::Workspace(path) => conversation.workspace = Some(path.clone()),
+            Self::Snippet {
+                message,
+                snippet,
+                path,
+            } => {
+                conversation.messages[*message].snippets[*snippet].file_path = Some(path.clone());
+            }
+        }
+    }
+}
+
+/// serde's PathBuf codec accepts UTF-8 only. Preserve the rare native paths
+/// that cannot round-trip through JSON in the compact entry, replacing them
+/// only for serialization and restoring them before returning to the caller.
+fn take_non_utf8_watch_paths(conversation: &mut NormalizedConversation) -> Vec<WatchSpoolPath> {
+    let mut paths = Vec::new();
+    if conversation.source_path.to_str().is_none() {
+        paths.push(WatchSpoolPath::Source(std::mem::take(
+            &mut conversation.source_path,
+        )));
+    }
+    if let Some(path) = conversation.workspace.as_mut()
+        && path.to_str().is_none()
+    {
+        paths.push(WatchSpoolPath::Workspace(std::mem::take(path)));
+    }
+    for (message, value) in conversation.messages.iter_mut().enumerate() {
+        for (snippet, value) in value.snippets.iter_mut().enumerate() {
+            if let Some(path) = value.file_path.as_mut()
+                && path.to_str().is_none()
+            {
+                paths.push(WatchSpoolPath::Snippet {
+                    message,
+                    snippet,
+                    path: std::mem::take(path),
+                });
+            }
+        }
+    }
+    paths
+}
+
+/// Watch connectors enumerate in filesystem order. Keep the existing global
+/// watermark/path/id sort without retaining a whole provider's transcripts in
+/// RAM before the first durable batch (GH #538). Only compact sort keys remain
+/// resident after the payload buffer fills. The anonymous file disappears on
+/// close or process termination, so an interrupted scan has no recovery debris.
+struct WatchConversationSpool {
+    entries: Vec<WatchConversationEntry>,
+    file: Option<BufWriter<File>>,
+    data_dir: PathBuf,
+    memory_bytes: usize,
+    written_bytes: u64,
+    disk_budget: u64,
+    memory_limit: usize,
+    count_limit: usize,
+}
+
+impl WatchConversationSpool {
+    fn new(data_dir: &Path, count_limit: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            file: None,
+            data_dir: data_dir.to_path_buf(),
+            memory_bytes: 0,
+            written_bytes: 0,
+            disk_budget: 0,
+            memory_limit: DEFAULT_STREAMING_BATCH_LIMITS.max_chars,
+            count_limit: count_limit.max(1),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn push(
+        &mut self,
+        mut conversation: NormalizedConversation,
+        progress: Option<&IndexingProgress>,
+    ) -> Result<()> {
+        let retained_bytes = conversation_batch_footprint(&conversation).retained_bytes;
+        if self.file.is_none()
+            && (self.entries.len() >= self.count_limit
+                || self.memory_bytes.saturating_add(retained_bytes) > self.memory_limit)
+        {
+            self.file = Some(BufWriter::with_capacity(
+                64 * 1024,
+                tempfile::tempfile_in(&self.data_dir).context("create watch scan spool")?,
+            ));
+            for entry in &mut self.entries {
+                let WatchConversationPayload::Memory(conversation) = &mut entry.payload else {
+                    continue;
+                };
+                entry.payload = write_watch_spool_conversation(
+                    self.file.as_mut().expect("watch spool is open"),
+                    &self.data_dir,
+                    &mut self.written_bytes,
+                    &mut self.disk_budget,
+                    conversation,
+                    &mut entry.non_utf8_paths,
+                    progress,
+                )?;
+            }
+            self.memory_bytes = 0;
+        }
+        let key = WatchConversationSortKey {
+            watermark: conversation_payload_watermark_ms(&conversation),
+            source_path: conversation.source_path.clone(),
+            external_id: conversation.external_id.clone(),
+        };
+        self.entries
+            .try_reserve(1)
+            .context("reserve watch scan sort entry")?;
+        let mut non_utf8_paths = Vec::new();
+        let payload = if let Some(file) = self.file.as_mut() {
+            write_watch_spool_conversation(
+                file,
+                &self.data_dir,
+                &mut self.written_bytes,
+                &mut self.disk_budget,
+                &mut conversation,
+                &mut non_utf8_paths,
+                progress,
+            )?
+        } else {
+            self.memory_bytes = self.memory_bytes.saturating_add(retained_bytes);
+            WatchConversationPayload::Memory(Box::new(conversation))
+        };
+        self.entries.push(WatchConversationEntry {
+            key,
+            retained_bytes,
+            payload,
+            non_utf8_paths,
+        });
+        if let Some(progress) = progress {
+            progress.tick_activity();
+        }
+        Ok(())
+    }
+
+    fn into_sorted_batches(mut self) -> Result<WatchConversationBatches> {
+        self.entries.sort_by(|left, right| left.key.cmp(&right.key));
+        let file = self
+            .file
+            .map(|writer| writer.into_inner().map_err(|error| error.into_error()))
+            .transpose()
+            .context("flush watch scan spool")?;
+        Ok(WatchConversationBatches {
+            entries: self.entries.into_iter().peekable(),
+            file,
+            memory_limit: self.memory_limit,
+            count_limit: self.count_limit,
+        })
+    }
+}
+
+/// Streaming serialization avoids making a second, potentially huge JSON
+/// allocation for a single conversation. Check free space and cancellation
+/// every buffer-sized write; completed writes, never a timer, report liveness.
+struct WatchSpoolWriter<'a> {
+    writer: &'a mut BufWriter<File>,
+    data_dir: &'a Path,
+    written_bytes: &'a mut u64,
+    progress: Option<&'a IndexingProgress>,
+    remaining: &'a mut u64,
+}
+
+impl Write for WatchSpoolWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let bytes = &bytes[..bytes.len().min(64 * 1024)];
+        if self.progress.is_some_and(IndexingProgress::stop_requested) {
+            return Err(std::io::Error::other("watch scan spool interrupted"));
+        }
+        if *self.remaining < bytes.len() as u64 {
+            self.writer.flush()?;
+            let available = if index_disk_headroom_check_disabled() {
+                u64::MAX
+            } else {
+                fs2::available_space(self.data_dir)?.saturating_sub(INDEX_MIN_FREE_SPACE_BYTES)
+            };
+            if available < bytes.len() as u64 {
+                return Err(std::io::Error::other(
+                    "watch scan spool would consume the index disk-space reserve",
+                ));
+            }
+            // Re-probe while writing, including within one oversized source.
+            *self.remaining = available.min(4 * 1024 * 1024);
+            if let Some(progress) = self.progress {
+                progress.tick_activity();
+            }
+        }
+        let written = self.writer.write(bytes)?;
+        *self.remaining -= written as u64;
+        *self.written_bytes = self.written_bytes.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+fn write_watch_spool_conversation(
+    writer: &mut BufWriter<File>,
+    data_dir: &Path,
+    written_bytes: &mut u64,
+    disk_budget: &mut u64,
+    conversation: &mut NormalizedConversation,
+    non_utf8_paths: &mut Vec<WatchSpoolPath>,
+    progress: Option<&IndexingProgress>,
+) -> Result<WatchConversationPayload> {
+    let offset = *written_bytes;
+    *non_utf8_paths = take_non_utf8_watch_paths(conversation);
+    let result = serde_json::to_writer(
+        WatchSpoolWriter {
+            writer,
+            data_dir,
+            written_bytes,
+            progress,
+            remaining: disk_budget,
+        },
+        &*conversation,
+    );
+    for path in non_utf8_paths.iter() {
+        path.restore(conversation);
+    }
+    if let Some(progress) = progress {
+        progress.check_stop()?;
+    }
+    result.context("write watch scan spool")?;
+    Ok(WatchConversationPayload::Spilled {
+        offset,
+        length: written_bytes.saturating_sub(offset),
+    })
+}
+
+struct WatchConversationBatches {
+    entries: std::iter::Peekable<std::vec::IntoIter<WatchConversationEntry>>,
+    file: Option<File>,
+    memory_limit: usize,
+    count_limit: usize,
+}
+
+struct WatchSpoolReader<'a, R> {
+    reader: R,
+    progress: Option<&'a IndexingProgress>,
+}
+
+impl<R: Read> Read for WatchSpoolReader<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        if self.progress.is_some_and(IndexingProgress::stop_requested) {
+            return Err(std::io::Error::other("watch scan spool interrupted"));
+        }
+        let limit = bytes.len().min(64 * 1024);
+        let read = self.reader.read(&mut bytes[..limit])?;
+        if read > 0
+            && let Some(progress) = self.progress
+        {
+            progress.tick_activity();
+        }
+        Ok(read)
+    }
+}
+
+impl WatchConversationBatches {
+    fn next_batch(
+        &mut self,
+        progress: Option<&IndexingProgress>,
+    ) -> Result<Vec<NormalizedConversation>> {
+        let mut batch = Vec::new();
+        let mut retained_bytes = 0usize;
+        while let Some(next) = self.entries.peek() {
+            if !batch.is_empty()
+                && (batch.len() >= self.count_limit
+                    || retained_bytes.saturating_add(next.retained_bytes) > self.memory_limit)
+            {
+                break;
+            }
+            if let Some(progress) = progress {
+                progress.check_stop()?;
+            }
+            let entry = self.entries.next().expect("peeked watch conversation");
+            let mut conversation = match entry.payload {
+                WatchConversationPayload::Memory(conversation) => *conversation,
+                WatchConversationPayload::Spilled { offset, length } => {
+                    let file = self.file.as_mut().expect("spilled watch source has a file");
+                    file.seek(SeekFrom::Start(offset))
+                        .context("seek watch scan spool")?;
+                    // Buffer outside the checked reader: serde consumes bytes
+                    // individually, but cancellation/liveness belong to each
+                    // completed read, including within an oversized payload.
+                    let reader = WatchSpoolReader {
+                        reader: file.take(length),
+                        progress,
+                    };
+                    let result =
+                        serde_json::from_reader(BufReader::with_capacity(64 * 1024, reader));
+                    if let Some(progress) = progress {
+                        progress.check_stop()?;
+                    }
+                    result.context("read watch scan spool")?
+                }
+            };
+            for path in &entry.non_utf8_paths {
+                path.restore(&mut conversation);
+            }
+            retained_bytes = retained_bytes
+                .saturating_add(conversation_batch_footprint(&conversation).retained_bytes);
+            batch.push(conversation);
+            if let Some(progress) = progress {
+                progress.tick_activity();
+            }
+        }
+        Ok(batch)
+    }
+}
+
 /// Keep deferred sources in the watch loop, including sources skipped during
 /// startup. An active writer may close without producing another filesystem
 /// event; the cooldown must therefore drive retries itself (GH455).
@@ -31711,6 +32063,30 @@ fn next_watch_loop_event(
     }
 }
 
+fn wait_watch_loop_event(
+    controls: &Receiver<IndexerEvent>,
+    notifications: &Receiver<()>,
+    timeout: Duration,
+    progress: Option<&Arc<IndexingProgress>>,
+) -> Result<WatchLoopEvent> {
+    let started = Instant::now();
+    loop {
+        if let Some(progress) = progress {
+            progress.check_stop()?;
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let poll = if progress.is_some() {
+            remaining.min(Duration::from_secs(1))
+        } else {
+            remaining
+        };
+        match next_watch_loop_event(controls, notifications, poll) {
+            WatchLoopEvent::Timeout if started.elapsed() < timeout => continue,
+            event => return Ok(event),
+        }
+    }
+}
+
 fn is_database_watch_root(kind: ConnectorKind, root: &ScanRoot) -> bool {
     (kind == ConnectorKind::Shelley
         || (kind == ConnectorKind::Devin
@@ -31807,11 +32183,13 @@ fn watch_scan_lower_bound(kind: ConnectorKind, since_ts: Option<i64>) -> Option<
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn watch_sources<F>(
     watch_once_paths: Option<Vec<PathBuf>>,
     roots: Vec<(ConnectorKind, ScanRoot)>,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
     stale_detector: Arc<StaleDetector>,
+    progress: Option<&Arc<IndexingProgress>>,
     watch_interval_secs: u64,
     deferred_sources: BTreeSet<PathBuf>,
     callback: F,
@@ -31897,6 +32275,9 @@ where
     );
 
     loop {
+        if let Some(progress) = progress {
+            progress.check_stop()?;
+        }
         // How much cooldown remains before we may fire the next callback.
         // Using this as recv_timeout lets us keep accumulating events
         // instead of blocking with thread::sleep (which would drop events
@@ -31933,7 +32314,9 @@ where
             }
         };
 
-        match next_watch_loop_event(&controls, &notifications, timeout) {
+        // Idle watchers still honor cooperative shutdown. This poll does not
+        // tick activity: it must never hide a stuck scan from the watchdog.
+        match wait_watch_loop_event(&controls, &notifications, timeout, progress)? {
             WatchLoopEvent::Filesystem => {
                 if !pending_rescan && pending.paths.is_empty() {
                     first_event = Some(Instant::now());
@@ -32123,6 +32506,9 @@ fn reindex_paths_with_semantic_delta(
 ) -> Result<usize> {
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
+    if let Some(progress) = &opts.progress {
+        progress.check_stop()?;
+    }
 
     let explicit = opts
         .watch_once_paths
@@ -32149,6 +32535,9 @@ fn reindex_paths_with_semantic_delta(
     let preserve_watch_watermark = scan_path_exclusions_active();
 
     for (kind, root, min_ts, max_ts) in triggers {
+        if let Some(progress) = &opts.progress {
+            progress.check_stop()?;
+        }
         let conn = kind.create_connector(Some(&opts.data_dir));
         let detect = conn.detect();
         if !detect.detected && root.origin.kind == SourceKind::Local && !root.path.exists() {
@@ -32234,11 +32623,15 @@ fn reindex_paths_with_semantic_delta(
         }
 
         // Use explicit root context
-        let ctx = crate::connectors::ScanContext::with_roots(
+        let mut ctx = crate::connectors::ScanContext::with_roots(
             root.path.clone(),
             vec![root.clone()],
             since_ts,
         );
+        if let Some(progress) = &opts.progress {
+            let progress = Arc::clone(progress);
+            ctx = ctx.with_progress_tick(Arc::new(move || progress.tick_activity()));
+        }
 
         let (mut ingest_diagnostics, preparse_active_source_skipped) =
             capture_connector_sources_before_parse(
@@ -32251,13 +32644,55 @@ fn reindex_paths_with_semantic_delta(
                 active_source_filter,
                 &raw_source_exclusions,
             );
+        if let Some(progress) = &opts.progress {
+            progress.check_stop()?;
+        }
 
         // SCAN PHASE: IO-heavy, no locks held
         let scan_start = Instant::now();
-        let mut convs = Vec::new();
-        let scan_error = match conn.scan_with_callback(&ctx, &mut |conversation| {
-            convs.push(conversation);
-            Ok(())
+        let ingest_chunk_size = watch_ingest_chunk_size();
+        let mut convs = WatchConversationSpool::new(&opts.data_dir, ingest_chunk_size);
+        let mut active_sources_skipped = 0usize;
+        let mut nomem_backoff_held = 0usize;
+        let nomem_deferrals = if explicit_watch_once {
+            WatchNomemDeferrals::default()
+        } else {
+            WatchNomemDeferrals::load(&opts.data_dir)
+        };
+        let now_ms = FrankenStorage::now_millis();
+        let scan_error = match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+            if let Some(progress) = &opts.progress {
+                progress.check_stop()?;
+                progress.tick_activity();
+            }
+            if should_skip_active_session_source(
+                active_source_filter,
+                root.origin.kind,
+                &conversation.source_path,
+            ) {
+                active_sources_skipped = active_sources_skipped.saturating_add(1);
+                return Ok(());
+            }
+            if should_skip_subagent(&conversation)
+                || should_skip_excluded_source(&conversation.source_path)
+            {
+                return Ok(());
+            }
+            ingest_diagnostics.observe_conversation(&mut conversation);
+            // Prepare sort-key identity now, but copy raw bytes only for the
+            // bounded batch about to commit. A mirror of every conversation
+            // before the first commit starved watch progress on large roots.
+            prepare_conversation_metadata_for_ingest(
+                kind.slug(),
+                &root.origin,
+                Some(&root),
+                &mut conversation,
+            );
+            if watch_conversation_in_nomem_backoff(&nomem_deferrals, &conversation, now_ms) {
+                nomem_backoff_held = nomem_backoff_held.saturating_add(1);
+                return Ok(());
+            }
+            convs.push(conversation, opts.progress.as_deref())
         }) {
             Ok(()) => None,
             Err(error) => {
@@ -32272,6 +32707,9 @@ fn reindex_paths_with_semantic_delta(
                 Some(message)
             }
         };
+        if let Some(progress) = &opts.progress {
+            progress.check_stop()?;
+        }
         let scan_ms = scan_start.elapsed().as_millis() as u64;
         // Publish the source error before persistence can fail for a separate
         // reason, including the all-bad case that has no ingest phase below.
@@ -32301,15 +32739,6 @@ fn reindex_paths_with_semantic_delta(
             None
         };
 
-        let pre_active_filter_count = convs.len();
-        convs.retain(|conv| {
-            !should_skip_active_session_source(
-                active_source_filter,
-                root.origin.kind,
-                &conv.source_path,
-            )
-        });
-        let active_sources_skipped = pre_active_filter_count.saturating_sub(convs.len());
         if active_sources_skipped > 0 {
             tracing::debug!(
                 ?kind,
@@ -32323,45 +32752,13 @@ fn reindex_paths_with_semantic_delta(
             || active_sources_skipped > 0
             || scan_error.is_some();
 
-        convs.retain(|conv| {
-            !should_skip_subagent(conv) && !should_skip_excluded_source(&conv.source_path)
-        });
-
-        for conversation in &mut convs {
-            ingest_diagnostics.observe_conversation(conversation);
-        }
         record_connector_ingest_report(opts.progress.as_ref(), ingest_diagnostics.finish());
-
-        // Provenance injection and path rewriting
-        for conv in &mut convs {
-            prepare_conversation_for_ingest(
-                &opts.data_dir,
-                kind.slug(),
-                &root.origin,
-                Some(&root),
-                conv,
-                &raw_source_exclusions,
+        if nomem_backoff_held > 0 {
+            tracing::debug!(
+                held = nomem_backoff_held,
+                "watch conversations are waiting out their NoMem deferral backoff (GH#510)"
             );
         }
-        // Watermark order for live watch; a total order (watermark, path,
-        // external id) for every batch, so canonical ids never depend on the
-        // filesystem's directory order (connectors walk unsorted).
-        sort_watch_conversations_for_watermark(&mut convs);
-
-        // GH#510: a conversation whose bounded-guard NoMem keeps recurring
-        // waits out its deferral backoff instead of re-running the split, solo
-        // retry and deferral on every tick. It counts as deferred so the
-        // watermark stays held for it. An explicit --watch-once is an
-        // operator's retry and is never held back.
-        let nomem_backoff_held = if explicit_watch_once {
-            0
-        } else {
-            retain_watch_conversations_past_nomem_backoff(
-                &opts.data_dir,
-                &mut convs,
-                FrankenStorage::now_millis(),
-            )
-        };
 
         // Update total and phase to indexing
         if let Some(p) = &opts.progress {
@@ -32415,6 +32812,7 @@ fn reindex_paths_with_semantic_delta(
         let mut quarantined_conversations = 0usize;
         let mut deferred_conversations = nomem_backoff_held;
         let mut lexical_replay_deferred = false;
+        let current_debt = WatchLexicalReplayDebt::for_root(kind, &root);
         {
             let storage = storage
                 .lock()
@@ -32425,196 +32823,229 @@ fn reindex_paths_with_semantic_delta(
             // Establish recovery debt BEFORE any canonical transaction. It
             // covers the whole selected source, including earlier successful
             // additions lost when a later addition discards this writer.
-            let current_debt = WatchLexicalReplayDebt::for_root(kind, &root);
             persist_watch_lexical_replay_debt(&storage, &current_debt)?;
             if replay_canonical {
                 // A prior failed callback may still own uncommitted additions.
                 // Reconciliation must start from the published generation.
                 *t_index_guard = None;
             }
-            let ingest_chunk_size = if explicit_watch_once {
-                conv_count.max(1)
-            } else {
-                watch_ingest_chunk_size()
-            };
-            let capture_semantic_delta = semantic_delta.is_some();
-            for chunk in convs.chunks(ingest_chunk_size) {
-                if let Some(pending) = load_lexical_rebuild_state(index_path)?
-                    && pending.is_incomplete()
-                    && pending.version == LEXICAL_REBUILD_STATE_VERSION
-                    && pending.schema_hash == crate::search::tantivy::SCHEMA_HASH
-                    && lexical_rebuild_page_size_is_compatible(pending.page_size)
-                    && lexical_rebuild_db_paths_match(
-                        &pending.db.db_path,
-                        &crate::normalize_path_identity(&opts.db_path).to_string_lossy(),
-                    )
-                {
-                    // A previous metadata transaction may already have landed.
-                    // Its repeated packet then has zero mutations; the durable
-                    // debt, rather than this packet's counts, requires repair.
-                    *t_index_guard = None;
-                    rebuild_tantivy_from_db_deferred_startup_with_options(
-                        &opts.db_path,
-                        &opts.data_dir,
-                        count_total_conversations_exact(&storage)?,
-                        opts.progress.clone(),
-                        None,
-                    )?;
+        }
+        let capture_semantic_delta = semantic_delta.is_some();
+        let mut convs = convs.into_sorted_batches()?;
+        let mut connector_name = None;
+        loop {
+            let mut chunk = convs.next_batch(opts.progress.as_deref())?;
+            if chunk.is_empty() {
+                break;
+            }
+            if connector_name.is_none() {
+                connector_name = chunk.first().map(|conv| conv.agent_slug.clone());
+            }
+            for conv in &mut chunk {
+                if let Some(progress) = &opts.progress {
+                    progress.check_stop()?;
                 }
-                if t_index_guard.is_none() {
-                    tracing::info!(
-                        index_path = %index_path.display(),
-                        "opening Tantivy lazily for watch ingest"
-                    );
-                    *t_index_guard = Some(TantivyIndex::open_or_create(index_path)?);
-                }
-                let mut chunk_outcome = {
-                    let t_index = t_index_guard
-                        .as_mut()
-                        .expect("lazy watch index must be open before ingest");
-                    ingest_watch_batch_with_oom_split_inner(
-                        &storage,
-                        t_index,
-                        &opts.data_dir,
-                        chunk,
-                        &opts.progress,
-                        !opts.watch,
-                        capture_semantic_delta,
-                        WatchOomIngestMode::Standard,
-                        replay_canonical,
-                    )?
-                };
-                if persist::defer_lexical_updates_enabled() {
-                    chunk_outcome
-                        .batch_outcome
-                        .record_deferred_lexical_update(&anyhow::anyhow!(
-                            "watch lexical publication is disabled by configuration"
-                        ));
-                } else if replay_canonical {
-                    // Reconcile once after the splitter has combined all IDs.
-                    // Overlapping packets must not stage the same replacement
-                    // twice against Quill's still-uncommitted snapshot.
-                    let replay = chunk_outcome
-                        .batch_outcome
-                        .canonical_conversation_ids
-                        .iter()
-                        .try_for_each(|id| {
-                            persist::replay_watch_canonical_conversation(
-                                &storage,
-                                t_index_guard.as_mut().expect("watch writer is open"),
-                                *id,
-                            )
-                        });
-                    if let Err(error) = replay {
-                        if error_is_out_of_memory(&error) {
-                            chunk_outcome
-                                .batch_outcome
-                                .record_deferred_lexical_update(&error);
-                        } else {
-                            return Err(error);
-                        }
-                    }
-                }
-                inserted_messages =
-                    inserted_messages.saturating_add(chunk_outcome.batch_outcome.inserted_messages);
-                processed_conversations =
-                    processed_conversations.saturating_add(chunk_outcome.processed_conversations);
-                quarantined_conversations = quarantined_conversations
-                    .saturating_add(chunk_outcome.quarantined_conversations);
-                deferred_conversations =
-                    deferred_conversations.saturating_add(chunk_outcome.deferred_conversations);
-                if let Some(delta) = semantic_delta.as_deref_mut() {
-                    delta.extend_from_batch(
-                        chunk_outcome.batch_outcome.semantic_delta_inputs,
-                        chunk_outcome.batch_outcome.semantic_delta_max_message_id,
-                    );
-                }
-
-                // Commit each successful chunk before advancing the partial
-                // watch watermark. A crash after this point replays at worst
-                // the next unfinished chunk, not the entire backlog.
-                let mut lexical_update_deferred =
-                    chunk_outcome.batch_outcome.lexical_update_deferred;
-                if chunk_outcome.batch_outcome.workspace_changes > 0 {
-                    // Do not leave a live watcher serving old workspace filters.
-                    // The pre-mutation checkpoint remains pending if this fails.
-                    *t_index_guard = None;
-                    rebuild_tantivy_from_db_deferred_startup_with_options(
-                        &opts.db_path,
-                        &opts.data_dir,
-                        count_total_conversations_exact(&storage)?,
-                        opts.progress.clone(),
-                        None,
-                    )?;
-                    *t_index_guard = Some(TantivyIndex::open_or_create(index_path)?);
-                    lexical_update_deferred = false;
-                }
-                if lexical_update_deferred {
-                    lexical_replay_deferred = true;
-                    tracing::warn!(
-                        error = ?chunk_outcome.batch_outcome.lexical_update_error,
-                        "dropping uncommitted watch Tantivy writer after deferred lexical update"
-                    );
-                    *t_index_guard = None;
-                } else {
-                    #[cfg(test)]
-                    inject_watch_lexical_test_failure(WatchLexicalTestFault::Commit)?;
-                    t_index_guard
-                        .as_mut()
-                        .expect("watch Tantivy writer must still be open before commit")
-                        .commit()?;
-                }
-
-                // Keep last_indexed_at current so `cass status` doesn't report stale during watch mode.
-                if lexical_replay_deferred {
-                    tracing::warn!(
-                        "skipping watch last_indexed_at update after deferred lexical update so health/status report stale lexical assets"
-                    );
-                } else if scan_error.is_some() {
-                    tracing::warn!(
-                        "skipping watch last_indexed_at update after incomplete source scan"
-                    );
-                } else {
-                    persist::with_ephemeral_writer(
-                        &storage,
-                        false,
-                        "updating watch last_indexed_at",
-                        |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
-                    )?;
-                }
-
-                // Conversations are sorted by watermark, so a clean later
-                // chunk must not advance past an earlier (or backed-off)
-                // deferred one, which would drop it from every later scan:
-                // the cumulative deferral count gates this. Quarantined
-                // conversations keep the per-chunk gate: they have no backoff,
-                // so holding the watermark for them would re-attempt them on
-                // every tick.
-                if !explicit_watch_once
-                    && !preserve_this_watch_watermark
-                    && !lexical_replay_deferred
-                    && chunk_outcome.quarantined_conversations == 0
-                    && deferred_conversations == 0
-                    && let Some(ts_val) = chunk_outcome.max_payload_watermark_ms
-                {
-                    save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
-                } else if chunk_outcome.quarantined_conversations > 0
-                    || chunk_outcome.deferred_conversations > 0
-                {
-                    tracing::info!(
-                        ?kind,
-                        quarantined_conversations = chunk_outcome.quarantined_conversations,
-                        deferred_conversations = chunk_outcome.deferred_conversations,
-                        "preserving partial watch watermark so quarantined/deferred source can be retried"
-                    );
-                } else if preserve_this_watch_watermark {
-                    tracing::debug!(
-                        ?kind,
-                        active_sources_skipped,
-                        "preserving partial watch watermark because a source failed or was excluded"
-                    );
+                capture_prepared_conversation(&opts.data_dir, conv, &raw_source_exclusions);
+                if let Some(progress) = &opts.progress {
+                    progress.check_stop()?;
+                    progress.tick_activity();
                 }
             }
+            let storage = storage
+                .lock()
+                .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+            let mut t_index_guard = t_index
+                .lock()
+                .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
+            if let Some(pending) = load_lexical_rebuild_state(index_path)?
+                && pending.is_incomplete()
+                && pending.version == LEXICAL_REBUILD_STATE_VERSION
+                && pending.schema_hash == crate::search::tantivy::SCHEMA_HASH
+                && lexical_rebuild_page_size_is_compatible(pending.page_size)
+                && lexical_rebuild_db_paths_match(
+                    &pending.db.db_path,
+                    &crate::normalize_path_identity(&opts.db_path).to_string_lossy(),
+                )
+            {
+                // A previous metadata transaction may already have landed.
+                // Its repeated packet then has zero mutations; the durable
+                // debt, rather than this packet's counts, requires repair.
+                *t_index_guard = None;
+                rebuild_tantivy_from_db_deferred_startup_with_options(
+                    &opts.db_path,
+                    &opts.data_dir,
+                    count_total_conversations_exact(&storage)?,
+                    opts.progress.clone(),
+                    None,
+                )?;
+            }
+            if t_index_guard.is_none() {
+                tracing::info!(
+                    index_path = %index_path.display(),
+                    "opening Tantivy lazily for watch ingest"
+                );
+                *t_index_guard = Some(open_lexical_index_with_heartbeat(
+                    index_path,
+                    opts.progress.as_ref(),
+                )?);
+            }
+            let mut chunk_outcome = {
+                let t_index = t_index_guard
+                    .as_mut()
+                    .expect("lazy watch index must be open before ingest");
+                ingest_watch_batch_with_oom_split_inner(
+                    &storage,
+                    t_index,
+                    &opts.data_dir,
+                    &chunk,
+                    &opts.progress,
+                    !opts.watch,
+                    capture_semantic_delta,
+                    WatchOomIngestMode::Standard,
+                    replay_canonical,
+                )?
+            };
+            if persist::defer_lexical_updates_enabled() {
+                chunk_outcome
+                    .batch_outcome
+                    .record_deferred_lexical_update(&anyhow::anyhow!(
+                        "watch lexical publication is disabled by configuration"
+                    ));
+            } else if replay_canonical {
+                // Reconcile once after the splitter has combined all IDs.
+                // Overlapping packets must not stage the same replacement
+                // twice against Quill's still-uncommitted snapshot.
+                let replay = chunk_outcome
+                    .batch_outcome
+                    .canonical_conversation_ids
+                    .iter()
+                    .try_for_each(|id| {
+                        persist::replay_watch_canonical_conversation(
+                            &storage,
+                            t_index_guard.as_mut().expect("watch writer is open"),
+                            *id,
+                        )
+                    });
+                if let Err(error) = replay {
+                    if error_is_out_of_memory(&error) {
+                        chunk_outcome
+                            .batch_outcome
+                            .record_deferred_lexical_update(&error);
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+            inserted_messages =
+                inserted_messages.saturating_add(chunk_outcome.batch_outcome.inserted_messages);
+            processed_conversations =
+                processed_conversations.saturating_add(chunk_outcome.processed_conversations);
+            quarantined_conversations =
+                quarantined_conversations.saturating_add(chunk_outcome.quarantined_conversations);
+            deferred_conversations =
+                deferred_conversations.saturating_add(chunk_outcome.deferred_conversations);
+            if let Some(delta) = semantic_delta.as_deref_mut() {
+                delta.extend_from_batch(
+                    chunk_outcome.batch_outcome.semantic_delta_inputs,
+                    chunk_outcome.batch_outcome.semantic_delta_max_message_id,
+                );
+            }
+
+            // Commit each successful chunk before advancing the partial
+            // watch watermark. A crash after this point replays at worst
+            // the next unfinished chunk, not the entire backlog.
+            let mut lexical_update_deferred = chunk_outcome.batch_outcome.lexical_update_deferred;
+            if chunk_outcome.batch_outcome.workspace_changes > 0 {
+                // Do not leave a live watcher serving old workspace filters.
+                // The pre-mutation checkpoint remains pending if this fails.
+                *t_index_guard = None;
+                rebuild_tantivy_from_db_deferred_startup_with_options(
+                    &opts.db_path,
+                    &opts.data_dir,
+                    count_total_conversations_exact(&storage)?,
+                    opts.progress.clone(),
+                    None,
+                )?;
+                *t_index_guard = Some(open_lexical_index_with_heartbeat(
+                    index_path,
+                    opts.progress.as_ref(),
+                )?);
+                lexical_update_deferred = false;
+            }
+            if lexical_update_deferred {
+                lexical_replay_deferred = true;
+                tracing::warn!(
+                    error = ?chunk_outcome.batch_outcome.lexical_update_error,
+                    "dropping uncommitted watch Tantivy writer after deferred lexical update"
+                );
+                *t_index_guard = None;
+            } else {
+                #[cfg(test)]
+                inject_watch_lexical_test_failure(WatchLexicalTestFault::Commit)?;
+                t_index_guard
+                    .as_mut()
+                    .expect("watch Tantivy writer must still be open before commit")
+                    .commit()?;
+            }
+
+            // Keep last_indexed_at current so `cass status` doesn't report stale during watch mode.
+            if lexical_replay_deferred {
+                tracing::warn!(
+                    "skipping watch last_indexed_at update after deferred lexical update so health/status report stale lexical assets"
+                );
+            } else if scan_error.is_some() {
+                tracing::warn!(
+                    "skipping watch last_indexed_at update after incomplete source scan"
+                );
+            } else {
+                persist::with_ephemeral_writer(
+                    &storage,
+                    false,
+                    "updating watch last_indexed_at",
+                    |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
+                )?;
+            }
+
+            // Conversations are sorted by watermark, so a clean later
+            // chunk must not advance past an earlier (or backed-off)
+            // deferred one, which would drop it from every later scan:
+            // the cumulative deferral count gates this. Quarantined
+            // conversations keep the per-chunk gate: they have no backoff,
+            // so holding the watermark for them would re-attempt them on
+            // every tick.
+            if !explicit_watch_once
+                && !preserve_this_watch_watermark
+                && !lexical_replay_deferred
+                && chunk_outcome.quarantined_conversations == 0
+                && deferred_conversations == 0
+                && let Some(ts_val) = chunk_outcome.max_payload_watermark_ms
+            {
+                save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
+            } else if chunk_outcome.quarantined_conversations > 0
+                || chunk_outcome.deferred_conversations > 0
+            {
+                tracing::info!(
+                    ?kind,
+                    quarantined_conversations = chunk_outcome.quarantined_conversations,
+                    deferred_conversations = chunk_outcome.deferred_conversations,
+                    "preserving partial watch watermark so quarantined/deferred source can be retried"
+                );
+            } else if preserve_this_watch_watermark {
+                tracing::debug!(
+                    ?kind,
+                    active_sources_skipped,
+                    "preserving partial watch watermark because a source failed or was excluded"
+                );
+            }
+            if let Some(progress) = &opts.progress {
+                progress.tick_activity();
+                progress.check_stop()?;
+            }
+        }
+        {
+            let storage = storage
+                .lock()
+                .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
             if !lexical_replay_deferred
                 && quarantined_conversations == 0
                 && deferred_conversations == 0
@@ -32639,10 +33070,8 @@ fn reindex_paths_with_semantic_delta(
         if let Some(p) = &opts.progress
             && let Ok(mut stats) = p.stats.lock()
         {
-            let connector_name = convs
-                .first()
-                .map(|conv| conv.agent_slug.clone())
-                .unwrap_or_else(|| format!("{kind:?}").to_ascii_lowercase());
+            let connector_name =
+                connector_name.unwrap_or_else(|| format!("{kind:?}").to_ascii_lowercase());
             if failed_stats_index.is_none() {
                 stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
             }
@@ -34241,12 +34670,29 @@ fn prepare_conversation_for_ingest(
     conv: &mut NormalizedConversation,
     raw_source_exclusions: &RawSourceExclusions,
 ) {
+    prepare_conversation_metadata_for_ingest(connector_name, origin, workspace_rewrite_root, conv);
+    capture_prepared_conversation(data_dir, conv, raw_source_exclusions);
+}
+
+fn prepare_conversation_metadata_for_ingest(
+    connector_name: &str,
+    origin: &Origin,
+    workspace_rewrite_root: Option<&ScanRoot>,
+    conv: &mut NormalizedConversation,
+) {
     inject_provenance(conv, origin);
     canonicalize_claude_external_id(connector_name, conv);
     if let Some(root) = workspace_rewrite_root {
         apply_workspace_rewrite(conv, root);
     }
     compact_large_connector_extras(connector_name, conv);
+}
+
+fn capture_prepared_conversation(
+    data_dir: &Path,
+    conv: &mut NormalizedConversation,
+    raw_source_exclusions: &RawSourceExclusions,
+) {
     if WorkspaceExclusions::from_env()
         .is_ok_and(|policy| !policy.excludes(conv.workspace.as_deref()))
     {
@@ -68959,6 +69405,299 @@ c.close()
             .map(|conv| conv.external_id.as_deref().unwrap())
             .collect();
         assert_eq!(ordered, vec!["a", "b", "c"]);
+    }
+
+    fn watch_spool_fixture(
+        session: usize,
+        message_count: usize,
+        content_bytes: usize,
+    ) -> NormalizedConversation {
+        let timestamp = 1_700_000_000_000_i64 + session as i64 * 1_000;
+        NormalizedConversation {
+            agent_slug: "amp".to_string(),
+            external_id: Some(format!("watch-spool-{session:05}")),
+            title: Some(format!("Conversation {session}")),
+            workspace: Some(PathBuf::from("/workspaces/watch-spool")),
+            source_path: PathBuf::from(format!("/sessions/thread-{session:05}.json")),
+            started_at: Some(timestamp),
+            ended_at: None,
+            metadata: serde_json::json!({"session": session, "preserve": [true, null, "é"]}),
+            messages: (0..message_count)
+                .map(|message| NormalizedMessage {
+                    idx: message as i64,
+                    role: if message.is_multiple_of(2) {
+                        "user"
+                    } else {
+                        "assistant"
+                    }
+                    .to_string(),
+                    author: None,
+                    created_at: Some(timestamp + message as i64),
+                    content: format!(
+                        "session {session} message {message} {}",
+                        "x".repeat(content_bytes)
+                    ),
+                    extra: serde_json::json!({"message": message}),
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn watch_spool_matches_in_memory_global_order_and_payloads() -> Result<()> {
+        let temp = TempDir::new()?;
+        let progress = IndexingProgress::default();
+        for count_limit in [1, 8, 512] {
+            let mut original = Vec::new();
+            let mut spool = WatchConversationSpool::new(temp.path(), count_limit);
+            for session in (0..97).rev() {
+                let mut conversation = watch_spool_fixture(session, session % 5, 100);
+                // Include absent and tied timestamps as well as path/id ties.
+                if session % 7 == 0 {
+                    conversation.started_at = None;
+                    conversation.messages.clear();
+                } else if session % 3 == 0 {
+                    conversation.started_at = Some(100);
+                    for message in &mut conversation.messages {
+                        message.created_at = Some(100);
+                    }
+                }
+                original.push(conversation.clone());
+                spool.push(conversation, Some(&progress))?;
+            }
+            sort_watch_conversations_for_watermark(&mut original);
+            let mut batches = spool.into_sorted_batches()?;
+            let mut actual = Vec::new();
+            loop {
+                let batch = batches.next_batch(Some(&progress))?;
+                if batch.is_empty() {
+                    break;
+                }
+                assert!(batch.len() <= count_limit);
+                actual.extend(batch);
+            }
+            assert_eq!(
+                serde_json::to_value(actual)?,
+                serde_json::to_value(original)?
+            );
+        }
+        assert!(progress.activity.load(Ordering::Relaxed) >= 97 * 3);
+        assert_eq!(
+            fs::read_dir(temp.path())?.count(),
+            0,
+            "anonymous spools leave no files"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn watch_spool_bounds_payload_memory_at_reported_archive_scale() -> Result<()> {
+        // GH #538: 8,560 conversations / 683,558 messages. Generate and consume
+        // one conversation at a time so the fixture does not hide a second
+        // full-corpus allocation beside the code under test.
+        const SESSIONS: usize = 8_560;
+        const MESSAGES: usize = 683_558;
+        let temp = TempDir::new()?;
+        let progress = IndexingProgress::default();
+        let mut spool = WatchConversationSpool::new(temp.path(), 32);
+        let limit = spool.memory_limit;
+        let mut peak_buffered_bytes = 0usize;
+        let mut full_corpus_bytes = 0usize;
+        for session in (0..SESSIONS).rev() {
+            let messages = MESSAGES / SESSIONS + usize::from(session < MESSAGES % SESSIONS);
+            let conversation = watch_spool_fixture(session, messages, 64);
+            full_corpus_bytes = full_corpus_bytes
+                .saturating_add(conversation_batch_footprint(&conversation).retained_bytes);
+            spool.push(conversation, Some(&progress))?;
+            peak_buffered_bytes = peak_buffered_bytes.max(spool.memory_bytes);
+            assert!(spool.memory_bytes <= limit);
+        }
+        assert_eq!(spool.len(), SESSIONS);
+        assert!(
+            spool.file.is_some(),
+            "large watch scans must spill payloads"
+        );
+        assert!(full_corpus_bytes > limit * 20);
+        let spooled_bytes = spool.written_bytes;
+        let mut batches = spool.into_sorted_batches()?;
+        let mut sessions = 0usize;
+        let mut messages = 0usize;
+        let mut batch_count = 0usize;
+        loop {
+            let batch = batches.next_batch(Some(&progress))?;
+            if batch.is_empty() {
+                break;
+            }
+            batch_count += 1;
+            let buffered_bytes = batch.iter().fold(0usize, |bytes, conversation| {
+                bytes.saturating_add(conversation_batch_footprint(conversation).retained_bytes)
+            });
+            peak_buffered_bytes = peak_buffered_bytes.max(buffered_bytes);
+            assert!(buffered_bytes <= limit);
+            assert!(batch.len() <= 32);
+            for conversation in batch {
+                assert_eq!(
+                    conversation.external_id,
+                    Some(format!("watch-spool-{sessions:05}"))
+                );
+                assert_eq!(conversation.metadata["session"], sessions);
+                messages += conversation.messages.len();
+                sessions += 1;
+            }
+        }
+        assert_eq!((sessions, messages), (SESSIONS, MESSAGES));
+        assert!(progress.activity.load(Ordering::Relaxed) >= 2 * SESSIONS as u64);
+        eprintln!(
+            "GH538 watch spool: conversations={sessions} messages={messages} batches={batch_count} \
+             peak_payload_bytes={peak_buffered_bytes} full_corpus_payload_bytes={full_corpus_bytes} \
+             temporary_bytes={spooled_bytes}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn watch_spool_keeps_one_oversized_conversation_isolated() -> Result<()> {
+        let temp = TempDir::new()?;
+        let mut spool = WatchConversationSpool::new(temp.path(), 32);
+        spool.push(watch_spool_fixture(2, 1, 16), None)?;
+        spool.push(watch_spool_fixture(1, 1, spool.memory_limit + 1), None)?;
+        spool.push(watch_spool_fixture(0, 1, 16), None)?;
+        let mut batches = spool.into_sorted_batches()?;
+        for session in 0..3 {
+            let batch = batches.next_batch(None)?;
+            assert_eq!(batch.len(), 1);
+            assert_eq!(
+                batch[0].external_id,
+                Some(format!("watch-spool-{session:05}"))
+            );
+        }
+        assert!(batches.next_batch(None)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn watch_spool_cancellation_leaves_sources_replayable() -> Result<()> {
+        let temp = TempDir::new()?;
+        let progress = IndexingProgress::default();
+        let mut spool = WatchConversationSpool::new(temp.path(), 1);
+        spool.push(watch_spool_fixture(0, 2, 100), Some(&progress))?;
+        progress.request_stop();
+        let error = spool
+            .push(watch_spool_fixture(1, 2, 100), Some(&progress))
+            .expect_err("cancelled spill must stop before adding another source");
+        assert!(error.downcast_ref::<IndexInterrupted>().is_some());
+        drop(spool);
+        assert_eq!(fs::read_dir(temp.path())?.count(), 0);
+
+        let progress = IndexingProgress::default();
+        let mut retry = WatchConversationSpool::new(temp.path(), 1);
+        for session in (0..2).rev() {
+            retry.push(watch_spool_fixture(session, 2, 100), Some(&progress))?;
+        }
+        let mut retry = retry.into_sorted_batches()?;
+        assert_eq!(
+            retry.next_batch(Some(&progress))?[0].external_id.as_deref(),
+            Some("watch-spool-00000")
+        );
+        progress.request_stop();
+        assert!(
+            retry
+                .next_batch(Some(&progress))
+                .unwrap_err()
+                .downcast_ref::<IndexInterrupted>()
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn watch_spool_reader_checks_stop_between_bounded_reads() -> Result<()> {
+        let progress = IndexingProgress::default();
+        let data = vec![b'x'; 256 * 1024];
+        let mut reader = WatchSpoolReader {
+            reader: std::io::Cursor::new(data),
+            progress: Some(&progress),
+        };
+        let mut buffer = vec![0; 128 * 1024];
+        assert_eq!(reader.read(&mut buffer)?, 64 * 1024);
+        assert_eq!(progress.activity.load(Ordering::Relaxed), 1);
+        progress.request_stop();
+        assert!(reader.read(&mut buffer).is_err());
+        assert_eq!(progress.activity.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn watch_idle_wait_honors_cancellation_without_activity() {
+        let progress = Arc::new(IndexingProgress::default());
+        let stopping = Arc::clone(&progress);
+        let stop = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            stopping.request_stop();
+        });
+        let started = Instant::now();
+        let result = wait_watch_loop_event(
+            &never(),
+            &never(),
+            Duration::from_secs(300),
+            Some(&progress),
+        );
+        stop.join().expect("stop request thread");
+        let Err(error) = result else {
+            panic!("idle watch wait must return the stop request");
+        };
+        assert!(error.downcast_ref::<IndexInterrupted>().is_some());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(progress.activity.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn watch_idle_wait_preserves_deadline_without_activity() -> Result<()> {
+        let progress = Arc::new(IndexingProgress::default());
+        let timeout = Duration::from_millis(80);
+        let started = Instant::now();
+        assert!(matches!(
+            wait_watch_loop_event(&never(), &never(), timeout, Some(&progress))?,
+            WatchLoopEvent::Timeout
+        ));
+        assert!(started.elapsed() >= timeout);
+        assert_eq!(progress.activity.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_spool_preserves_non_utf8_source_workspace_and_snippet_paths() -> Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new()?;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/sessions/non-utf8-\xff".to_vec(),
+        ));
+        let mut conversation = watch_spool_fixture(0, 1, 10);
+        conversation.source_path = path.clone();
+        conversation.workspace = Some(path.clone());
+        conversation.messages[0].snippets.push(NormalizedSnippet {
+            file_path: Some(path.clone()),
+            start_line: Some(1),
+            end_line: Some(2),
+            language: Some("rust".to_string()),
+            snippet_text: Some("let preserved = true;".to_string()),
+        });
+        let mut spool = WatchConversationSpool::new(temp.path(), 1);
+        spool.push(conversation, None)?;
+        spool.push(watch_spool_fixture(1, 1, 10), None)?;
+        let mut batches = spool.into_sorted_batches()?;
+        let restored = batches.next_batch(None)?.remove(0);
+        assert_eq!(restored.source_path, path);
+        assert_eq!(restored.workspace.as_ref(), Some(&path));
+        assert_eq!(
+            restored.messages[0].snippets[0].file_path.as_ref(),
+            Some(&path)
+        );
+        Ok(())
     }
 
     #[test]

@@ -1,13 +1,14 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const RAW_MIRROR_SCHEMA_VERSION: u32 = 1;
 const RAW_MIRROR_ROOT_DIR: &str = "raw-mirror";
@@ -26,7 +27,152 @@ static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 static BLOB_CAPTURE_CACHE: OnceLock<
     Mutex<HashMap<RawMirrorBlobSourceKey, CachedRawMirrorBlobRecord>>,
 > = OnceLock::new();
-static MANIFEST_UPDATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Clone)]
+struct RawMirrorIoObserver {
+    on_progress: Arc<dyn Fn() + Send + Sync>,
+    is_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+thread_local! {
+    static RAW_MIRROR_IO_OBSERVER: RefCell<Option<RawMirrorIoObserver>> = const { RefCell::new(None) };
+}
+
+/// The observer belongs to the thread doing the I/O, including connector
+/// producer threads. Dropping a nested scope restores the previous observer.
+pub(crate) struct RawMirrorIoScope {
+    previous: Option<RawMirrorIoObserver>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for RawMirrorIoScope {
+    fn drop(&mut self) {
+        RAW_MIRROR_IO_OBSERVER.with(|observer| {
+            *observer.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+pub(crate) fn observe_raw_mirror_io(
+    on_progress: Arc<dyn Fn() + Send + Sync>,
+    is_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> RawMirrorIoScope {
+    let previous = RAW_MIRROR_IO_OBSERVER.with(|observer| {
+        observer.replace(Some(RawMirrorIoObserver {
+            on_progress,
+            is_cancelled,
+        }))
+    });
+    RawMirrorIoScope {
+        previous,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+struct RawMirrorActiveIo {
+    operation: &'static str,
+    path: PathBuf,
+    started: Instant,
+}
+
+static RAW_MIRROR_IO_NONCE: AtomicU64 = AtomicU64::new(0);
+static RAW_MIRROR_ACTIVE_IO: OnceLock<Mutex<BTreeMap<u64, RawMirrorActiveIo>>> = OnceLock::new();
+
+struct RawMirrorActiveIoGuard(u64);
+
+impl Drop for RawMirrorActiveIoGuard {
+    fn drop(&mut self) {
+        if let Some(active) = RAW_MIRROR_ACTIVE_IO.get() {
+            active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.0);
+        }
+    }
+}
+
+/// This snapshot performs no filesystem I/O and never waits for a filesystem
+/// operation or its lock. In particular it can name an lstat that has not
+/// returned on macOS, even in a stripped release binary (GH #538).
+pub(crate) fn raw_mirror_io_snapshot() -> Value {
+    let Some(active) = RAW_MIRROR_ACTIVE_IO.get() else {
+        return json!([]);
+    };
+    let active = active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Value::Array(
+        active
+            .values()
+            .map(|entry| {
+                json!({
+                    "operation": entry.operation,
+                    "path": entry.path.to_string_lossy(),
+                    "elapsed_ms": entry.started.elapsed().as_millis() as u64,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn raw_mirror_checkpoint() -> std::io::Result<()> {
+    let cancelled = RAW_MIRROR_IO_OBSERVER.with(|observer| {
+        observer
+            .borrow()
+            .as_ref()
+            .is_some_and(|observer| (observer.is_cancelled)())
+    });
+    if cancelled {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "raw-mirror operation cancelled",
+        ));
+    }
+    Ok(())
+}
+
+fn raw_mirror_record_progress() {
+    let observer = RAW_MIRROR_IO_OBSERVER.with(|observer| observer.borrow().clone());
+    if let Some(observer) = observer {
+        (observer.on_progress)();
+    }
+}
+
+fn raw_mirror_io<T>(
+    operation: &'static str,
+    path: &Path,
+    perform: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    raw_mirror_checkpoint()?;
+    let observed = RAW_MIRROR_IO_OBSERVER.with(|observer| observer.borrow().is_some());
+    // The before-operation trace is useful even outside an index run. No
+    // timer manufactures liveness while a syscall or lock is still blocked.
+    tracing::trace!(operation, path = %path.display(), "raw-mirror filesystem operation");
+    let guard = observed.then(|| {
+        let id = RAW_MIRROR_IO_NONCE.fetch_add(1, Ordering::Relaxed);
+        RAW_MIRROR_ACTIVE_IO
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                id,
+                RawMirrorActiveIo {
+                    operation,
+                    path: path.to_path_buf(),
+                    started: Instant::now(),
+                },
+            );
+        RawMirrorActiveIoGuard(id)
+    });
+    let result = perform();
+    drop(guard);
+    raw_mirror_record_progress();
+    result
+}
+
+fn raw_mirror_symlink_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
+    raw_mirror_io("symlink_metadata", path, || fs::symlink_metadata(path))
+}
 
 #[derive(Debug)]
 struct RawMirrorFileLockGuard {
@@ -1523,7 +1669,7 @@ fn acquire_raw_mirror_mutation_lock(root: &Path) -> Result<RawMirrorFileLockGuar
             lock_path.display()
         ));
     }
-    match fs::symlink_metadata(&lock_path) {
+    match raw_mirror_symlink_metadata(&lock_path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             return Err(anyhow!(
                 "raw mirror mutation lock path {} is not a regular file",
@@ -1551,11 +1697,25 @@ fn acquire_raw_mirror_mutation_lock(root: &Path) -> Result<RawMirrorFileLockGuar
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     configure_lock_open_options(&mut options);
-    let file = options
-        .open(&lock_path)
-        .with_context(|| format!("open raw mirror mutation lock {}", lock_path.display()))?;
-    file.lock()
-        .with_context(|| format!("acquire raw mirror mutation lock {}", lock_path.display()))?;
+    let file = raw_mirror_io("open_mutation_lock", &lock_path, || {
+        options.open(&lock_path)
+    })
+    .with_context(|| format!("open raw mirror mutation lock {}", lock_path.display()))?;
+    raw_mirror_io("acquire_mutation_lock", &lock_path, || {
+        loop {
+            raw_mirror_checkpoint()?;
+            match file.try_lock() {
+                Ok(()) => break Ok(()),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    // Waiting is not forward progress. Keep the operation visible
+                    // to diagnostics and observe cancellation between attempts.
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(std::fs::TryLockError::Error(error)) => break Err(error),
+            }
+        }
+    })
+    .with_context(|| format!("acquire raw mirror mutation lock {}", lock_path.display()))?;
 
     let opened_metadata = file.metadata().with_context(|| {
         format!(
@@ -1563,7 +1723,7 @@ fn acquire_raw_mirror_mutation_lock(root: &Path) -> Result<RawMirrorFileLockGuar
             lock_path.display()
         )
     })?;
-    let path_metadata = fs::symlink_metadata(&lock_path)
+    let path_metadata = raw_mirror_symlink_metadata(&lock_path)
         .with_context(|| format!("restat raw mirror mutation lock {}", lock_path.display()))?;
     if path_metadata.file_type().is_symlink()
         || !path_metadata.is_file()
@@ -1648,6 +1808,9 @@ fn configure_lock_open_options(options: &mut OpenOptions) {
 fn set_private_open_file_permissions(file: &File, path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
+    if file.metadata()?.permissions().mode() & 0o7777 == 0o600 {
+        return Ok(());
+    }
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .with_context(|| format!("set raw mirror lock permissions {}", path.display()))
 }
@@ -1844,7 +2007,6 @@ pub fn merge_manifest_db_links(
     let root = raw_mirror_root(data_dir);
     let _mutation_lock = acquire_raw_mirror_mutation_lock(&root)?;
     let manifest_path = raw_mirror_manifest_path_from_relative(&root, manifest_relative_path)?;
-    policy::note_mutation(&root)?;
     merge_raw_mirror_manifest_db_links(&root, &manifest_path, links, None)
 }
 
@@ -1898,7 +2060,7 @@ fn content_addressed_blob_is_verified(root: &Path, reference: &RawMirrorChunkRef
             path.display()
         ));
     }
-    match fs::symlink_metadata(&path) {
+    match raw_mirror_symlink_metadata(&path) {
         Ok(_) => {
             verify_existing_blob_reference(root, reference)?;
             Ok(true)
@@ -1911,7 +2073,7 @@ fn content_addressed_blob_is_verified(root: &Path, reference: &RawMirrorChunkRef
 }
 
 fn open_stable_source_file(source_path: &Path, expected_metadata: &fs::Metadata) -> Result<File> {
-    let source = File::open(source_path)
+    let source = raw_mirror_io("open_source", source_path, || File::open(source_path))
         .with_context(|| format!("open raw mirror source {}", source_path.display()))?;
     let opened_metadata = source
         .metadata()
@@ -1922,7 +2084,7 @@ fn open_stable_source_file(source_path: &Path, expected_metadata: &fs::Metadata)
             source_path.display()
         ));
     }
-    let current_path_metadata = fs::symlink_metadata(source_path)
+    let current_path_metadata = raw_mirror_symlink_metadata(source_path)
         .with_context(|| format!("restat raw mirror source {}", source_path.display()))?;
     if current_path_metadata.file_type().is_symlink() {
         return Err(anyhow!(
@@ -2003,7 +2165,7 @@ fn source_file_changed_during_capture(
 }
 
 fn source_path_changed_identity_during_capture(source_path: &Path, initial: &fs::Metadata) -> bool {
-    match fs::symlink_metadata(source_path) {
+    match raw_mirror_symlink_metadata(source_path) {
         Ok(current) => current.file_type().is_symlink() || !same_source_identity(initial, &current),
         Err(_) => true,
     }
@@ -2024,7 +2186,7 @@ fn publish_content_addressed_temp(
             expected_blake3
         ));
     }
-    let temp_size_bytes = fs::symlink_metadata(temp_path)
+    let temp_size_bytes = raw_mirror_symlink_metadata(temp_path)
         .with_context(|| format!("stat raw mirror temp {}", temp_path.display()))?
         .len();
     let reference = RawMirrorChunkRef {
@@ -2038,7 +2200,7 @@ fn publish_content_addressed_temp(
             .parent()
             .ok_or_else(|| anyhow!("raw mirror blob path has no parent"))?,
     )?;
-    match fs::symlink_metadata(final_path) {
+    match raw_mirror_symlink_metadata(final_path) {
         Ok(_) => {
             verify_existing_blob_reference(root, &reference)?;
             remove_temp_best_effort(temp_path);
@@ -2130,15 +2292,15 @@ fn merge_raw_mirror_manifest_db_links(
         return Ok(());
     }
 
-    let lock = MANIFEST_UPDATE_LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = lock
-        .lock()
-        .map_err(|_| anyhow!("raw mirror manifest update lock poisoned"))?;
-
-    let parsed_manifest = read_raw_mirror_manifest(manifest_path)?;
-    let expected_manifest_path = root.join(raw_mirror_manifest_relative_path(
-        &parsed_manifest.manifest_id,
-    ));
+    // All callers hold this root's mutation file lock. A second process-wide
+    // mutex held across the read/write used to stall unrelated mirrors behind
+    // a slow filesystem without exposing the waiter or observing cancellation.
+    if raw_mirror_path_has_symlink_below_root(root, manifest_path) {
+        return Err(anyhow!("raw mirror manifest path contains a symlink"));
+    }
+    let mut manifest = read_raw_mirror_manifest(manifest_path)?;
+    let expected_manifest_path =
+        root.join(raw_mirror_manifest_relative_path(&manifest.manifest_id));
     if manifest_path != expected_manifest_path {
         return Err(anyhow!(
             "raw mirror manifest {} is not at its canonical path {}",
@@ -2146,7 +2308,10 @@ fn merge_raw_mirror_manifest_db_links(
             expected_manifest_path.display()
         ));
     }
-    let mut manifest = read_validated_raw_mirror_manifest(root, &parsed_manifest.manifest_id)?;
+    // Validate the snapshot already read. A second read both repeats metadata
+    // work for every conversation and needlessly separates identity validation
+    // from the descriptor whose links are being changed.
+    validate_raw_mirror_manifest_contents(&manifest, &manifest.manifest_id)?;
     if let Some(expected_blob_blake3) = expected_blob_blake3
         && manifest.blob_blake3 != expected_blob_blake3
     {
@@ -2176,11 +2341,18 @@ fn merge_raw_mirror_manifest_db_links(
             RAW_MIRROR_MANIFEST_MAX_BYTES
         ));
     }
+    // An already-linked conversation is a read-only no-op, including the
+    // cross-process usage fence. Fence only an actual replacement.
+    policy::note_mutation(root)?;
     replace_raw_mirror_bytes(root, manifest_path, &manifest_bytes)
 }
 
-fn replace_raw_mirror_bytes(root: &Path, manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()> {
-    let previous_size = match fs::symlink_metadata(manifest_path) {
+fn replace_raw_mirror_bytes(
+    root: &Path,
+    manifest_path: &Path,
+    manifest_bytes: &[u8],
+) -> Result<()> {
+    let previous_size = match raw_mirror_symlink_metadata(manifest_path) {
         Ok(metadata) => metadata.len(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
         Err(error) => return Err(error).context("inspect raw mirror replacement size"),
@@ -2222,10 +2394,7 @@ fn replace_raw_mirror_bytes(root: &Path, manifest_path: &Path, manifest_bytes: &
         Ok(())
     })();
     if result.is_ok() {
-        policy::record_file_growth(
-            root,
-            (manifest_bytes.len() as u64).saturating_sub(previous_size),
-        );
+        policy::record_file_size_change(root, previous_size, manifest_bytes.len() as u64);
     } else {
         // Failed replacement may leave retained staging bytes. Never reuse a
         // total that cannot account for the actual error outcome.
@@ -2270,7 +2439,7 @@ fn raw_mirror_manifest_path_from_relative(root: &Path, relative_path: &str) -> R
 }
 
 fn verify_existing_file(path: &Path, expected_blake3: &str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
+    let metadata = raw_mirror_symlink_metadata(path)
         .with_context(|| format!("stat raw mirror blob {}", path.display()))?;
     if metadata.file_type().is_symlink() {
         return Err(anyhow!(
@@ -2334,7 +2503,7 @@ fn validated_existing_manifest(
 }
 
 fn read_raw_mirror_manifest(path: &Path) -> Result<RawMirrorManifestFile> {
-    let metadata = fs::symlink_metadata(path)
+    let metadata = raw_mirror_symlink_metadata(path)
         .with_context(|| format!("stat raw mirror manifest {}", path.display()))?;
     if metadata.file_type().is_symlink() {
         return Err(anyhow!(
@@ -2367,9 +2536,11 @@ fn read_raw_mirror_manifest_from_open_file(
     // reading. Read one sentinel byte beyond the limit, then reject before JSON
     // parsing rather than accepting a truncated prefix.
     let mut bytes = Vec::new();
-    file.take(RAW_MIRROR_MANIFEST_MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("read raw mirror manifest {}", path.display()))?;
+    raw_mirror_io("read_manifest", path, || {
+        file.take(RAW_MIRROR_MANIFEST_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+    })
+    .with_context(|| format!("read raw mirror manifest {}", path.display()))?;
     if bytes.len() as u64 > RAW_MIRROR_MANIFEST_MAX_BYTES {
         anyhow::bail!(
             "refusing to read raw mirror manifest {} larger than {} bytes",
@@ -2420,7 +2591,7 @@ fn raw_mirror_source_sidecars_fingerprint(source_path: &Path) -> Option<String> 
         let mut path = source_path.as_os_str().to_os_string();
         path.push(suffix);
         hasher.update(suffix.as_bytes());
-        match fs::symlink_metadata(Path::new(&path)) {
+        match raw_mirror_symlink_metadata(Path::new(&path)) {
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
                 let fingerprint = format!(
                     "{}:{}:{}:{};",
@@ -2456,15 +2627,17 @@ fn read_persisted_raw_mirror_blob_cache(
     if raw_mirror_path_has_symlink_below_root(root, &path) {
         return None;
     }
-    let metadata = fs::symlink_metadata(&path).ok()?;
+    let metadata = raw_mirror_symlink_metadata(&path).ok()?;
     if !metadata.is_file() || metadata.len() > RAW_MIRROR_MANIFEST_MAX_BYTES {
         return None;
     }
     let file = open_stable_source_file(&path, &metadata).ok()?;
     let mut bytes = Vec::new();
-    file.take(RAW_MIRROR_MANIFEST_MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
+    raw_mirror_io("read_capture_cache", &path, || {
+        file.take(RAW_MIRROR_MANIFEST_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+    })
+    .ok()?;
     if bytes.len() as u64 > RAW_MIRROR_MANIFEST_MAX_BYTES {
         return None;
     }
@@ -2574,7 +2747,7 @@ fn cached_raw_mirror_blob_record(
 }
 
 fn raw_mirror_blob_cache_source_is_current(key: &RawMirrorBlobCacheKey) -> bool {
-    fs::symlink_metadata(&key.source_path)
+    raw_mirror_symlink_metadata(&key.source_path)
         .ok()
         .is_some_and(|metadata| {
             !metadata.file_type().is_symlink()
@@ -2616,7 +2789,7 @@ fn raw_mirror_stored_blob_fingerprints(
         if raw_mirror_path_has_symlink_below_root(root, &path) {
             return None;
         }
-        let metadata = fs::symlink_metadata(&path).ok()?;
+        let metadata = raw_mirror_symlink_metadata(&path).ok()?;
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
             || metadata.len() != reference.blob_size_bytes
@@ -3068,7 +3241,7 @@ fn validate_existing_blob_metadata(root: &Path, reference: &RawMirrorChunkRef) -
             path.display()
         ));
     }
-    let metadata = fs::symlink_metadata(&path)
+    let metadata = raw_mirror_symlink_metadata(&path)
         .with_context(|| format!("stat raw mirror blob {}", path.display()))?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
@@ -3091,7 +3264,7 @@ fn raw_mirror_path_has_symlink_below_root(root: &Path, path: &Path) -> bool {
     // created) must not be refused with a misleading symlink error. This
     // mirrors the component walk below, where NotFound => false. Any other
     // metadata error stays fail-closed.
-    match fs::symlink_metadata(root) {
+    match raw_mirror_symlink_metadata(root) {
         Ok(metadata) if metadata.file_type().is_symlink() => return true,
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
@@ -3103,7 +3276,7 @@ fn raw_mirror_path_has_symlink_below_root(root: &Path, path: &Path) -> bool {
             return true;
         };
         current.push(part);
-        match fs::symlink_metadata(&current) {
+        match raw_mirror_symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => return true,
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
@@ -3200,7 +3373,7 @@ fn unique_db_links(links: &[RawMirrorDbLink]) -> Vec<RawMirrorDbLink> {
 }
 
 fn file_blake3(path: &Path) -> Result<String> {
-    let expected_metadata = fs::symlink_metadata(path)
+    let expected_metadata = raw_mirror_symlink_metadata(path)
         .with_context(|| format!("stat {} before hashing", path.display()))?;
     if expected_metadata.file_type().is_symlink() || !expected_metadata.is_file() {
         return Err(anyhow!(
@@ -3211,13 +3384,12 @@ fn file_blake3(path: &Path) -> Result<String> {
     let mut options = OpenOptions::new();
     options.read(true);
     configure_lock_open_options(&mut options);
-    let mut file = options
-        .open(path)
+    let mut file = raw_mirror_io("open_blob", path, || options.open(path))
         .with_context(|| format!("open {}", path.display()))?;
     let opened_metadata = file
         .metadata()
         .with_context(|| format!("stat opened raw mirror file {}", path.display()))?;
-    let current_path_metadata = fs::symlink_metadata(path)
+    let current_path_metadata = raw_mirror_symlink_metadata(path)
         .with_context(|| format!("restat raw mirror file {}", path.display()))?;
     if current_path_metadata.file_type().is_symlink()
         || !same_source_identity(&expected_metadata, &opened_metadata)
@@ -3231,8 +3403,7 @@ fn file_blake3(path: &Path) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let read = file
-            .read(&mut buffer)
+        let read = raw_mirror_io("hash_blob_read", path, || file.read(&mut buffer))
             .with_context(|| format!("read {}", path.display()))?;
         if read == 0 {
             break;
@@ -3243,9 +3414,9 @@ fn file_blake3(path: &Path) -> Result<String> {
 }
 
 fn ensure_private_dir(path: &Path) -> Result<()> {
-    create_private_dir_all(path)
+    raw_mirror_io("create_dir", path, || create_private_dir_all(path))
         .with_context(|| format!("create raw mirror dir {}", path.display()))?;
-    let metadata = fs::symlink_metadata(path)
+    let metadata = raw_mirror_symlink_metadata(path)
         .with_context(|| format!("stat raw mirror dir {}", path.display()))?;
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
@@ -3470,6 +3641,140 @@ fn set_private_dir_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gh538_blocked_io_names_its_path_without_fabricating_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("blocked-manifest.json");
+        let completed = Arc::new(AtomicU64::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_path = path.clone();
+        let worker_completed = Arc::clone(&completed);
+        let worker = std::thread::spawn(move || {
+            let _observer = observe_raw_mirror_io(
+                Arc::new(move || {
+                    worker_completed.fetch_add(1, Ordering::Relaxed);
+                }),
+                Arc::new(|| false),
+            );
+            raw_mirror_io("symlink_metadata", &worker_path, || {
+                started_tx.send(()).map_err(std::io::Error::other)?;
+                release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(std::io::Error::other)?;
+                Ok(())
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let snapshot = raw_mirror_io_snapshot();
+        let active = snapshot
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["path"] == json!(path))
+            .expect("the blocked operation must remain attributable");
+        assert_eq!(active["operation"], "symlink_metadata");
+        assert!(active["elapsed_ms"].is_u64());
+        assert_eq!(completed.load(Ordering::Relaxed), 0);
+        release_tx.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        assert_eq!(completed.load(Ordering::Relaxed), 1);
+        assert!(
+            raw_mirror_io_snapshot()
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["path"] != json!(path))
+        );
+    }
+
+    #[test]
+    fn gh538_blob_verification_observes_cancellation_between_real_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("blob.raw");
+        fs::write(&path, vec![b'x'; 256 * 1024]).unwrap();
+        let completed = Arc::new(AtomicU64::new(0));
+        let tick_completed = Arc::clone(&completed);
+        let cancel_completed = Arc::clone(&completed);
+        let _observer = observe_raw_mirror_io(
+            Arc::new(move || {
+                tick_completed.fetch_add(1, Ordering::Relaxed);
+            }),
+            Arc::new(move || cancel_completed.load(Ordering::Relaxed) >= 4),
+        );
+        // Metadata, open, identity restat and one 64 KiB read complete; the
+        // next read is cancelled, so a large verification is interruptible.
+        let error = file_blake3(&path).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert_eq!(completed.load(Ordering::Relaxed), 4);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 256 * 1024);
+    }
+
+    #[test]
+    fn gh538_repeated_db_links_do_not_mutate_the_mirror() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("archive");
+        let source = temp.path().join("session.jsonl");
+        fs::write(&source, b"{\"message\":\"retained recovery evidence\"}\n").unwrap();
+        // This checks repeated link updates, independently of the machine's
+        // production retention settings. Keep real admission and a nonzero
+        // reserve while budgeting for this tiny fixture.
+        let record = policy::capture(
+            RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source,
+                db_links: &[],
+            },
+            RAW_MIRROR_CHUNK_THRESHOLD_BYTES,
+            RAW_MIRROR_CHUNK_SIZE_BYTES,
+            policy::RawMirrorRetentionPolicy {
+                max_bytes: 1024 * 1024,
+                min_free_bytes: 64 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let links = [RawMirrorDbLink {
+            conversation_id: Some(42),
+            message_count: Some(1),
+            source_path: Some(source.display().to_string()),
+            started_at_ms: Some(123),
+        }];
+        merge_manifest_db_links(&data_dir, &record.manifest_relative_path, &links).unwrap();
+        let root = raw_mirror_root(&data_dir);
+        let manifest_path = root.join(&record.manifest_relative_path);
+        let generation_path = root.join(".usage-generation");
+        let before = fs::read(&manifest_path).unwrap();
+        let generation = fs::read(&generation_path).unwrap();
+        let manifest_mtime = fs::metadata(&manifest_path).unwrap().modified().unwrap();
+        let tmp_mtime = fs::metadata(root.join("tmp")).unwrap().modified().unwrap();
+        for _ in 0..128 {
+            merge_manifest_db_links(&data_dir, &record.manifest_relative_path, &links).unwrap();
+        }
+        assert_eq!(fs::read(&manifest_path).unwrap(), before);
+        assert_eq!(fs::read(&generation_path).unwrap(), generation);
+        assert_eq!(
+            fs::metadata(&manifest_path).unwrap().modified().unwrap(),
+            manifest_mtime
+        );
+        assert_eq!(
+            fs::metadata(root.join("tmp")).unwrap().modified().unwrap(),
+            tmp_mtime
+        );
+        assert_eq!(
+            read_validated_raw_mirror_manifest(&root, &record.manifest_id)
+                .unwrap()
+                .db_links,
+            links
+        );
+    }
 
     #[test]
     fn gh447_sensitive_containers_refuse_capture_before_reading_or_creating_mirrors() {

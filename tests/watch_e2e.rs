@@ -71,16 +71,33 @@ mod deferred_watch_sources {
     }
 
     fn start_watch(home: &Path, data: &Path, streaming: bool) -> (WatchChild, std::path::PathBuf) {
+        start_watch_with_env(home, data, streaming, &[])
+    }
+
+    fn start_watch_with_env(
+        home: &Path,
+        data: &Path,
+        streaming: bool,
+        environment: &[(&str, &str)],
+    ) -> (WatchChild, std::path::PathBuf) {
         let log_path = home.join("watch.log");
         let log = fs::File::create(&log_path).expect("watch log");
         let mut command = cass(home, data);
         command
             // JSON mode suppresses the INFO readiness signal unless requested.
             .arg("--verbose")
-            .args(["index", "--watch", "--watch-interval", "1", "--json"])
+            .args([
+                "index",
+                "--watch",
+                "--watch-interval",
+                "1",
+                "--json",
+                "--no-progress-events",
+            ])
             .env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "8")
             .env("CASS_STREAMING_INDEX", if streaming { "1" } else { "0" })
-            .env("RUST_LOG", "info");
+            .env("RUST_LOG", "info")
+            .envs(environment.iter().copied());
         let mut child = WatchChild(
             command
                 .stdout(Stdio::null())
@@ -326,6 +343,265 @@ mod deferred_watch_sources {
             fs::metadata(&held).unwrap().modified().unwrap(),
             held_modified
         );
+    }
+
+    /// GH #538: exercise a resident watcher, including repeated source discovery
+    /// and recovery after interruption. The raw-mirror unit workload covers the
+    /// reporter's 20,816-file inventory; this test keeps 128 real preserved
+    /// sources alongside a small canonical archive so DB fixture creation does
+    /// not hide the watch-cycle behavior under test.
+    // The persisted capture cache has strong inode/ctime fingerprints on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn gh538_live_watch_preserves_idle_mirror_and_recovers_repeated_updates() {
+        use coding_agent_search::raw_mirror::{RawMirrorCaptureInput, capture_source_file};
+        use std::io::Write;
+
+        const STALL_ABORT_SECS: u64 = 20;
+
+        fn age_source(path: &Path, seconds: u64) {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .expect("open fixture for timestamp update")
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds)),
+                )
+                .expect("set fixture modification time");
+        }
+
+        fn snapshot_mirror(
+            data: &Path,
+        ) -> Vec<(std::path::PathBuf, Vec<u8>, std::time::SystemTime)> {
+            let root = data.join("raw-mirror/v1");
+            let mut paths = vec![root.join(".usage-generation")];
+            for directory in ["manifests", "capture-cache"] {
+                for entry in walkdir::WalkDir::new(root.join(directory)) {
+                    let entry = entry.expect("enumerate preserved mirror files");
+                    if entry.file_type().is_file() {
+                        paths.push(entry.into_path());
+                    }
+                }
+            }
+            paths.sort();
+            paths
+                .into_iter()
+                .map(|path| {
+                    let bytes = fs::read(&path).expect("read preserved mirror file");
+                    let modified = fs::metadata(&path)
+                        .expect("preserved mirror metadata")
+                        .modified()
+                        .expect("preserved mirror modification time");
+                    (path, bytes, modified)
+                })
+                .collect()
+        }
+
+        fn staging_modified(data: &Path) -> std::time::SystemTime {
+            fs::metadata(data.join("raw-mirror/v1/tmp"))
+                .expect("mirror staging directory")
+                .modified()
+                .expect("staging directory modification time")
+        }
+
+        fn capture_count(logs: &str) -> usize {
+            logs.lines()
+                .filter(|line| {
+                    line.contains("captured discovered provider source into raw mirror before connector parse")
+                })
+                .count()
+        }
+
+        fn wait_for_hit(
+            child: &mut WatchChild,
+            home: &Path,
+            data: &Path,
+            log: &Path,
+            needle: &str,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let logs = fs::read_to_string(log).expect("read resident watcher log");
+                assert!(
+                    child.0.try_wait().expect("watch process status").is_none(),
+                    "resident watcher exited before indexing {needle}: {logs}"
+                );
+                let result = search(home, data, needle);
+                let count = content_hit_count(&result, needle);
+                assert!(count <= 1, "duplicate canonical search hit: {result}");
+                if count == 1 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "lost watch update {needle}: {logs}"
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+
+        fn append_user(path: &Path, needle: &str) {
+            let message = serde_json::json!({
+                "timestamp": "2025-09-30T15:43:00.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": needle}]
+                }
+            });
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .expect("open source for an actual append");
+            writeln!(file, "{message}").expect("append complete source event");
+        }
+
+        let home = indexed_watch_home();
+        let data = home.path().join("cass-data");
+        let archived_sources = home.path().join("preserved-sources");
+        fs::create_dir(&archived_sources).expect("preserved fixture directory");
+        for index in 0..128 {
+            let source = archived_sources.join(format!("rollout-{index:04}.jsonl"));
+            write_codex_session(
+                &source,
+                &format!("preservedsource{index:04}"),
+                &format!("preserved-source-{index:04}"),
+            );
+            capture_source_file(RawMirrorCaptureInput {
+                data_dir: &data,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source,
+                db_links: &[],
+            })
+            .expect("capture real archived source");
+        }
+        let expected_idle_mirror = snapshot_mirror(&data);
+        let expected_idle_staging = staging_modified(&data);
+        assert!(
+            expected_idle_mirror.len() >= 259,
+            "fixture must contain 129 manifests, their source caches, and its generation fence"
+        );
+
+        let stall_abort_secs = STALL_ABORT_SECS.to_string();
+        let environment = [
+            ("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0"),
+            ("CASS_INDEX_STALL_DETECT_SECS", "5"),
+            ("CASS_INDEX_STALL_ABORT_SECS", stall_abort_secs.as_str()),
+            ("CASS_INDEX_FINALIZE_ABORT_SECS", stall_abort_secs.as_str()),
+            ("RUST_LOG", "info,coding_agent_search::indexer=debug"),
+        ];
+        let (mut child, log_path) = start_watch_with_env(home.path(), &data, true, &environment);
+        let watch_started = Instant::now();
+        let sessions = home.path().join(".codex/sessions");
+
+        // Each marker generates a real filesystem notification under the
+        // watched root. Its old timestamp admits rediscovery of the unchanged
+        // baseline without modifying that source's strong cache fingerprint.
+        // An unrelated suffix keeps the marker out of the connector's input.
+        // Keep doing real discovery work beyond the configured abort window,
+        // even when the first three cycles finish quickly on this machine.
+        let mut cycle = 0;
+        while cycle < 3 || watch_started.elapsed() <= Duration::from_secs(STALL_ABORT_SECS) {
+            let previous = capture_count(&fs::read_to_string(&log_path).unwrap());
+            let marker = sessions.join(format!("rediscover-{cycle}.marker"));
+            fs::write(&marker, b"root discovery notification").expect("emit filesystem event");
+            age_source(&marker, 1_600_000_000);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let logs = fs::read_to_string(&log_path).expect("read capture evidence");
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "watch exited: {logs}"
+                );
+                if capture_count(&logs) > previous {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "duplicate discovery never ran: {logs}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert_eq!(
+                snapshot_mirror(&data),
+                expected_idle_mirror,
+                "unchanged discovery cycle {cycle} rewrote preserved evidence or its mutation fence"
+            );
+            assert_eq!(
+                staging_modified(&data),
+                expected_idle_staging,
+                "unchanged discovery cycle {cycle} created transient staging work"
+            );
+            cycle += 1;
+        }
+
+        let live = sessions.join("rollout-gh538-live.jsonl");
+        write_codex_session(&live, "watchnewgh538", "gh538-live");
+        wait_for_hit(&mut child, home.path(), &data, &log_path, "watchnewgh538");
+        for needle in ["watchappendonegh538", "watchappendtwogh538"] {
+            append_user(&live, needle);
+            wait_for_hit(&mut child, home.path(), &data, &log_path, needle);
+        }
+        assert_ne!(
+            fs::read(data.join("raw-mirror/v1/.usage-generation")).unwrap(),
+            expected_idle_mirror
+                .iter()
+                .find(|(path, _, _)| path.ends_with(".usage-generation"))
+                .unwrap()
+                .1,
+            "actual source changes must advance the mutation fence"
+        );
+        assert_eq!(
+            content_hit_count(
+                &search(home.path(), &data, "baselinewatch"),
+                "baselinewatch"
+            ),
+            1,
+            "replayed discovery must preserve the baseline without duplication"
+        );
+        // An interrupted resident process must release its leases, and a
+        // successor must discover an append made while no watcher was alive.
+        child.0.kill().expect("interrupt resident watcher");
+        child.0.wait().expect("reap interrupted resident watcher");
+        append_user(&live, "watchrestartgh538");
+        let (mut restarted, restart_log) =
+            start_watch_with_env(home.path(), &data, true, &environment);
+        wait_for_hit(
+            &mut restarted,
+            home.path(),
+            &data,
+            &restart_log,
+            "watchrestartgh538",
+        );
+        append_user(&live, "watchafterrestartgh538");
+        wait_for_hit(
+            &mut restarted,
+            home.path(),
+            &data,
+            &restart_log,
+            "watchafterrestartgh538",
+        );
+        for needle in [
+            "watchnewgh538",
+            "watchappendonegh538",
+            "watchappendtwogh538",
+        ] {
+            assert_eq!(
+                content_hit_count(&search(home.path(), &data, needle), needle),
+                1,
+                "restart lost or duplicated an earlier watch update"
+            );
+        }
+        let logs = fs::read_to_string(&restart_log).expect("read recovered watcher log");
+        assert!(
+            !logs.contains("index-stalled"),
+            "recovered watcher stalled: {logs}"
+        );
+        assert!(restarted.0.try_wait().unwrap().is_none());
     }
 }
 

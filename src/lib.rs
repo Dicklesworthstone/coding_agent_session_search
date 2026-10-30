@@ -108798,6 +108798,12 @@ fn collect_stall_diagnostics(data_dir: &Path) -> serde_json::Value {
     const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024;
 
     let mut out = serde_json::Map::new();
+    // Captured by the thread about to enter the syscall, so a blocked lstat
+    // can be attributed without touching that path again or needing symbols.
+    out.insert(
+        "raw_mirror_io".into(),
+        crate::raw_mirror::raw_mirror_io_snapshot(),
+    );
 
     let index_dir = data_dir.join("index");
     out.insert(
@@ -108922,6 +108928,7 @@ fn collect_stall_diagnostics(data_dir: &Path) -> serde_json::Value {
 
 const INDEX_STALL_HINT: &str = concat!(
     "Indexer made no forward progress for the configured stall window. ",
+    "For raw-mirror stalls, diagnostics.raw_mirror_io names the in-flight filesystem operation, path and elapsed_ms. ",
     "Capture a stack trace with `sudo cat /proc/$(pgrep -f 'cass index')/stack` ",
     "and/or `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` ",
     "and attach it to a new GitHub issue (say whether it is an indexing-phase wedge or a watch_startup wedge ",

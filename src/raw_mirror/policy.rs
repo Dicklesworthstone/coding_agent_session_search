@@ -59,25 +59,52 @@ impl std::error::Error for RawMirrorCapturePaused {}
 // unreadable subtree. Include manifests, descriptors, caches, audits and tmp.
 fn measured_usage(root: &Path) -> Result<u64> {
     let mut total = 0_u64;
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(path) = pending.pop() {
-        let metadata = fs::symlink_metadata(&path)?;
+    let mut path = root.to_path_buf();
+    let mut directories = Vec::new();
+    loop {
+        let metadata = raw_mirror_symlink_metadata(&path)
+            .with_context(|| format!("inventory raw-mirror entry {}", path.display()))?;
         if metadata.file_type().is_symlink() {
-            anyhow::bail!("cannot budget a symlinked raw-mirror subtree");
+            anyhow::bail!(
+                "cannot budget a symlinked raw-mirror subtree {}",
+                path.display()
+            );
         }
         if metadata.is_dir() {
-            for entry in fs::read_dir(path)? {
-                pending.push(entry?.path());
-            }
+            // Keep one directory cursor per level instead of retaining every
+            // sibling path. The format uses only a few levels; refuse hostile
+            // nesting before it can exhaust file descriptors or memory.
+            anyhow::ensure!(
+                directories.len() < 64,
+                "raw-mirror inventory exceeds 64 directory levels"
+            );
+            let entries = raw_mirror_io("read_dir", &path, || fs::read_dir(&path))?;
+            directories.push((path.clone(), entries));
         } else if metadata.is_file() {
             total = total
                 .checked_add(metadata.len())
                 .ok_or_else(|| anyhow!("raw-mirror byte inventory overflow"))?;
         } else {
-            anyhow::bail!("cannot budget a non-regular raw-mirror entry");
+            anyhow::bail!(
+                "cannot budget a non-regular raw-mirror entry {}",
+                path.display()
+            );
+        }
+        loop {
+            let Some((directory, entries)) = directories.last_mut() else {
+                return Ok(total);
+            };
+            match raw_mirror_io("read_dir_next", directory, || entries.next().transpose())? {
+                Some(entry) => {
+                    path = entry.path();
+                    break;
+                }
+                None => {
+                    directories.pop();
+                }
+            }
         }
     }
-    Ok(total)
 }
 
 /// Mirror usage from `measured_usage`, shared by every capture in this
@@ -86,15 +113,17 @@ fn measured_usage(root: &Path) -> Result<u64> {
 /// from 12 to 2.6 sessions/s. A walk is reused until it is older than
 /// max(60 s, 20 times its own duration), and a prune in this process drops it.
 /// Admissions add their reservations, which count 4 KiB per file and so
-/// overstate small files; the shared total therefore only admits (it can admit
-/// late, never early), and only with an eighth of the cap to spare. It refuses
-/// only when the walked bytes alone exceed the cap by that eighth. Every
-/// other decision walks first.
+/// overstate small files. That conservative upper bound can admit a write;
+/// the walked bytes, adjusted for replacements that shrink, are a lower bound
+/// that can refuse one. Only ambiguous or expired decisions walk again. An
+/// arbitrary margin around the cap made every near-full watch capture walk
+/// the whole mirror even when either bound already proved the decision.
 static MEASURED_USAGE: OnceLock<Mutex<HashMap<PathBuf, MeasuredUsage>>> = OnceLock::new();
+const MEASURED_USAGE_MAX_ROOTS: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
 struct MeasuredUsage {
-    /// Bytes found by the last walk.
+    /// Bytes found by the last walk, minus subsequent known shrinkage.
     measured: u64,
     /// Bytes reserved by admissions since that walk.
     admitted: u64,
@@ -113,13 +142,9 @@ fn measured_usage_cache() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Mea
 
 const USAGE_GENERATION_FILE: &str = ".usage-generation";
 
-/// Fence cached usage before a writer changes the mirror. The caller holds
-/// the existing mutation lock. Previews must never call this function.
-/// All cooperating writers must use this protocol; older writers cannot
-/// invalidate another process's in-memory inventory.
-pub(super) fn note_mutation(root: &Path) -> Result<()> {
+fn read_usage_generation(root: &Path) -> Result<u64> {
     let path = root.join(USAGE_GENERATION_FILE);
-    let previous = match fs::symlink_metadata(&path) {
+    let generation = match raw_mirror_symlink_metadata(&path) {
         Ok(metadata) => {
             anyhow::ensure!(
                 metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() == 16,
@@ -127,7 +152,7 @@ pub(super) fn note_mutation(root: &Path) -> Result<()> {
             );
             let mut file = open_stable_source_file(&path, &metadata)?;
             let mut bytes = [0_u8; 16];
-            file.read_exact(&mut bytes)?;
+            raw_mirror_io("read_usage_generation", &path, || file.read_exact(&mut bytes))?;
             let (magic, value) = bytes.split_at(8);
             anyhow::ensure!(magic == b"CASSRMU1", "invalid raw-mirror usage generation");
             let mut value_bytes = [0_u8; 8];
@@ -137,9 +162,33 @@ pub(super) fn note_mutation(root: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
         Err(error) => return Err(error).context("inspect raw-mirror usage generation"),
     };
-    let next = previous
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("raw-mirror usage generation exhausted"))?;
+    anyhow::ensure!(
+        generation < u64::MAX,
+        "raw-mirror usage generation exhausted"
+    );
+    Ok(generation)
+}
+
+fn make_usage_cache_room(cache: &mut HashMap<PathBuf, MeasuredUsage>, root: &Path) {
+    if !cache.contains_key(root)
+        && cache.len() >= MEASURED_USAGE_MAX_ROOTS
+        && let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.measured_at)
+            .map(|(path, _)| path.clone())
+    {
+        cache.remove(&oldest);
+    }
+}
+
+/// Fence cached usage before a writer changes the mirror. The caller holds
+/// the existing mutation lock. Previews must never call this function.
+/// All cooperating writers must use this protocol; older writers cannot
+/// invalidate another process's in-memory inventory.
+pub(super) fn note_mutation(root: &Path) -> Result<()> {
+    let path = root.join(USAGE_GENERATION_FILE);
+    let previous = read_usage_generation(root)?;
+    let next = previous + 1;
     let mut bytes = [0_u8; 16];
     let (magic, value) = bytes.split_at_mut(8);
     magic.copy_from_slice(b"CASSRMU1");
@@ -149,6 +198,7 @@ pub(super) fn note_mutation(root: &Path) -> Result<()> {
     // under a generation that was never made visible.
     replace_raw_mirror_bytes(root, &path, &bytes)?;
     let mut cache = measured_usage_cache();
+    make_usage_cache_room(&mut cache, root);
     let entry = cache.entry(root.to_path_buf()).or_insert(MeasuredUsage {
         measured: 0,
         admitted: 0,
@@ -165,37 +215,51 @@ pub(super) fn note_mutation(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Direct DB-link updates can grow a manifest outside a capture's Budget.
-/// Count positive growth conservatively; shrinkage waits for the next walk.
-pub(super) fn record_file_growth(root: &Path, bytes: u64) {
+/// Replacements outside a capture's Budget can grow or shrink an existing
+/// file. Growth counts toward the conservative upper bound; subtract known
+/// shrinkage from the lower bound too, so a cached refusal stays sound.
+pub(super) fn record_file_size_change(root: &Path, previous: u64, current: u64) {
     if let Some(entry) = measured_usage_cache().get_mut(root) {
-        entry.admitted = entry.admitted.saturating_add(bytes);
+        if current >= previous {
+            entry.admitted = entry.admitted.saturating_add(current - previous);
+        } else {
+            // A replacement may refer to a file published since the inventory.
+            // Subtract from the total upper bound without turning excess
+            // shrinkage into an underestimate through saturating arithmetic.
+            let shrinkage = previous - current;
+            let from_measured = shrinkage.min(entry.measured);
+            entry.measured -= from_measured;
+            entry.admitted = entry.admitted.saturating_sub(shrinkage - from_measured);
+        }
     }
 }
 
 /// Usage to admit `bytes` against under `policy`: the shared total when it
 /// decides clearly (see MEASURED_USAGE), otherwise a new walk.
 fn shared_usage(root: &Path, policy: RawMirrorRetentionPolicy, bytes: u64) -> Result<u64> {
-    let mut cache = measured_usage_cache();
-    let previous = cache.get(root).copied();
+    let previous = measured_usage_cache().get(root).copied();
     if let Some(entry) = previous
         && let Some(measured_at) = entry.measured_at
     {
         let refresh_after = entry.walk.saturating_mul(20).max(Duration::from_secs(60));
-        let margin = policy.max_bytes / 8;
         let request = bytes.saturating_add(4096);
         let estimated = entry.measured.saturating_add(entry.admitted);
         if measured_at.elapsed() < refresh_after {
-            if estimated.saturating_add(request) < policy.max_bytes.saturating_sub(margin) {
+            if estimated.saturating_add(request) <= policy.max_bytes {
                 return Ok(estimated);
             }
-            if entry.measured.saturating_add(request) > policy.max_bytes.saturating_add(margin) {
+            if entry.measured.saturating_add(request) > policy.max_bytes {
                 return Ok(entry.measured);
             }
         }
     }
     let started = std::time::Instant::now();
+    // The caller holds this mirror's mutation lock. Do not hold the global
+    // cache mutex across filesystem I/O: a slow store must not block captures
+    // or progress reporting for unrelated stores.
     let measured = measured_usage(root)?;
+    let mut cache = measured_usage_cache();
+    make_usage_cache_room(&mut cache, root);
     cache.insert(
         root.to_path_buf(),
         MeasuredUsage {
@@ -264,7 +328,10 @@ impl Budget<'_> {
             self.used = shared_usage(self.root, self.policy, bytes)?;
             self.inventoried = true;
         }
-        self.reserve_with_available(bytes, fs2::available_space(self.root)?)?;
+        let available = raw_mirror_io("available_space", self.root, || {
+            fs2::available_space(self.root)
+        })?;
+        self.reserve_with_available(bytes, available)?;
         record_admitted_usage(self.root, self.used);
         Ok(())
     }
@@ -280,7 +347,7 @@ impl Staging {
     fn new(root: &Path) -> Result<Self> {
         ensure_private_dir_descendant(root, &root.join("tmp"))?;
         let directory = unique_capture_temp_dir(root);
-        fs::create_dir(&directory)?;
+        raw_mirror_io("create_staging_dir", &directory, || fs::create_dir(&directory))?;
         let staging = Self {
             directory,
             files: Vec::new(),
@@ -298,7 +365,7 @@ impl Staging {
         let path = unique_temp_path(&self.directory, name);
         let mut file = private_create_new_file(&path)?;
         self.files.push(path.clone());
-        file.write_all(bytes)?;
+        raw_mirror_io("write_staging", &path, || file.write_all(bytes))?;
         sync_open_file_if_required(&file, || "sync bounded raw-mirror staging".to_string())?;
         Ok(path)
     }
@@ -369,7 +436,9 @@ fn prepare_bounded(
     let mut chunks = Vec::new();
     loop {
         let length = remaining.min(buffer_size as u64) as usize;
-        snapshot.read_exact(&mut buffer[..length])?;
+        raw_mirror_io("read_source_chunk", input.source_path, || {
+            snapshot.read_exact(&mut buffer[..length])
+        })?;
         hasher.update(&buffer[..length]);
         chunks.push(stage_blob(
             root,
@@ -384,7 +453,10 @@ fn prepare_bounded(
             break;
         }
     }
-    if source_file_changed_during_capture(metadata, &source.metadata()?)
+    if source_file_changed_during_capture(
+        metadata,
+        &raw_mirror_io("fstat_source", input.source_path, || source.metadata())?,
+    )
         || source_path_changed_identity_during_capture(input.source_path, metadata)
     {
         anyhow::bail!("raw-mirror source changed during bounded capture; retry a stable snapshot");
@@ -525,8 +597,14 @@ fn save_cache(
         path.parent()
             .ok_or_else(|| anyhow!("cache has no parent"))?,
     )?;
+    let previous_size = match raw_mirror_symlink_metadata(&path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error).context("inspect previous raw-mirror cache size"),
+    };
     let temporary = staging.write(budget, "cache", &bytes)?;
-    fs::rename(temporary, &path)?;
+    raw_mirror_io("publish_cache", &path, || fs::rename(temporary, &path))?;
+    record_file_size_change(root, previous_size, bytes.len() as u64);
     sync_parent(&path)?;
     Ok(())
 }
@@ -549,7 +627,7 @@ pub(crate) fn capture(
     if chunk_size == 0 {
         anyhow::bail!("raw mirror chunk size must be greater than zero");
     }
-    let metadata = fs::symlink_metadata(input.source_path)
+    let metadata = raw_mirror_symlink_metadata(input.source_path)
         .with_context(|| format!("stat raw mirror source {}", input.source_path.display()))?;
     if metadata.file_type().is_symlink() {
         anyhow::bail!(
@@ -565,11 +643,14 @@ pub(crate) fn capture(
     }
     let root = ensure_raw_mirror_root(input.data_dir)?;
     let _mutation = acquire_raw_mirror_mutation_lock(&root)?;
-    let metadata = fs::symlink_metadata(input.source_path)?;
+    let metadata = raw_mirror_symlink_metadata(input.source_path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         anyhow::bail!("raw mirror source changed identity while waiting for capture");
     }
-    note_mutation(&root)?;
+    // Validate coordination even on a cache hit, but do not rewrite it until
+    // this capture actually needs to publish something. Repeated watch scans
+    // of unchanged sources must not create staging trees or mutation events.
+    read_usage_generation(&root)?;
     let mut budget = Budget {
         root: &root,
         policy,
@@ -579,21 +660,25 @@ pub(crate) fn capture(
     let key = raw_mirror_blob_cache_key(&input, &metadata, threshold, chunk_size);
     let cached = cached_record(&root, &key);
     let was_cached = cached.is_some();
-    let mut staging = Staging::new(&root)?;
+    let mut staging = None;
     let prepared = match cached {
         Some(record) => PreparedRawMirrorContent {
             record,
             files: Vec::new(),
         },
-        None => prepare_bounded(
-            &root,
-            &input,
-            &metadata,
-            threshold,
-            chunk_size,
-            &mut staging,
-            &mut budget,
-        )?,
+        None => {
+            note_mutation(&root)?;
+            let staged = staging.insert(Staging::new(&root)?);
+            prepare_bounded(
+                &root,
+                &input,
+                &metadata,
+                threshold,
+                chunk_size,
+                staged,
+                &mut budget,
+            )?
+        }
     };
     let record = prepared.record;
     let path_hash = raw_mirror_original_path_blake3(&input.source_path.display().to_string());
@@ -653,7 +738,7 @@ pub(crate) fn capture(
     if bytes.len() as u64 > RAW_MIRROR_MANIFEST_MAX_BYTES {
         anyhow::bail!("raw-mirror manifest exceeds its size limit");
     }
-    let existing = match fs::symlink_metadata(&path) {
+    let existing = match raw_mirror_symlink_metadata(&path) {
         Ok(_) => Some(read_validated_raw_mirror_manifest(&root, &id)?),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
@@ -666,11 +751,14 @@ pub(crate) fn capture(
     });
     // Reserve publication BEFORE making any staged blob visible. A budget
     // refusal therefore leaves neither a partial manifest nor new orphan blobs.
+    if was_cached && (existing.is_none() || needs_merge) {
+        note_mutation(&root)?;
+    }
     if existing.is_none() {
         budget.reserve(bytes.len() as u64)?;
     } else if needs_merge {
         budget.reserve(
-            fs::symlink_metadata(&path)?
+            raw_mirror_symlink_metadata(&path)?
                 .len()
                 .saturating_add(bytes.len() as u64),
         )?;
@@ -697,10 +785,10 @@ pub(crate) fn capture(
     } else {
         publish_manifest_bytes_create_new(&root, &path, &bytes, &record.blob_blake3)?;
     }
-    if !was_cached {
+    if let Some(staging) = staging.as_mut() {
         // Cache admission is optional; successfully preserving the source must
         // not be reported as a failed capture merely because its cache cannot fit.
-        if let Err(error) = save_cache(&root, key, record.clone(), &mut staging, &mut budget) {
+        if let Err(error) = save_cache(&root, key, record.clone(), staging, &mut budget) {
             tracing::debug!(%error, "raw-mirror capture cache not persisted");
         }
     }
