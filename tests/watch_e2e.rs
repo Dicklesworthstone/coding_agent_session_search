@@ -12,7 +12,7 @@ use util::cass_bin;
 mod deferred_watch_sources {
     use super::*;
     use std::fs;
-    use std::process::{Child, Stdio};
+    use std::process::Child;
     use std::time::Instant;
 
     struct WatchChild(Child);
@@ -25,7 +25,7 @@ mod deferred_watch_sources {
     }
 
     fn cass(home: &Path, data: &Path) -> std::process::Command {
-        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        let mut cmd = std::process::Command::new(cass_bin());
         cmd.env_clear()
             .env("HOME", home)
             .env("USERPROFILE", home)
@@ -80,8 +80,19 @@ mod deferred_watch_sources {
         streaming: bool,
         environment: &[(&str, &str)],
     ) -> (WatchChild, std::path::PathBuf) {
-        let log_path = home.join("watch.log");
-        let log = fs::File::create(&log_path).expect("watch log");
+        // Retain each process's evidence across restarts. In particular a
+        // successor must not truncate the stall event that explains why its
+        // predecessor exited. Files avoid a full stderr/stdout pipe stalling
+        // the watcher itself while the test waits for an indexing event.
+        let (log, log_path) = tempfile::Builder::new()
+            .prefix("watch-")
+            .suffix(".stderr.log")
+            .tempfile_in(home)
+            .expect("watch log")
+            .keep()
+            .expect("retain watch log");
+        let stdout =
+            fs::File::create(log_path.with_extension("stdout.jsonl")).expect("watch JSON output");
         let mut command = cass(home, data);
         command
             // JSON mode suppresses the INFO readiness signal unless requested.
@@ -100,7 +111,7 @@ mod deferred_watch_sources {
             .envs(environment.iter().copied());
         let mut child = WatchChild(
             command
-                .stdout(Stdio::null())
+                .stdout(stdout)
                 .stderr(log)
                 .spawn()
                 .expect("start watch"),
@@ -149,6 +160,48 @@ mod deferred_watch_sources {
         );
         assert!(result["hits"].is_array(), "search hit array: {result}");
         result
+    }
+
+    #[cfg(unix)]
+    fn wait_for_hit(child: &mut WatchChild, home: &Path, data: &Path, log: &Path, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let logs = fs::read_to_string(log).expect("read resident watcher log");
+            assert!(
+                child.0.try_wait().expect("watch process status").is_none(),
+                "resident watcher exited before indexing {needle}: {logs}"
+            );
+            let result = search(home, data, needle);
+            let count = content_hit_count(&result, needle);
+            assert!(count <= 1, "duplicate canonical search hit: {result}");
+            if count == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "lost watch update {needle}: {logs}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    #[cfg(unix)]
+    fn append_user(path: &Path, needle: &str) {
+        use std::io::Write;
+
+        let message = serde_json::json!({
+            "timestamp": "2025-09-30T15:43:00.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": needle}]
+            }
+        });
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("open source for an actual append");
+        writeln!(file, "{message}").expect("append complete source event");
     }
 
     fn assert_deferred_source_retried(skipped_at_startup: bool, streaming: bool) {
@@ -355,7 +408,6 @@ mod deferred_watch_sources {
     #[test]
     fn gh538_live_watch_preserves_idle_mirror_and_recovers_repeated_updates() {
         use coding_agent_search::raw_mirror::{RawMirrorCaptureInput, capture_source_file};
-        use std::io::Write;
 
         const STALL_ABORT_SECS: u64 = 20;
 
@@ -376,7 +428,7 @@ mod deferred_watch_sources {
         ) -> Vec<(std::path::PathBuf, Vec<u8>, std::time::SystemTime)> {
             let root = data.join("raw-mirror/v1");
             let mut paths = vec![root.join(".usage-generation")];
-            for directory in ["manifests", "capture-cache"] {
+            for directory in ["manifests", "capture-cache", "blobs"] {
                 for entry in walkdir::WalkDir::new(root.join(directory)) {
                     let entry = entry.expect("enumerate preserved mirror files");
                     if entry.file_type().is_file() {
@@ -413,50 +465,6 @@ mod deferred_watch_sources {
                 .count()
         }
 
-        fn wait_for_hit(
-            child: &mut WatchChild,
-            home: &Path,
-            data: &Path,
-            log: &Path,
-            needle: &str,
-        ) {
-            let deadline = Instant::now() + Duration::from_secs(60);
-            loop {
-                let logs = fs::read_to_string(log).expect("read resident watcher log");
-                assert!(
-                    child.0.try_wait().expect("watch process status").is_none(),
-                    "resident watcher exited before indexing {needle}: {logs}"
-                );
-                let result = search(home, data, needle);
-                let count = content_hit_count(&result, needle);
-                assert!(count <= 1, "duplicate canonical search hit: {result}");
-                if count == 1 {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "lost watch update {needle}: {logs}"
-                );
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
-
-        fn append_user(path: &Path, needle: &str) {
-            let message = serde_json::json!({
-                "timestamp": "2025-09-30T15:43:00.000Z",
-                "type": "response_item",
-                "payload": {
-                    "type": "message", "role": "user",
-                    "content": [{"type": "input_text", "text": needle}]
-                }
-            });
-            let mut file = fs::OpenOptions::new()
-                .append(true)
-                .open(path)
-                .expect("open source for an actual append");
-            writeln!(file, "{message}").expect("append complete source event");
-        }
-
         let home = indexed_watch_home();
         let data = home.path().join("cass-data");
         let archived_sources = home.path().join("preserved-sources");
@@ -482,8 +490,8 @@ mod deferred_watch_sources {
         let expected_idle_mirror = snapshot_mirror(&data);
         let expected_idle_staging = staging_modified(&data);
         assert!(
-            expected_idle_mirror.len() >= 259,
-            "fixture must contain 129 manifests, their source caches, and its generation fence"
+            expected_idle_mirror.len() >= 388,
+            "fixture must contain 129 manifests, their source caches/blobs, and its generation fence"
         );
 
         let stall_abort_secs = STALL_ABORT_SECS.to_string();
@@ -602,6 +610,233 @@ mod deferred_watch_sources {
             "recovered watcher stalled: {logs}"
         );
         assert!(restarted.0.try_wait().unwrap().is_none());
+        for (path, bytes, modified) in expected_idle_mirror {
+            if path.ends_with(".usage-generation") {
+                continue;
+            }
+            assert_eq!(
+                fs::read(&path).expect("preserved mirror evidence after restart"),
+                bytes,
+                "watch updates or recovery modified archived evidence: {}",
+                path.display()
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().modified().unwrap(),
+                modified,
+                "watch updates or recovery rewrote archived evidence: {}",
+                path.display()
+            );
+        }
+    }
+
+    /// A real contended filesystem lease must remain diagnosable and abortable,
+    /// then leave the next watcher able to recover the unfinished source. This
+    /// exercises the production watcher/watchdog/lock path, not a timer that
+    /// impersonates a blocked syscall. It does not reproduce macOS's lstat wait.
+    #[cfg(unix)]
+    #[test]
+    fn gh538_live_watch_diagnoses_blocked_mirror_and_recovers_after_watchdog_abort() {
+        use std::os::unix::fs::FileTypeExt;
+
+        const ABORT_SECS: u64 = 20;
+
+        fn watch_state(data: &Path) -> Option<Vec<u8>> {
+            match fs::read(data.join("watch_state.json")) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("read watch watermark: {error}"),
+            }
+        }
+
+        fn stall_event(logs: &str, event: &str) -> Option<Value> {
+            logs.lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|value| value["event"] == event)
+        }
+
+        fn blocked_lock_elapsed(payload: &Value, lock_path: &Path) -> Option<u64> {
+            let expected = lock_path.to_str().expect("UTF-8 fixture lock path");
+            payload
+                .pointer("/diagnostics/raw_mirror_io")?
+                .as_array()?
+                .iter()
+                .find(|operation| {
+                    operation["operation"] == "acquire_mutation_lock"
+                        && operation["path"] == expected
+                })?
+                .get("elapsed_ms")?
+                .as_u64()
+        }
+
+        let home = indexed_watch_home();
+        let data = home.path().join("cass-data");
+        let environment = [
+            ("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0"),
+            ("CASS_INDEX_STALL_DETECT_SECS", "4"),
+            ("CASS_INDEX_STALL_ABORT_SECS", "20"),
+            ("CASS_INDEX_FINALIZE_ABORT_SECS", "20"),
+        ];
+        let (mut child, log_path) = start_watch_with_env(home.path(), &data, true, &environment);
+        // Readiness is emitted only after startup indexing and native watcher
+        // registration. Contend with an actual watch event, not startup work.
+        // The legacy diagnostic candidate is not the live engine checkpoint.
+        // A FIFO there makes an unguarded diagnostic read block indefinitely:
+        // reporting the underlying stall must never stall the watchdog itself.
+        let diagnostic_root = data.join("index");
+        fs::create_dir_all(&diagnostic_root).expect("legacy diagnostic directory");
+        let diagnostic_fifo = diagnostic_root.join("lexical_rebuild_state.json");
+        assert!(
+            !diagnostic_fifo.exists(),
+            "the test must not overwrite an existing checkpoint"
+        );
+        assert_cmd::Command::new("mkfifo")
+            .arg(&diagnostic_fifo)
+            .timeout(Duration::from_secs(5))
+            .assert()
+            .success();
+        assert!(
+            fs::symlink_metadata(&diagnostic_fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        // Keep the same spelling passed to --data-dir. macOS may expose the
+        // temp directory through /var while canonicalize returns /private/var.
+        let lock_path = data.join("raw-mirror/v1/.mutation.lock");
+        let lease = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open existing mirror lease");
+        lease.try_lock().expect("hold real mirror mutation lease");
+        let watermark_before = watch_state(&data);
+        let generation_before = fs::read(data.join("raw-mirror/v1/.usage-generation"))
+            .expect("mirror generation before blocked update");
+        let blocked = home.path().join(".codex/sessions/rollout-blocked.jsonl");
+        write_codex_session(&blocked, "blockedwatchgh538", "blocked-watch-gh538");
+
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            let logs = fs::read_to_string(&log_path).expect("read blocked watcher log");
+            if let Some(event) = stall_event(&logs, "stall_detected") {
+                assert!(
+                    blocked_lock_elapsed(&event, &lock_path).is_some_and(|ms| ms >= 4_000),
+                    "stall diagnostics must name the still-blocked operation and exact path: {event}"
+                );
+                break;
+            }
+            assert!(
+                child.0.try_wait().expect("blocked watch status").is_none(),
+                "watcher exited without diagnosing the held lease: {logs}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "no blocked-I/O diagnosis: {logs}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            content_hit_count(
+                &search(home.path(), &data, "blockedwatchgh538"),
+                "blockedwatchgh538"
+            ),
+            0,
+            "the waiting capture must not be presented as completed indexing"
+        );
+        assert_eq!(
+            content_hit_count(
+                &search(home.path(), &data, "baselinewatch"),
+                "baselinewatch"
+            ),
+            1,
+            "a blocked capture must leave the published generation searchable"
+        );
+        assert_eq!(watch_state(&data), watermark_before);
+        let competing = assert_cmd::Command::from_std(cass(home.path(), &data))
+            .args(["index", "--json"])
+            .timeout(Duration::from_secs(10))
+            .output()
+            .expect("competing index command");
+        assert_eq!(
+            competing.status.code(),
+            Some(7),
+            "the blocked watcher must retain index ownership: {}",
+            String::from_utf8_lossy(&competing.stderr)
+        );
+
+        let status = loop {
+            if let Some(status) = child.0.try_wait().expect("watchdog exit status") {
+                break status;
+            }
+            let logs = fs::read_to_string(&log_path).expect("read watchdog evidence");
+            assert!(
+                Instant::now() < deadline,
+                "lock polling must not manufacture progress or defeat the watchdog: {logs}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let logs = fs::read_to_string(&log_path).expect("watchdog stderr");
+        let stdout = fs::read_to_string(log_path.with_extension("stdout.jsonl"))
+            .expect("watchdog JSON stdout");
+        assert_eq!(status.code(), Some(70), "stdout={stdout}\nstderr={logs}");
+        for evidence in [&logs, &stdout] {
+            let abort = stall_event(evidence, "stall_aborting")
+                .unwrap_or_else(|| panic!("missing structured abort event: {evidence}"));
+            assert_eq!(abort["exit_code"], 70);
+            assert_eq!(abort["abort_threshold_secs"], ABORT_SECS);
+            assert_eq!(
+                abort.pointer("/diagnostics/filesystem_probe/status"),
+                Some(&serde_json::json!("pending")),
+                "blocked diagnostic I/O must be reported without delaying the watchdog: {abort}"
+            );
+            assert!(
+                blocked_lock_elapsed(&abort, &lock_path).is_some_and(|ms| ms >= ABORT_SECS * 1000),
+                "abort must retain the same in-flight operation: {abort}"
+            );
+        }
+        let envelope = logs
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| value["kind"] == "index-stalled")
+            .expect("exit-70 machine-readable envelope");
+        assert_eq!(envelope["code"], 70);
+        assert_eq!(envelope["retryable"], true);
+        assert_eq!(watch_state(&data), watermark_before);
+        assert_eq!(
+            fs::read(data.join("raw-mirror/v1/.usage-generation")).unwrap(),
+            generation_before,
+            "waiting must not publish a mutation generation"
+        );
+        lease.unlock().expect("release contended mirror lease");
+        drop(lease);
+
+        // No second write/event for the blocked source: restart itself must
+        // recover it, with the OS lease released by the watchdog's exit.
+        let (mut restarted, restart_log) =
+            start_watch_with_env(home.path(), &data, true, &environment);
+        wait_for_hit(
+            &mut restarted,
+            home.path(),
+            &data,
+            &restart_log,
+            "blockedwatchgh538",
+        );
+        append_user(&blocked, "afterblockedrestartgh538");
+        wait_for_hit(
+            &mut restarted,
+            home.path(),
+            &data,
+            &restart_log,
+            "afterblockedrestartgh538",
+        );
+        for needle in ["baselinewatch", "blockedwatchgh538"] {
+            assert_eq!(
+                content_hit_count(&search(home.path(), &data, needle), needle),
+                1,
+                "abort/restart lost or duplicated a committed result"
+            );
+        }
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), logs);
     }
 }
 

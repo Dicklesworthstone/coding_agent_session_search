@@ -108786,11 +108786,10 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     }
 }
 
-/// Collect forensic context for a stalled `cass index` run so the JSON stall
-/// event carries enough on-disk state for issue triage without requiring the
-/// reporter to run secondary commands. All lookups are best-effort: if a path
-/// is missing or unreadable, we record the failure but never propagate an
-/// error out of the watchdog emitter.
+/// Collect optional on-disk forensic context on a separate thread. Even a
+/// metadata lookup can block in the kernel on the filesystem being diagnosed
+/// (GH #538), so the watchdog must never call this function synchronously.
+/// Missing or unreadable paths remain best-effort diagnostic failures.
 fn collect_stall_diagnostics(data_dir: &Path) -> serde_json::Value {
     // Keep the snapshot compact — this is an observability event on stderr,
     // not a full forensic bundle. If the reporter needs more, the event hint
@@ -108798,13 +108797,6 @@ fn collect_stall_diagnostics(data_dir: &Path) -> serde_json::Value {
     const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024;
 
     let mut out = serde_json::Map::new();
-    // Captured by the thread about to enter the syscall, so a blocked lstat
-    // can be attributed without touching that path again or needing symbols.
-    out.insert(
-        "raw_mirror_io".into(),
-        crate::raw_mirror::raw_mirror_io_snapshot(),
-    );
-
     let index_dir = data_dir.join("index");
     out.insert(
         "index_dir".into(),
@@ -108842,7 +108834,7 @@ fn collect_stall_diagnostics(data_dir: &Path) -> serde_json::Value {
             entry.insert("modified_ms".into(), serde_json::json!(ms));
         }
         if size <= MAX_CHECKPOINT_BYTES {
-            match std::fs::read_to_string(&path) {
+            match read_bounded_stall_diagnostic(&path, MAX_CHECKPOINT_BYTES) {
                 Ok(contents) => {
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) {
                         entry.insert("content".into(), parsed);
@@ -108913,7 +108905,7 @@ fn collect_stall_diagnostics(data_dir: &Path) -> serde_json::Value {
                 );
             }
         }
-        if let Ok(contents) = std::fs::read_to_string(&lock_path) {
+        if let Ok(contents) = read_bounded_stall_diagnostic(&lock_path, MAX_CHECKPOINT_BYTES) {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) {
                 lock.insert("content".into(), parsed);
             } else {
@@ -108926,9 +108918,138 @@ fn collect_stall_diagnostics(data_dir: &Path) -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
+fn read_bounded_stall_diagnostic(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::Read;
+
+    // A pre-read metadata length is not a bound: the file can grow or be
+    // replaced between stat and open. Keep the diagnostic worker's allocation
+    // bounded as well as keeping its I/O off the watchdog thread.
+    let mut contents = String::new();
+    std::fs::File::open(path)?
+        .take(max_bytes.saturating_add(1))
+        .read_to_string(&mut contents)?;
+    if contents.len() as u64 > max_bytes {
+        return Err(std::io::Error::other("diagnostic file exceeds byte limit"));
+    }
+    Ok(contents)
+}
+
+/// At most one filesystem probe belongs to a watchdog, even if an earlier
+/// probe is kernel-blocked and indexing later resumes. Its receiver is only
+/// polled: diagnostic collection never delays a warning or the abort deadline.
+#[derive(Default)]
+enum IndexStallFilesystemProbe {
+    #[default]
+    NotStarted,
+    Pending {
+        receiver: std::sync::mpsc::Receiver<(serde_json::Value, i64)>,
+        started: std::time::Instant,
+        started_at_ms: i64,
+    },
+    Complete {
+        diagnostics: serde_json::Value,
+        started_at_ms: i64,
+        completed_at_ms: i64,
+    },
+    Failed(String),
+}
+
+impl IndexStallFilesystemProbe {
+    fn reset_after_progress(&mut self) {
+        // Never abandon an in-flight worker and spawn another: a stuck volume
+        // must not accumulate diagnostic threads over repeated watch cycles.
+        // A result already buffered in the channel belongs to the old stall;
+        // discard it now so a later stall starts a fresh filesystem snapshot.
+        let still_running = matches!(
+            self,
+            Self::Pending { receiver, .. }
+                if matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty))
+        );
+        if !still_running {
+            *self = Self::NotStarted;
+        }
+    }
+
+    fn snapshot(&mut self, data_dir: &Path) -> serde_json::Value {
+        if matches!(self, Self::NotStarted) {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let probe_dir = data_dir.to_path_buf();
+            let started = std::time::Instant::now();
+            let started_at_ms = chrono::Utc::now().timestamp_millis();
+            *self = match std::thread::Builder::new()
+                .name("cass-stall-diagnostics".to_string())
+                .spawn(move || {
+                    let diagnostics = collect_stall_diagnostics(&probe_dir);
+                    let _ = sender.send((diagnostics, chrono::Utc::now().timestamp_millis()));
+                }) {
+                Ok(_worker) => Self::Pending {
+                    receiver,
+                    started,
+                    started_at_ms,
+                },
+                Err(error) => Self::Failed(error.to_string()),
+            };
+        }
+
+        if let Self::Pending {
+            receiver,
+            started_at_ms,
+            ..
+        } = self
+        {
+            match receiver.try_recv() {
+                Ok((diagnostics, completed_at_ms)) => {
+                    *self = Self::Complete {
+                        diagnostics,
+                        started_at_ms: *started_at_ms,
+                        completed_at_ms,
+                    };
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    *self = Self::Failed("diagnostic worker exited without a result".to_string());
+                }
+            }
+        }
+
+        let mut diagnostics = match self {
+            Self::Complete { diagnostics, .. } => diagnostics.clone(),
+            _ => serde_json::json!({"index_dir": data_dir.join("index").display().to_string()}),
+        };
+        diagnostics["filesystem_probe"] = match self {
+            Self::Pending {
+                started,
+                started_at_ms,
+                ..
+            } => serde_json::json!({
+                "status": "pending",
+                "started_at_ms": *started_at_ms,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+            }),
+            Self::Complete {
+                started_at_ms,
+                completed_at_ms,
+                ..
+            } => serde_json::json!({
+                "status": "complete",
+                "started_at_ms": *started_at_ms,
+                "completed_at_ms": *completed_at_ms,
+            }),
+            Self::Failed(error) => serde_json::json!({"status": "failed", "error": error}),
+            Self::NotStarted => serde_json::json!({"status": "not_started"}),
+        };
+        // Always take this in-memory snapshot now, independently of the
+        // optional filesystem result. No stat or debug symbols are needed to
+        // identify the operation that is still blocking the indexing thread.
+        diagnostics["raw_mirror_io"] = crate::raw_mirror::raw_mirror_io_snapshot();
+        diagnostics
+    }
+}
+
 const INDEX_STALL_HINT: &str = concat!(
     "Indexer made no forward progress for the configured stall window. ",
     "For raw-mirror stalls, diagnostics.raw_mirror_io names the in-flight filesystem operation, path and elapsed_ms. ",
+    "Filesystem diagnostics run separately: filesystem_probe.status=pending means the probe has not completed, not that assets are absent. ",
     "Capture a stack trace with `sudo cat /proc/$(pgrep -f 'cass index')/stack` ",
     "and/or `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` ",
     "and attach it to a new GitHub issue (say whether it is an indexing-phase wedge or a watch_startup wedge ",
@@ -109154,6 +109275,7 @@ enum IndexStallAbortPolicy {
 
 struct IndexStallWatchdog {
     data_dir: PathBuf,
+    filesystem_probe: IndexStallFilesystemProbe,
     threshold: Option<Duration>,
     abort_threshold: Option<Duration>,
     /// Larger abort grace used only while `IndexingProgress::finalizing` is set
@@ -109161,10 +109283,9 @@ struct IndexStallWatchdog {
     /// finalize (report-only). See `index_finalize_abort_threshold` (#319/#321).
     finalize_abort_threshold: Option<Duration>,
     abort_policy: IndexStallAbortPolicy,
-    /// True when supervising a long-lived `cass index --watch` daemon. In
-    /// watch mode the post-publish quiescent resting state (phase 0,
-    /// `current >= total`) is normal idle between rescans, not a wedge, so the
-    /// finalize-wedge detect/abort is suppressed (cass #311).
+    /// True when supervising a long-lived `cass index --watch` daemon. Only
+    /// its explicitly marked event wait is healthy idle. Cumulative counters
+    /// cannot distinguish recovered work from an active blocked callback.
     is_watch: bool,
     /// True when this run is building semantic (vector) assets. Semantic work
     /// now publishes honest per-phase counters; this flag keeps those phases
@@ -109219,11 +109340,9 @@ impl IndexStallWatchdog {
     }
 
     /// Mark this watchdog as supervising a long-lived `cass index --watch`
-    /// daemon. In watch mode the post-publish, fully-quiescent resting state
-    /// (phase 0 "preparing", `current >= total`) is the NORMAL idle between
-    /// rescans — it is not a wedge. Without this flag the #297 finalize-wedge
-    /// abort fires after `abort_threshold` of that normal idle and crash-loops
-    /// the daemon with exit(70) (cass #311). Set on the watch path only.
+    /// daemon. Its explicit `watch_idle` scope distinguishes normal event
+    /// waits from active callbacks, including work that blocks before it can
+    /// update phase or counters. Set on the watch path only.
     fn watch_aware(mut self, is_watch: bool) -> Self {
         self.is_watch = is_watch;
         self
@@ -109253,6 +109372,7 @@ impl IndexStallWatchdog {
         let finalize_abort_threshold = index_finalize_abort_threshold(abort_threshold);
         Self {
             data_dir,
+            filesystem_probe: IndexStallFilesystemProbe::default(),
             threshold,
             abort_threshold,
             finalize_abort_threshold,
@@ -109288,6 +109408,7 @@ impl IndexStallWatchdog {
             .load(std::sync::atomic::Ordering::Relaxed);
 
         if phase_code != self.last_phase {
+            self.filesystem_probe.reset_after_progress();
             self.last_phase = phase_code;
             self.last_current = current;
             self.last_activity = activity;
@@ -109298,6 +109419,7 @@ impl IndexStallWatchdog {
         }
 
         if current != self.last_current {
+            self.filesystem_probe.reset_after_progress();
             self.last_progress_advance = std::time::Instant::now();
             self.last_current = current;
             self.last_activity = activity;
@@ -109311,6 +109433,7 @@ impl IndexStallWatchdog {
         // for minutes while ticking the activity counter per parsed
         // conversation — that is forward progress, not a stall.
         if activity != self.last_activity {
+            self.filesystem_probe.reset_after_progress();
             self.last_progress_advance = std::time::Instant::now();
             self.last_activity = activity;
             self.stall_reported_for_phase = None;
@@ -109345,18 +109468,29 @@ impl IndexStallWatchdog {
 
         let threshold = self.threshold?;
         let stall_elapsed = self.last_progress_advance.elapsed();
-        // cass #311: in `--watch` mode the daemon legitimately rests in a
-        // quiescent, fully-published state (phase 0 "preparing",
-        // `current >= total`) between rescans. That resting state matches the
-        // #297 finalize-wedge shape, so the watchdog used to emit a spurious
-        // `stall_detected` and then abort the long-lived watch process with
-        // exit(70) after `abort_threshold` of perfectly normal idle — a
-        // crash-loop (systemd restart -> repeat). Treat the quiescent resting
-        // state as healthy idle in watch mode (no detect, no abort). A genuine
-        // watch wedge in active work — phase 2, or phase 0 with `current < total`
-        // or a non-quiescent rebuild pipeline — does not match and is still
-        // detected and aborted below.
-        //
+        // GH #538 / #311: only the owner's actual event/cooldown wait is idle.
+        // A failed batch followed by a successful retry leaves cumulative
+        // current < total; equal counters can also precede a blocked classify
+        // or optimize call. Neither count shape proves whether work is active.
+        if self.is_watch
+            && phase_code == 0
+            && index_progress
+                .watch_idle
+                .load(std::sync::atomic::Ordering::Acquire)
+            && index_progress.rebuild_pipeline_is_quiescent()
+        {
+            // Pause the deadline during a genuine wait so a long quiet night
+            // is not charged against the first syscall of the next callback.
+            // This does not tick activity or advance any completion counter.
+            // A callback can also return to idle without changing counters.
+            // Retire its completed probe, keeping any blocked worker owned.
+            self.filesystem_probe.reset_after_progress();
+            self.last_progress_advance = std::time::Instant::now();
+            self.stall_reported_for_phase = None;
+            self.stall_abort_reported_for_phase = None;
+            return None;
+        }
+
         // cass #315: a one-shot `cass index --semantic` build has the same
         // healthy-idle shape here for the entire semantic pass. The lexical
         // rebuild finishes and parks progress at phase 0 / `current == total` /
@@ -109367,7 +109501,7 @@ impl IndexStallWatchdog {
         // the quiescent finalize state as healthy active work for semantic
         // builds too, so the embed/publish runs to completion. A genuine phase-2
         // lexical wedge does not match (phase_code != 0) and is still caught.
-        if (self.is_watch || self.semantic_build) && phase_code == 0 {
+        if self.semantic_build && phase_code == 0 {
             let total = index_progress
                 .total
                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -109552,7 +109686,7 @@ impl IndexStallWatchdog {
     }
 
     fn stall_payload(
-        &self,
+        &mut self,
         index_progress: &indexer::IndexingProgress,
         elapsed_ms: u128,
         stall_elapsed: Duration,
@@ -109586,7 +109720,7 @@ impl IndexStallWatchdog {
             }
             m.insert(
                 "diagnostics".into(),
-                collect_stall_diagnostics(&self.data_dir),
+                self.filesystem_probe.snapshot(&self.data_dir),
             );
             // gh373/oeu5a: phase-aware hint. A phase-2 stall with an active
             // batched persist is the giant-conversation window; the generic
@@ -109861,6 +109995,75 @@ mod stall_diagnostics_tests {
         assert!(entry.contains_key("content_omitted"));
         assert!(!entry.contains_key("content"));
         assert_eq!(entry["size_bytes"], serde_json::json!(big.len() as u64));
+    }
+
+    #[test]
+    fn gh538_stall_diagnostic_reads_enforce_the_limit_on_actual_bytes() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("diagnostic.json");
+        std::fs::write(&path, b"12345")?;
+        assert_eq!(super::read_bounded_stall_diagnostic(&path, 5)?, "12345");
+        assert!(super::read_bounded_stall_diagnostic(&path, 4).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn gh538_pending_diagnostics_cannot_delay_a_watchdog_abort() -> anyhow::Result<()> {
+        use super::{IndexStallFilesystemProbe, IndexStallWatchdog};
+        use crate::indexer::{INDEX_PHASE_LEXICAL_INDEXING, IndexingProgress};
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let temp = TempDir::new()?;
+        let mut watchdog = IndexStallWatchdog::aborting_lexical_phases(
+            temp.path().to_path_buf(),
+            Duration::from_millis(50),
+        )
+        .watch_aware(true);
+        // Withhold a probe's result through the actual channel protocol. The
+        // live Unix regression separately blocks a real diagnostic file read
+        // and verifies process exit 70 while the raw mirror lease is held.
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let started = Instant::now();
+        watchdog.filesystem_probe = IndexStallFilesystemProbe::Pending {
+            receiver,
+            started,
+            started_at_ms: 1,
+        };
+        watchdog.threshold = Some(Duration::from_millis(1));
+        watchdog.abort_threshold = Some(Duration::from_millis(2));
+        watchdog.last_phase = INDEX_PHASE_LEXICAL_INDEXING;
+        watchdog.last_progress_advance = started - Duration::from_millis(100);
+        let progress = IndexingProgress::default();
+        progress
+            .phase
+            .store(INDEX_PHASE_LEXICAL_INDEXING, Ordering::Relaxed);
+        progress.total.store(1, Ordering::Relaxed);
+
+        let warning = watchdog.observe(&progress, 100).expect("stall warning");
+        let abort = watchdog.observe(&progress, 200).expect("stall abort");
+        assert_eq!(warning["event"], "stall_detected");
+        assert_eq!(abort["event"], "stall_aborting");
+        assert_eq!(abort["exit_code"], 70);
+        assert_eq!(
+            abort["diagnostics"]["filesystem_probe"]["status"],
+            "pending"
+        );
+        assert!(abort["diagnostics"]["raw_mirror_io"].is_array());
+        assert_eq!(progress.current.load(Ordering::Relaxed), 0);
+        assert_eq!(progress.activity.load(Ordering::Relaxed), 0);
+
+        // Genuine progress may reset stall detection, but cannot spawn more
+        // workers while an earlier filesystem probe is still blocked.
+        watchdog.filesystem_probe.reset_after_progress();
+        let pending = watchdog.filesystem_probe.snapshot(temp.path());
+        assert_eq!(pending["filesystem_probe"]["started_at_ms"], 1);
+        sender.send((serde_json::json!({"index_dir_exists": true}), 2))?;
+        let completed = watchdog.filesystem_probe.snapshot(temp.path());
+        assert_eq!(completed["filesystem_probe"]["status"], "complete");
+        assert_eq!(completed["filesystem_probe"]["completed_at_ms"], 2);
+        assert_eq!(completed["index_dir_exists"], true);
+        Ok(())
     }
 
     /// Regression for #258: `IndexStallWatchdog` previously short-
@@ -110500,11 +110703,12 @@ mod stall_diagnostics_tests {
         watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
 
         let progress = Arc::new(IndexingProgress::default());
-        // Identical state to the #297 finalize-wedge test, but in watch mode
-        // this is healthy idle: the daemon published and awaits the next rescan.
+        // The owner has explicitly entered its event wait. Counts alone
+        // cannot distinguish this from an active phase-zero filesystem call.
         progress.phase.store(0, Ordering::Relaxed);
         progress.total.store(100, Ordering::Relaxed);
         progress.current.store(100, Ordering::Relaxed);
+        progress.watch_idle.store(true, Ordering::Release);
         assert!(progress.rebuild_pipeline_is_quiescent());
 
         // Well past both detect and abort thresholds: a non-watch watchdog
@@ -110520,6 +110724,7 @@ mod stall_diagnostics_tests {
         );
 
         // A genuine phase-2 wedge in watch mode is still aborted.
+        progress.watch_idle.store(false, Ordering::Release);
         progress.phase.store(2, Ordering::Relaxed);
         // The phase change resets the watchdog's progress clock; re-arm it.
         let _ = watchdog.observe(&progress, 250);
@@ -110533,6 +110738,96 @@ mod stall_diagnostics_tests {
             .ok_or_else(|| anyhow::anyhow!("phase-2 watch stall did not abort"))?;
         assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
+    #[test]
+    fn gh538_watchdog_idle_preserves_counts_and_rearms_for_active_work() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallFilesystemProbe, IndexStallWatchdog};
+        use crate::indexer::IndexingProgress;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        for (current, total) in [(0, 0), (1, 2), (100, 100)] {
+            let tmp = TempDir::new()?;
+            let mut watchdog = IndexStallWatchdog::with_abort_policy(
+                tmp.path().to_path_buf(),
+                Duration::from_millis(50),
+                IndexStallAbortPolicy::AbortLexicalPhases,
+            )
+            .watch_aware(true);
+            watchdog.io_probe = || None;
+            watchdog.threshold = Some(Duration::from_secs(1));
+            watchdog.abort_threshold = Some(Duration::from_secs(2));
+            watchdog.last_phase = 0;
+            watchdog.last_current = current;
+            watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_secs(600);
+            let progress = Arc::new(IndexingProgress::default());
+            progress.current.store(current, Ordering::Relaxed);
+            progress.total.store(total, Ordering::Relaxed);
+            progress.watch_idle.store(true, Ordering::Release);
+
+            watchdog.filesystem_probe = IndexStallFilesystemProbe::Complete {
+                diagnostics: serde_json::json!({"stale_checkpoint": true}),
+                started_at_ms: 1,
+                completed_at_ms: 2,
+            };
+            assert!(watchdog.observe(&progress, 600_000).is_none());
+            assert!(matches!(
+                watchdog.filesystem_probe,
+                IndexStallFilesystemProbe::NotStarted
+            ));
+
+            // Idle alone must retire old diagnostics, even with unchanged
+            // phase/current/activity. An unresolved worker must instead stay
+            // owned, so repeated idle observations cannot spawn duplicates.
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            watchdog.filesystem_probe = IndexStallFilesystemProbe::Pending {
+                receiver,
+                started: std::time::Instant::now(),
+                started_at_ms: 3,
+            };
+            for _ in 0..2 {
+                assert!(watchdog.observe(&progress, 600_000).is_none());
+                assert!(matches!(
+                    watchdog.filesystem_probe,
+                    IndexStallFilesystemProbe::Pending {
+                        started_at_ms: 3,
+                        ..
+                    }
+                ));
+                let pending = watchdog.filesystem_probe.snapshot(tmp.path());
+                assert_eq!(pending["filesystem_probe"]["status"], "pending");
+                assert_eq!(pending["filesystem_probe"]["started_at_ms"], 3);
+            }
+            sender.send((serde_json::json!({"stale_checkpoint": true}), 4))?;
+            assert!(watchdog.observe(&progress, 600_000).is_none());
+            assert!(matches!(
+                watchdog.filesystem_probe,
+                IndexStallFilesystemProbe::NotStarted
+            ));
+            assert_eq!(progress.current.load(Ordering::Relaxed), current);
+            assert_eq!(progress.total.load(Ordering::Relaxed), total);
+            assert_eq!(progress.activity.load(Ordering::Relaxed), 0);
+
+            // Returning from a long event wait has not used the new callback's
+            // stall budget. Then park a phase-zero syscall without any work
+            // progress: it must report and abort, even with completed counts.
+            progress.watch_idle.store(false, Ordering::Release);
+            assert!(watchdog.observe(&progress, 600_001).is_none());
+            watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_secs(3);
+            let report = watchdog
+                .observe(&progress, 603_000)
+                .ok_or_else(|| anyhow::anyhow!("active watch syscall did not report"))?;
+            assert_eq!(report["event"], serde_json::json!("stall_detected"));
+            assert!(report["diagnostics"].get("stale_checkpoint").is_none());
+            let abort = watchdog
+                .observe(&progress, 603_001)
+                .ok_or_else(|| anyhow::anyhow!("active watch syscall did not abort"))?;
+            assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+            assert_eq!(abort["exit_code"], serde_json::json!(70));
+        }
         Ok(())
     }
 

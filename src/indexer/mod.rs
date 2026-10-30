@@ -1255,6 +1255,11 @@ pub struct IndexingProgress {
     // Phase indicator. Values 0-2 cover canonical/lexical work; 3-9 identify
     // the independently measured semantic pipeline stages above.
     pub phase: AtomicUsize,
+    /// True only while the watch owner is waiting for events or its cooldown.
+    /// A failed attempt can leave cumulative `current < total` after a later
+    /// successful retry; those counters must not pretend the failed attempt
+    /// completed just to distinguish an idle watcher from a blocked syscall.
+    pub watch_idle: AtomicBool,
     pub is_rebuilding: AtomicBool,
     /// Set by `run_index` while it is inside the post-publish finalize window —
     /// specifically `close_storage_after_index`, which runs the (deferred,
@@ -20048,6 +20053,13 @@ fn run_index_with_storage_ownership(
             .watch_once_paths
             .as_ref()
             .is_some_and(|paths| !paths.is_empty());
+        if opts.watch && !watch_once_mode {
+            // A stopped watch callback can leave canonical rows ahead of the
+            // published index without another filesystem event to wake it.
+            // Seed recovery once; steady-state callbacks return only work
+            // that is actually retryable, not permanent exclusion debt.
+            deferred_watch_sources.extend(watch_lexical_replay_sources(&storage, &watch_roots)?);
+        }
 
         if targeted_watch_once_only_run
             && t_index.is_none()
@@ -20194,6 +20206,7 @@ fn run_index_with_storage_ownership(
                     Vec::new()
                 };
                 let active_source_filter = ActiveSessionSourceFilter::new(!watch_once_mode);
+                let mut retry_sources = BTreeSet::new();
                 let indexed = if is_rebuild {
                     if let Ok(mut g) = state.lock() {
                         g.clear();
@@ -20217,7 +20230,11 @@ fn run_index_with_storage_ownership(
                         true,
                         None,
                         &active_source_filter,
-                    );
+                    )
+                    .map(|outcome| {
+                        retry_sources.extend(outcome.retry_sources);
+                        outcome.indexed
+                    });
                     finalize_watch_reindex_result(
                         indexed,
                         &detector_clone,
@@ -20237,7 +20254,11 @@ fn run_index_with_storage_ownership(
                             false,
                             None,
                             &active_source_filter,
-                        ),
+                        )
+                        .map(|outcome| {
+                            retry_sources.extend(outcome.retry_sources);
+                            outcome.indexed
+                        }),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
                         "watch incremental reindex",
@@ -20293,7 +20314,11 @@ fn run_index_with_storage_ownership(
                             false,
                             None,
                             &active_source_filter,
-                        ),
+                        )
+                        .map(|outcome| {
+                            retry_sources.extend(outcome.retry_sources);
+                            outcome.indexed
+                        }),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
                         "watch incremental reindex",
@@ -20381,6 +20406,7 @@ fn run_index_with_storage_ownership(
                 if watch_once_mode {
                     record_deferred_active_sources(opts_clone.progress.as_ref(), &deferred);
                 }
+                deferred.extend(retry_sources);
                 deferred.extend(semantic_maintenance.borrow().pending_paths.iter().cloned());
                 Ok(deferred)
             },
@@ -20632,15 +20658,23 @@ pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
 }
 
 fn best_effort_abort_wal_checkpoint_for_db(db_path: &Path) {
-    if !db_path.exists() {
-        return;
-    }
+    let mut database_absent = false;
     match run_bounded_abort_wal_checkpoint(
         db_path.to_path_buf(),
         ABORT_WAL_CHECKPOINT_TIMEOUT,
         "stall abort",
-        |path| run_final_wal_checkpoint(path, "stall abort"),
+        |path| {
+            // Metadata can block on the same filesystem as the stalled
+            // indexer. Arm the terminal deadline before even this existence
+            // probe; keep absent archives as a no-op without creating one.
+            if !path.try_exists()? {
+                database_absent = true;
+                return Ok(FinalWalCheckpointOutcome::Completed);
+            }
+            run_final_wal_checkpoint(path, "stall abort")
+        },
     ) {
+        AbortWalCheckpointAttempt::Finished(Ok(_)) if database_absent => {}
         AbortWalCheckpointAttempt::Finished(Ok(FinalWalCheckpointOutcome::Completed)) => {
             tracing::info!(
                 db_path = %db_path.display(),
@@ -32069,6 +32103,10 @@ fn wait_watch_loop_event(
     timeout: Duration,
     progress: Option<&Arc<IndexingProgress>>,
 ) -> Result<WatchLoopEvent> {
+    let _idle_scope = progress.map(|progress| {
+        progress.watch_idle.store(true, Ordering::Release);
+        WatchIdleWaitScope(progress.as_ref())
+    });
     let started = Instant::now();
     loop {
         if let Some(progress) = progress {
@@ -32084,6 +32122,16 @@ fn wait_watch_loop_event(
             WatchLoopEvent::Timeout if started.elapsed() < timeout => continue,
             event => return Ok(event),
         }
+    }
+}
+
+struct WatchIdleWaitScope<'a>(&'a IndexingProgress);
+
+impl Drop for WatchIdleWaitScope<'_> {
+    fn drop(&mut self) {
+        // Events, cancellation, errors and unwinding all re-arm the watchdog
+        // before any classification, source I/O or persistence can begin.
+        self.0.watch_idle.store(false, Ordering::Release);
     }
 }
 
@@ -32489,6 +32537,13 @@ fn reindex_paths(
             opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
         ),
     )
+    .map(|outcome| outcome.indexed)
+}
+
+#[derive(Default)]
+struct WatchReindexOutcome {
+    indexed: usize,
+    retry_sources: BTreeSet<PathBuf>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -32503,7 +32558,7 @@ fn reindex_paths_with_semantic_delta(
     force_full: bool,
     semantic_delta: Option<&mut WatchSemanticDelta>,
     active_source_filter: &ActiveSessionSourceFilter,
-) -> Result<usize> {
+) -> Result<WatchReindexOutcome> {
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
     if let Some(progress) = &opts.progress {
@@ -32519,7 +32574,7 @@ fn reindex_paths_with_semantic_delta(
     }
     let triggers = classify_paths(paths, roots, explicit);
     if triggers.is_empty() {
-        return Ok(0);
+        return Ok(WatchReindexOutcome::default());
     }
 
     let raw_source_exclusions = {
@@ -32528,7 +32583,7 @@ fn reindex_paths_with_semantic_delta(
             .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
         RawSourceExclusions::load(&storage)?
     };
-    let mut total_indexed = 0usize;
+    let mut outcome = WatchReindexOutcome::default();
     let mut first_source_scan_error = None;
 
     let mut semantic_delta = semantic_delta;
@@ -32788,6 +32843,12 @@ fn reindex_paths_with_semantic_delta(
         // `last_indexed_at`, and must not trigger downstream optimize/merge.
         // See issue #194.
         if conv_count == 0 {
+            if nomem_backoff_held > 0 {
+                // Holding the watermark is not enough: no source mutation
+                // need follow a transient OOM. Keep the cooldown-driven retry
+                // scheduled while the existing per-conversation backoff runs.
+                outcome.retry_sources.insert(root.path.clone());
+            }
             if scan_error.is_some() {
                 // A later successful sibling may advance the shared provider
                 // watermark. Keep this source eligible for an unfiltered retry
@@ -33111,7 +33172,14 @@ fn reindex_paths_with_semantic_delta(
         // follows the old return shape (scanned conversations, not newly
         // inserted rows) while including quarantined single-conversation OOMs
         // as forward progress so watch mode does not wedge on a poison file.
-        total_indexed = total_indexed.saturating_add(processed_conversations);
+        outcome.indexed = outcome.indexed.saturating_add(processed_conversations);
+        if lexical_replay_deferred || deferred_conversations > 0 {
+            // An Ok callback consumes its triggering event. Retained durable
+            // debt must also remain in the live pending queue, or a transient
+            // publication/NoMem failure waits forever for an unrelated event.
+            // Exclusions and quarantines alone do not schedule retry loops.
+            outcome.retry_sources.insert(root.path.clone());
+        }
 
         // Explicit watch-once imports are one-shot recovery/replay work, not
         // live daemon watch progress. Do not let them advance the persistent
@@ -33153,7 +33221,7 @@ fn reindex_paths_with_semantic_delta(
 
     match first_source_scan_error {
         Some(error) => Err(ConnectorScanFailure(error).into()),
-        None => Ok(total_indexed),
+        None => Ok(outcome),
     }
 }
 
@@ -33261,11 +33329,7 @@ impl WatchLexicalReplayDebt {
     }
 }
 
-fn watch_lexical_replay_debt_for_root(
-    storage: &FrankenStorage,
-    kind: ConnectorKind,
-    root: &ScanRoot,
-) -> Result<Vec<WatchLexicalReplayDebt>> {
+fn load_watch_lexical_replay_debt(storage: &FrankenStorage) -> Result<Vec<WatchLexicalReplayDebt>> {
     let rows: Vec<String> = storage.raw().query_map_collect(
         "SELECT value FROM meta WHERE key >= ?1 AND key < ?2",
         &[
@@ -33274,11 +33338,49 @@ fn watch_lexical_replay_debt_for_root(
         ],
         |row| row.get_typed(0),
     )?;
+    rows.into_iter()
+        .map(|row| serde_json::from_str(&row).context("reading durable watch lexical replay debt"))
+        .collect()
+}
+
+/// Recover interrupted callbacks even when their source has stopped changing.
+/// Only current connector/source roots may authorize replay; a removed source
+/// must not be resurrected merely because an older run left a debt record.
+fn watch_lexical_replay_sources(
+    storage: &FrankenStorage,
+    roots: &[(ConnectorKind, ScanRoot)],
+) -> Result<BTreeSet<PathBuf>> {
+    let debts = load_watch_lexical_replay_debt(storage)?;
+    if debts.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let roots: Vec<_> = roots
+        .iter()
+        .map(|(kind, root)| (kind, root, crate::normalize_path_identity(&root.path)))
+        .collect();
+    let mut pending = BTreeSet::new();
+    for debt in debts {
+        let debt_path = crate::normalize_path_identity(&debt.path);
+        for (kind, root, root_path) in &roots {
+            if debt.connector == **kind
+                && debt.source_id == root.origin.source_id
+                && (debt_path.starts_with(root_path) || root_path.starts_with(&debt_path))
+            {
+                pending.insert(root.path.clone());
+            }
+        }
+    }
+    Ok(pending)
+}
+
+fn watch_lexical_replay_debt_for_root(
+    storage: &FrankenStorage,
+    kind: ConnectorKind,
+    root: &ScanRoot,
+) -> Result<Vec<WatchLexicalReplayDebt>> {
     let selected_path = crate::normalize_path_identity(&root.path);
     let mut pending = Vec::new();
-    for row in rows {
-        let debt: WatchLexicalReplayDebt =
-            serde_json::from_str(&row).context("reading durable watch lexical replay debt")?;
+    for debt in load_watch_lexical_replay_debt(storage)? {
         // Re-normalize the saved path: an older build (or another alias of the
         // same root) may have stored a different spelling, e.g. Windows' \\?\
         // form before txc9h. The debt itself is returned as stored, so clearing
@@ -55252,6 +55354,10 @@ mod tests {
 
         // No DB yet -> clean no-op (must not panic).
         best_effort_abort_wal_checkpoint(&data_dir);
+        anyhow::ensure!(
+            !data_dir.join("agent_search.db").exists(),
+            "an absent archive must not be created by the abort checkpoint"
+        );
 
         // Create a canonical DB with some content and an active WAL.
         let db_path = data_dir.join("agent_search.db");
@@ -67947,7 +68053,7 @@ c.close()
         let t_index = std::sync::Mutex::new(Some(t_index));
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
         let tick = || {
-            reindex_paths(
+            reindex_paths_with_semantic_delta(
                 &opts,
                 vec![amp_file.clone()],
                 &roots,
@@ -67956,6 +68062,8 @@ c.close()
                 &t_index,
                 &index_path,
                 false,
+                None,
+                &ActiveSessionSourceFilter::new(false),
             )
             .unwrap()
         };
@@ -67973,7 +68081,12 @@ c.close()
         };
 
         // Tick 1: attempted, deferred, scheduled one minute out.
-        assert_eq!(tick(), 1);
+        let first_tick = tick();
+        assert_eq!(first_tick.indexed, 1);
+        assert_eq!(
+            first_tick.retry_sources,
+            BTreeSet::from([roots[0].1.path.clone()])
+        );
         let first = only_entry();
         assert_eq!(first.deferrals, 1);
         assert_eq!(first.next_retry_at_ms - first.last_deferred_at_ms, 60_000);
@@ -67981,7 +68094,12 @@ c.close()
 
         // Tick 2, inside the backoff: no ingest attempt. An attempt would
         // NoMem again under the injection and count a second deferral.
-        assert_eq!(tick(), 0, "a backed-off conversation is not ingested");
+        let held_tick = tick();
+        assert_eq!(
+            held_tick.indexed, 0,
+            "a backed-off conversation is not ingested"
+        );
+        assert_eq!(held_tick.retry_sources, first_tick.retry_sources);
         assert_eq!(only_entry(), first, "no attempt inside the backoff");
         assert!(
             load_watch_state(&data_dir).is_empty(),
@@ -67990,7 +68108,9 @@ c.close()
 
         // Backoff elapsed: attempted again, and the backoff doubles.
         expire_backoff();
-        assert_eq!(tick(), 1);
+        let second_tick = tick();
+        assert_eq!(second_tick.indexed, 1);
+        assert_eq!(second_tick.retry_sources, first_tick.retry_sources);
         let second = only_entry();
         assert_eq!(second.deferrals, 2);
         assert_eq!(second.first_deferred_at_ms, first.first_deferred_at_ms);
@@ -68010,7 +68130,9 @@ c.close()
         drop(solo_oom_guard);
         drop(oom_guard);
         expire_backoff();
-        assert_eq!(tick(), 1);
+        let recovered_tick = tick();
+        assert_eq!(recovered_tick.indexed, 1);
+        assert!(recovered_tick.retry_sources.is_empty());
         assert!(WatchNomemDeferrals::load(&data_dir).entries.is_empty());
         assert!(
             load_watch_state(&data_dir).contains_key(&ConnectorKind::Amp),
@@ -68581,6 +68703,262 @@ c.close()
             &index_dir(&opts.data_dir)?,
             false,
         )
+    }
+
+    #[test]
+    #[serial]
+    fn gh538_watch_deferred_publication_retries_without_another_event() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("cass");
+        fs::create_dir_all(&data_dir)?;
+        let selected = tmp.path().join("amp");
+        let source = selected.join("thread-retry.json");
+        let unrelated = tmp.path().join("preserved/amp/thread-preserved.json");
+        write_watch_lexical_source(&source, "thread-retry", "watchretryscheduledneedle");
+        write_watch_lexical_source(&unrelated, "thread-preserved", "watchretrypreservedneedle");
+        let source_before = fs::read(&source)?;
+        let source_mtime = fs::metadata(&source)?.modified()?;
+        let mut opts = watch_lexical_options(&data_dir);
+        opts.watch = true;
+        let roots = [(ConnectorKind::Amp, ScanRoot::local(selected.clone()))];
+        let index_path = index_dir(&data_dir)?;
+        let storage = Mutex::new(FrankenStorage::open(&opts.db_path)?);
+        let index = Mutex::new(Some(TantivyIndex::open_or_create(&index_path)?));
+        run_watch_lexical_selection(&opts, &unrelated, &storage, &index)?;
+        let preserved_ids = watch_lexical_search_ids(&index_path, "watchretrypreservedneedle");
+        assert_eq!(preserved_ids.len(), 1);
+        let last_indexed_before = storage.lock().unwrap().get_last_indexed_at()?;
+        let state = Mutex::new(HashMap::new());
+        let progress = Arc::new(IndexingProgress::default());
+        opts.progress = Some(Arc::clone(&progress));
+        {
+            // A failed attempt discovers work but completes none. A later
+            // successful retry must not falsify that cumulative accounting
+            // merely to make the watch watchdog recognize an idle owner.
+            let _fault = WatchLexicalFaultGuard::set(WatchLexicalTestFault::DebtWrite);
+            let failed = reindex_paths_with_semantic_delta(
+                &opts,
+                vec![source.clone()],
+                &roots,
+                &state,
+                &storage,
+                &index,
+                &index_path,
+                false,
+                None,
+                &ActiveSessionSourceFilter::new(false),
+            );
+            assert!(
+                finalize_watch_reindex_result(
+                    failed.map(|outcome| outcome.indexed),
+                    &StaleDetector::from_env(),
+                    Some(&progress),
+                    "GH538 failed attempt",
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(progress.current.load(Ordering::Relaxed), 0);
+        assert_eq!(progress.total.load(Ordering::Relaxed), 1);
+        assert_eq!(progress.phase.load(Ordering::Relaxed), 0);
+        assert!(!progress.watch_idle.load(Ordering::Acquire));
+        let mut pending = WatchEventBacklog::default();
+        assert!(pending.extend([source.clone()]));
+        let mut pending_rescan = false;
+        {
+            let _fault = WatchLexicalFaultGuard::set(WatchLexicalTestFault::PublicationAfter(0));
+            dispatch_pending_watch_callback(
+                &mut pending,
+                &mut pending_rescan,
+                &roots,
+                &|paths, roots, force_full| {
+                    let outcome = reindex_paths_with_semantic_delta(
+                        &opts,
+                        paths,
+                        roots,
+                        &state,
+                        &storage,
+                        &index,
+                        &index_path,
+                        force_full,
+                        None,
+                        &ActiveSessionSourceFilter::new(false),
+                    )?;
+                    assert_eq!(outcome.indexed, 1);
+                    Ok(outcome.retry_sources)
+                },
+            );
+        }
+        assert!(!pending_rescan);
+        assert_eq!(pending.paths, BTreeSet::from([selected.clone()]));
+        assert!(watch_lexical_search_ids(&index_path, "watchretryscheduledneedle").is_empty());
+        assert_eq!(
+            storage.lock().unwrap().get_last_indexed_at()?,
+            last_indexed_before
+        );
+        assert!(load_watch_state(&data_dir).is_empty());
+        let committed = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        assert_eq!(committed.len(), 2);
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "watchretrypreservedneedle"),
+            preserved_ids
+        );
+
+        // Drop the in-memory event queue and handles exactly as a restart
+        // does. Recovery is seeded from canonical debt, with no source write
+        // or filesystem notification after the failed publication.
+        drop(index);
+        storage.into_inner().unwrap().close()?;
+        pending.clear();
+        let storage = Mutex::new(FrankenStorage::open(&opts.db_path)?);
+        let index = Mutex::new(None);
+        let recovery = watch_lexical_replay_sources(&storage.lock().unwrap(), &roots)?;
+        assert_eq!(recovery, BTreeSet::from([selected]));
+        assert!(pending.extend(recovery));
+        dispatch_pending_watch_callback(
+            &mut pending,
+            &mut pending_rescan,
+            &roots,
+            &|paths, roots, force_full| {
+                let outcome = reindex_paths_with_semantic_delta(
+                    &opts,
+                    paths,
+                    roots,
+                    &state,
+                    &storage,
+                    &index,
+                    &index_path,
+                    force_full,
+                    None,
+                    &ActiveSessionSourceFilter::new(false),
+                )?;
+                assert_eq!(outcome.indexed, 1);
+                Ok(outcome.retry_sources)
+            },
+        );
+        assert!(pending.paths.is_empty());
+        assert!(!pending_rescan);
+        assert!(watch_lexical_replay_sources(&storage.lock().unwrap(), &roots)?.is_empty());
+        assert_eq!(
+            watch_lexical_canonical_rows(&storage.lock().unwrap()),
+            committed
+        );
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "watchretryscheduledneedle").len(),
+            1
+        );
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "watchretrypreservedneedle"),
+            preserved_ids
+        );
+        assert_eq!(fs::read(&source)?, source_before);
+        assert_eq!(fs::metadata(&source)?.modified()?, source_mtime);
+        assert_eq!(progress.current.load(Ordering::Relaxed), 2);
+        assert_eq!(progress.total.load(Ordering::Relaxed), 3);
+        assert_eq!(progress.phase.load(Ordering::Relaxed), 0);
+        assert!(!progress.watch_idle.load(Ordering::Acquire));
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn gh538_watch_restart_debt_respects_source_connector_and_root_scope() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let storage = FrankenStorage::open(&tmp.path().join("agent_search.db"))?;
+        let root = ScanRoot::local(tmp.path().join("amp"));
+        let child = ScanRoot::local(root.path.join("child"));
+        let roots = [(ConnectorKind::Amp, root.clone())];
+        assert!(watch_lexical_replay_sources(&storage, &roots)?.is_empty());
+        let same_root = WatchLexicalReplayDebt::for_root(ConnectorKind::Amp, &root);
+        let child_debt = WatchLexicalReplayDebt::for_root(ConnectorKind::Amp, &child);
+        let another_connector = WatchLexicalReplayDebt::for_root(ConnectorKind::Claude, &root);
+        let mut another_source = WatchLexicalReplayDebt::for_root(ConnectorKind::Amp, &root);
+        another_source.source_id = "removed-source".into();
+        let removed_root = WatchLexicalReplayDebt::for_root(
+            ConnectorKind::Amp,
+            &ScanRoot::local(tmp.path().join("removed-root")),
+        );
+        for debt in [
+            &same_root,
+            &child_debt,
+            &another_connector,
+            &another_source,
+            &removed_root,
+        ] {
+            persist_watch_lexical_replay_debt(&storage, debt)?;
+        }
+        assert_eq!(
+            watch_lexical_replay_sources(&storage, &roots)?,
+            BTreeSet::from([root.path.clone()])
+        );
+        assert_eq!(
+            watch_lexical_replay_sources(&storage, &[(ConnectorKind::Amp, child.clone())])?,
+            BTreeSet::from([child.path]),
+            "an ancestor debt may retry only the still-configured child"
+        );
+        clear_watch_lexical_replay_debt(&storage, &same_root)?;
+        clear_watch_lexical_replay_debt(&storage, &child_debt)?;
+        assert!(watch_lexical_replay_sources(&storage, &roots)?.is_empty());
+        assert_eq!(load_watch_lexical_replay_debt(&storage)?.len(), 3);
+
+        storage.raw().execute_compat(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+            &[
+                ParamValue::from(format!("{WATCH_LEXICAL_REPLAY_DEBT_PREFIX}malformed")),
+                ParamValue::from("{broken"),
+            ],
+        )?;
+        assert!(watch_lexical_replay_sources(&storage, &roots).is_err());
+        let malformed: String = storage.raw().query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            &[ParamValue::from(format!(
+                "{WATCH_LEXICAL_REPLAY_DEBT_PREFIX}malformed"
+            ))],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(
+            malformed, "{broken",
+            "a failed load must not discard recovery debt"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn gh538_watch_excluded_debt_does_not_schedule_an_endless_rescan() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let source = tmp.path().join("amp/thread-excluded.json");
+        write_watch_lexical_source(&source, "thread-excluded", "excludedwatchneedle");
+        let _exclusion = set_env("CASS_EXCLUDE_PATHS", &source.to_string_lossy());
+        let opts = watch_lexical_options(tmp.path());
+        let storage = Mutex::new(FrankenStorage::open(&opts.db_path)?);
+        let root = ScanRoot::local(source.parent().unwrap().to_path_buf());
+        persist_watch_lexical_replay_debt(
+            &storage.lock().unwrap(),
+            &WatchLexicalReplayDebt::for_root(ConnectorKind::Amp, &root),
+        )?;
+        let index = Mutex::new(None);
+        let outcome = reindex_paths_with_semantic_delta(
+            &opts,
+            vec![root.path.clone()],
+            &[(ConnectorKind::Amp, root.clone())],
+            &Mutex::new(HashMap::new()),
+            &storage,
+            &index,
+            &index_dir(tmp.path())?,
+            false,
+            None,
+            &ActiveSessionSourceFilter::new(false),
+        )?;
+        assert_eq!(outcome.indexed, 0);
+        assert!(outcome.retry_sources.is_empty());
+        assert!(index.lock().unwrap().is_none());
+        assert_eq!(
+            load_watch_lexical_replay_debt(&storage.lock().unwrap())?.len(),
+            1
+        );
+        assert_eq!(storage.lock().unwrap().get_last_indexed_at()?, None);
+        Ok(())
     }
 
     #[test]
@@ -69634,8 +70012,13 @@ c.close()
         let progress = Arc::new(IndexingProgress::default());
         let stopping = Arc::clone(&progress);
         let stop = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !stopping.watch_idle.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let observed_idle = stopping.watch_idle.load(Ordering::Acquire);
             stopping.request_stop();
+            observed_idle
         });
         let started = Instant::now();
         let result = wait_watch_loop_event(
@@ -69644,13 +70027,14 @@ c.close()
             Duration::from_secs(300),
             Some(&progress),
         );
-        stop.join().expect("stop request thread");
+        assert!(stop.join().expect("stop request thread"));
         let Err(error) = result else {
             panic!("idle watch wait must return the stop request");
         };
         assert!(error.downcast_ref::<IndexInterrupted>().is_some());
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(progress.activity.load(Ordering::Relaxed), 0);
+        assert!(!progress.watch_idle.load(Ordering::Acquire));
     }
 
     #[test]
@@ -69663,6 +70047,37 @@ c.close()
             WatchLoopEvent::Timeout
         ));
         assert!(started.elapsed() >= timeout);
+        assert_eq!(progress.activity.load(Ordering::Relaxed), 0);
+        assert!(!progress.watch_idle.load(Ordering::Acquire));
+        Ok(())
+    }
+
+    #[test]
+    fn gh538_watch_idle_marker_clears_before_event_or_disconnect() -> Result<()> {
+        let progress = Arc::new(IndexingProgress::default());
+        let (wake, notifications) = bounded(1);
+        wake.send(())?;
+        assert!(matches!(
+            wait_watch_loop_event(
+                &never(),
+                &notifications,
+                Duration::from_secs(300),
+                Some(&progress),
+            )?,
+            WatchLoopEvent::Filesystem
+        ));
+        assert!(!progress.watch_idle.load(Ordering::Acquire));
+        drop(wake);
+        assert!(matches!(
+            wait_watch_loop_event(
+                &never(),
+                &notifications,
+                Duration::from_secs(300),
+                Some(&progress),
+            )?,
+            WatchLoopEvent::Disconnected
+        ));
+        assert!(!progress.watch_idle.load(Ordering::Acquire));
         assert_eq!(progress.activity.load(Ordering::Relaxed), 0);
         Ok(())
     }
@@ -69780,7 +70195,7 @@ c.close()
             &ActiveSessionSourceFilter::new(false),
         )
         .unwrap();
-        assert_eq!(indexed, 1);
+        assert_eq!(indexed.indexed, 1);
         let first_contents: Vec<_> = first_delta
             .inputs
             .iter()
@@ -69822,7 +70237,7 @@ c.close()
             &ActiveSessionSourceFilter::new(false),
         )
         .unwrap();
-        assert_eq!(indexed, 1);
+        assert_eq!(indexed.indexed, 1);
         assert_eq!(second_delta.inputs.len(), 1);
         assert_eq!(second_delta.inputs[0].content, "followup");
         assert_eq!(
