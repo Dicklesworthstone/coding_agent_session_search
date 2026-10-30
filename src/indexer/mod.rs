@@ -95,8 +95,7 @@ use crate::storage::sqlite::{
 };
 use semantic::{
     EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage_since,
-    packet_embedding_inputs_from_storage_with_progress, semantic_doc_id_for_input,
-    visit_packet_embedding_inputs_from_storage,
+    semantic_doc_id_for_input, visit_packet_embedding_inputs_from_storage,
 };
 
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
@@ -19296,7 +19295,10 @@ fn run_index_with_storage_ownership(
         // entirely and re-embed the whole corpus every run. When the existing
         // index + watermark already cover the newest message, there is nothing
         // to embed — skip the bulk pass on one-shot runs too.
-        let watermark_covers_corpus = !semantic_identity_rebuild_required
+        // An explicit full semantic rebuild must not be certified by an old
+        // watermark, including when the canonical archive is now empty.
+        let watermark_covers_corpus = !opts.full
+            && !semantic_identity_rebuild_required
             && has_existing_index
             && match (last_embedded, storage.max_message_id()?) {
                 (Some(watermark), Some(max_id)) => watermark >= max_id,
@@ -19312,7 +19314,8 @@ fn run_index_with_storage_ownership(
         // the delta, not the corpus. Identity changes still force the bulk
         // rebuild, and any delta failure falls back to the bulk pass so the
         // artifact never ends up less complete than before.
-        let one_shot_delta_eligible = !opts.watch
+        let one_shot_delta_eligible = !opts.full
+            && !opts.watch
             && !semantic_identity_rebuild_required
             && has_existing_index
             && has_watermark
@@ -19386,7 +19389,11 @@ fn run_index_with_storage_ownership(
             }
         }
 
-        if opts.watch && !semantic_identity_rebuild_required && has_existing_index && has_watermark
+        if opts.watch
+            && !opts.full
+            && !semantic_identity_rebuild_required
+            && has_existing_index
+            && has_watermark
         {
             tracing::info!(
                 dir = %vi_dir.display(),
@@ -19452,119 +19459,84 @@ fn run_index_with_storage_ownership(
                     )
                 })?;
 
-            let mut embedding_inputs = packet_embedding_inputs_from_storage_with_progress(
+            let build_started_at_ms = semantic_indexing_now_ms();
+            let mut active_phase = semantic::SemanticStorageBuildPhase::Replay;
+            let semantic_build = semantic_indexer.build_and_save_index_from_storage_with_progress(
                 &semantic_read_storage,
-                |current, total| {
-                    update_semantic_progress(
-                        opts.progress.as_ref(),
-                        &progress_bump,
-                        current,
-                        total,
-                    );
-                },
-            )?;
-            tracing::info!(
-                passage_count = embedding_inputs.len(),
-                packet_driven = true,
-                "built semantic inputs from canonical ConversationPacket replay"
-            );
-
-            embedding_inputs.retain(|message| {
-                !is_hard_message_noise(semantic_role_name(message.role), &message.content)
-            });
-
-            // Generate embeddings
-            set_semantic_phase("semantic:embedding");
-            set_semantic_progress_phase(
-                opts.progress.as_ref(),
-                &progress_bump,
-                INDEX_PHASE_SEMANTIC_EMBEDDING,
-                0,
-                embedding_inputs.len(),
-            );
-            let embedded_messages = semantic_indexer.embed_messages_with_progress(
-                &embedding_inputs,
-                |current, total| {
-                    update_semantic_progress(
-                        opts.progress.as_ref(),
-                        &progress_bump,
-                        current,
-                        total,
-                    );
-                },
-            )?;
-            tracing::info!(
-                embedded_count = embedded_messages.len(),
-                "generated embeddings"
-            );
-
-            if !embedded_messages.is_empty() {
-                let embedded_doc_count = embedded_messages.len();
-                let build_started_at_ms = semantic_indexing_now_ms();
-                set_semantic_phase("semantic:vector_publish");
-                set_semantic_progress_phase(
-                    opts.progress.as_ref(),
-                    &progress_bump,
-                    INDEX_PHASE_SEMANTIC_VECTOR_PUBLISH,
-                    0,
-                    embedded_doc_count,
-                );
-                semantic_indexer.build_and_save_index_with_progress(
-                    embedded_messages,
-                    &opts.data_dir,
-                    |current| {
+                &opts.data_dir,
+                |phase, current, total| {
+                    let (name, code) = match phase {
+                        semantic::SemanticStorageBuildPhase::Replay => {
+                            ("semantic:replay", INDEX_PHASE_SEMANTIC_REPLAY)
+                        }
+                        semantic::SemanticStorageBuildPhase::Embedding => {
+                            ("semantic:embedding", INDEX_PHASE_SEMANTIC_EMBEDDING)
+                        }
+                        semantic::SemanticStorageBuildPhase::VectorPublish => (
+                            "semantic:vector_publish",
+                            INDEX_PHASE_SEMANTIC_VECTOR_PUBLISH,
+                        ),
+                    };
+                    if phase != active_phase {
+                        set_semantic_phase(name);
+                        set_semantic_progress_phase(
+                            opts.progress.as_ref(),
+                            &progress_bump,
+                            code,
+                            current,
+                            total,
+                        );
+                        active_phase = phase;
+                    } else {
                         update_semantic_progress(
                             opts.progress.as_ref(),
                             &progress_bump,
                             current,
-                            embedded_doc_count,
+                            total,
                         );
-                    },
-                )?;
-                let index_path = crate::search::vector_index::vector_index_path(
-                    &opts.data_dir,
-                    semantic_indexer.embedder_id(),
-                );
-                tracing::info!(
-                    path = %index_path.display(),
-                    embedder = semantic_indexer.embedder_id(),
-                    "saved semantic vector index"
-                );
+                    }
+                },
+            )?;
+            tracing::info!(
+                passage_count = semantic_build.input_passages,
+                embedded_count = semantic_build.embedded_docs,
+                packet_driven = true,
+                "published semantic vector index from bounded canonical replay and embedding"
+            );
+            let index_path = crate::search::vector_index::vector_index_path(
+                &opts.data_dir,
+                semantic_indexer.embedder_id(),
+            );
 
-                // Publish the artifact to the semantic manifest so `cass
-                // status` reflects the freshly-built index. Without this,
-                // `index --semantic` republishes the .fsvi file but leaves
-                // semantic_manifest.json pointed at stale metadata, so
-                // status reports `semantic: stale / available: false`
-                // even though semantic search works (issue #203).
-                set_semantic_phase("semantic:manifest");
-                set_semantic_progress_phase(
-                    opts.progress.as_ref(),
-                    &progress_bump,
-                    INDEX_PHASE_SEMANTIC_MANIFEST,
-                    0,
-                    1,
+            // An empty completed replay is a real replacement too: leaving the
+            // previous nonempty artifact installed would retain deleted evidence.
+            set_semantic_phase("semantic:manifest");
+            set_semantic_progress_phase(
+                opts.progress.as_ref(),
+                &progress_bump,
+                INDEX_PHASE_SEMANTIC_MANIFEST,
+                0,
+                1,
+            );
+            if let Err(err) = publish_direct_semantic_artifact(
+                &semantic_read_storage,
+                &opts.data_dir,
+                &index_path,
+                semantic_indexer.embedder_id(),
+                semantic_indexer.embedder_dimension(),
+                u64::try_from(semantic_build.embedded_docs).unwrap_or(u64::MAX),
+                build_started_at_ms,
+            ) {
+                tracing::warn!(
+                    embedder = semantic_indexer.embedder_id(),
+                    error = %err,
+                    "direct semantic artifact published to disk but \
+                     manifest update failed; cass status may report \
+                    stale/unavailable until next backfill cycle"
                 );
-                if let Err(err) = publish_direct_semantic_artifact(
-                    &semantic_read_storage,
-                    &opts.data_dir,
-                    &index_path,
-                    semantic_indexer.embedder_id(),
-                    semantic_indexer.embedder_dimension(),
-                    u64::try_from(embedded_doc_count).unwrap_or(u64::MAX),
-                    build_started_at_ms,
-                ) {
-                    tracing::warn!(
-                        embedder = semantic_indexer.embedder_id(),
-                        error = %err,
-                        "direct semantic artifact published to disk but \
-                         manifest update failed; cass status may report \
-                        stale/unavailable until next backfill cycle"
-                    );
-                } else {
-                    semantic_manifest_published = true;
-                    update_semantic_progress(opts.progress.as_ref(), &progress_bump, 1, 1);
-                }
+            } else {
+                semantic_manifest_published = true;
+                update_semantic_progress(opts.progress.as_ref(), &progress_bump, 1, 1);
             }
 
             // Set watermark so incremental watch-mode embedding only sees new messages
@@ -19577,17 +19549,14 @@ fn run_index_with_storage_ownership(
                 1,
             );
             semantic_read_storage.close_best_effort_in_place();
-            if let Some(max_id) = embedding_inputs.iter().map(|e| e.message_id).max() {
-                persist::with_ephemeral_writer(
-                    &storage,
-                    false,
-                    "updating semantic indexing watermark",
-                    |writer| {
-                        writer
-                            .set_last_embedded_message_id(i64::try_from(max_id).unwrap_or(i64::MAX))
-                    },
-                )?;
-            }
+            persist::with_ephemeral_writer(
+                &storage,
+                false,
+                "updating semantic indexing watermark",
+                |writer| {
+                    writer.set_last_embedded_message_id(semantic_build.last_message_id.unwrap_or(0))
+                },
+            )?;
             if semantic_identity_rebuild_required && semantic_manifest_published {
                 crate::indexer::semantic::invalidate_identity_stale_semantic_shards(
                     &opts.data_dir,

@@ -2,8 +2,8 @@
 //!
 //! One integer per nonempty parent is retained for a stable progress denominator.
 //! Message text is admitted in 64-row / 1-MiB pages, with one oversized message
-//! allowed whole. The returned passage vector and native/allocator scratch are
-//! still additional memory; this is not a process RSS bound or streaming embedder.
+//! allowed whole. Consumers can embed and release passages during replay instead
+//! of retaining the corpus. Native/allocator scratch remains additional memory.
 
 use super::{PARENT_PAGE_SIZE, engine, envelopes, pages};
 use crate::franken_sync::{Connection, FrankenError, SqliteValue, compat::RowExt};
@@ -135,31 +135,66 @@ fn nonempty_parents(connection: &Connection) -> Result<Vec<i64>> {
 /// large parent, not completed conversations. Only a completely read parent
 /// advances the conversation count. Errors return no successful input prefix.
 /// A caller-owned transaction remains owned by the caller on every exit path.
+#[cfg(test)]
 pub(crate) fn packet_embedding_inputs_from_storage_with_progress<F>(
     storage: &FrankenStorage,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<Vec<engine::EmbeddingInput>>
 where
     F: FnMut(usize, usize),
 {
-    if matches!(
-        dotenvy::var("CASS_SEMANTIC_STREAM_REPLAY").as_deref(),
-        Ok("0")
-    ) {
-        return engine::packet_embedding_inputs_from_storage_with_progress(storage, on_progress);
-    }
+    let mut inputs = Vec::new();
+    visit_packet_embedding_inputs_from_storage_with_progress(
+        storage,
+        |input| {
+            inputs.push(input);
+            Ok(())
+        },
+        on_progress,
+    )?;
+    Ok(inputs)
+}
+
+/// Replay one snapshot into a fallible consumer. An error or unwind never
+/// becomes successful end-of-input, so an unpublished writer can discard its
+/// buffered prefix without replacing the selected generation.
+pub(crate) fn visit_packet_embedding_inputs_from_storage_with_progress<F, P>(
+    storage: &FrankenStorage,
+    mut consume: F,
+    mut on_progress: P,
+) -> Result<Option<i64>>
+where
+    F: FnMut(engine::EmbeddingInput) -> Result<()>,
+    P: FnMut(usize, usize),
+{
     let snapshot = ReadSnapshot::begin(storage.raw())?;
     // A caller's progress callback can unwind. Running SQL cleanup during that
     // unwind poisons native database locks merely because their guards drop
     // while thread::panicking(). Finish cleanup outside the unwind, then resume
     // the identical panic; no callback failure becomes a successful input prefix.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        collect(storage, &mut on_progress)
+        if matches!(
+            dotenvy::var("CASS_SEMANTIC_STREAM_REPLAY").as_deref(),
+            Ok("0")
+        ) {
+            // Explicit diagnostic opt-out retains legacy materialization, but
+            // binds its watermark and content to the same read snapshot.
+            let last_message_id = storage.max_message_id()?;
+            for input in engine::packet_embedding_inputs_from_storage_with_progress(
+                storage,
+                &mut on_progress,
+            )? {
+                consume(input)?;
+            }
+            Ok(last_message_id)
+        } else {
+            replay(storage, &mut consume, &mut on_progress)
+        }
     }));
     match result {
-        Ok(Ok(inputs)) => {
+        Ok(Ok(last_message_id)) => {
             snapshot.release()?;
-            Ok(inputs)
+            Ok(last_message_id)
         }
         Ok(Err(error)) => {
             drop(snapshot);
@@ -172,14 +207,15 @@ where
     }
 }
 
-fn collect(
+fn replay(
     storage: &FrankenStorage,
+    consume: &mut impl FnMut(engine::EmbeddingInput) -> Result<()>,
     on_progress: &mut impl FnMut(usize, usize),
-) -> Result<Vec<engine::EmbeddingInput>> {
+) -> Result<Option<i64>> {
     let parents = nonempty_parents(storage.raw())?;
     let total = parents.len();
     let mut completed = 0usize;
-    let mut inputs = Vec::new();
+    let mut last_message_id = None;
     on_progress(0, total);
     for ids in parents.chunks(PARENT_PAGE_SIZE) {
         for envelope in envelopes(storage, ids)? {
@@ -191,9 +227,15 @@ fn collect(
                 envelope.context.conversation_id,
                 &mut |message| {
                     seen = true;
+                    if let Some(id) = message.id.filter(|id| *id > 0) {
+                        last_message_id =
+                            Some(last_message_id.map_or(id, |previous: i64| previous.max(id)));
+                    }
                     worked_rows += 1;
                     worked_bytes = worked_bytes.saturating_add(message.content.len());
-                    inputs.extend(envelope.project(message)?);
+                    for input in envelope.project(message)? {
+                        consume(input)?;
+                    }
                     if worked_rows >= pages::MAX_ROWS || worked_bytes >= pages::MAX_CONTENT_BYTES {
                         on_progress(completed, total);
                         worked_rows = 0;
@@ -210,5 +252,5 @@ fn collect(
             on_progress(completed, total);
         }
     }
-    Ok(inputs)
+    Ok(last_message_id)
 }

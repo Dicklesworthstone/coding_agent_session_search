@@ -13,12 +13,146 @@ pub(super) fn run<I, F, C>(
     messages: I,
     data_dir: &Path,
     mut on_progress: Option<F>,
-    mut check_cancelled: C,
+    check_cancelled: C,
 ) -> Result<VectorIndex>
 where
     I: IntoIterator<Item = EmbeddedMessage>,
     F: FnMut(usize),
     C: FnMut() -> Result<()>,
+{
+    publish(
+        indexer,
+        data_dir,
+        check_cancelled,
+        |scratch, candidate_path, generation, check_cancelled| {
+            if generation.is_none() {
+                // Keep the engine's existing first-generation/progress interface live.
+                // It accepts an infallible iterator, so a cancelled adapter stops input
+                // and retains the exact error. Any finished prefix remains private and
+                // is rejected before candidate admission or installation.
+                build_initial(
+                    indexer,
+                    messages,
+                    scratch,
+                    &mut on_progress,
+                    check_cancelled,
+                )?;
+            } else {
+                let mut writer = candidate_writer(indexer, candidate_path, generation)?;
+
+                // into_iter(), next(), and the progress callback are arbitrary caller code.
+                // In particular, final None must not hide a cancellation from publication.
+                check_cancelled()?;
+                let mut messages = messages.into_iter();
+                let mut accepted = 0usize;
+                loop {
+                    check_cancelled()?;
+                    let embedded = messages.next();
+                    check_cancelled()?;
+                    let Some(embedded) = embedded else {
+                        break;
+                    };
+                    write_record(&mut writer, &embedded, indexer.embedder_dimension())?;
+                    accepted = accepted.saturating_add(1);
+                    if let Some(progress) = on_progress.as_mut() {
+                        progress(accepted);
+                    }
+                    check_cancelled()?;
+                }
+                // Drop arbitrary iterator state before the final cancellation fence too.
+                drop(messages);
+                check_cancelled()?;
+                writer
+                    .finish()
+                    .context("finish unpublished semantic replacement")?;
+                check_cancelled()?;
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Feed fallible, bounded batches directly into a private writer. A producer
+/// error after earlier successful records must never install that prefix.
+pub(super) fn run_with_producer<P, F, C>(
+    indexer: &SemanticIndexer,
+    data_dir: &Path,
+    produce: P,
+    mut on_progress: F,
+    check_cancelled: C,
+) -> Result<VectorIndex>
+where
+    P: FnOnce(&mut dyn FnMut(EmbeddedMessage) -> Result<()>) -> Result<()>,
+    F: FnMut(usize),
+    C: FnMut() -> Result<()>,
+{
+    publish(
+        indexer,
+        data_dir,
+        check_cancelled,
+        |_, candidate_path, generation, check_cancelled| {
+            let mut writer = candidate_writer(indexer, candidate_path, generation)?;
+            let mut accepted = 0usize;
+            let mut rejected = false;
+            check_cancelled()?;
+            let result = produce(&mut |embedded| {
+                ensure!(
+                    !rejected,
+                    "semantic rebuild producer continued after a rejected record"
+                );
+                let result = (|| {
+                    check_cancelled()?;
+                    write_record(&mut writer, &embedded, indexer.embedder_dimension())?;
+                    accepted = accepted.saturating_add(1);
+                    on_progress(accepted);
+                    check_cancelled()
+                })();
+                rejected = result.is_err();
+                result
+            });
+            result?;
+            // A caller may accidentally swallow an emit error. Retain that
+            // refusal independently of the producer's return value.
+            ensure!(
+                !rejected,
+                "semantic rebuild producer ignored a rejected record"
+            );
+            check_cancelled()?;
+            writer
+                .finish()
+                .context("finish unpublished semantic replacement")?;
+            check_cancelled()?;
+            Ok(())
+        },
+    )
+}
+
+fn candidate_writer(
+    indexer: &SemanticIndexer,
+    candidate_path: &Path,
+    previous_generation: Option<u8>,
+) -> Result<VectorIndexWriter> {
+    let revision = expected_vector_space_revision(indexer.embedder_id())
+        .context("full rebuild has no registered vector-space revision")?;
+    Ok(VectorIndex::create_with_revision(
+        candidate_path,
+        indexer.embedder_id(),
+        revision,
+        indexer.embedder_dimension(),
+        Quantization::F16,
+    )?
+    .with_generation(previous_generation.map_or(1, next_generation)))
+}
+
+fn publish<C, P>(
+    indexer: &SemanticIndexer,
+    data_dir: &Path,
+    mut check_cancelled: C,
+    prepare: P,
+) -> Result<VectorIndex>
+where
+    C: FnMut() -> Result<()>,
+    P: FnOnce(&Path, &Path, Option<u8>, &mut C) -> Result<()>,
 {
     check_cancelled()?;
     // Declare the lease before any source observations or candidate owners.
@@ -28,61 +162,17 @@ where
     let destination = vector_index_path(data_dir, indexer.embedder_id());
     refuse_publication_sidecars(&destination, false)?;
     let previous = RebuildDestination::capture(&destination)?;
-    let revision = expected_vector_space_revision(indexer.embedder_id())
-        .context("full rebuild has no registered vector-space revision")?;
     check_cancelled()?;
     let scratch = artifacts.scratch()?;
     let candidate_path = vector_index_path(scratch.path(), indexer.embedder_id());
     fs::create_dir_all(candidate_path.parent().context("candidate has no parent")?)?;
-    if previous.generation.is_none() {
-        // Keep the engine's existing first-generation/progress interface live.
-        // It accepts an infallible iterator, so a cancelled adapter stops input
-        // and retains the exact error. Any finished prefix remains private and
-        // is rejected before candidate admission or installation.
-        build_initial(
-            indexer,
-            messages,
-            scratch.path(),
-            &mut on_progress,
-            &mut check_cancelled,
-        )?;
-    } else {
-        let mut writer = VectorIndex::create_with_revision(
-            &candidate_path,
-            indexer.embedder_id(),
-            revision,
-            indexer.embedder_dimension(),
-            Quantization::F16,
-        )?
-        .with_generation(previous.generation.map_or(1, next_generation));
-
-        // into_iter(), next(), and the progress callback are arbitrary caller code.
-        // In particular, final None must not hide a cancellation from publication.
-        check_cancelled()?;
-        let mut messages = messages.into_iter();
-        let mut accepted = 0usize;
-        loop {
-            check_cancelled()?;
-            let embedded = messages.next();
-            check_cancelled()?;
-            let Some(embedded) = embedded else {
-                break;
-            };
-            write_record(&mut writer, &embedded, indexer.embedder_dimension())?;
-            accepted = accepted.saturating_add(1);
-            if let Some(progress) = on_progress.as_mut() {
-                progress(accepted);
-            }
-            check_cancelled()?;
-        }
-        // Drop arbitrary iterator state before the final cancellation fence too.
-        drop(messages);
-        check_cancelled()?;
-        writer
-            .finish()
-            .context("finish unpublished semantic replacement")?;
-        check_cancelled()?;
-    }
+    prepare(
+        scratch.path(),
+        &candidate_path,
+        previous.generation,
+        &mut check_cancelled,
+    )?;
+    check_cancelled()?;
 
     let candidate = VectorIndex::open_read_only(&candidate_path)?;
     validate_candidate(&candidate, &mut check_cancelled)?;

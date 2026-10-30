@@ -17,12 +17,14 @@ pub use artifacts::{
     BackfillManifestChanged, apply_backfill_artifact_plan, plan_backfill_artifacts,
     reclaim_backfill_artifacts,
 };
+pub(crate) use delegate::SemanticStorageBuildPhase;
 pub use engine::*;
 // Explicitly select bounded message replay over the engine glob export.
+#[cfg(test)]
+pub(crate) use replay::packet_embedding_inputs_from_storage_with_progress;
 pub(crate) use replay::{
     packet_embedding_inputs_from_storage_for_message_ids,
-    packet_embedding_inputs_from_storage_since, packet_embedding_inputs_from_storage_with_progress,
-    visit_packet_embedding_inputs_from_storage,
+    packet_embedding_inputs_from_storage_since, visit_packet_embedding_inputs_from_storage,
 };
 
 use std::path::{Path, PathBuf};

@@ -533,6 +533,184 @@ fn direct_semantic_progress_empty_archive_reports_no_fabricated_work() -> Result
     Ok(())
 }
 
+fn stored_semantic_rows(
+    root: &Path,
+    indexer: &crate::indexer::semantic::SemanticIndexer,
+) -> Result<std::collections::BTreeMap<String, Vec<f32>>> {
+    let path = crate::search::vector_index::vector_index_path(root, indexer.embedder_id());
+    let index = frankensearch::index::VectorIndex::open_read_only(&path)?;
+    (0..index.record_count())
+        .map(|row| Ok((index.doc_id_at(row)?.to_owned(), index.vector_at_f32(row)?)))
+        .collect()
+}
+
+#[test]
+fn direct_semantic_streaming_build_matches_incumbent_vectors_across_batches() -> Result<()> {
+    use crate::indexer::semantic::{SemanticIndexer, SemanticStorageBuildPhase};
+
+    let temp = tempfile::tempdir()?;
+    let storage = database(temp.path(), 1, 515)?;
+    storage.raw().execute_compat(
+        "UPDATE messages SET content = ?1, role = 'tool' WHERE id = 1",
+        &[ParamValue::from(
+            "complete Unicode café 東京 compiler and transaction evidence. ".repeat(20_000),
+        )],
+    )?;
+    storage
+        .raw()
+        .execute("UPDATE messages SET content = '' WHERE id = 515")?;
+    storage.set_last_embedded_message_id(7)?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let mut inputs =
+        engine::packet_embedding_inputs_from_storage_with_progress(&storage, |_, _| {})?;
+    inputs.retain(|input| {
+        !crate::search::canonicalize::is_hard_message_noise(
+            crate::indexer::semantic_role_name(input.role),
+            &input.content,
+        )
+    });
+    let expected_count = inputs.len();
+    let incumbent = temp.path().join("incumbent");
+    drop(indexer.build_and_save_index(indexer.embed_messages(&inputs)?, &incumbent)?);
+    drop(inputs);
+    let streaming = temp.path().join("streaming");
+    let mut embed_batches = 0;
+    let outcome = indexer.build_and_save_index_from_storage_with_progress(
+        &storage,
+        &streaming,
+        |phase, current, total| {
+            if phase == SemanticStorageBuildPhase::Embedding && current == 0 {
+                assert!(total <= 512, "source text must stay batch-bounded");
+                embed_batches += 1;
+            }
+        },
+    )?;
+    assert!(embed_batches > 1);
+    assert_eq!(outcome.embedded_docs, expected_count);
+    assert_eq!(outcome.last_message_id, Some(515));
+    assert_eq!(
+        stored_semantic_rows(&streaming, &indexer)?,
+        stored_semantic_rows(&incumbent, &indexer)?
+    );
+    assert_eq!(storage.get_last_embedded_message_id()?, Some(7));
+    assert!(!storage.raw().as_async().in_transaction());
+    storage.close()?;
+    Ok(())
+}
+
+#[test]
+fn direct_semantic_streaming_late_replay_error_preserves_published_generation() -> Result<()> {
+    use crate::indexer::semantic::{EmbeddingInput, SemanticIndexer, SemanticStorageBuildPhase};
+
+    let temp = tempfile::tempdir()?;
+    let storage = database(temp.path(), 1, 577)?;
+    storage.set_last_embedded_message_id(11)?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    drop(indexer.build_and_save_index(
+        indexer.embed_messages(&[EmbeddingInput::new(
+            999,
+            "prior committed compiler evidence",
+        )])?,
+        temp.path(),
+    )?);
+    let path = crate::search::vector_index::vector_index_path(temp.path(), indexer.embedder_id());
+    let before = std::fs::read(&path)?;
+    // The corrupt page follows enough valid rows to produce a real embedding
+    // batch. A fallible replay cannot turn that earlier prefix into a publish.
+    storage
+        .raw()
+        .execute("UPDATE messages SET role = X'00' WHERE idx = 512")?;
+    let mut embedded_prefix = false;
+    let error = indexer
+        .build_and_save_index_from_storage_with_progress(
+            &storage,
+            temp.path(),
+            |phase, current, total| {
+                if phase == SemanticStorageBuildPhase::Embedding && current > 0 && current == total
+                {
+                    embedded_prefix = true;
+                }
+            },
+        )
+        .unwrap_err();
+    assert!(
+        embedded_prefix,
+        "the failure must follow useful embedded work"
+    );
+    assert!(error.downcast_ref::<FrankenError>().is_some());
+    assert_eq!(std::fs::read(&path)?, before);
+    assert_eq!(storage.get_last_embedded_message_id()?, Some(11));
+    assert!(!storage.raw().as_async().in_transaction());
+    storage.close()?;
+    Ok(())
+}
+
+#[test]
+fn direct_semantic_streaming_build_and_watermark_share_one_snapshot() -> Result<()> {
+    use crate::indexer::semantic::{SemanticIndexer, SemanticStorageBuildPhase};
+
+    let temp = tempfile::tempdir()?;
+    let storage = database(temp.path(), 2, 3)?;
+    let writer = FrankenStorage::open(&temp.path().join("archive.db"))?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let before = temp.path().join("before");
+    let inputs = engine::packet_embedding_inputs_from_storage(&storage)?;
+    drop(indexer.build_and_save_index(indexer.embed_messages(&inputs)?, &before)?);
+    let mut changed = false;
+    let streaming = temp.path().join("streaming");
+    let outcome = indexer.build_and_save_index_from_storage_with_progress(
+        &storage,
+        &streaming,
+        |phase, _, _| {
+            if phase == SemanticStorageBuildPhase::Replay && !changed {
+                writer.raw().execute(
+                    "INSERT INTO messages(conversation_id, idx, role, content, created_at) VALUES (2, 99, 'user', 'later concurrent archive evidence', 1700000000100)",
+                ).expect("concurrent canonical append");
+                changed = true;
+            }
+        },
+    )?;
+    assert!(changed);
+    assert_eq!(outcome.embedded_docs, 6);
+    assert_eq!(outcome.last_message_id, Some(6));
+    assert_eq!(storage.max_message_id()?, Some(7));
+    assert_eq!(
+        stored_semantic_rows(&streaming, &indexer)?,
+        stored_semantic_rows(&before, &indexer)?
+    );
+    assert!(!storage.raw().as_async().in_transaction());
+    writer.close()?;
+    storage.close()?;
+    Ok(())
+}
+
+#[test]
+fn direct_semantic_streaming_all_noise_replaces_old_vectors_and_reports_cursor() -> Result<()> {
+    use crate::indexer::semantic::{EmbeddingInput, SemanticIndexer};
+
+    let temp = tempfile::tempdir()?;
+    let storage = database(temp.path(), 1, 2)?;
+    storage.raw().execute("UPDATE messages SET content = ''")?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    drop(indexer.build_and_save_index(
+        indexer.embed_messages(&[EmbeddingInput::new(
+            99,
+            "retired semantic compiler evidence",
+        )])?,
+        temp.path(),
+    )?);
+    let outcome = indexer.build_and_save_index_from_storage_with_progress(
+        &storage,
+        temp.path(),
+        |_, _, _| {},
+    )?;
+    assert_eq!(outcome.embedded_docs, 0);
+    assert_eq!(outcome.last_message_id, Some(2));
+    assert!(stored_semantic_rows(temp.path(), &indexer)?.is_empty());
+    storage.close()?;
+    Ok(())
+}
+
 #[test]
 #[cfg(target_os = "linux")]
 #[ignore = "subprocess measurement worker; invoked explicitly by paired memory test"]

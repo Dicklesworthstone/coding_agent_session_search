@@ -218,6 +218,123 @@ fn one_shot_semantic_index_embeds_only_the_delta_when_watermark_trails() -> Resu
 }
 
 #[test]
+fn empty_semantic_rebuild_resets_watermark_and_indexes_new_lower_ids()
+-> Result<(), Box<dyn std::error::Error>> {
+    use coding_agent_search::indexer::semantic::{EmbeddingInput, SemanticIndexer};
+    use coding_agent_search::search::semantic_manifest::SemanticManifest;
+    use coding_agent_search::search::vector_index::{
+        VectorIndex, parse_semantic_doc_id, vector_index_path,
+    };
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let home = tempfile::tempdir()?;
+    let home_path = home.path().to_path_buf();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(home_path.join(".env"))?;
+    let fixture = Fixture {
+        _home: home,
+        data_dir: home_path.join("cass-data"),
+        codex_home: home_path.join(".codex"),
+        home: home_path,
+    };
+    std::fs::create_dir_all(&fixture.data_dir)?;
+    std::fs::create_dir_all(fixture.codex_home.join("sessions"))?;
+    let db_path = fixture.data_dir.join("agent_search.db");
+    let storage = FrankenStorage::open(&db_path)?;
+    storage.set_last_embedded_message_id(100_000)?;
+    assert_eq!(storage.max_message_id()?, None);
+    storage.close()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    drop(indexer.build_and_save_index(
+        indexer.embed_messages(&[EmbeddingInput::new(99_999, "retired compiler evidence")])?,
+        &fixture.data_dir,
+    )?);
+    let fsvi_path = vector_index_path(&fixture.data_dir, indexer.embedder_id());
+
+    let run_index = |label: &str, full: bool| {
+        let mut args = vec![
+            "index",
+            "--semantic",
+            "--embedder",
+            "hash",
+            "--no-progress-events",
+        ];
+        if full {
+            args.push("--full");
+        }
+        let mut command = cass(&fixture, &args, &[]);
+        command.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command
+            .env("HOME", &fixture.home)
+            .env("USERPROFILE", &fixture.home)
+            .env("XDG_CONFIG_HOME", fixture.home.join("xdg-config"))
+            .env("XDG_DATA_HOME", fixture.home.join("xdg-data"))
+            .env("XDG_CACHE_HOME", fixture.home.join("xdg-cache"))
+            .env("CLAUDE_CONFIG_DIR", fixture.home.join(".claude"))
+            .env("CODEX_HOME", &fixture.codex_home)
+            .env("TUI_HEADLESS", "1")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_RESPONSIVENESS_DISABLE", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .env("NO_COLOR", "1");
+        let output =
+            spawn_with_timeout_or_diag(command, label, Some(&fixture.data_dir), INDEX_TIMEOUT);
+        assert!(
+            output.status.success(),
+            "{label}: stdout: {}\nstderr: {}",
+            text(&output.stdout),
+            text(&output.stderr)
+        );
+    };
+
+    run_index("empty_semantic_reset", true);
+    let storage = FrankenStorage::open_readonly(&db_path)?;
+    assert_eq!(storage.max_message_id()?, None);
+    assert_eq!(storage.get_last_embedded_message_id()?, Some(0));
+    storage.close()?;
+    let empty = VectorIndex::open_read_only(&fsvi_path)?;
+    assert_eq!(empty.record_count(), 0);
+    drop(empty);
+    let manifest = SemanticManifest::load(&fixture.data_dir)?.ok_or("missing empty manifest")?;
+    assert_eq!(
+        manifest
+            .fast_tier
+            .ok_or("missing empty fast tier")?
+            .doc_count,
+        0
+    );
+
+    util::seed_codex_session(
+        &fixture.codex_home,
+        "rollout-2026-04-23T10-00-00-after-empty.jsonl",
+        SECOND_KEYWORD,
+        false,
+    );
+    run_index("semantic_reingest_after_empty", false);
+    let storage = FrankenStorage::open_readonly(&db_path)?;
+    let max_id = storage
+        .max_message_id()?
+        .ok_or("missing new canonical messages")?;
+    assert!((1..100_000).contains(&max_id));
+    assert_eq!(storage.get_last_embedded_message_id()?, Some(max_id));
+    storage.close()?;
+    let rebuilt = VectorIndex::open_read_only(&fsvi_path)?;
+    assert!(rebuilt.record_count() > 0);
+    for row in 0..rebuilt.record_count() {
+        let id = parse_semantic_doc_id(rebuilt.doc_id_at(row)?).ok_or("invalid semantic ID")?;
+        assert!(id.message_id > 0 && id.message_id <= u64::try_from(max_id)?);
+    }
+    Ok(())
+}
+
+#[test]
 fn gh470_covered_watermark_rebuilds_old_prefix_and_reuses_current_passages()
 -> Result<(), Box<dyn std::error::Error>> {
     use coding_agent_search::indexer::semantic::HASH_VECTOR_SPACE_REVISION;

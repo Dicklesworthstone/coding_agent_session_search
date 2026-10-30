@@ -4,6 +4,7 @@
 
 use super::*;
 use anyhow::{Context, ensure};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -17,6 +18,23 @@ mod append;
 mod hnsw;
 mod rebuild;
 mod reconcile;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticStorageBuildPhase {
+    Replay,
+    Embedding,
+    VectorPublish,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SemanticStorageBuildOutcome {
+    pub input_passages: usize,
+    pub embedded_docs: usize,
+    pub last_message_id: Option<i64>,
+}
+
+const DIRECT_EMBED_MAX_INPUTS: usize = 512;
+const DIRECT_EMBED_MAX_INPUT_BYTES: usize = 1024 * 1024;
 
 impl SemanticIndexer {
     pub fn batch_size(&self) -> usize {
@@ -70,6 +88,7 @@ impl SemanticIndexer {
         self.publish_full_rebuild(embedded_messages, data_dir, None::<fn(usize)>)
     }
 
+    #[cfg(test)]
     pub(crate) fn build_and_save_index_with_progress<I, F>(
         &self,
         embedded_messages: I,
@@ -98,6 +117,122 @@ impl SemanticIndexer {
         rebuild::run(self, embedded_messages, data_dir, on_progress, || {
             self.inner.check_external_cancelled()
         })
+    }
+
+    pub(crate) fn build_and_save_index_with_producer<F, P>(
+        &self,
+        data_dir: &Path,
+        produce: F,
+        on_progress: P,
+    ) -> Result<VectorIndex>
+    where
+        F: FnOnce(&mut dyn FnMut(EmbeddedMessage) -> Result<()>) -> Result<()>,
+        P: FnMut(usize),
+    {
+        rebuild::run_with_producer(self, data_dir, produce, on_progress, || {
+            self.inner.check_external_cancelled()
+        })
+    }
+
+    /// Replay and embed bounded text batches directly into an unpublished
+    /// candidate. Only the native writer retains corpus-sized vectors: CASS
+    /// keeps no second complete text or embedding collection. Native writer,
+    /// model, and database allocations remain outside this batch bound.
+    pub(crate) fn build_and_save_index_from_storage_with_progress<F>(
+        &self,
+        storage: &FrankenStorage,
+        data_dir: &Path,
+        on_progress: F,
+    ) -> Result<SemanticStorageBuildOutcome>
+    where
+        F: FnMut(SemanticStorageBuildPhase, usize, usize),
+    {
+        let on_progress = RefCell::new(on_progress);
+        let max_inputs = self
+            .batch_size()
+            .saturating_mul(4)
+            .clamp(1, DIRECT_EMBED_MAX_INPUTS);
+        let mut outcome = SemanticStorageBuildOutcome::default();
+        let published = self.build_and_save_index_with_producer(
+            data_dir,
+            |emit| {
+                let mut pending = Vec::with_capacity(max_inputs);
+                let mut pending_bytes = 0usize;
+                outcome.last_message_id =
+                    super::replay::visit_packet_embedding_inputs_from_storage_with_progress(
+                        storage,
+                        |input| {
+                            self.inner.check_external_cancelled()?;
+                            outcome.input_passages = outcome.input_passages.saturating_add(1);
+                            if crate::search::canonicalize::is_hard_message_noise(
+                                crate::indexer::semantic_role_name(input.role),
+                                &input.content,
+                            ) {
+                                return Ok(());
+                            }
+                            let bytes = input.content.len();
+                            if !pending.is_empty()
+                                && pending_bytes.saturating_add(bytes)
+                                    > DIRECT_EMBED_MAX_INPUT_BYTES
+                            {
+                                outcome.embedded_docs = outcome.embedded_docs.saturating_add(
+                                    write_storage_embedding_batch(
+                                        self,
+                                        &mut pending,
+                                        emit,
+                                        &on_progress,
+                                    )?,
+                                );
+                                pending_bytes = 0;
+                            }
+                            pending_bytes = pending_bytes.saturating_add(bytes);
+                            pending.push(input);
+                            if pending.len() >= max_inputs
+                                || pending_bytes >= DIRECT_EMBED_MAX_INPUT_BYTES
+                            {
+                                outcome.embedded_docs = outcome.embedded_docs.saturating_add(
+                                    write_storage_embedding_batch(
+                                        self,
+                                        &mut pending,
+                                        emit,
+                                        &on_progress,
+                                    )?,
+                                );
+                                pending_bytes = 0;
+                            }
+                            Ok(())
+                        },
+                        |current, total| {
+                            (on_progress.borrow_mut())(
+                                SemanticStorageBuildPhase::Replay,
+                                current,
+                                total,
+                            );
+                        },
+                    )?;
+                outcome.embedded_docs =
+                    outcome
+                        .embedded_docs
+                        .saturating_add(write_storage_embedding_batch(
+                            self,
+                            &mut pending,
+                            emit,
+                            &on_progress,
+                        )?);
+                self.inner.check_external_cancelled()?;
+                (on_progress.borrow_mut())(
+                    SemanticStorageBuildPhase::VectorPublish,
+                    0,
+                    outcome.embedded_docs,
+                );
+                Ok(())
+            },
+            |_| {},
+        )?;
+        // Close the installed reader before the caller updates manifest or
+        // watermark state, including on Windows. No callbacks run after commit.
+        drop(published);
+        Ok(outcome)
     }
 
     pub fn build_and_save_index_shards<I>(
@@ -261,6 +396,33 @@ impl SemanticIndexer {
         self.inner
             .completed_backfill_fingerprint(storage, data_dir, manifest, tier, model_revision)
     }
+}
+
+fn write_storage_embedding_batch<F>(
+    indexer: &SemanticIndexer,
+    pending: &mut Vec<EmbeddingInput>,
+    emit: &mut dyn FnMut(EmbeddedMessage) -> Result<()>,
+    on_progress: &RefCell<F>,
+) -> Result<usize>
+where
+    F: FnMut(SemanticStorageBuildPhase, usize, usize),
+{
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    indexer.inner.check_external_cancelled()?;
+    (on_progress.borrow_mut())(SemanticStorageBuildPhase::Embedding, 0, pending.len());
+    let embedded = indexer.embed_messages_with_progress(pending, |current, total| {
+        (on_progress.borrow_mut())(SemanticStorageBuildPhase::Embedding, current, total);
+    })?;
+    // Release passage text before the native writer copies this batch's vectors.
+    pending.clear();
+    let count = embedded.len();
+    for message in embedded {
+        indexer.inner.check_external_cancelled()?;
+        emit(message)?;
+    }
+    Ok(count)
 }
 
 fn refuse_publication_sidecars(destination: &Path, canonical_reconciliation: bool) -> Result<()> {

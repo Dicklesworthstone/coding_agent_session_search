@@ -25,7 +25,9 @@ mod pages;
 mod progress;
 mod selected;
 
+#[cfg(test)]
 pub(crate) use progress::packet_embedding_inputs_from_storage_with_progress;
+pub(super) use progress::visit_packet_embedding_inputs_from_storage_with_progress;
 pub(crate) use selected::{
     packet_embedding_inputs_from_storage_for_message_ids,
     packet_embedding_inputs_from_storage_since,

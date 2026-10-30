@@ -291,3 +291,212 @@ fn initial_rebuild_keeps_work_private_and_releases_scratch_on_success_or_unwind(
     }
     Ok(())
 }
+
+#[test]
+fn fallible_producer_keeps_successful_batches_private_until_completion() -> Result<()> {
+    let indexer = SemanticIndexer::new("hash", None)?;
+    for existing in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let data = temp.path();
+        let live = vector_index_path(data, indexer.embedder_id());
+        let rows = indexer.embed_messages(&[
+            EmbeddingInput::new(11, "durable compiler evidence"),
+            EmbeddingInput::new(12, "streamed network evidence"),
+        ])?;
+        let before = if existing {
+            drop(indexer.build_and_save_index(rows.clone(), data)?);
+            Some(fs::read(&live)?)
+        } else {
+            None
+        };
+        let mut progress = Vec::new();
+        let error = run_with_producer(
+            &indexer,
+            data,
+            |emit| {
+                for row in rows {
+                    emit(row)?;
+                    assert_eq!(live.exists(), existing);
+                    if let Some(before) = &before {
+                        assert_eq!(fs::read(&live)?, *before);
+                    }
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "canonical replay failed after two complete batches",
+                )
+                .into())
+            },
+            |accepted| progress.push(accepted),
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+            Some(std::io::ErrorKind::UnexpectedEof)
+        );
+        assert_eq!(progress, vec![1, 2]);
+        assert_eq!(live.exists(), existing);
+        if let Some(before) = before {
+            assert_eq!(fs::read(&live)?, before);
+            assert_eq!(VectorIndex::open_read_only(&live)?.record_count(), 2);
+        }
+        assert!(scratch_paths(data)?.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn streamed_publication_matches_an_independent_iterator_build() -> Result<()> {
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let rows = indexer.embed_messages(&[
+        EmbeddingInput::new(11, "durable compiler evidence"),
+        EmbeddingInput::new(12, "streamed network evidence"),
+        EmbeddingInput::new(13, "atomic publication checkpoint"),
+    ])?;
+    let reference = tempfile::tempdir()?;
+    let expected = indexer.build_and_save_index(rows.clone(), reference.path())?;
+    for existing in [false, true] {
+        let temp = tempfile::tempdir()?;
+        if existing {
+            let old = indexer.embed_messages(&[EmbeddingInput::new(1, "old generation")])?;
+            drop(indexer.build_and_save_index(old, temp.path())?);
+        }
+        let live = vector_index_path(temp.path(), indexer.embedder_id());
+        let previous = if existing {
+            Some(VectorIndex::peek_compaction_gen(&live)?)
+        } else {
+            None
+        };
+        let mut progress = Vec::new();
+        let published = run_with_producer(
+            &indexer,
+            temp.path(),
+            |emit| {
+                for row in rows.iter().cloned() {
+                    emit(row)?;
+                }
+                Ok(())
+            },
+            |accepted| progress.push(accepted),
+            || Ok(()),
+        )?;
+        assert_eq!(progress, vec![1, 2, 3]);
+        assert_eq!(published.record_count(), rows.len());
+        assert_eq!(published.wal_record_count(), 0);
+        if let Some(previous) = previous {
+            assert_eq!(
+                VectorIndex::peek_compaction_gen(&live)?,
+                next_generation(previous)
+            );
+        }
+        drop(published);
+        let fresh = VectorIndex::open_read_only(&live)?;
+        for query in &rows {
+            assert_eq!(
+                fresh.search_top_k(&query.embedding, rows.len(), None)?,
+                expected.search_top_k(&query.embedding, rows.len(), None)?
+            );
+        }
+        assert!(scratch_paths(temp.path())?.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn producer_cannot_turn_a_rejected_record_into_a_successful_prefix() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path();
+    let (indexer, rows, _, live) = fixture(data)?;
+    let before = fs::read(&live)?;
+    let mut invalid = rows[1].clone();
+    invalid.embedding.pop();
+    let mut progress = Vec::new();
+    let error = run_with_producer(
+        &indexer,
+        data,
+        |emit| {
+            emit(rows[0].clone())?;
+            assert!(emit(invalid).is_err());
+            assert!(emit(rows[2].clone()).is_err());
+            Ok(())
+        },
+        |accepted| progress.push(accepted),
+        || Ok(()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("ignored a rejected record"));
+    assert_eq!(progress, vec![1]);
+    assert_eq!(fs::read(&live)?, before);
+    assert!(scratch_paths(data)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn cancellation_after_the_last_produced_batch_preserves_the_old_generation() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path();
+    let (indexer, rows, _, live) = fixture(data)?;
+    let before = fs::read(&live)?;
+    let cancelled = Cell::new(false);
+    let error = run_with_producer(
+        &indexer,
+        data,
+        |emit| {
+            for row in rows {
+                emit(row)?;
+            }
+            cancelled.set(true);
+            Ok(())
+        },
+        |_| {},
+        || {
+            if cancelled.get() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "cancelled after canonical replay",
+                )
+                .into())
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+        Some(std::io::ErrorKind::Interrupted)
+    );
+    assert_eq!(fs::read(&live)?, before);
+    assert!(scratch_paths(data)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn complete_empty_producer_replaces_stale_vectors_with_an_empty_generation() -> Result<()> {
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let query = HashEmbedder::default().embed_sync("old compiler evidence")?;
+    for existing in [false, true] {
+        let temp = tempfile::tempdir()?;
+        if existing {
+            let old = indexer.embed_messages(&[EmbeddingInput::new(1, "old compiler evidence")])?;
+            drop(indexer.build_and_save_index(old, temp.path())?);
+        }
+        let published = run_with_producer(
+            &indexer,
+            temp.path(),
+            |_| Ok(()),
+            |_| panic!("empty producer has no accepted records"),
+            || Ok(()),
+        )?;
+        assert_eq!(published.record_count(), 0);
+        assert!(published.search_top_k(&query, 1, None)?.is_empty());
+        let live = published.path().to_path_buf();
+        drop(published);
+        let fresh = VectorIndex::open_read_only(&live)?;
+        assert_eq!(fresh.record_count(), 0);
+        assert!(fresh.search_top_k(&query, 1, None)?.is_empty());
+        assert!(scratch_paths(temp.path())?.is_empty());
+    }
+    Ok(())
+}
