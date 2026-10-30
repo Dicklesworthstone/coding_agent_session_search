@@ -144,6 +144,18 @@ fn raw_mirror_io<T>(
     perform: impl FnOnce() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
     raw_mirror_checkpoint()?;
+    raw_mirror_tracked_io(operation, path, perform)
+}
+
+/// Attribute an operation without introducing a cancellation boundary. In
+/// particular, publication's durability steps and staging cleanup must still
+/// finish when cancellation arrives after a link/rename. Cancellable work uses
+/// `raw_mirror_io`; both paths report progress only after the operation returns.
+fn raw_mirror_tracked_io<T>(
+    operation: &'static str,
+    path: &Path,
+    perform: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
     let observed = RAW_MIRROR_IO_OBSERVER.with(|observer| observer.borrow().is_some());
     // The before-operation trace is useful even outside an index run. No
     // timer manufactures liveness while a syscall or lock is still blocked.
@@ -1687,7 +1699,10 @@ fn acquire_raw_mirror_mutation_lock(root: &Path) -> Result<RawMirrorFileLockGuar
     // bet45: first use of a mirror may acquire the mutation lock before the
     // root has ever been created; the root was just verified symlink-free
     // (or nonexistent) above, so creating it here is safe.
-    fs::create_dir_all(root).with_context(|| {
+    raw_mirror_tracked_io("create_mutation_lock_parent", root, || {
+        fs::create_dir_all(root)
+    })
+    .with_context(|| {
         format!(
             "create raw mirror root for mutation lock {}",
             root.display()
@@ -1717,12 +1732,15 @@ fn acquire_raw_mirror_mutation_lock(root: &Path) -> Result<RawMirrorFileLockGuar
     })
     .with_context(|| format!("acquire raw mirror mutation lock {}", lock_path.display()))?;
 
-    let opened_metadata = file.metadata().with_context(|| {
-        format!(
-            "stat opened raw mirror mutation lock {}",
-            lock_path.display()
-        )
-    })?;
+    let opened_metadata =
+        raw_mirror_tracked_io("fstat_mutation_lock", &lock_path, || file.metadata()).with_context(
+            || {
+                format!(
+                    "stat opened raw mirror mutation lock {}",
+                    lock_path.display()
+                )
+            },
+        )?;
     let path_metadata = raw_mirror_symlink_metadata(&lock_path)
         .with_context(|| format!("restat raw mirror mutation lock {}", lock_path.display()))?;
     if path_metadata.file_type().is_symlink()
@@ -1808,11 +1826,18 @@ fn configure_lock_open_options(options: &mut OpenOptions) {
 fn set_private_open_file_permissions(file: &File, path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    if file.metadata()?.permissions().mode() & 0o7777 == 0o600 {
+    if raw_mirror_tracked_io("fstat_permissions", path, || file.metadata())?
+        .permissions()
+        .mode()
+        & 0o7777
+        == 0o600
+    {
         return Ok(());
     }
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("set raw mirror lock permissions {}", path.display()))
+    raw_mirror_tracked_io("set_file_permissions", path, || {
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+    })
+    .with_context(|| format!("set raw mirror lock permissions {}", path.display()))
 }
 
 #[cfg(not(unix))]
@@ -2075,8 +2100,7 @@ fn content_addressed_blob_is_verified(root: &Path, reference: &RawMirrorChunkRef
 fn open_stable_source_file(source_path: &Path, expected_metadata: &fs::Metadata) -> Result<File> {
     let source = raw_mirror_io("open_source", source_path, || File::open(source_path))
         .with_context(|| format!("open raw mirror source {}", source_path.display()))?;
-    let opened_metadata = source
-        .metadata()
+    let opened_metadata = raw_mirror_tracked_io("fstat_source", source_path, || source.metadata())
         .with_context(|| format!("stat opened raw mirror source {}", source_path.display()))?;
     if !same_source_identity(expected_metadata, &opened_metadata) {
         return Err(anyhow!(
@@ -2213,7 +2237,9 @@ fn publish_content_addressed_temp(
         }
     }
 
-    match fs::hard_link(temp_path, final_path) {
+    match raw_mirror_tracked_io("publish_blob", final_path, || {
+        fs::hard_link(temp_path, final_path)
+    }) {
         Ok(()) => {
             sync_file(final_path)?;
             sync_parent(final_path)?;
@@ -2245,22 +2271,37 @@ fn publish_manifest_bytes_create_new(
             .parent()
             .ok_or_else(|| anyhow!("raw mirror manifest path has no parent"))?,
     )?;
-    if manifest_path.exists() {
-        verify_existing_manifest(root, manifest_path, blob_blake3)?;
-        return Ok(true);
+    match raw_mirror_symlink_metadata(manifest_path) {
+        Ok(_) => {
+            verify_existing_manifest(root, manifest_path, blob_blake3)?;
+            return Ok(true);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "inspect raw mirror manifest {} before publication",
+                    manifest_path.display()
+                )
+            });
+        }
     }
 
     let temp_dir = unique_capture_temp_dir(root);
     ensure_private_dir_descendant(root, &temp_dir)?;
     let temp_path = unique_temp_path(&temp_dir, "manifest");
     let mut temp = private_create_new_file(&temp_path)?;
-    temp.write_all(manifest_bytes)
-        .with_context(|| format!("write raw mirror manifest temp {}", temp_path.display()))?;
-    sync_open_file_if_required(&temp, || {
+    raw_mirror_tracked_io("write_manifest", &temp_path, || {
+        temp.write_all(manifest_bytes)
+    })
+    .with_context(|| format!("write raw mirror manifest temp {}", temp_path.display()))?;
+    sync_open_file_if_required(&temp, &temp_path, || {
         format!("sync raw mirror manifest temp {}", temp_path.display())
     })?;
 
-    match fs::hard_link(&temp_path, manifest_path) {
+    match raw_mirror_tracked_io("publish_manifest", manifest_path, || {
+        fs::hard_link(&temp_path, manifest_path)
+    }) {
         Ok(()) => {
             sync_file(manifest_path)?;
             sync_parent(manifest_path)?;
@@ -2368,13 +2409,16 @@ fn replace_raw_mirror_bytes(
         ensure_private_dir_descendant(root, &temp_dir)?;
         let temp_path = unique_temp_path(&temp_dir, "manifest-update");
         let mut temp = private_create_new_file(&temp_path)?;
-        temp.write_all(manifest_bytes).with_context(|| {
+        raw_mirror_tracked_io("write_manifest", &temp_path, || {
+            temp.write_all(manifest_bytes)
+        })
+        .with_context(|| {
             format!(
                 "write raw mirror manifest update temp {}",
                 temp_path.display()
             )
         })?;
-        sync_open_file_if_required(&temp, || {
+        sync_open_file_if_required(&temp, &temp_path, || {
             format!(
                 "sync raw mirror manifest update temp {}",
                 temp_path.display()
@@ -2382,7 +2426,10 @@ fn replace_raw_mirror_bytes(
         })?;
         drop(temp);
 
-        fs::rename(&temp_path, manifest_path).with_context(|| {
+        raw_mirror_tracked_io("replace_manifest", manifest_path, || {
+            fs::rename(&temp_path, manifest_path)
+        })
+        .with_context(|| {
             format!(
                 "replace raw mirror manifest {} from {}",
                 manifest_path.display(),
@@ -2675,7 +2722,9 @@ fn persist_raw_mirror_blob_cache(root: &Path, entry: &CachedRawMirrorBlobRecord)
     let temporary = unique_temp_path(parent, "cache");
     let mut file = private_create_new_file(&temporary)?;
     file.write_all(&bytes)?;
-    sync_open_file_if_required(&file, || "sync raw mirror capture cache".to_string())?;
+    sync_open_file_if_required(&file, &temporary, || {
+        "sync raw mirror capture cache".to_string()
+    })?;
     drop(file);
     fs::rename(&temporary, &path)?;
     sync_parent(&path)?;
@@ -3386,8 +3435,7 @@ fn file_blake3(path: &Path) -> Result<String> {
     configure_lock_open_options(&mut options);
     let mut file = raw_mirror_io("open_blob", path, || options.open(path))
         .with_context(|| format!("open {}", path.display()))?;
-    let opened_metadata = file
-        .metadata()
+    let opened_metadata = raw_mirror_tracked_io("fstat_blob", path, || file.metadata())
         .with_context(|| format!("stat opened raw mirror file {}", path.display()))?;
     let current_path_metadata = raw_mirror_symlink_metadata(path)
         .with_context(|| format!("restat raw mirror file {}", path.display()))?;
@@ -3482,8 +3530,7 @@ fn private_create_new_file(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     set_private_create_file_mode(&mut options);
-    let file = options
-        .open(path)
+    let file = raw_mirror_tracked_io("create_file", path, || options.open(path))
         .with_context(|| format!("create raw mirror file {}", path.display()))?;
     Ok(file)
 }
@@ -3511,11 +3558,15 @@ fn set_private_create_file_mode(options: &mut OpenOptions) {
 #[cfg(not(unix))]
 fn set_private_create_file_mode(_options: &mut OpenOptions) {}
 
-fn sync_open_file_if_required(message_file: &File, context: impl FnOnce() -> String) -> Result<()> {
+fn sync_open_file_if_required(
+    message_file: &File,
+    path: &Path,
+    context: impl FnOnce() -> String,
+) -> Result<()> {
     if !raw_mirror_fsync_enabled() {
         return Ok(());
     }
-    message_file.sync_all().with_context(context)
+    raw_mirror_tracked_io("sync_file", path, || message_file.sync_all()).with_context(context)
 }
 
 fn sync_file(path: &Path) -> Result<()> {
@@ -3526,9 +3577,9 @@ fn sync_file(path: &Path) -> Result<()> {
     options.read(true);
     #[cfg(windows)]
     options.write(true);
-    options
-        .open(path)
-        .and_then(|file| file.sync_all())
+    let file = raw_mirror_tracked_io("open_file_for_sync", path, || options.open(path))
+        .with_context(|| format!("open raw mirror file {} for sync", path.display()))?;
+    raw_mirror_tracked_io("sync_file", path, || file.sync_all())
         .with_context(|| format!("sync raw mirror file {}", path.display()))
 }
 
@@ -3544,8 +3595,9 @@ fn sync_parent_unconditionally(path: &Path) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    File::open(parent)
-        .and_then(|file| file.sync_all())
+    let directory = raw_mirror_tracked_io("open_parent_for_sync", parent, || File::open(parent))
+        .with_context(|| format!("open raw mirror parent {} for sync", parent.display()))?;
+    raw_mirror_tracked_io("sync_parent", parent, || directory.sync_all())
         .with_context(|| format!("sync raw mirror parent {}", parent.display()))
 }
 
@@ -3583,7 +3635,7 @@ fn unique_capture_temp_dir(root: &Path) -> PathBuf {
 }
 
 fn remove_temp_best_effort(path: &Path) {
-    if let Err(err) = fs::remove_file(path) {
+    if let Err(err) = raw_mirror_tracked_io("remove_temp_file", path, || fs::remove_file(path)) {
         tracing::debug!(
             path = %path.display(),
             error = %err,
@@ -3593,7 +3645,7 @@ fn remove_temp_best_effort(path: &Path) {
 }
 
 fn remove_empty_temp_dir_best_effort(path: &Path) {
-    if let Err(err) = fs::remove_dir(path) {
+    if let Err(err) = raw_mirror_tracked_io("remove_temp_dir", path, || fs::remove_dir(path)) {
         tracing::debug!(
             path = %path.display(),
             error = %err,
@@ -3629,8 +3681,10 @@ fn system_time_to_ns(time: SystemTime) -> Option<u128> {
 #[cfg(unix)]
 fn set_private_dir_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("set raw mirror dir permissions {}", path.display()))
+    raw_mirror_tracked_io("set_dir_permissions", path, || {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    })
+    .with_context(|| format!("set raw mirror dir permissions {}", path.display()))
 }
 
 #[cfg(not(unix))]
@@ -3641,6 +3695,200 @@ fn set_private_dir_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct RawMirrorTraceBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RawMirrorTraceBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn gh538_capture_and_link_publication_trace_real_operation_paths() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let data = temp.path().join("data");
+        let source = temp.path().join("session.jsonl");
+        let original = b"{\"message\":\"diagnose publication without losing recovery evidence\"}\n";
+        fs::write(&source, original)?;
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = RawMirrorTraceBuffer(Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        let completed = Arc::new(AtomicU64::new(0));
+        let progress = Arc::clone(&completed);
+        let record = tracing::subscriber::with_default(subscriber, || -> Result<_> {
+            let _observer = observe_raw_mirror_io(
+                Arc::new(move || {
+                    progress.fetch_add(1, Ordering::Relaxed);
+                }),
+                Arc::new(|| false),
+            );
+            let record = policy::capture_default(
+                RawMirrorCaptureInput {
+                    data_dir: &data,
+                    provider: "codex",
+                    source_id: "local",
+                    origin_kind: "local",
+                    origin_host: None,
+                    source_path: &source,
+                    db_links: &[],
+                },
+                policy::RawMirrorRetentionPolicy {
+                    max_bytes: 1024 * 1024,
+                    min_free_bytes: 0,
+                },
+            )?;
+            merge_manifest_db_links(
+                &data,
+                &record.manifest_relative_path,
+                &[RawMirrorDbLink {
+                    conversation_id: Some(538),
+                    message_count: Some(1),
+                    source_path: Some(source.display().to_string()),
+                    started_at_ms: None,
+                }],
+            )?;
+            // Exercise the actual directory flush without changing process-wide
+            // CASS_RAW_MIRROR_FSYNC or requiring any test-only filesystem path.
+            sync_parent_unconditionally(
+                &raw_mirror_root(&data).join(&record.manifest_relative_path),
+            )?;
+            Ok(record)
+        })?;
+        let log = String::from_utf8(bytes.lock().unwrap().clone())?;
+        let events = log
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let observed = |operation: &str, path: &Path| {
+            events.iter().any(|event| {
+                event["fields"]["operation"] == operation
+                    && event["fields"]["path"] == path.display().to_string()
+            })
+        };
+        let root = raw_mirror_root(&data);
+        let manifest = root.join(&record.manifest_relative_path);
+        assert!(observed("fstat_source", &source));
+        assert!(observed(
+            "fstat_mutation_lock",
+            &root.join(RAW_MIRROR_MUTATION_LOCK_FILE)
+        ));
+        assert!(observed(
+            "publish_blob",
+            &root.join(&record.blob_relative_path)
+        ));
+        assert!(observed("publish_manifest", &manifest));
+        assert!(observed("replace_manifest", &manifest));
+        assert!(observed(
+            "replace_manifest",
+            &root.join(".usage-generation")
+        ));
+        for operation in [
+            "create_file",
+            "write_manifest",
+            "remove_temp_file",
+            "remove_temp_dir",
+        ] {
+            assert!(
+                events.iter().any(|event| {
+                    event["fields"]["operation"] == operation
+                        && event["fields"]["path"]
+                            .as_str()
+                            .is_some_and(|path| Path::new(path).starts_with(root.join("tmp")))
+                }),
+                "missing staging trace for {operation}"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(observed("open_parent_for_sync", &root.join("manifests")));
+            assert!(observed("sync_parent", &root.join("manifests")));
+        }
+        assert!(completed.load(Ordering::Relaxed) > 0);
+        assert!(
+            raw_mirror_io_snapshot()
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| {
+                    !entry["path"]
+                        .as_str()
+                        .is_some_and(|path| Path::new(path).starts_with(&root))
+                })
+        );
+        assert_eq!(read_source_bytes(&data, &record.manifest_id)?, original);
+        assert_eq!(fs::read_dir(root.join("tmp"))?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn gh538_cancellation_does_not_skip_publication_cleanup_or_durability() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let staging = temp.path().join("staging");
+        fs::create_dir(&staging)?;
+        let path = staging.join("staged.raw");
+        fs::write(&path, b"a completed write still needs cleanup")?;
+        let completed = Arc::new(AtomicU64::new(0));
+        let progress = Arc::clone(&completed);
+        let _observer = observe_raw_mirror_io(
+            Arc::new(move || {
+                progress.fetch_add(1, Ordering::Relaxed);
+            }),
+            Arc::new(|| true),
+        );
+        assert_eq!(
+            raw_mirror_symlink_metadata(&path).unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert_eq!(completed.load(Ordering::Relaxed), 0);
+        sync_parent_unconditionally(&path)?;
+        #[cfg(not(windows))]
+        assert_eq!(
+            completed.load(Ordering::Relaxed),
+            2,
+            "the directory open and sync must still complete"
+        );
+        let before_cleanup = completed.load(Ordering::Relaxed);
+        remove_temp_best_effort(&path);
+        remove_empty_temp_dir_best_effort(&staging);
+        assert_eq!(completed.load(Ordering::Relaxed), before_cleanup + 2);
+        assert!(!path.try_exists()?);
+        assert!(!staging.try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gh538_dangling_manifest_symlink_is_refused_before_staging() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = ensure_raw_mirror_root(temp.path())?;
+        let manifests = root.join("manifests");
+        ensure_private_dir_descendant(&root, &manifests)?;
+        let manifest = manifests.join("pending.json");
+        let absent = temp.path().join("absent.json");
+        std::os::unix::fs::symlink(&absent, &manifest)?;
+        let error = publish_manifest_bytes_create_new(&root, &manifest, b"{}", &"a".repeat(64))
+            .expect_err("a dangling symlink is an existing unsafe manifest, not an absent path");
+        assert!(error.to_string().contains("symlink"), "{error:#}");
+        assert!(fs::symlink_metadata(&manifest)?.file_type().is_symlink());
+        assert!(!absent.try_exists()?);
+        let staging = root.join("tmp");
+        assert!(
+            !staging.try_exists()? || fs::read_dir(staging)?.count() == 0,
+            "refusing a symlink must not leak an unowned manifest staging file"
+        );
+        Ok(())
+    }
 
     #[test]
     fn gh538_blocked_io_names_its_path_without_fabricating_progress() {
@@ -3701,16 +3949,16 @@ mod tests {
             Arc::new(move || {
                 tick_completed.fetch_add(1, Ordering::Relaxed);
             }),
-            Arc::new(move || cancel_completed.load(Ordering::Relaxed) >= 4),
+            Arc::new(move || cancel_completed.load(Ordering::Relaxed) >= 5),
         );
-        // Metadata, open, identity restat and one 64 KiB read complete; the
+        // Metadata, open, fstat, identity restat and one 64 KiB read complete; the
         // next read is cancelled, so a large verification is interruptible.
         let error = file_blake3(&path).unwrap_err();
         assert_eq!(
             error.downcast_ref::<std::io::Error>().unwrap().kind(),
             std::io::ErrorKind::Interrupted
         );
-        assert_eq!(completed.load(Ordering::Relaxed), 4);
+        assert_eq!(completed.load(Ordering::Relaxed), 5);
         assert_eq!(fs::metadata(&path).unwrap().len(), 256 * 1024);
     }
 

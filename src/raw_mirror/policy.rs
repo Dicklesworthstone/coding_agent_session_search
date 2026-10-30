@@ -152,7 +152,9 @@ fn read_usage_generation(root: &Path) -> Result<u64> {
             );
             let mut file = open_stable_source_file(&path, &metadata)?;
             let mut bytes = [0_u8; 16];
-            raw_mirror_io("read_usage_generation", &path, || file.read_exact(&mut bytes))?;
+            raw_mirror_io("read_usage_generation", &path, || {
+                file.read_exact(&mut bytes)
+            })?;
             let (magic, value) = bytes.split_at(8);
             anyhow::ensure!(magic == b"CASSRMU1", "invalid raw-mirror usage generation");
             let mut value_bytes = [0_u8; 8];
@@ -287,7 +289,9 @@ pub(super) fn forget_measured_usage(root: &Path) {
 
 #[cfg(test)]
 fn measured_usage_walks(root: &Path) -> u64 {
-    measured_usage_cache().get(root).map_or(0, |entry| entry.walks)
+    measured_usage_cache()
+        .get(root)
+        .map_or(0, |entry| entry.walks)
 }
 
 struct Budget<'a> {
@@ -347,7 +351,9 @@ impl Staging {
     fn new(root: &Path) -> Result<Self> {
         ensure_private_dir_descendant(root, &root.join("tmp"))?;
         let directory = unique_capture_temp_dir(root);
-        raw_mirror_io("create_staging_dir", &directory, || fs::create_dir(&directory))?;
+        raw_mirror_io("create_staging_dir", &directory, || {
+            fs::create_dir(&directory)
+        })?;
         let staging = Self {
             directory,
             files: Vec::new(),
@@ -355,7 +361,9 @@ impl Staging {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&staging.directory, fs::Permissions::from_mode(0o700))?;
+            raw_mirror_tracked_io("set_staging_permissions", &staging.directory, || {
+                fs::set_permissions(&staging.directory, fs::Permissions::from_mode(0o700))
+            })?;
         }
         Ok(staging)
     }
@@ -366,7 +374,9 @@ impl Staging {
         let mut file = private_create_new_file(&path)?;
         self.files.push(path.clone());
         raw_mirror_io("write_staging", &path, || file.write_all(bytes))?;
-        sync_open_file_if_required(&file, || "sync bounded raw-mirror staging".to_string())?;
+        sync_open_file_if_required(&file, &path, || {
+            "sync bounded raw-mirror staging".to_string()
+        })?;
         Ok(path)
     }
 }
@@ -456,8 +466,7 @@ fn prepare_bounded(
     if source_file_changed_during_capture(
         metadata,
         &raw_mirror_io("fstat_source", input.source_path, || source.metadata())?,
-    )
-        || source_path_changed_identity_during_capture(input.source_path, metadata)
+    ) || source_path_changed_identity_during_capture(input.source_path, metadata)
     {
         anyhow::bail!("raw-mirror source changed during bounded capture; retry a stable snapshot");
     }
