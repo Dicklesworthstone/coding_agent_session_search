@@ -217,3 +217,194 @@ Receipts are `/tmp/cass-538-ubs-baseline.log`, `/tmp/cass-538-ubs-final.log`,
 `/tmp/cass-538-ubs-final-source-sha256.txt`, and
 `/tmp/cass-538-ubs-final-comparison.json`; review notes are in
 `/tmp/cass-538-ubs-baseline-comparison.md`.
+
+## Follow-up from `a93afc1` (2026-10-30)
+
+This follow-up starts from `a93afc1e85f069f606a64eea4ce810a30a0a3bc8` and
+preserves the corrections and historical evidence above. It addresses additional
+recovery and diagnostic defects found by reviewing the actual watch path. It
+does **not** establish that the original macOS `lstat` stall is resolved.
+
+### Additional correctness changes
+
+| Remaining defect | Correction and invariant |
+| --- | --- |
+| An otherwise successful callback consumed its event even when lexical publication or a transient NoMem failure retained replay debt. Nothing guaranteed a later event. | Return explicit retry roots with the reindex outcome and retain them in the existing cooldown queue, including scans held entirely by NoMem backoff. Permanent exclusions and quarantines alone do not create endless rescans. |
+| A process restart lost the in-memory pending queue after durable replay debt had been recorded. | Seed recovery once from durable debt, restricted to the currently configured connector, source ID, and intersecting root. Removed sources are not resurrected; malformed debt is reported rather than silently discarded. |
+| Cumulative `current`/`total` counters were being used to infer watch idleness. Failed attempts can leave `current < total` after recovery; completed counts can also precede blocked I/O. | An RAII scope marks only the owner's actual event/cooldown wait. The marker clears before callback work and on cancellation, disconnect, or unwind. The watchdog pauses during that real wait without changing work or activity counters, and re-arms for active phase-zero I/O even when `current == total`. |
+| The watchdog synchronously inspected the same filesystem it was diagnosing. A blocked diagnostic `stat` or `open` could delay the abort itself. | At most one separate filesystem probe is pending per watchdog. The watchdog only polls its receiver and never joins it. Every event gets a fresh in-memory `raw_mirror_io` snapshot. `filesystem_probe.status: "pending"` means unfinished diagnostics, not absent assets. Completed/buffered probes are retired on real progress or idle transitions; an unresolved worker is retained. |
+| Diagnostic reads trusted a prior metadata length, and the abort checkpoint checked database existence before starting its terminal deadline. | Bound actual diagnostic reads to 64 KiB plus one overflow-detection byte. Put the database existence probe inside the existing bounded checkpoint operation, retaining ownership and the existing deadline. A missing database remains a no-op. |
+| Several real capture/publication filesystem operations were missing from in-flight diagnostics. Instrumenting mandatory post-publication steps must preserve their non-cancellable cleanup/durability behavior. | Observe metadata/open/create, writes, link/rename publication, permissions, sync, and cleanup. Mandatory post-publication operations are observed without introducing cancellation boundaries. Activity advances after an operation returns, never while a syscall or lock acquisition is blocked. |
+| `Path::exists()` followed a dangling canonical-manifest symlink, so the refusal happened after staging and leaked a temporary file. | Use observed `symlink_metadata` and refuse the unsafe existing path before staging. The current regression fails with the specific staging-leak assertion on the pinned starting commit and passes on the corrected source. |
+
+The normal stall thresholds, terminal exit code 70, mutation and index leases,
+generation fence, conservative mirror accounting, source checks, and durable
+watermark/publication rules are preserved. These changes do not declare deferred
+work complete to quiet the watchdog.
+
+### Full application regressions
+
+`tests/watch_e2e.rs` now retains distinct stdout/stderr files for every watcher
+process, so a restart cannot truncate its predecessor's stall evidence and a
+full pipe cannot block the watcher. Its command helper accepts the existing
+`CARGO_BIN_EXE_cass` binary override through `util::cass_bin`.
+
+The existing live no-op/update/restart regression additionally preserves raw
+blob contents and mtimes, alongside manifests, source caches, staging metadata,
+and the generation fence. It exercises repeated real watch discovery beyond its
+configured abort window, successive appends, process interruption/restart, and
+preservation of older searchable results without duplicate hits.
+
+The additional live stall regression first waits for a resident native watcher.
+It then holds a real raw-mirror mutation lease, writes a real new source, and
+places an unpaired FIFO at a legacy diagnostic-only checkpoint pathname. It
+requires the exact `acquire_mutation_lock` path and increasing elapsed time,
+unchanged watermark/generation while work is incomplete, old results remaining
+searchable, competing-index exit 7, and watchdog exit 70 with the optional probe
+still pending. It releases the lease and restarts without rewriting the pending
+source, then checks recovered results and another append. Literal `--data-dir`
+path spelling is retained for macOS `/var` versus `/private/var` aliases.
+
+The storage-backed library regression also covers failure to write replay debt
+before canonical mutation, deferred publication, loss of the pending queue,
+storage reopen, recovery without a new source event, and preservation of
+unrelated results. Scope and permanent-exclusion tests constrain replay seeding.
+These application-level tests were reviewed and formatted, but **were not
+executed in this environment** because the application did not compile within
+the available resources.
+
+On a provisioned host, run the full gate and the live selection:
+
+```sh
+RUST_MIN_STACK=134217728 \
+  cargo test --locked --test watch_e2e gh538_live_watch -- --nocapture --test-threads=1
+
+GATE_BUILD_JOBS=1 scripts/gate.sh --local \
+  --lib-filter 'gh538 raw_mirror watch_spool watch_idle_wait watch_reindex watch_lexical reindex_paths_carries_only_new_packet_semantic_delta_messages watch_conversation_sort stall_diagnostics_tests' \
+  --integration 'watch_e2e:gh538,cli_index:gh439_slow_post_publish_fts_repair_is_not_aborted_while_it_heartbeats gh439_parked_post_publish_fts_repair_still_aborts_with_the_index_stalled_envelope'
+```
+
+### Executed supplemental regressions
+
+The source-faithful runner is now committed at
+[`scripts/tests/gh538/`](../../scripts/tests/gh538/README.md). It extracts selected
+production code, records input/range/output hashes, verifies the compiled test
+inventory and exact executed binary, and builds with `--locked` dependency
+subsets checked against the repository lockfile. No generated copy of production
+Rust is committed. Baseline and candidate have distinct crate identities, and
+the negative control always uses the pinned `a93afc1` object, never moving `HEAD`.
+
+```sh
+python3 scripts/tests/gh538/run.py --output-dir /tmp/cass-gh538-components
+```
+
+Use `--offline` with a populated cache. The README documents the pinned-toolchain
+directory override, reusable target directories, extraction-only verification,
+recorded environment, and all exclusions. Every invocation preserves its own
+timestamped report and logs; a compile error or a missing/skipped test cannot
+silently satisfy the runner.
+
+The final frozen-source run on Linux tmpfs passed **19/19 mirror tests and 32/32
+watchdog/diagnostic/idle tests**. The separate baseline invocation ran one
+regression and reproduced exactly the expected staging-leak assertion; this is
+a successful negative control, not a passing baseline test. The mirror suite
+retains the 20,816-file / 9,523-manifest / 11 GiB logical fixture and twelve
+append/no-op and refusal cycles. Sparse bytes and tmpfs are not physical 11 GiB
+disk or APFS performance measurements.
+
+The FIFO subprocess probe first proved that synchronous diagnostic collection
+really blocks, then killed and reaped that owned negative-control child. With
+the asynchronous production watchdog, the abort decision occurred at **3,009
+ms** and process exit **70** was observed at **3,060 ms**. The fresh raw-mirror
+snapshot identified the actual blocked FIFO operation/path with **3,014 ms**
+elapsed, while the diagnostic probe remained pending. Work and activity counters
+were unchanged. This used the supported three-second abort setting without
+weakening the production decision logic.
+
+An earlier run of the packaged suite failed twelve mirror tests when the overlay
+disk filled. That run remains a failure. The subsequent successful runs used
+real tmpfs fixtures and separate evidence directories; they do not erase the
+disk-exhaustion result. The final source, commands, counts, hashes, exclusions,
+and static-analysis summary are recorded in
+[`issue-538-followup-validation.json`](issue-538-followup-validation.json).
+
+This runner does **not** execute provider ingestion, canonical SQL, lexical
+publication/search, durable replay recovery, SQL cancellation/WAL checkpointing,
+or a complete CASS watcher. It projects the progress carrier only to remove the
+SQL cancellation relay and unused statistics fields, with that projection
+recorded explicitly. It neither substitutes SQLite nor calls the component
+result a full application pass.
+
+### Full validation remains red
+
+Two direct attempts to build the live-watch test, with one Cargo job and the
+pinned dependencies/toolchain, were killed while compiling `asupersync 0.5.0`
+under the shared 8 GiB cgroup limit. The second used the installed Cranelift
+backend for that dependency and still received SIGKILL. Neither reached the
+application test executable; no dependency source or version was substituted.
+
+The subsequent full gate used a wrapper that preserves compiler arguments but
+waits for headroom and refuses compilation below 750 MB available disk. It
+refused `asupersync` at approximately 731 MB free, and later phases had still less
+space. `fmt` passed; clippy, library build/tests, both integrations, binary,
+and goldens returned 101 without positive terminal test counts. The checkout
+also changed during that attempt, so source stability failed. This is a red
+attempt against an earlier snapshot, not a full gate for the final source.
+Final frozen-source formatting and whitespace checks passed separately.
+
+The gate's UBS invocation lacked the parser rule-pack and is not complete
+static-analysis evidence. A separate identical full-five-file comparison used
+pinned UBS v5.4.4, real ast-grep 0.45.3, the unchanged exclusions, and
+`--ci --fail-on-warning`. Both baseline and final candidate remain **strict exit
+1**:
+
+| Follow-up snapshot | Critical | Warnings | Info | Strict exit |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline `a93afc1` | 76 | 16,826 | 8,441 | 1 |
+| Final follow-up source | 78 | 17,010 | 8,473 | 1 |
+
+All six real parser invocations in each scan completed with exit 0. The mapped
+warning delta is 202 added and 18 removed; 197 additions are in tests. The
+validation receipt records source identities and parser invocation status.
+Added critical findings are deliberate live-test
+failure paths. Reviewed production findings concern owned retry-root copies and
+bounded diagnostic JSON object updates; that review does not turn a red scanner
+gate green. No rules, suppressions, thresholds, or required gates were weakened.
+
+### Native macOS qualification still required
+
+No native macOS host or the reporter's archive was available. The executed Linux
+FIFO probe establishes the selected diagnostic mechanism; the held-lock live
+watcher regression remains unexecuted. Neither establishes the original kernel
+`lstat` cause or its disappearance on APFS.
+
+Run the exact candidate binary with the reporter's original source roots,
+retention/cap settings, preflight settings, and watch interval. Keep the existing
+stall watchdog enabled and use the supported bounded trace command:
+
+```sh
+CASS_TRACE_FILTER=warn,coding_agent_search::raw_mirror=trace \
+  cass --trace-file cass-watch-538.jsonl index --watch --watch-interval 30 --json
+```
+
+Retain the version/commit, complete command and relevant `CASS_*` settings,
+stdout, stderr, exit code, timestamps, and trace artifact. If it stalls, capture
+the full structured stall event as well as the compact `index-stalled` envelope.
+The event's `diagnostics.raw_mirror_io` supplies the operation/path/elapsed time;
+`diagnostics.filesystem_probe.status` states whether optional filesystem context
+finished. A pending probe is not evidence that the files are absent. A process
+sample taken during the same interval can then be correlated with the named
+operation rather than guessing a pathname from the old stripped stack.
+
+Qualification should include repeated quiet scans spanning several of the
+original approximately 300-second windows, new sources and successive appends,
+interruption/restart, unchanged archive captures during no-ops, and preservation
+of known old and new searchable results. Record durations and counts rather than
+assuming that one successful startup run qualifies a resident watcher.
+
+Two narrower boundaries also remain: this change fixes the demonstrated dangling
+symlink staging leak, not every later write/fsync/link/rename error-cleanup path;
+and replay recovery requires debt to have been established. A historical local
+import with preserved old mtime, a lost event, and termination before discovery
+has recorded debt is not covered by these tests. The original issue must not be
+called resolved on the strength of the component receipts alone.

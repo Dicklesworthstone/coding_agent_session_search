@@ -1,0 +1,792 @@
+{
+  "format": 1,
+  "issue": "https://github.com/Dicklesworthstone/coding_agent_session_search/issues/538",
+  "date": "2026-10-30",
+  "baseline_revision": "a93afc1e85f069f606a64eea4ce810a30a0a3bc8",
+  "source_commits": [
+    "5b695ca42b899e02b8bbc7ffd6f353adca0547f3",
+    "01d9bdc90ff323c1b1f823504693cde4857cc13a"
+  ],
+  "qualification": "Supplemental component validation only; full Rust gate red; live application and native macOS not qualified.",
+  "source_identity": {
+    "src/indexer/mod.rs": {
+      "sha256": "fae991e4a9d2a805bdbad141bf67f055e18e980fb81db55a91ce4111bb23e9f5",
+      "git_blob_sha": "bdfbd9baae95d89689ced876aee4641fd6459dd3"
+    },
+    "src/lib.rs": {
+      "sha256": "efde5682f939b0f3201bd185e9cb1e8a7955cd57cd4c7285c9f556d24f47a992",
+      "git_blob_sha": "7140dff5f673d6839f3b222586e6f2a8458faf01"
+    },
+    "src/raw_mirror/policy.rs": {
+      "sha256": "898597ac30ce76b06a306d5397a4743e217eabd46abfc3b0faebe6918457970b",
+      "git_blob_sha": "caf2798eb75ee5be49178e157ef961b8c69616ac"
+    },
+    "src/raw_mirror/store.rs": {
+      "sha256": "cb26d2463733073e9c1b23c025d84d57176f9ebb27029eb56bedd0f90b060e26",
+      "git_blob_sha": "107d08d215ef70e1beda1206e207a94b0920a533"
+    },
+    "tests/watch_e2e.rs": {
+      "sha256": "a2cd32c455c7cd78c9c0a00020792e72dcaccd54221fa2e46d1295050eab886a",
+      "git_blob_sha": "08236dacf8fcb68a9b374fbbf5d5d1ddb65695b2"
+    },
+    "scripts/tests/gh538/README.md": {
+      "sha256": "41700e50b6688d06143e057e5fcb409a438d9e263009d47c33b65d317e0e5f49",
+      "git_blob_sha": "4914a28e420c52abb53b63eee181245cf7da1da6"
+    },
+    "scripts/tests/gh538/extract.py": {
+      "sha256": "05ea5d73aaa758f42eecbede6c5ead70c1d3b46470a30ea6ed2719688c6e01ca",
+      "git_blob_sha": "66b1157ffd708e2eaf9bef95be0d18a3a6ccacf3"
+    },
+    "scripts/tests/gh538/locks/mirror.Cargo.lock": {
+      "sha256": "420d03f8186ccb8432f79dbe94f5a43b0483519c77f1a582ffd690f801823e70",
+      "git_blob_sha": "81eb2d0e68e64eff89fced0459d6776a5d8654e3"
+    },
+    "scripts/tests/gh538/locks/watchdog.Cargo.lock": {
+      "sha256": "cc113d9206d41d5aeadeb5ea7a5c42af7b32f8f3a7763fdc510fd080bd00d3fa",
+      "git_blob_sha": "d763be9971f8687e4f519592449ca5f15f18e6bc"
+    },
+    "scripts/tests/gh538/run.py": {
+      "sha256": "13bcfb85c5a58c42407ca3a293de5cc9dfca5d05576897c05ed54ff491066cad",
+      "git_blob_sha": "9c5f1d3132ef7aaeec2f5186172b04ab07ec93c4"
+    },
+    "scripts/tests/gh538/support/fifo_io_support.rs": {
+      "sha256": "1fc9ffa168bca4ab06c9de87e27b7a477cf97959b4308d479228ac32b5613943",
+      "git_blob_sha": "b525b546970e5761ab6273a464f36c3272273240"
+    },
+    "scripts/tests/gh538/support/fifo_tests.rs": {
+      "sha256": "c08dec357045c083448d533e4afb9c34b5f7c8e120396ceb77e6873d4ae20805",
+      "git_blob_sha": "6a7f84fa364dae594e95be20bf80f52729384a10"
+    }
+  },
+  "component_report_sha256": "d6b25b3f4b2225ac6eb635cf9b34a59b41f5dcc61be9bb69fc2224af6d7a9310",
+  "component_run": {
+    "format": 1,
+    "qualification": "supplemental component evidence, not the full Rust/live-watcher/macOS gate",
+    "started_utc": "2026-10-30T20:40:38.902935+00:00",
+    "run_id": "20261030T204038.902935Z-283371",
+    "evidence_directory": "/dev/shm/cass-538-final-evidence/runs/20261030T204038.902935Z-283371",
+    "baseline_revision": "a93afc1e85f069f606a64eea4ce810a30a0a3bc8",
+    "candidate_head": "a93afc1e85f069f606a64eea4ce810a30a0a3bc8",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+    "toolchain_pin": "nightly-2026-08-31",
+    "cargo": "cargo 1.100.0-nightly (e8cb624d5 2026-08-22)\nrelease: 1.100.0-nightly\ncommit-hash: e8cb624d5701824f46a2ec5873cfd59ee3d2f66c\ncommit-date: 2026-08-22\nhost: x86_64-unknown-linux-gnu\nlibgit2: 1.9.6 (sys:0.21.0 vendored)\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)\nssl: OpenSSL 3.6.3 9 Jun 2026\nos: Ubuntu 24.4.0 (noble) [64-bit]",
+    "rustc": "rustc 1.100.0-nightly (908501772 2026-08-30)\nbinary: rustc\ncommit-hash: 90850177249efe0321573c569aec5d12b257f8d6\ncommit-date: 2026-08-30\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0",
+    "runner_sha256": "13bcfb85c5a58c42407ca3a293de5cc9dfca5d05576897c05ed54ff491066cad",
+    "environment": {
+      "RUSTUP_TOOLCHAIN": "nightly-2026-08-31",
+      "RUSTC": "/tmp/fgdb-rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+      "CARGO_BUILD_RUSTC": "/tmp/fgdb-rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+      "RUSTFLAGS": "-Z threads=1",
+      "CARGO_ENCODED_RUSTFLAGS": null,
+      "RUST_MIN_STACK": "134217728",
+      "CARGO_BUILD_JOBS": "1",
+      "CARGO_HOME": "/tmp/cass-538-followup-cargo",
+      "RUSTC_WRAPPER": null,
+      "RUSTC_WORKSPACE_WRAPPER": null
+    },
+    "components": [
+      {
+        "component": "mirror-candidate",
+        "status": "passed",
+        "source_verified_before": true,
+        "source_verified_after": true,
+        "sources_sha256": "a7e49d735ace69e97d4b0614b03ec4213776643cad8538e701515794327afba2",
+        "cargo_configuration_sha256": {},
+        "build": {
+          "command": [
+            "/tmp/fgdb-rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--locked",
+            "--lib",
+            "--no-run",
+            "--message-format=json",
+            "-j1",
+            "--offline"
+          ],
+          "cwd": "/dev/shm/cass-538-final-evidence/runs/20261030T204038.902935Z-283371/mirror-candidate",
+          "returncode": 0,
+          "timed_out": false,
+          "wall_seconds": 3.131,
+          "stdout": "mirror-candidate-build.stdout.log",
+          "stdout_sha256": "e3efb5c69bacc0e5e979ffc59b8a36af9a1b79e080ea4f5385dfb108d897dd6f",
+          "stderr": "mirror-candidate-build.stderr.log",
+          "stderr_sha256": "47af7376933e6e64a5812dc0872c72ee37674abf5062e61086a92807453e99a2"
+        },
+        "executable": "/dev/shm/cass-538-packaged-review/mirror-target/debug/build/cass-538-mirror-exact-candidate/d341a9d3e2d4387b/out/cass_538_mirror_exact_candidate-d341a9d3e2d4387b",
+        "executable_sha256": "c87a02cf6228a484365a1cd66cf5da4363ef64871e7f5a89856b36467649084e",
+        "cargo_artifact_fresh": false,
+        "package_id": "path+file:///dev/shm/cass-538-final-evidence/runs/20261030T204038.902935Z-283371/mirror-candidate#cass-538-mirror-exact-candidate@0.0.0",
+        "test_inventory": {
+          "command": [
+            "/dev/shm/cass-538-packaged-review/mirror-target/debug/build/cass-538-mirror-exact-candidate/d341a9d3e2d4387b/out/cass_538_mirror_exact_candidate-d341a9d3e2d4387b",
+            "--list"
+          ],
+          "cwd": "/dev/shm/cass-538-final-evidence/runs/20261030T204038.902935Z-283371/mirror-candidate",
+          "returncode": 0,
+          "timed_out": false,
+          "wall_seconds": 0.004,
+          "stdout": "mirror-candidate-list.stdout.log",
+          "stdout_sha256": "e8ac604a982593021012ec987f609a737467fb79d9ca794713a97abf922bf0b4",
+          "stderr": "mirror-candidate-list.stderr.log",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "compiled_tests": [
+          "raw_mirror::store::policy::tests::a_path_alias_cannot_reuse_another_inventory_of_the_same_store",
+          "raw_mirror::store::policy::tests::a_symlinked_usage_generation_is_refused_and_preserves_its_target",
+          "raw_mirror::store::policy::tests::an_unchanged_capture_at_the_cap_is_not_an_outage",
+          "raw_mirror::store::policy::tests::direct_manifest_link_growth_counts_before_the_next_admission",
+          "raw_mirror::store::policy::tests::frequent_appends_reuse_chunks_and_preserve_every_published_snapshot",
+          "raw_mirror::store::policy::tests::gh538_cancelled_inventory_is_not_cached_and_does_not_hold_global_mutex",
+          "raw_mirror::store::policy::tests::gh538_inventory_rejects_excessive_depth_without_unbounded_descriptors",
+          "raw_mirror::store::policy::tests::gh538_large_mirror_near_cap_reuses_inventory_across_watch_cycles",
+          "raw_mirror::store::policy::tests::gh538_replacement_shrink_invalidates_a_cached_lower_bound",
+          "raw_mirror::store::policy::tests::gh538_unchanged_watch_captures_do_not_mutate_the_mirror",
+          "raw_mirror::store::policy::tests::malformed_or_exhausted_usage_generations_preserve_existing_snapshots",
+          "raw_mirror::store::policy::tests::partial_staging_is_removed_when_the_next_chunk_cannot_fit",
+          "raw_mirror::store::policy::tests::refused_append_leaves_the_last_recovery_copy_intact",
+          "raw_mirror::store::tests::gh538_blob_verification_observes_cancellation_between_real_reads",
+          "raw_mirror::store::tests::gh538_blocked_io_names_its_path_without_fabricating_progress",
+          "raw_mirror::store::tests::gh538_cancellation_does_not_skip_publication_cleanup_or_durability",
+          "raw_mirror::store::tests::gh538_capture_and_link_publication_trace_real_operation_paths",
+          "raw_mirror::store::tests::gh538_dangling_manifest_symlink_is_refused_before_staging",
+          "raw_mirror::store::tests::gh538_repeated_db_links_do_not_mutate_the_mirror"
+        ],
+        "tests": {
+          "command": [
+            "/dev/shm/cass-538-packaged-review/mirror-target/debug/build/cass-538-mirror-exact-candidate/d341a9d3e2d4387b/out/cass_538_mirror_exact_candidate-d341a9d3e2d4387b",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "cwd": "/dev/shm/cass-538-final-evidence/runs/20261030T204038.902935Z-283371/mirror-candidate",
+          "returncode": 0,
+          "timed_out": false,
+          "wall_seconds": 4.542,
+          "stdout": "mirror-candidate-tests.stdout.log",
+          "stdout_sha256": "9360299fe37df46bd86c41a06d53fb7e5ecf5cb7a7476d2a3dc82ab2c3d7923e",
+          "stderr": "mirror-candidate-tests.stderr.log",
+          "stderr_sha256": "1ade584e8e241303a5aa6464e243b5b3e1fb249bff505b15518f292be928a609"
+        },
+        "counts": {
+          "passed": 19,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        "scope": "Verbatim production raw-mirror filesystem and capture/admission policy; candidate tests, with no filesystem or database substitutes",
+        "exclusions": [
+          "SQL prune entry point, pinned manifest/tag SQL queries, automatic retention",
+          "Unselected unit tests and subprocess policy tests",
+          "Indexer, provider scanning, native watcher, canonical SQL, lexical search/replay",
+          "Original macOS kernel stall and reporter archive qualification"
+        ]
+      },
+      {
+        "component": "mirror-baseline",
+        "status": "expected-regression-reproduced",
+        "source_verified_before": true,
+        "source_verified_after": true,
+        "sources_sha256": "df7a09b67bb7fb43bc90a3b03efa730b476c87bec5e5b215d71b174bac750fa7",
+        "cargo_configuration_sha256": {},
+        "build": {
+          "command": [
+            "/tmp/fgdb-rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--locked",
+            "--lib",
+            "--no-run",
+            "--message-format=json",
+            "-j1",
+            "--offline"
+          ],
+          "cwd": "/dev/shm/cass-538-final-evidence/runs/20261030T204038.902935Z-283371/mirror-baseline",
+          "returncode": 0,
+          "timed_out": false,
+          "wall_seconds": 2.372,
+          "stdout": "mirror-baseline-build.stdout.log",
+          "stdout_sha256": "29a0d9aa5a302af6d81b6a4011e6cbe76f957d9bb5a594e61653f33e11e589da",
+          "stderr": "mirror-baseline-build.stderr.log",
+          "stderr_sha256": "4374a1e60ededeae3956a17a6997986bc1c939ab0658ff32a22548b4aaad4752"
+        },
+        "executable": "/dev/shm/cass-538-packaged-review/mirror-target/debug/build/cass-538-mirror-exact-baseline/3b69a819b63092b1/out/cass_538_mirror_exact_baseline-3b69a819b63092b1",
+        "executable_sha256": "e6f276c0d8ab37b46158ebf505ad88344fffbd7f24be15f93d8e63f0f2fada9e",
+        "cargo_artifact_fresh": false,
+        "package_id": "path+file:///dev/shm/cass-538-final-evidence/runs/20261030T204038.902935Z-283371/mirror-baseline#cass-538-mirror-exact-baseline@0.0.0",
+        "test_inventory": {
+          "command": [
+            "/dev/shm/cass-538-packaged-review/mirror-target/debug/build/cass-538-mirror-exact-baseline/3b69a819b63092b1/out/cass_538_mirror_exact_baseline-3b69a819b63092b1",
+            "--list"
+          ],
+          "cwd": "/dev/shm/cass-538-final-evidence/runs/20261030T204038.902935Z-283371/mirror-baseline",
+          "returncode": 0,
+          "timed_out": false,
+          "wall_seconds": 0.002,
+          "stdout": "mirror-baseline-list.stdout.log",
+          "stdout_sha256": "e8ac604a982593021012ec987f609a737467fb79d9ca794713a97abf922bf0b4",
+          "stderr": "mirror-baseline-list.stderr.log",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "compiled_tests": [
+          "raw_mirror::store::policy::tests::a_path_alias_cannot_reuse_another_inventory_of_the_same_store",
+          "raw_mirror::store::policy::tests::a_symlinked_usage_generation_is_refused_and_preserves_its_target",
+          "raw_mirror::store::policy::tests::an_unchanged_capture_at_the_cap_is_not_an_outage",
+          "raw_mirror::store::policy::tests::direct_manifest_link_growth_counts_before_the_next_admission",
+          "raw_mirror::store::policy::tests::frequent_appends_reuse_chunks_and_preserve_every_published_snapshot",
+          "raw_mirror::store::policy::tests::gh538_cancelled_inventory_is_not_cached_and_does_not_hold_global_mutex",
+          "raw_mirror::store::policy::tests::gh538_inventory_rejects_excessive_depth_without_unbounded_descriptors",
+          "raw_mirror::store::policy::tests::gh538_large_mirror_near_cap_reuses_inventory_across_watch_cycles",
+          "raw_mirror::store::policy::tests::gh538_replacement_shrink_invalidates_a_cached_lower_bound",
+          "raw_mirror::store::policy::tests::gh538_unchanged_watch_captures_do_not_mutate_the_mirror",
+          "raw_mirror::store::policy::tests::malformed_or_exhausted_usage_generations_preserve_existing_snapshots",
+          "raw_mirror::store::policy::tests::partial_staging_is_removed_when_the_next_chunk_cannot_fit",
+          "raw_mirror::store::policy::tests::refused_append_leaves_the_last_recovery_copy_intact",
+          "raw_mirror::store::tests::gh538_blob_verification_observes_cancellation_between_real_reads",
+          "raw_mirror::store::tests::gh538_blocked_io_names_its_path_without_fabricating_progress",
+          "raw_mirror::store::tests::gh538_cancellation_does_not_skip_publication_cleanup_or_durability",
+          "raw_mirror::store::tests::gh538_capture_and_link_publication_trace_real_operation_paths",
+          "raw_mirror::store::tests::gh538_dangling_manifest_symlink_is_refused_before_staging",
+          "raw_mirror::store::tests::gh538_repeated_db_links_do_not_mutate_the_mirror"
+        ],
+        "purpose": "pinned pre-fix negative control; one specific assertion must fail",
+        "tests": {
+          "command": [
+            "/dev/shm/cass-538-packaged-review/mirror-target/debug/build/cass-538-mirror-exact-baseline/3b69a819b63092b1/out/cass_538_mirror_exact_baseline-3b69a819b63092b1",
+            "--nocapture",
+            "--test-threads=1",
+            "--exact",
+            "raw_mirror::store::tests::gh538_dangling_manifest_symlink_is_refused_before_staging"
+          ],
+          "cwd": "/dev/shm/cass-538-final-evidence/runs/20261030T204038.902935Z-283371/mirror-baseline",
+          "returncode": 101,
+          "timed_out": false,
+          "wall_seconds": 0.003,
+          "stdout": "mirror-baseline-tests.stdout.log",
+          "stdout_sha256": "2d79e5f0f707451a2b536c9bdaee68e89dda1203fdfd089f843d1a8a609e07d3",
+          "stderr": "mirror-baseline-tests.stderr.log",
+          "stderr_sha256": "6eb83722145b8182144c66a6c903450e9aa4e875a4bdc8490d755233ae5f8bc1"
+        },
+        "counts": {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 18
+        },
+        "scope": "Verbatim production raw-mirror filesystem and capture/admission policy; candidate tests, with no filesystem or database substitutes",
+        "exclusions": [
+          "SQL prune entry point, pinned manifest/tag SQL queries, automatic retention",
+          "Unselected unit tests and subprocess policy tests",
+          "Indexer, provider scanning, native watcher, canonical SQL, lexical search/replay",
+          "Original macOS kernel stall and reporter archive qualification"
+        ]
+      },
+      {
+        "component": "watchdog",
+        "status": "passed",
+        "source_verified_before": true,
+        "source_verified_after": true,
+        "sources_sha256": "68790ba0cc717bb1f9bbe9385e96eb0b9deb45c16d8a88cd5525a815a662cec6",
+        "cargo_configuration_sha256": {},
+        "build": {
+          "command": [
+            "/tmp/fgdb-rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--locked",
+            "--lib",
+            "--no-run",
+            "--message-format=json",
+            "-j1",
+            "--offline"
+          ],
+          "cwd": "/dev/shm/cass-538-final-evidence/runs/20261030T204038.902935Z-283371/watchdog",
+          "returncode": 0,
+          "timed_out": false,
+          "wall_seconds": 1.776,
+          "stdout": "watchdog-build.stdout.log",
+          "stdout_sha256": "e48417d068a3773c46d734095ad29395ffb5137041065e4afca71ce1ba456343",
+          "stderr": "watchdog-build.stderr.log",
+          "stderr_sha256": "436e1a40491d189268765e3e3fe75d31f7b417d9866e8d342eb4a551005b126a"
+        },
+        "executable": "/dev/shm/cass-538-packaged-review/watchdog-target/debug/build/cass-538-watchdog-exact/4cf312f8673d0fdf/out/cass_538_watchdog_exact-4cf312f8673d0fdf",
+        "executable_sha256": "a7508e1a9068b65be4193ee5d4e432f23fd084aa67b3144c8770f85639044dc9",
+        "cargo_artifact_fresh": false,
+        "package_id": "path+file:///dev/shm/cass-538-final-evidence/runs/20261030T204038.902935Z-283371/watchdog#cass-538-watchdog-exact@0.0.0",
+        "test_inventory": {
+          "command": [
+            "/dev/shm/cass-538-packaged-review/watchdog-target/debug/build/cass-538-watchdog-exact/4cf312f8673d0fdf/out/cass_538_watchdog_exact-4cf312f8673d0fdf",
+            "--list"
+          ],
+          "cwd": "/dev/shm/cass-538-final-evidence/runs/20261030T204038.902935Z-283371/watchdog",
+          "returncode": 0,
+          "timed_out": false,
+          "wall_seconds": 0.004,
+          "stdout": "watchdog-list.stdout.log",
+          "stdout_sha256": "7e3a4bb10e3aebf5759733c7c3e832e39431cc6564978fca58f5d9cfef88390b",
+          "stderr": "watchdog-list.stderr.log",
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "compiled_tests": [
+          "fifo_tests::real_fifo_diagnostics_cannot_hide_watchdog_abort",
+          "indexer::tests::gh538_watch_idle_marker_clears_before_event_or_disconnect",
+          "indexer::tests::watch_idle_wait_honors_cancellation_without_activity",
+          "indexer::tests::watch_idle_wait_preserves_deadline_without_activity",
+          "stall_diagnostics_tests::captures_checkpoint_contents_and_lock_when_present",
+          "stall_diagnostics_tests::empty_data_dir_produces_null_checkpoint_and_no_lock",
+          "stall_diagnostics_tests::gh422_watchdog_aborts_a_phase_zero_lexical_startup_wedge",
+          "stall_diagnostics_tests::gh426_watchdog_bounds_analytics_repair_in_all_index_modes",
+          "stall_diagnostics_tests::gh437_all_phases_flag_parses_expected_truthy_values",
+          "stall_diagnostics_tests::gh437_all_phases_optin_promotes_report_only_stall_to_abort",
+          "stall_diagnostics_tests::gh437_without_optin_report_only_stall_is_not_promoted",
+          "stall_diagnostics_tests::gh538_pending_diagnostics_cannot_delay_a_watchdog_abort",
+          "stall_diagnostics_tests::gh538_stall_diagnostic_reads_enforce_the_limit_on_actual_bytes",
+          "stall_diagnostics_tests::gh538_watchdog_idle_preserves_counts_and_rearms_for_active_work",
+          "stall_diagnostics_tests::issue_342_watchdog_reports_semantic_embedding_stall_without_aborting",
+          "stall_diagnostics_tests::issue_342_watchdog_suppresses_false_stall_for_opaque_semantic_hnsw",
+          "stall_diagnostics_tests::issue_366_watchdog_grants_rebuild_handoff_finalize_grace",
+          "stall_diagnostics_tests::oversized_checkpoint_omits_content_but_records_size",
+          "stall_diagnostics_tests::snapshot_suppresses_eta_until_total_is_final",
+          "stall_diagnostics_tests::stall_abort_emits_index_stalled_error_envelope_only_when_aborting",
+          "stall_diagnostics_tests::watchdog_aborts_on_quiescent_finalize_wedge",
+          "stall_diagnostics_tests::watchdog_defers_abort_during_final_wal_checkpoint_finalize",
+          "stall_diagnostics_tests::watchdog_does_not_abort_active_rebuild_outside_phase_two",
+          "stall_diagnostics_tests::watchdog_does_not_abort_semantic_finalize_build",
+          "stall_diagnostics_tests::watchdog_does_not_abort_watch_idle_resting_state",
+          "stall_diagnostics_tests::watchdog_fires_on_phase_zero_startup_wedge",
+          "stall_diagnostics_tests::watchdog_grants_bounded_preparing_grace_while_block_io_advances",
+          "stall_diagnostics_tests::watchdog_grants_finalize_grace_during_active_giant_batch_persist",
+          "stall_diagnostics_tests::watchdog_grants_finalize_grace_to_phase_two_rebuild_tail",
+          "stall_diagnostics_tests::watchdog_reports_before_phase_two_abort_event",
+          "stall_diagnostics_tests::watchdog_treats_activity_ticks_as_progress",
+          "stall_diagnostics_tests::watchdog_without_io_signal_keeps_base_preparing_abort"
+        ],
+        "tests": {
+          "command": [
+            "/dev/shm/cass-538-packaged-review/watchdog-target/debug/build/cass-538-watchdog-exact/4cf312f8673d0fdf/out/cass_538_watchdog_exact-4cf312f8673d0fdf",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "cwd": "/dev/shm/cass-538-final-evidence/runs/20261030T204038.902935Z-283371/watchdog",
+          "returncode": 0,
+          "timed_out": false,
+          "wall_seconds": 4.687,
+          "stdout": "watchdog-tests.stdout.log",
+          "stdout_sha256": "f7e21e853b6c76e0467e941698715451b0880087cd205c741e84128f5022a617",
+          "stderr": "watchdog-tests.stderr.log",
+          "stderr_sha256": "fc912e727f7eb75fc9300d4ba6587221d9ce75077c0fadd406d3ef2bf54bb54e"
+        },
+        "counts": {
+          "passed": 32,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        "scope": "Exact watchdog, diagnostics, raw I/O observer, idle wait and selected production tests, plus separately identified real FIFO subprocess probes",
+        "exclusions": [
+          "Full cass executable and native filesystem watcher",
+          "Provider scanning, ingestion, canonical SQL, lexical publication, replay debts/search",
+          "Progress SQL cancellation field/relay; atomic stop behavior remains exact",
+          "IndexingStats fields unused by the progress snapshot",
+          "abort_after_index_stall_if_requested and real bounded SQL WAL checkpoint; FIFO probe uses exact envelope/exit helper after the exact watchdog abort decision",
+          "CLI help test, unrelated application tests, native macOS qualification"
+        ]
+      }
+    ],
+    "status": "supplemental-passed",
+    "source_verification": "generated and verified before and after each test run",
+    "finished_utc": "2026-10-30T20:41:02.114177+00:00"
+  },
+  "fifo_evidence": [
+    "negative control: exact synchronous collection blocked in FIFO open; killed and reaped",
+    "FIFO probe wall_ms=3060",
+    {
+      "event": "stall_detected",
+      "elapsed_ms": 1052,
+      "diagnostics": {
+        "filesystem_probe": {
+          "elapsed_ms": 0,
+          "started_at_ms": 1793392858225,
+          "status": "pending"
+        },
+        "index_dir": "/dev/shm/cass-538-packaged-review/tmp/.tmpLNqWEx/index",
+        "raw_mirror_io": [
+          {
+            "elapsed_ms": 1057,
+            "operation": "harness_open_source_fifo",
+            "path": "/dev/shm/cass-538-packaged-review/tmp/.tmpLNqWEx/source.fifo"
+          }
+        ]
+      }
+    },
+    {
+      "event": "stall_aborting",
+      "elapsed_ms": 3009,
+      "diagnostics": {
+        "filesystem_probe": {
+          "elapsed_ms": 1957,
+          "started_at_ms": 1793392858225,
+          "status": "pending"
+        },
+        "index_dir": "/dev/shm/cass-538-packaged-review/tmp/.tmpLNqWEx/index",
+        "raw_mirror_io": [
+          {
+            "elapsed_ms": 3014,
+            "operation": "harness_open_source_fifo",
+            "path": "/dev/shm/cass-538-packaged-review/tmp/.tmpLNqWEx/source.fifo"
+          }
+        ]
+      }
+    }
+  ],
+  "formatting": {
+    "cargo_fmt_all_check": {
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    "git_diff_check": {
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": ""
+    }
+  },
+  "earlier_packaged_run": {
+    "status": "failed",
+    "started_utc": "2026-10-30T20:01:03.282710+00:00",
+    "finished_utc": "2026-10-30T20:01:15.015571+00:00",
+    "report_sha256": "4624cf2bea22c683ee672e8e013db4795cc72a5f0b41a5658180fca1c1c8f3e6",
+    "cause": "Overlay disk exhaustion. This failed run is not replaced by the later successful tmpfs run.",
+    "components": [
+      {
+        "component": "mirror-candidate",
+        "status": "failed",
+        "counts": {
+          "passed": 7,
+          "failed": 12,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        "failure": "test result did not satisfy this component's explicit expectation"
+      },
+      {
+        "component": "mirror-baseline",
+        "status": "expected-regression-reproduced",
+        "counts": {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 18
+        }
+      },
+      {
+        "component": "watchdog",
+        "status": "passed",
+        "counts": {
+          "passed": 32,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        }
+      }
+    ]
+  },
+  "full_application_validation": {
+    "status": "red",
+    "memory_limit_bytes": 8589934592,
+    "application_test_binaries_completed": 0,
+    "live_watcher_executed": false,
+    "storage_replay_tests_executed": false,
+    "native_macos_executed": false,
+    "build_attempts": [
+      {
+        "log": "watch-build.log",
+        "sha256": "26debfaf92a3417ace98e5a04c20945a015caf09400405cafc72ccb01b3ce260",
+        "outcome": "cargo exit 101; asupersync 0.5.0 rustc SIGKILL before application test compilation"
+      },
+      {
+        "log": "watch-build-cranelift.log",
+        "sha256": "217f66d475759f506113faae11b98620fc2e1730f0bdd6dd687b933877eb3df5",
+        "outcome": "cargo exit 101; asupersync 0.5.0 rustc SIGKILL with installed Cranelift backend before application test compilation"
+      }
+    ],
+    "gate": {
+      "output_sha256": "c15d8e168e67e71646b65af5b457e349d1aa66836f980fe61bfac8bf509c0eb5",
+      "receipt_sha256": "5a34f612c4d917c37e11b1932bad0f96dcd3c0e6280f5fc187e5481f2fdd697c",
+      "snapshot": "earlier uncommitted snapshot; source-stability failed; not a final-source full gate",
+      "resource_wrapper_sha256": "4d2d60596745a1e03ab9d47692d8c638c0f959e781f2a696b7000ec00e302e2f",
+      "resource_wrapper_behavior": "Compiler arguments and inputs unchanged; waits for memory headroom, exits 75 below 750000000 available disk bytes; Cargo reports 101.",
+      "first_disk_refusal_available_bytes": 731521024,
+      "stages": [
+        {
+          "stage": "source-identity",
+          "exit": 0,
+          "detail": ""
+        },
+        {
+          "stage": "source-freshness",
+          "exit": 0,
+          "detail": ""
+        },
+        {
+          "stage": "fmt",
+          "exit": 0,
+          "detail": ""
+        },
+        {
+          "stage": "clippy",
+          "exit": 101,
+          "detail": ""
+        },
+        {
+          "stage": "lib-build",
+          "exit": 101,
+          "detail": ""
+        },
+        {
+          "stage": "lib-tests",
+          "exit": 101,
+          "detail": ""
+        },
+        {
+          "stage": "test-watch_e2e",
+          "exit": 101,
+          "detail": ""
+        },
+        {
+          "stage": "test-cli_index",
+          "exit": 101,
+          "detail": ""
+        },
+        {
+          "stage": "bin-build",
+          "exit": 101,
+          "detail": ""
+        },
+        {
+          "stage": "bin-cass",
+          "exit": 101,
+          "detail": ""
+        },
+        {
+          "stage": "goldens",
+          "exit": 101,
+          "detail": ""
+        },
+        {
+          "stage": "ubs",
+          "exit": 1,
+          "detail": ""
+        },
+        {
+          "stage": "job-complete",
+          "exit": 0,
+          "detail": ""
+        },
+        {
+          "stage": "source-stability",
+          "exit": 1,
+          "detail": "(checkout changed during validation)"
+        },
+        {
+          "stage": "source-identity",
+          "exit": 0,
+          "detail": ""
+        },
+        {
+          "stage": "source-freshness",
+          "exit": 0,
+          "detail": ""
+        },
+        {
+          "stage": "fmt",
+          "exit": 0,
+          "detail": ""
+        },
+        {
+          "stage": "clippy",
+          "exit": 101,
+          "detail": ""
+        },
+        {
+          "stage": "lib-build",
+          "exit": 101,
+          "detail": ""
+        },
+        {
+          "stage": "lib-tests",
+          "exit": 101,
+          "detail": ""
+        },
+        {
+          "stage": "test-watch_e2e",
+          "exit": 101,
+          "detail": ""
+        },
+        {
+          "stage": "test-cli_index",
+          "exit": 101,
+          "detail": ""
+        },
+        {
+          "stage": "bin-build",
+          "exit": 101,
+          "detail": ""
+        },
+        {
+          "stage": "bin-cass",
+          "exit": 101,
+          "detail": ""
+        },
+        {
+          "stage": "goldens",
+          "exit": 101,
+          "detail": ""
+        },
+        {
+          "stage": "ubs",
+          "exit": 1,
+          "detail": ""
+        },
+        {
+          "stage": "job-complete",
+          "exit": 0,
+          "detail": ""
+        }
+      ],
+      "ubs_limitation": "Gate scanner lacked ast-grep scan rule-pack coverage; independent complete parser-backed scan below is the static-analysis evidence."
+    }
+  },
+  "static_analysis": {
+    "strict_gate": "red",
+    "tool_provenance": {
+      "ubs_version": "v5.4.4",
+      "ast_grep_version": "ast-grep 0.45.3",
+      "asset_url": "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-x86_64-unknown-linux-gnu.zip",
+      "download_user_agent": "coding_agent_session_search-agent (+https://github.com/Dicklesworthstone/coding_agent_session_search)",
+      "sha256": {
+        "/tmp/cass-538-followup-ubs/ubs": "bdeccbb35f2056e6177c73b3f0f9966d20d1cbeff22b7f084133c4a6ac625ee2",
+        "/tmp/cass-538-followup-ubs/modules/ubs-rust.sh": "70cc497fb712b34986db337f4e9edcfeb9b33bbd650b5b4dae019d4212486a68",
+        "/tmp/cass-538-ast-grep/ast-grep": "7a5ab30160186184c0bf8bffc87da4af25123c183964cd98c11b0b354137db0a",
+        "/tmp/cass-538-ast-grep/ast-grep-0.45.3-linux.zip": "f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8",
+        "/tmp/cass-538-ubs-bin/ast-grep": "7f2ea78475e4975b1c98e456086a511cbe4f4fb7ae9bfe46681519bd5bbe2d38"
+      },
+      "wrapper_behavior": "Forwards all args/stdin/stdout/stderr unchanged to verified real ast-grep; appends argv, cwd, exit status, wall seconds after child completion",
+      "limitations": [
+        "Static analysis of entire selected files including tests; Cargo phases are reported not evaluated by targeted-scan shadow workspace",
+        "No suppression or gate configuration changes; baseline uses a93afc1e85f069f606a64eea4ce810a30a0a3bc8"
+      ]
+    },
+    "source_sha256": {
+      "candidate": {
+        "src/lib.rs": "efde5682f939b0f3201bd185e9cb1e8a7955cd57cd4c7285c9f556d24f47a992",
+        "src/indexer/mod.rs": "fae991e4a9d2a805bdbad141bf67f055e18e980fb81db55a91ce4111bb23e9f5",
+        "src/raw_mirror/store.rs": "cb26d2463733073e9c1b23c025d84d57176f9ebb27029eb56bedd0f90b060e26",
+        "src/raw_mirror/policy.rs": "898597ac30ce76b06a306d5397a4743e217eabd46abfc3b0faebe6918457970b",
+        "tests/watch_e2e.rs": "a2cd32c455c7cd78c9c0a00020792e72dcaccd54221fa2e46d1295050eab886a",
+        ".ubsignore": "63bf4f9eedf24c17c81644da25d4b44bf8ea7c84ec0a07f2232b3371beb292d2"
+      },
+      "baseline": {
+        "src/lib.rs": "619cc30f7f6239b55579ec1295917dc87bd222c02a10ac59ec5a266ca65e5c5d",
+        "src/indexer/mod.rs": "f4127d9e83dd3a04f0b653cfadf38936fc4bf38c4a82b2216f507067af53a1ed",
+        "src/raw_mirror/store.rs": "9e381bba1532692332ac52d335236b29f445648508f7574083317f09fb035b35",
+        "src/raw_mirror/policy.rs": "b41f18d5fa2e1521e6bc59bd16bdd30dcf6d27d59d0690bc3be7896eb476d047",
+        "tests/watch_e2e.rs": "877e86950aadde4524569448275b30ce37a34e7077308fdd56a388ba8241b7fb",
+        ".ubsignore": "63bf4f9eedf24c17c81644da25d4b44bf8ea7c84ec0a07f2232b3371beb292d2"
+      }
+    },
+    "baseline_receipt": {
+      "snapshot": "baseline",
+      "command": [
+        "/tmp/cass-538-followup-ubs/ubs",
+        "--ci",
+        "--fail-on-warning",
+        "--only=rust",
+        "--format=json",
+        "--no-cache",
+        "--no-auto-update",
+        "--module-dir=/tmp/cass-538-followup-ubs/modules",
+        "--cache-dir=/tmp/cass-538-ubs-scan-cache",
+        "src/lib.rs",
+        "src/indexer/mod.rs",
+        "src/raw_mirror/store.rs",
+        "src/raw_mirror/policy.rs",
+        "tests/watch_e2e.rs"
+      ],
+      "cwd": "/workspace/scratch/9eaa7e4adc8c/validation/ubs-comparison/baseline",
+      "exit": 1,
+      "wall_seconds": 162.34250182699998
+    },
+    "candidate_receipt": {
+      "snapshot": "final-candidate",
+      "command": [
+        "/tmp/cass-538-followup-ubs/ubs",
+        "--ci",
+        "--fail-on-warning",
+        "--only=rust",
+        "--format=json",
+        "--no-cache",
+        "--no-auto-update",
+        "--module-dir=/tmp/cass-538-followup-ubs/modules",
+        "--cache-dir=/dev/shm/cass-538-ubs-final/cache",
+        "src/lib.rs",
+        "src/indexer/mod.rs",
+        "src/raw_mirror/store.rs",
+        "src/raw_mirror/policy.rs",
+        "tests/watch_e2e.rs"
+      ],
+      "cwd": "/dev/shm/cass-538-ubs-final/candidate",
+      "exit": 1,
+      "wall_seconds": 144.53718406100052
+    },
+    "totals": {
+      "baseline": {
+        "critical": 76,
+        "warning": 16826,
+        "info": 8441,
+        "files": 5
+      },
+      "candidate": {
+        "critical": 78,
+        "warning": 17010,
+        "info": 8473,
+        "files": 5
+      }
+    },
+    "scanner_status": {
+      "baseline": "ok",
+      "candidate": "ok"
+    },
+    "added_counts": {
+      "warning": 202,
+      "critical": 2,
+      "info": 36
+    },
+    "removed_counts": {
+      "warning": 18,
+      "info": 4
+    },
+    "baseline_report_sha256": "0c1900d6dfcabc1aa9d2a17f9faf0cbf68f2f1378439e1b1b9cc23dc513898d9",
+    "candidate_report_sha256": "54df1f7a16a3563315f696e707615537995304641d2afb89863ce342ce2ac608",
+    "baseline_parser_invocations": 6,
+    "candidate_parser_invocations": 6,
+    "all_parser_invocations_exit_zero": true,
+    "candidate_parser_receipt_sha256": "e7c1ac4ee01ae7ba6db7f3ef7d1403dc6c40c371f650966d143467d8780a11f6",
+    "delta_review": {
+      "added_critical_test_failure_panics": 2,
+      "added_test_warnings": 197,
+      "added_production_warnings": 5,
+      "production_review": "Three owned root-path clones required by pending/retry sets; two diagnostic JSON object updates with object preconditions. No production critical introduced. Findings remain unsuppressed; this review is not a scanner pass."
+    },
+    "limitations": "Complete selected-file static scan, including tests. Cargo phases explicitly not evaluated. No suppressions, exclusions or gate changes."
+  },
+  "remaining_boundaries": [
+    "Full CASS watcher, provider ingestion, canonical SQL, lexical publication/search, replay recovery and SQL cancellation/WAL checkpointing did not execute.",
+    "The executed Linux tmpfs FIFO probe does not reproduce or qualify original native macOS lstat behavior. The held-lock live-watcher regression remains unexecuted. Original blocked pathname is unknown.",
+    "Historical local imports with preserved old mtime and lost events before durable replay debt is established are not covered.",
+    "Dangling-manifest-symlink staging leak is fixed; all later write/fsync/link/rename error-cleanup paths are not qualified.",
+    "Sparse 11 GiB logical mirror fixture is not physical 11 GiB disk I/O or a performance comparison."
+  ]
+}
