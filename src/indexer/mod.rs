@@ -20133,6 +20133,7 @@ fn run_index_with_storage_ownership(
             .and_then(|v| v.parse().ok())
             .filter(|&v| v > 0) // guard against division by zero
             .unwrap_or(50); // recycle every 50 watch callbacks
+        let watch_storage_reopen_pending = std::cell::Cell::new(false);
 
         // Semantic embedding cooldown state for watch mode.
         // The initial pass already embedded everything, so we start the clock
@@ -20196,6 +20197,16 @@ fn run_index_with_storage_ownership(
             opts.watch_interval_secs,
             deferred_watch_sources,
             move |paths, roots, is_rebuild| {
+                // A failed recycle leaves the old handle closed. Repair that
+                // state before any callback can read or persist through it;
+                // failure keeps this callback's sources queued for retry.
+                reopen_watch_storage_if_pending(
+                    &storage_for_watch,
+                    &opts_clone.db_path,
+                    &watch_storage_reopen_pending,
+                    opts_clone.watch,
+                    opts_clone.progress.as_ref(),
+                )?;
                 let semantic_retry_paths = if semantic_enabled && !targeted_semantic_watch_once {
                     if is_rebuild {
                         roots.iter().map(|(_, root)| root.path.clone()).collect()
@@ -20373,31 +20384,22 @@ fn run_index_with_storage_ownership(
                 // autocommit_retain could not be disabled.
                 let count = watch_recycle_counter.get().wrapping_add(1);
                 watch_recycle_counter.set(count);
-                if count.is_multiple_of(watch_recycle_interval)
-                    && let Ok(mut guard) = storage_for_watch.lock()
-                {
-                    let db_path = guard.database_path().ok();
-                    guard.close_best_effort_in_place();
-                    if let Some(path) = db_path {
-                        match FrankenStorage::open(&path) {
-                            Ok(new_storage) => {
-                                *guard = new_storage;
-                                tracing::debug!(
-                                    cycle = count,
-                                    "recycled long-lived storage handle to shed MVCC state"
-                                );
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    cycle = count,
-                                    "failed to reopen storage handle after recycle; \
-                                     next watch cycle will use the closed handle \
-                                     and likely fail"
-                                );
-                            }
-                        }
-                    }
+                if count.is_multiple_of(watch_recycle_interval) {
+                    close_watch_storage_for_recycle(
+                        &storage_for_watch,
+                        &watch_storage_reopen_pending,
+                    )?;
+                    reopen_watch_storage_if_pending(
+                        &storage_for_watch,
+                        &opts_clone.db_path,
+                        &watch_storage_reopen_pending,
+                        opts_clone.watch,
+                        opts_clone.progress.as_ref(),
+                    )?;
+                    tracing::debug!(
+                        cycle = count,
+                        "recycled long-lived storage handle to shed MVCC state"
+                    );
                 }
 
                 let mut deferred = active_source_filter.take_deferred_sources();
@@ -20848,6 +20850,59 @@ fn restore_watch_steady_state_checkpoint_policy(storage: &FrankenStorage, watch_
     if watch_enabled {
         persist::apply_index_writer_checkpoint_policy(storage, false);
     }
+}
+
+fn close_watch_storage_for_recycle(
+    storage: &Mutex<FrankenStorage>,
+    reopen_pending: &std::cell::Cell<bool>,
+) -> Result<()> {
+    if reopen_pending.get() {
+        return Ok(());
+    }
+    let mut storage = storage
+        .lock()
+        .map_err(|_| anyhow::anyhow!("storage lock poisoned before watch recycle"))?;
+    // Record the obligation before closing. A failed open must never turn
+    // the next callback into another attempt to use this closed connection.
+    reopen_pending.set(true);
+    storage.close_best_effort_in_place();
+    Ok(())
+}
+
+fn reopen_watch_storage_if_pending(
+    storage: &Mutex<FrankenStorage>,
+    db_path: &Path,
+    reopen_pending: &std::cell::Cell<bool>,
+    watch_enabled: bool,
+    progress: Option<&Arc<IndexingProgress>>,
+) -> Result<()> {
+    if !reopen_pending.get() {
+        return Ok(());
+    }
+    if let Some(progress) = progress {
+        progress.check_stop()?;
+    }
+    let mut storage = storage
+        .lock()
+        .map_err(|_| anyhow::anyhow!("storage lock poisoned while reopening watch storage"))?;
+    let replacement = FrankenStorage::open(db_path)
+        .with_context(|| {
+            format!(
+                "reopening canonical db after watch recycle: {}",
+                db_path.display()
+            )
+        })
+        .inspect_err(|error| {
+            set_progress_last_error(progress, Some(format!("{error:#}")));
+        })?;
+    restore_watch_steady_state_checkpoint_policy(&replacement, watch_enabled);
+    *storage = replacement;
+    reopen_pending.set(false);
+    set_progress_last_error(progress, None);
+    if let Some(progress) = progress {
+        progress.tick_activity();
+    }
+    Ok(())
 }
 
 fn release_watch_storage_after_index(
@@ -68703,6 +68758,192 @@ c.close()
             &index_dir(&opts.data_dir)?,
             false,
         )
+    }
+
+    #[test]
+    #[serial]
+    fn watch_storage_recycle_recovers_after_transient_open_failure() -> Result<()> {
+        let _checkpoint = set_env("CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES", "-1");
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("cass");
+        let archive_dir = tmp.path().join("archive");
+        let mut opts = watch_lexical_options(&data_dir);
+        opts.db_path = archive_dir.join("agent_search.db");
+        opts.watch = true;
+        let progress = Arc::new(IndexingProgress::default());
+        opts.progress = Some(Arc::clone(&progress));
+        let storage = Mutex::new(FrankenStorage::open(&opts.db_path)?);
+        let index_path = index_dir(&data_dir)?;
+        let index = Mutex::new(Some(TantivyIndex::open_or_create(&index_path)?));
+        let preserved = tmp.path().join("preserved/amp/thread-preserved.json");
+        write_watch_lexical_source(&preserved, "thread-preserved", "recyclepreservedneedle");
+        assert_eq!(
+            run_watch_lexical_selection(&opts, &preserved, &storage, &index)?,
+            1
+        );
+        let canonical_before = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        let preserved_ids = watch_lexical_search_ids(&index_path, "recyclepreservedneedle");
+        assert_eq!(preserved_ids.len(), 1);
+
+        let source = tmp.path().join("pending/amp/thread-pending.json");
+        write_watch_lexical_source(&source, "thread-pending", "recyclerecoveredneedle");
+        let source_before = fs::read(&source)?;
+        let source_modified = fs::metadata(&source)?.modified()?;
+        let roots = [(
+            ConnectorKind::Amp,
+            ScanRoot::local(source.parent().unwrap().to_path_buf()),
+        )];
+        let state = Mutex::new(HashMap::new());
+        let reopen_pending = std::cell::Cell::new(false);
+        let activity_before = progress.activity.load(Ordering::Relaxed);
+        reopen_watch_storage_if_pending(
+            &storage,
+            &opts.db_path,
+            &reopen_pending,
+            true,
+            Some(&progress),
+        )?;
+        assert_eq!(
+            progress.activity.load(Ordering::Relaxed),
+            activity_before,
+            "normal callback admission must not manufacture progress or reopen storage"
+        );
+        close_watch_storage_for_recycle(&storage, &reopen_pending)?;
+        assert!(reopen_pending.get());
+        assert!(storage.lock().unwrap().raw().query("SELECT 1").is_err());
+
+        // Cause a real filesystem open failure after the handle has closed.
+        // Keep the entire database bundle intact, including committed WAL data.
+        let parked_archive = tmp.path().join("parked-archive");
+        fs::rename(&archive_dir, &parked_archive)?;
+        fs::write(&archive_dir, b"temporarily unavailable archive directory")?;
+        let database_before = fs::read(parked_archive.join("agent_search.db"))?;
+        let mut pending = BTreeSet::from([source.clone()]);
+        let callback = |paths, roots: &[(ConnectorKind, ScanRoot)], force_full| {
+            reopen_watch_storage_if_pending(
+                &storage,
+                &opts.db_path,
+                &reopen_pending,
+                true,
+                Some(&progress),
+            )?;
+            let outcome = reindex_paths_with_semantic_delta(
+                &opts,
+                paths,
+                roots,
+                &state,
+                &storage,
+                &index,
+                &index_path,
+                force_full,
+                None,
+                &ActiveSessionSourceFilter::new(false),
+            )?;
+            Ok(outcome.retry_sources)
+        };
+        for _ in 0..2 {
+            assert!(!dispatch_watch_callback(
+                &mut pending,
+                &roots,
+                false,
+                &callback,
+            ));
+            assert_eq!(pending, BTreeSet::from([source.clone()]));
+            assert!(
+                reopen_pending.get(),
+                "a failed open must retain its recovery obligation"
+            );
+            assert_eq!(
+                progress.activity.load(Ordering::Relaxed),
+                activity_before,
+                "failed open attempts must not mask a stalled owner"
+            );
+            assert!(
+                progress
+                    .last_error
+                    .lock()
+                    .unwrap()
+                    .as_deref()
+                    .is_some_and(|error| {
+                        error.contains("reopening canonical db after watch recycle")
+                    })
+            );
+            assert_eq!(
+                fs::read(parked_archive.join("agent_search.db"))?,
+                database_before
+            );
+            assert!(watch_lexical_search_ids(&index_path, "recyclerecoveredneedle").is_empty());
+        }
+
+        fs::rename(&archive_dir, tmp.path().join("retired-path-blocker"))?;
+        fs::rename(&parked_archive, &archive_dir)?;
+        // Retry the retained source with no new filesystem notification.
+        assert!(dispatch_watch_callback(
+            &mut pending,
+            &roots,
+            false,
+            &callback,
+        ));
+        assert!(pending.is_empty());
+        assert!(!reopen_pending.get());
+        assert!(progress.last_error.lock().unwrap().is_none());
+        let canonical_after = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        assert_eq!(canonical_after.len(), canonical_before.len() + 1);
+        assert!(
+            canonical_before
+                .iter()
+                .all(|row| canonical_after.contains(row))
+        );
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "recyclepreservedneedle"),
+            preserved_ids
+        );
+        let recovered_ids = watch_lexical_search_ids(&index_path, "recyclerecoveredneedle");
+        assert_eq!(recovered_ids.len(), 1);
+        assert_eq!(
+            storage.lock().unwrap().index_writer_checkpoint_pages(),
+            Some(1000)
+        );
+
+        // Repeated delivery after recovery still has one canonical and lexical identity.
+        run_watch_lexical_selection(&opts, &source, &storage, &index)?;
+        assert_eq!(
+            watch_lexical_canonical_rows(&storage.lock().unwrap()),
+            canonical_after
+        );
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "recyclerecoveredneedle"),
+            recovered_ids
+        );
+        assert_eq!(fs::read(&source)?, source_before);
+        assert_eq!(fs::metadata(&source)?.modified()?, source_modified);
+        drop(index);
+        storage.into_inner().unwrap().close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn watch_storage_recycle_honors_cancellation_before_reopen() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = Mutex::new(FrankenStorage::open(&db_path)?);
+        let reopen_pending = std::cell::Cell::new(false);
+        close_watch_storage_for_recycle(&storage, &reopen_pending)?;
+        let progress = Arc::new(IndexingProgress::default());
+        progress.request_stop();
+        let error = reopen_watch_storage_if_pending(
+            &storage,
+            &db_path,
+            &reopen_pending,
+            true,
+            Some(&progress),
+        )
+        .expect_err("cancellation must prevent another storage open");
+        assert!(error.downcast_ref::<IndexInterrupted>().is_some());
+        assert!(reopen_pending.get());
+        assert_eq!(progress.activity.load(Ordering::Relaxed), 0);
+        assert!(storage.lock().unwrap().raw().query("SELECT 1").is_err());
+        Ok(())
     }
 
     #[test]
