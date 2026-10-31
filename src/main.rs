@@ -5,7 +5,6 @@
 mod codex_layout_cli;
 mod lexical_quarantine_cli;
 mod logical_archive;
-mod raw_mirror_cli;
 mod search_service;
 pub mod semantic_reclaim_cli;
 
@@ -377,7 +376,6 @@ fn main() -> anyhow::Result<()> {
     };
 
     apply_default_tantivy_writer_thread_cap();
-    raw_mirror_cli::maintain(&parsed.cli);
 
     let runtime = if command_uses_current_thread(parsed.cli.command.as_ref()) {
         asupersync::runtime::RuntimeBuilder::current_thread().build()?

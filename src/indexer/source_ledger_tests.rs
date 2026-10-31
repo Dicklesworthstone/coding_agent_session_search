@@ -33,6 +33,144 @@ fn legacy_row(source: &DiscoveredSourceFile) -> String {
     )
 }
 
+#[test]
+fn gh538_source_ledger_identity_preserves_existing_unicode_keys() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("session-雪.jsonl");
+    fs::write(&path, b"retained source").unwrap();
+    let source = discovered(&path, "claude_code");
+    let mut root = ScanRoot::local(temp.path().to_path_buf());
+    root.workspace_rewrites = vec![crate::sources::config::PathMapping::new(
+        "/remote/workspace",
+        "/local/雪",
+    )];
+    let ctx = ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+    // Persisted source keys came from json! Values. Direct serialization of
+    // structs can change object field order; keep the existing key contract.
+    let mappings: Vec<_> = ctx
+        .scan_roots
+        .iter()
+        .map(|root| serde_json::json!([root.path, root.workspace_rewrites]))
+        .collect();
+    let identity = serde_json::json!([
+        source.provider_slug,
+        source.scan_root,
+        dunce::canonicalize(&path).unwrap(),
+        source.origin.source_id,
+        source.origin.kind,
+        source.origin.host,
+        mappings
+    ]);
+    let previous_key = format!(
+        "source_ingest_v1:{}",
+        blake3::hash(identity.to_string().as_bytes()).to_hex()
+    );
+    assert_eq!(source_ledger_key(&source, &ctx), Some(previous_key));
+}
+
+#[cfg(unix)]
+#[test]
+fn gh538_source_ledger_identity_rejects_unencodable_paths_without_panicking() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let first = temp
+        .path()
+        .join(OsString::from_vec(b"session-\xff.jsonl".to_vec()));
+    let second = temp
+        .path()
+        .join(OsString::from_vec(b"session-\xfe.jsonl".to_vec()));
+    fs::write(&first, b"retained first source").unwrap();
+    assert_ne!(first, second);
+    assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+    let mut ctx = ScanContext::with_roots(
+        temp.path().to_path_buf(),
+        vec![ScanRoot::local(temp.path().to_path_buf())],
+        None,
+    );
+    for path in [&first, &second] {
+        assert!(source_ledger_key(&discovered(path, "codex"), &ctx).is_none());
+    }
+
+    let ordinary = temp.path().join("ordinary.jsonl");
+    fs::write(&ordinary, b"retained ordinary source").unwrap();
+    let source = discovered(&ordinary, "codex");
+    assert!(source_ledger_key(&source, &ctx).is_some());
+    let mut bad_origin = source.clone();
+    bad_origin.scan_root = first.clone();
+    assert!(source_ledger_key(&bad_origin, &ctx).is_none());
+    ctx.scan_roots.push(ScanRoot::local(second.clone()));
+    assert!(source_ledger_key(&source, &ctx).is_none());
+    ctx.scan_roots.pop();
+
+    // The user-facing spelling can be Unicode while its canonical target is
+    // not. It must not alias another native name or panic in json! either.
+    let link = temp.path().join("ordinary-link.jsonl");
+    symlink(&first, &link).unwrap();
+    assert!(source_ledger_key(&discovered(&link, "codex"), &ctx).is_none());
+    assert_eq!(fs::read(&first).unwrap(), b"retained first source");
+    assert_eq!(fs::read(&ordinary).unwrap(), b"retained ordinary source");
+}
+
+#[cfg(unix)]
+#[test]
+fn gh538_unencodable_ledger_identity_keeps_real_source_parsing_without_ack() -> Result<()> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = TempDir::new()?;
+    let path = temp.path().join("claude/projects/gh538/session.jsonl");
+    fs::create_dir_all(path.parent().unwrap())?;
+    fs::write(
+        &path,
+        concat!(
+            "{\"type\":\"user\",\"sessionId\":\"gh538\",\"uuid\":\"message-1\",",
+            "\"timestamp\":\"2026-08-01T10:00:00Z\",\"cwd\":\"/work/gh538\",",
+            "\"message\":{\"role\":\"user\",\"content\":\"retained unencodable root\"}}\n",
+        ),
+    )?;
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir)?;
+    let mut ctx = ScanContext::with_roots(data_dir.clone(), vec![ScanRoot::local(path)], None);
+    let mut config = StreamingProducerConfig {
+        source_ledger: Arc::new(HashMap::new()),
+        raw_source_exclusions: Arc::new(RawSourceExclusions::default()),
+        flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+        data_dir,
+        additional_scan_roots: Vec::new(),
+        local_connector_roots: None,
+        since_ts: None,
+        local_since_ts_by_connector: Arc::new(HashMap::new()),
+        progress: None,
+        active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
+    };
+    let connector = crate::connectors::claude_code::ClaudeCodeConnector::new();
+    let (control, mut entries) = collect_ledger_scan(&connector, &ctx, &config, "claude")?;
+    assert_eq!(control.len(), 1);
+    assert_eq!(entries.len(), 1);
+    let entry = entries.pop().unwrap();
+    config.source_ledger = Arc::new(HashMap::from([(entry.key, entry.observation)]));
+
+    let unencodable_root = temp
+        .path()
+        .join(OsString::from_vec(b"workspace-\xff".to_vec()));
+    fs::create_dir(&unencodable_root)?;
+    ctx.scan_roots.push(ScanRoot::local(unencodable_root));
+    let (parsed, entries) = collect_ledger_scan(&connector, &ctx, &config, "claude")?;
+    assert_eq!(parsed.len(), 1, "unknown identity must not skip parsing");
+    assert_eq!(
+        serde_json::to_value(&parsed[0].messages)?,
+        serde_json::to_value(&control[0].messages)?
+    );
+    assert!(
+        entries.is_empty(),
+        "unencodable identity cannot be certified"
+    );
+    Ok(())
+}
+
 /// No timestamp sleeps: require an observed directory change before testing
 /// invalidation. Unique files also force directory growth on coarse clocks.
 fn grow_directory(path: &Path, prefix: &str) {

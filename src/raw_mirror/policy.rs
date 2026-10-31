@@ -847,3 +847,4 @@ mod retention {
 pub use retention::{
     RawMirrorAutomaticRetention, RawMirrorMaintenanceReport, maintain_before_index,
 };
+pub(crate) use retention::maintain_while_index_owned;

@@ -111,3 +111,52 @@ cargo test --locked --test watch_e2e gh538_live_watch -- --nocapture --test-thre
 ```
 
 The component runner never marks those application-level requirements complete.
+
+## Watch source stability and receipt bounds
+
+The existing source-ledger matcher harness also has an opt-in GH538 component
+mode. It copies the production filesystem matcher, the complete
+`watch_source_stability.rs` helper and its eight tests, and the production
+`ReceiptBuffer` implementation and its two size-limit tests:
+
+```sh
+python3 scripts/test_source_ledger_matcher.py --watch-components --offline \
+  --output-dir /tmp/cass-gh538-watch-sources
+```
+
+Add `--watch-scan` to include the exact `WatchSourceLedger::scan` method and the
+two synthetic connector boundary tests. This option implies
+`--watch-components`. Those tests mutate real source files after delivering a
+prefix, withhold the completion event as Codex and Claude do, and require a retry
+signal both at the next source boundary and at the end of the scan. They then
+scan the settled source and require its complete bytes and a completion receipt.
+The SQL methods `begin_publication` and `publish_batch` are excluded completely;
+the harness supplies no simulated database.
+
+Both modes verify the cached `franken_agent_detection` checkout against the
+exact revision in `Cargo.lock`. `--fad-checkout DIR` can select that checkout
+explicitly. The smaller mode extracts its actual source metadata type and
+methods; scan mode also extracts the actual normalized/provenance types,
+`Connector` trait, scan context and source hooks. The CASS observation, key and
+workspace-policy helpers used in scan mode are copied verbatim.
+
+The generated report lists each adapter: a minimal `ScanRoot` carrier, fixture
+dispatch to the production dependency-policy declarations, and, for scan mode,
+an absent-progress adapter and a deliberately inactive source-filter adapter.
+Progress methods panic if unexpectedly called. The scan fixture uses an
+explicit supplemental producer-contract string and no path/workspace
+exclusions. Its two `serial_test` annotations and import are the only changes to
+the selected boundary tests; the executable always runs with one test thread.
+This does **not** validate active-writer filtering, cancellation, the complete
+factory registry, aggregate receipt-map bounds, receipt/debt transactions,
+native notifications, or end-to-end ingestion and searchability.
+
+The small dependency graph is derived from the repository lockfile, audited
+before compilation, and built with one job and `--locked`. Use
+`--toolchain-bin DIR` for an installed pinned toolchain and `--target-dir DIR` to
+reuse a separate component build cache. Every run retains its generated sources,
+input and selected-range hashes, dependency checksums, compiler identities,
+commands, logs, executable hash, test inventory and exclusions under
+`runs/<timestamp>-<PID>/`; `report.json` points to the latest result. Input and
+generated source hashes are checked again after testing. The workload benchmark
+remains intentionally ignored unless `--bench` is requested.

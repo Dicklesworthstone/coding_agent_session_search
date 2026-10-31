@@ -112038,10 +112038,7 @@ fn run_index_with_data(
     let previous_robot_trace_ingest =
         robot_trace_ingest.then(|| indexer::set_robot_trace_ingest_enabled(true));
     let index_handle = index_worker_thread_builder()
-        .spawn(move || match mirror_source_ids {
-            Some(source_ids) => indexer::run_index_for_mirror_sources(opts_clone, source_ids),
-            None => indexer::run_index(opts_clone, None),
-        })
+        .spawn(move || indexer::run_cli_index(opts_clone, mirror_source_ids))
         .map_err(|error| CliError {
             code: 9,
             kind: CliErrorKind::Index.kind_str(),

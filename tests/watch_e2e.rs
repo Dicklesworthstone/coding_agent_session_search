@@ -204,6 +204,48 @@ mod deferred_watch_sources {
         writeln!(file, "{message}").expect("append complete source event");
     }
 
+    #[cfg(unix)]
+    fn append_claude_user(path: &Path, needle: &str, session_id: &str) {
+        use std::io::Write;
+
+        let message = serde_json::json!({
+            "type": "user", "cwd": "/workspace", "sessionId": session_id,
+            "message": {"role": "user", "content": needle},
+            "timestamp": "2025-11-12T18:32:00.000Z"
+        });
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("open Claude source for append");
+        writeln!(file, "{message}").expect("append complete Claude source event");
+    }
+
+    #[cfg(unix)]
+    fn snapshot_mirror(data: &Path) -> Vec<(std::path::PathBuf, Vec<u8>, std::time::SystemTime)> {
+        let root = data.join("raw-mirror/v1");
+        let mut paths = vec![root.join(".usage-generation")];
+        for directory in ["manifests", "capture-cache", "blobs"] {
+            for entry in walkdir::WalkDir::new(root.join(directory)) {
+                let entry = entry.expect("enumerate preserved mirror files");
+                if entry.file_type().is_file() {
+                    paths.push(entry.into_path());
+                }
+            }
+        }
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let bytes = fs::read(&path).expect("read preserved mirror file");
+                let modified = fs::metadata(&path)
+                    .expect("preserved mirror metadata")
+                    .modified()
+                    .expect("preserved mirror modification time");
+                (path, bytes, modified)
+            })
+            .collect()
+    }
+
     fn assert_deferred_source_retried(skipped_at_startup: bool, streaming: bool) {
         let home = indexed_watch_home();
         let data = home.path().join("cass-data");
@@ -423,33 +465,6 @@ mod deferred_watch_sources {
                 .expect("set fixture modification time");
         }
 
-        fn snapshot_mirror(
-            data: &Path,
-        ) -> Vec<(std::path::PathBuf, Vec<u8>, std::time::SystemTime)> {
-            let root = data.join("raw-mirror/v1");
-            let mut paths = vec![root.join(".usage-generation")];
-            for directory in ["manifests", "capture-cache", "blobs"] {
-                for entry in walkdir::WalkDir::new(root.join(directory)) {
-                    let entry = entry.expect("enumerate preserved mirror files");
-                    if entry.file_type().is_file() {
-                        paths.push(entry.into_path());
-                    }
-                }
-            }
-            paths.sort();
-            paths
-                .into_iter()
-                .map(|path| {
-                    let bytes = fs::read(&path).expect("read preserved mirror file");
-                    let modified = fs::metadata(&path)
-                        .expect("preserved mirror metadata")
-                        .modified()
-                        .expect("preserved mirror modification time");
-                    (path, bytes, modified)
-                })
-                .collect()
-        }
-
         fn staging_modified(data: &Path) -> std::time::SystemTime {
             fs::metadata(data.join("raw-mirror/v1/tmp"))
                 .expect("mirror staging directory")
@@ -627,6 +642,259 @@ mod deferred_watch_sources {
                 path.display()
             );
         }
+    }
+
+    /// A full raw mirror must not block provider ingestion. Exercise startup,
+    /// native notifications and restart
+    /// with capture actually refused throughout, then inspect canonical rows
+    /// as well as lexical hits so de-duplicated search results cannot hide
+    /// duplicated conversations or messages in storage.
+    #[cfg(unix)]
+    #[test]
+    fn gh538_live_watch_ingests_startup_append_and_restart_over_mirror_cap() {
+        let home = indexed_watch_home();
+        let data = home.path().join("cass-data");
+        let sessions = home.path().join(".codex/sessions");
+        let baseline = sessions.join("rollout-baseline.jsonl");
+        let preserved = snapshot_mirror(&data);
+        assert!(
+            preserved.len() >= 4,
+            "the baseline must have a real manifest, source cache, blob and generation"
+        );
+        let environment = [
+            ("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0"),
+            ("CASS_RAW_MIRROR_MAX_BYTES", "1"),
+            ("CASS_RAW_MIRROR_MIN_FREE_BYTES", "67108864"),
+        ];
+
+        // These changes predate native watcher registration. No standalone
+        // index command is run after this point, including across restarts.
+        append_user(&baseline, "capbaselineappendgh538");
+        let startup = sessions.join("rollout-cap-startup.jsonl");
+        write_codex_session(&startup, "capstartupgh538", "cap-startup-gh538");
+        let projects = home.path().join(".claude/projects");
+        let startup_project = projects.join("cap-startup");
+        fs::create_dir_all(&startup_project).expect("Claude project present before startup");
+        let claude_startup = startup_project.join("cap-startup.jsonl");
+        write_claude_session_with_id(
+            &claude_startup,
+            "claudequotaopen538",
+            "claude-cap-startup-gh538",
+        );
+        let (mut child, log_path) = start_watch_with_env(home.path(), &data, true, &environment);
+        for needle in [
+            "capbaselineappendgh538",
+            "capstartupgh538",
+            "claudequotaopen538",
+        ] {
+            wait_for_hit(&mut child, home.path(), &data, &log_path, needle);
+        }
+
+        // A directory created after native watcher installation and a sibling
+        // subsequently created in that same directory exercise both event
+        // shapes from the report. Payload times remain older than ingestion.
+        let nested = sessions.join("2026/10/31");
+        fs::create_dir_all(&nested).expect("create new watched source directory");
+        let live = nested.join("rollout-cap-live.jsonl");
+        write_codex_session(&live, "caplivegh538", "cap-live-gh538");
+        wait_for_hit(&mut child, home.path(), &data, &log_path, "caplivegh538");
+        let sibling = nested.join("rollout-cap-sibling.jsonl");
+        write_codex_session(&sibling, "capsiblinggh538", "cap-sibling-gh538");
+        wait_for_hit(&mut child, home.path(), &data, &log_path, "capsiblinggh538");
+        for needle in ["capappendonegh538", "capappendtwogh538"] {
+            append_user(&live, needle);
+            wait_for_hit(&mut child, home.path(), &data, &log_path, needle);
+        }
+        let live_project = projects.join("cap-live");
+        fs::create_dir(&live_project).expect("new Claude project while watcher is resident");
+        let claude_live = live_project.join("cap-live.jsonl");
+        write_claude_session_with_id(&claude_live, "claudequotalive538", "claude-cap-live-gh538");
+        wait_for_hit(
+            &mut child,
+            home.path(),
+            &data,
+            &log_path,
+            "claudequotalive538",
+        );
+        for needle in ["claudequotaone538", "claudequotatwo538"] {
+            append_claude_user(&claude_live, needle, "claude-cap-live-gh538");
+            wait_for_hit(&mut child, home.path(), &data, &log_path, needle);
+        }
+        let first_logs = fs::read_to_string(&log_path).expect("first watch evidence");
+        assert!(
+            first_logs.contains("raw_mirror_capture_paused"),
+            "the fixture must reach a real cap refusal: {first_logs}"
+        );
+        child.0.kill().expect("interrupt watcher between updates");
+        child.0.wait().expect("reap interrupted watcher");
+
+        append_user(&live, "caprestartgh538");
+        append_claude_user(
+            &claude_live,
+            "claudequotarestart538",
+            "claude-cap-live-gh538",
+        );
+        let offline_dir = sessions.join("2026/11/01");
+        fs::create_dir_all(&offline_dir).expect("new source directory while watcher is stopped");
+        let offline = offline_dir.join("rollout-cap-offline.jsonl");
+        write_codex_session(&offline, "capofflinegh538", "cap-offline-gh538");
+        let (mut restarted, restart_log) =
+            start_watch_with_env(home.path(), &data, true, &environment);
+        for needle in [
+            "caprestartgh538",
+            "capofflinegh538",
+            "claudequotarestart538",
+        ] {
+            wait_for_hit(&mut restarted, home.path(), &data, &restart_log, needle);
+        }
+        append_user(&live, "capafterrestartgh538");
+        wait_for_hit(
+            &mut restarted,
+            home.path(),
+            &data,
+            &restart_log,
+            "capafterrestartgh538",
+        );
+        append_claude_user(&claude_live, "claudequotaafter538", "claude-cap-live-gh538");
+        wait_for_hit(
+            &mut restarted,
+            home.path(),
+            &data,
+            &restart_log,
+            "claudequotaafter538",
+        );
+        for needle in [
+            "baselinewatch",
+            "capbaselineappendgh538",
+            "capstartupgh538",
+            "caplivegh538",
+            "capsiblinggh538",
+            "capappendonegh538",
+            "capappendtwogh538",
+            "caprestartgh538",
+            "capofflinegh538",
+            "capafterrestartgh538",
+            "claudequotaopen538",
+            "claudequotalive538",
+            "claudequotaone538",
+            "claudequotatwo538",
+            "claudequotarestart538",
+            "claudequotaafter538",
+        ] {
+            assert_eq!(
+                content_hit_count(&search(home.path(), &data, needle), needle),
+                1,
+                "old and new content must remain searchable exactly once: {needle}"
+            );
+        }
+        let status = assert_cmd::Command::from_std(cass(home.path(), &data))
+            .args(["status", "--json"])
+            .timeout(Duration::from_secs(10))
+            .output()
+            .expect("status after searchable publication");
+        assert!(
+            status.status.success(),
+            "status failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let status: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+        assert_eq!(status["pending"]["watch_active"], true, "{status}");
+        assert_eq!(status["pending"]["sessions"], 0, "{status}");
+        assert_eq!(status["index"]["status"], "ready", "{status}");
+        assert_eq!(status["index"]["documents"], 23, "{status}");
+
+        let restarted_logs = fs::read_to_string(&restart_log).expect("restart watch evidence");
+        assert!(
+            restarted_logs.contains("raw_mirror_capture_paused"),
+            "capture must remain refused after restart: {restarted_logs}"
+        );
+        assert!(
+            !restarted_logs.contains("index-stalled"),
+            "{restarted_logs}"
+        );
+        restarted
+            .0
+            .kill()
+            .expect("stop watcher before canonical inspection");
+        restarted
+            .0
+            .wait()
+            .expect("reap watcher before canonical inspection");
+
+        let storage = SqliteStorage::open_readonly(&data.join("agent_search.db"))
+            .expect("inspect canonical archive after watcher exit");
+        let source_paths: Vec<String> = storage
+            .raw()
+            .query_map_collect("SELECT source_path FROM conversations", &[], |row| {
+                row.get_typed(0)
+            })
+            .expect("read canonical conversation identities");
+        assert_eq!(
+            source_paths.len(),
+            7,
+            "no duplicate canonical conversations"
+        );
+        let rows: Vec<(String, String)> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT c.source_path, m.content FROM conversations c \
+                 JOIN messages m ON m.conversation_id = c.id ORDER BY c.id, m.idx",
+                &[],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .expect("read every canonical message, including repeated assistant text");
+        let expected: [(&Path, &[&str]); 7] = [
+            (
+                &baseline,
+                &["baselinewatch", "acknowledged", "capbaselineappendgh538"],
+            ),
+            (&startup, &["capstartupgh538", "acknowledged"]),
+            (
+                &live,
+                &[
+                    "caplivegh538",
+                    "acknowledged",
+                    "capappendonegh538",
+                    "capappendtwogh538",
+                    "caprestartgh538",
+                    "capafterrestartgh538",
+                ],
+            ),
+            (&sibling, &["capsiblinggh538", "acknowledged"]),
+            (&offline, &["capofflinegh538", "acknowledged"]),
+            (&claude_startup, &["claudequotaopen538", "ready"]),
+            (
+                &claude_live,
+                &[
+                    "claudequotalive538",
+                    "ready",
+                    "claudequotaone538",
+                    "claudequotatwo538",
+                    "claudequotarestart538",
+                    "claudequotaafter538",
+                ],
+            ),
+        ];
+        assert_eq!(rows.len(), 23, "no hidden or duplicate canonical messages");
+        for (path, messages) in expected {
+            let canonical = fs::canonicalize(path).expect("canonical fixture path");
+            let actual: Vec<&str> = rows
+                .iter()
+                .filter(|(source, _)| fs::canonicalize(source).unwrap() == canonical)
+                .map(|(_, content)| content.as_str())
+                .collect();
+            assert_eq!(
+                actual,
+                messages,
+                "canonical contents for {}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            snapshot_mirror(&data),
+            preserved,
+            "cap pressure must retain existing evidence without publishing new raw captures"
+        );
     }
 
     /// A real contended filesystem lease must remain diagnosable and abortable,
@@ -971,16 +1239,21 @@ fn write_codex_session(path: &Path, user_text: &str, session_id: &str) {
 }
 
 fn write_claude_session(path: &Path, user_text: &str) {
+    write_claude_session_with_id(path, user_text, "sess-1");
+}
+
+fn write_claude_session_with_id(path: &Path, user_text: &str, session_id: &str) {
     let sample = format!(
         concat!(
-            "{{\"type\":\"user\",\"cwd\":\"/workspace\",\"sessionId\":\"sess-1\",\"gitBranch\":\"main\",",
+            "{{\"type\":\"user\",\"cwd\":\"/workspace\",\"sessionId\":\"{session_id}\",\"gitBranch\":\"main\",",
             "\"message\":{{\"role\":\"user\",\"content\":\"{user_text}\"}},",
             "\"timestamp\":\"2025-11-12T18:31:18.000Z\"}}\n",
             "{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"model\":\"claude-opus-4\",",
             "\"content\":[{{\"type\":\"text\",\"text\":\"ready\"}}]}},",
             "\"timestamp\":\"2025-11-12T18:31:20.000Z\"}}\n"
         ),
-        user_text = user_text
+        user_text = user_text,
+        session_id = session_id,
     );
     std::fs::write(path, sample).expect("write claude session");
 }

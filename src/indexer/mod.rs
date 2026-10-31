@@ -18,6 +18,11 @@ pub mod semantic_progress;
 mod source_ledger_tests;
 mod source_writer_probe;
 pub(crate) mod staging_reclaim;
+#[cfg(test)]
+mod watch_ingestion_tests;
+mod watch_source_cache;
+mod watch_source_ledger;
+mod watch_source_stability;
 
 use self::quarantine::{QuarantineKey, QuarantineState};
 use self::raw_source_exclusions::RawSourceExclusions;
@@ -3539,7 +3544,7 @@ fn lexical_rebuild_db_state_matches_legacy(
 }
 
 #[derive(Debug)]
-struct IndexRunLockGuard {
+pub(crate) struct IndexRunLockGuard {
     // Keep the file handle alive for the lifetime of the lock.
     file: File,
     // The data-dir lock protects derived assets; this separate pathname lease
@@ -3593,6 +3598,10 @@ impl Drop for IndexRunLockGuard {
 }
 
 impl IndexRunLockGuard {
+    pub(crate) fn protects_data_dir(&self, data_dir: &Path) -> bool {
+        self._path == data_dir.join("index-run.lock")
+    }
+
     fn acquire_archive_write_lease(&mut self) -> Result<()> {
         if self.archive_write_lease.is_none() {
             self.archive_write_lease = Some(acquire_archive_write_lease(&self.archive_path)?);
@@ -4184,6 +4193,7 @@ const WATCH_STARTUP_SUB_PHASE_TAXONOMY: &[&str] = &[
     // the stable IDs of any future appended phases cannot reuse it.
     "watch_startup:count_nonresumable_checkpoint_conversations",
     "watch_startup:fts_shadow_viability",
+    "watch_startup:raw_mirror_maintenance",
 ];
 
 /// Lookup the taxonomy step index for a sub-phase string. Returns
@@ -14568,7 +14578,7 @@ fn remember_discovered_connector(discovered_names: &mut Vec<String>, connector_n
     }
 }
 
-fn source_ledger_key(source: &DiscoveredSourceFile, ctx: &ScanContext) -> String {
+fn source_ledger_key(source: &DiscoveredSourceFile, ctx: &ScanContext) -> Option<String> {
     // dunce: on Windows the plain spelling (C:\...) a scan records, not the
     // verbatim \\?\C:\... std::fs::canonicalize returns (9v9xi).
     let canonical =
@@ -14576,21 +14586,28 @@ fn source_ledger_key(source: &DiscoveredSourceFile, ctx: &ScanContext) -> String
     let mappings = ctx
         .scan_roots
         .iter()
-        .map(|root| serde_json::json!([root.path, root.workspace_rewrites]))
+        .map(|root| (&root.path, &root.workspace_rewrites))
         .collect::<Vec<_>>();
-    let identity = serde_json::json!([
-        source.provider_slug,
-        source.scan_root,
-        canonical,
-        source.origin.source_id,
-        source.origin.kind,
-        source.origin.host,
-        mappings
-    ]);
-    format!(
+    // Path's JSON serializer rejects non-Unicode names. Missing identity
+    // evidence must disable reuse, not panic before a source can be parsed or
+    // collapse distinct native paths through lossy replacement characters.
+    // Keep the Value intermediate so existing workspace-mapping object order
+    // (and therefore every already-persisted key) stays byte-for-byte stable.
+    let identity = serde_json::to_value((
+        &source.provider_slug,
+        &source.scan_root,
+        &canonical,
+        &source.origin.source_id,
+        &source.origin.kind,
+        &source.origin.host,
+        mappings,
+    ))
+    .ok()?;
+    let encoded = serde_json::to_vec(&identity).ok()?;
+    Some(format!(
         "source_ingest_v1:{}",
-        blake3::hash(identity.to_string().as_bytes()).to_hex()
-    )
+        blake3::hash(&encoded).to_hex()
+    ))
 }
 
 fn source_file_observation(path: &Path) -> Option<serde_json::Value> {
@@ -14745,9 +14762,8 @@ fn scan_with_durable_source_boundaries(
         *primary_before.borrow_mut() = source_file_observation(&source.source_path);
         let skip = env!("CASS_SOURCE_INGEST_REUSE") == "true"
             && !filtered.get()
-            && config
-                .source_ledger
-                .get(&source_ledger_key(source, &ctx))
+            && source_ledger_key(source, &ctx)
+                .and_then(|key| config.source_ledger.get(&key))
                 .is_some_and(|saved| {
                     source_ledger_matches_with_contract(saved, source, &producer_contract)
                 });
@@ -14780,8 +14796,11 @@ fn scan_with_durable_source_boundaries(
         ) else {
             return sender.borrow_mut().flush();
         };
+        let Some(key) = source_ledger_key(&completion.source, &ctx) else {
+            return sender.borrow_mut().flush();
+        };
         let entry = crate::storage::sqlite::SourceIngestLedgerEntry {
-            key: source_ledger_key(&completion.source, &ctx),
+            key,
             observation: serde_json::json!({"primary":primary,"dependencies":dependencies,
                 "producer_contract":producer_contract})
             .to_string(),
@@ -17169,18 +17188,42 @@ pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
 ) -> Result<()> {
-    run_index_inner(opts, event_channel, None, None)
+    run_index_inner(opts, event_channel, None, None, false)
+}
+
+/// Preserve the existing explicit `cass index` admission for automatic raw
+/// retention. Refresh, doctor, TUI and library indexing do not acquire it just
+/// because maintenance now lives inside the observed index owner.
+pub(crate) fn run_cli_index(opts: IndexOptions, source_ids: Option<Vec<String>>) -> Result<()> {
+    match source_ids {
+        Some(source_ids) => run_index_for_mirror_sources_inner(opts, source_ids, true),
+        None => run_index_inner(opts, None, None, None, true),
+    }
 }
 
 /// Re-read only the selected remote mirrors, without advancing local scan
 /// watermarks or treating unchanged mirror metadata as proof of ingestion.
 pub fn run_index_for_mirror_sources(opts: IndexOptions, source_ids: Vec<String>) -> Result<()> {
+    run_index_for_mirror_sources_inner(opts, source_ids, false)
+}
+
+fn run_index_for_mirror_sources_inner(
+    opts: IndexOptions,
+    source_ids: Vec<String>,
+    maintain_raw_mirror: bool,
+) -> Result<()> {
     anyhow::ensure!(!source_ids.is_empty(), "mirror reingest requires a source");
     anyhow::ensure!(
         !opts.watch && opts.watch_once_paths.is_none() && !opts.force_rebuild,
         "mirror reingest cannot run a watch or canonical-only rebuild"
     );
-    run_index_inner(opts, None, Some(Arc::new(HashMap::new())), Some(source_ids))
+    run_index_inner(
+        opts,
+        None,
+        Some(Arc::new(HashMap::new())),
+        Some(source_ids),
+        maintain_raw_mirror,
+    )
 }
 
 /// qu81y class-B injection seam: run one index pass with the connectors'
@@ -17201,6 +17244,7 @@ pub fn run_index_with_local_connector_roots(
         event_channel,
         Some(Arc::new(local_connector_roots)),
         None,
+        false,
     )
 }
 
@@ -17289,6 +17333,7 @@ fn run_index_inner(
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
     local_connector_roots: LocalConnectorRootsOverride,
     mirror_source_ids: Option<Vec<String>>,
+    maintain_raw_mirror: bool,
 ) -> Result<()> {
     let progress = opts.progress.clone();
     let result = run_index_with_storage_ownership(
@@ -17296,6 +17341,7 @@ fn run_index_inner(
         event_channel,
         local_connector_roots,
         mirror_source_ids,
+        maintain_raw_mirror,
     );
     // Some archive diagnostics intentionally turn engine errors into reason
     // strings. Once the owner has drained, a requested stop must not escape
@@ -17318,6 +17364,7 @@ fn run_index_with_storage_ownership(
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
     local_connector_roots: LocalConnectorRootsOverride,
     mirror_source_ids: Option<Vec<String>>,
+    maintain_raw_mirror: bool,
 ) -> Result<()> {
     let _raw_mirror_io = observe_index_raw_mirror_io(opts.progress.as_ref());
     // Reject malformed configuration before opening storage or capturing any
@@ -17550,6 +17597,13 @@ fn run_index_with_storage_ownership(
         }};
     }
 
+    // Retention used to run in main before tracing and the watchdog existed.
+    // Reuse the held index lease and the normal monitored preflight instead.
+    if maintain_raw_mirror {
+        preflight_phase!("watch_startup:raw_mirror_maintenance");
+        crate::raw_mirror::maintain_for_index(&opts.data_dir, &opts.db_path, &index_run_lock);
+        complete_preflight_phase!();
+    }
     preflight_phase!("watch_startup:ensure_index_dir");
     let index_path = index_dir(&opts.data_dir)?;
     complete_preflight_phase!();
@@ -20213,7 +20267,7 @@ fn run_index_with_storage_ownership(
                     )
                     .map(|outcome| {
                         retry_sources.extend(outcome.retry_sources);
-                        outcome.indexed
+                        outcome.published_conversations
                     });
                     finalize_watch_reindex_result(
                         indexed,
@@ -20297,7 +20351,7 @@ fn run_index_with_storage_ownership(
                         )
                         .map(|outcome| {
                             retry_sources.extend(outcome.retry_sources);
-                            outcome.indexed
+                            outcome.published_conversations
                         }),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
@@ -32324,7 +32378,14 @@ where
     // Stale check interval: check every 5 minutes for quicker detection
     let stale_check_interval = Duration::from_secs(300);
     let mut pending = WatchEventBacklog::default();
-    let mut pending_rescan = !pending.extend(deferred_sources);
+    // Register notifications before reconciling the startup snapshot. A file
+    // written after startup discovery but before watch registration produces
+    // no event for this watcher; source receipts make this second census cheap.
+    let mut pending_rescan = !pending.extend(
+        deferred_sources
+            .into_iter()
+            .chain(roots.iter().map(|(_, root)| root.path.clone())),
+    );
     let mut first_event = (pending_rescan || !pending.paths.is_empty()).then(Instant::now);
     let mut last_stale_check = Instant::now();
     // Initialize to the past so the first scan can fire immediately.
@@ -32567,6 +32628,9 @@ fn reindex_paths(
 #[derive(Default)]
 struct WatchReindexOutcome {
     indexed: usize,
+    /// Conversations whose new/revised content or recovery actually reached
+    /// a committed lexical generation. Parsing old packets is not ingestion.
+    published_conversations: usize,
     retry_sources: BTreeSet<PathBuf>,
 }
 
@@ -32651,7 +32715,8 @@ fn reindex_paths_with_semantic_delta(
                 .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
             watch_lexical_replay_debt_for_root(&storage, kind, &root)?
         };
-        let replay_canonical = !pending_lexical_debt.is_empty();
+        let replay_canonical = pending_lexical_debt.iter().any(|debt| !debt.discovery_only);
+        let source_scoped = conn.supports_source_boundaries();
         // Semantic watch-once must reconcile and attest an unchanged source,
         // even when the caller no longer captures callback-local deltas.
         if explicit_watch_once && !force_full && !opts.semantic && semantic_delta.is_none() {
@@ -32707,6 +32772,11 @@ fn reindex_paths_with_semantic_delta(
             vec![root.clone()],
             since_ts,
         );
+        if source_scoped {
+            // Per-source receipts, rather than a provider timestamp, decide
+            // reuse. Backdated imports and restart gaps remain discoverable.
+            ctx.since_ts = None;
+        }
         if let Some(progress) = &opts.progress {
             let progress = Arc::clone(progress);
             ctx = ctx.with_progress_tick(Arc::new(move || progress.tick_activity()));
@@ -32739,40 +32809,61 @@ fn reindex_paths_with_semantic_delta(
             WatchNomemDeferrals::load(&opts.data_dir)
         };
         let now_ms = FrankenStorage::now_millis();
-        let scan_error = match conn.scan_with_callback(&ctx, &mut |mut conversation| {
-            if let Some(progress) = &opts.progress {
-                progress.check_stop()?;
-                progress.tick_activity();
-            }
-            if should_skip_active_session_source(
-                active_source_filter,
-                root.origin.kind,
-                &conversation.source_path,
-            ) {
-                active_sources_skipped = active_sources_skipped.saturating_add(1);
-                return Ok(());
-            }
-            if should_skip_subagent(&conversation)
-                || should_skip_excluded_source(&conversation.source_path)
-            {
-                return Ok(());
-            }
-            ingest_diagnostics.observe_conversation(&mut conversation);
-            // Prepare sort-key identity now, but copy raw bytes only for the
-            // bounded batch about to commit. A mirror of every conversation
-            // before the first commit starved watch progress on large roots.
-            prepare_conversation_metadata_for_ingest(
-                kind.slug(),
-                &root.origin,
-                Some(&root),
-                &mut conversation,
-            );
-            if watch_conversation_in_nomem_backoff(&nomem_deferrals, &conversation, now_ms) {
-                nomem_backoff_held = nomem_backoff_held.saturating_add(1);
-                return Ok(());
-            }
-            convs.push(conversation, opts.progress.as_deref())
-        }) {
+        let saved_source_ledger = {
+            let storage = storage
+                .lock()
+                .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+            watch_source_cache::load_bounded_watch_source_ledger(
+                &storage,
+                opts.progress.as_deref(),
+            )?
+        };
+        let mut source_ledger = watch_source_ledger::WatchSourceLedger::default();
+        let scan_error = match source_ledger.scan(
+            conn.as_ref(),
+            kind.slug(),
+            &ctx,
+            &saved_source_ledger,
+            !explicit_watch_once && !force_full,
+            replay_canonical,
+            active_source_filter,
+            opts.progress.as_deref(),
+            &mut |mut conversation| {
+                if let Some(progress) = &opts.progress {
+                    progress.check_stop()?;
+                    progress.tick_activity();
+                }
+                if should_skip_active_session_source(
+                    active_source_filter,
+                    root.origin.kind,
+                    &conversation.source_path,
+                ) {
+                    active_sources_skipped = active_sources_skipped.saturating_add(1);
+                    return Ok(false);
+                }
+                if should_skip_subagent(&conversation)
+                    || should_skip_excluded_source(&conversation.source_path)
+                {
+                    return Ok(false);
+                }
+                ingest_diagnostics.observe_conversation(&mut conversation);
+                // Prepare sort-key identity now, but copy raw bytes only for the
+                // bounded batch about to commit. A mirror of every conversation
+                // before the first commit starved watch progress on large roots.
+                prepare_conversation_metadata_for_ingest(
+                    kind.slug(),
+                    &root.origin,
+                    Some(&root),
+                    &mut conversation,
+                );
+                if watch_conversation_in_nomem_backoff(&nomem_deferrals, &conversation, now_ms) {
+                    nomem_backoff_held = nomem_backoff_held.saturating_add(1);
+                    return Ok(false);
+                }
+                convs.push(conversation, opts.progress.as_deref())?;
+                Ok(true)
+            },
+        ) {
             Ok(()) => None,
             Err(error) => {
                 ingest_diagnostics.observe_connector_scan_error(&root.path, &error);
@@ -32786,9 +32877,14 @@ fn reindex_paths_with_semantic_delta(
                 Some(message)
             }
         };
+        drop(saved_source_ledger);
         if let Some(progress) = &opts.progress {
             progress.check_stop()?;
         }
+        active_sources_skipped =
+            active_sources_skipped.saturating_add(source_ledger.active_sources_skipped);
+        ingest_diagnostics
+            .observe_reused_sources(std::mem::take(&mut source_ledger.reused_sources));
         let scan_ms = scan_start.elapsed().as_millis() as u64;
         // Publish the source error before persistence can fail for a separate
         // reason, including the all-bad case that has no ingest phase below.
@@ -32829,7 +32925,30 @@ fn reindex_paths_with_semantic_delta(
         let preserve_this_watch_watermark = preserve_watch_watermark
             || preparse_active_source_skipped
             || active_sources_skipped > 0
-            || scan_error.is_some();
+            || scan_error.is_some()
+            || source_ledger.unstable_sources;
+        // A reused source is already certified by its unchanged publication
+        // receipt. Preparse may defer its optional mirror capture while an
+        // unchanged writer still holds it open; that must not strand replay
+        // debt belonging to another, successfully recovered source.
+        let recovery_scan_complete = if source_scoped {
+            !preserve_watch_watermark
+                && active_sources_skipped == 0
+                && scan_error.is_none()
+                && !source_ledger.unstable_sources
+        } else {
+            !preserve_this_watch_watermark
+        };
+        if source_scoped && (scan_error.is_some() || source_ledger.unstable_sources) {
+            let storage = storage
+                .lock()
+                .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+            persist_watch_lexical_replay_debt(
+                &storage,
+                &WatchLexicalReplayDebt::for_discovery(kind, &root),
+            )?;
+            outcome.retry_sources.insert(root.path.clone());
+        }
 
         record_connector_ingest_report(opts.progress.as_ref(), ingest_diagnostics.finish());
         if nomem_backoff_held > 0 {
@@ -32873,7 +32992,7 @@ fn reindex_paths_with_semantic_delta(
                 // scheduled while the existing per-conversation backoff runs.
                 outcome.retry_sources.insert(root.path.clone());
             }
-            if scan_error.is_some() {
+            if scan_error.is_some() && !source_scoped {
                 // A later successful sibling may advance the shared provider
                 // watermark. Keep this source eligible for an unfiltered retry
                 // even when it had no valid conversation to publish today.
@@ -32884,6 +33003,18 @@ fn reindex_paths_with_semantic_delta(
                     &storage,
                     &WatchLexicalReplayDebt::for_root(kind, &root),
                 )?;
+            }
+            if recovery_scan_complete {
+                let storage = storage
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+                let selected_path = crate::normalize_path_identity(&root.path);
+                for debt in pending_lexical_debt.iter().filter(|debt| {
+                    debt.discovery_only
+                        && crate::normalize_path_identity(&debt.path).starts_with(&selected_path)
+                }) {
+                    clear_watch_lexical_replay_debt(&storage, debt)?;
+                }
             }
             continue;
         }
@@ -32897,6 +33028,8 @@ fn reindex_paths_with_semantic_delta(
         let mut quarantined_conversations = 0usize;
         let mut deferred_conversations = nomem_backoff_held;
         let mut lexical_replay_deferred = false;
+        let mut published_conversations = 0usize;
+        let mut remaining_conversations = conv_count;
         let current_debt = WatchLexicalReplayDebt::for_root(kind, &root);
         {
             let storage = storage
@@ -32908,7 +33041,7 @@ fn reindex_paths_with_semantic_delta(
             // Establish recovery debt BEFORE any canonical transaction. It
             // covers the whole selected source, including earlier successful
             // additions lost when a later addition discards this writer.
-            persist_watch_lexical_replay_debt(&storage, &current_debt)?;
+            source_ledger.begin_publication(&storage, &current_debt, opts.progress.as_deref())?;
             if replay_canonical {
                 // A prior failed callback may still own uncommitted additions.
                 // Reconciliation must start from the published generation.
@@ -32923,6 +33056,7 @@ fn reindex_paths_with_semantic_delta(
             if chunk.is_empty() {
                 break;
             }
+            remaining_conversations = remaining_conversations.saturating_sub(chunk.len());
             if connector_name.is_none() {
                 connector_name = chunk.first().map(|conv| conv.agent_slug.clone());
             }
@@ -33040,6 +33174,11 @@ fn reindex_paths_with_semantic_delta(
             // watch watermark. A crash after this point replays at worst
             // the next unfinished chunk, not the entire backlog.
             let mut lexical_update_deferred = chunk_outcome.batch_outcome.lexical_update_deferred;
+            let chunk_needs_publication = replay_canonical
+                || chunk_outcome.batch_outcome.inserted_conversations > 0
+                || chunk_outcome.batch_outcome.inserted_messages > 0
+                || chunk_outcome.batch_outcome.updated_messages > 0
+                || chunk_outcome.batch_outcome.workspace_changes > 0;
             if chunk_outcome.batch_outcome.workspace_changes > 0 {
                 // Do not leave a live watcher serving old workspace filters.
                 // The pre-mutation checkpoint remains pending if this fails.
@@ -33065,30 +33204,57 @@ fn reindex_paths_with_semantic_delta(
                 );
                 *t_index_guard = None;
             } else {
-                #[cfg(test)]
-                inject_watch_lexical_test_failure(WatchLexicalTestFault::Commit)?;
-                t_index_guard
-                    .as_mut()
-                    .expect("watch Tantivy writer must still be open before commit")
-                    .commit()?;
-            }
-
-            // Keep last_indexed_at current so `cass status` doesn't report stale during watch mode.
-            if lexical_replay_deferred {
-                tracing::warn!(
-                    "skipping watch last_indexed_at update after deferred lexical update so health/status report stale lexical assets"
-                );
-            } else if scan_error.is_some() {
-                tracing::warn!(
-                    "skipping watch last_indexed_at update after incomplete source scan"
-                );
-            } else {
-                persist::with_ephemeral_writer(
-                    &storage,
-                    false,
-                    "updating watch last_indexed_at",
-                    |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
-                )?;
+                if chunk_needs_publication {
+                    #[cfg(test)]
+                    inject_watch_lexical_test_failure(WatchLexicalTestFault::Commit)?;
+                    t_index_guard
+                        .as_mut()
+                        .expect("watch Tantivy writer must still be open before commit")
+                        .commit()?;
+                    published_conversations = published_conversations.saturating_add(
+                        chunk_outcome.batch_outcome.canonical_conversation_ids.len(),
+                    );
+                }
+                if chunk_outcome.quarantined_conversations == 0
+                    && chunk_outcome.deferred_conversations == 0
+                {
+                    // Each receipt follows all of its source's canonical and
+                    // lexical commits. A failed earlier chunk cannot certify
+                    // a multi-conversation source from its successful tail.
+                    let selected_path = crate::normalize_path_identity(&root.path);
+                    let publication_complete = !lexical_replay_deferred
+                        && quarantined_conversations == 0
+                        && deferred_conversations == 0
+                        && (source_scoped || scan_error.is_none())
+                        && (!replay_canonical || recovery_scan_complete);
+                    let completed_debts: Vec<_> = if remaining_conversations == 0
+                        && !lexical_replay_deferred
+                        && quarantined_conversations == 0
+                        && deferred_conversations == 0
+                    {
+                        pending_lexical_debt
+                            .iter()
+                            .chain(std::iter::once(&current_debt))
+                            .filter(|debt| {
+                                crate::normalize_path_identity(&debt.path)
+                                    .starts_with(&selected_path)
+                                    && if debt.discovery_only {
+                                        recovery_scan_complete
+                                    } else {
+                                        publication_complete
+                                    }
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    source_ledger.publish_batch(
+                        &storage,
+                        &chunk,
+                        &completed_debts,
+                        remaining_conversations == 0 && !publication_complete,
+                    )?;
+                }
             }
 
             // Conversations are sorted by watermark, so a clean later
@@ -33131,23 +33297,19 @@ fn reindex_paths_with_semantic_delta(
             let storage = storage
                 .lock()
                 .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
-            if !lexical_replay_deferred
+            if published_conversations > 0
+                && !lexical_replay_deferred
+                && scan_error.is_none()
                 && quarantined_conversations == 0
                 && deferred_conversations == 0
                 && !preserve_this_watch_watermark
             {
-                // A child-only retry must not discharge a failed parent's
-                // sibling work. Broader repair checkpoints are never touched.
-                let selected_path = crate::normalize_path_identity(&root.path);
-                for debt in pending_lexical_debt
-                    .iter()
-                    .chain(std::iter::once(&current_debt))
-                    .filter(|debt| {
-                        crate::normalize_path_identity(&debt.path).starts_with(&selected_path)
-                    })
-                {
-                    clear_watch_lexical_replay_debt(&storage, debt)?;
-                }
+                persist::with_ephemeral_writer(
+                    &storage,
+                    false,
+                    "recording watch publication progress",
+                    |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
+                )?;
             }
         }
         let index_ms = index_start.elapsed().as_millis() as u64;
@@ -33197,6 +33359,9 @@ fn reindex_paths_with_semantic_delta(
         // inserted rows) while including quarantined single-conversation OOMs
         // as forward progress so watch mode does not wedge on a poison file.
         outcome.indexed = outcome.indexed.saturating_add(processed_conversations);
+        outcome.published_conversations = outcome
+            .published_conversations
+            .saturating_add(published_conversations);
         if lexical_replay_deferred || deferred_conversations > 0 {
             // An Ok callback consumes its triggering event. Retained durable
             // debt must also remain in the live pending queue, or a transient
@@ -33332,6 +33497,11 @@ struct WatchLexicalReplayDebt {
     connector: ConnectorKind,
     source_id: String,
     path: PathBuf,
+    /// Discovery failed without leaving unpublished canonical mutations.
+    /// A complete all-reused census can discharge this marker. Old records
+    /// omit the field and retain their conservative publication semantics.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    discovery_only: bool,
 }
 
 impl WatchLexicalReplayDebt {
@@ -33340,6 +33510,14 @@ impl WatchLexicalReplayDebt {
             connector: kind,
             source_id: root.origin.source_id.clone(),
             path: crate::normalize_path_identity(&root.path),
+            discovery_only: false,
+        }
+    }
+
+    fn for_discovery(kind: ConnectorKind, root: &ScanRoot) -> Self {
+        Self {
+            discovery_only: true,
+            ..Self::for_root(kind, root)
         }
     }
 
@@ -45939,6 +46117,7 @@ mod tests {
             "watch_startup:classify_nonresumable_checkpoint",
             "watch_startup:count_nonresumable_checkpoint_conversations",
             "watch_startup:fts_shadow_viability",
+            "watch_startup:raw_mirror_maintenance",
         ];
         for sub_phase in documented_sub_phases {
             assert!(
@@ -69177,10 +69356,8 @@ c.close()
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("cass");
         fs::create_dir_all(&data_dir).unwrap();
-        // The lost source is a Claude Code session because Claude honors the
-        // mtime watermark. Amp cannot show the loss: FAD re-reads every Amp
-        // thread on every scan (Amp never bumps mtimes), so any retry would
-        // recover it and the negative control below would be vacuous.
+        // A backdated Claude source must remain discoverable even after a
+        // newer provider watermark and a notification backlog overflow.
         let selected = tmp.path().join("selected/claude");
         let missed = selected.join("projects/overflow/session-missed.jsonl");
         let unrelated = tmp.path().join("unrelated/amp/thread-other.json");
@@ -69217,8 +69394,8 @@ c.close()
         let roots = [(ConnectorKind::Claude, ScanRoot::local(selected.clone()))];
         let state = Mutex::new(HashMap::from([(ConnectorKind::Claude, i64::MAX / 4)]));
 
-        // A directory-only incremental retry does not recover the lost event:
-        // both the event watermark and directory mtime postdate this source.
+        // Source receipts now make the ordinary directory retry sufficient:
+        // a provider timestamp cannot hide an unacknowledged backdated source.
         assert_eq!(
             reindex_paths(
                 &opts,
@@ -69231,9 +69408,12 @@ c.close()
                 false,
             )
             .unwrap(),
-            0
+            1
         );
-        assert!(watch_lexical_search_ids(&index_path, "overflowrecoveryneedle").is_empty());
+        let recovered_ids = watch_lexical_search_ids(&index_path, "overflowrecoveryneedle");
+        assert_eq!(recovered_ids.len(), 1);
+        let recovered_rows = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        assert_eq!(recovered_rows.len(), 2);
 
         let backlog = Mutex::new(WatchEventBacklog::default());
         let rescan = AtomicBool::new(false);
@@ -69274,6 +69454,7 @@ c.close()
         );
         assert!(!pending_rescan);
         let rows = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        assert_eq!(rows, recovered_rows);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], preserved_rows[0]);
         assert_eq!(
@@ -69281,8 +69462,8 @@ c.close()
             preserved_ids
         );
         assert_eq!(
-            watch_lexical_search_ids(&index_path, "overflowrecoveryneedle").len(),
-            1
+            watch_lexical_search_ids(&index_path, "overflowrecoveryneedle"),
+            recovered_ids
         );
         assert_eq!(fs::read(&missed).unwrap(), source_bytes);
         assert_eq!(
@@ -69311,11 +69492,13 @@ c.close()
             connector: ConnectorKind::Amp,
             source_id: root.origin.source_id.clone(),
             path: alias.clone(),
+            discovery_only: false,
         };
         let unrelated = WatchLexicalReplayDebt {
             connector: ConnectorKind::Amp,
             source_id: root.origin.source_id.clone(),
             path: sibling.clone(),
+            discovery_only: false,
         };
         persist_watch_lexical_replay_debt(&storage, &saved).unwrap();
         persist_watch_lexical_replay_debt(&storage, &unrelated).unwrap();
@@ -69362,6 +69545,7 @@ c.close()
             connector: ConnectorKind::Amp,
             source_id: root.origin.source_id.clone(),
             path: std::fs::canonicalize(&real).unwrap(),
+            discovery_only: false,
         };
         persist_watch_lexical_replay_debt(&storage, &saved).unwrap();
         let pending =

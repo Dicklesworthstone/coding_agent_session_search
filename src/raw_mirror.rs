@@ -5,6 +5,9 @@
 //! exclusions here too, before source access, mirror creation, locks or caches.
 
 mod exclusions;
+#[path = "raw_mirror_cli.rs"]
+mod index_maintenance;
+pub(crate) use index_maintenance::maintain_for_index;
 // Keep the policy next to the store's private validation/publication helpers.
 // The v1 codec and its existing test module remain byte-for-byte unchanged.
 mod store {

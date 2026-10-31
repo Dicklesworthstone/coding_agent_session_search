@@ -52,15 +52,35 @@ pub struct RawMirrorMaintenanceReport {
 /// must not disable otherwise viable indexing. No guard or safety check is
 /// disabled here, and both locks are released before the caller starts indexing.
 pub fn maintain_before_index(data_dir: &Path) -> Result<RawMirrorMaintenanceReport> {
-    if !super::super::super::capture_enabled() {
+    let Some(policy) = automatic_retention_policy_from_env()? else {
         return Ok(RawMirrorMaintenanceReport::default());
+    };
+    maintain(data_dir, &policy, now_ms())
+}
+
+/// The index owner already holds the data-dir lease before its observed
+/// preflight starts. Require that concrete lease, bound to this directory,
+/// instead of attempting to lock the same file through a second handle.
+pub(crate) fn maintain_while_index_owned(
+    data_dir: &Path,
+    index_lease: &crate::indexer::IndexRunLockGuard,
+) -> Result<RawMirrorMaintenanceReport> {
+    let Some(policy) = automatic_retention_policy_from_env()? else {
+        return Ok(RawMirrorMaintenanceReport::default());
+    };
+    maintain_with_index_lease(data_dir, &policy, now_ms(), Some(index_lease))
+}
+
+fn automatic_retention_policy_from_env() -> Result<Option<RawMirrorAutomaticRetention>> {
+    if !super::super::super::capture_enabled() {
+        return Ok(None);
     }
     if let Ok(value) = dotenvy::var("CASS_RAW_MIRROR_AUTO_PRUNE")
         && matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
     {
-        return Ok(RawMirrorMaintenanceReport::default());
+        return Ok(None);
     }
-    maintain(data_dir, &RawMirrorAutomaticRetention::from_env()?, now_ms())
+    RawMirrorAutomaticRetention::from_env().map(Some)
 }
 
 fn content_chunks(manifest: &RawMirrorManifestFile) -> Vec<RawMirrorChunkRef> {
@@ -85,6 +105,7 @@ fn preserved_prefix(root: &Path, old: &RawMirrorManifestFile, new: &RawMirrorMan
     let mut left_bytes = [0_u8; 64 * 1024];
     let mut right_bytes = [0_u8; 64 * 1024];
     while compared < old.source_size_bytes {
+        raw_mirror_checkpoint()?;
         let l = left.get(i).ok_or_else(|| anyhow!("short old raw-mirror content"))?;
         let r = right.get(j).ok_or_else(|| anyhow!("short successor raw-mirror content"))?;
         let remaining_left = l.blob_size_bytes.checked_sub(a).ok_or_else(|| anyhow!("invalid chunk offset"))?;
@@ -99,15 +120,27 @@ fn preserved_prefix(root: &Path, old: &RawMirrorManifestFile, new: &RawMirrorMan
             b += length;
             continue;
         }
-        let mut old_file = File::open(root.join(&l.blob_relative_path))?;
-        let mut new_file = File::open(root.join(&r.blob_relative_path))?;
-        old_file.seek(SeekFrom::Start(a))?;
-        new_file.seek(SeekFrom::Start(b))?;
+        let old_path = root.join(&l.blob_relative_path);
+        let new_path = root.join(&r.blob_relative_path);
+        let mut old_file =
+            raw_mirror_io("open_retention_prefix", &old_path, || File::open(&old_path))?;
+        let mut new_file =
+            raw_mirror_io("open_retention_prefix", &new_path, || File::open(&new_path))?;
+        raw_mirror_io("seek_retention_prefix", &old_path, || {
+            old_file.seek(SeekFrom::Start(a))
+        })?;
+        raw_mirror_io("seek_retention_prefix", &new_path, || {
+            new_file.seek(SeekFrom::Start(b))
+        })?;
         let mut remaining = length;
         while remaining > 0 {
             let count = remaining.min(left_bytes.len() as u64) as usize;
-            old_file.read_exact(&mut left_bytes[..count])?;
-            new_file.read_exact(&mut right_bytes[..count])?;
+            raw_mirror_io("read_retention_prefix", &old_path, || {
+                old_file.read_exact(&mut left_bytes[..count])
+            })?;
+            raw_mirror_io("read_retention_prefix", &new_path, || {
+                new_file.read_exact(&mut right_bytes[..count])
+            })?;
             if left_bytes[..count] != right_bytes[..count] { return Ok(false); }
             remaining -= count as u64;
         }
@@ -145,11 +178,26 @@ fn source_key(manifest: &RawMirrorManifestFile) -> Result<String> {
 }
 
 fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> Result<RawMirrorMaintenanceReport> {
+    maintain_with_index_lease(data_dir, policy, now, None)
+}
+
+fn maintain_with_index_lease(
+    data_dir: &Path,
+    policy: &RawMirrorAutomaticRetention,
+    now: i64,
+    index_lease: Option<&crate::indexer::IndexRunLockGuard>,
+) -> Result<RawMirrorMaintenanceReport> {
     if policy.keep_latest == 0 || policy.safety_hold_down_ms < 0 {
         anyhow::bail!("invalid automatic raw-mirror retention policy");
     }
+    if let Some(lease) = index_lease {
+        anyhow::ensure!(
+            lease.protects_data_dir(data_dir),
+            "automatic retention requires the index lease for this data directory"
+        );
+    }
     let root = raw_mirror_root(data_dir);
-    match fs::symlink_metadata(&root) {
+    match raw_mirror_symlink_metadata(&root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(RawMirrorMaintenanceReport::default()),
         Err(error) => return Err(error.into()),
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -159,10 +207,14 @@ fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> 
     }
     // Acquire the nonblocking index lease FIRST; never wait for an indexer
     // while holding the mirror lock it needs for capture.
-    let _index_run = try_acquire_index_run_lock_for_prune(data_dir)?;
+    let _index_run = if index_lease.is_some() {
+        None
+    } else {
+        Some(try_acquire_index_run_lock_for_prune(data_dir)?)
+    };
     let _mutation = acquire_raw_mirror_mutation_lock(&root)?;
     let used = measured_usage(&root)?;
-    let available = fs2::available_space(&root)?;
+    let available = raw_mirror_io("available_space", &root, || fs2::available_space(&root))?;
     let mut result = RawMirrorMaintenanceReport {
         used_bytes_before: used, used_bytes_after: used, available_bytes_after: available,
         ..RawMirrorMaintenanceReport::default()
@@ -171,6 +223,7 @@ fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> 
     let physical: HashMap<_, _> = collect_raw_mirror_physical_blobs(&root)?.into_iter()
         .map(|blob| (blob.relative_path.clone(), blob)).collect();
     for manifest in &inventory {
+        raw_mirror_checkpoint()?;
         for reference in &manifest.blob_references {
             let blob = physical.get(&reference.blob_relative_path)
                 .ok_or_else(|| anyhow!("automatic retention refused: a referenced blob is missing"))?;
@@ -184,6 +237,7 @@ fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> 
     let mut manifests = HashMap::new();
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for item in &inventory {
+        raw_mirror_checkpoint()?;
         let manifest = read_validated_raw_mirror_manifest(&root, &item.manifest_id)?;
         groups.entry(source_key(&manifest)?).or_default().push(item.manifest_id.clone());
         if !ordinary_capture(&manifest) { protected.insert(item.manifest_id.clone()); }
@@ -191,6 +245,7 @@ fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> 
     }
     // Inventory is oldest first; reverse only within the exact origin identity.
     for ids in groups.values_mut() {
+        raw_mirror_checkpoint()?;
         ids.sort_by(|left, right| {
             let a = &manifests[left];
             let b = &manifests[right];
@@ -203,8 +258,10 @@ fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> 
     let mut selected: BTreeMap<String, String> = BTreeMap::new();
     let mut verified = HashSet::new();
     for ids in groups.values() {
+        raw_mirror_checkpoint()?;
         let anchors: Vec<_> = ids.iter().filter(|id| protected.contains(*id)).collect();
         for id in ids {
+            raw_mirror_checkpoint()?;
             if protected.contains(id) { continue; }
             let old = &manifests[id];
             for successor in &anchors {
@@ -225,6 +282,7 @@ fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> 
     // are NEVER automatically selected. Explicit prune remains operator policy.
     let mut references: BTreeMap<String, (RawMirrorChunkRef, bool)> = BTreeMap::new();
     for item in &inventory {
+        raw_mirror_checkpoint()?;
         for reference in &item.blob_references {
             let entry = references.entry(reference.blob_relative_path.clone())
                 .or_insert_with(|| (reference.clone(), false));
@@ -252,6 +310,7 @@ fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> 
         audit_log_path: None, omitted_entry_count: 0, entries: Vec::new(),
     };
     for item in &inventory {
+        raw_mirror_checkpoint()?;
         if let Some(successor) = selected.get(&item.manifest_id) {
             let old = &manifests[&item.manifest_id];
             report.entries.push(RawMirrorPruneEntry {
@@ -264,6 +323,7 @@ fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> 
         }
     }
     for (path, (reference, retained)) in &references {
+        raw_mirror_checkpoint()?;
         if !retained {
             report.planned_blob_count += 1;
             report.entries.push(RawMirrorPruneEntry {
@@ -296,7 +356,8 @@ fn maintain(data_dir: &Path, policy: &RawMirrorAutomaticRetention, now: i64) -> 
     result.retired_manifests = report.applied_manifest_count;
     result.reclaimed_bytes = report.applied_reclaim_bytes;
     result.used_bytes_after = measured_usage(&root)?;
-    result.available_bytes_after = fs2::available_space(&root)?;
+    result.available_bytes_after =
+        raw_mirror_io("available_space", &root, || fs2::available_space(&root))?;
     result.capture_paused = result.used_bytes_after >= policy.capture.max_bytes
         || result.available_bytes_after <= policy.capture.min_free_bytes;
     Ok(result)

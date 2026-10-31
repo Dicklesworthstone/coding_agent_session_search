@@ -260,3 +260,110 @@ fn legacy_whole_blob_prefix_can_retire_without_a_format_migration() {
     assert!(!fixture.exists(&old));
     assert!(fixture.bytes(&newest).starts_with(&original));
 }
+
+#[test]
+fn gh538_retention_prefix_comparison_observes_cancellation_between_bounded_reads() {
+    let fixture = Fixture::new();
+    let original = transcript(0, 192 * 1024);
+    let old = fixture.record(&original, 1);
+    let mut appended = original.clone();
+    appended.extend(transcript(1, 100 * 1024));
+    let new = fixture.record(&appended, 2);
+    let root = raw_mirror_root(&fixture.data);
+    let old_manifest = read_validated_raw_mirror_manifest(&root, &old.manifest_id).unwrap();
+    let new_manifest = read_validated_raw_mirror_manifest(&root, &new.manifest_id).unwrap();
+    let old_bytes = fs::read(root.join(&old.manifest_relative_path)).unwrap();
+    let new_bytes = fs::read(root.join(&new.manifest_relative_path)).unwrap();
+    let completed = Arc::new(AtomicU64::new(0));
+    let on_progress = completed.clone();
+    let is_cancelled = completed.clone();
+    {
+        let _observer = observe_raw_mirror_io(
+            Arc::new(move || {
+                on_progress.fetch_add(1, Ordering::Relaxed);
+            }),
+            // Let real opens/seeks and the first bounded reads complete,
+            // then interrupt the remaining prefix comparison.
+            Arc::new(move || is_cancelled.load(Ordering::Relaxed) >= 6),
+        );
+        let error = preserved_prefix(&root, &old_manifest, &new_manifest)
+            .expect_err("retention must not ignore a stop during a large prefix comparison");
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
+        }));
+        assert!(completed.load(Ordering::Relaxed) > 0);
+    }
+    assert_eq!(
+        fs::read(root.join(&old.manifest_relative_path)).unwrap(),
+        old_bytes
+    );
+    assert_eq!(
+        fs::read(root.join(&new.manifest_relative_path)).unwrap(),
+        new_bytes
+    );
+    assert_eq!(fixture.bytes(&old), original);
+    assert_eq!(fixture.bytes(&new), appended);
+    assert!(preserved_prefix(&root, &old_manifest, &new_manifest).unwrap());
+}
+
+#[test]
+fn gh538_cancelled_maintenance_releases_both_leases_without_retiring_evidence() {
+    fn held_by_another_handle(file: &File) -> bool {
+        match file.try_lock() {
+            Ok(()) => {
+                file.unlock().unwrap();
+                false
+            }
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(std::fs::TryLockError::Error(error)) => panic!("probe maintenance lease: {error}"),
+        }
+    }
+
+    let fixture = Fixture::new();
+    let old = fixture.record(b"one\n", 1);
+    fixture.record(b"one\ntwo\n", 2);
+    let latest = fixture.record(b"one\ntwo\nthree\n", 3);
+    let root = raw_mirror_root(&fixture.data);
+    // Pre-open independent handles; the observer does no path lookup while
+    // deciding whether the actual maintenance owner holds both leases.
+    drop(try_acquire_index_run_lock_for_prune(&fixture.data).unwrap());
+    let index_probe = File::options()
+        .read(true)
+        .write(true)
+        .open(fixture.data.join("index-run.lock"))
+        .unwrap();
+    let mutation_probe = File::options()
+        .read(true)
+        .write(true)
+        .open(root.join(RAW_MIRROR_MUTATION_LOCK_FILE))
+        .unwrap();
+    let observed_both = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancelled = observed_both.clone();
+    {
+        let _observer = observe_raw_mirror_io(
+            Arc::new(|| {}),
+            Arc::new(move || {
+                let both =
+                    held_by_another_handle(&index_probe) && held_by_another_handle(&mutation_probe);
+                cancelled.fetch_or(both, Ordering::Relaxed);
+                both
+            }),
+        );
+        let error = maintain(&fixture.data, &fixture.policy(), 1000)
+            .expect_err("stop must drain maintenance while both leases are held");
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
+        }));
+    }
+    assert!(observed_both.load(Ordering::Relaxed));
+    let _index = try_acquire_index_run_lock_for_prune(&fixture.data).unwrap();
+    let _mutation = acquire_raw_mirror_mutation_lock(&root).unwrap();
+    assert_eq!(collect_prune_manifests(&root).unwrap().len(), 3);
+    assert!(fixture.exists(&old));
+    assert_eq!(fixture.bytes(&latest), b"one\ntwo\nthree\n");
+    assert!(!root.join("pruned.jsonl").exists());
+}

@@ -138,7 +138,7 @@ fn raw_mirror_record_progress() {
     }
 }
 
-fn raw_mirror_io<T>(
+pub(super) fn raw_mirror_io<T>(
     operation: &'static str,
     path: &Path,
     perform: impl FnOnce() -> std::io::Result<T>,
@@ -1073,7 +1073,7 @@ fn apply_prune_entries(
 
 fn collect_prune_manifests(root: &Path) -> Result<Vec<RawMirrorPruneManifest>> {
     let manifests_dir = root.join("manifests");
-    let metadata = match fs::symlink_metadata(&manifests_dir) {
+    let metadata = match raw_mirror_symlink_metadata(&manifests_dir) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err).with_context(|| format!("stat {}", manifests_dir.display())),
@@ -1086,15 +1086,16 @@ fn collect_prune_manifests(root: &Path) -> Result<Vec<RawMirrorPruneManifest>> {
     }
 
     let mut manifests = Vec::new();
-    for entry in
-        fs::read_dir(&manifests_dir).with_context(|| format!("read {}", manifests_dir.display()))?
-    {
-        let entry = entry?;
+    let mut entries = raw_mirror_io("read_dir", &manifests_dir, || fs::read_dir(&manifests_dir))
+        .with_context(|| format!("read {}", manifests_dir.display()))?;
+    while let Some(entry) = raw_mirror_io("read_dir_next", &manifests_dir, || {
+        entries.next().transpose()
+    })? {
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        let manifest_metadata = fs::symlink_metadata(&path)
+        let manifest_metadata = raw_mirror_symlink_metadata(&path)
             .with_context(|| format!("stat raw mirror manifest {}", path.display()))?;
         if manifest_metadata.file_type().is_symlink() || !manifest_metadata.is_file() {
             anyhow::bail!(
@@ -1264,7 +1265,7 @@ fn load_keep_tag_conversation_ids(
 
 fn collect_raw_mirror_physical_blobs(root: &Path) -> Result<Vec<RawMirrorPhysicalBlob>> {
     let blobs_root = root.join("blobs").join(RAW_MIRROR_HASH_ALGORITHM);
-    let metadata = match fs::symlink_metadata(&blobs_root) {
+    let metadata = match raw_mirror_symlink_metadata(&blobs_root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
@@ -1282,12 +1283,13 @@ fn collect_raw_mirror_physical_blobs(root: &Path) -> Result<Vec<RawMirrorPhysica
     let mut stack = vec![blobs_root];
     let mut blobs = Vec::new();
     while let Some(directory) = stack.pop() {
-        for entry in fs::read_dir(&directory)
-            .with_context(|| format!("read raw mirror blob directory {}", directory.display()))?
+        let mut entries = raw_mirror_io("read_dir", &directory, || fs::read_dir(&directory))
+            .with_context(|| format!("read raw mirror blob directory {}", directory.display()))?;
+        while let Some(entry) =
+            raw_mirror_io("read_dir_next", &directory, || entries.next().transpose())?
         {
-            let entry = entry?;
             let path = entry.path();
-            let metadata = fs::symlink_metadata(&path).with_context(|| {
+            let metadata = raw_mirror_symlink_metadata(&path).with_context(|| {
                 format!("stat raw mirror blob inventory path {}", path.display())
             })?;
             if metadata.file_type().is_symlink() {
@@ -1353,7 +1355,7 @@ fn validate_prune_target_file(root: &Path, path: &Path) -> Result<bool> {
             path.display()
         );
     }
-    let metadata = match fs::symlink_metadata(path) {
+    let metadata = match raw_mirror_symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(err).with_context(|| format!("stat {}", path.display())),
@@ -1375,7 +1377,7 @@ fn remove_prune_entry_file(root: &Path, entry: &RawMirrorPruneEntry) -> Result<b
     if !validate_prune_target_file(root, &path)? {
         return Ok(false);
     }
-    let metadata = fs::symlink_metadata(&path)
+    let metadata = raw_mirror_symlink_metadata(&path)
         .with_context(|| format!("restat raw mirror prune target {}", path.display()))?;
     if metadata.len() != entry.size_bytes {
         return Err(anyhow!(
@@ -1446,7 +1448,8 @@ fn remove_prune_entry_file(root: &Path, entry: &RawMirrorPruneEntry) -> Result<b
         }
     }
 
-    fs::remove_file(&path).with_context(|| format!("remove raw mirror file {}", path.display()))?;
+    raw_mirror_tracked_io("remove_pruned_file", &path, || fs::remove_file(&path))
+        .with_context(|| format!("remove raw mirror file {}", path.display()))?;
     sync_parent_unconditionally(&path)?;
     Ok(true)
 }
@@ -1592,16 +1595,20 @@ fn open_prune_audit_log(root: &Path) -> Result<(PathBuf, File)> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     configure_lock_open_options(&mut options);
-    let file = options
-        .open(&audit_path)
-        .with_context(|| format!("open raw mirror prune audit {}", audit_path.display()))?;
-    let opened_metadata = file.metadata().with_context(|| {
-        format!(
-            "stat opened raw mirror prune audit {}",
-            audit_path.display()
-        )
-    })?;
-    let path_metadata = fs::symlink_metadata(&audit_path)
+    let file = raw_mirror_io("open_prune_audit", &audit_path, || {
+        options.open(&audit_path)
+    })
+    .with_context(|| format!("open raw mirror prune audit {}", audit_path.display()))?;
+    let opened_metadata =
+        raw_mirror_tracked_io("fstat_prune_audit", &audit_path, || file.metadata()).with_context(
+            || {
+                format!(
+                    "stat opened raw mirror prune audit {}",
+                    audit_path.display()
+                )
+            },
+        )?;
+    let path_metadata = raw_mirror_symlink_metadata(&audit_path)
         .with_context(|| format!("restat raw mirror prune audit {}", audit_path.display()))?;
     if path_metadata.file_type().is_symlink()
         || !path_metadata.is_file()
@@ -1637,19 +1644,21 @@ fn append_prune_audit_records(
             "reason": entry.reason,
             "applied": entry.applied,
         });
-        writeln!(file, "{record}")
-            .with_context(|| format!("write raw mirror prune audit {}", audit_path.display()))?;
+        raw_mirror_tracked_io("write_prune_audit", audit_path, || {
+            writeln!(file, "{record}")
+        })
+        .with_context(|| format!("write raw mirror prune audit {}", audit_path.display()))?;
     }
     // Unlike optional capture durability, this journal authorizes deletion.
     // Never advance past an intent/result whose sync failed or was disabled.
-    file.sync_all()
+    raw_mirror_tracked_io("sync_prune_audit", audit_path, || file.sync_all())
         .with_context(|| format!("sync raw mirror prune audit {}", audit_path.display()))?;
     sync_parent_unconditionally(audit_path)?;
     Ok(())
 }
 
 fn ensure_prune_audit_log_appendable(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
+    match raw_mirror_symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             anyhow::bail!(
                 "refusing to append raw mirror prune audit through symlink {}",
@@ -1760,7 +1769,7 @@ fn acquire_raw_mirror_mutation_lock(root: &Path) -> Result<RawMirrorFileLockGuar
 
 fn try_acquire_index_run_lock_for_prune(data_dir: &Path) -> Result<RawMirrorFileLockGuard> {
     let lock_path = data_dir.join("index-run.lock");
-    match fs::symlink_metadata(&lock_path) {
+    match raw_mirror_symlink_metadata(&lock_path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             return Err(anyhow!(
                 "refusing raw mirror prune because index-run lock {} is not a regular file",
@@ -1777,9 +1786,10 @@ fn try_acquire_index_run_lock_for_prune(data_dir: &Path) -> Result<RawMirrorFile
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     configure_lock_open_options(&mut options);
-    let file = options
-        .open(&lock_path)
-        .with_context(|| format!("open index-run lock {}", lock_path.display()))?;
+    let file = raw_mirror_io("open_index_run_lock_for_prune", &lock_path, || {
+        options.open(&lock_path)
+    })
+    .with_context(|| format!("open index-run lock {}", lock_path.display()))?;
     match file.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
@@ -1793,10 +1803,12 @@ fn try_acquire_index_run_lock_for_prune(data_dir: &Path) -> Result<RawMirrorFile
                 .with_context(|| format!("acquire index-run lock {}", lock_path.display()));
         }
     }
-    let opened_metadata = file
-        .metadata()
+    let opened_metadata =
+        raw_mirror_tracked_io("fstat_index_run_lock_for_prune", &lock_path, || {
+            file.metadata()
+        })
         .with_context(|| format!("stat opened index-run lock {}", lock_path.display()))?;
-    let path_metadata = fs::symlink_metadata(&lock_path)
+    let path_metadata = raw_mirror_symlink_metadata(&lock_path)
         .with_context(|| format!("restat index-run lock {}", lock_path.display()))?;
     if path_metadata.file_type().is_symlink()
         || !path_metadata.is_file()
