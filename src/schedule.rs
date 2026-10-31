@@ -15,9 +15,9 @@
 //!   the fast (hash) tier, then the configured quality tier — until the
 //!   backlog drains or the scheduler gates (load, console idle) say stop.
 //!
-//! Priority is delegated to the OS: launchd uses `Nice=15` without
-//! background I/O throttling, while systemd uses `Nice=19` +
-//! `IOSchedulingClass=idle` + `CPUSchedulingPolicy=idle`. Each job step is a
+//! Priority is delegated to the OS: launchd uses `Nice=15` with explicit
+//! `ProcessType=Interactive` to avoid its implicit I/O throttling, while systemd
+//! uses `Nice=19` + `IOSchedulingClass=idle` + `CPUSchedulingPolicy=idle`. Each job step is a
 //! child `cass` process, so the normal `index-run.lock` / exit-7 `index-busy`
 //! contract protects against a human running `cass index` at the same moment.
 //! Severe machine load skips a run, but an incremental run is skipped for load
@@ -215,6 +215,12 @@ fn xml_escape(raw: &str) -> String {
 }
 
 /// Render the launchd property list for one job.
+///
+/// Omitting `ProcessType` means `Standard`, which still applies CPU and I/O
+/// throttling. GH #538 reproduced filesystem stalls under that default even
+/// without `LowPriorityIO`. Keep CPU niceness and the scheduler's load/idle
+/// gates, but explicitly avoid launchd's implicit I/O throttle. These jobs do
+/// not use XPC transactions, so `Adaptive` cannot lift their classification.
 pub fn render_launchd_plist(spec: &ScheduleSpec, job: ScheduleJob) -> String {
     let mut argv = vec![spec.binary.display().to_string()];
     argv.extend(spec.job_args(job));
@@ -247,6 +253,8 @@ pub fn render_launchd_plist(spec: &ScheduleSpec, job: ScheduleJob) -> String {
     <false/>\n\
     <key>Nice</key>\n\
     <integer>15</integer>\n\
+    <key>ProcessType</key>\n\
+    <string>Interactive</string>\n\
     <key>StandardOutPath</key>\n\
     <string>{log}</string>\n\
     <key>StandardErrorPath</key>\n\
@@ -1762,7 +1770,7 @@ mod tests {
     }
 
     #[test]
-    fn launchd_jobs_keep_cpu_niceness_without_background_io_throttling() {
+    fn gh538_launchd_jobs_keep_cpu_niceness_without_implicit_io_throttling() {
         for job in [ScheduleJob::Incremental, ScheduleJob::Nightly] {
             let plist = render_launchd_plist(&spec(), job);
             // The renderer's line-continuation literal drops indentation, so
@@ -1777,7 +1785,21 @@ mod tests {
                 "{} must keep Nice=15: {plist}",
                 job.as_str()
             );
-            for key in ["ProcessType", "LowPriorityIO", "LowPriorityBackgroundIO"] {
+            // The unset/default `Standard` classification throttles I/O too.
+            // Require the actual key/value pair, not merely absence of the
+            // explicit LowPriorityIO switches.
+            let process_type_key = "<key>ProcessType</key>";
+            assert_eq!(plist.matches(process_type_key).count(), 1);
+            let process_type_at = plist
+                .find(process_type_key)
+                .unwrap_or_else(|| panic!("{} must set ProcessType: {plist}", job.as_str()));
+            let after_process_type = plist[process_type_at + process_type_key.len()..].trim_start();
+            assert!(
+                after_process_type.starts_with("<string>Interactive</string>"),
+                "{} must avoid launchd's implicit I/O throttle: {plist}",
+                job.as_str()
+            );
+            for key in ["LowPriorityIO", "LowPriorityBackgroundIO"] {
                 assert!(
                     !plist.contains(&format!("<key>{key}</key>")),
                     "{} must not request {key}: {plist}",
