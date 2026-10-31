@@ -3,6 +3,11 @@
 Investigation date: 2026-10-30. Baseline: `f94ea2d3ff9bf62cce5b67f6f642947de35c4109`.
 Report: [coding_agent_session_search#538](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/538).
 
+The [October 31 ingestion follow-up](issue-538-oct31-ingestion.md) addresses the
+reporter's subsequent shell-watch failure separately from launchd throttling,
+with source publication receipts, recovery health, and explicit qualification
+limits. The investigation and validation history below remain unchanged.
+
 The reporter's macOS archive contains 8,560 conversations, 683,558 lexical
 documents, and an approximately 11 GB raw mirror with 20,816 files and 9,523
 manifests. Standalone incremental indexing completed in 187 seconds, while the

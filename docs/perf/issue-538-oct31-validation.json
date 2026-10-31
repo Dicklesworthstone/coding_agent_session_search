@@ -1,0 +1,1630 @@
+{
+  "schema_version": 1,
+  "generated_utc": "2026-10-31T17:33:34.821355+00:00",
+  "issue": "https://github.com/Dicklesworthstone/coding_agent_session_search/issues/538",
+  "reporter_evidence": "https://github.com/Dicklesworthstone/coding_agent_session_search/issues/538#issuecomment-6539798177",
+  "baseline_commit": "30f96a3dbed4f18e99ff205541fa97528eeba3e7",
+  "implementation_commit": "8b5441a955d9ed50f05ee9c92506e1e4c6fe1a1f",
+  "readiness_commit": "e69fe41b634a51a914697af81a3f951b39cd9263",
+  "launchd_commit": "7db0e0902cceae5052d42947955ea71fe230cbd0",
+  "bead": "coding_agent_session_search-gh538-watch-ingestion-20261031",
+  "overall_status": "implementation_committed_full_application_unqualified",
+  "full_gate_passed": false,
+  "native_macos_executed": false,
+  "reporter_archive_executed": false,
+  "runtime_environment": {
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+    "memory_limit_bytes": "8589934592",
+    "cargo_home": "/tmp/br585-cargo",
+    "cargo_target_dir": "/tmp/cass-538-target",
+    "build_jobs": 1,
+    "rustflags": "-Z threads=1 -C link-arg=-fuse-ld=lld",
+    "dev_debug": 0,
+    "test_debug": 0,
+    "incremental": false,
+    "rust_min_stack": 134217728,
+    "dependency_manifest_modified": false,
+    "dependency_lock_modified": false
+  },
+  "build_attempts": [
+    {
+      "command": "cargo test --offline --locked --test watch_e2e --no-run",
+      "exit_code": 101,
+      "failed_crate": "asupersync 0.5.0",
+      "cause": "rustc terminated by signal 9 (SIGKILL)",
+      "cass_reached": false,
+      "tests_executed": false,
+      "log_name": "build-watch-baseline.log",
+      "log_sha256": "983b0f64304d8f20e2c918ec9b19a9e60ee24e5a8c346128738e2d4f2b9148b8",
+      "log_bytes": 27426,
+      "qualification": "Dependency compilation failure before CASS; worktree was evolving, so this is not validation of the final source snapshot."
+    },
+    {
+      "command": "cargo check --offline --locked --all-targets",
+      "exit_code": 101,
+      "failed_crate": "asupersync 0.5.0",
+      "cause": "rustc terminated by signal 9 (SIGKILL)",
+      "cass_reached": false,
+      "tests_executed": false,
+      "log_name": "check-all-targets.log",
+      "log_sha256": "d5b71f7750cd872161f9593c4a64a5dfc1be889ac3ec1e312cd697144098d326",
+      "log_bytes": 25611,
+      "qualification": "Dependency compilation failure before CASS; worktree was evolving, so this is not validation of the final source snapshot."
+    }
+  ],
+  "initial_partial_gate": {
+    "command": "CARGO_NET_OFFLINE=true GATE_TARGET_DIR=/tmp/cass-538-target GATE_BUILD_JOBS=1 scripts/gate.sh --local --no-lib --no-bin --integration '' --no-goldens",
+    "status": "red",
+    "stages": {
+      "source-identity": 0,
+      "source-freshness": 0,
+      "fmt": 0,
+      "clippy": 101,
+      "ubs": 1,
+      "job-complete": 0
+    },
+    "clippy_reason": "Pinned Clippy component was initially absent; subsequently installed and version-checked, but a full all-target check also SIGKILLed in the common asupersync dependency. Full Clippy did not execute.",
+    "ubs_reason": "Initial ordinary-network proxy failure; subsequently provisioned verified pinned tools and ran standalone scanner below.",
+    "selected_stages_note": "This explicitly partial invocation never selected application tests and is not a full gate receipt. No required full-gate stage is claimed passed by exclusion.",
+    "log_sha256": "fce0de0d467e91dbeb596b289074f6b985e60fc232864dacca3ee1ae8e81a858"
+  },
+  "additional_checks": {
+    "final_repository_format": {
+      "command": "scripts/gate.sh --verify-fmt",
+      "exit_code": 0,
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "git_diff_check": "passed",
+    "edited_json_goldens_parsed": 7,
+    "introspection_shape_review": "Independent shape derivation matched the additive edited introspection golden; CLI regeneration tests were not executed."
+  },
+  "verified_final_source_sha256": {
+    "scripts/test_source_ledger_matcher.py": "533b3de32e518fd842f8bdaefbdc0c6ece218db4b269ee5d3972227203b7f268",
+    "src/indexer/mod.rs": "f032b995f3aee254c9f2c2749a62ae5ff06fcafcae72dd35d684444a69af0519",
+    "src/indexer/source_ledger_tests.rs": "913c6f4f3b7a53d9d3fe08e0027c65814db0afef6226bd2895c46bc75c8dc011",
+    "src/indexer/watch_ingestion_tests.rs": "431725568e7558c82b84509b46363f876f4b9cb96fe9576bce9c2240a18d3e13",
+    "src/indexer/watch_source_cache.rs": "6b2773c46351bae0b688cabf868c0a38916deb89c0c1d77f1092808a1d5d39a1",
+    "src/indexer/watch_source_ledger.rs": "5c4753ea60cde8e4af8f54f828b7913f4fe48fb19c38ba56e60a0a6a46a32298",
+    "src/indexer/watch_source_ledger_tests.rs": "2b0739b64b3546bcea536879383dbde819e12e21bb7851c5fd42bc4fea2833cf",
+    "src/indexer/watch_source_stability.rs": "b73abaf35003bdb7d70dcc918dc36b37a362e6ade3b8a98e29b6b8ab352cbf17",
+    "src/lib.rs": "ae411ac0c97ab0df33a3ac2e1b7e167a5bfe94438def04d3f5038d7a32f97a79",
+    "src/main.rs": "056f6cd492f5e0cea68cec4393b973bb6cd1d097819f21d88fb63a4f605ba4e8",
+    "src/raw_mirror.rs": "59e5220716c1e86b9b72550d5bc1cc7d90a25cf8533fc3479969a1e3b5e5c0b8",
+    "src/raw_mirror/policy.rs": "0c8e85056dd2b11292ea7468b309d246f26fb975f900228b83440d40c9024f9d",
+    "src/raw_mirror/retention.rs": "d232e6b7c03ca596800d9bdd4e17223561f9bee77e05089b76943ca02b7d5ff4",
+    "src/raw_mirror/retention_tests.rs": "a5af88c43697b7d7a68e918316fa96aa3eea0a2466467c381c044c74a2b10ff2",
+    "src/raw_mirror/store.rs": "a5aff0c70a2c4970281b4981296042b2632f1cd933930fc58691d452c3c778fe",
+    "src/raw_mirror_cli.rs": "dc5632c31ce73b5f30fc1e04e56e2026e9d8a17259527ccb51e7cfa8496b7a6d",
+    "src/schedule.rs": "8fbd4b4e372097eadc93efebae84934fba9b0bdba01b3a1b7624a16f04f462fe",
+    "tests/watch_e2e.rs": "2e9589eac6c4ce71c6ee9f6688632d4389aee5481b6b46d9cd44d471db30f4b9"
+  },
+  "supplemental_reports": {
+    "mirror_and_watchdog": {
+      "report_sha256": "b3a4f2d32488b51f59fcb86bb638146685ff7b49b1bcb9448ea02a4bb4586a1b",
+      "record": {
+        "format": 1,
+        "qualification": "supplemental component evidence, not the full Rust/live-watcher/macOS gate",
+        "started_utc": "2026-10-31T17:23:21.462582+00:00",
+        "run_id": "20261031T172321.462582Z-2",
+        "evidence_directory": "/tmp/cass-538-validation/gh538-components/runs/20261031T172321.462582Z-2",
+        "baseline_revision": "a93afc1e85f069f606a64eea4ce810a30a0a3bc8",
+        "candidate_head": "7db0e0902cceae5052d42947955ea71fe230cbd0",
+        "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+        "toolchain_pin": "nightly-2026-08-31",
+        "cargo": "cargo 1.100.0-nightly (e8cb624d5 2026-08-22)\nrelease: 1.100.0-nightly\ncommit-hash: e8cb624d5701824f46a2ec5873cfd59ee3d2f66c\ncommit-date: 2026-08-22\nhost: x86_64-unknown-linux-gnu\nlibgit2: 1.9.6 (sys:0.21.0 vendored)\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)\nssl: OpenSSL 3.6.3 9 Jun 2026\nos: Ubuntu 24.4.0 (noble) [64-bit]",
+        "rustc": "rustc 1.100.0-nightly (908501772 2026-08-30)\nbinary: rustc\ncommit-hash: 90850177249efe0321573c569aec5d12b257f8d6\ncommit-date: 2026-08-30\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0",
+        "runner_sha256": "13bcfb85c5a58c42407ca3a293de5cc9dfca5d05576897c05ed54ff491066cad",
+        "environment": {
+          "RUSTUP_TOOLCHAIN": "nightly-2026-08-31",
+          "RUSTC": "/tmp/am-extensions-toolchain-a12f7733/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+          "CARGO_BUILD_RUSTC": "/tmp/am-extensions-toolchain-a12f7733/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+          "RUSTFLAGS": "-Z threads=1",
+          "CARGO_ENCODED_RUSTFLAGS": null,
+          "RUST_MIN_STACK": "134217728",
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_HOME": "/tmp/br585-cargo",
+          "RUSTC_WRAPPER": null,
+          "RUSTC_WORKSPACE_WRAPPER": null
+        },
+        "components": [
+          {
+            "component": "mirror-candidate",
+            "status": "passed",
+            "source_verified_before": true,
+            "source_verified_after": true,
+            "sources_sha256": "1e27eec09ae288ed7ec557ad8ad5a7a8c7fbfa9fe94b5e7e8624709f7c0fc68e",
+            "cargo_configuration_sha256": {},
+            "build": {
+              "command": [
+                "/tmp/am-extensions-toolchain-a12f7733/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo",
+                "test",
+                "--locked",
+                "--lib",
+                "--no-run",
+                "--message-format=json",
+                "-j1",
+                "--offline"
+              ],
+              "cwd": "/tmp/cass-538-validation/gh538-components/runs/20261031T172321.462582Z-2/mirror-candidate",
+              "returncode": 0,
+              "timed_out": false,
+              "wall_seconds": 27.302,
+              "stdout": "mirror-candidate-build.stdout.log",
+              "stdout_sha256": "ce7dd1910a2a762db5f590b8f221bb6384aeb6c66344ab91c881c3a87b8808af",
+              "stderr": "mirror-candidate-build.stderr.log",
+              "stderr_sha256": "f44898e1e040dcbeb065cdb26452175e8825a6eef040228f90243c807c2ec9a1"
+            },
+            "executable": "/tmp/cass-538-validation/gh538-components/target/debug/build/cass-538-mirror-exact-candidate/d341a9d3e2d4387b/out/cass_538_mirror_exact_candidate-d341a9d3e2d4387b",
+            "executable_sha256": "6df7580430b184fc77aa43b01ef871506554d76108a76ea4207ba0a3de6153bd",
+            "cargo_artifact_fresh": false,
+            "package_id": "path+file:///tmp/cass-538-validation/gh538-components/runs/20261031T172321.462582Z-2/mirror-candidate#cass-538-mirror-exact-candidate@0.0.0",
+            "test_inventory": {
+              "command": [
+                "/tmp/cass-538-validation/gh538-components/target/debug/build/cass-538-mirror-exact-candidate/d341a9d3e2d4387b/out/cass_538_mirror_exact_candidate-d341a9d3e2d4387b",
+                "--list"
+              ],
+              "cwd": "/tmp/cass-538-validation/gh538-components/runs/20261031T172321.462582Z-2/mirror-candidate",
+              "returncode": 0,
+              "timed_out": false,
+              "wall_seconds": 0.003,
+              "stdout": "mirror-candidate-list.stdout.log",
+              "stdout_sha256": "e8ac604a982593021012ec987f609a737467fb79d9ca794713a97abf922bf0b4",
+              "stderr": "mirror-candidate-list.stderr.log",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "compiled_tests": [
+              "raw_mirror::store::policy::tests::a_path_alias_cannot_reuse_another_inventory_of_the_same_store",
+              "raw_mirror::store::policy::tests::a_symlinked_usage_generation_is_refused_and_preserves_its_target",
+              "raw_mirror::store::policy::tests::an_unchanged_capture_at_the_cap_is_not_an_outage",
+              "raw_mirror::store::policy::tests::direct_manifest_link_growth_counts_before_the_next_admission",
+              "raw_mirror::store::policy::tests::frequent_appends_reuse_chunks_and_preserve_every_published_snapshot",
+              "raw_mirror::store::policy::tests::gh538_cancelled_inventory_is_not_cached_and_does_not_hold_global_mutex",
+              "raw_mirror::store::policy::tests::gh538_inventory_rejects_excessive_depth_without_unbounded_descriptors",
+              "raw_mirror::store::policy::tests::gh538_large_mirror_near_cap_reuses_inventory_across_watch_cycles",
+              "raw_mirror::store::policy::tests::gh538_replacement_shrink_invalidates_a_cached_lower_bound",
+              "raw_mirror::store::policy::tests::gh538_unchanged_watch_captures_do_not_mutate_the_mirror",
+              "raw_mirror::store::policy::tests::malformed_or_exhausted_usage_generations_preserve_existing_snapshots",
+              "raw_mirror::store::policy::tests::partial_staging_is_removed_when_the_next_chunk_cannot_fit",
+              "raw_mirror::store::policy::tests::refused_append_leaves_the_last_recovery_copy_intact",
+              "raw_mirror::store::tests::gh538_blob_verification_observes_cancellation_between_real_reads",
+              "raw_mirror::store::tests::gh538_blocked_io_names_its_path_without_fabricating_progress",
+              "raw_mirror::store::tests::gh538_cancellation_does_not_skip_publication_cleanup_or_durability",
+              "raw_mirror::store::tests::gh538_capture_and_link_publication_trace_real_operation_paths",
+              "raw_mirror::store::tests::gh538_dangling_manifest_symlink_is_refused_before_staging",
+              "raw_mirror::store::tests::gh538_repeated_db_links_do_not_mutate_the_mirror"
+            ],
+            "tests": {
+              "command": [
+                "/tmp/cass-538-validation/gh538-components/target/debug/build/cass-538-mirror-exact-candidate/d341a9d3e2d4387b/out/cass_538_mirror_exact_candidate-d341a9d3e2d4387b",
+                "--nocapture",
+                "--test-threads=1"
+              ],
+              "cwd": "/tmp/cass-538-validation/gh538-components/runs/20261031T172321.462582Z-2/mirror-candidate",
+              "returncode": 0,
+              "timed_out": false,
+              "wall_seconds": 6.104,
+              "stdout": "mirror-candidate-tests.stdout.log",
+              "stdout_sha256": "18e3a6872542114d2988655afd49d42b9cf97d49d42320f45cb11b4085c43d4c",
+              "stderr": "mirror-candidate-tests.stderr.log",
+              "stderr_sha256": "e1b1b656f43aa656f2b187a86310578d24aaa826a3b9f29583df01dddd820133"
+            },
+            "counts": {
+              "passed": 19,
+              "failed": 0,
+              "ignored": 0,
+              "measured": 0,
+              "filtered_out": 0
+            },
+            "scope": "Verbatim production raw-mirror filesystem and capture/admission policy; candidate tests, with no filesystem or database substitutes",
+            "exclusions": [
+              "SQL prune entry point, pinned manifest/tag SQL queries, automatic retention",
+              "Unselected unit tests and subprocess policy tests",
+              "Indexer, provider scanning, native watcher, canonical SQL, lexical search/replay",
+              "Original macOS kernel stall and reporter archive qualification"
+            ]
+          },
+          {
+            "component": "mirror-baseline",
+            "status": "expected-regression-reproduced",
+            "source_verified_before": true,
+            "source_verified_after": true,
+            "sources_sha256": "8af6a88e2fd1c0d225f06d140d259bca67182186ed6e3fedf7759196197014b9",
+            "cargo_configuration_sha256": {},
+            "build": {
+              "command": [
+                "/tmp/am-extensions-toolchain-a12f7733/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo",
+                "test",
+                "--locked",
+                "--lib",
+                "--no-run",
+                "--message-format=json",
+                "-j1",
+                "--offline"
+              ],
+              "cwd": "/tmp/cass-538-validation/gh538-components/runs/20261031T172321.462582Z-2/mirror-baseline",
+              "returncode": 0,
+              "timed_out": false,
+              "wall_seconds": 2.328,
+              "stdout": "mirror-baseline-build.stdout.log",
+              "stdout_sha256": "080be433e05576283463d5ca870fa18999f22cd698ac04e55218d0a3eab8557f",
+              "stderr": "mirror-baseline-build.stderr.log",
+              "stderr_sha256": "b48ac587f79401d0a079bcd36d838ae62e5ce0aaa63b01297d3a21b8aa064164"
+            },
+            "executable": "/tmp/cass-538-validation/gh538-components/target/debug/build/cass-538-mirror-exact-baseline/3b69a819b63092b1/out/cass_538_mirror_exact_baseline-3b69a819b63092b1",
+            "executable_sha256": "dca9989a733fba842086422c811dbfd56383e542ae9a76fb869114e8669b3fd6",
+            "cargo_artifact_fresh": false,
+            "package_id": "path+file:///tmp/cass-538-validation/gh538-components/runs/20261031T172321.462582Z-2/mirror-baseline#cass-538-mirror-exact-baseline@0.0.0",
+            "test_inventory": {
+              "command": [
+                "/tmp/cass-538-validation/gh538-components/target/debug/build/cass-538-mirror-exact-baseline/3b69a819b63092b1/out/cass_538_mirror_exact_baseline-3b69a819b63092b1",
+                "--list"
+              ],
+              "cwd": "/tmp/cass-538-validation/gh538-components/runs/20261031T172321.462582Z-2/mirror-baseline",
+              "returncode": 0,
+              "timed_out": false,
+              "wall_seconds": 0.003,
+              "stdout": "mirror-baseline-list.stdout.log",
+              "stdout_sha256": "e8ac604a982593021012ec987f609a737467fb79d9ca794713a97abf922bf0b4",
+              "stderr": "mirror-baseline-list.stderr.log",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "compiled_tests": [
+              "raw_mirror::store::policy::tests::a_path_alias_cannot_reuse_another_inventory_of_the_same_store",
+              "raw_mirror::store::policy::tests::a_symlinked_usage_generation_is_refused_and_preserves_its_target",
+              "raw_mirror::store::policy::tests::an_unchanged_capture_at_the_cap_is_not_an_outage",
+              "raw_mirror::store::policy::tests::direct_manifest_link_growth_counts_before_the_next_admission",
+              "raw_mirror::store::policy::tests::frequent_appends_reuse_chunks_and_preserve_every_published_snapshot",
+              "raw_mirror::store::policy::tests::gh538_cancelled_inventory_is_not_cached_and_does_not_hold_global_mutex",
+              "raw_mirror::store::policy::tests::gh538_inventory_rejects_excessive_depth_without_unbounded_descriptors",
+              "raw_mirror::store::policy::tests::gh538_large_mirror_near_cap_reuses_inventory_across_watch_cycles",
+              "raw_mirror::store::policy::tests::gh538_replacement_shrink_invalidates_a_cached_lower_bound",
+              "raw_mirror::store::policy::tests::gh538_unchanged_watch_captures_do_not_mutate_the_mirror",
+              "raw_mirror::store::policy::tests::malformed_or_exhausted_usage_generations_preserve_existing_snapshots",
+              "raw_mirror::store::policy::tests::partial_staging_is_removed_when_the_next_chunk_cannot_fit",
+              "raw_mirror::store::policy::tests::refused_append_leaves_the_last_recovery_copy_intact",
+              "raw_mirror::store::tests::gh538_blob_verification_observes_cancellation_between_real_reads",
+              "raw_mirror::store::tests::gh538_blocked_io_names_its_path_without_fabricating_progress",
+              "raw_mirror::store::tests::gh538_cancellation_does_not_skip_publication_cleanup_or_durability",
+              "raw_mirror::store::tests::gh538_capture_and_link_publication_trace_real_operation_paths",
+              "raw_mirror::store::tests::gh538_dangling_manifest_symlink_is_refused_before_staging",
+              "raw_mirror::store::tests::gh538_repeated_db_links_do_not_mutate_the_mirror"
+            ],
+            "purpose": "pinned pre-fix negative control; one specific assertion must fail",
+            "tests": {
+              "command": [
+                "/tmp/cass-538-validation/gh538-components/target/debug/build/cass-538-mirror-exact-baseline/3b69a819b63092b1/out/cass_538_mirror_exact_baseline-3b69a819b63092b1",
+                "--nocapture",
+                "--test-threads=1",
+                "--exact",
+                "raw_mirror::store::tests::gh538_dangling_manifest_symlink_is_refused_before_staging"
+              ],
+              "cwd": "/tmp/cass-538-validation/gh538-components/runs/20261031T172321.462582Z-2/mirror-baseline",
+              "returncode": 101,
+              "timed_out": false,
+              "wall_seconds": 0.004,
+              "stdout": "mirror-baseline-tests.stdout.log",
+              "stdout_sha256": "2d79e5f0f707451a2b536c9bdaee68e89dda1203fdfd089f843d1a8a609e07d3",
+              "stderr": "mirror-baseline-tests.stderr.log",
+              "stderr_sha256": "24ef724f0a21829b4d34c40eaf53a4a6c3b872956c1d06b046e96ad8f6aaa2e2"
+            },
+            "counts": {
+              "passed": 0,
+              "failed": 1,
+              "ignored": 0,
+              "measured": 0,
+              "filtered_out": 18
+            },
+            "scope": "Verbatim production raw-mirror filesystem and capture/admission policy; candidate tests, with no filesystem or database substitutes",
+            "exclusions": [
+              "SQL prune entry point, pinned manifest/tag SQL queries, automatic retention",
+              "Unselected unit tests and subprocess policy tests",
+              "Indexer, provider scanning, native watcher, canonical SQL, lexical search/replay",
+              "Original macOS kernel stall and reporter archive qualification"
+            ]
+          },
+          {
+            "component": "watchdog",
+            "status": "passed",
+            "source_verified_before": true,
+            "source_verified_after": true,
+            "sources_sha256": "be6566cfda3b97c4ff0169d2d3d858c91e338019d55662484254e44081287852",
+            "cargo_configuration_sha256": {},
+            "build": {
+              "command": [
+                "/tmp/am-extensions-toolchain-a12f7733/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo",
+                "test",
+                "--locked",
+                "--lib",
+                "--no-run",
+                "--message-format=json",
+                "-j1",
+                "--offline"
+              ],
+              "cwd": "/tmp/cass-538-validation/gh538-components/runs/20261031T172321.462582Z-2/watchdog",
+              "returncode": 0,
+              "timed_out": false,
+              "wall_seconds": 7.552,
+              "stdout": "watchdog-build.stdout.log",
+              "stdout_sha256": "dafb2eb0a5aacec59d64b61dfe790c23ba1d4bcdf0fb8f5809ca54c1b0b684bc",
+              "stderr": "watchdog-build.stderr.log",
+              "stderr_sha256": "f50776b7f4738d4717f8a5906ec93acd4bc06d6eb8277f5851e74b3310260b4d"
+            },
+            "executable": "/tmp/cass-538-validation/gh538-components/target/debug/build/cass-538-watchdog-exact/4cf312f8673d0fdf/out/cass_538_watchdog_exact-4cf312f8673d0fdf",
+            "executable_sha256": "4776ba90192dc11a6661a5856a1cecfa5acf08b79d1c8cf89b7433b68e43e269",
+            "cargo_artifact_fresh": false,
+            "package_id": "path+file:///tmp/cass-538-validation/gh538-components/runs/20261031T172321.462582Z-2/watchdog#cass-538-watchdog-exact@0.0.0",
+            "test_inventory": {
+              "command": [
+                "/tmp/cass-538-validation/gh538-components/target/debug/build/cass-538-watchdog-exact/4cf312f8673d0fdf/out/cass_538_watchdog_exact-4cf312f8673d0fdf",
+                "--list"
+              ],
+              "cwd": "/tmp/cass-538-validation/gh538-components/runs/20261031T172321.462582Z-2/watchdog",
+              "returncode": 0,
+              "timed_out": false,
+              "wall_seconds": 0.002,
+              "stdout": "watchdog-list.stdout.log",
+              "stdout_sha256": "7e3a4bb10e3aebf5759733c7c3e832e39431cc6564978fca58f5d9cfef88390b",
+              "stderr": "watchdog-list.stderr.log",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "compiled_tests": [
+              "fifo_tests::real_fifo_diagnostics_cannot_hide_watchdog_abort",
+              "indexer::tests::gh538_watch_idle_marker_clears_before_event_or_disconnect",
+              "indexer::tests::watch_idle_wait_honors_cancellation_without_activity",
+              "indexer::tests::watch_idle_wait_preserves_deadline_without_activity",
+              "stall_diagnostics_tests::captures_checkpoint_contents_and_lock_when_present",
+              "stall_diagnostics_tests::empty_data_dir_produces_null_checkpoint_and_no_lock",
+              "stall_diagnostics_tests::gh422_watchdog_aborts_a_phase_zero_lexical_startup_wedge",
+              "stall_diagnostics_tests::gh426_watchdog_bounds_analytics_repair_in_all_index_modes",
+              "stall_diagnostics_tests::gh437_all_phases_flag_parses_expected_truthy_values",
+              "stall_diagnostics_tests::gh437_all_phases_optin_promotes_report_only_stall_to_abort",
+              "stall_diagnostics_tests::gh437_without_optin_report_only_stall_is_not_promoted",
+              "stall_diagnostics_tests::gh538_pending_diagnostics_cannot_delay_a_watchdog_abort",
+              "stall_diagnostics_tests::gh538_stall_diagnostic_reads_enforce_the_limit_on_actual_bytes",
+              "stall_diagnostics_tests::gh538_watchdog_idle_preserves_counts_and_rearms_for_active_work",
+              "stall_diagnostics_tests::issue_342_watchdog_reports_semantic_embedding_stall_without_aborting",
+              "stall_diagnostics_tests::issue_342_watchdog_suppresses_false_stall_for_opaque_semantic_hnsw",
+              "stall_diagnostics_tests::issue_366_watchdog_grants_rebuild_handoff_finalize_grace",
+              "stall_diagnostics_tests::oversized_checkpoint_omits_content_but_records_size",
+              "stall_diagnostics_tests::snapshot_suppresses_eta_until_total_is_final",
+              "stall_diagnostics_tests::stall_abort_emits_index_stalled_error_envelope_only_when_aborting",
+              "stall_diagnostics_tests::watchdog_aborts_on_quiescent_finalize_wedge",
+              "stall_diagnostics_tests::watchdog_defers_abort_during_final_wal_checkpoint_finalize",
+              "stall_diagnostics_tests::watchdog_does_not_abort_active_rebuild_outside_phase_two",
+              "stall_diagnostics_tests::watchdog_does_not_abort_semantic_finalize_build",
+              "stall_diagnostics_tests::watchdog_does_not_abort_watch_idle_resting_state",
+              "stall_diagnostics_tests::watchdog_fires_on_phase_zero_startup_wedge",
+              "stall_diagnostics_tests::watchdog_grants_bounded_preparing_grace_while_block_io_advances",
+              "stall_diagnostics_tests::watchdog_grants_finalize_grace_during_active_giant_batch_persist",
+              "stall_diagnostics_tests::watchdog_grants_finalize_grace_to_phase_two_rebuild_tail",
+              "stall_diagnostics_tests::watchdog_reports_before_phase_two_abort_event",
+              "stall_diagnostics_tests::watchdog_treats_activity_ticks_as_progress",
+              "stall_diagnostics_tests::watchdog_without_io_signal_keeps_base_preparing_abort"
+            ],
+            "tests": {
+              "command": [
+                "/tmp/cass-538-validation/gh538-components/target/debug/build/cass-538-watchdog-exact/4cf312f8673d0fdf/out/cass_538_watchdog_exact-4cf312f8673d0fdf",
+                "--nocapture",
+                "--test-threads=1"
+              ],
+              "cwd": "/tmp/cass-538-validation/gh538-components/runs/20261031T172321.462582Z-2/watchdog",
+              "returncode": 0,
+              "timed_out": false,
+              "wall_seconds": 4.683,
+              "stdout": "watchdog-tests.stdout.log",
+              "stdout_sha256": "f7e21e853b6c76e0467e941698715451b0880087cd205c741e84128f5022a617",
+              "stderr": "watchdog-tests.stderr.log",
+              "stderr_sha256": "829a35ed862560ccfe5d47ff66bfcf35c55c89f1d4530a2ccfaf0ead482a6f38"
+            },
+            "counts": {
+              "passed": 32,
+              "failed": 0,
+              "ignored": 0,
+              "measured": 0,
+              "filtered_out": 0
+            },
+            "scope": "Exact watchdog, diagnostics, raw I/O observer, idle wait and selected production tests, plus separately identified real FIFO subprocess probes",
+            "exclusions": [
+              "Full cass executable and native filesystem watcher",
+              "Provider scanning, ingestion, canonical SQL, lexical publication, replay debts/search",
+              "Progress SQL cancellation field/relay; atomic stop behavior remains exact",
+              "IndexingStats fields unused by the progress snapshot",
+              "abort_after_index_stall_if_requested and real bounded SQL WAL checkpoint; FIFO probe uses exact envelope/exit helper after the exact watchdog abort decision",
+              "CLI help test, unrelated application tests, native macOS qualification"
+            ]
+          }
+        ],
+        "status": "supplemental-passed",
+        "source_verification": "generated and verified before and after each test run",
+        "finished_utc": "2026-10-31T17:24:16.286905+00:00"
+      }
+    },
+    "source_boundaries": {
+      "report_sha256": "f0847a64cbd70a92702b48bf7c6b08e129a7421d32afa89418e21acd924651e5",
+      "record": {
+        "format": 1,
+        "qualification": "supplemental exact-source components, not full CASS/live watcher/macOS",
+        "status": "supplemental-passed",
+        "started_utc": "2026-10-31T17:29:41.952684+00:00",
+        "evidence_directory": "/tmp/cass-538-validation/watch-source-scan/runs/20261031T172941.952684Z-2",
+        "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+        "repository_lock_sha256": "1daeb680b1db621c270a7c56f04dbc0b20e3e8b21186a266aa859c40ceab8d6d",
+        "runner_sha256": "533b3de32e518fd842f8bdaefbdc0c6ece218db4b269ee5d3972227203b7f268",
+        "commands": [
+          {
+            "command": [
+              "/tmp/am-extensions-toolchain-a12f7733/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo",
+              "--version",
+              "--verbose"
+            ],
+            "returncode": 0,
+            "timed_out": false,
+            "drain_timed_out": false,
+            "termination_error": null,
+            "process_exit_and_pipe_drain_verified": true,
+            "wall_seconds": 0.031,
+            "stdout": "logs/cargo-version.stdout.log",
+            "stderr": "logs/cargo-version.stderr.log",
+            "stdout_sha256": "beb48c9ccf0acdfd7360c3f95741ba50b7b7eb50868f9b2ad65a5bbff3f8a80d",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "command": [
+              "/tmp/am-extensions-toolchain-a12f7733/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+              "--version",
+              "--verbose"
+            ],
+            "returncode": 0,
+            "timed_out": false,
+            "drain_timed_out": false,
+            "termination_error": null,
+            "process_exit_and_pipe_drain_verified": true,
+            "wall_seconds": 0.115,
+            "stdout": "logs/rustc-version.stdout.log",
+            "stderr": "logs/rustc-version.stderr.log",
+            "stdout_sha256": "afa0463fc538f7e3dfa46074095886a69302c98f037fcf29238678c8b5000cd9",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "command": [
+              "/tmp/am-extensions-toolchain-a12f7733/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo",
+              "metadata",
+              "--format-version",
+              "1",
+              "--offline"
+            ],
+            "returncode": 0,
+            "timed_out": false,
+            "drain_timed_out": false,
+            "termination_error": null,
+            "process_exit_and_pipe_drain_verified": true,
+            "wall_seconds": 0.12,
+            "stdout": "logs/metadata.stdout.log",
+            "stderr": "logs/metadata.stderr.log",
+            "stdout_sha256": "b12ca9888f6cf5aee38084c92d0ef854b062246a86b8242ae69796a248daea13",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "command": [
+              "/tmp/am-extensions-toolchain-a12f7733/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/cargo",
+              "test",
+              "--locked",
+              "--lib",
+              "--no-run",
+              "--message-format=json",
+              "-j1",
+              "--offline"
+            ],
+            "returncode": 0,
+            "timed_out": false,
+            "drain_timed_out": false,
+            "termination_error": null,
+            "process_exit_and_pipe_drain_verified": true,
+            "wall_seconds": 2.15,
+            "stdout": "logs/build.stdout.log",
+            "stderr": "logs/build.stderr.log",
+            "stdout_sha256": "94471dad9d5f0114ff9744037d351896de5091649bd2f14c667657cffb082c48",
+            "stderr_sha256": "b0ae9245732b3b7383908442070330c51ec9832823f53f21e4969f84f05cc4b7"
+          },
+          {
+            "command": [
+              "/tmp/cass-538-validation/watch-source-scan/target/debug/build/cass-source-ledger-matcher/072feaf9c6c09247/out/cass_source_ledger_matcher-072feaf9c6c09247",
+              "--list"
+            ],
+            "returncode": 0,
+            "timed_out": false,
+            "drain_timed_out": false,
+            "termination_error": null,
+            "process_exit_and_pipe_drain_verified": true,
+            "wall_seconds": 0.004,
+            "stdout": "logs/inventory.stdout.log",
+            "stderr": "logs/inventory.stderr.log",
+            "stdout_sha256": "7ebd52ea5e5dd6de88d88b21d623112f147cab19023c88e5ed06faf0bed6bc02",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "command": [
+              "/tmp/cass-538-validation/watch-source-scan/target/debug/build/cass-source-ledger-matcher/072feaf9c6c09247/out/cass_source_ledger_matcher-072feaf9c6c09247",
+              "--nocapture",
+              "--test-threads=1"
+            ],
+            "returncode": 0,
+            "timed_out": false,
+            "drain_timed_out": false,
+            "termination_error": null,
+            "process_exit_and_pipe_drain_verified": true,
+            "wall_seconds": 0.016,
+            "stdout": "logs/tests.stdout.log",
+            "stderr": "logs/tests.stderr.log",
+            "stdout_sha256": "901997a157b1c2bc82eb0651027e243adbb04ab1c405f1a40f5a39d04f3d2595",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ],
+        "environment": {
+          "CARGO_HOME": "/tmp/br585-cargo",
+          "CARGO_TARGET_DIR": "/tmp/cass-538-validation/watch-source-scan/target",
+          "CARGO_BUILD_JOBS": "1",
+          "RUSTUP_TOOLCHAIN": "nightly-2026-08-31",
+          "RUSTC": "/tmp/am-extensions-toolchain-a12f7733/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+          "CARGO_BUILD_RUSTC": "/tmp/am-extensions-toolchain-a12f7733/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+          "CASS_SOURCE_INGEST_CONTRACT": "supplemental-gh538-source-boundary-fixture",
+          "CASS_SOURCE_INGEST_REUSE": "true",
+          "CASS_EXCLUDE_PATHS": null,
+          "CASS_EXCLUDE_WORKSPACES": null,
+          "CASS_TEST_ACTIVE_SESSION_SOURCE_PATHS": null
+        },
+        "inputs": {
+          "pinned-fad:src/connectors/scan.rs": {
+            "path": "/tmp/br585-cargo/git/checkouts/franken_agent_detection-1ef1b003c0d2ba55/6b337ba/src/connectors/scan.rs",
+            "sha256": "2e957537a64a8ba7f3be1d219cb1e28c7cadddaf8503ea343150906d0e37b6d7"
+          },
+          "cass:src/connectors/source_dependencies/observation.rs": {
+            "path": "/workspace/scratch/5340e1fe88cf/cass/src/connectors/source_dependencies/observation.rs",
+            "sha256": "9864024b4ebd66fd2c980df3c940b50e57cb10df5fd8601f39c41a1bc5addf71"
+          },
+          "cass:src/connectors/source_dependencies/observation/windows.rs": {
+            "path": "/workspace/scratch/5340e1fe88cf/cass/src/connectors/source_dependencies/observation/windows.rs",
+            "sha256": "bc6f730e9119e84fdc32eed8d7d614ae982a8b99fa57c41ec24ad8f72add3e7b"
+          },
+          "cass:src/indexer/watch_source_stability.rs": {
+            "path": "/workspace/scratch/5340e1fe88cf/cass/src/indexer/watch_source_stability.rs",
+            "sha256": "b73abaf35003bdb7d70dcc918dc36b37a362e6ade3b8a98e29b6b8ab352cbf17"
+          },
+          "cass:src/indexer/watch_source_ledger.rs": {
+            "path": "/workspace/scratch/5340e1fe88cf/cass/src/indexer/watch_source_ledger.rs",
+            "sha256": "5c4753ea60cde8e4af8f54f828b7913f4fe48fb19c38ba56e60a0a6a46a32298"
+          },
+          "cass:src/connectors/source_dependencies.rs": {
+            "path": "/workspace/scratch/5340e1fe88cf/cass/src/connectors/source_dependencies.rs",
+            "sha256": "f49f5ed961376f9d494031dd9512c3500d7afeca221abfd7b367be8cf2f61bdf"
+          },
+          "cass:src/indexer/mod.rs": {
+            "path": "/workspace/scratch/5340e1fe88cf/cass/src/indexer/mod.rs",
+            "sha256": "f032b995f3aee254c9f2c2749a62ae5ff06fcafcae72dd35d684444a69af0519"
+          },
+          "pinned-fad:src/types.rs": {
+            "path": "/tmp/br585-cargo/git/checkouts/franken_agent_detection-1ef1b003c0d2ba55/6b337ba/src/types.rs",
+            "sha256": "895e41adfff19404516a1d2106fbb6b31acf4f081ba2c4c34a334a354c037e7b"
+          },
+          "pinned-fad:src/connectors/mod.rs": {
+            "path": "/tmp/br585-cargo/git/checkouts/franken_agent_detection-1ef1b003c0d2ba55/6b337ba/src/connectors/mod.rs",
+            "sha256": "b8e03a33ea277fa3f6685b8f5a1e49f8e35117782e07696890d97bb34d72cf44"
+          },
+          "cass:src/storage/sqlite.rs": {
+            "path": "/workspace/scratch/5340e1fe88cf/cass/src/storage/sqlite.rs",
+            "sha256": "919d8416ffe53d0579ffa58477852a072946dee286895b3ee39f117236cd2ecd"
+          },
+          "cass:src/indexer/watch_source_ledger_tests.rs": {
+            "path": "/workspace/scratch/5340e1fe88cf/cass/src/indexer/watch_source_ledger_tests.rs",
+            "sha256": "2b0739b64b3546bcea536879383dbde819e12e21bb7851c5fd42bc4fea2833cf"
+          }
+        },
+        "source_ranges": [
+          {
+            "input": "pinned-fad:src/connectors/scan.rs",
+            "start_line": 247,
+            "end_line": 342,
+            "start_byte": 7797,
+            "end_byte": 11190,
+            "sha256": "843780115c240fccf88389c7ec0ee1b93ce81352a679d4293f24068426058155"
+          },
+          {
+            "input": "cass:src/indexer/watch_source_ledger.rs",
+            "start_line": 20,
+            "end_line": 20,
+            "start_byte": 720,
+            "end_byte": 771,
+            "sha256": "7bc95b5194ee27fc7450f13b967b09f3393278707b0d9aac8e1ec0218a927aa3"
+          },
+          {
+            "input": "cass:src/indexer/watch_source_ledger.rs",
+            "start_line": 404,
+            "end_line": 455,
+            "start_byte": 16623,
+            "end_byte": 18176,
+            "sha256": "0508fdf9ab7b047b0fb65d41646f5ed18a0a040946b350c0ca980ed816ed7bee"
+          },
+          {
+            "input": "cass:src/connectors/source_dependencies.rs",
+            "start_line": 13,
+            "end_line": 67,
+            "start_byte": 351,
+            "end_byte": 3018,
+            "sha256": "8e67762fa98ba84889a10866fd9bf740c1337ad5bf14292217fae2b97f22a31c"
+          },
+          {
+            "input": "cass:src/indexer/mod.rs",
+            "start_line": 14613,
+            "end_line": 14616,
+            "start_byte": 591771,
+            "end_byte": 591925,
+            "sha256": "b98bb85904dd5afb3aa8653371098931ff237a5e3cf2dfcec1f1fac4366c33ac"
+          },
+          {
+            "input": "cass:src/indexer/mod.rs",
+            "start_line": 14636,
+            "end_line": 14640,
+            "start_byte": 592543,
+            "end_byte": 592747,
+            "sha256": "e47862f36794580806c39ff1355bfc8076ba611a8166fdb41c74729baf2cfc14"
+          },
+          {
+            "input": "pinned-fad:src/types.rs",
+            "start_line": 1,
+            "end_line": 374,
+            "start_byte": 0,
+            "end_byte": 12187,
+            "sha256": "42c93f927675dca3e0299da02f63b3b5e4a90ceb11ff1edbab65d98a5261ffb6"
+          },
+          {
+            "input": "pinned-fad:src/connectors/scan.rs",
+            "start_line": 160,
+            "end_line": 411,
+            "start_byte": 5009,
+            "end_byte": 14166,
+            "sha256": "f7199c6fe226f4b27b36bc1d8105c5f70ba9ccda1c7f7608550680ec26f3321e"
+          },
+          {
+            "input": "pinned-fad:src/connectors/mod.rs",
+            "start_line": 98,
+            "end_line": 181,
+            "start_byte": 2404,
+            "end_byte": 5999,
+            "sha256": "e74405ddfafa86921b4346d9cd3938c1b5ce53b22eb1b21f1ca6ad7e13b5aab8"
+          },
+          {
+            "input": "cass:src/storage/sqlite.rs",
+            "start_line": 7992,
+            "end_line": 7996,
+            "start_byte": 306681,
+            "end_byte": 306771,
+            "sha256": "6014e5a03db3f415d00517b796698f237db349a1de5c93a93558343347aada18"
+          },
+          {
+            "input": "cass:src/indexer/mod.rs",
+            "start_line": 14581,
+            "end_line": 14689,
+            "start_byte": 590482,
+            "end_byte": 594460,
+            "sha256": "2c0a5c1e69b044bc6d3322349b514c216d2b052555dc4d211c4c4ec5d74110a6"
+          },
+          {
+            "input": "cass:src/indexer/mod.rs",
+            "start_line": 317,
+            "end_line": 374,
+            "start_byte": 12141,
+            "end_byte": 13958,
+            "sha256": "0f52f2ec26bd652fd72a70fca89417994d7c439ace349e1de9dd04428b28810f"
+          },
+          {
+            "input": "cass:src/indexer/mod.rs",
+            "start_line": 15017,
+            "end_line": 15028,
+            "start_byte": 607251,
+            "end_byte": 607596,
+            "sha256": "a52165e8940cec5126e9ad68e70aa0e32f8e141c9a2d683f70f41684167348e9"
+          },
+          {
+            "input": "cass:src/indexer/watch_source_ledger.rs",
+            "start_line": 18,
+            "end_line": 271,
+            "start_byte": 626,
+            "end_byte": 11260,
+            "sha256": "d5ef9212a75a3673df975631fd2bb9a4274ea890ab3d179e9a8de70640d7c2cb"
+          },
+          {
+            "input": "cass:src/indexer/watch_source_ledger.rs",
+            "start_line": 398,
+            "end_line": 455,
+            "start_byte": 16402,
+            "end_byte": 18176,
+            "sha256": "09af58e01f245712aa7d78195bcf2e1b5e127292793c422c89f154245de9273f"
+          }
+        ],
+        "required_watch_tests": [
+          "gh538_stable_primary_and_sidecars_do_not_request_retry",
+          "gh538_primary_mutation_and_disappearance_request_retry",
+          "gh538_replacement_is_changed_even_when_size_and_mtime_match",
+          "gh538_parent_changes_only_matter_for_directory_dependency_policies",
+          "gh538_declared_sidecar_mutation_and_appearance_request_retry",
+          "gh538_unavailable_evidence_alone_does_not_request_retry",
+          "gh538_losing_a_previously_available_observation_requests_retry",
+          "gh538_non_unicode_sources_retry_only_for_observed_metadata_changes",
+          "receipt_serialization_budget_does_not_retain_an_oversized_payload",
+          "receipt_budget_rejects_a_single_large_write_before_allocating",
+          "gh538_watch_ledger_detects_withheld_completion_at_scan_end",
+          "gh538_watch_ledger_detects_withheld_completion_at_next_source"
+        ],
+        "fad_revision": "6b337ba434b72c65c6c5a748b7ec47885f840ac0",
+        "projections": {
+          "provenance_carriers": "Exact pinned FAD normalized types, Origin, Platform, context, Connector trait and hooks; ScanRoot retains constructor fields needed by fixture/key only",
+          "policy_dispatch": "Fixture names map to verbatim CASS capability declarations; full connector registry excluded",
+          "receipt_scope": "Verbatim MAX_RECEIPT_ENTRY_BYTES, ReceiptBuffer Write implementation, and both unit tests only",
+          "active_filter": "No-active-writer fixture adapter; recent-write option must be None; not a writer-probe test",
+          "progress": "Absent-progress fixture adapter; all methods panic if invoked",
+          "producer_contract": "Explicit supplemental fixture contract with source reuse enabled; CASS build-contract generation is not exercised",
+          "serial_test": "Removed only serial_test import and two serial attributes; executable runs with --test-threads=1",
+          "scan_scope": "Verbatim fields and scan method; begin_publication and publish_batch excluded completely; exact SourceIngestLedgerEntry carrier without storage implementation"
+        },
+        "exclusions": [
+          "Full CASS compilation and application tests",
+          "Native connector parsing, discovery, filesystem notifications; boundary tests use their explicit synthetic connector",
+          "Active-writer, exclusion-policy dispatch, cancellation/progress and full registry integration",
+          "begin_publication/publish_batch, source receipt and debt persistence, canonical SQL and lexical/search recovery",
+          "Aggregate receipt memory limits, replay/restart integration, native macOS qualification"
+        ],
+        "source_verified_before": true,
+        "cargo": "cargo 1.100.0-nightly (e8cb624d5 2026-08-22)\nrelease: 1.100.0-nightly\ncommit-hash: e8cb624d5701824f46a2ec5873cfd59ee3d2f66c\ncommit-date: 2026-08-22\nhost: x86_64-unknown-linux-gnu\nlibgit2: 1.9.6 (sys:0.21.0 vendored)\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)\nssl: OpenSSL 3.6.3 9 Jun 2026\nos: Ubuntu 24.4.0 (noble) [64-bit]",
+        "rustc": "rustc 1.100.0-nightly (908501772 2026-08-30)\nbinary: rustc\ncommit-hash: 90850177249efe0321573c569aec5d12b257f8d6\ncommit-date: 2026-08-30\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0",
+        "dependencies": [
+          {
+            "name": "anyhow",
+            "version": "1.0.104",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+          },
+          {
+            "name": "arrayvec",
+            "version": "0.7.8",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+          },
+          {
+            "name": "bitflags",
+            "version": "2.13.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+          },
+          {
+            "name": "blake3",
+            "version": "1.8.7",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae"
+          },
+          {
+            "name": "cc",
+            "version": "1.4.4",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "0ad534f4357a5264cce5019c989cf66a4f0dc4e0d1b1d15f8aacec0ff7360273"
+          },
+          {
+            "name": "cfg-if",
+            "version": "1.0.4",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+          },
+          {
+            "name": "constant_time_eq",
+            "version": "0.4.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+          },
+          {
+            "name": "cpufeatures",
+            "version": "0.3.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
+          },
+          {
+            "name": "dotenvy",
+            "version": "0.15.7",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
+          },
+          {
+            "name": "dunce",
+            "version": "1.0.5",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+          },
+          {
+            "name": "errno",
+            "version": "0.3.14",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+          },
+          {
+            "name": "fastrand",
+            "version": "2.5.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+          },
+          {
+            "name": "find-msvc-tools",
+            "version": "0.1.11",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
+          },
+          {
+            "name": "getrandom",
+            "version": "0.4.3",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+          },
+          {
+            "name": "glob",
+            "version": "0.3.4",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+          },
+          {
+            "name": "itoa",
+            "version": "1.0.18",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+          },
+          {
+            "name": "libc",
+            "version": "0.2.189",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+          },
+          {
+            "name": "linux-raw-sys",
+            "version": "0.12.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+          },
+          {
+            "name": "memchr",
+            "version": "2.8.3",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+          },
+          {
+            "name": "once_cell",
+            "version": "1.21.4",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+          },
+          {
+            "name": "proc-macro2",
+            "version": "1.0.107",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
+          },
+          {
+            "name": "quote",
+            "version": "1.0.47",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
+          },
+          {
+            "name": "r-efi",
+            "version": "6.0.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+          },
+          {
+            "name": "rustix",
+            "version": "1.1.5",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+          },
+          {
+            "name": "serde",
+            "version": "1.0.229",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
+          },
+          {
+            "name": "serde_core",
+            "version": "1.0.229",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
+          },
+          {
+            "name": "serde_derive",
+            "version": "1.0.229",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
+          },
+          {
+            "name": "serde_json",
+            "version": "1.0.151",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+          },
+          {
+            "name": "shlex",
+            "version": "2.0.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+          },
+          {
+            "name": "syn",
+            "version": "3.0.4",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f"
+          },
+          {
+            "name": "tempfile",
+            "version": "3.27.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+          },
+          {
+            "name": "unicode-ident",
+            "version": "1.0.24",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+          },
+          {
+            "name": "windows-link",
+            "version": "0.2.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+          },
+          {
+            "name": "windows-sys",
+            "version": "0.61.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
+          },
+          {
+            "name": "zmij",
+            "version": "1.0.23",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+          }
+        ],
+        "harness_lock_sha256": "4ea067c4c000cba6b02ccd8666ea4324b9ffb6e3ebc2dd8110c8a4009c8f9668",
+        "output_sha256": {
+          "src/connectors/source_dependencies/observation/windows.rs": "bc6f730e9119e84fdc32eed8d7d614ae982a8b99fa57c41ec24ad8f72add3e7b",
+          "src/connectors/source_dependencies/observation.rs": "9864024b4ebd66fd2c980df3c940b50e57cb10df5fd8601f39c41a1bc5addf71",
+          "src/fad.rs": "b3a59c2440da6bce433f7baba1eec84545504def4528faf24ab64332b3e0d6ae",
+          "src/fad_types.rs": "42c93f927675dca3e0299da02f63b3b5e4a90ceb11ff1edbab65d98a5261ffb6",
+          "src/indexer/watch_source_ledger.rs": "fb6b69c17698c2a22634f117ad5cf08977135cda622e8fed2131a457b70b5464",
+          "src/indexer/watch_source_ledger_tests.rs": "c8e8700db834c1bda496346afff7e3ff2155bdc0c4f654309de973bc787c65b1",
+          "src/indexer/watch_source_stability.rs": "b73abaf35003bdb7d70dcc918dc36b37a362e6ade3b8a98e29b6b8ab352cbf17",
+          "src/lib.rs": "5005e0bbea635b9de6294a64c8847211d345fca2a220789fcc10a01c5132be0c",
+          "src/policy.rs": "8e67762fa98ba84889a10866fd9bf740c1337ad5bf14292217fae2b97f22a31c",
+          "src/receipt_buffer.rs": "b75255ec605d496259a840ffbae29e10f1fe0d1f2adcd722df34bfaec6cc7817"
+        },
+        "manifest_sha256": "1a13ab9ba885e57b3ea72fdb2ef953e1a732751e183ae5a560f2f5e7b8486ed6",
+        "executable": "/tmp/cass-538-validation/watch-source-scan/target/debug/build/cass-source-ledger-matcher/072feaf9c6c09247/out/cass_source_ledger_matcher-072feaf9c6c09247",
+        "executable_sha256": "3ebced47267f533ecf0ec269cb73614273457f0e9f59e5f371624822d0f7d8d6",
+        "compiled_tests": [
+          "connectors::source_dependencies::observation::path_encoding_tests::mixed_dependency_capture_preserves_healthy_inputs_around_unencodable_sources",
+          "connectors::source_dependencies::observation::path_encoding_tests::unencodable_existing_and_missing_paths_never_receive_a_ledger_certificate",
+          "connectors::source_dependencies::observation::path_encoding_tests::unicode_paths_keep_the_existing_wire_shape_and_reuse_contract",
+          "connectors::source_dependencies::observation::tests::dependency_snapshot_spans_discovery_and_keeps_the_first_parent",
+          "connectors::source_dependencies::observation::tests::explicit_absence_and_existing_sidecars_remain_dependencies",
+          "connectors::source_dependencies::observation::tests::gh512_benchmark_4159_sources_10_folders",
+          "connectors::source_dependencies::observation::tests::gh536_device_number_is_not_evidence_and_legacy_rows_stay_reusable",
+          "connectors::source_dependencies::observation::tests::legacy_parent_is_ignored_only_when_connector_declares_it_irrelevant",
+          "connectors::source_dependencies::observation::tests::malformed_dependencies_and_producer_changes_fail_closed",
+          "connectors::source_dependencies::observation::tests::missing_or_unreadable_primary_never_matches_a_malformed_row",
+          "connectors::source_dependencies::observation::tests::removing_a_previously_certified_primary_invalidates_every_policy",
+          "connectors::source_dependencies::observation::tests::sidecar_aware_reuse_requires_the_parent_observation",
+          "connectors::source_dependencies::observation::tests::unknown_or_unobservable_parent_has_no_discovery_authority",
+          "indexer::watch_source_ledger::boundary_tests::gh538_watch_ledger_detects_withheld_completion_at_next_source",
+          "indexer::watch_source_ledger::boundary_tests::gh538_watch_ledger_detects_withheld_completion_at_scan_end",
+          "indexer::watch_source_ledger::tests::receipt_budget_rejects_a_single_large_write_before_allocating",
+          "indexer::watch_source_ledger::tests::receipt_serialization_budget_does_not_retain_an_oversized_payload",
+          "indexer::watch_source_stability::tests::gh538_declared_sidecar_mutation_and_appearance_request_retry",
+          "indexer::watch_source_stability::tests::gh538_losing_a_previously_available_observation_requests_retry",
+          "indexer::watch_source_stability::tests::gh538_non_unicode_sources_retry_only_for_observed_metadata_changes",
+          "indexer::watch_source_stability::tests::gh538_parent_changes_only_matter_for_directory_dependency_policies",
+          "indexer::watch_source_stability::tests::gh538_primary_mutation_and_disappearance_request_retry",
+          "indexer::watch_source_stability::tests::gh538_replacement_is_changed_even_when_size_and_mtime_match",
+          "indexer::watch_source_stability::tests::gh538_stable_primary_and_sidecars_do_not_request_retry",
+          "indexer::watch_source_stability::tests::gh538_unavailable_evidence_alone_does_not_request_retry"
+        ],
+        "counts": {
+          "passed": 24,
+          "failed": 0,
+          "ignored": 1,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        "source_verified_after": true,
+        "finished_utc": "2026-10-31T17:29:44.519759+00:00"
+      }
+    },
+    "launchd_renderer": {
+      "report_sha256": "67b03b08455f7aaa439712e6280d5324a0341f918f9cea2acf8c89f0f341d4a7",
+      "record": {
+        "qualification": "supplemental std-only exact-source renderer tests, not full CASS or native macOS",
+        "source": "/workspace/scratch/5340e1fe88cf/cass/src/schedule.rs",
+        "source_sha256": "8fbd4b4e372097eadc93efebae84934fba9b0bdba01b3a1b7624a16f04f462fe",
+        "baseline_revision": "30f96a3dbed4f18e99ff205541fa97528eeba3e7",
+        "baseline_source_sha256": "9814309a9b12bb455c2215d629b3935a1b9043475c6aa132a24972971dfda583",
+        "evidence_directory": "/tmp/cass-538-validation/schedule-20261031T165534.766828Z",
+        "rustc": "rustc 1.100.0-nightly (908501772 2026-08-30)\nbinary: rustc\ncommit-hash: 90850177249efe0321573c569aec5d12b257f8d6\ncommit-date: 2026-08-30\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0\n",
+        "runner_sha256": "324f37c11268a7f2232dcc31abcc315e2f223baf89deefedbe475fbf3586eb71",
+        "results": [
+          {
+            "command": [
+              "/tmp/am-extensions-toolchain-a12f7733/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+              "--edition=2024",
+              "--test",
+              "-C",
+              "debuginfo=0",
+              "/tmp/cass-538-validation/schedule-20261031T165534.766828Z/candidate.rs",
+              "-o",
+              "/tmp/cass-538-validation/schedule-20261031T165534.766828Z/candidate-tests"
+            ],
+            "exit": 0,
+            "wall_seconds": 0.6205,
+            "stdout": "candidate-compile.stdout.log",
+            "stderr": "candidate-compile.stderr.log"
+          },
+          {
+            "command": [
+              "/tmp/cass-538-validation/schedule-20261031T165534.766828Z/candidate-tests",
+              "--list"
+            ],
+            "exit": 0,
+            "wall_seconds": 0.0064,
+            "stdout": "candidate-inventory.stdout.log",
+            "stderr": "candidate-inventory.stderr.log"
+          },
+          {
+            "command": [
+              "/tmp/cass-538-validation/schedule-20261031T165534.766828Z/candidate-tests",
+              "--nocapture",
+              "--test-threads=1"
+            ],
+            "exit": 0,
+            "wall_seconds": 0.0111,
+            "stdout": "candidate-tests.stdout.log",
+            "stderr": "candidate-tests.stderr.log",
+            "executable_sha256": "00a05b5a03d2b96c732628446283866cf422efc1fae9721c0415f60790e6a439"
+          },
+          {
+            "command": [
+              "/tmp/am-extensions-toolchain-a12f7733/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+              "--edition=2024",
+              "--test",
+              "-C",
+              "debuginfo=0",
+              "/tmp/cass-538-validation/schedule-20261031T165534.766828Z/baseline.rs",
+              "-o",
+              "/tmp/cass-538-validation/schedule-20261031T165534.766828Z/baseline-tests"
+            ],
+            "exit": 0,
+            "wall_seconds": 0.6379,
+            "stdout": "baseline-compile.stdout.log",
+            "stderr": "baseline-compile.stderr.log"
+          },
+          {
+            "command": [
+              "/tmp/cass-538-validation/schedule-20261031T165534.766828Z/baseline-tests",
+              "--list"
+            ],
+            "exit": 0,
+            "wall_seconds": 0.0073,
+            "stdout": "baseline-inventory.stdout.log",
+            "stderr": "baseline-inventory.stderr.log"
+          },
+          {
+            "command": [
+              "/tmp/cass-538-validation/schedule-20261031T165534.766828Z/baseline-tests",
+              "--nocapture",
+              "--test-threads=1"
+            ],
+            "exit": 101,
+            "wall_seconds": 0.0128,
+            "stdout": "baseline-tests.stdout.log",
+            "stderr": "baseline-tests.stderr.log",
+            "executable_sha256": "ad5305fd5f11d0320b4ebf8dc48618054abf4051cb76a86cae0e8807d3a4c0e2",
+            "classification": "expected missing-ProcessType regression reproduced"
+          },
+          {
+            "command": [
+              "/tmp/am-extensions-toolchain-a12f7733/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustc",
+              "--edition=2024",
+              "-C",
+              "debuginfo=0",
+              "/tmp/cass-538-validation/schedule-20261031T165534.766828Z/emit-plists.rs",
+              "-o",
+              "/tmp/cass-538-validation/schedule-20261031T165534.766828Z/emit-plists"
+            ],
+            "exit": 0,
+            "wall_seconds": 0.4248,
+            "stdout": "emitter-compile.stdout.log",
+            "stderr": "emitter-compile.stderr.log"
+          },
+          {
+            "command": [
+              "/tmp/cass-538-validation/schedule-20261031T165534.766828Z/emit-plists",
+              "/tmp/cass-538-validation/schedule-20261031T165534.766828Z"
+            ],
+            "exit": 0,
+            "wall_seconds": 0.004,
+            "stdout": "emit-plists.stdout.log",
+            "stderr": "emit-plists.stderr.log"
+          }
+        ],
+        "independent_plist_validation": [
+          {
+            "file": "normal-incremental.plist",
+            "sha256": "e1bfef4b454f81262e219c8d69acc50a352a2c56aff41d7ed53dadf22f87cdf5",
+            "status": "passed"
+          },
+          {
+            "file": "normal-nightly.plist",
+            "sha256": "060c4c0ecd0ad8fefbf8751eddb6561f899ecd83873795acbdfe15148058899a",
+            "status": "passed"
+          },
+          {
+            "file": "escaped-incremental.plist",
+            "sha256": "9ac65a7bdfa8014eec1045d5c1125a0489dc68008f9d2731e26baac74ed60184",
+            "status": "passed"
+          },
+          {
+            "file": "escaped-nightly.plist",
+            "sha256": "b76a1a1723ba6a205e7a36df0f8dfbc52a35e47832c40aa62a60ea104cd8c72d",
+            "status": "passed"
+          }
+        ],
+        "source_stable": true,
+        "status": "passed"
+      }
+    }
+  },
+  "static_analysis": {
+    "summary_sha256": "e9d8731adae4a1ea5eb5e886193a207ce1431a350d1c62159d291b8c437463e8",
+    "record": {
+      "schema_version": 1,
+      "purpose": "Issue #538 pinned UBS static validation; findings remain and this is not a passing full application gate.",
+      "generated_at": "2026-10-31T17:31:55.900838+00:00",
+      "base_commit": "30f96a3dbed4f18e99ff205541fa97528eeba3e7",
+      "source_head_at_scan": "7db0e0902cceae5052d42947955ea71fe230cbd0",
+      "tooling": {
+        "ubs_version": "v5.4.4",
+        "runner_sha256": "bdeccbb35f2056e6177c73b3f0f9966d20d1cbeff22b7f084133c4a6ac625ee2",
+        "contract_sha256": "7319b2e5e085d0dd2434e5114291b2dee9fbbb96e2cfe02027eb263abcb06ac3",
+        "ast_grep_version": "0.45.3",
+        "ast_grep_archive_sha256": "f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8",
+        "ast_grep_binary_sha256": "7a5ab30160186184c0bf8bffc87da4af25123c183964cd98c11b0b354137db0a",
+        "run_ubs_extracted_verbatim": true,
+        "run_ubs_function_sha256": "8171bf15db106a915a19fb735304d7316d5ed4c4cc32bf30661d77fe08f7b1dd",
+        "ubsignore_sha256": "63bf4f9eedf24c17c81644da25d4b44bf8ea7c84ec0a07f2232b3371beb292d2"
+      },
+      "scope": {
+        "files": 18,
+        "rust_files": 17,
+        "python_files": 1,
+        "excluded_by_ubsignore": [],
+        "source_manifest": "source-manifest-at-scan.json",
+        "rust_source_changed_since_scan": []
+      },
+      "first_scan": {
+        "exit_code": 1,
+        "elapsed_seconds": 210.186,
+        "source_changed_during_scan": [],
+        "module_summary": {
+          "project": "/workspace/scratch/5340e1fe88cf/cass",
+          "timestamp": "2026-10-31T17:27:36Z",
+          "status": "ok",
+          "failed_modules": [],
+          "git": {
+            "repository": "https://github.com/Dicklesworthstone/coding_agent_session_search",
+            "commit": "7db0e0902cceae5052d42947955ea71fe230cbd0",
+            "blob_base": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/7db0e0902cceae5052d42947955ea71fe230cbd0"
+          },
+          "scanners": [
+            {
+              "language": "python",
+              "project": "/workspace/scratch/5340e1fe88cf/cass",
+              "files": 1,
+              "critical": 2,
+              "warning": 6,
+              "info": 35,
+              "timestamp": "2026-10-31T17:24:58Z",
+              "status": "ok"
+            },
+            {
+              "language": "rust",
+              "project": "/workspace/scratch/5340e1fe88cf/cass",
+              "files": 17,
+              "critical": 93,
+              "warning": 18037,
+              "info": 8783,
+              "timestamp": "2026-10-31T17:27:24Z",
+              "status": "ok"
+            }
+          ],
+          "totals": {
+            "critical": 95,
+            "warning": 18043,
+            "info": 8818,
+            "files": 18
+          },
+          "generated_at": "2026-10-31T17:27:36Z"
+        },
+        "invocation": "invocation.json",
+        "log": "scan.log",
+        "cache_record_summary": {
+          "cached_source_files": 18,
+          "cached_record_counts": {
+            "rust": {
+              "critical": 93,
+              "warning": 18030,
+              "info": 8777
+            },
+            "python": {
+              "critical": 2,
+              "warning": 6,
+              "info": 14
+            }
+          },
+          "changed_line_counts": {
+            "warning": 445,
+            "critical": 4,
+            "info": 104
+          },
+          "changed_rules": {
+            "py.security.subprocess-timeout": 3,
+            "python.taint.command": 1,
+            "py.any-typing": 5,
+            "rust.ownership.unwrap-expect": 133,
+            "rust.async.lock-unwrap": 21,
+            "rust.numeric.division-by-var": 19,
+            "rust.collections.clone-any": 29,
+            "rust.collections.clone-in-loop": 15,
+            "rust.modules.wildcard-imports": 6,
+            "rust.panic.assert-macros": 250,
+            "rust.perf.string-alloc-in-loop": 13,
+            "rust.numeric.modulo-by-var": 2,
+            "rust.filesystem.fs-usage": 10,
+            "rust.filesystem.write-not-atomic": 28,
+            "rust.panic.direct-indexing": 7,
+            "rust.parsing.serde-unwrap": 1,
+            "rust.ownership.panic-macro": 3,
+            "rust.numeric.float-equality": 2,
+            "rust.security.path-traversal": 1,
+            "rust.api-misuse.unwrap-err": 2,
+            "rust.domain.from-str": 1,
+            "rust.parsing.strict-utf8": 1
+          }
+        }
+      },
+      "changed_rust_line_findings": {
+        "located_cached_counts": {
+          "warning": 442,
+          "info": 99,
+          "critical": 3
+        },
+        "critical_review": [
+          {
+            "path": "src/schedule.rs",
+            "line": 1795,
+            "rule": "rust.ownership.panic-macro",
+            "disposition": "Intentional panic branch reporting a failed regression-test precondition or assertion; test-only."
+          },
+          {
+            "path": "src/raw_mirror/retention_tests.rs",
+            "line": 320,
+            "rule": "rust.ownership.panic-macro",
+            "disposition": "Intentional panic branch reporting a failed regression-test precondition or assertion; test-only."
+          },
+          {
+            "path": "src/indexer/watch_source_stability.rs",
+            "line": 78,
+            "rule": "rust.ownership.panic-macro",
+            "disposition": "Intentional panic branch reporting a failed regression-test precondition or assertion; test-only."
+          }
+        ],
+        "reviewed_production_warnings": [
+          {
+            "path": "src/indexer/mod.rs",
+            "lines": [
+              32950,
+              33210
+            ],
+            "review": "Root path cloning is bounded by the retry-root set. The writer expect follows the explicit writer reopen/check flow before commit; it expresses an internal invariant."
+          },
+          {
+            "path": "src/indexer/watch_source_cache.rs",
+            "lines": [
+              102
+            ],
+            "review": "Cloned pagination cursor is limited to 512 bytes per page, at most 65,536 examined rows; required for forward keyset progress."
+          },
+          {
+            "path": "src/indexer/watch_source_ledger.rs",
+            "lines": [
+              215,
+              343,
+              401
+            ],
+            "review": "Successful serde_json serialization produces UTF-8; source paths queued after completion are bounded by the receipt/batch limits. serde_json Value lookup returns null for absent/non-object keys and the bool check fails closed."
+          },
+          {
+            "path": "src/raw_mirror/retention.rs",
+            "lines": [
+              139,
+              142
+            ],
+            "review": "Slice length is limited by remaining.min(left_bytes.len()); left and right fixed buffers share capacity."
+          },
+          {
+            "path": "src/raw_mirror/store.rs",
+            "lines": [
+              1287,
+              1650
+            ],
+            "review": "Formatting inside with_context closures is lazy and executes only on error."
+          },
+          {
+            "path": "src/lib.rs",
+            "lines": [
+              22071,
+              22072
+            ],
+            "review": "Modulo heuristic matches tracing field-display syntax (%); no arithmetic division/modulo occurs."
+          }
+        ],
+        "other_changed_findings": "Remaining warnings are regression fixture/assertion/temporary-file operations or heuristic matches to path/XML strings. No additional actionable production defect was identified during this review."
+      },
+      "python_recheck": {
+        "source_sha256": "533b3de32e518fd842f8bdaefbdc0c6ece218db4b269ee5d3972227203b7f268",
+        "exit_code": 1,
+        "elapsed_seconds": 5.811,
+        "source_changed_during_recheck": false,
+        "module_summary": {
+          "project": "/workspace/scratch/5340e1fe88cf/cass",
+          "timestamp": "2026-10-31T17:30:58Z",
+          "status": "ok",
+          "failed_modules": [],
+          "git": {
+            "repository": "https://github.com/Dicklesworthstone/coding_agent_session_search",
+            "commit": "7db0e0902cceae5052d42947955ea71fe230cbd0",
+            "blob_base": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/7db0e0902cceae5052d42947955ea71fe230cbd0"
+          },
+          "scanners": [
+            {
+              "language": "python",
+              "project": "/workspace/scratch/5340e1fe88cf/cass",
+              "files": 1,
+              "critical": 1,
+              "warning": 3,
+              "info": 35,
+              "timestamp": "2026-10-31T17:30:58Z",
+              "status": "ok"
+            }
+          ],
+          "totals": {
+            "critical": 1,
+            "warning": 3,
+            "info": 35,
+            "files": 1
+          },
+          "generated_at": "2026-10-31T17:30:59Z"
+        },
+        "invocation": "python-recheck-invocation.json",
+        "log": "python-recheck.log",
+        "fixed": "Three newly added Git check_output calls now have 30-second timeouts. Post-SIGKILL communicate is also bounded with cleanup uncertainty reported. The original three changed-line timeout warnings are absent.",
+        "remaining": "1 critical taint heuristic on the existing shell-free Cargo subprocess with copied environment; 3 timeout warnings on existing Cargo metadata/test/benchmark paths at current lines670,684,686. These are outside the changed Git/watch-scan path. Bandit reports generic low-severity subprocess checks; no suppression added."
+      },
+      "coverage": {
+        "rust_module_completed": true,
+        "rust_module_seconds": 163,
+        "python_modules_completed": true,
+        "failed_modules": [],
+        "ast_evidence": {
+          "direct_ast_check_rules_with_hits": {
+            "rust.collections.map-clone": 9,
+            "rust.filesystem.write-not-atomic": 723,
+            "rust.panic.debug-assert-macros": 7,
+            "rust.numeric.instant-subtraction": 6,
+            "rust.numeric.wrapping-arithmetic": 1,
+            "rust.parsing.strict-utf8": 1
+          },
+          "total_located_matches": 747,
+          "limitation": "Pinned Rust helper does not record each ast-grep subprocess completion status; match evidence establishes actual AST use, not complete AST coverage."
+        },
+        "python_ast_evidence": "Both scans emitted 13 py.any-typing AST rule-pack matches; native Python/taint/resource findings and external Ruff/Bandit reports were generated.",
+        "not_evaluated": [
+          "Cargo formatting/clippy/check/test/audit/deny/udeps/outdated in UBS; UBS_SKIP_RUST_BUILD=1 after separate full build/check attempts died in pinned asupersync.",
+          "Runtime ingestion/searchability/crash-recovery integration tests are not executed by static UBS.",
+          "Rust ast-grep per-invocation success is not persisted by pinned helper; observed matches establish actual execution, not complete parser coverage."
+        ]
+      },
+      "limitations": [
+        "Text rendering samples categories; review used the original per-file cached records additionally. Cached located records do not include every aggregate-only warning/info item: Rust has93 critical/18030 warning/8777 info located records vs93/18037/8783 module totals.",
+        "Source-line intersection is a changed-line triage aid, not a proof of novelty or semantic correctness; unchanged-line bugs caused by changed flow may escape it.",
+        "Scanner status ok means module completion. Both invocations exited1 and the full gate is not green. No findings were suppressed or categories skipped."
+      ],
+      "source_targets": [
+        {
+          "path": "scripts/test_source_ledger_matcher.py",
+          "bytes": 36985,
+          "sha256": "47f4981e9c337dc57ad163aaa941d203fffb19b7076e6561c90d068957a36d06"
+        },
+        {
+          "path": "src/indexer/mod.rs",
+          "bytes": 3187109,
+          "sha256": "f032b995f3aee254c9f2c2749a62ae5ff06fcafcae72dd35d684444a69af0519"
+        },
+        {
+          "path": "src/indexer/source_ledger_tests.rs",
+          "bytes": 39118,
+          "sha256": "913c6f4f3b7a53d9d3fe08e0027c65814db0afef6226bd2895c46bc75c8dc011"
+        },
+        {
+          "path": "src/indexer/watch_ingestion_tests.rs",
+          "bytes": 26695,
+          "sha256": "431725568e7558c82b84509b46363f876f4b9cb96fe9576bce9c2240a18d3e13"
+        },
+        {
+          "path": "src/indexer/watch_source_cache.rs",
+          "bytes": 9125,
+          "sha256": "6b2773c46351bae0b688cabf868c0a38916deb89c0c1d77f1092808a1d5d39a1"
+        },
+        {
+          "path": "src/indexer/watch_source_ledger.rs",
+          "bytes": 18176,
+          "sha256": "5c4753ea60cde8e4af8f54f828b7913f4fe48fb19c38ba56e60a0a6a46a32298"
+        },
+        {
+          "path": "src/indexer/watch_source_ledger_tests.rs",
+          "bytes": 7715,
+          "sha256": "2b0739b64b3546bcea536879383dbde819e12e21bb7851c5fd42bc4fea2833cf"
+        },
+        {
+          "path": "src/indexer/watch_source_stability.rs",
+          "bytes": 12140,
+          "sha256": "b73abaf35003bdb7d70dcc918dc36b37a362e6ade3b8a98e29b6b8ab352cbf17"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 5247352,
+          "sha256": "ae411ac0c97ab0df33a3ac2e1b7e167a5bfe94438def04d3f5038d7a32f97a79"
+        },
+        {
+          "path": "src/main.rs",
+          "bytes": 17595,
+          "sha256": "056f6cd492f5e0cea68cec4393b973bb6cd1d097819f21d88fb63a4f605ba4e8"
+        },
+        {
+          "path": "src/raw_mirror.rs",
+          "bytes": 10444,
+          "sha256": "59e5220716c1e86b9b72550d5bc1cc7d90a25cf8533fc3479969a1e3b5e5c0b8"
+        },
+        {
+          "path": "src/raw_mirror/policy.rs",
+          "bytes": 31749,
+          "sha256": "0c8e85056dd2b11292ea7468b309d246f26fb975f900228b83440d40c9024f9d"
+        },
+        {
+          "path": "src/raw_mirror/retention.rs",
+          "bytes": 17579,
+          "sha256": "d232e6b7c03ca596800d9bdd4e17223561f9bee77e05089b76943ca02b7d5ff4"
+        },
+        {
+          "path": "src/raw_mirror/retention_tests.rs",
+          "bytes": 17060,
+          "sha256": "a5af88c43697b7d7a68e918316fa96aa3eea0a2466467c381c044c74a2b10ff2"
+        },
+        {
+          "path": "src/raw_mirror/store.rs",
+          "bytes": 282577,
+          "sha256": "a5aff0c70a2c4970281b4981296042b2632f1cd933930fc58691d452c3c778fe"
+        },
+        {
+          "path": "src/raw_mirror_cli.rs",
+          "bytes": 4755,
+          "sha256": "dc5632c31ce73b5f30fc1e04e56e2026e9d8a17259527ccb51e7cfa8496b7a6d"
+        },
+        {
+          "path": "src/schedule.rs",
+          "bytes": 91429,
+          "sha256": "8fbd4b4e372097eadc93efebae84934fba9b0bdba01b3a1b7624a16f04f462fe"
+        },
+        {
+          "path": "tests/watch_e2e.rs",
+          "bytes": 69218,
+          "sha256": "2e9589eac6c4ce71c6ee9f6688632d4389aee5481b6b46d9cd44d471db30f4b9"
+        }
+      ],
+      "artifacts": {
+        "run_ubs.function.sh": {
+          "sha256": "8171bf15db106a915a19fb735304d7316d5ed4c4cc32bf30661d77fe08f7b1dd",
+          "bytes": 3101
+        },
+        "run_ubs-extracted.sh": {
+          "sha256": "ef6c58a227063a050a0eed3c9a1ce13778773e9cef8136337c546fab9eb5ff48",
+          "bytes": 3142
+        },
+        "source-manifest-at-scan.json": {
+          "sha256": "91057a7f7950aa895e63653108b3ed69abfb554b80e2a9945f8532b4344a69a9",
+          "bytes": 3316
+        },
+        "changed-lines.json": {
+          "sha256": "2a897fb4860b0f0b84223cd4b38d66f4545fb3dc248bb14021c461fcc1002cd4",
+          "bytes": 5633
+        },
+        "changed-line-findings.json": {
+          "sha256": "85aa07cd74a513d62353c32cd9b17f5fac4ab442aa2cf7a73e8f83829a9ca588",
+          "bytes": 394615
+        },
+        "cache-finding-summary.json": {
+          "sha256": "8d15810ad55a386fc7f978a55a17293ac46de589e4789927b228d8b245a8066c",
+          "bytes": 1160
+        },
+        "ast-match-evidence.json": {
+          "sha256": "fe68c40bcff3f75f5a0454f39052a6e2a2902d5241550d6f1200676fca9a06e1",
+          "bytes": 491
+        },
+        "invocation.json": {
+          "sha256": "e32c2d9192c75c42256a9eb13ea096b7357c7b54cc1d8f6f3c68caab163bbd5a",
+          "bytes": 1711
+        },
+        "result.json": {
+          "sha256": "bc11f202f64482d67aa1065dd0d8f9596afe1320aef095eb98cfd909b9e2b1e0",
+          "bytes": 317
+        },
+        "scan.log": {
+          "sha256": "a4ebd8793e2c56830f89f4e0f11a03951ed0e1f3771031d2dcc3036a2df4060b",
+          "bytes": 146815
+        },
+        "report.json": {
+          "sha256": "54b695fc22b653462e545548628e67dc18fb0c7722d2aa07d8e59e04e2a86703",
+          "bytes": 1067
+        },
+        "python-recheck-invocation.json": {
+          "sha256": "50d175d4e1c7f0b2acc666dc2ee2c4d4fc47d3a6e1102b922a5d3449b611c9ac",
+          "bytes": 758
+        },
+        "python-recheck-result.json": {
+          "sha256": "1da1c9031ebdb7a9237c5119a01c69dce27b093957a806df8296b42ad7427aa4",
+          "bytes": 886
+        },
+        "python-recheck.log": {
+          "sha256": "abd928bdbf5cfab963999ddcfd38f3f7c6c74b9b9fd623e6c3de61c4b812995e",
+          "bytes": 25466
+        },
+        "python-recheck-report.json": {
+          "sha256": "361e45ccae2c189ed8baaa9dde8f359b2319999a74e93f3357d41994d3afa0d2",
+          "bytes": 814
+        }
+      }
+    }
+  },
+  "full_application_tests_added_not_executed": [
+    "deferred_watch_sources::gh538_live_watch_ingests_startup_append_and_restart_over_mirror_cap",
+    "gh538_watch_source_receipts_bound_codex_active_retries_and_restart",
+    "gh538_watch_source_receipts_bound_claude_active_retries_and_restart",
+    "gh538_watch_source_receipts_require_publication_before_reuse",
+    "gh538_watch_discovery_failure_retries_without_inventing_publication_debt",
+    "gh538_watch_recovery_reuses_locked_published_sibling_without_stranding_debt",
+    "gh538_watch_replay_debt_overrides_recent_publication_and_live_lease",
+    "gh538_failed_watch_replay_probe_is_unknown_and_cannot_report_ready",
+    "gh538_watch_source_cache_*",
+    "source_ledger_tests native-path/key compatibility and real Claude delivery tests",
+    "gh538_retention_prefix_comparison_observes_cancellation_between_bounded_reads",
+    "gh538_cancelled_maintenance_releases_both_leases_without_retiring_evidence"
+  ],
+  "qualification_limits": [
+    "Source/component tests do not qualify begin_publication/publish_batch, canonical SQL, lexical publication/recovery, actual filesystem notification ingestion, or live watcher restart/searchability.",
+    "The real application lifecycle tests assert exact-once canonical rows and lexical identities; these assertions were not executed in this environment.",
+    "The synthetic source-boundary harness uses documented progress/active-writer/provenance adapters; native parsing and active-writer/cancellation integration are excluded.",
+    "The 11 GiB mirror fixture is sparse logical data, not physical 11 GiB disk traffic or an APFS performance measurement.",
+    "Generated plist checks do not reproduce native launchd scheduling, identify the original blocked syscall, or explain shell-watch ingestion failure.",
+    "Pinned UBS completion and reviewed findings are not a passing gate; full AST subprocess coverage is not established and Cargo-backed categories were not evaluated."
+  ]
+}
