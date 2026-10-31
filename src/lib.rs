@@ -21457,6 +21457,11 @@ struct StateDbSnapshot {
     /// the last reason. `None` streak when the last run did not defer.
     lexical_repair_deferred_runs: Option<i64>,
     lexical_repair_deferred_reason: Option<String>,
+    /// GH #538: a durable watch retry can outlive the process that created
+    /// it, even when last_indexed_at is recent and the live watcher holds a
+    /// healthy lease. This is source-root debt, not a known session count.
+    /// None means the bounded metadata probe could not establish its absence.
+    watch_lexical_replay_pending: Option<bool>,
     /// i6upe: result of the bounded real-column integrity probe. `None` when
     /// the probe did not run (watermarks-only health path, unopened DB) or
     /// could not classify (busy/transient error). A probe, not a proof:
@@ -22047,6 +22052,29 @@ fn probe_state_db_strict_worker(
         .filter(|runs| *runs > 0);
     snapshot.lexical_repair_deferred_reason =
         meta_value("lexical_repair_deferred_reason").filter(|detail| !detail.is_empty());
+
+    // The primary-key range and LIMIT keep this independent of archive size
+    // and of the number/size of debt payloads. Even malformed debt is pending:
+    // a readiness probe must not silently turn unreadable recovery work into
+    // success. The existing owner-thread hard deadline bounds this query too.
+    set_phase("watch_lexical_replay");
+    snapshot.watch_lexical_replay_pending = match owner_query_row_map_retry(
+        &conn,
+        "SELECT 1 FROM meta WHERE key >= 'watch_lexical_replay_v1:' \
+         AND key < 'watch_lexical_replay_v1;' LIMIT 1",
+        |row| row.get_typed::<i64>(0),
+    ) {
+        Ok(_) => Some(true),
+        Err(crate::franken_sync::FrankenError::QueryReturnedNoRows) => Some(false),
+        Err(error) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                %error,
+                "could not determine whether durable watch replay is pending"
+            );
+            None
+        }
+    };
 
     // i6upe: real-column corruption probe on the status surface, gated by the
     // physical bundle ceiling (GH #413) — the exact configuration in which
@@ -23225,6 +23253,7 @@ fn state_meta_json_inner(
     let message_count = db_snapshot.message_count;
     let last_scan_ts = db_snapshot.last_scan_ts;
     let mut last_indexed_at = db_snapshot.last_indexed_at;
+    let watch_lexical_replay_pending = db_snapshot.watch_lexical_replay_pending;
     let db_opened = db_snapshot.opened;
     let db_open_error = db_snapshot.open_error;
     let db_open_retryable = db_snapshot.open_retryable;
@@ -23385,6 +23414,32 @@ fn state_meta_json_inner(
             "last_scan_ts is newer than last_indexed_at; a prior scan advanced without a completed projection into the searchable index"
                 .to_string(),
         );
+    }
+    // A lease heartbeat and a recent timestamp cannot certify publication
+    // while source replay remains durable. An unsuccessful requested probe
+    // also cannot certify its absence. Passive no-maintenance reads retain
+    // their existing contract and expose null instead of pretending to probe.
+    let watch_replay_unverified = watch_lexical_replay_pending.is_none()
+        && db_exists
+        && !passive_db_probe
+        && (allow_db_open || skip_db_open);
+    if assets.lexical.exists
+        && (watch_lexical_replay_pending == Some(true) || watch_replay_unverified)
+    {
+        assets.lexical.fresh = false;
+        assets.lexical.stale = true;
+        // Do not replace stronger missing/corrupt/hollow/rebuilding verdicts.
+        if matches!(assets.lexical.status, "ready" | "stale") {
+            assets.lexical.status = "stale";
+            assets.lexical.status_reason = Some(
+                if watch_lexical_replay_pending == Some(true) {
+                    "durable watch ingestion or lexical publication is pending; watcher activity and last_indexed_at do not establish that new content is searchable"
+                } else {
+                    "durable watch replay could not be checked; searchable publication is not verified"
+                }
+                .to_string(),
+            );
+        }
     }
     let not_initialized = cass_not_initialized(
         db_exists,
@@ -23600,6 +23655,7 @@ fn state_meta_json_inner(
     let index_partial = lexical.exists
         && !lexical.rebuilding
         && ((lexical.checkpoint.present && lexical.checkpoint.completed == Some(false))
+            || watch_lexical_replay_pending == Some(true)
             || last_scan_ts.is_some_and(|scan_ts| {
                 last_indexed_at
                     .map(|indexed_at| scan_ts > indexed_at.saturating_add(1_000))
@@ -23609,6 +23665,10 @@ fn state_meta_json_inner(
         if lexical.checkpoint.present && lexical.checkpoint.completed == Some(false) {
             Some(
                 "lexical index is PARTIAL: a prior `cass index --full` was aborted or interrupted before its checkpoint completed; search results omit conversations indexed after the abort. Re-run `cass index --full` to complete it.",
+            )
+        } else if watch_lexical_replay_pending == Some(true) {
+            Some(
+                "lexical index is PARTIAL: durable watch ingestion or publication remains pending for one or more source roots; new content may not yet be searchable. The watcher will retry; restart `cass index --watch` if no watcher is running.",
             )
         } else {
             Some(
@@ -23694,6 +23754,7 @@ fn state_meta_json_inner(
         },
         "pending": {
             "sessions": lexical.pending_sessions,
+            "lexical_replay": watch_lexical_replay_pending,
             "watch_active": lexical.watch_active,
             "orphaned": index_run.orphaned
         },
@@ -90333,6 +90394,7 @@ mod cli_read_db_tests {
         assert!(snapshot.opened, "state probe should open the database");
         assert_eq!(snapshot.last_indexed_at, Some(1_733_000_000_000));
         assert_eq!(snapshot.last_scan_ts, Some(1_732_999_999_000));
+        assert_eq!(snapshot.watch_lexical_replay_pending, Some(false));
         assert!(snapshot.counts_skipped, "count scan should remain disabled");
         assert_eq!(snapshot.conversation_count, 0);
         assert_eq!(snapshot.message_count, 0);
@@ -90609,6 +90671,139 @@ mod cli_read_db_tests {
                 .get("messages")
                 .is_some_and(serde_json::Value::is_null),
             "health must still report messages=null (counts skipped): {health_db:?}"
+        );
+    }
+
+    #[test]
+    fn gh538_watch_replay_debt_overrides_recent_publication_and_live_lease() {
+        let (temp, db_path) = seed_cli_db();
+        let now = FrankenStorage::now_millis();
+        {
+            let storage = FrankenStorage::open(&db_path).expect("reopen cass db");
+            storage
+                .set_last_indexed_at(now)
+                .expect("recent publication");
+            storage
+                .set_last_scan_ts(now.saturating_sub(1_000))
+                .expect("scan covered by publication");
+            // Prefix neighbors must not count as watch debt.
+            storage
+                .raw()
+                .execute_batch(
+                    "INSERT INTO meta(key, value) VALUES \
+                     ('watch_lexical_replay_v0:old', '{}'), \
+                     ('watch_lexical_replay_v1;neighbor', '{}');",
+                )
+                .expect("insert unrelated metadata");
+        }
+        let index_path = crate::search::tantivy::expected_index_dir(temp.path());
+        let mut index = crate::search::tantivy::TantivyIndex::open_or_create(&index_path)
+            .expect("create real lexical generation");
+        index.commit().expect("publish lexical generation");
+        drop(index);
+
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open watch lease");
+        lock_file.try_lock_exclusive().expect("hold watch lease");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={now}\nupdated_at_ms={now}\ndb_path={}\nmode=watch\n",
+                std::process::id(),
+                db_path.display()
+            ),
+        );
+
+        let clean = state_meta_json_for_health(temp.path(), &db_path, 3600);
+        assert_eq!(clean["index"]["status"], "ready", "{clean}");
+        assert_eq!(clean["pending"]["lexical_replay"], false);
+        assert_eq!(clean["pending"]["watch_active"], true);
+
+        {
+            let storage = FrankenStorage::open(&db_path).expect("open debt writer");
+            // A corrupt payload is still outstanding work. Health must not
+            // parse it away, count its roots as sessions, or certify readiness.
+            storage
+                .raw()
+                .execute_batch(
+                    "INSERT INTO meta(key, value) \
+                     VALUES('watch_lexical_replay_v1:pending-source', 'malformed debt');",
+                )
+                .expect("persist unresolved replay");
+        }
+        let before = std::fs::read(&db_path).expect("snapshot canonical bytes");
+        for state in [
+            state_meta_json_for_status(temp.path(), &db_path, 3600),
+            state_meta_json_for_health(temp.path(), &db_path, 3600),
+        ] {
+            assert_eq!(state["pending"]["lexical_replay"], true, "{state}");
+            assert_eq!(state["pending"]["watch_active"], true);
+            assert_eq!(state["pending"]["sessions"], 0);
+            assert_eq!(state["index"]["status"], "stale");
+            assert_eq!(state["index"]["fresh"], false);
+            assert_eq!(state["index"]["partial"], true);
+            assert_eq!(
+                state["index"]["last_indexed_at"],
+                clean["index"]["last_indexed_at"]
+            );
+            assert!(
+                state["index"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("durable watch"))
+            );
+        }
+        assert_eq!(
+            std::fs::read(&db_path).expect("canonical bytes after readiness reads"),
+            before,
+            "readiness probes cannot discharge or rewrite recovery debt"
+        );
+
+        {
+            let storage = FrankenStorage::open(&db_path).expect("open completion writer");
+            storage
+                .raw()
+                .execute_batch(
+                    "DELETE FROM meta WHERE key = 'watch_lexical_replay_v1:pending-source';",
+                )
+                .expect("complete exact replay debt");
+        }
+        let recovered = state_meta_json_for_health(temp.path(), &db_path, 3600);
+        assert_eq!(recovered["pending"]["lexical_replay"], false);
+        assert_eq!(recovered["index"]["status"], "ready", "{recovered}");
+        assert_eq!(recovered["index"]["partial"], false);
+    }
+
+    #[test]
+    fn gh538_failed_watch_replay_probe_is_unknown_and_cannot_report_ready() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        {
+            let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())
+                .expect("open malformed metadata fixture");
+            conn.execute_batch("CREATE TABLE meta (unexpected TEXT);")
+                .expect("create metadata without its key column");
+        }
+        let index_path = crate::search::tantivy::expected_index_dir(temp.path());
+        let mut index = crate::search::tantivy::TantivyIndex::open_or_create(&index_path)
+            .expect("create real lexical generation");
+        index.commit().expect("publish lexical generation");
+        drop(index);
+
+        let state = state_meta_json_for_health(temp.path(), &db_path, 3600);
+        assert!(state["pending"]["lexical_replay"].is_null(), "{state}");
+        assert_eq!(state["index"]["fresh"], false);
+        assert_eq!(state["index"]["status"], "stale", "{state}");
+        assert!(
+            state["index"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("could not be checked"))
         );
     }
 
@@ -100518,6 +100713,7 @@ fn response_schema_pending_state() -> serde_json::Value {
         "type": "object",
         "properties": {
             "sessions": { "type": "integer" },
+            "lexical_replay": { "type": ["boolean", "null"] },
             "watch_active": { "type": "boolean" },
             "orphaned": { "type": "boolean" }
         }

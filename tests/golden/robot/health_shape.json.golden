@@ -1058,6 +1058,9 @@
             "sessions": {
               "type": "integer"
             },
+            "lexical_replay": {
+              "type": "null"
+            },
             "watch_active": {
               "type": "boolean"
             },

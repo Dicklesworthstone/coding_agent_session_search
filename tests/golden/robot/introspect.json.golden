@@ -30269,6 +30269,12 @@
                 "sessions": {
                   "type": "integer"
                 },
+                "lexical_replay": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
                 "watch_active": {
                   "type": "boolean"
                 },
@@ -33163,6 +33169,12 @@
                     "sessions": {
                       "type": "integer"
                     },
+                    "lexical_replay": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
                     "watch_active": {
                       "type": "boolean"
                     },
@@ -34465,6 +34477,12 @@
           "properties": {
             "sessions": {
               "type": "integer"
+            },
+            "lexical_replay": {
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "watch_active": {
               "type": "boolean"
@@ -36618,6 +36636,12 @@
           "properties": {
             "sessions": {
               "type": "integer"
+            },
+            "lexical_replay": {
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "watch_active": {
               "type": "boolean"
@@ -38778,6 +38802,12 @@
               "properties": {
                 "sessions": {
                   "type": "integer"
+                },
+                "lexical_replay": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
                 },
                 "watch_active": {
                   "type": "boolean"

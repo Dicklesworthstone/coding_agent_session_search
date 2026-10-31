@@ -3042,6 +3042,7 @@ schemas: (auto-generated from contract)
         - schema_version: integer
         - status: string
       - pending: object
+        - lexical_replay: ?
         - orphaned: boolean
         - sessions: integer
         - watch_active: boolean
@@ -3589,6 +3590,7 @@ schemas: (auto-generated from contract)
       - status: string
     - initialized: boolean
     - pending: object
+      - lexical_replay: ?
       - orphaned: boolean
       - sessions: integer
       - watch_active: boolean
@@ -3994,6 +3996,7 @@ schemas: (auto-generated from contract)
       - status: string
     - initialized: boolean
     - pending: object
+      - lexical_replay: ?
       - orphaned: boolean
       - sessions: integer
       - watch_active: boolean
@@ -4274,6 +4277,7 @@ schemas: (auto-generated from contract)
         - status: string
       - pending: object
         - inspected: boolean
+        - lexical_replay: ?
         - orphaned: boolean
         - sessions: integer
         - watch_active: boolean

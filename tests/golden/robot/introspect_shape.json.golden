@@ -55264,6 +55264,17 @@
                                     }
                                   }
                                 },
+                                "lexical_replay": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
                                 "watch_active": {
                                   "type": "object",
                                   "properties": {
@@ -61908,6 +61919,17 @@
                                             }
                                           }
                                         },
+                                        "lexical_replay": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
                                         "watch_active": {
                                           "type": "object",
                                           "properties": {
@@ -64711,6 +64733,17 @@
                           "properties": {
                             "type": {
                               "type": "string"
+                            }
+                          }
+                        },
+                        "lexical_replay": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         },
@@ -69359,6 +69392,17 @@
                             }
                           }
                         },
+                        "lexical_replay": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "watch_active": {
                           "type": "object",
                           "properties": {
@@ -73967,6 +74011,17 @@
                                   "properties": {
                                     "type": {
                                       "type": "string"
+                                    }
+                                  }
+                                },
+                                "lexical_replay": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
                                     }
                                   }
                                 },
