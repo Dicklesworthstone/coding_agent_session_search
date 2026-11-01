@@ -2,6 +2,10 @@
 
 Investigation date: 2026-10-31. Baseline:
 [`5cfb9d6a033927255a8a4befad153a44c8ed36e4`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/5cfb9d6a033927255a8a4befad153a44c8ed36e4).
+The native registration and missing-child publication corrections were committed
+directly to `main` as
+[`52e5e9d4`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96).
+The containing follow-up additionally covers a wholly absent current root.
 
 ## Scope and qualification
 
@@ -17,8 +21,11 @@ This follow-up investigates additional failure paths after the
 failures have been reproduced with isolated directories on Linux. The canonical
 publication regressions and complete CASS watcher tests are implemented but
 **full application qualification remains outstanding after dependency code
-generation exceeded the available memory**. A metadata-only compile check is
-continuing separately; it does not execute the application tests.
+generation exceeded the available memory**. The final frozen-source
+`cargo check --all-targets` has passed against the pinned graph, including the
+library tests and `watch_e2e` target. The same frozen source also passed
+`cargo clippy --all-targets --no-deps -- -D warnings`. These checks do not
+execute tests.
 No reporter archive was accessed. These results do not establish the
 cause or resolution of the reporter's seven probes, macOS FSEvents behavior, or
 original-archive performance. The GH538 ingestion bead remains open.
@@ -73,6 +80,21 @@ otherwise unchanged root. This safeguard follows dependency-source inspection;
 it is not a claim of native macOS runtime validation. Healthy registration
 checks still schedule no census.
 
+The follow-up also corrects the polling backend's initial-error contract. In
+pinned notify 8.2.0, `PollWatcher::watch` returns `Ok` even when its synchronous
+callback reports failure to initialize the watched directory. A real missing
+parent reproduction on `52e5e9d4` therefore left registration retry disabled.
+The poller now captures initial callback errors for its selected parent paths
+and folds them into the retry result. Errors for unrelated children remain
+diagnostic, and the error callback does not request a global rescan.
+
+Every poller rebuild attempt also queues ordinary reconciliation of its current
+database roots. A new polling snapshot cannot report writes made during the
+registration gap. This includes partial registration failures: repeatedly
+rebuilding a healthy peer alongside a failing directory must not strand that
+peer's WAL updates. The scan uses existing idempotent database ingestion and
+does not force a scan of unrelated conversation roots.
+
 ### Canonical writes whose raw transcript disappears
 
 The source audit found a separate publication obligation:
@@ -113,6 +135,36 @@ durable debt for the same connector and source. It reads debts once when a
 definitively missing pending path exists. This makes same-process retry possible
 without another event. Explicit watch-once classification is unchanged.
 
+### Canonical writes whose whole configured root disappears
+
+The same obligation can outlive its entire root directory. Previously, both the
+retained notification leaf and the current root failed classification, so saved
+canonical messages remained unpublished until the directory returned.
+
+Missing-path routing now separates eligible absent roots from ordinary source
+scans. It requires a current connector, source origin, and configured root that
+intersect non-discovery publication debt. Only a filesystem `NotFound` result
+certifies root absence; permission errors, lookup loops, and non-directory paths
+cannot authorize this route. When an eligible extant owner exists, its ordinary
+census retains precedence. Duplicate and nested absent selections coalesce only
+within the same currently authorized family.
+
+The canonical-only route uses the existing bounded replay to publish already
+admitted messages. It never detects or scans a connector, creates a source
+receipt, changes `last_indexed_at`, or advances in-memory or persisted watch
+watermarks. Publication must commit before its debt can clear. A final absence
+check withholds clearance and queues ordinary reconciliation if the root has
+returned. A root that disappears between classification and ordinary detection
+likewise retains its retry rather than permitting a connector's default-path
+fallback.
+
+Current path, workspace, subagent, and deferred-lexical policies preserve debt
+without scheduling an intentional-policy retry loop. Matching unexpired NoMem
+deferrals retain cooldown retry. Active-source exclusions remain in force.
+Discovery-only debt, an ancestor obligation extending beyond current roots, and
+empty canonical identities remain unproven. Old debt alone never restores a
+removed source configuration.
+
 ## Preserved behavior and limits
 
 The candidate builds on the existing changes rather than replacing them:
@@ -146,10 +198,11 @@ retains debt: the existing replay API cannot prove deletion of stale lexical
 documents by replaying no messages. Successful siblings do not advance that
 incomplete root's publication-completion timestamp or persistent watermarks.
 
-Two adjacent gaps remain explicit:
+The following limits remain explicit:
 
-- Canonical recovery here covers vanished children beneath an extant current
-  root. A wholly absent configured root remains pending until it returns.
+- A wholly absent root can publish admitted canonical messages only while that
+  root remains authorized by current configuration. Source discovery and new raw
+  ingestion still require the directory to return.
 - An empty canonical conversation cannot certify removal of stale lexical
   documents through the existing upsert-only replay path. Its debt remains
   visible; this condition alone does not schedule an endless retry loop.
@@ -189,24 +242,32 @@ canonical conversations or search lexical results.
 | Retargeted alias retains the original shared root | Intermediate candidate failed | Passed | Native component |
 | Recursive parent and nested alias preserve native coverage | Not a baseline negative control | Passed | Native component |
 | Alias retarget within an unchanged native parent requests census | Intermediate candidate failed | Passed | Native component |
+| Polling callback registration failure retains retry and reconciles peers | Published `52e5e9d4` failed retry assertion | Passed | Native component |
 | Canonical recovery and actual pending-leaf retry | Regression tests prepared | Pending execution | Full application library |
 | Live replacement, over-cap updates, and restart | Regression tests prepared | Pending execution | CASS subprocess and search |
 
 The baseline pair, `gh538_native_watch_retries_failed_root_registration` and
 `gh538_native_watch_rearms_replaced_root`, failed **2/2** in 30.03 seconds. The
-initial component selection passed **5/5** in 21.51 seconds. The final follow-up
-selection passed **8/8** in 20.08 seconds; these times cover test fixtures and
+initial component selection passed **5/5** in 21.51 seconds. The first published
+follow-up passed **8/8** in 20.08 seconds. The final selection, including the
+polling registration regression, passed **9/9** in 27.04 seconds. Its negative
+control on the published `52e5e9d4` polling implementation failed the intended
+retry assertion, with **0 passed and 1 failed**. These times cover test fixtures and
 waits, not indexing throughput. Session evidence is retained in `registration-baseline.log`,
 `registration-final.log`, and `registration-probe/sources.json` beside the working
 checkout. The latter records selected-block hashes, adapters, and dependency-lock
-identity. Final follow-up results are in `registration-final8-20261101.log` and
-`registration-final8-20261101-receipt.json`. Both alias negative controls are
+identity. Final results are in `registration-final9-20261101.log` and
+`registration-final9-20261101-receipt.json`; the polling negative is in
+`registration-poller-negative-20261101.log`. The earlier eight-test receipt
+remains a separate checkpoint. Both alias negative controls are
 recorded separately; they are failures of intermediate candidates, not additional
 executed baseline application tests. All five extracted production blocks match
-the final candidate verbatim. The complete application build has not yet
-produced a passing receipt; dependency compilation was killed under memory
-pressure. Seven bounded attempts ended without reaching CASS, with unchanged
-dependency pins, sources, and features.
+the final candidate verbatim. The executable application build has not produced
+a passing receipt; dependency code generation was killed under memory pressure.
+Seven initial bounded attempts ended without reaching CASS. Later attempts
+reached the actual application metadata checks, found and corrected six test
+compilation errors, and passed a final all-target check. Dependency pins,
+sources, and features remained unchanged.
 
 The recorded component invocation, from the repository checkout with its
 session harness and environment already prepared, was:
@@ -240,6 +301,35 @@ The new [library regressions](../../src/indexer/watch_ingestion_tests.rs) are:
   Codex and Claude, empty and changed-sibling scans, actual retained dispatch
   queue, reopened storage, no publication on unchanged sibling retries, and
   eventual recovery without supplying another notification.
+
+The whole-root follow-up adds nine application regressions:
+
+- `gh538_watch_publishes_canonical_debt_after_whole_current_root_disappears`:
+  Codex and Claude, retained-leaf retry and reopened handles; preserved rows,
+  historical search identities, receipts, timestamps, and watch state; a repeated
+  callback publishes nothing after debt clears.
+- `gh538_watch_absent_root_recovery_requires_commit_before_debt_clearance`:
+  another commit fault retains the queue, debt, and previous searchable state.
+- `gh538_watch_absent_root_recovery_requires_current_authorization`: removed
+  configuration, provider/source mismatch, and unchanged explicit watch-once.
+- `gh538_watch_absent_root_routing_prefers_extant_owner_and_coalesces_duplicates`:
+  existing ancestor ownership and one replay per canonical identity.
+- `gh538_watch_absent_root_selection_rejects_nonabsence_errors` and
+  `gh538_watch_absent_root_lookup_loop_cannot_authorize_recovery`: typed error
+  policy and a real Unix filesystem lookup loop. The permission control is not a
+  claim of an unprivileged filesystem permission-denial run.
+- `gh538_watch_absent_root_preserves_nomem_retry_and_discovery_debt`: backoff
+  expiry permits publication while discovery debt survives the missing census.
+- `gh538_watch_absent_root_empty_canonical_identity_retains_debt`: an empty
+  canonical conversation cannot prove removal of stale lexical results.
+- `gh538_watch_absent_root_honors_exclusion_skip_and_defer_policies`: isolated
+  child processes verify each current policy without racing process environment.
+
+The tests-only `gh538-whole-root-negative.patch` applies to `52e5e9d4` without
+production changes and adds the primary whole-root scenario plus the required
+test compilation corrections. The expected
+baseline failure is zero recovered conversations where two are required. Patch
+applicability was checked; this application negative control has not executed.
 
 The new [subprocess regression](../../tests/watch_e2e.rs),
 `deferred_watch_sources::gh538_live_watch_recovers_replaced_root_and_retains_history`,
@@ -280,8 +370,10 @@ Any use of the reporter's archive requires separate access and authorization.
 
 ## Executed checks and remaining publication gate
 
-The final candidate preserves the five native source blocks that passed the
-component tests byte for byte. Pinned formatting and whitespace checks pass.
+The final nine-test component run extracts five production source blocks from
+the corrected candidate verbatim. Their hashes and all 53 resolved registry
+dependency identities/checksums were independently checked. Pinned formatting
+and whitespace checks pass.
 The machine-readable [validation receipt](issue-538-root-and-publication-validation.json)
 records the final source identities and keeps native component results separate
 from unexecuted application requirements.
@@ -310,6 +402,19 @@ in bounded configured-root maps. The final scan is valid and failing; the
 preceding low-count scan remains invalid. No gate policy or source suppression
 was changed.
 
+The containing follow-up has its own final two-file scan after the whole-root,
+polling, and test compilation corrections: **46 critical, 10,950 warning, and
+2,986 informational findings; exit 1**. All 46 critical findings are outside the
+newly added lines. Added lines contain 197 warnings and 38 informational
+findings. The added production findings include 12 warnings: seven bounded
+configured-root clones, two indexes with local construction invariants, and
+three error-context closures. Review found no concrete additional production
+defect. Fresh content-matched cache records contain 6,508 AST-only unwrap/expect
+and 150 direct-indexing findings. The scan is valid and remains failing, with no
+new suppression or scanner-policy change. It covers exactly the two Rust files
+changed since `52e5e9d4`; the earlier four-file result remains a separate
+checkpoint.
+
 Seven meaningful application compilation attempts reached pinned
 `asupersync 0.5.0`, never CASS. Three ended with actual OOM/SIGKILL and four were
 cancelled to avoid exhausting the shared 8 GiB container while other builds
@@ -327,6 +432,21 @@ trials reached the new canonical, live-watch, restart, or exactly-once tests.
 There is no configured RCH/dsr build fleet or compatible complete CASS binary
 available in this environment.
 
+The final all-target metadata check completed with exit 0 in 626.10 seconds,
+with no new OOM. All four recorded Rust source hashes and all four dependency,
+toolchain, and Cargo configuration hashes matched before and after the run.
+This includes the production library, complete library test module, live-watch
+integration target, and remaining integration/benchmark targets. The only
+terminal warning concerned the pinned transitive `nix 0.28.0` dependency's
+future Rust compatibility. It was not a CASS source diagnostic.
+
+The final same-graph Clippy run also completed with exit 0 in 729.70 seconds,
+using `--all-targets --no-deps -- -D warnings`. Production code, the complete
+library test module, `watch_e2e`, and the remaining targets passed with denied
+warnings. Source and pin/configuration hashes again matched before and after,
+with no dependency rebuild or OOM. The same Cargo dependency-compatibility
+notice remained. Neither successful check executes an application test.
+
 **Application tests executed: zero. The full repository gate has not passed.**
 `AGENTS.md` requires the batched formatting, clippy, tests, goldens, and blocking
 UBS gate before publication. These component results and source reviews are a
@@ -340,16 +460,20 @@ instruction to continue substantive work and commit directly to `main`, without
 a pull request. This recovery change is published under that instruction. The
 reported application and UBS results remain unchanged; publication does not
 constitute a passing gate, a release qualification, or closure of GH538.
-Additional application execution is being attempted in a newly available build
-window. The same change includes the newly reproduced overlapping native-watch
-correction and conservative zero-emission completion/retry handling described
-above. The validation receipt distinguishes the earlier frozen candidate from
-this follow-up; unexecuted application regressions remain unexecuted.
+The first direct commit includes the reproduced overlapping native-watch
+correction and conservative zero-emission completion/retry handling. The
+containing follow-up adds whole-root canonical publication and polling
+callback-error/snapshot-gap recovery. The validation receipt distinguishes the
+earlier candidate, the first published commit, and the final source; unexecuted
+application regressions remain unexecuted.
 
 The follow-up full compilation completed Asupersync's borrow checking, then
 exhausted memory during code generation. A subsequent metadata-only check was
 also killed when another compiler entered the shared memory limit. The final
-metadata-only retry has passed Asupersync and is continuing through the remaining
-dependency graph. These attempts preserve the pinned sources and features;
-none has executed the prepared CASS application regressions at this publication
-checkpoint.
+metadata-only retry passed Asupersync and reached CASS, where it exposed two
+untyped boolean callback parameters and four diagnostics from an old polling
+test's argument/return assumptions. These test-only compilation defects were
+fixed in place. A subsequent frozen-source all-target metadata check passed.
+The required same-graph Clippy check is recorded separately in the validation
+receipt. These attempts preserve the pinned sources and features; none has
+executed the prepared CASS application regressions.

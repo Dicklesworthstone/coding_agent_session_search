@@ -3,12 +3,12 @@
   "issue": "https://github.com/Dicklesworthstone/coding_agent_session_search/issues/538",
   "reporter_evidence": "https://github.com/Dicklesworthstone/coding_agent_session_search/issues/538#issuecomment-6539798177",
   "baseline_commit": "5cfb9d6a033927255a8a4befad153a44c8ed36e4",
-  "qualification": "Native component regressions and formatting passed; application execution and full repository gate remain unqualified.",
+  "qualification": "Nine native component regressions, final all-target metadata checking, all-target Clippy with denied warnings, and formatting passed; application execution and the full repository gate remain unqualified.",
   "reporter_archive_used": false,
   "native_macos_executed": false,
   "candidate_source_sha256": {
-    "src/indexer/mod.rs": "0dfe220bf273c488349bcb343a97b36e33433338b1dd2bf578077ec7bafa27c0",
-    "src/indexer/watch_ingestion_tests.rs": "4d0c5c414a634e78b5c41b6f5aa24b371bc515e0d029af87bfab0bfc5b57373e",
+    "src/indexer/mod.rs": "0fb39ba0042fd64fce89663e36034bad4d04a785ba41e31495327dc3be9f444c",
+    "src/indexer/watch_ingestion_tests.rs": "f54a52a40d4ed7df49780938b0618103fdb895929dd81f1e2b7ceea0a19a339a",
     "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
     "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747"
   },
@@ -19,13 +19,13 @@
   ],
   "native_component": {
     "platform": "Linux",
-    "passed": 8,
+    "passed": 9,
     "failed": 0,
-    "test_runtime_seconds": 20.08,
+    "test_runtime_seconds": 27.04,
     "receipt": {
-      "started_at": "2026-11-01T02:31:42.826820+00:00",
-      "completed_at": "2026-11-01T02:32:04.768690+00:00",
-      "elapsed_seconds": 21.94193359900237,
+      "started_at": "2026-11-01T03:02:56.474926+00:00",
+      "completed_at": "2026-11-01T03:03:25.405685+00:00",
+      "elapsed_seconds": 28.93080567400466,
       "command": [
         "cargo",
         "test",
@@ -40,11 +40,12 @@
         "--test-threads=1"
       ],
       "returncode": 0,
-      "source_sha256": "0dfe220bf273c488349bcb343a97b36e33433338b1dd2bf578077ec7bafa27c0",
-      "harness_sha256": "8b7a543a1e5be3530b880f96d6df79eee978666effc1e5092cf215acf34d69ae",
-      "log": "registration-final8-20261101.log",
-      "log_sha256": "3a9c427cdd7b60ae5436b34320bacc98234530ba9a982cac2caf1092287f6834",
-      "proof_scope": "Eight exact-source real native notify and PollWatcher component tests on Linux; callback observes source bytes. No CASS canonical indexing, search publication, macOS, or reporter archive is tested."
+      "source_sha256": "0fb39ba0042fd64fce89663e36034bad4d04a785ba41e31495327dc3be9f444c",
+      "source_unchanged": true,
+      "harness_sha256": "805a152251e06b621be7337240982fd05f21d8f56cdabaf1d779eaf1c1ccb7d5",
+      "log": "registration-final9-20261101.log",
+      "log_sha256": "8f6620306eb134aa8b991cf571283c3dbdb0b692ec1398f63a97ba02a9e07146",
+      "proof_scope": "Nine exact-source native notify/PollWatcher component tests on Linux, including real watch_sources scheduling. Callback observes source bytes/selected paths. No CASS canonical indexing, search publication, macOS, or reporter archive is tested."
     },
     "production_block_selections": [
       {
@@ -65,7 +66,7 @@
       {
         "start": "/// Keep deferred sources in the watch loop,",
         "end": "#[cfg(test)]\nfn reset_storage(",
-        "sha256": "f3eaf72e2a68d9e6f0c6367f71641b6a2d1198001c82d32f6e4ac386bcd4c8b9"
+        "sha256": "6584c7b0b10ad7983b068da134d0afdec44eee951c064813081f9ce03af20547"
       },
       {
         "start": "fn watch_event_should_trigger_reindex(",
@@ -77,9 +78,9 @@
     "resolved_dependencies_matching_repository_lock": 53,
     "adapters_and_limits": "ConnectorKind carries tested variants, ScanRoot carries only path, atomic progress carrier omits SQL cancellation. Entire native watch loop, backlog, polling, stale detector, event filters, registration helpers and regression tests are verbatim. Callback observes source bytes; canonical indexing/search are not tested.",
     "log": {
-      "file": "registration-final8-20261101.log",
-      "bytes": 1217,
-      "sha256": "3a9c427cdd7b60ae5436b34320bacc98234530ba9a982cac2caf1092287f6834"
+      "file": "registration-final9-20261101.log",
+      "bytes": 1314,
+      "sha256": "8f6620306eb134aa8b991cf571283c3dbdb0b692ec1398f63a97ba02a9e07146"
     },
     "negative_controls": {
       "baseline_missing_and_replaced_root": {
@@ -135,6 +136,40 @@
         "source_sha256": "6746b91781b047e87d625b03b621fa0389b25d7115e8204124a154ad07d8ce25",
         "harness_sha256": "094d80049527616cdcb265ea8cb1a96c07d2067526e8e8894fb65dbb060763d1",
         "log_sha256": "9e8bc526a0979c3f9ccd50a220218e7b5a1f66572fdec9d24c01f7e3c3ccbdaa"
+      },
+      "published_52_poller_initial_callback_error": {
+        "receipt": {
+          "started_at": "2026-11-01T02:58:55.153734+00:00",
+          "completed_at": "2026-11-01T02:58:56.641710+00:00",
+          "elapsed_seconds": 1.487980988000345,
+          "command": [
+            "cargo",
+            "test",
+            "--offline",
+            "--locked",
+            "--manifest-path",
+            "registration-probe/Cargo.toml",
+            "--lib",
+            "gh538_database_poller_retries_callback_registration_errors",
+            "--",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "returncode": 101,
+          "baseline_poller_provenance": "registration-poller-negative-provenance.json",
+          "harness_sha256": "d4905b75b87c926ee3af6d12d889bb534eca1f507fcdc29a21ca80b8e57f5c98",
+          "log": "registration-poller-negative-20261101.log",
+          "log_sha256": "c45c1e8d7b941bfda8565283b36b083963e5b7d645993d33f1af7ad1d205cf22"
+        },
+        "provenance": {
+          "baseline": "52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96",
+          "poller_is_exact_published_source": true,
+          "poller_sha256": "87fa4fbaaf4dcae97fa1e14036359d390af49e45c4c332ab99023d4f5c84af0d"
+        },
+        "passed": 0,
+        "failed": 1,
+        "test_runtime_seconds": 0.0,
+        "failure": "a callback registration error must request re-enrollment"
       }
     },
     "native_macos_executed": false,
@@ -148,159 +183,160 @@
     ],
     "status": "passed",
     "source_hashes": {
-      "src/indexer/mod.rs": "0dfe220bf273c488349bcb343a97b36e33433338b1dd2bf578077ec7bafa27c0",
-      "src/indexer/watch_ingestion_tests.rs": "4d0c5c414a634e78b5c41b6f5aa24b371bc515e0d029af87bfab0bfc5b57373e",
+      "src/indexer/mod.rs": "0fb39ba0042fd64fce89663e36034bad4d04a785ba41e31495327dc3be9f444c",
+      "src/indexer/watch_ingestion_tests.rs": "f54a52a40d4ed7df49780938b0618103fdb895929dd81f1e2b7ceea0a19a339a",
       "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
       "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747"
     },
     "log": {
-      "file": "cass-nov01-final-fmt.log",
+      "file": "cass-nov01-combined-final-fmt.log",
       "bytes": 0,
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    }
+    },
+    "recorded_at_utc": "2026-11-01T03:06:25.987550+00:00"
   },
   "ubs": {
-    "status": "VALID_SCAN_FAILED_GATE",
-    "returncode": 1,
-    "totals": {
-      "files": 4,
-      "critical": 49,
-      "warning": 11025,
-      "info": 3038
+    "version": "5.4.4",
+    "status": "valid_scan_failed_gate",
+    "exit_code": 1,
+    "counts": {
+      "files": 2,
+      "critical": 46,
+      "warning": 10950,
+      "info": 2986
     },
-    "summary": {
-      "baseline": "5cfb9d6a033927255a8a4befad153a44c8ed36e4",
+    "source_sha256": {
+      "src/indexer/mod.rs": "0fb39ba0042fd64fce89663e36034bad4d04a785ba41e31495327dc3be9f444c",
+      "src/indexer/watch_ingestion_tests.rs": "f54a52a40d4ed7df49780938b0618103fdb895929dd81f1e2b7ceea0a19a339a"
+    },
+    "source_unchanged_during_scan": true,
+    "invocation": {
+      "started_at": "2026-11-01T03:04:00.774877+00:00",
+      "completed_at": "2026-11-01T03:05:06.810192+00:00",
+      "elapsed_seconds": 66.03540964999411,
+      "command": [
+        "bash",
+        "/tmp/cass-gate-ubs.emUzKP/ubs",
+        "--module-dir=/tmp/cass-gate-ubs.emUzKP/modules",
+        "--no-auto-update",
+        "--format=text",
+        "--ci",
+        "--fail-on-warning",
+        "src/indexer/mod.rs",
+        "src/indexer/watch_ingestion_tests.rs"
+      ],
+      "returncode": 1,
+      "source_sha256": {
+        "src/indexer/mod.rs": "0fb39ba0042fd64fce89663e36034bad4d04a785ba41e31495327dc3be9f444c",
+        "src/indexer/watch_ingestion_tests.rs": "f54a52a40d4ed7df49780938b0618103fdb895929dd81f1e2b7ceea0a19a339a"
+      },
+      "source_unchanged_during_scan": true,
+      "pinned_tools_sha256": {
+        "/tmp/cass-gate-ubs.emUzKP/ubs": "bdeccbb35f2056e6177c73b3f0f9966d20d1cbeff22b7f084133c4a6ac625ee2",
+        "/tmp/cass-gate-ubs.emUzKP/modules/ubs-rust.sh": "70cc497fb712b34986db337f4e9edcfeb9b33bbd650b5b4dae019d4212486a68",
+        "/tmp/cass-gate-ubs.emUzKP/modules/contract.json": "7319b2e5e085d0dd2434e5114291b2dee9fbbb96e2cfe02027eb263abcb06ac3"
+      },
+      "ast_grep": {
+        "path": "/workspace/scratch/1344867c7dce/fgdb-tools/bin/ast-grep",
+        "version": "ast-grep 0.51.0",
+        "sha256": "99b5aeab1f47536789482b4517595b759de910f7f1f1d1f80c752824e894e38e"
+      },
+      "log": "cass-ubs-followup-final-20261101-verified.log",
+      "log_sha256": "c0b9a6e5eeb6b0b205ff4dbe841f2f284a7f6de6dec7d0f2c22c11431f6ed8cc",
+      "scan_validity": "VALID_STATIC_SCAN_WITH_FINDINGS",
+      "gate_status": "NOT_PASSED"
+    },
+    "triage": {
+      "baseline": "52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96",
       "scan_validity": "VALID_STATIC_SCAN_WITH_FINDINGS",
       "gate_status": "NOT_PASSED",
-      "run_receipt": "cass-ubs-nov01-final-ast-run.json",
-      "log": "cass-ubs-nov01-final-ast-verified.log",
+      "run_receipt": "cass-ubs-followup-final-20261101-run.json",
+      "log": "cass-ubs-followup-final-20261101-verified.log",
       "returncode": 1,
       "totals": {
-        "files": 4,
-        "critical": 49,
-        "warning": 11025,
-        "info": 3038
+        "files": 2,
+        "critical": 46,
+        "warning": 10950,
+        "info": 2986
       },
       "source_record_counts": {
-        "warning": 11025,
-        "critical": 49,
-        "info": 3033
+        "warning": 10950,
+        "critical": 46,
+        "info": 2981
       },
       "non_source_info": 5,
       "files": [
         {
           "path": "src/indexer/mod.rs",
-          "sha256": "0dfe220bf273c488349bcb343a97b36e33433338b1dd2bf578077ec7bafa27c0",
+          "sha256": "0fb39ba0042fd64fce89663e36034bad4d04a785ba41e31495327dc3be9f444c",
           "matches_launch_hash": true,
-          "scanner_content_blake2b_128": "40c56aad7efaab4806fed37ea5322254",
-          "cache": "/root/.cache/ubs/c46576762e0ac846074ab12e463ce14f/files/7d/7d01c2b8c40972712882316f2184f2c9.json",
-          "cache_sha256": "be83d00b6020223dafa3fdc0923ea28a434c50808dcfbc5e999a2953c9a578f9",
-          "cache_stored_at": 1793500590.7249856,
-          "records": 13398,
-          "ast_only_findings": 6589
+          "scanner_content_blake2b_128": "722e7be9ac2da2b2bb4e0ba3dd268e96",
+          "cache": "/root/.cache/ubs/3099da798cbcc5a4b840a88ede1c4404/files/ba/bac2c70fd86a3f2f28cf2d43cecd0501.json",
+          "cache_sha256": "042282364ceba872adfa5f0cc1d826f85a4d1d5a45915bf059cd9db3c5a8b41e",
+          "cache_stored_at": 1793502301.1557457,
+          "records": 13477,
+          "ast_only_findings": 6625
         },
         {
           "path": "src/indexer/watch_ingestion_tests.rs",
-          "sha256": "4d0c5c414a634e78b5c41b6f5aa24b371bc515e0d029af87bfab0bfc5b57373e",
+          "sha256": "f54a52a40d4ed7df49780938b0618103fdb895929dd81f1e2b7ceea0a19a339a",
           "matches_launch_hash": true,
-          "scanner_content_blake2b_128": "b99e443c7fb05022678c95c41ad43353",
-          "cache": "/root/.cache/ubs/c46576762e0ac846074ab12e463ce14f/files/a4/a4530ec9f4703dce1c4ef34f5d152105.json",
-          "cache_sha256": "281f66ef9d1679ded5396d1da70cfc2ccd7fe662f10ad8a9f5621f553abc0771",
-          "cache_stored_at": 1793500590.8186114,
-          "records": 351,
-          "ast_only_findings": 18
-        },
-        {
-          "path": "src/indexer/watch_source_ledger.rs",
-          "sha256": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
-          "matches_launch_hash": true,
-          "scanner_content_blake2b_128": "8dc34884bb4a2bc543eade6262473afc",
-          "cache": "/root/.cache/ubs/c46576762e0ac846074ab12e463ce14f/files/a9/a9ca8c135aef0189e125632b05e9b111.json",
-          "cache_sha256": "8ea7fb258efd7867fbe4351284a746b675cf6de9b7e40c85d02393777429696a",
-          "cache_stored_at": 1793500590.71959,
-          "records": 22,
-          "ast_only_findings": 6
-        },
-        {
-          "path": "tests/watch_e2e.rs",
-          "sha256": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747",
-          "matches_launch_hash": true,
-          "scanner_content_blake2b_128": "e8ee16aa894247cae2d1297ca6287d47",
-          "cache": "/root/.cache/ubs/c46576762e0ac846074ab12e463ce14f/files/45/4568b16969cfdd8bc660c35de95a60f8.json",
-          "cache_sha256": "fccf59e5ead756443b5348f457b3eb3909e6f2a8fa793689f14f5f679e6fbd54",
-          "cache_stored_at": 1793500590.8210652,
-          "records": 336,
-          "ast_only_findings": 137
+          "scanner_content_blake2b_128": "73c4b3a4442a7d5ee8cc90957f568181",
+          "cache": "/root/.cache/ubs/3099da798cbcc5a4b840a88ede1c4404/files/7f/7fb4ecaf0c12597b619b5302b688c8d7.json",
+          "cache_sha256": "63e2ac59d07522a577292df30115c02b15f7156ad0177e5e5703756186fbaf04",
+          "cache_stored_at": 1793502301.151862,
+          "records": 500,
+          "ast_only_findings": 33
         }
       ],
       "positive_ast_only_records": {
-        "rust.ownership.unwrap-expect": 6600,
+        "rust.ownership.unwrap-expect": 6508,
         "rust.panic.direct-indexing": 150
       },
-      "ast_evidence": "Fresh exact-content cached results for all four frozen sources include AST-only unwrap/expect and direct-indexing rules from the pinned rust_scan.py. This verifies structural execution; assertion counts alone and the staged-rule-pack message do not.",
+      "ast_evidence": "Fresh content-hashed records for both exact frozen sources include AST-only unwrap/expect and direct-indexing rules. The AST staged message and fallback assertion records are not the evidence.",
       "added_line_findings": {
-        "warning": 347,
-        "critical": 1,
-        "info": 67
+        "warning": 197,
+        "info": 38
       },
-      "added_line_triage_scope": "Counts and full records retained; prior backlog audit not repeated. Native helper and publication source changes independently reviewed, and only native component tests executed in the extracted harness.",
-      "invalid_preceding_run": {
-        "receipt": "cass-ubs-nov01-final-run.json",
-        "reason": "AST_NOT_AVAILABLE",
-        "reported_totals": {
-          "files": 4,
-          "critical": 2,
-          "warning": 4157,
-          "info": 1738
-        }
+      "native_component_blocks": "The final exact-source native extraction passed all nine real notify/PollWatcher component tests; source and selected-block hashes are preserved in registration-final9-20261101-receipt.json and registration-probe/sources.json.",
+      "review": "No concrete blocker found by independent read-only review of current configured source authorization, extant ancestor preference, strict NotFound selection, exclusions, held NoMem backoff, active-source deferrals, and root reappearance debt-retention checks. Polling corrections were separately authorized: initial selected-parent callback errors request registration retry, every poller rebuild queues only current database roots for an ordinary census, and unrelated child errors remain diagnostic. Nine exact-source native tests passed; no suppressions or gate changes were made.",
+      "added_production_finding_counts": {
+        "info": 15,
+        "warning": 12
+      },
+      "added_production_rule_counts": {
+        "rust.numeric.float-equality": 6,
+        "rust.numeric.modulo-by-var": 1,
+        "rust.collections.clone-any": 8,
+        "rust.collections.clone-in-loop": 7,
+        "rust.panic.direct-indexing": 2,
+        "rust.perf.string-alloc-in-loop": 3
+      },
+      "added_production_review": {
+        "configured_root_clones": "Copies only configured source/root identifiers into retained work sets; no archive/message payload is copied by these findings.",
+        "observed_roots_index": "Current root key is inserted by Entry::Vacant or already present; a metadata error returns before indexing and there is no intervening removal.",
+        "debt_index": "Completed indices originate from enumerate() over this same immutable debt slice; the slice is not modified before clearance.",
+        "error_context_formatting": "with_context closures allocate diagnostic strings only on returned errors, not on every successful root probe.",
+        "float_equality_info": "Comparisons are connector/origin/platform values, strings, and paths, not floating-point numbers.",
+        "disposition": "No concrete new production defect found in these findings. Findings retained; no suppression or scanner/gate modification.",
+        "modulo_info": "The %error token is tracing formatting syntax, not a modulo operation."
       }
     },
     "log": {
-      "file": "cass-ubs-nov01-final-ast-verified.log",
-      "bytes": 52414,
-      "sha256": "9a00eca68cda2b151bb25a92eb08d9eb5a61e0fa7262a0f735d18a5170da33fa"
-    },
-    "invocation": {
-      "file": "cass-ubs-nov01-final-ast-run.json",
-      "bytes": 1823,
-      "sha256": "f57104b91556a3ed311bcfad7bd75b6d2a3fefc87634b512c8b5ad11a4a137b0"
-    },
-    "full_findings": {
-      "file": "cass-ubs-nov01-final-full-findings.ndjson",
-      "bytes": 7018180,
-      "sha256": "06321a5e6e43807ba3eef13b63bb3e72336526726e5e610119a88267b4969c3f"
-    },
-    "added_line_findings": {
-      "file": "cass-ubs-nov01-final-added-line-findings.json",
-      "bytes": 236740,
-      "sha256": "bf92967809e623994afe6b91996caad6d6754c7246ecdbd9134407477d55a18a"
-    },
-    "source_sha256": {
-      "src/indexer/mod.rs": "0dfe220bf273c488349bcb343a97b36e33433338b1dd2bf578077ec7bafa27c0",
-      "src/indexer/watch_ingestion_tests.rs": "4d0c5c414a634e78b5c41b6f5aa24b371bc515e0d029af87bfab0bfc5b57373e",
-      "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
-      "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747"
+      "file": "cass-ubs-followup-final-20261101-verified.log",
+      "bytes": 52364,
+      "sha256": "c0b9a6e5eeb6b0b205ff4dbe841f2f284a7f6de6dec7d0f2c22c11431f6ed8cc"
     },
     "gate_passed": false,
     "suppressions_added": false,
-    "new_production_review": {
-      "warning_records": 18,
-      "rules": {
-        "rust.ownership.unwrap-expect": 2,
-        "rust.collections.clone-in-loop": 12,
-        "rust.panic.direct-indexing": 2,
-        "rust.perf.string-alloc-in-loop": 2
-      },
-      "concrete_new_defect_identified": false,
-      "basis": "Owned clones are bounded by configured source maps; writer initialization precedes both expect calls; debt indices are enumerated from the unchanged debt vector; root lookup follows insertion; error formatting is lazy. This review does not change the failing gate result."
-    }
+    "scanner_or_policy_changed": false
   },
   "application": {
-    "status": "application_validation_blocked_by_build_memory",
+    "status": "final_all_target_metadata_check_passed_application_execution_blocked_by_codegen_memory",
     "application_tests_executed": 0,
     "baseline_negative_tests_executed": 0,
     "candidate_application_tests_executed": 0,
-    "cass_compilation_reached": false,
+    "cass_compilation_reached": true,
     "ordinary_repository_profile_build_completed": false,
     "full_repository_gate_completed": false,
     "pins": {
@@ -545,12 +581,12 @@
       "outcome": "jobs-backend rejected without -Zunstable-options; corrected in all later attempts",
       "application_tests_executed": 0
     },
-    "observed_blocking_phase": "Asupersync MIR_borrow_checking, after type_check_crate; no CASS source compiled.",
+    "observed_blocking_phase": "Full code generation remains blocked by Asupersync monomorphization memory; metadata-only checking of all CASS targets completed successfully.",
     "pending_validation": [
-      "Candidate watch_e2e::deferred_watch_sources live integration tests",
-      "Baseline negative controls for disappeared-source publication, disappeared notification leaf, and narrowed ancestor debt",
-      "Candidate library GH538 and watch_registration_tests regressions",
-      "Unchanged repository gate including clippy, bin tests, golden tests, and UBS"
+      "Full application library and live-watch regression execution on a host able to code-generate the pinned graph",
+      "Application negative controls against the recorded baseline",
+      "Complete unchanged repository gate including executed bin/golden tests and the still-failing UBS scan",
+      "Native macOS shell/Interactive launchd qualification; reporter archive use requires separate authorization"
     ],
     "remote_build_and_cache": {
       "rch_executable_found": false,
@@ -617,12 +653,49 @@
       "possible_admission_window": false
     },
     "followup": {
-      "generated_at": "2026-11-01T02:29:33.898138+00:00",
+      "generated_at": "2026-11-01T03:27:46.665234+00:00",
       "application_tests_executed": 0,
-      "candidate_application_or_test_typecheck_completed": false,
-      "candidate_compiler_errors_observed": [],
-      "candidate_typecheck_started": false,
-      "candidate_source_note": "Both attempts stopped in the pinned Asupersync dependency before CASS library or tests were typechecked. Candidate sources evolved during the dependency-only all-targets check. No CASS package-check announcement was observed.",
+      "candidate_application_or_test_typecheck_completed": true,
+      "candidate_compiler_errors_observed": [
+        {
+          "code": "E0282",
+          "file": "src/indexer/watch_ingestion_tests.rs",
+          "line": 388,
+          "issue": "callback force_full parameter requires explicit bool annotation"
+        },
+        {
+          "code": "E0282",
+          "file": "src/indexer/watch_ingestion_tests.rs",
+          "line": 881,
+          "issue": "callback force_full parameter requires explicit bool annotation"
+        },
+        {
+          "code": "E0308",
+          "file": "src/indexer/mod.rs",
+          "line": 67466,
+          "issue": "database_root_poller test passes old vector argument rather than BTreeSet<PathBuf>"
+        },
+        {
+          "code": "E0308",
+          "file": "src/indexer/mod.rs",
+          "line": 67478,
+          "issue": "database_root_poller test passes old vector argument rather than BTreeSet<PathBuf>"
+        },
+        {
+          "code": "E0599",
+          "file": "src/indexer/mod.rs",
+          "line": 67472,
+          "issue": "database_root_poller test treats tuple return as former Option"
+        },
+        {
+          "code": "E0599",
+          "file": "src/indexer/mod.rs",
+          "line": 67484,
+          "issue": "database_root_poller test treats tuple return as former Option"
+        }
+      ],
+      "candidate_typecheck_started": true,
+      "candidate_source_note": "Exact frozen Rust sources and pin/config files passed full all-target metadata checking and root all-target Clippy with denied warnings. The six test-code compiler errors found by the first actual CASS cfg(test) check are resolved. Full CASS application tests were never executed.",
       "dependency_pins_and_configuration_unchanged": true,
       "memory_limit_bytes": 8589934592,
       "attempts": [
@@ -669,34 +742,410 @@
           "receipt": "cass-nov01-check-all-targets-receipt.json",
           "log": "cass-nov01-check-all-targets.log",
           "resource_samples": "cass-nov01-check-all-targets-resources.jsonl"
+        },
+        {
+          "label": "cass-nov01-check-clear-window",
+          "kind": "metadata_only_all_targets_check",
+          "outcome": "candidate_lib_test_compile_errors",
+          "phase": "CASS cfg(test) library analysis after library and 159 additional target metadata outputs",
+          "started_at": "2026-11-01T02:27:29.725049+00:00",
+          "elapsed_seconds": 1784.107180907995,
+          "maximum_child_rss_kib": 7106268,
+          "returncode": 101,
+          "sigkill_confirmed": false,
+          "cgroup_oom_kill_increment": 0,
+          "source_before": {
+            "head": "5cfb9d6a033927255a8a4befad153a44c8ed36e4",
+            "diff_sha256": "18a98611d9294ebf98e44f2934594b3ddd77c83daed89aef87b353af8ef401eb"
+          },
+          "source_after": {
+            "head": "52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96",
+            "diff_sha256": "cc7912d54933ef276a3d59cb714974562d69e4846ca3c55c5afdc153345c8dff"
+          },
+          "receipt": "cass-nov01-check-clear-window-receipt.json",
+          "log": "cass-nov01-check-clear-window.log",
+          "resource_samples": "cass-nov01-check-clear-window-resources.jsonl",
+          "explicit_source_snapshots": "cass-nov01-check-clear-window-explicit-sources.jsonl"
+        },
+        {
+          "label": "cass-nov01-final-recheck",
+          "kind": "metadata_only_all_targets_check",
+          "outcome": "passed",
+          "started_at": "2026-11-01T03:03:54.775410+00:00",
+          "elapsed_seconds": 626.1039537270044,
+          "maximum_child_rss_kib": 6600904,
+          "returncode": 0,
+          "sigkill_confirmed": false,
+          "cgroup_oom_kill_increment": 0,
+          "source_before": {
+            "head": "52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96",
+            "diff_sha256": "a174ed82b708439de6ee6da03f99af7af5f12b512a62ca5e727ada59b8f069d8",
+            "file_sha256": {
+              "src/indexer/mod.rs": "0fb39ba0042fd64fce89663e36034bad4d04a785ba41e31495327dc3be9f444c",
+              "src/indexer/watch_ingestion_tests.rs": "f54a52a40d4ed7df49780938b0618103fdb895929dd81f1e2b7ceea0a19a339a",
+              "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
+              "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747",
+              "Cargo.toml": "b28a7edbec9ce7cbebbdeacc04c6333e2c40ef4acd795ce29afebfca38dd11c0",
+              "Cargo.lock": "1daeb680b1db621c270a7c56f04dbc0b20e3e8b21186a266aa859c40ceab8d6d",
+              "rust-toolchain.toml": "7fab71eddf5e49029d9df39990f4ad5809b9218804a363a2e10d7c4ea2de06bc",
+              ".cargo/config.toml": "8a7c49456694f211b2f14d72d8d4ddf8c8ec511c80ab78009aa77fd42ecd78f2"
+            }
+          },
+          "source_after": {
+            "head": "52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96",
+            "diff_sha256": "3cbb557d5375000864d88e145ebb764c3d0ef1cbb3a96d028f353f0046656934",
+            "file_sha256": {
+              "src/indexer/mod.rs": "0fb39ba0042fd64fce89663e36034bad4d04a785ba41e31495327dc3be9f444c",
+              "src/indexer/watch_ingestion_tests.rs": "f54a52a40d4ed7df49780938b0618103fdb895929dd81f1e2b7ceea0a19a339a",
+              "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
+              "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747",
+              "Cargo.toml": "b28a7edbec9ce7cbebbdeacc04c6333e2c40ef4acd795ce29afebfca38dd11c0",
+              "Cargo.lock": "1daeb680b1db621c270a7c56f04dbc0b20e3e8b21186a266aa859c40ceab8d6d",
+              "rust-toolchain.toml": "7fab71eddf5e49029d9df39990f4ad5809b9218804a363a2e10d7c4ea2de06bc",
+              ".cargo/config.toml": "8a7c49456694f211b2f14d72d8d4ddf8c8ec511c80ab78009aa77fd42ecd78f2"
+            }
+          },
+          "all_eight_source_and_pin_hashes_unchanged": true,
+          "receipt": "cass-nov01-final-recheck-receipt.json",
+          "log": "cass-nov01-final-recheck.log",
+          "resource_samples": "cass-nov01-final-recheck-resources.jsonl",
+          "warning": "Cargo future incompatibility report for nix v0.28.0",
+          "cached_timing_note": "Asupersync timing output replayed from cached compiler diagnostics; no dependency recompilation."
+        },
+        {
+          "label": "cass-nov01-final-clippy",
+          "kind": "root_clippy_all_targets_deny_warnings",
+          "outcome": "passed",
+          "started_at": "2026-11-01T03:14:57.675651+00:00",
+          "elapsed_seconds": 729.6959058940047,
+          "maximum_child_rss_kib": 6677648,
+          "returncode": 0,
+          "sigkill_confirmed": false,
+          "cgroup_oom_kill_increment": 0,
+          "source_before": {
+            "head": "52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96",
+            "diff_sha256": "3cbb557d5375000864d88e145ebb764c3d0ef1cbb3a96d028f353f0046656934",
+            "file_sha256": {
+              "src/indexer/mod.rs": "0fb39ba0042fd64fce89663e36034bad4d04a785ba41e31495327dc3be9f444c",
+              "src/indexer/watch_ingestion_tests.rs": "f54a52a40d4ed7df49780938b0618103fdb895929dd81f1e2b7ceea0a19a339a",
+              "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
+              "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747",
+              "Cargo.toml": "b28a7edbec9ce7cbebbdeacc04c6333e2c40ef4acd795ce29afebfca38dd11c0",
+              "Cargo.lock": "1daeb680b1db621c270a7c56f04dbc0b20e3e8b21186a266aa859c40ceab8d6d",
+              "rust-toolchain.toml": "7fab71eddf5e49029d9df39990f4ad5809b9218804a363a2e10d7c4ea2de06bc",
+              ".cargo/config.toml": "8a7c49456694f211b2f14d72d8d4ddf8c8ec511c80ab78009aa77fd42ecd78f2"
+            }
+          },
+          "source_after": {
+            "head": "52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96",
+            "diff_sha256": "b2ce2cf741624b0e4ea8b980eb92d74353223029225db11fd37ebb2839f25e03",
+            "file_sha256": {
+              "src/indexer/mod.rs": "0fb39ba0042fd64fce89663e36034bad4d04a785ba41e31495327dc3be9f444c",
+              "src/indexer/watch_ingestion_tests.rs": "f54a52a40d4ed7df49780938b0618103fdb895929dd81f1e2b7ceea0a19a339a",
+              "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
+              "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747",
+              "Cargo.toml": "b28a7edbec9ce7cbebbdeacc04c6333e2c40ef4acd795ce29afebfca38dd11c0",
+              "Cargo.lock": "1daeb680b1db621c270a7c56f04dbc0b20e3e8b21186a266aa859c40ceab8d6d",
+              "rust-toolchain.toml": "7fab71eddf5e49029d9df39990f4ad5809b9218804a363a2e10d7c4ea2de06bc",
+              ".cargo/config.toml": "8a7c49456694f211b2f14d72d8d4ddf8c8ec511c80ab78009aa77fd42ecd78f2"
+            }
+          },
+          "all_eight_source_and_pin_hashes_unchanged": true,
+          "receipt": "cass-nov01-final-clippy-receipt.json",
+          "log": "cass-nov01-final-clippy.log",
+          "resource_samples": "cass-nov01-final-clippy-resources.jsonl",
+          "cache_verification": "cass-nov01-final-clippy-cache-verification.json",
+          "warning": "Cargo future incompatibility notice for nix v0.28.0; no Clippy warnings or errors"
         }
       ],
       "source_snapshots": "cass-nov01-check-all-targets-source-snapshots.jsonl",
       "admission_before_full_attempt": "cass-nov01-admission.json",
-      "current_followup": "The sole permitted identical metadata-only retry is running after a fresh 30-second clear window and successful immediate preflight. No further retries are authorized.",
+      "current_followup": "Static application qualification completed. Parent is finalizing documentation/bead and direct GitHub main publication. No more validation commands planned.",
       "clear_window_samples": "cass-nov01-clear-window-watch.jsonl",
-      "owned_build_or_check_running": true,
-      "source_monitor_running": true,
+      "owned_build_or_check_running": false,
+      "source_monitor_running": false,
       "clear_window_monitor_running": false,
-      "active_retry": {
-        "label": "cass-nov01-check-clear-window",
-        "admission": "cass-nov01-check-clear-window-admitted-preflight.json",
-        "qualified_window": "cass-nov01-clear-window-resumed-result.json",
-        "log": "cass-nov01-check-clear-window.log",
-        "source_snapshots": "cass-nov01-check-clear-window-source-snapshots.jsonl"
+      "candidate_library_metadata_completed": true,
+      "all_targets_typecheck_completed": true,
+      "candidate_compiler_errors_resolved_by_final_check": true,
+      "full_application_test_build_completed": false,
+      "root_all_targets_clippy_deny_warnings_passed": true,
+      "final_source_and_pin_sha256": {
+        "src/indexer/mod.rs": "0fb39ba0042fd64fce89663e36034bad4d04a785ba41e31495327dc3be9f444c",
+        "src/indexer/watch_ingestion_tests.rs": "f54a52a40d4ed7df49780938b0618103fdb895929dd81f1e2b7ceea0a19a339a",
+        "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
+        "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747",
+        "Cargo.toml": "b28a7edbec9ce7cbebbdeacc04c6333e2c40ef4acd795ce29afebfca38dd11c0",
+        "Cargo.lock": "1daeb680b1db621c270a7c56f04dbc0b20e3e8b21186a266aa859c40ceab8d6d",
+        "rust-toolchain.toml": "7fab71eddf5e49029d9df39990f4ad5809b9218804a363a2e10d7c4ea2de06bc",
+        ".cargo/config.toml": "8a7c49456694f211b2f14d72d8d4ddf8c8ec511c80ab78009aa77fd42ecd78f2"
+      },
+      "final_source_and_pin_hashes_match_both_passing_receipts": true,
+      "same_asupersync_metadata_reused_by_clippy": true,
+      "final_pass_receipts": {
+        "all_targets_check": "cass-nov01-final-recheck-receipt.json",
+        "root_all_targets_clippy": "cass-nov01-final-clippy-receipt.json"
+      },
+      "final_owned_process_check": {
+        "utc": "2026-11-01T03:27:46.665234+00:00",
+        "owned_processes": []
+      },
+      "resource_overrides_note": "Both passing commands use the unchanged pinned compiler/dependencies/features and the explicitly recorded invocation-only low-memory profile/environment settings. This is not a claim that the ordinary optimized dependency build or the complete repository gate passed.",
+      "full_gate_passed": false,
+      "full_gate_limitation": "Full application runtime tests remain unexecuted after the measured pinned Asupersync full-codegen OOM. Separate pinned UBS receipts remain red as reported by trace_events.",
+      "mir_strip_assessment": "cass-nov01-mir-strip-assessment.json"
+    },
+    "candidate_application_and_test_typecheck_completed": true,
+    "historical_blocking_phase": "Asupersync MIR_borrow_checking, after type_check_crate; no CASS source compiled.",
+    "final_all_target_metadata_check": {
+      "status": "passed",
+      "exit_code": 0,
+      "receipt": {
+        "command": [
+          "cargo",
+          "-Z",
+          "profile-rustflags",
+          "--config",
+          "profile.dev.package.asupersync.opt-level=0",
+          "--config",
+          "profile.test.package.asupersync.opt-level=0",
+          "--config",
+          "profile.dev.package.asupersync.codegen-units=256",
+          "--config",
+          "profile.test.package.asupersync.codegen-units=256",
+          "--config",
+          "profile.dev.package.asupersync.rustflags=[\"-Zmir-opt-level=0\",\"-Zunstable-options\",\"--jobs-backend=1\",\"-Ztime-passes=yes\",\"-Ztime-passes-format=json\"]",
+          "--config",
+          "profile.test.package.asupersync.rustflags=[\"-Zmir-opt-level=0\",\"-Zunstable-options\",\"--jobs-backend=1\",\"-Ztime-passes=yes\",\"-Ztime-passes-format=json\"]",
+          "check",
+          "--locked",
+          "--offline",
+          "-j1",
+          "--all-targets"
+        ],
+        "cwd": "coding_agent_session_search",
+        "started_at": "2026-11-01T03:03:54.775410+00:00",
+        "elapsed_seconds": 626.1039537270044,
+        "returncode": 0,
+        "maximum_child_rss_kib": 6600904,
+        "memory_events_before": "low 0\nhigh 0\nmax 52489243\noom 240\noom_kill 26\noom_group_kill 0\n",
+        "memory_events_after": "low 0\nhigh 0\nmax 52547017\noom 240\noom_kill 26\noom_group_kill 0\n",
+        "source_before": {
+          "head": "52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96",
+          "diff_sha256": "a174ed82b708439de6ee6da03f99af7af5f12b512a62ca5e727ada59b8f069d8",
+          "file_sha256": {
+            "src/indexer/mod.rs": "0fb39ba0042fd64fce89663e36034bad4d04a785ba41e31495327dc3be9f444c",
+            "src/indexer/watch_ingestion_tests.rs": "f54a52a40d4ed7df49780938b0618103fdb895929dd81f1e2b7ceea0a19a339a",
+            "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
+            "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747",
+            "Cargo.toml": "b28a7edbec9ce7cbebbdeacc04c6333e2c40ef4acd795ce29afebfca38dd11c0",
+            "Cargo.lock": "1daeb680b1db621c270a7c56f04dbc0b20e3e8b21186a266aa859c40ceab8d6d",
+            "rust-toolchain.toml": "7fab71eddf5e49029d9df39990f4ad5809b9218804a363a2e10d7c4ea2de06bc",
+            ".cargo/config.toml": "8a7c49456694f211b2f14d72d8d4ddf8c8ec511c80ab78009aa77fd42ecd78f2"
+          }
+        },
+        "source_after": {
+          "head": "52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96",
+          "diff_sha256": "3cbb557d5375000864d88e145ebb764c3d0ef1cbb3a96d028f353f0046656934",
+          "file_sha256": {
+            "src/indexer/mod.rs": "0fb39ba0042fd64fce89663e36034bad4d04a785ba41e31495327dc3be9f444c",
+            "src/indexer/watch_ingestion_tests.rs": "f54a52a40d4ed7df49780938b0618103fdb895929dd81f1e2b7ceea0a19a339a",
+            "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
+            "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747",
+            "Cargo.toml": "b28a7edbec9ce7cbebbdeacc04c6333e2c40ef4acd795ce29afebfca38dd11c0",
+            "Cargo.lock": "1daeb680b1db621c270a7c56f04dbc0b20e3e8b21186a266aa859c40ceab8d6d",
+            "rust-toolchain.toml": "7fab71eddf5e49029d9df39990f4ad5809b9218804a363a2e10d7c4ea2de06bc",
+            ".cargo/config.toml": "8a7c49456694f211b2f14d72d8d4ddf8c8ec511c80ab78009aa77fd42ecd78f2"
+          }
+        },
+        "runner_oom_score_adj_before": "0",
+        "runner_oom_score_adj_after": "0",
+        "build_environment": {
+          "RUSTFLAGS": "-Z threads=1 -C debuginfo=0 -C link-arg=-fuse-ld=lld",
+          "RUST_MIN_STACK": "134217728",
+          "CARGO_HOME": "cass-cargo-home",
+          "CARGO_TARGET_DIR": "cass-target",
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "CARGO_INCREMENTAL": "0",
+          "MALLOC_CONF": "narenas:1,dirty_decay_ms:0,muzzy_decay_ms:0",
+          "CASS_BUILD_CHILD_OOM_SCORE_ADJ": "1000"
+        }
+      },
+      "log": {
+        "file": "cass-nov01-final-recheck.log",
+        "bytes": 25475554,
+        "sha256": "9617395c3e8254dbad5bb52bdf718060fd0c9877ec8d5bc00351278482cfd085"
+      },
+      "source_and_configuration_hashes_unchanged": true,
+      "candidate_source_diagnostics": [],
+      "cargo_terminal_dependency_warning": "Pinned transitive nix 0.28.0 has future Rust compatibility warnings.",
+      "application_tests_executed": 0
+    },
+    "clippy": {
+      "status": "passed",
+      "exit_code": 0,
+      "receipt": {
+        "command": [
+          "cargo",
+          "clippy",
+          "-Z",
+          "profile-rustflags",
+          "--config",
+          "profile.dev.package.asupersync.opt-level=0",
+          "--config",
+          "profile.test.package.asupersync.opt-level=0",
+          "--config",
+          "profile.dev.package.asupersync.codegen-units=256",
+          "--config",
+          "profile.test.package.asupersync.codegen-units=256",
+          "--config",
+          "profile.dev.package.asupersync.rustflags=[\"-Zmir-opt-level=0\",\"-Zunstable-options\",\"--jobs-backend=1\",\"-Ztime-passes=yes\",\"-Ztime-passes-format=json\"]",
+          "--config",
+          "profile.test.package.asupersync.rustflags=[\"-Zmir-opt-level=0\",\"-Zunstable-options\",\"--jobs-backend=1\",\"-Ztime-passes=yes\",\"-Ztime-passes-format=json\"]",
+          "--locked",
+          "--offline",
+          "-j1",
+          "--all-targets",
+          "--no-deps",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "cwd": "coding_agent_session_search",
+        "started_at": "2026-11-01T03:14:57.675651+00:00",
+        "elapsed_seconds": 729.6959058940047,
+        "returncode": 0,
+        "maximum_child_rss_kib": 6677648,
+        "memory_events_before": "low 0\nhigh 0\nmax 52547017\noom 240\noom_kill 26\noom_group_kill 0\n",
+        "memory_events_after": "low 0\nhigh 0\nmax 52602009\noom 240\noom_kill 26\noom_group_kill 0\n",
+        "source_before": {
+          "head": "52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96",
+          "diff_sha256": "3cbb557d5375000864d88e145ebb764c3d0ef1cbb3a96d028f353f0046656934",
+          "file_sha256": {
+            "src/indexer/mod.rs": "0fb39ba0042fd64fce89663e36034bad4d04a785ba41e31495327dc3be9f444c",
+            "src/indexer/watch_ingestion_tests.rs": "f54a52a40d4ed7df49780938b0618103fdb895929dd81f1e2b7ceea0a19a339a",
+            "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
+            "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747",
+            "Cargo.toml": "b28a7edbec9ce7cbebbdeacc04c6333e2c40ef4acd795ce29afebfca38dd11c0",
+            "Cargo.lock": "1daeb680b1db621c270a7c56f04dbc0b20e3e8b21186a266aa859c40ceab8d6d",
+            "rust-toolchain.toml": "7fab71eddf5e49029d9df39990f4ad5809b9218804a363a2e10d7c4ea2de06bc",
+            ".cargo/config.toml": "8a7c49456694f211b2f14d72d8d4ddf8c8ec511c80ab78009aa77fd42ecd78f2"
+          }
+        },
+        "source_after": {
+          "head": "52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96",
+          "diff_sha256": "b2ce2cf741624b0e4ea8b980eb92d74353223029225db11fd37ebb2839f25e03",
+          "file_sha256": {
+            "src/indexer/mod.rs": "0fb39ba0042fd64fce89663e36034bad4d04a785ba41e31495327dc3be9f444c",
+            "src/indexer/watch_ingestion_tests.rs": "f54a52a40d4ed7df49780938b0618103fdb895929dd81f1e2b7ceea0a19a339a",
+            "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
+            "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747",
+            "Cargo.toml": "b28a7edbec9ce7cbebbdeacc04c6333e2c40ef4acd795ce29afebfca38dd11c0",
+            "Cargo.lock": "1daeb680b1db621c270a7c56f04dbc0b20e3e8b21186a266aa859c40ceab8d6d",
+            "rust-toolchain.toml": "7fab71eddf5e49029d9df39990f4ad5809b9218804a363a2e10d7c4ea2de06bc",
+            ".cargo/config.toml": "8a7c49456694f211b2f14d72d8d4ddf8c8ec511c80ab78009aa77fd42ecd78f2"
+          }
+        },
+        "runner_oom_score_adj_before": "0",
+        "runner_oom_score_adj_after": "0",
+        "build_environment": {
+          "RUSTFLAGS": "-Z threads=1 -C debuginfo=0 -C link-arg=-fuse-ld=lld",
+          "RUST_MIN_STACK": "134217728",
+          "CARGO_HOME": "cass-cargo-home",
+          "CARGO_TARGET_DIR": "cass-target",
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "CARGO_INCREMENTAL": "0",
+          "MALLOC_CONF": "narenas:1,dirty_decay_ms:0,muzzy_decay_ms:0",
+          "CASS_BUILD_CHILD_OOM_SCORE_ADJ": "1000"
+        }
+      },
+      "log": {
+        "file": "cass-nov01-final-clippy.log",
+        "bytes": 25475554,
+        "sha256": "655804f2c185d8623659c9181dad341776c42816cd412fea5cf576fbb064569f"
+      },
+      "source_and_configuration_hashes_unchanged": true,
+      "candidate_source_diagnostics": [],
+      "application_tests_executed": 0
+    },
+    "mir_strip_assessment": {
+      "generated_at": "2026-11-01T03:00:30.312343+00:00",
+      "purpose": "Bounded source-only assessment requested by parent; no compilation or flag change authorized or performed.",
+      "compiler_commit": "90850177249efe0321573c569aec5d12b257f8d6",
+      "option_probe": {
+        "command": "rustc -Zmir-strip-debuginfo=<value> --print cfg",
+        "accepted": "all-locals",
+        "rejected": [
+          "all",
+          "INVALID"
+        ],
+        "expected_enum": [
+          "none",
+          "locals-in-tiny-functions",
+          "all-locals"
+        ],
+        "note": "--version bypasses option validation and was not used to establish accepted values."
+      },
+      "timing": {
+        "borrow_check_end_rss_bytes": 6849904640,
+        "mono_roots_end_rss_bytes": 6813978624,
+        "maximum_child_rss_kib": 7302524,
+        "failed_phase": "monomorphization graph walk (root collection completed; graph walk did not emit completion)",
+        "full_attempt_receipt": "cass-nov01-watch-qualification-receipt.json",
+        "full_attempt_log": "cass-nov01-watch-qualification.log",
+        "full_attempt_resource_samples": "cass-nov01-watch-qualification-resources.jsonl"
+      },
+      "findings": [
+        "StripDebugInfo is an optional non-optimization pass, so MIR opt-level=0 does not suppress it when explicitly enabled.",
+        "For normal function instances, the collector requests instance_mir -> optimized_mir; the latter runs the pass. It is after borrow checking but before the collector examines that function's MIR.",
+        "The pass retains argument VarDebugInfo entries and drops other local debug entries, plus invalid statement debug records. It does not remove local_decls or the type/query arenas.",
+        "Body.var_debug_info is Vec<VarDebugInfo>; retain reduces length without shrinking its retained backing capacity. Dropped nested composite debug boxes/projection vectors can release some memory, but no actual allocation-size evidence is available.",
+        "The collector visits var_debug_info only under DebugInfo::Full. The measured invocation uses -C debuginfo=0, so that direct debug-info mono traversal is already skipped."
+      ],
+      "conclusion": "Timing is potentially relevant for the later failure, but evidence does not establish a material RSS reduction for this exact command. Do not spend another full build solely on this flag.",
+      "source_references": [
+        {
+          "name": "mir_pipeline",
+          "url": "https://github.com/rust-lang/rust/blob/90850177249efe0321573c569aec5d12b257f8d6/compiler/rustc_mir_transform/src/lib.rs",
+          "blob_sha": "d2dd77c9863189aa7b01528f27c36d13f8309db3"
+        },
+        {
+          "name": "mir_strip",
+          "url": "https://github.com/rust-lang/rust/blob/90850177249efe0321573c569aec5d12b257f8d6/compiler/rustc_mir_transform/src/strip_debuginfo.rs",
+          "blob_sha": "7535ab166c7572d9213c682232ef573c6d319c36"
+        },
+        {
+          "name": "mono_full",
+          "url": "https://github.com/rust-lang/rust/blob/90850177249efe0321573c569aec5d12b257f8d6/compiler/rustc_monomorphize/src/collector.rs",
+          "blob_sha": "b7813992db5bfcdec6154a89189ec744e5c46e11"
+        },
+        {
+          "name": "mir_types",
+          "url": "https://github.com/rust-lang/rust/blob/90850177249efe0321573c569aec5d12b257f8d6/compiler/rustc_middle/src/mir/mod.rs",
+          "blob_sha": "fd3ba5c7fe02aac00236f766c9b13f70168589a2"
+        },
+        {
+          "name": "mir_ty",
+          "url": "https://github.com/rust-lang/rust/blob/90850177249efe0321573c569aec5d12b257f8d6/compiler/rustc_middle/src/ty/mod.rs",
+          "blob_sha": "ddaa01640b64be38d386d59399ef50245924db6b"
+        }
+      ],
+      "excerpts": {
+        "strip_pass": "use rustc_middle::mir::*;\nuse rustc_middle::ty::TyCtxt;\nuse rustc_mir_dataflow::debuginfo::debuginfo_locals;\nuse rustc_session::config::MirStripDebugInfo;\n\nuse crate::PassPolicy;\n\n/// Conditionally remove some of the VarDebugInfo in MIR.\n///\n/// In particular, stripping non-parameter debug info for tiny, primitive-like\n/// methods in core saves work later, and nobody ever wanted to use it anyway.\npub(super) struct StripDebugInfo;\n\nimpl<'tcx> crate::MirPass<'tcx> for StripDebugInfo {\n    fn policy(&self, sess: &rustc_session::Session) -> PassPolicy {\n        PassPolicy::optional_non_optimization(\n            sess.opts.unstable_opts.mir_strip_debuginfo != MirStripDebugInfo::None,\n        )\n    }\n\n    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {\n        match tcx.sess.opts.unstable_opts.mir_strip_debuginfo {\n            MirStripDebugInfo::None => return,\n            MirStripDebugInfo::AllLocals => {}\n            MirStripDebugInfo::LocalsInTinyFunctions\n                if let TerminatorKind::Return { .. } =\n                    body.basic_blocks[START_BLOCK].terminator().kind => {}\n            MirStripDebugInfo::LocalsInTinyFunctions => return,\n        }\n\n        body.var_debug_info.retain(|vdi| {\n            matches!(\n                vdi.value,\n                VarDebugInfoContents::Place(place)\n                    if place.local.as_usize() <= body.arg_count && place.local != RETURN_PLACE,\n            )\n        });\n\n        drop_invalid_debuginfos(body);\n    }\n}\n\n// Drop invalid debuginfos when strip locals in `var_debug_info`.\npub(super) fn drop_invalid_debuginfos(body: &mut Body<'_>) {\n    let debuginfo_locals = debuginfo_locals(body);\n    for data in body.basic_blocks.as_mut_preserves_cfg() {\n        for stmt in data.statements.iter_mut() {\n            stmt.debuginfos.retain_locals(&debuginfo_locals);\n        }\n        data.after_last_stmt_debuginfos.retain_locals(&debuginfo_locals);\n    }\n}",
+        "mono_debug_gate": "fn collect_items_of_instance<'tcx>(\n    tcx: TyCtxt<'tcx>,\n    instance: Instance<'tcx>,\n    mode: CollectionMode,\n) -> Result<(MonoItems<'tcx>, MonoItems<'tcx>), NormalizationErrorInMono> {\n    // This item is getting monomorphized, do mono-time checks.\n    let body = tcx.instance_mir(instance.def);\n    // Plenty of code paths later assume that everything can be normalized. So we have to check\n    // normalization first.\n    // We choose to emit the error outside to provide helpful diagnostics.\n    check_normalization_error(tcx, instance, body)?;\n    tcx.ensure_ok().check_mono_item(instance);\n\n    // Naively, in \"used\" collection mode, all functions get added to *both* `used_items` and\n    // `mentioned_items`. Mentioned items processing will then notice that they have already been\n    // visited, but at that point each mentioned item has been monomorphized, added to the\n    // `mentioned_items` worklist, and checked in the global set of visited items. To remove that\n    // overhead, we have a special optimization that avoids adding items to `mentioned_items` when\n    // they are already added in `used_items`. We could just scan `used_items`, but that's a linear\n    // scan and not very efficient. Furthermore we can only do that *after* monomorphizing the\n    // mentioned item. So instead we collect all pre-monomorphized `MentionedItem` that were already\n    // added to `used_items` in a hash set, which can efficiently query in the\n    // `body.mentioned_items` loop below without even having to monomorphize the item.\n    let mut used_items = MonoItems::new();\n    let mut mentioned_items = MonoItems::new();\n    let mut used_mentioned_items = Default::default();\n    let mut collector = MirUsedCollector {\n        tcx,\n        body,\n        used_items: &mut used_items,\n        used_mentioned_items: &mut used_mentioned_items,\n        instance,\n    };\n\n    if mode == CollectionMode::UsedItems {\n        if tcx.sess.opts.debuginfo == DebugInfo::Full {\n            for var_debug_info in &body.var_debug_info {\n                collector.visit_var_debug_info(var_debug_info);\n            }\n        }\n        for (bb, data) in traversal::mono_reachable(body, tcx, instance) {\n            collector.visit_basic_block_data(bb, data)\n        }\n    }",
+        "instance_mir": "    }\n\n    /// Returns the possibly-auto-generated MIR of a [`ty::InstanceKind`].\n    #[instrument(skip(self), level = \"debug\")]\n    pub fn instance_mir(self, instance: ty::InstanceKind<'tcx>) -> &'tcx Body<'tcx> {\n        let body = match instance {\n            ty::InstanceKind::Item(def) => {\n                debug!(\"calling def_kind on def: {:?}\", def);\n                let def_kind = self.def_kind(def);\n                debug!(\"returned from def_kind: {:?}\", def_kind);\n                match def_kind {\n                    DefKind::Const { .. }\n                    | DefKind::Static { .. }\n                    | DefKind::AssocConst { .. }\n                    | DefKind::Ctor(..)\n                    | DefKind::AnonConst => self.mir_for_ctfe(def),\n                    DefKind::Fn | DefKind::AssocFn\n                        if matches!(\n                            self.constness(def),\n                            hir::Constness::Const { always: true }\n                        ) =>\n                    {\n                        self.mir_for_ctfe(def)\n                    }\n                    // If the caller wants `mir_for_ctfe` of a function they should not be using\n                    // `instance_mir`, so we'll assume const fn also wants the optimized version.\n                    _ => self.optimized_mir(def),\n                }\n            }\n            ty::InstanceKind::Intrinsic(..) | ty::InstanceKind::LlvmIntrinsic(..) => {\n                bug!(\"intrinsics have no instance MIR\")\n            }\n            ty::InstanceKind::Virtual(..) => bug!(\"virtual dispatches have no instance MIR\"),\n            ty::InstanceKind::Shim(shim) => self.mir_shims(shim),\n        };\n\n        assert!(\n            matches!(body.phase, MirPhase::Runtime(_)),\n            \"body: {body:?} instance: {instance:?} {:?}\",\n            if let ty::InstanceKind::Item(d) = instance { Some(self.def_kind(d)) } else { None },\n        );\n\n        body\n    }\n\n    /// Gets all attributes with the given name.\n    #[deprecated = \"Though there are valid usecases for this method, especially when your attribute is not a parsed attribute, usually you want to call rustc_hir::find_attr! instead.\"]\n    pub fn get_attrs("
       }
     },
-    "followup_progress": {
-      "status": "Final metadata-only retry passed Asupersync and is continuing; CASS package check has not started at this checkpoint.",
-      "application_tests_executed": 0,
-      "log": "cass-nov01-check-clear-window.log",
-      "source_snapshots": "cass-nov01-check-clear-window-source-snapshots.jsonl"
-    }
+    "initial_six_test_compilation_errors_resolved": true
   },
   "remaining_scope_limits": [
     "No reporter archive was accessed.",
     "No native macOS/FSEvents runtime, launchd, or original-archive throughput qualification was executed.",
-    "Whole absent current roots retain debt until they return.",
+    "Whole absent roots may publish canonical debt only while currently configured; raw discovery waits for the directory to return.",
     "Empty canonical identities retain debt because the current replay API cannot certify stale lexical-document removal.",
     "Existing zero-emission sources retain debt and eligible cooldown retries until source completion evidence becomes available.",
     "Replay identity pages are bounded; existing per-conversation message-footprint hydration remains.",
@@ -704,16 +1153,26 @@
     "Application regressions, including new conversations, appends, restart and exact-once assertions, remain unexecuted."
   ],
   "publication": {
-    "base_main": "5cfb9d6a033927255a8a4befad153a44c8ed36e4",
+    "base_main": "52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96",
     "requested_branch": "main",
     "pull_request_requested": false,
     "authorization": "User renewed the explicit direct-to-main instruction after receiving missing application and failing UBS qualification details.",
-    "status": "Substantive recovery correction prepared for direct-main publication; the containing commit identifies the immutable candidate.",
+    "status": "Substantive follow-up prepared for direct publication through GitHub; the containing commit identifies the immutable final candidate.",
     "full_gate_passed": false,
     "issue_resolved": false,
-    "ingestion_bead_status": "in_progress"
+    "ingestion_bead_status": "in_progress",
+    "prior_direct_main_commit": "52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96",
+    "prior_direct_main_verified": true,
+    "pull_request_created": false,
+    "final_static_checks_passed": [
+      "formatting",
+      "all_target_metadata_check",
+      "all_target_clippy_with_denied_warnings"
+    ],
+    "native_component_tests_passed": 9,
+    "bead_comment_id": 2947
   },
-  "recorded_at_utc": "2026-11-01T02:35:56.932694+00:00",
+  "recorded_at_utc": "2026-11-01T03:28:13.176871+00:00",
   "prior_native_component": {
     "production_block_selections": [
       {
@@ -808,5 +1267,364 @@
       "sha256": "a95ab6ae4a988855072efb231d5236e70c5ee9b4c8346bf8d3b99d1a638e953d",
       "bytes": 7884171
     }
+  },
+  "prior_source_sha256_at_52e5e9d4": {
+    "src/indexer/mod.rs": "0dfe220bf273c488349bcb343a97b36e33433338b1dd2bf578077ec7bafa27c0",
+    "src/indexer/watch_ingestion_tests.rs": "4d0c5c414a634e78b5c41b6f5aa24b371bc515e0d029af87bfab0bfc5b57373e",
+    "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
+    "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747"
+  },
+  "whole_absent_root_followup": {
+    "baseline_commit": "52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96",
+    "current_authorization_required": true,
+    "strict_not_found_required": true,
+    "ordinary_extant_owner_has_precedence": true,
+    "connector_detect_or_scan_invoked": false,
+    "source_receipts_written": false,
+    "last_indexed_at_updated": false,
+    "watch_watermarks_updated": false,
+    "bounded_canonical_replay_requires_committed_publication": true,
+    "root_reappearance_requests_ordinary_retry_and_preserves_debt": true,
+    "intentional_policy_exclusions_preserve_debt_without_retry_loop": true,
+    "unexpired_nomem_deferral_retains_cooldown_retry": true,
+    "discovery_ancestor_and_empty_canonical_obligations_retained": true,
+    "new_application_regression_functions": [
+      "gh538_watch_publishes_canonical_debt_after_whole_current_root_disappears",
+      "gh538_watch_absent_root_recovery_requires_commit_before_debt_clearance",
+      "gh538_watch_absent_root_recovery_requires_current_authorization",
+      "gh538_watch_absent_root_routing_prefers_extant_owner_and_coalesces_duplicates",
+      "gh538_watch_absent_root_selection_rejects_nonabsence_errors",
+      "gh538_watch_absent_root_lookup_loop_cannot_authorize_recovery",
+      "gh538_watch_absent_root_preserves_nomem_retry_and_discovery_debt",
+      "gh538_watch_absent_root_empty_canonical_identity_retains_debt",
+      "gh538_watch_absent_root_honors_exclusion_skip_and_defer_policies"
+    ],
+    "new_application_regressions_executed": 0,
+    "native_registration_source_blocks_unchanged": false,
+    "independent_source_reviews": 2,
+    "negative_control": {
+      "baseline": "52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96",
+      "patch": "gh538-whole-root-negative.patch",
+      "sha256": "5e61baac04d35b6c582870a7617f7156c9d7f79661da8e4ecdd5162b32a3e362",
+      "prerequisite_test_compilation_fixes": [
+        "Two standalone force_full bool annotations",
+        "Existing poller caller uses database selection and tuple API"
+      ],
+      "behavioral_test": "gh538_watch_publishes_canonical_debt_after_whole_current_root_disappears",
+      "production_changes": false,
+      "applicability_exit": 0,
+      "executed": false,
+      "expected_assertion": "recovered.indexed is 0 where 2 is required"
+    },
+    "permission_probe_scope": "Typed error-policy proof plus an actual Unix symlink lookup loop; no unprivileged filesystem PermissionDenied run.",
+    "test_compilation_fixes": {
+      "callback_annotations": {
+        "file": "src/indexer/watch_ingestion_tests.rs",
+        "count": 2,
+        "change": "Annotate standalone force_full closure parameters as bool."
+      },
+      "poller_caller": {
+        "file": "src/indexer/mod.rs",
+        "change": "Existing held-open-WAL test now selects actual database roots and asserts the (Option<PollWatcher>, retry) tuple."
+      },
+      "diagnostic_source": "cass-nov01-check-clear-window.log",
+      "initial_diagnostics": {
+        "E0282": 2,
+        "E0308": 2,
+        "E0599": 2
+      },
+      "production_behavior_changed_by_compile_fixes": false
+    },
+    "native_component_revalidation": "All nine exact-source native component tests passed; root independently verified five block hashes and53 registry dependency identities/checksums.",
+    "application_regression_typecheck": "passed_as_part_of_final_all_target_metadata_check"
+  },
+  "polling_registration_followup": {
+    "pinned_backend": "notify 8.2.0 PollWatcher",
+    "defect": "watch() returns Ok after synchronous callback error refuses to initialize a selected parent directory; the prior retry boolean stayed false.",
+    "initial_parent_callback_errors_request_registration_retry": true,
+    "unrelated_child_errors_remain_diagnostic": true,
+    "periodic_errors_do_not_manufacture_global_rescan": true,
+    "every_poller_rebuild_reconciles_current_database_roots": true,
+    "reconciliation_mode": "ordinary idempotent source ingestion, not force_full",
+    "includes_partial_registration_failure": true,
+    "baseline_negative_commit": "52e5e9d4125cb08ac5aaab2f75d8ae460a8a7e96",
+    "baseline_negative_expected_failure_observed": true,
+    "baseline_negative_assertion": "missing-parent callback error must request registration retry",
+    "candidate_test": "gh538_database_poller_retries_callback_registration_errors",
+    "candidate_component_run": "passed_with_all_nine_native_regressions",
+    "candidate_assertions": [
+      "Missing parent callback error requests retry",
+      "Restored parent with unchanged inode re-enrolls",
+      "Unrelated child lookup errors do not request registration retry",
+      "Held-open WAL writes reach the notification backlog",
+      "Real watch_sources callback reconciles an unchanged peer when a late database rebuilds polling"
+    ]
+  },
+  "native_component_at_52e5e9d4": {
+    "platform": "Linux",
+    "passed": 8,
+    "failed": 0,
+    "test_runtime_seconds": 20.08,
+    "receipt": {
+      "started_at": "2026-11-01T02:31:42.826820+00:00",
+      "completed_at": "2026-11-01T02:32:04.768690+00:00",
+      "elapsed_seconds": 21.94193359900237,
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "--manifest-path",
+        "registration-probe/Cargo.toml",
+        "--lib",
+        "watch_registration_tests",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "returncode": 0,
+      "source_sha256": "0dfe220bf273c488349bcb343a97b36e33433338b1dd2bf578077ec7bafa27c0",
+      "harness_sha256": "8b7a543a1e5be3530b880f96d6df79eee978666effc1e5092cf215acf34d69ae",
+      "log": "registration-final8-20261101.log",
+      "log_sha256": "3a9c427cdd7b60ae5436b34320bacc98234530ba9a982cac2caf1092287f6834",
+      "proof_scope": "Eight exact-source real native notify and PollWatcher component tests on Linux; callback observes source bytes. No CASS canonical indexing, search publication, macOS, or reporter archive is tested."
+    },
+    "production_block_selections": [
+      {
+        "start": "#[derive(Debug, Clone)]\npub enum ReindexCommand {",
+        "end": "/// Per-connector statistics for structured logging",
+        "sha256": "ca526832017e178be281ba3c34a4f9cac35187600869d27cd09fb7bd1fddb79b"
+      },
+      {
+        "start": "fn database_sidecar_paths(",
+        "end": "/// GH #450: how long",
+        "sha256": "48f49899e6fbda0fef27b24c6dd179ada8c153f7bf83297027856b059181990d"
+      },
+      {
+        "start": "fn database_path_with_suffix(",
+        "end": "\nfn ",
+        "sha256": "32130a1e87bdc04a6a46496affc05f593354406abf4fdd13925e2682801b73ce"
+      },
+      {
+        "start": "/// Keep deferred sources in the watch loop,",
+        "end": "#[cfg(test)]\nfn reset_storage(",
+        "sha256": "f3eaf72e2a68d9e6f0c6367f71641b6a2d1198001c82d32f6e4ac386bcd4c8b9"
+      },
+      {
+        "start": "fn watch_event_should_trigger_reindex(",
+        "end": "\nfn sync_sources_config_to_db(",
+        "sha256": "17235095f5ca840550dfeeaefd45e01c85a4c8e7f057c4bc1b083a03c7c4b0fc"
+      }
+    ],
+    "final_candidate_blocks_match_tested_blocks_verbatim": true,
+    "resolved_dependencies_matching_repository_lock": 53,
+    "adapters_and_limits": "ConnectorKind carries tested variants, ScanRoot carries only path, atomic progress carrier omits SQL cancellation. Entire native watch loop, backlog, polling, stale detector, event filters, registration helpers and regression tests are verbatim. Callback observes source bytes; canonical indexing/search are not tested.",
+    "log": {
+      "file": "registration-final8-20261101.log",
+      "bytes": 1217,
+      "sha256": "3a9c427cdd7b60ae5436b34320bacc98234530ba9a982cac2caf1092287f6834"
+    },
+    "negative_controls": {
+      "baseline_missing_and_replaced_root": {
+        "passed": 0,
+        "failed": 2,
+        "reason": "native callback observation timeouts, not compilation failure",
+        "elapsed_seconds": 30.03,
+        "log": {
+          "name": "registration-baseline.log",
+          "sha256": "e626653c4718947f59fe7f68136b93c7a5f6a8fd32b7aee6931c2c24e10df8f9",
+          "bytes": 2030
+        }
+      },
+      "intermediate_alias_sharing": {
+        "started_at": "2026-11-01T02:14:49.216181+00:00",
+        "elapsed_seconds": 4.762344686998404,
+        "returncode": 101,
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "--manifest-path",
+          "registration-alias-probe/Cargo.toml",
+          "--lib",
+          "alias_rearm_review::gh538_retargeted_alias_keeps_original_root_watched",
+          "--",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "harness_sha256": "1ac1b70f730de0fb975f46ea47f813110a815d184e677865a80833252fa91513",
+        "log_sha256": "f37c603ec20f24567e312c7e248eca2323b4c62647738bd9c93079c7ece81fb8"
+      },
+      "intermediate_source_binding": {
+        "started_at": "2026-11-01T02:27:13.398416+00:00",
+        "elapsed_seconds": 1.437335610993614,
+        "returncode": 101,
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "--manifest-path",
+          "registration-probe/Cargo.toml",
+          "--lib",
+          "watch_registration_tests::gh538_native_watch_retargets_alias_within_registered_ancestor",
+          "--",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "source_sha256": "6746b91781b047e87d625b03b621fa0389b25d7115e8204124a154ad07d8ce25",
+        "harness_sha256": "094d80049527616cdcb265ea8cb1a96c07d2067526e8e8894fb65dbb060763d1",
+        "log_sha256": "9e8bc526a0979c3f9ccd50a220218e7b5a1f66572fdec9d24c01f7e3c3ccbdaa"
+      }
+    },
+    "native_macos_executed": false,
+    "fsevents_policy_basis": "Pinned notify 8.2.0 watch_inner/unwatch_inner restart the entire SinceNow stream even when append/remove fails; backend-specific reconciliation is source-audited only."
+  },
+  "ubs_at_52e5e9d4": {
+    "status": "VALID_SCAN_FAILED_GATE",
+    "returncode": 1,
+    "totals": {
+      "files": 4,
+      "critical": 49,
+      "warning": 11025,
+      "info": 3038
+    },
+    "summary": {
+      "baseline": "5cfb9d6a033927255a8a4befad153a44c8ed36e4",
+      "scan_validity": "VALID_STATIC_SCAN_WITH_FINDINGS",
+      "gate_status": "NOT_PASSED",
+      "run_receipt": "cass-ubs-nov01-final-ast-run.json",
+      "log": "cass-ubs-nov01-final-ast-verified.log",
+      "returncode": 1,
+      "totals": {
+        "files": 4,
+        "critical": 49,
+        "warning": 11025,
+        "info": 3038
+      },
+      "source_record_counts": {
+        "warning": 11025,
+        "critical": 49,
+        "info": 3033
+      },
+      "non_source_info": 5,
+      "files": [
+        {
+          "path": "src/indexer/mod.rs",
+          "sha256": "0dfe220bf273c488349bcb343a97b36e33433338b1dd2bf578077ec7bafa27c0",
+          "matches_launch_hash": true,
+          "scanner_content_blake2b_128": "40c56aad7efaab4806fed37ea5322254",
+          "cache": "/root/.cache/ubs/c46576762e0ac846074ab12e463ce14f/files/7d/7d01c2b8c40972712882316f2184f2c9.json",
+          "cache_sha256": "be83d00b6020223dafa3fdc0923ea28a434c50808dcfbc5e999a2953c9a578f9",
+          "cache_stored_at": 1793500590.7249856,
+          "records": 13398,
+          "ast_only_findings": 6589
+        },
+        {
+          "path": "src/indexer/watch_ingestion_tests.rs",
+          "sha256": "4d0c5c414a634e78b5c41b6f5aa24b371bc515e0d029af87bfab0bfc5b57373e",
+          "matches_launch_hash": true,
+          "scanner_content_blake2b_128": "b99e443c7fb05022678c95c41ad43353",
+          "cache": "/root/.cache/ubs/c46576762e0ac846074ab12e463ce14f/files/a4/a4530ec9f4703dce1c4ef34f5d152105.json",
+          "cache_sha256": "281f66ef9d1679ded5396d1da70cfc2ccd7fe662f10ad8a9f5621f553abc0771",
+          "cache_stored_at": 1793500590.8186114,
+          "records": 351,
+          "ast_only_findings": 18
+        },
+        {
+          "path": "src/indexer/watch_source_ledger.rs",
+          "sha256": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
+          "matches_launch_hash": true,
+          "scanner_content_blake2b_128": "8dc34884bb4a2bc543eade6262473afc",
+          "cache": "/root/.cache/ubs/c46576762e0ac846074ab12e463ce14f/files/a9/a9ca8c135aef0189e125632b05e9b111.json",
+          "cache_sha256": "8ea7fb258efd7867fbe4351284a746b675cf6de9b7e40c85d02393777429696a",
+          "cache_stored_at": 1793500590.71959,
+          "records": 22,
+          "ast_only_findings": 6
+        },
+        {
+          "path": "tests/watch_e2e.rs",
+          "sha256": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747",
+          "matches_launch_hash": true,
+          "scanner_content_blake2b_128": "e8ee16aa894247cae2d1297ca6287d47",
+          "cache": "/root/.cache/ubs/c46576762e0ac846074ab12e463ce14f/files/45/4568b16969cfdd8bc660c35de95a60f8.json",
+          "cache_sha256": "fccf59e5ead756443b5348f457b3eb3909e6f2a8fa793689f14f5f679e6fbd54",
+          "cache_stored_at": 1793500590.8210652,
+          "records": 336,
+          "ast_only_findings": 137
+        }
+      ],
+      "positive_ast_only_records": {
+        "rust.ownership.unwrap-expect": 6600,
+        "rust.panic.direct-indexing": 150
+      },
+      "ast_evidence": "Fresh exact-content cached results for all four frozen sources include AST-only unwrap/expect and direct-indexing rules from the pinned rust_scan.py. This verifies structural execution; assertion counts alone and the staged-rule-pack message do not.",
+      "added_line_findings": {
+        "warning": 347,
+        "critical": 1,
+        "info": 67
+      },
+      "added_line_triage_scope": "Counts and full records retained; prior backlog audit not repeated. Native helper and publication source changes independently reviewed, and only native component tests executed in the extracted harness.",
+      "invalid_preceding_run": {
+        "receipt": "cass-ubs-nov01-final-run.json",
+        "reason": "AST_NOT_AVAILABLE",
+        "reported_totals": {
+          "files": 4,
+          "critical": 2,
+          "warning": 4157,
+          "info": 1738
+        }
+      }
+    },
+    "log": {
+      "file": "cass-ubs-nov01-final-ast-verified.log",
+      "bytes": 52414,
+      "sha256": "9a00eca68cda2b151bb25a92eb08d9eb5a61e0fa7262a0f735d18a5170da33fa"
+    },
+    "invocation": {
+      "file": "cass-ubs-nov01-final-ast-run.json",
+      "bytes": 1823,
+      "sha256": "f57104b91556a3ed311bcfad7bd75b6d2a3fefc87634b512c8b5ad11a4a137b0"
+    },
+    "full_findings": {
+      "file": "cass-ubs-nov01-final-full-findings.ndjson",
+      "bytes": 7018180,
+      "sha256": "06321a5e6e43807ba3eef13b63bb3e72336526726e5e610119a88267b4969c3f"
+    },
+    "added_line_findings": {
+      "file": "cass-ubs-nov01-final-added-line-findings.json",
+      "bytes": 236740,
+      "sha256": "bf92967809e623994afe6b91996caad6d6754c7246ecdbd9134407477d55a18a"
+    },
+    "source_sha256": {
+      "src/indexer/mod.rs": "0dfe220bf273c488349bcb343a97b36e33433338b1dd2bf578077ec7bafa27c0",
+      "src/indexer/watch_ingestion_tests.rs": "4d0c5c414a634e78b5c41b6f5aa24b371bc515e0d029af87bfab0bfc5b57373e",
+      "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
+      "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747"
+    },
+    "gate_passed": false,
+    "suppressions_added": false,
+    "new_production_review": {
+      "warning_records": 18,
+      "rules": {
+        "rust.ownership.unwrap-expect": 2,
+        "rust.collections.clone-in-loop": 12,
+        "rust.panic.direct-indexing": 2,
+        "rust.perf.string-alloc-in-loop": 2
+      },
+      "concrete_new_defect_identified": false,
+      "basis": "Owned clones are bounded by configured source maps; writer initialization precedes both expect calls; debt indices are enumerated from the unchanged debt vector; root lookup follows insertion; error formatting is lazy. This review does not change the failing gate result."
+    }
+  },
+  "latest_reporter_comment_rechecked": {
+    "checked_at_utc": "2026-11-01T03:07:50+00:00",
+    "comment_id": 6539798177,
+    "author": "jwross24",
+    "updated_at": "2026-10-31T05:55:35Z",
+    "total_issue_comments": 2,
+    "new_reporter_evidence_since_initial_read": false
   }
 }

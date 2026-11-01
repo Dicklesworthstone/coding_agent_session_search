@@ -32269,13 +32269,29 @@ fn database_root_poller(
         .iter()
         .map(|database| database.parent().unwrap_or(database.as_path()))
         .collect();
+    // notify 8.2 reports failed initial directory scans synchronously through
+    // the callback, yet PollWatcher::watch still returns Ok. Only these root
+    // errors invalidate registration; an unrelated child must not rearm it.
+    let registration_directories: HashSet<PathBuf> =
+        directories.iter().map(|path| path.to_path_buf()).collect();
+    let callback_registration_failed = Arc::new(AtomicBool::new(false));
+    let failed_for_callback = Arc::clone(&callback_registration_failed);
     let mut poller = match notify::PollWatcher::new(
         move |result: notify::Result<notify::Event>| match result {
             Ok(mut event) => {
                 event.paths.retain(|path| files.contains(path));
                 enqueue_watch_notification(Ok(event), &backlog, &rescan, &wake);
             }
-            Err(error) => tracing::debug!(%error, "database root poll failed"),
+            Err(error) => {
+                if error
+                    .paths
+                    .iter()
+                    .any(|path| registration_directories.contains(path))
+                {
+                    failed_for_callback.store(true, Ordering::Release);
+                }
+                tracing::debug!(%error, "database root poll failed");
+            }
         },
         notify::Config::default().with_poll_interval(interval),
     ) {
@@ -32294,6 +32310,9 @@ fn database_root_poller(
             tracing::info!("polling {} for database commits", directory.display());
         }
     }
+    // This is an initial-registration snapshot. Later polling errors retain
+    // their existing watches and remain diagnostic, without retry/rescan churn.
+    retry_registration |= callback_registration_failed.load(Ordering::Acquire);
     (Some(poller), retry_registration)
 }
 
@@ -32691,7 +32710,7 @@ where
             progress.check_stop()?;
         }
         if last_registration_check.elapsed() >= min_scan_interval {
-            let refreshed = refresh_watch_root_registrations(
+            let mut refreshed = refresh_watch_root_registrations(
                 &mut watcher,
                 &roots,
                 &mut registered_roots,
@@ -32714,6 +32733,13 @@ where
                     Arc::clone(&notification_rescan),
                     wake.clone(),
                 );
+                // A replacement poller treats current WAL contents as its
+                // initial snapshot. Reconcile the selected databases after
+                // every attempt, including partial failure, or healthy peers
+                // can lose writes while another directory keeps retrying.
+                refreshed
+                    .reconcile
+                    .extend(polled_database_roots.iter().cloned());
             }
             last_registration_check = Instant::now();
             let recovered = refreshed.reconcile;
@@ -33262,6 +33288,142 @@ mod watch_registration_tests {
     }
 
     #[test]
+    fn gh538_database_poller_retries_callback_registration_errors() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("provider");
+        let database = parent.join("sessions.db");
+        fs::create_dir(&parent).unwrap();
+        fs::write(&database, b"SQLite format 3\0").unwrap();
+        let roots = vec![(ConnectorKind::Devin, ScanRoot::local(database.clone()))];
+        let mut watcher = recommended_watcher(|_| {}).unwrap();
+        let mut registered = BTreeMap::new();
+        let selected =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert_eq!(selected.database_roots, BTreeSet::from([database.clone()]));
+
+        // Reproduce the real registration race after discovery selected an
+        // existing database. notify 8.2 reports this through the callback but
+        // still returns Ok from PollWatcher::watch, leaving no poll enrolled.
+        let preserved = temp.path().join("preserved-provider");
+        fs::rename(&parent, &preserved).unwrap();
+        let backlog = Arc::new(Mutex::new(WatchEventBacklog::default()));
+        let rescan = Arc::new(AtomicBool::new(false));
+        let (wake, notifications) = bounded(1);
+        let (poller, retry) = database_root_poller(
+            &selected.database_roots,
+            Duration::from_millis(50),
+            Arc::clone(&backlog),
+            Arc::clone(&rescan),
+            wake.clone(),
+        );
+        assert!(poller.is_some(), "the backend creates the poller itself");
+        assert!(
+            retry,
+            "a callback registration error must request re-enrollment"
+        );
+        assert!(backlog.lock().unwrap().paths.is_empty());
+        assert!(!rescan.load(Ordering::Acquire));
+        assert!(notifications.try_recv().is_err());
+        drop(poller);
+
+        // Restore the same inode before the next metadata probe: native root
+        // identity alone cannot reveal that the poll registration was missed.
+        fs::rename(&preserved, &parent).unwrap();
+        let unrelated = parent.join("unrelated-broken-link");
+        symlink(parent.join("not-present"), &unrelated).unwrap();
+        let (poller, retry) = database_root_poller(
+            &selected.database_roots,
+            Duration::from_millis(50),
+            Arc::clone(&backlog),
+            Arc::clone(&rescan),
+            wake,
+        );
+        let _poller = poller.expect("the restored parent can be polled");
+        assert!(
+            !retry,
+            "an unrelated child error must not rearm the database poller"
+        );
+
+        let wal = database_sidecar_paths(&database)[0].clone();
+        let mut provider = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal)
+            .unwrap();
+        provider
+            .write_all(b"commit through a descriptor that stays open")
+            .unwrap();
+        provider.sync_all().unwrap();
+        let mut pending = WatchEventBacklog::default();
+        let mut pending_rescan = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pending.paths.contains(&wal) {
+            notifications
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            collect_watch_notifications(&backlog, &rescan, &mut pending, &mut pending_rescan);
+        }
+        assert!(
+            !pending_rescan,
+            "registration repair stays scoped to the database"
+        );
+        assert!(!pending.paths.contains(&unrelated));
+        assert!(!rescan.load(Ordering::Acquire));
+        drop(provider);
+        drop(_poller);
+
+        // Rebuilding a poller for a newly selected database also resets its
+        // unchanged peer's snapshot. The real watch loop must request both
+        // source censuses, even when the peer emitted no filesystem event.
+        let watch_temp = TempDir::new().unwrap();
+        let first = watch_temp.path().join("first.db");
+        let arriving = watch_temp.path().join("arriving.db");
+        fs::write(&first, "unchanged peer").unwrap();
+        let roots = vec![
+            (ConnectorKind::Devin, ScanRoot::local(first.clone())),
+            (ConnectorKind::Devin, ScanRoot::local(arriving.clone())),
+        ];
+        let progress = Arc::new(IndexingProgress::default());
+        let worker_progress = Arc::clone(&progress);
+        let worker_arriving = arriving.clone();
+        let (observed_tx, observed) = crossbeam_channel::unbounded();
+        let worker = thread::spawn(move || {
+            watch_sources(
+                None,
+                roots,
+                None,
+                Arc::new(StaleDetector::new(StaleConfig {
+                    action: StaleAction::None,
+                    ..StaleConfig::default()
+                })),
+                Some(&worker_progress),
+                1,
+                BTreeSet::new(),
+                move |paths: Vec<PathBuf>, _, force_full: bool| {
+                    assert!(!force_full, "poller repair uses an ordinary census");
+                    let content = if paths.contains(&first) && paths.contains(&worker_arriving) {
+                        fs::read_to_string(&worker_arriving).ok()
+                    } else {
+                        None
+                    };
+                    observed_tx.send(content)?;
+                    Ok(BTreeSet::new())
+                },
+            )
+        });
+        let watch = NativeWatch {
+            root: watch_temp.path().to_path_buf(),
+            _temp: watch_temp,
+            observed,
+            progress,
+            worker: Some(worker),
+        };
+        watch.wait_for(None);
+        fs::write(&arriving, "late database arrival").unwrap();
+        watch.wait_for(Some("late database arrival"));
+    }
+
+    #[test]
     fn gh538_late_database_under_registered_parent_joins_poll_discovery() {
         let temp = TempDir::new().unwrap();
         let existing = temp.path().join("existing.db");
@@ -33426,12 +33588,34 @@ fn reindex_paths_with_semantic_delta(
         warn_unclaimed_explicit_watch_once_paths(&paths, roots);
     }
     let mut paths = paths;
-    if !explicit {
-        promote_missing_watch_replay_paths(&mut paths, roots, storage, opts.progress.as_ref())?;
-    }
-    let triggers = classify_paths(paths, roots, explicit);
+    let absent_roots = if !explicit {
+        promote_missing_watch_replay_paths(&mut paths, roots, storage, opts.progress.as_ref())?
+    } else {
+        Vec::new()
+    };
+    let mut triggers = classify_paths(paths, roots, explicit);
+    triggers.retain(|(kind, root, _, _)| {
+        !absent_roots.iter().any(|(absent_kind, absent)| {
+            kind == absent_kind && root.origin == absent.origin && root.path == absent.path
+        })
+    });
+    let mut outcome = match recover_absent_watch_roots(
+        opts,
+        &absent_roots,
+        storage,
+        t_index,
+        index_path,
+        active_source_filter,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            reset_progress_to_idle(opts.progress.as_ref());
+            return Err(error);
+        }
+    };
     if triggers.is_empty() {
-        return Ok(WatchReindexOutcome::default());
+        reset_progress_to_idle(opts.progress.as_ref());
+        return Ok(outcome);
     }
 
     let raw_source_exclusions = {
@@ -33440,7 +33624,6 @@ fn reindex_paths_with_semantic_delta(
             .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
         RawSourceExclusions::load(&storage)?
     };
-    let mut outcome = WatchReindexOutcome::default();
     let mut first_source_scan_error = None;
 
     let mut semantic_delta = semantic_delta;
@@ -33449,6 +33632,19 @@ fn reindex_paths_with_semantic_delta(
     for (kind, root, min_ts, max_ts) in triggers {
         if let Some(progress) = &opts.progress {
             progress.check_stop()?;
+        }
+        if opts.watch && !explicit {
+            let metadata = fs::metadata(&root.path);
+            if let Some(progress) = &opts.progress {
+                progress.tick_activity();
+            }
+            if metadata.is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
+                // The selected root can disappear after classification. Keep
+                // its retry so canonical-only recovery gets the next callback;
+                // do not let a connector fall back to unrelated default roots.
+                outcome.retry_sources.insert(root.path.clone());
+                continue;
+            }
         }
         let conn = kind.create_connector(Some(&opts.data_dir));
         let detect = conn.detect();
@@ -33799,6 +33995,7 @@ fn reindex_paths_with_semantic_delta(
                 &root,
                 &pending_lexical_debt,
                 recovery_source_coverage.as_ref(),
+                None,
                 &storage,
                 t_index,
                 index_path,
@@ -34461,16 +34658,42 @@ fn watch_lexical_replay_debt_for_root(
     Ok(pending)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchReplayRootStatus {
+    Directory,
+    Absent,
+    Other,
+}
+
+/// Only NotFound proves the whole configured root is absent. A failed lookup
+/// through a non-directory, a permission denial, or a loop is not that proof.
+fn watch_replay_root_status(
+    metadata: std::io::Result<fs::Metadata>,
+) -> std::io::Result<WatchReplayRootStatus> {
+    match metadata {
+        Ok(metadata) if metadata.is_dir() => Ok(WatchReplayRootStatus::Directory),
+        Ok(_) => Ok(WatchReplayRootStatus::Other),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(WatchReplayRootStatus::Absent)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+            Ok(WatchReplayRootStatus::Other)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// A failed callback retains its notification paths. If a transcript is moved
 /// before retry, classification can no longer stat that leaf to select its
-/// owning root. Durable debt still authorizes recovery under an extant current
-/// root; a missing path alone does not authorize a scan or resurrect a source.
+/// owning root. Prefer the ordinary census under an extant current root. Only
+/// when none covers that connector/origin may a strictly absent current root
+/// authorize a separate canonical-only publication of its durable debt.
 fn promote_missing_watch_replay_paths(
     paths: &mut Vec<PathBuf>,
     roots: &[(ConnectorKind, ScanRoot)],
     storage: &Mutex<FrankenStorage>,
     progress: Option<&Arc<IndexingProgress>>,
-) -> Result<()> {
+) -> Result<Vec<(ConnectorKind, ScanRoot)>> {
     let mut missing = BTreeSet::new();
     for path in paths.iter() {
         if let Some(progress) = progress {
@@ -34490,7 +34713,7 @@ fn promote_missing_watch_replay_paths(
         }
     }
     if missing.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let debts = {
         let storage = storage
@@ -34499,39 +34722,41 @@ fn promote_missing_watch_replay_paths(
         load_watch_lexical_replay_debt(&storage)?
     };
     if debts.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let debts: Vec<_> = debts
         .into_iter()
         .map(|debt| {
             let path = crate::normalize_path_identity(&debt.path);
-            (debt.connector, debt.source_id, path)
+            (debt.connector, debt.source_id, path, debt.discovery_only)
         })
         .collect();
     let roots: Vec<_> = roots
         .iter()
         .map(|(kind, root)| (*kind, root, crate::normalize_path_identity(&root.path)))
         .collect();
-    let mut extant_roots = BTreeMap::new();
+    let mut observed_roots = BTreeMap::new();
     let mut promoted = BTreeSet::new();
+    let mut absent_roots: Vec<(ConnectorKind, ScanRoot, PathBuf)> = Vec::new();
     for missing_path in missing {
         if let Some(progress) = progress {
             progress.check_stop()?;
         }
         let mut selected: Vec<(ConnectorKind, &ScanRoot, &PathBuf)> = Vec::new();
+        let mut absent: Vec<(ConnectorKind, &ScanRoot, &PathBuf)> = Vec::new();
         for (kind, root, root_path) in &roots {
-            if !missing_path.starts_with(root_path)
-                || !debts.iter().any(|(debt_kind, source_id, debt_path)| {
+            let matches_debt =
+                |(debt_kind, source_id, debt_path, _): &(ConnectorKind, String, PathBuf, bool)| {
                     debt_kind == kind
                         && source_id == &root.origin.source_id
                         && (missing_path.starts_with(debt_path)
                             || debt_path.starts_with(&missing_path))
-                })
-            {
+                };
+            if !missing_path.starts_with(root_path) || !debts.iter().any(matches_debt) {
                 continue;
             }
             if let std::collections::btree_map::Entry::Vacant(entry) =
-                extant_roots.entry(root.path.clone())
+                observed_roots.entry(root.path.clone())
             {
                 if let Some(progress) = progress {
                     progress.check_stop()?;
@@ -34540,44 +34765,194 @@ fn promote_missing_watch_replay_paths(
                 if let Some(progress) = progress {
                     progress.tick_activity();
                 }
-                let is_directory = match metadata {
-                    Ok(metadata) => metadata.is_dir(),
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                        ) =>
-                    {
-                        false
-                    }
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("checking watch replay root {}", root.path.display())
-                        });
-                    }
-                };
-                entry.insert(is_directory);
+                let status = watch_replay_root_status(metadata).with_context(|| {
+                    format!("checking watch replay root {}", root.path.display())
+                })?;
+                entry.insert(status);
             }
-            if !extant_roots[&root.path] {
-                continue;
-            }
-            if let Some(previous) = selected
-                .iter_mut()
-                .find(|(selected_kind, selected_root, _)| {
-                    *selected_kind == *kind && selected_root.origin == root.origin
-                })
+            let candidates = match observed_roots[&root.path] {
+                WatchReplayRootStatus::Directory => &mut selected,
+                WatchReplayRootStatus::Absent
+                    if debts.iter().any(|debt| matches_debt(debt) && !debt.3) =>
+                {
+                    &mut absent
+                }
+                _ => continue,
+            };
+            if let Some(previous) =
+                candidates
+                    .iter_mut()
+                    .find(|(selected_kind, selected_root, _)| {
+                        *selected_kind == *kind && selected_root.origin == root.origin
+                    })
             {
                 if root_path.components().count() > previous.2.components().count() {
                     *previous = (*kind, *root, root_path);
                 }
             } else {
-                selected.push((*kind, *root, root_path));
+                candidates.push((*kind, *root, root_path));
             }
+        }
+        for (kind, root, root_path) in absent {
+            if selected.iter().any(|(extant_kind, extant, _)| {
+                *extant_kind == kind && extant.origin == root.origin
+            }) {
+                // The existing ancestor census already recovers absent
+                // children; do not publish the same canonical identities twice.
+                continue;
+            }
+            let same_family = |candidate: &(ConnectorKind, ScanRoot, PathBuf)| {
+                candidate.0 == kind
+                    && candidate.1.origin == root.origin
+                    && candidate.1.platform == root.platform
+            };
+            if absent_roots
+                .iter()
+                .any(|candidate| same_family(candidate) && root_path.starts_with(&candidate.2))
+            {
+                continue;
+            }
+            absent_roots.retain(|candidate| {
+                !(same_family(candidate) && candidate.2.starts_with(root_path))
+            });
+            absent_roots.push((kind, root.clone(), root_path.clone()));
         }
         promoted.extend(selected.into_iter().map(|(_, root, _)| root.path.clone()));
     }
     paths.extend(promoted);
-    Ok(())
+    Ok(absent_roots
+        .into_iter()
+        .map(|(kind, root, _)| (kind, root))
+        .collect())
+}
+
+/// Publish already-admitted canonical rows when their entire current root is
+/// absent. This is not a source census: it never detects or scans a connector,
+/// writes a source receipt, or advances source/completion watermarks.
+fn recover_absent_watch_roots(
+    opts: &IndexOptions,
+    roots: &[(ConnectorKind, ScanRoot)],
+    storage: &Mutex<FrankenStorage>,
+    t_index: &Mutex<Option<TantivyIndex>>,
+    index_path: &Path,
+    active_source_filter: &ActiveSessionSourceFilter,
+) -> Result<WatchReindexOutcome> {
+    let mut outcome = WatchReindexOutcome::default();
+    if roots.is_empty() || !opts.watch {
+        return Ok(outcome);
+    }
+    crate::connectors::codex::path_policy::ScanExclusions::from_env().validate()?;
+    if scan_path_exclusions_active()
+        || skip_subagents_active()
+        || !WorkspaceExclusions::from_env()?.patterns.is_empty()
+        || persist::defer_lexical_updates_enabled()
+    {
+        // These are intentional restrictions, not a transient filesystem gap.
+        // Leave debt durable without manufacturing periodic source scans.
+        return Ok(outcome);
+    }
+    let nomem_deferrals = WatchNomemDeferrals::load(&opts.data_dir);
+    let now_ms = FrankenStorage::now_millis();
+    for (kind, root) in roots {
+        if let Some(progress) = &opts.progress {
+            progress.check_stop()?;
+        }
+        let metadata = fs::metadata(&root.path);
+        if let Some(progress) = &opts.progress {
+            progress.tick_activity();
+        }
+        if watch_replay_root_status(metadata)
+            .with_context(|| format!("checking absent watch replay root {}", root.path.display()))?
+            != WatchReplayRootStatus::Absent
+        {
+            // It returned after selection. Let the next ordinary callback
+            // establish current source evidence instead of falling through to
+            // a connector whose missing-root behavior may use default paths.
+            outcome.retry_sources.insert(root.path.clone());
+            continue;
+        }
+        if !kind
+            .create_connector(Some(&opts.data_dir))
+            .supports_source_boundaries()
+        {
+            continue;
+        }
+        let storage = storage
+            .lock()
+            .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+        let debts = watch_lexical_replay_debt_for_root(&storage, *kind, root)?;
+        if !debts.iter().any(|debt| !debt.discovery_only) {
+            continue;
+        }
+        let selected_path = crate::normalize_path_identity(&root.path);
+        let provider = crate::connectors::archive_provider_slug(kind.slug());
+        let held = nomem_deferrals.entries.values().any(|entry| {
+            if entry.next_retry_at_ms <= now_ms
+                || !(entry.agent == kind.slug()
+                    || entry.agent == provider
+                    || (*kind == ConnectorKind::Claude && entry.agent == "claude-code"))
+            {
+                return false;
+            }
+            let path = crate::normalize_path_identity(Path::new(&entry.source_path));
+            path.starts_with(&selected_path)
+                && debts.iter().any(|debt| {
+                    !debt.discovery_only
+                        && path.starts_with(crate::normalize_path_identity(&debt.path))
+                })
+        });
+        if held {
+            outcome.retry_sources.insert(root.path.clone());
+            continue;
+        }
+        if let Some(progress) = &opts.progress {
+            progress.phase.store(2, Ordering::Relaxed);
+            progress.total_is_final.store(false, Ordering::Relaxed);
+        }
+        let recovered = recover_absent_watch_source_publications(
+            opts,
+            *kind,
+            root,
+            &debts,
+            None,
+            Some(active_source_filter),
+            &storage,
+            t_index,
+            index_path,
+        )?;
+        outcome.indexed = outcome
+            .indexed
+            .saturating_add(recovered.published_conversations);
+        outcome.published_conversations = outcome
+            .published_conversations
+            .saturating_add(recovered.published_conversations);
+
+        let metadata = fs::metadata(&root.path);
+        if let Some(progress) = &opts.progress {
+            progress.tick_activity();
+            progress.check_stop()?;
+        }
+        if watch_replay_root_status(metadata).with_context(|| {
+            format!(
+                "rechecking absent watch replay root {}",
+                root.path.display()
+            )
+        })? == WatchReplayRootStatus::Absent
+        {
+            // The bounded replay certifies only the selected publication
+            // obligations. Discovery debt, an ancestor obligation, and empty
+            // canonical identities remain unproven; no scan happened here.
+            for index in recovered.completed_debts {
+                clear_watch_lexical_replay_debt(&storage, &debts[index])?;
+            }
+        } else {
+            outcome.retry_sources.insert(root.path.clone());
+        }
+        if recovered.retry_unproven_source {
+            outcome.retry_sources.insert(root.path.clone());
+        }
+    }
+    Ok(outcome)
 }
 
 #[derive(Default)]
@@ -34661,6 +35036,7 @@ fn recover_absent_watch_source_publications(
     root: &ScanRoot,
     debts: &[WatchLexicalReplayDebt],
     source_coverage: Option<&WatchRecoverySourceCoverage>,
+    active_source_filter: Option<&ActiveSessionSourceFilter>,
     storage: &FrankenStorage,
     t_index: &Mutex<Option<TantivyIndex>>,
     index_path: &Path,
@@ -34773,6 +35149,19 @@ fn recover_absent_watch_source_publications(
             };
             if let Some(progress) = &opts.progress {
                 progress.tick_activity();
+            }
+            if missing
+                && active_source_filter.is_some_and(|filter| {
+                    should_skip_active_session_source(filter, root.origin.kind, &path)
+                })
+            {
+                recovered.unresolved_source = true;
+                for (_, scope, _, existing_covered, _) in &mut scopes {
+                    if path.starts_with(scope) {
+                        *existing_covered = false;
+                    }
+                }
+                continue;
             }
             let source_is_covered = missing
                 || source_coverage.is_some_and(|coverage| coverage.contains_normalized(&path));
@@ -67234,27 +67623,49 @@ c.close()
             ConnectorKind::Codex,
             ScanRoot::local(tmp.path().to_path_buf()),
         )];
+        let mut native_watcher = recommended_watcher(|_| {}).unwrap();
+        let mut registered = BTreeMap::new();
+        let directory_selection = refresh_watch_root_registrations(
+            &mut native_watcher,
+            &directory_root,
+            &mut registered,
+            None,
+        )
+        .unwrap();
+        assert!(directory_selection.database_roots.is_empty());
+        let (poller, retry) = database_root_poller(
+            &directory_selection.database_roots,
+            Duration::from_millis(50),
+            Arc::clone(&backlog),
+            Arc::clone(&rescan),
+            wake.clone(),
+        );
+        assert!(poller.is_none(), "only database roots are polled");
         assert!(
-            database_root_poller(
-                &directory_root,
-                Duration::from_millis(50),
-                Arc::clone(&backlog),
-                Arc::clone(&rescan),
-                wake.clone(),
-            )
-            .is_none(),
-            "only database roots are polled"
+            !retry,
+            "an empty database selection needs no registration retry"
         );
 
         let roots = vec![(ConnectorKind::Devin, ScanRoot::local(database.clone()))];
-        let _poller = database_root_poller(
-            &roots,
+        let database_selection =
+            refresh_watch_root_registrations(&mut native_watcher, &roots, &mut registered, None)
+                .unwrap();
+        assert_eq!(
+            database_selection.database_roots,
+            BTreeSet::from([database.clone()])
+        );
+        let (poller, retry) = database_root_poller(
+            &database_selection.database_roots,
             Duration::from_millis(50),
             Arc::clone(&backlog),
             Arc::clone(&rescan),
             wake,
-        )
-        .expect("a database root is polled");
+        );
+        assert!(
+            !retry,
+            "an available database parent is registered immediately"
+        );
+        let _poller = poller.expect("a database root is polled");
         std::thread::sleep(Duration::from_millis(300));
 
         std::fs::write(&neighbour, b"after, and longer").unwrap();
