@@ -646,3 +646,646 @@ fn gh538_watch_source_receipts_require_publication_before_reuse() -> Result<()> 
     }
     Ok(())
 }
+
+fn recover_publication_after_source_disappears(
+    kind: ConnectorKind,
+    restart: bool,
+    change_sibling: bool,
+) -> Result<()> {
+    let fixture = Fixture::new(kind)?;
+    let missing = fixture.source("missing", "missingbaselinegh538")?;
+    let sibling = fixture.source("sibling", "missingsiblinggh538")?;
+    let handles = Handles::open(&fixture)?;
+    assert_eq!(handles.scan(&fixture, true)?.0.indexed, 2);
+    let old_rows = canonical_rows(&handles)?;
+    let old_ids = search_ids(&fixture, "missingbaselinegh538")?;
+    let sibling_ids = search_ids(&fixture, "missingsiblinggh538")?;
+    assert_eq!(old_ids.len(), 1);
+    assert_eq!(sibling_ids.len(), 1);
+
+    fixture.append(&missing, "missing", "missingpublicationgh538")?;
+    {
+        let _fault = FaultGuard::set(WatchLexicalTestFault::Commit);
+        let error = handles.scan(&fixture, false).err().expect("commit fault");
+        assert!(error.to_string().contains("injected watch lexical"));
+    }
+    let committed = canonical_rows(&handles)?;
+    assert_eq!(committed.len(), 3);
+    assert_eq!(&committed[..old_rows.len()], old_rows.as_slice());
+    assert!(search_ids(&fixture, "missingpublicationgh538")?.is_empty());
+    assert!(!load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+
+    // A producer can rotate or remove its transcript after canonical commit.
+    // Preserve the fixture outside discovery: recovery must use the canonical
+    // rows, without a new source event or a standalone index command.
+    fs::rename(
+        &missing,
+        fixture._temp.path().join("retained-missing-source"),
+    )?;
+    if change_sibling {
+        fixture.append(&sibling, "sibling", "missingsiblingappendgh538")?;
+    }
+    let handles = if restart {
+        handles.close()?;
+        Handles::open(&fixture)?
+    } else {
+        handles
+    };
+    let (recovered, deferred) = handles.scan(&fixture, false)?;
+    assert!(deferred.is_empty());
+    assert_eq!(
+        search_ids(&fixture, "missingpublicationgh538")?.len(),
+        1,
+        "durable canonical content must publish after its raw source disappears"
+    );
+    assert_eq!(search_ids(&fixture, "missingbaselinegh538")?, old_ids);
+    assert_eq!(search_ids(&fixture, "missingsiblinggh538")?, sibling_ids);
+    assert_eq!(
+        recovered.published_conversations,
+        1 + usize::from(change_sibling)
+    );
+    assert!(load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+    assert_publication_receipts(&handles, 1)?;
+    let recovered_rows = canonical_rows(&handles)?;
+    assert_eq!(recovered_rows.len(), 3 + usize::from(change_sibling));
+    assert_eq!(&recovered_rows[..committed.len()], committed.as_slice());
+    if change_sibling {
+        assert_eq!(search_ids(&fixture, "missingsiblingappendgh538")?.len(), 1);
+    }
+
+    let published = published_state(&fixture, &handles)?;
+    let (noop, deferred) = handles.scan(&fixture, false)?;
+    assert_eq!(noop.published_conversations, 0);
+    assert!(deferred.is_empty());
+    assert_eq!(published_state(&fixture, &handles)?, published);
+    assert_eq!(canonical_rows(&handles)?, recovered_rows);
+    assert_eq!(search_ids(&fixture, "missingpublicationgh538")?.len(), 1);
+    handles.close()?;
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn gh538_watch_publishes_canonical_debt_after_source_disappears() -> Result<()> {
+    for kind in [ConnectorKind::Codex, ConnectorKind::Claude] {
+        for restart in [false, true] {
+            for change_sibling in [false, true] {
+                recover_publication_after_source_disappears(kind, restart, change_sibling)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn gh538_watch_absent_source_recovery_preserves_debt_until_commit() -> Result<()> {
+    let fixture = Fixture::new(ConnectorKind::Codex)?;
+    let missing = fixture.source("missing", "missingretrybaselinegh538")?;
+    let sibling = fixture.source("sibling", "missingretrycontrolgh538")?;
+    let handles = Handles::open(&fixture)?;
+    handles.scan(&fixture, true)?;
+    fixture.append(&missing, "missing", "missingretrypublicationgh538")?;
+    {
+        let _fault = FaultGuard::set(WatchLexicalTestFault::Commit);
+        assert!(handles.scan(&fixture, false).is_err());
+    }
+    fs::rename(
+        &missing,
+        fixture._temp.path().join("retained-missing-source"),
+    )?;
+    let committed = canonical_rows(&handles)?;
+    let published = published_state(&fixture, &handles)?;
+    {
+        let _fault = FaultGuard::set(WatchLexicalTestFault::Commit);
+        let error = handles
+            .scan(&fixture, false)
+            .err()
+            .expect("canonical recovery must attempt lexical commit");
+        assert!(error.to_string().contains("injected watch lexical"));
+    }
+    assert_eq!(canonical_rows(&handles)?, committed);
+    assert_eq!(published_state(&fixture, &handles)?, published);
+    assert!(search_ids(&fixture, "missingretrypublicationgh538")?.is_empty());
+    assert!(!load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+
+    // An active changed sibling keeps the census incomplete. Do not clear the
+    // old root obligation, or repeatedly rebuild absent history on every retry.
+    fixture.append(&sibling, "sibling", "missingretryactivegh538")?;
+    let lease = OpenOptions::new().read(true).write(true).open(&sibling)?;
+    lease.try_lock()?;
+    let (held, deferred) = handles.scan(&fixture, false)?;
+    assert_eq!(held.published_conversations, 0);
+    assert_eq!(deferred, BTreeSet::from([sibling]));
+    assert_eq!(canonical_rows(&handles)?, committed);
+    assert_eq!(published_state(&fixture, &handles)?, published);
+    assert!(!load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+    lease.unlock()?;
+    drop(lease);
+
+    let (recovered, deferred) = handles.scan(&fixture, false)?;
+    assert_eq!(recovered.published_conversations, 2);
+    assert!(deferred.is_empty());
+    for needle in [
+        "missingretrybaselinegh538",
+        "missingretrypublicationgh538",
+        "missingretrycontrolgh538",
+        "missingretryactivegh538",
+    ] {
+        assert_eq!(search_ids(&fixture, needle)?.len(), 1, "{needle}");
+    }
+    assert_eq!(canonical_rows(&handles)?.len(), 4);
+    assert!(load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+    handles.close()?;
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn gh538_watch_empty_absent_canonical_source_cannot_certify_publication() -> Result<()> {
+    for change_sibling in [false, true] {
+        let fixture = Fixture::new(ConnectorKind::Codex)?;
+        let missing = fixture.source("missing", "missingemptybaselinegh538")?;
+        let sibling = fixture.source("sibling", "missingemptycontrolgh538")?;
+        let handles = Handles::open(&fixture)?;
+        handles.scan(&fixture, true)?;
+        let published = published_state(&fixture, &handles)?;
+        let watch_state = load_watch_state(&fixture.options.data_dir);
+        let old_ids = search_ids(&fixture, "missingemptybaselinegh538")?;
+        let conversation_id = canonical_rows(&handles)?
+            .into_iter()
+            .find(|(_, _, _, content)| content == "missingemptybaselinegh538")
+            .expect("initial canonical message")
+            .0;
+
+        // Simulate an interrupted canonical cleanup that left stale lexical
+        // documents. The existing replay API only upserts nonempty message
+        // batches; an empty canonical source cannot certify their deletion.
+        {
+            let storage = handles.storage.lock().unwrap();
+            persist::with_ephemeral_writer(
+                &storage,
+                false,
+                "prepare empty replay source",
+                |writer| {
+                    writer.raw().execute_compat(
+                        "DELETE FROM messages WHERE conversation_id = ?1",
+                        &[ParamValue::from(conversation_id)],
+                    )?;
+                    Ok(())
+                },
+            )?;
+            persist_watch_lexical_replay_debt(
+                &storage,
+                &WatchLexicalReplayDebt::for_root(fixture.kind, &fixture.root),
+            )?;
+        }
+        fs::rename(&missing, fixture._temp.path().join("retained-empty-source"))?;
+        if change_sibling {
+            fixture.append(&sibling, "sibling", "missingemptyappendgh538")?;
+        }
+        let (outcome, deferred) = handles.scan(&fixture, false)?;
+        assert!(deferred.is_empty());
+        assert_eq!(outcome.published_conversations, usize::from(change_sibling));
+        assert!(
+            outcome.retry_sources.is_empty(),
+            "an empty canonical identity cannot drive an endless source retry"
+        );
+        assert_eq!(search_ids(&fixture, "missingemptybaselinegh538")?, old_ids);
+        assert_eq!(published_state(&fixture, &handles)?.0, published.0);
+        assert_eq!(load_watch_state(&fixture.options.data_dir), watch_state);
+        assert_eq!(*handles.state.lock().unwrap(), watch_state);
+        assert!(!load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+        if change_sibling {
+            assert_eq!(search_ids(&fixture, "missingemptyappendgh538")?.len(), 1);
+        } else {
+            assert_eq!(published_state(&fixture, &handles)?, published);
+        }
+        handles.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn gh538_watch_retries_disappeared_notification_leaf_without_another_event() -> Result<()> {
+    let fixture = Fixture::new(ConnectorKind::Codex)?;
+    let missing = fixture.source("missing", "missingleafbaselinegh538")?;
+    fixture.source("sibling", "missingleafcontrolgh538")?;
+    let handles = Handles::open(&fixture)?;
+    handles.scan(&fixture, true)?;
+    let old_ids = search_ids(&fixture, "missingleafbaselinegh538")?;
+    let sibling_ids = search_ids(&fixture, "missingleafcontrolgh538")?;
+    fixture.append(&missing, "missing", "missingleafpublicationgh538")?;
+    let mut pending = BTreeSet::from([missing.clone()]);
+    let callback = |paths: Vec<PathBuf>, roots: &[(ConnectorKind, ScanRoot)], force_full| {
+        assert_eq!(
+            paths,
+            vec![missing.clone()],
+            "retry the original notification"
+        );
+        assert!(!force_full);
+        let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+        let outcome = reindex_paths_with_semantic_delta(
+            &fixture.options,
+            paths,
+            roots,
+            &handles.state,
+            &handles.storage,
+            &handles.index,
+            &fixture.index_path,
+            force_full,
+            None,
+            &filter,
+        )?;
+        assert!(filter.take_deferred_sources().is_empty());
+        Ok(outcome.retry_sources)
+    };
+    {
+        let _fault = FaultGuard::set(WatchLexicalTestFault::Commit);
+        assert!(!dispatch_watch_callback(
+            &mut pending,
+            &fixture.roots(),
+            false,
+            &callback
+        ));
+    }
+    assert_eq!(pending, BTreeSet::from([missing.clone()]));
+    let committed = canonical_rows(&handles)?;
+    assert_eq!(committed.len(), 3);
+    assert!(search_ids(&fixture, "missingleafpublicationgh538")?.is_empty());
+    assert!(!load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+
+    fs::rename(
+        &missing,
+        fixture._temp.path().join("retained-notification-source"),
+    )?;
+    assert!(dispatch_watch_callback(
+        &mut pending,
+        &fixture.roots(),
+        false,
+        &callback
+    ));
+    assert!(pending.is_empty());
+    assert_eq!(
+        search_ids(&fixture, "missingleafpublicationgh538")?.len(),
+        1
+    );
+    assert_eq!(search_ids(&fixture, "missingleafbaselinegh538")?, old_ids);
+    assert_eq!(
+        search_ids(&fixture, "missingleafcontrolgh538")?,
+        sibling_ids
+    );
+    assert_eq!(canonical_rows(&handles)?, committed);
+    assert!(load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+    assert_publication_receipts(&handles, 1)?;
+    handles.close()?;
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn gh538_watch_missing_leaf_promotion_requires_current_matching_debt() -> Result<()> {
+    let fixture = Fixture::new(ConnectorKind::Codex)?;
+    let handles = Handles::open(&fixture)?;
+    let child = ScanRoot::local(fixture.root.path.join("nested"));
+    fs::create_dir(&child.path)?;
+    let missing = child.path.join("rollout-vanished.jsonl");
+    let roots = [
+        (fixture.kind, fixture.root.clone()),
+        (fixture.kind, child.clone()),
+    ];
+    let original = vec![missing.clone()];
+    let mut selected = original.clone();
+    promote_missing_watch_replay_paths(&mut selected, &roots, &handles.storage, None)?;
+    assert_eq!(
+        selected, original,
+        "a missing path alone cannot schedule a scan"
+    );
+
+    {
+        let storage = handles.storage.lock().unwrap();
+        for debt in [
+            WatchLexicalReplayDebt::for_root(ConnectorKind::Claude, &fixture.root),
+            WatchLexicalReplayDebt {
+                source_id: "unconfigured-origin".into(),
+                ..WatchLexicalReplayDebt::for_root(fixture.kind, &fixture.root)
+            },
+            WatchLexicalReplayDebt {
+                path: child.path.join("different-source.jsonl"),
+                ..WatchLexicalReplayDebt::for_root(fixture.kind, &fixture.root)
+            },
+        ] {
+            persist_watch_lexical_replay_debt(&storage, &debt)?;
+        }
+    }
+    promote_missing_watch_replay_paths(&mut selected, &roots, &handles.storage, None)?;
+    assert_eq!(
+        selected, original,
+        "unrelated obligations cannot authorize replay"
+    );
+    persist_watch_lexical_replay_debt(
+        &handles.storage.lock().unwrap(),
+        &WatchLexicalReplayDebt {
+            path: missing.clone(),
+            ..WatchLexicalReplayDebt::for_root(fixture.kind, &fixture.root)
+        },
+    )?;
+    promote_missing_watch_replay_paths(&mut selected, &roots, &handles.storage, None)?;
+    assert_eq!(
+        selected,
+        vec![missing.clone(), child.path.clone()],
+        "retain only the deepest current root for this connector and provenance"
+    );
+
+    let no_current_roots = [];
+    let mut unconfigured = original.clone();
+    promote_missing_watch_replay_paths(
+        &mut unconfigured,
+        &no_current_roots,
+        &handles.storage,
+        None,
+    )?;
+    assert_eq!(
+        unconfigured, original,
+        "removed configuration cannot be revived by debt"
+    );
+    handles.close()?;
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn gh538_watch_narrowed_root_replays_only_its_share_of_ancestor_debt() -> Result<()> {
+    let mut fixture = Fixture::new(ConnectorKind::Codex)?;
+    let parent = fixture.root.clone();
+    let child = ScanRoot::local(parent.path.join("current-child"));
+    let outside_dir = parent.path.join("former-sibling");
+    fs::create_dir(&child.path)?;
+    fs::create_dir(&outside_dir)?;
+    let original_child = fixture.source("child", "ancestorkeptbaselinegh538")?;
+    let original_outside = fixture.source("outside", "ancestoroutsidebaselinegh538")?;
+    let missing = child.path.join("rollout-child.jsonl");
+    let outside = outside_dir.join("rollout-outside.jsonl");
+    fs::rename(original_child, &missing)?;
+    fs::rename(original_outside, &outside)?;
+    let handles = Handles::open(&fixture)?;
+    assert_eq!(handles.scan(&fixture, true)?.0.indexed, 2);
+    let child_ids = search_ids(&fixture, "ancestorkeptbaselinegh538")?;
+    let outside_ids = search_ids(&fixture, "ancestoroutsidebaselinegh538")?;
+
+    fixture.append(&missing, "child", "ancestorkeptpublicationgh538")?;
+    fixture.append(&outside, "outside", "ancestoroutsidepublicationgh538")?;
+    {
+        let _fault = FaultGuard::set(WatchLexicalTestFault::Commit);
+        assert!(handles.scan(&fixture, false).is_err());
+    }
+    let committed = canonical_rows(&handles)?;
+    assert_eq!(committed.len(), 4);
+    let published = published_state(&fixture, &handles)?;
+    let watch_state = load_watch_state(&fixture.options.data_dir);
+    fs::rename(
+        &missing,
+        fixture._temp.path().join("retained-current-child"),
+    )?;
+    fs::rename(
+        &outside,
+        fixture._temp.path().join("retained-former-sibling"),
+    )?;
+    handles.close()?;
+
+    // The current configuration now authorizes only the child. Older parent
+    // debt remains durable, but must neither strand this child's publication
+    // nor authorize replay of its former sibling.
+    fixture.root = child;
+    let handles = Handles::open(&fixture)?;
+    assert_eq!(
+        watch_lexical_replay_sources(&handles.storage.lock().unwrap(), &fixture.roots())?,
+        BTreeSet::from([fixture.root.path.clone()]),
+    );
+    let mut pending = BTreeSet::from([missing.clone()]);
+    assert!(dispatch_watch_callback(
+        &mut pending,
+        &fixture.roots(),
+        false,
+        &|paths, roots, force_full| {
+            assert_eq!(paths, vec![missing.clone()]);
+            assert!(!force_full);
+            let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+            let outcome = reindex_paths_with_semantic_delta(
+                &fixture.options,
+                paths,
+                roots,
+                &handles.state,
+                &handles.storage,
+                &handles.index,
+                &fixture.index_path,
+                force_full,
+                None,
+                &filter,
+            )?;
+            assert_eq!(outcome.published_conversations, 1);
+            assert!(filter.take_deferred_sources().is_empty());
+            Ok(outcome.retry_sources)
+        },
+    ));
+    assert!(pending.is_empty());
+    let recovered_ids = search_ids(&fixture, "ancestorkeptpublicationgh538")?;
+    assert_eq!(recovered_ids.len(), 1);
+    assert!(search_ids(&fixture, "ancestoroutsidepublicationgh538")?.is_empty());
+    assert_eq!(
+        search_ids(&fixture, "ancestorkeptbaselinegh538")?,
+        child_ids
+    );
+    assert_eq!(
+        search_ids(&fixture, "ancestoroutsidebaselinegh538")?,
+        outside_ids
+    );
+    assert_eq!(canonical_rows(&handles)?, committed);
+    assert_eq!(published_state(&fixture, &handles)?.0, published.0);
+    assert_eq!(load_watch_state(&fixture.options.data_dir), watch_state);
+    assert_eq!(*handles.state.lock().unwrap(), watch_state);
+    assert_publication_receipts(&handles, 0)?;
+    let debts = load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?;
+    assert_eq!(debts.len(), 1);
+    assert_eq!(debts[0].path, crate::normalize_path_identity(&parent.path));
+
+    // Only an explicitly current parent can finish the remaining obligation.
+    // Replaying the child again must retain its already-published identities.
+    fixture.root = parent;
+    assert_eq!(handles.scan(&fixture, false)?.0.published_conversations, 2);
+    assert_eq!(
+        search_ids(&fixture, "ancestorkeptpublicationgh538")?,
+        recovered_ids
+    );
+    assert_eq!(
+        search_ids(&fixture, "ancestoroutsidepublicationgh538")?.len(),
+        1
+    );
+    assert_eq!(
+        search_ids(&fixture, "ancestorkeptbaselinegh538")?,
+        child_ids
+    );
+    assert_eq!(
+        search_ids(&fixture, "ancestoroutsidebaselinegh538")?,
+        outside_ids
+    );
+    assert_eq!(canonical_rows(&handles)?, committed);
+    assert!(load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+    let completed = published_state(&fixture, &handles)?;
+    assert_eq!(handles.scan(&fixture, false)?.0.published_conversations, 0);
+    assert_eq!(published_state(&fixture, &handles)?, completed);
+    handles.close()?;
+    Ok(())
+}
+
+fn dispatch_source_retry(
+    fixture: &Fixture,
+    handles: &Handles,
+    pending: &mut BTreeSet<PathBuf>,
+) -> Result<WatchReindexOutcome> {
+    let observed = std::cell::RefCell::new(None);
+    assert!(dispatch_watch_callback(
+        pending,
+        &fixture.roots(),
+        false,
+        &|paths, roots, force_full| {
+            assert!(!force_full);
+            let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+            let outcome = reindex_paths_with_semantic_delta(
+                &fixture.options,
+                paths,
+                roots,
+                &handles.state,
+                &handles.storage,
+                &handles.index,
+                &fixture.index_path,
+                force_full,
+                None,
+                &filter,
+            )?;
+            assert!(filter.take_deferred_sources().is_empty());
+            let retries = outcome.retry_sources.clone();
+            observed.replace(Some(outcome));
+            Ok(retries)
+        },
+    ));
+    observed.into_inner().context("watch callback must run")
+}
+
+fn zero_emission_source_preserves_recovery(
+    kind: ConnectorKind,
+    change_sibling: bool,
+) -> Result<()> {
+    let fixture = Fixture::new(kind)?;
+    let source = fixture.source("unproven", "zeroemissionbaselinegh538")?;
+    let sibling = fixture.source("sibling", "zeroemissioncontrolgh538")?;
+    let handles = Handles::open(&fixture)?;
+    handles.scan(&fixture, true)?;
+    let old_ids = search_ids(&fixture, "zeroemissionbaselinegh538")?;
+    let sibling_ids = search_ids(&fixture, "zeroemissioncontrolgh538")?;
+    fixture.append(&source, "unproven", "zeroemissionpublicationgh538")?;
+    {
+        let _fault = FaultGuard::set(WatchLexicalTestFault::Commit);
+        assert!(handles.scan(&fixture, false).is_err());
+    }
+    let committed = canonical_rows(&handles)?;
+    assert_eq!(committed.len(), 3);
+    let published = published_state(&fixture, &handles)?;
+    let watch_state = load_watch_state(&fixture.options.data_dir);
+
+    // Codex and Claude omit source completion when an existing transcript
+    // yields no messages. Preserve the original input outside discovery, then
+    // model a producer that truncated its transcript before recovery.
+    let retained = fixture._temp.path().join("retained-nonempty-source");
+    fs::rename(&source, &retained)?;
+    fs::write(&source, b"")?;
+    if change_sibling {
+        fixture.append(&sibling, "sibling", "zeroemissionsiblingappendgh538")?;
+    }
+    let mut pending = BTreeSet::from([source.clone()]);
+    let blocked = dispatch_source_retry(&fixture, &handles, &mut pending)?;
+    assert_eq!(blocked.published_conversations, usize::from(change_sibling));
+    assert!(search_ids(&fixture, "zeroemissionpublicationgh538")?.is_empty());
+    assert_eq!(search_ids(&fixture, "zeroemissionbaselinegh538")?, old_ids);
+    assert_eq!(
+        search_ids(&fixture, "zeroemissioncontrolgh538")?,
+        sibling_ids
+    );
+    let after_sibling = canonical_rows(&handles)?;
+    assert_eq!(after_sibling.len(), 3 + usize::from(change_sibling));
+    assert_eq!(&after_sibling[..committed.len()], committed.as_slice());
+    if change_sibling {
+        assert_eq!(
+            search_ids(&fixture, "zeroemissionsiblingappendgh538")?.len(),
+            1
+        );
+    }
+    assert!(!load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+    assert_eq!(pending, BTreeSet::from([fixture.root.path.clone()]));
+    assert_eq!(published_state(&fixture, &handles)?.0, published.0);
+    assert_eq!(load_watch_state(&fixture.options.data_dir), watch_state);
+    assert_eq!(*handles.state.lock().unwrap(), watch_state);
+    assert_publication_receipts(&handles, 1)?;
+
+    // The complete sibling retains its receipt even while the zero-output
+    // source withholds root completion. Repeated recovery must not republish
+    // that healthy history merely to keep the unresolved obligation alive.
+    let partial = published_state(&fixture, &handles)?;
+    let noop = dispatch_source_retry(&fixture, &handles, &mut pending)?;
+    assert_eq!(noop.published_conversations, 0);
+    assert_eq!(pending, BTreeSet::from([fixture.root.path.clone()]));
+    assert_eq!(published_state(&fixture, &handles)?, partial);
+    assert_eq!(canonical_rows(&handles)?, after_sibling);
+    assert!(!load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+    handles.close()?;
+
+    let handles = Handles::open(&fixture)?;
+    let mut pending =
+        watch_lexical_replay_sources(&handles.storage.lock().unwrap(), &fixture.roots())?;
+    assert_eq!(pending, BTreeSet::from([fixture.root.path.clone()]));
+    assert_eq!(
+        dispatch_source_retry(&fixture, &handles, &mut pending)?.published_conversations,
+        0
+    );
+    assert_eq!(pending, BTreeSet::from([fixture.root.path.clone()]));
+    assert_eq!(published_state(&fixture, &handles)?, partial);
+    assert!(!load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+
+    // Restoring a complete source supplies the missing evidence. Its canonical
+    // append already exists, so publication recovery must not insert it again.
+    // The retained queue, without a newly supplied event, drives this attempt.
+    fs::rename(&source, fixture._temp.path().join("retained-empty-source"))?;
+    fs::rename(&retained, &source)?;
+    let recovered = dispatch_source_retry(&fixture, &handles, &mut pending)?;
+    assert_eq!(recovered.published_conversations, 1);
+    assert!(pending.is_empty());
+    assert_eq!(
+        search_ids(&fixture, "zeroemissionpublicationgh538")?.len(),
+        1
+    );
+    assert_eq!(search_ids(&fixture, "zeroemissionbaselinegh538")?, old_ids);
+    assert_eq!(
+        search_ids(&fixture, "zeroemissioncontrolgh538")?,
+        sibling_ids
+    );
+    assert_eq!(canonical_rows(&handles)?, after_sibling);
+    assert_publication_receipts(&handles, 2)?;
+    assert!(load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+    let complete = published_state(&fixture, &handles)?;
+    assert_eq!(handles.scan(&fixture, false)?.0.published_conversations, 0);
+    assert_eq!(published_state(&fixture, &handles)?, complete);
+    handles.close()?;
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn gh538_watch_zero_emission_source_cannot_discharge_sibling_publication_debt() -> Result<()> {
+    for kind in [ConnectorKind::Codex, ConnectorKind::Claude] {
+        for change_sibling in [true, false] {
+            zero_emission_source_preserves_recovery(kind, change_sibling)?;
+        }
+    }
+    Ok(())
+}

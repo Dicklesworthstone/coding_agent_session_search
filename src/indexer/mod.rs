@@ -11546,7 +11546,8 @@ fn can_skip_unchanged_explicit_watch_once_index_run(
         return Ok(false);
     }
 
-    let additional_scan_roots = additional_scan_roots_for_scan_or_watch(storage, &opts.data_dir);
+    let additional_scan_roots =
+        additional_scan_roots_for_scan_or_watch(storage, &opts.data_dir, false);
     let watch_roots = build_watch_roots(additional_scan_roots);
     if !should_skip_unchanged_explicit_watch_once_paths(opts, storage, &watch_roots)? {
         return Ok(false);
@@ -18939,7 +18940,7 @@ fn run_index_with_storage_ownership(
                 // HOME/XDG-scoped, so an env-free run must not consult it —
                 // the override map is the complete scan universe.
                 let additional_scan_roots = if let Some(source_ids) = &mirror_source_ids {
-                    additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir)
+                    additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir, false)
                         .into_iter()
                         .filter(|root| {
                             root.origin.kind.is_remote()
@@ -18949,7 +18950,7 @@ fn run_index_with_storage_ownership(
                 } else if local_connector_roots.is_some() {
                     Vec::new()
                 } else {
-                    additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir)
+                    additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir, false)
                 };
                 // #372: drop remote mirror roots whose on-disk fingerprint is
                 // unchanged since the last error-free scan (they would otherwise
@@ -20069,13 +20070,16 @@ fn run_index_with_storage_ownership(
     reset_progress_to_idle(opts.progress.as_ref());
 
     if opts.watch || opts.watch_once_paths.is_some() {
-        let additional_scan_roots =
-            additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
-        let watch_roots = build_watch_roots(additional_scan_roots.clone());
         let watch_once_mode = opts
             .watch_once_paths
             .as_ref()
             .is_some_and(|paths| !paths.is_empty());
+        let additional_scan_roots = additional_scan_roots_for_scan_or_watch(
+            &storage,
+            &opts.data_dir,
+            opts.watch && !watch_once_mode,
+        );
+        let watch_roots = build_watch_roots(additional_scan_roots.clone());
         if opts.watch && !watch_once_mode {
             // A stopped watch callback can leave canonical rows ahead of the
             // published index without another filesystem event to wake it.
@@ -32214,13 +32218,13 @@ impl Drop for WatchIdleWaitScope<'_> {
 }
 
 fn is_database_watch_root(kind: ConnectorKind, root: &ScanRoot) -> bool {
-    (kind == ConnectorKind::Shelley
+    is_database_watch_path(kind, &root.path) && root.path.is_file()
+}
+
+fn is_database_watch_path(kind: ConnectorKind, path: &Path) -> bool {
+    kind == ConnectorKind::Shelley
         || (kind == ConnectorKind::Devin
-            && root
-                .path
-                .extension()
-                .is_some_and(|extension| extension == "db")))
-        && root.path.is_file()
+            && path.extension().is_some_and(|extension| extension == "db"))
 }
 
 /// Shelley and Devin take an explicit file root as their database and fail the
@@ -32245,30 +32249,25 @@ fn explicit_watch_once_file_may_be_database(kind: ConnectorKind, path: &Path) ->
 /// sidecars. The native watcher stays authoritative: a poll error is logged,
 /// never escalated to a full-root rescan.
 fn database_root_poller(
-    roots: &[(ConnectorKind, ScanRoot)],
+    databases: &BTreeSet<PathBuf>,
     interval: Duration,
     backlog: Arc<Mutex<WatchEventBacklog>>,
     rescan: Arc<AtomicBool>,
     wake: Sender<()>,
-) -> Option<notify::PollWatcher> {
-    let databases: Vec<&Path> = roots
-        .iter()
-        .filter(|(kind, root)| is_database_watch_root(*kind, root))
-        .map(|(_, root)| root.path.as_path())
-        .collect();
+) -> (Option<notify::PollWatcher>, bool) {
     if databases.is_empty() {
-        return None;
+        return (None, false);
     }
     let files: HashSet<PathBuf> = databases
         .iter()
         .flat_map(|database| {
             let [wal, shm] = database_sidecar_paths(database);
-            [database.to_path_buf(), wal, shm]
+            [database.clone(), wal, shm]
         })
         .collect();
     let directories: BTreeSet<&Path> = databases
         .iter()
-        .map(|database| database.parent().unwrap_or(database))
+        .map(|database| database.parent().unwrap_or(database.as_path()))
         .collect();
     let mut poller = match notify::PollWatcher::new(
         move |result: notify::Result<notify::Event>| match result {
@@ -32283,17 +32282,19 @@ fn database_root_poller(
         Ok(poller) => poller,
         Err(error) => {
             tracing::warn!(%error, "failed to start polling database roots");
-            return None;
+            return (None, true);
         }
     };
+    let mut retry_registration = false;
     for directory in directories {
         if let Err(error) = poller.watch(directory, RecursiveMode::NonRecursive) {
             tracing::warn!("failed to poll {}: {}", directory.display(), error);
+            retry_registration = true;
         } else {
             tracing::info!("polling {} for database commits", directory.display());
         }
     }
-    Some(poller)
+    (Some(poller), retry_registration)
 }
 
 fn watch_scan_lower_bound(kind: ConnectorKind, since_ts: Option<i64>) -> Option<i64> {
@@ -32307,6 +32308,293 @@ fn watch_scan_lower_bound(kind: ConnectorKind, since_ts: Option<i64>) -> Option<
     } else {
         since_ts
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchRootIdentity {
+    is_directory: bool,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    created_at: Option<SystemTime>,
+}
+
+impl WatchRootIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            is_directory: metadata.is_dir(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(not(unix))]
+            created_at: metadata.created().ok(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct WatchSourceBinding {
+    resolved_path: PathBuf,
+    identity: WatchRootIdentity,
+}
+
+struct WatchRootRegistration {
+    identity: WatchRootIdentity,
+    recursive: bool,
+    sources: BTreeMap<PathBuf, WatchSourceBinding>,
+}
+
+#[derive(Default)]
+struct WatchRootTarget {
+    recursive: bool,
+    sources: BTreeSet<PathBuf>,
+}
+
+#[derive(Default)]
+struct WatchRootRefresh {
+    reconcile: BTreeSet<PathBuf>,
+    database_roots: BTreeSet<PathBuf>,
+}
+
+/// Native backends can share one watch descriptor between aliases and nested
+/// recursive registrations. Removing either registration then removes the
+/// other's coverage too. Canonical targets must have disjoint recursive
+/// coverage, while their source paths retain the configured provenance.
+fn coalesce_native_watch_targets(
+    targets: BTreeMap<PathBuf, WatchRootTarget>,
+) -> BTreeMap<PathBuf, WatchRootTarget> {
+    let mut kept: BTreeMap<PathBuf, WatchRootTarget> = BTreeMap::new();
+    // Path ordering places every ancestor before its descendants.
+    for (path, target) in targets {
+        let covering = kept.iter_mut().find_map(|(ancestor, existing)| {
+            if existing.recursive && path.starts_with(ancestor) {
+                Some(&mut existing.sources)
+            } else {
+                None
+            }
+        });
+        if let Some(sources) = covering {
+            sources.extend(target.sources);
+        } else {
+            kept.insert(path, target);
+        }
+    }
+    kept
+}
+
+/// Native watches follow filesystem objects, not a permanently live pathname.
+/// A failed initial registration or a replaced root needs another registration
+/// and a census after it. Inspect only distinct roots, never their descendants;
+/// unchanged healthy registrations do not request a scan.
+fn refresh_watch_root_registrations<W: Watcher>(
+    watcher: &mut W,
+    roots: &[(ConnectorKind, ScanRoot)],
+    registered: &mut BTreeMap<PathBuf, WatchRootRegistration>,
+    progress: Option<&Arc<IndexingProgress>>,
+) -> Result<WatchRootRefresh> {
+    let mut observations = BTreeMap::new();
+    let mut source_bindings = BTreeMap::new();
+    let mut refreshed = WatchRootRefresh::default();
+    for (_, root) in roots {
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            observations.entry(root.path.clone())
+        {
+            if let Some(progress) = progress {
+                progress.check_stop()?;
+            }
+            let observed = fs::metadata(&root.path);
+            if let Some(progress) = progress {
+                progress.tick_activity();
+                progress.check_stop()?;
+            }
+            if let Ok(metadata) = &observed {
+                let resolved_path =
+                    dunce::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone());
+                if let Some(progress) = progress {
+                    progress.tick_activity();
+                }
+                source_bindings.insert(
+                    root.path.clone(),
+                    WatchSourceBinding {
+                        resolved_path,
+                        identity: WatchRootIdentity::from_metadata(metadata),
+                    },
+                );
+            }
+            if let Err(error) = &observed
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %root.path.display(), %error, "watch root is temporarily unavailable; retrying discovery");
+                refreshed.reconcile.insert(root.path.clone());
+            }
+            entry.insert(observed);
+        }
+    }
+
+    // A database watches its parent for WAL creation. Several connectors or
+    // provenances can share the same native path; install the strongest mode
+    // once and retain every source root for the subsequent ordinary census.
+    let mut targets: BTreeMap<PathBuf, WatchRootTarget> = BTreeMap::new();
+    for (kind, root) in roots {
+        // Missing roots stay in `roots` for the next metadata probe. Do not
+        // enroll them in an existing ancestor's coverage yet: their later
+        // appearance must request a census even if it produces no event.
+        let Some(Ok(metadata)) = observations.get(&root.path) else {
+            continue;
+        };
+        let database_file = is_database_watch_path(*kind, &root.path) && metadata.is_file();
+        let watch_path = if database_file {
+            refreshed.database_roots.insert(root.path.clone());
+            root.path.parent().unwrap_or(&root.path)
+        } else {
+            &root.path
+        };
+        let target = targets.entry(watch_path.to_path_buf()).or_default();
+        target.recursive |= !database_file;
+        target.sources.insert(root.path.clone());
+    }
+    let mut native_targets: BTreeMap<PathBuf, WatchRootTarget> = BTreeMap::new();
+    for (path, target) in targets {
+        if let Some(progress) = progress {
+            progress.check_stop()?;
+        }
+        let native_path = if let Some(binding) = source_bindings.get(&path) {
+            binding.resolved_path.clone()
+        } else {
+            let native_path = dunce::canonicalize(&path).unwrap_or(path);
+            if let Some(progress) = progress {
+                progress.tick_activity();
+            }
+            native_path
+        };
+        let native_target = native_targets.entry(native_path).or_default();
+        native_target.recursive |= target.recursive;
+        native_target.sources.extend(target.sources);
+    }
+    let targets = coalesce_native_watch_targets(native_targets);
+    let mut native_registration_changed = false;
+    let obsolete: Vec<_> = registered
+        .keys()
+        .filter(|path| !targets.contains_key(*path))
+        .cloned()
+        .collect();
+    for path in obsolete {
+        if let Some(progress) = progress {
+            progress.check_stop()?;
+        }
+        native_registration_changed = true;
+        let _ = watcher.unwatch(&path);
+        registered.remove(&path);
+        if let Some(progress) = progress {
+            progress.tick_activity();
+        }
+    }
+
+    for (path, WatchRootTarget { recursive, sources }) in targets {
+        if let Some(progress) = progress {
+            progress.check_stop()?;
+        }
+        let observed = observations.entry(path.clone()).or_insert_with(|| {
+            let observed = fs::metadata(&path);
+            if let Some(progress) = progress {
+                progress.tick_activity();
+            }
+            observed
+        });
+        let identity = match observed {
+            Ok(metadata) => WatchRootIdentity::from_metadata(metadata),
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    if registered.remove(&path).is_some() {
+                        native_registration_changed = true;
+                        let _ = watcher.unwatch(&path);
+                        if let Some(progress) = progress {
+                            progress.tick_activity();
+                        }
+                    }
+                } else {
+                    tracing::warn!(path = %path.display(), %error, "watch root is temporarily unavailable; retrying discovery");
+                    refreshed.reconcile.extend(sources);
+                }
+                continue;
+            }
+        };
+        let bindings: BTreeMap<_, _> = sources
+            .iter()
+            .filter_map(|source| {
+                source_bindings
+                    .get(source)
+                    .map(|binding| (source.clone(), binding.clone()))
+            })
+            .collect();
+        if let Some(registration) = registered.get_mut(&path)
+            && registration.identity == identity
+            && registration.recursive == recursive
+        {
+            // A new source or a retargeted alias can stay within an existing
+            // parent's native coverage. Its configured identity still needs
+            // a census; a symlink change outside that parent emits no event
+            // there. Source bindings ignore ordinary directory mtime changes.
+            for (source, binding) in &bindings {
+                if registration.sources.get(source) != Some(binding) {
+                    refreshed.reconcile.insert(source.clone());
+                }
+            }
+            registration.sources = bindings;
+            continue;
+        }
+        if registered.remove(&path).is_some() {
+            let _ = watcher.unwatch(&path);
+            if let Some(progress) = progress {
+                progress.tick_activity();
+                progress.check_stop()?;
+            }
+        }
+        let mode = if recursive {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        };
+        native_registration_changed = true;
+        match watcher.watch(&path, mode) {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "registered watch root; reconciling source snapshot");
+                registered.insert(
+                    path,
+                    WatchRootRegistration {
+                        identity,
+                        recursive,
+                        sources: bindings,
+                    },
+                );
+            }
+            Err(error) => {
+                // While registration remains unavailable, ordinary source
+                // receipts provide bounded fallback discovery at the existing
+                // watch cooldown. A warning alone would strand future writes.
+                tracing::warn!(path = %path.display(), %error, "failed to watch root; retrying registration and source discovery");
+            }
+        }
+        if let Some(progress) = progress {
+            progress.tick_activity();
+            progress.check_stop()?;
+        }
+        refreshed.reconcile.extend(sources);
+    }
+    if native_registration_changed && W::kind() == notify::WatcherKind::Fsevent {
+        // notify 8.2 restarts its entire FSEvents stream with SinceNow for
+        // every watch/unwatch attempt, even an unsuccessful one. Writes to
+        // other roots in that gap need an ordinary post-registration census.
+        // Unchanged registrations never trigger this reconciliation.
+        refreshed.reconcile.extend(source_bindings.into_keys());
+    }
+    Ok(refreshed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -32338,37 +32626,28 @@ where
     let notification_rescan = Arc::new(AtomicBool::new(false));
     let backlog_for_watcher = Arc::clone(&notification_backlog);
     let rescan_for_watcher = Arc::clone(&notification_rescan);
-    let _database_poller = database_root_poller(
-        &roots,
+    let wake_for_watcher = wake.clone();
+    let mut watcher = recommended_watcher(move |result| {
+        enqueue_watch_notification(
+            result,
+            &backlog_for_watcher,
+            &rescan_for_watcher,
+            &wake_for_watcher,
+        );
+    })?;
+
+    let mut registered_roots = BTreeMap::new();
+    let initial_roots =
+        refresh_watch_root_registrations(&mut watcher, &roots, &mut registered_roots, progress)?;
+    let mut polled_database_roots = initial_roots.database_roots;
+    let (mut database_poller, mut retry_database_registration) = database_root_poller(
+        &polled_database_roots,
         Duration::from_secs(watch_interval_secs.max(1)),
         Arc::clone(&notification_backlog),
         Arc::clone(&notification_rescan),
         wake.clone(),
     );
-
-    let mut watcher = recommended_watcher(move |result| {
-        enqueue_watch_notification(result, &backlog_for_watcher, &rescan_for_watcher, &wake);
-    })?;
-
-    // Watch all detected roots
-    for (kind, root) in &roots {
-        // An explicit database override can be a file. SQLite commits
-        // may touch only a sibling WAL, including creating it after startup.
-        // Watch the parent, but retain the database root for classification.
-        let (watch_path, mode) = if is_database_watch_root(*kind, root) {
-            (
-                root.path.parent().unwrap_or(&root.path),
-                RecursiveMode::NonRecursive,
-            )
-        } else {
-            (root.path.as_path(), RecursiveMode::Recursive)
-        };
-        if let Err(e) = watcher.watch(watch_path, mode) {
-            tracing::warn!("failed to watch {}: {}", watch_path.display(), e);
-        } else {
-            tracing::info!("watching {}", watch_path.display());
-        }
-    }
+    let mut last_registration_check = Instant::now();
 
     let debounce = Duration::from_secs(2);
     let max_wait = Duration::from_secs(5);
@@ -32411,6 +32690,42 @@ where
         if let Some(progress) = progress {
             progress.check_stop()?;
         }
+        if last_registration_check.elapsed() >= min_scan_interval {
+            let refreshed = refresh_watch_root_registrations(
+                &mut watcher,
+                &roots,
+                &mut registered_roots,
+                progress,
+            )?;
+            if refreshed.database_roots != polled_database_roots
+                || retry_database_registration
+                || !refreshed.reconcile.is_disjoint(&refreshed.database_roots)
+            {
+                // A newly created database may share an already-watched
+                // parent. Its native events alone do not cover macOS writes
+                // through a long-lived WAL descriptor; enroll it in polling
+                // even when no native parent registration needed replacement.
+                drop(database_poller.take());
+                polled_database_roots = refreshed.database_roots;
+                (database_poller, retry_database_registration) = database_root_poller(
+                    &polled_database_roots,
+                    min_scan_interval,
+                    Arc::clone(&notification_backlog),
+                    Arc::clone(&notification_rescan),
+                    wake.clone(),
+                );
+            }
+            last_registration_check = Instant::now();
+            let recovered = refreshed.reconcile;
+            if !recovered.is_empty() {
+                if !pending_rescan && pending.paths.is_empty() {
+                    first_event = Some(Instant::now());
+                }
+                if !pending_rescan && !pending.extend(recovered) {
+                    pending_rescan = true;
+                }
+            }
+        }
         // How much cooldown remains before we may fire the next callback.
         // Using this as recv_timeout lets us keep accumulating events
         // instead of blocking with thread::sleep (which would drop events
@@ -32419,7 +32734,11 @@ where
 
         // Calculate timeout: use stale check interval when idle, debounce when active
         let timeout = if !pending_rescan && pending.paths.is_empty() {
+            // Wake for root registration only. Healthy registrations do not
+            // create scan work, and an active batch retains its existing
+            // debounce/cooldown behavior.
             stale_check_interval
+                .min(min_scan_interval.saturating_sub(last_registration_check.elapsed()))
         } else {
             let now = Instant::now();
             let elapsed = now.duration_since(first_event.unwrap_or(now));
@@ -32563,6 +32882,452 @@ where
     Ok(())
 }
 
+#[cfg(all(test, unix))]
+mod watch_registration_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
+
+    fn wait_for_native_write(events: &Receiver<notify::Result<notify::Event>>, path: &Path) {
+        let expected = dunce::canonicalize(path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("native write notification must arrive")
+                .expect("native watcher must remain available");
+            if watch_event_should_trigger_reindex(&event)
+                && event.paths.iter().any(|observed| observed == &expected)
+            {
+                return;
+            }
+        }
+    }
+
+    struct NativeWatch {
+        _temp: TempDir,
+        root: PathBuf,
+        observed: Receiver<Option<String>>,
+        progress: Arc<IndexingProgress>,
+        worker: Option<JoinHandle<Result<()>>>,
+    }
+
+    impl NativeWatch {
+        fn start(root_exists: bool) -> Self {
+            let temp = TempDir::new().unwrap();
+            let root = temp.path().join("sessions");
+            if root_exists {
+                fs::create_dir(&root).unwrap();
+                fs::write(root.join("rollout.jsonl"), "baseline").unwrap();
+            }
+            let progress = Arc::new(IndexingProgress::default());
+            let worker_progress = Arc::clone(&progress);
+            let worker_root = root.clone();
+            let (observed_tx, observed) = crossbeam_channel::unbounded();
+            let worker = thread::spawn(move || {
+                watch_sources(
+                    None,
+                    vec![(ConnectorKind::Codex, ScanRoot::local(worker_root.clone()))],
+                    None,
+                    Arc::new(StaleDetector::new(StaleConfig {
+                        action: StaleAction::None,
+                        ..StaleConfig::default()
+                    })),
+                    Some(&worker_progress),
+                    1,
+                    BTreeSet::new(),
+                    move |paths, roots, force_full| {
+                        assert!(
+                            !force_full,
+                            "registration recovery is an ordinary source census"
+                        );
+                        assert_eq!(roots.len(), 1);
+                        let native_root = dunce::canonicalize(&worker_root).ok();
+                        assert!(paths.iter().any(|path| {
+                            path.starts_with(&worker_root)
+                                || native_root
+                                    .as_ref()
+                                    .is_some_and(|root| path.starts_with(root))
+                        }));
+                        observed_tx
+                            .send(fs::read_to_string(worker_root.join("rollout.jsonl")).ok())?;
+                        Ok(BTreeSet::new())
+                    },
+                )
+            });
+            Self {
+                _temp: temp,
+                root,
+                observed,
+                progress,
+                worker: Some(worker),
+            }
+        }
+
+        fn wait_for(&self, content: Option<&str>) {
+            let deadline = Instant::now() + Duration::from_secs(12);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let observed = self
+                    .observed
+                    .recv_timeout(remaining)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "native watch did not revisit {content:?} after root recovery: {error}"
+                        )
+                    });
+                if observed.as_deref() == content {
+                    return;
+                }
+            }
+        }
+    }
+
+    impl Drop for NativeWatch {
+        fn drop(&mut self) {
+            self.progress.request_stop();
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    #[test]
+    fn gh538_native_watch_retries_failed_root_registration() {
+        let watch = NativeWatch::start(false);
+        // The initial registration fails on a real absent directory. Wait for
+        // the initial census to finish before creating it; no existing parent
+        // watch or later operator command can deliver this change for us.
+        watch.wait_for(None);
+        fs::create_dir(&watch.root).unwrap();
+        fs::write(watch.root.join("rollout.jsonl"), "first arrival").unwrap();
+        watch.wait_for(Some("first arrival"));
+        fs::write(watch.root.join("rollout.jsonl"), "successive append").unwrap();
+        watch.wait_for(Some("successive append"));
+    }
+
+    #[test]
+    fn gh538_native_watch_rearms_replaced_root() {
+        let watch = NativeWatch::start(true);
+        watch.wait_for(Some("baseline"));
+        // Preserve the old directory and its source. Replacing a watched
+        // pathname gives the new directory a different inode; the old native
+        // registration alone cannot observe writes to that replacement.
+        fs::rename(&watch.root, watch.root.with_file_name("preserved-sessions")).unwrap();
+        fs::create_dir(&watch.root).unwrap();
+        fs::write(watch.root.join("rollout.jsonl"), "replacement").unwrap();
+        watch.wait_for(Some("replacement"));
+        fs::write(watch.root.join("rollout.jsonl"), "replacement append").unwrap();
+        watch.wait_for(Some("replacement append"));
+        assert_eq!(
+            fs::read_to_string(
+                watch
+                    .root
+                    .with_file_name("preserved-sessions")
+                    .join("rollout.jsonl")
+            )
+            .unwrap(),
+            "baseline"
+        );
+    }
+
+    #[test]
+    fn gh538_healthy_watch_registration_does_not_schedule_periodic_scans() {
+        let watch = NativeWatch::start(true);
+        watch.wait_for(Some("baseline"));
+        assert!(
+            watch.observed.recv_timeout(Duration::from_secs(3)).is_err(),
+            "healthy root checks must not manufacture indexing work"
+        );
+    }
+
+    #[test]
+    fn gh538_native_watch_retargets_alias_without_losing_shared_root() {
+        let temp = TempDir::new().unwrap();
+        let original = temp.path().join("original");
+        let replacement = temp.path().join("new-target");
+        let alias = temp.path().join("alias");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        symlink(&original, &alias).unwrap();
+        let roots = vec![
+            (ConnectorKind::Codex, ScanRoot::local(original.clone())),
+            (ConnectorKind::Codex, ScanRoot::local(alias.clone())),
+        ];
+        let (events_tx, events) = crossbeam_channel::unbounded();
+        let mut watcher = recommended_watcher(move |event| {
+            let _ = events_tx.send(event);
+        })
+        .unwrap();
+        let mut registered = BTreeMap::new();
+        refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert_eq!(registered.len(), 1, "aliases must share one native watch");
+        let before = original.join("before.jsonl");
+        fs::write(&before, "original target").unwrap();
+        wait_for_native_write(&events, &before);
+
+        let link = temp.path().join("replacement-link");
+        symlink(&replacement, &link).unwrap();
+        fs::rename(link, &alias).unwrap();
+        let refreshed =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        let expected = if notify::RecommendedWatcher::kind() == notify::WatcherKind::Fsevent {
+            roots.iter().map(|(_, root)| root.path.clone()).collect()
+        } else {
+            BTreeSet::from([alias])
+        };
+        assert_eq!(refreshed.reconcile, expected);
+        assert_eq!(registered.len(), 2);
+        let moved = replacement.join("rearmed.jsonl");
+        fs::write(&moved, "retargeted alias").unwrap();
+        wait_for_native_write(&events, &moved);
+
+        // notify's inotify backend shares descriptors by inode. Unwatching
+        // a separately registered alias would also disable this unchanged
+        // root, even though its metadata still matched the registration.
+        let kept = original.join("kept-after.jsonl");
+        fs::write(&kept, "new conversation in unchanged root").unwrap();
+        wait_for_native_write(&events, &kept);
+        fs::write(&before, "successive write in unchanged root").unwrap();
+        wait_for_native_write(&events, &before);
+    }
+
+    #[test]
+    fn gh538_native_watch_coalesces_nested_alias_coverage() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("sessions");
+        let child = parent.join("project");
+        let arriving = parent.join("arriving");
+        let replacement = temp.path().join("new-target");
+        let alias = temp.path().join("child-alias");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        symlink(&child, &alias).unwrap();
+        let roots = vec![
+            (ConnectorKind::Codex, ScanRoot::local(parent.clone())),
+            (ConnectorKind::Devin, ScanRoot::local(child.clone())),
+            (ConnectorKind::Shelley, ScanRoot::local(arriving.clone())),
+            (ConnectorKind::Codex, ScanRoot::local(alias.clone())),
+        ];
+        let (events_tx, events) = crossbeam_channel::unbounded();
+        let mut watcher = recommended_watcher(move |event| {
+            let _ = events_tx.send(event);
+        })
+        .unwrap();
+        let mut registered = BTreeMap::new();
+        let initial =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert_eq!(
+            registered.len(),
+            1,
+            "recursive native coverage must not overlap"
+        );
+        assert_eq!(
+            initial.reconcile,
+            BTreeSet::from([parent, child.clone(), alias.clone()])
+        );
+        let existing = child.join("existing.jsonl");
+        fs::write(&existing, "nested baseline").unwrap();
+        wait_for_native_write(&events, &existing);
+
+        // An already-watched ancestor must not count an absent configured
+        // child as enrolled: appearance still needs its own first census.
+        fs::create_dir(&arriving).unwrap();
+        assert_eq!(
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None)
+                .unwrap()
+                .reconcile,
+            BTreeSet::from([arriving])
+        );
+        let link = temp.path().join("replacement-link");
+        symlink(&replacement, &link).unwrap();
+        fs::rename(link, &alias).unwrap();
+        let refreshed =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        let expected = if notify::RecommendedWatcher::kind() == notify::WatcherKind::Fsevent {
+            roots.iter().map(|(_, root)| root.path.clone()).collect()
+        } else {
+            BTreeSet::from([alias])
+        };
+        assert_eq!(refreshed.reconcile, expected);
+        assert_eq!(registered.len(), 2);
+        let moved = replacement.join("rearmed.jsonl");
+        fs::write(&moved, "new alias target").unwrap();
+        wait_for_native_write(&events, &moved);
+        fs::write(&existing, "append under retained recursive ancestor").unwrap();
+        wait_for_native_write(&events, &existing);
+        assert!(
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None)
+                .unwrap()
+                .reconcile
+                .is_empty(),
+            "healthy coverage must not schedule another census"
+        );
+    }
+
+    #[test]
+    fn gh538_native_watch_retargets_alias_within_registered_ancestor() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("sessions");
+        let first = parent.join("first-project");
+        let second = parent.join("second-project");
+        let alias = temp.path().join("external-alias");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        symlink(&first, &alias).unwrap();
+        let roots = vec![
+            (ConnectorKind::Codex, ScanRoot::local(parent)),
+            (ConnectorKind::Devin, ScanRoot::local(alias.clone())),
+        ];
+        let (events_tx, events) = crossbeam_channel::unbounded();
+        let mut watcher = recommended_watcher(move |event| {
+            let _ = events_tx.send(event);
+        })
+        .unwrap();
+        let mut registered = BTreeMap::new();
+        refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert_eq!(registered.len(), 1);
+        assert!(
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None)
+                .unwrap()
+                .reconcile
+                .is_empty()
+        );
+
+        // Both physical targets were already covered. The link changes
+        // outside the native parent, so no event there can select this
+        // configured source's new snapshot for its distinct connector.
+        let link = temp.path().join("replacement-link");
+        symlink(&second, &link).unwrap();
+        fs::rename(link, &alias).unwrap();
+        assert_eq!(
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None)
+                .unwrap()
+                .reconcile,
+            BTreeSet::from([alias])
+        );
+        assert_eq!(registered.len(), 1, "native coverage remains unchanged");
+        for (directory, text) in [(first, "old target"), (second, "new target")] {
+            let path = directory.join("rollout.jsonl");
+            fs::write(&path, text).unwrap();
+            wait_for_native_write(&events, &path);
+        }
+    }
+
+    #[test]
+    fn gh538_registration_coalesces_paths_without_using_directory_mtime() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("sessions.db");
+        fs::write(&database, b"SQLite format 3\0").unwrap();
+        let roots = vec![
+            (
+                ConnectorKind::Codex,
+                ScanRoot::local(temp.path().to_path_buf()),
+            ),
+            (ConnectorKind::Devin, ScanRoot::local(database.clone())),
+            (ConnectorKind::Shelley, ScanRoot::local(database.clone())),
+        ];
+        let mut watcher = recommended_watcher(|_| {}).unwrap();
+        let mut registered = BTreeMap::new();
+        let pending =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert_eq!(pending.database_roots, BTreeSet::from([database.clone()]));
+        assert_eq!(
+            pending.reconcile,
+            BTreeSet::from([temp.path().to_path_buf(), database])
+        );
+        assert_eq!(
+            registered.len(),
+            1,
+            "one native registration per shared path"
+        );
+        assert!(
+            registered[&dunce::canonicalize(temp.path()).unwrap()].recursive,
+            "preserve the strongest watch mode"
+        );
+
+        // A directory's mtime changes during normal writes. That is an event,
+        // not a replaced native watch, and must not force another whole-root
+        // census after the corresponding event already completed.
+        File::open(temp.path())
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1_600_000_000))
+            .unwrap();
+        assert!(
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None)
+                .unwrap()
+                .reconcile
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn gh538_late_database_under_registered_parent_joins_poll_discovery() {
+        let temp = TempDir::new().unwrap();
+        let existing = temp.path().join("existing.db");
+        let arriving = temp.path().join("arriving.db");
+        fs::write(&existing, b"SQLite format 3\0").unwrap();
+        let roots = vec![
+            (ConnectorKind::Devin, ScanRoot::local(existing.clone())),
+            (ConnectorKind::Devin, ScanRoot::local(arriving.clone())),
+        ];
+        let mut watcher = recommended_watcher(|_| {}).unwrap();
+        let mut registered = BTreeMap::new();
+        let before =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert_eq!(before.database_roots, BTreeSet::from([existing.clone()]));
+
+        fs::write(&arriving, b"SQLite format 3\0").unwrap();
+        let after =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert_eq!(
+            after.reconcile,
+            BTreeSet::from([arriving.clone()]),
+            "a new source needs a census even when its native parent is already registered"
+        );
+        assert_eq!(
+            after.database_roots,
+            BTreeSet::from([existing, arriving.clone()])
+        );
+        assert_ne!(before.database_roots, after.database_roots);
+
+        let backlog = Arc::new(Mutex::new(WatchEventBacklog::default()));
+        let rescan = Arc::new(AtomicBool::new(false));
+        let (wake, notifications) = bounded(1);
+        let (_poller, retry) = database_root_poller(
+            &after.database_roots,
+            Duration::from_millis(100),
+            Arc::clone(&backlog),
+            Arc::clone(&rescan),
+            wake,
+        );
+        assert!(_poller.is_some() && !retry);
+        let wal = database_sidecar_paths(&arriving)[0].clone();
+        let mut held_writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal)
+            .unwrap();
+        held_writer
+            .write_all(b"committed while the descriptor stays open")
+            .unwrap();
+        let mut pending = WatchEventBacklog::default();
+        let mut pending_rescan = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pending.paths.contains(&wal) {
+            notifications
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            collect_watch_notifications(&backlog, &rescan, &mut pending, &mut pending_rescan);
+            assert!(
+                !pending_rescan,
+                "a WAL poll must remain scoped to its database"
+            );
+        }
+        drop(held_writer);
+    }
+}
+
 #[cfg(test)]
 fn reset_storage(storage: &FrankenStorage) -> Result<()> {
     // Wrap the canonical-table reset in a transaction so partial clears roll back.
@@ -32659,6 +33424,10 @@ fn reindex_paths_with_semantic_delta(
         .is_some_and(|paths| !paths.is_empty());
     if explicit {
         warn_unclaimed_explicit_watch_once_paths(&paths, roots);
+    }
+    let mut paths = paths;
+    if !explicit {
+        promote_missing_watch_replay_paths(&mut paths, roots, storage, opts.progress.as_ref())?;
     }
     let triggers = classify_paths(paths, roots, explicit);
     if triggers.is_empty() {
@@ -32883,6 +33652,30 @@ fn reindex_paths_with_semantic_delta(
         }
         active_sources_skipped =
             active_sources_skipped.saturating_add(source_ledger.active_sources_skipped);
+        // A canonical identity can outlive a source's last emitted packet.
+        // Both empty and nonempty recovery scans need source-level evidence;
+        // a sibling packet alone cannot certify an existing zero-output file.
+        // Completed-source evidence becomes publication proof only after all
+        // admitted canonical/lexical chunks succeed below.
+        let recovery_source_coverage = (source_scoped && replay_canonical && !explicit_watch_once)
+            .then(|| WatchRecoverySourceCoverage::capture(&source_ledger, opts.progress.as_deref()))
+            .transpose()?;
+        let mut unproven_scanned_source = false;
+        if let Some(coverage) = &recovery_source_coverage {
+            for entry in &convs.entries {
+                if let Some(progress) = &opts.progress {
+                    progress.check_stop()?;
+                }
+                let path = crate::normalize_path_identity(&entry.key.source_path);
+                if let Some(progress) = &opts.progress {
+                    progress.tick_activity();
+                }
+                if !coverage.contains_normalized(&path) {
+                    unproven_scanned_source = true;
+                    break;
+                }
+            }
+        }
         ingest_diagnostics
             .observe_reused_sources(std::mem::take(&mut source_ledger.reused_sources));
         let scan_ms = scan_start.elapsed().as_millis() as u64;
@@ -32926,19 +33719,22 @@ fn reindex_paths_with_semantic_delta(
             || preparse_active_source_skipped
             || active_sources_skipped > 0
             || scan_error.is_some()
-            || source_ledger.unstable_sources;
+            || source_ledger.unstable_sources
+            || unproven_scanned_source;
         // A reused source is already certified by its unchanged publication
         // receipt. Preparse may defer its optional mirror capture while an
         // unchanged writer still holds it open; that must not strand replay
         // debt belonging to another, successfully recovered source.
-        let recovery_scan_complete = if source_scoped {
+        let recovery_scan_complete = (if source_scoped {
             !preserve_watch_watermark
                 && active_sources_skipped == 0
                 && scan_error.is_none()
                 && !source_ledger.unstable_sources
+                && !unproven_scanned_source
         } else {
             !preserve_this_watch_watermark
-        };
+        }) && (!replay_canonical
+            || (!skip_subagents_active() && WorkspaceExclusions::from_env()?.patterns.is_empty()));
         if source_scoped && (scan_error.is_some() || source_ledger.unstable_sources) {
             let storage = storage
                 .lock()
@@ -32981,15 +33777,50 @@ fn reindex_paths_with_semantic_delta(
             tracing::info!(?kind, conversations = conv_count, since_ts, "watch_scan");
         }
 
-        // Skip empty incremental scans entirely: an empty batch has nothing
-        // to ingest, must not produce a Tantivy segment, must not bump
-        // `last_indexed_at`, and must not trigger downstream optimize/merge.
-        // See issue #194.
+        // Root replay debt can outlive its raw transcript. Its canonical rows
+        // are still authoritative, even when discovery no longer emits a
+        // packet carrying their IDs. Recover those rows before a clean census
+        // may discharge the old obligation, including a nonempty sibling scan.
+        // Waiting for a complete census avoids repeatedly replaying absent
+        // history while an active or excluded sibling keeps the root open.
+        let absent_source_recovery = if source_scoped
+            && replay_canonical
+            && recovery_scan_complete
+            && nomem_backoff_held == 0
+            && !explicit_watch_once
+            && !persist::defer_lexical_updates_enabled()
+        {
+            let storage = storage
+                .lock()
+                .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+            recover_absent_watch_source_publications(
+                opts,
+                kind,
+                &root,
+                &pending_lexical_debt,
+                recovery_source_coverage.as_ref(),
+                &storage,
+                t_index,
+                index_path,
+            )?
+        } else {
+            WatchAbsentSourceRecovery::default()
+        };
+        // An empty canonical identity or an existing source without completion
+        // evidence cannot certify publication. Successful siblings must not
+        // advance this incomplete root's watermarks or completion timestamp.
+        let preserve_this_watch_watermark =
+            preserve_this_watch_watermark || absent_source_recovery.unresolved_source;
+
+        // An ordinary empty scan has nothing to ingest or publish (#194).
+        // The recovery above can nevertheless have published canonical rows
+        // whose raw source disappeared; only that actual work counts here.
         if conv_count == 0 {
-            if nomem_backoff_held > 0 {
+            if nomem_backoff_held > 0 || absent_source_recovery.retry_unproven_source {
                 // Holding the watermark is not enough: no source mutation
-                // need follow a transient OOM. Keep the cooldown-driven retry
-                // scheduled while the existing per-conversation backoff runs.
+                // need follow a transient OOM or omitted source completion.
+                // Keep the cooldown-driven retry for existing canonical work;
+                // an empty canonical identity alone does not request a loop.
                 outcome.retry_sources.insert(root.path.clone());
             }
             if scan_error.is_some() && !source_scoped {
@@ -33015,7 +33846,26 @@ fn reindex_paths_with_semantic_delta(
                 }) {
                     clear_watch_lexical_replay_debt(&storage, debt)?;
                 }
+                for index in &absent_source_recovery.completed_debts {
+                    clear_watch_lexical_replay_debt(&storage, &pending_lexical_debt[*index])?;
+                }
+                if absent_source_recovery.published_conversations > 0
+                    && watch_lexical_replay_debt_for_root(&storage, kind, &root)?.is_empty()
+                {
+                    persist::with_ephemeral_writer(
+                        &storage,
+                        false,
+                        "recording recovered watch publication progress",
+                        |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
+                    )?;
+                }
             }
+            outcome.indexed = outcome
+                .indexed
+                .saturating_add(absent_source_recovery.published_conversations);
+            outcome.published_conversations = outcome
+                .published_conversations
+                .saturating_add(absent_source_recovery.published_conversations);
             continue;
         }
 
@@ -33028,7 +33878,7 @@ fn reindex_paths_with_semantic_delta(
         let mut quarantined_conversations = 0usize;
         let mut deferred_conversations = nomem_backoff_held;
         let mut lexical_replay_deferred = false;
-        let mut published_conversations = 0usize;
+        let mut published_conversations = absent_source_recovery.published_conversations;
         let mut remaining_conversations = conv_count;
         let current_debt = WatchLexicalReplayDebt::for_root(kind, &root);
         {
@@ -33225,6 +34075,7 @@ fn reindex_paths_with_semantic_delta(
                     let publication_complete = !lexical_replay_deferred
                         && quarantined_conversations == 0
                         && deferred_conversations == 0
+                        && !absent_source_recovery.unresolved_source
                         && (source_scoped || scan_error.is_none())
                         && (!replay_canonical || recovery_scan_complete);
                     let completed_debts: Vec<_> = if remaining_conversations == 0
@@ -33252,7 +34103,13 @@ fn reindex_paths_with_semantic_delta(
                         &storage,
                         &chunk,
                         &completed_debts,
-                        remaining_conversations == 0 && !publication_complete,
+                        // The canonical census can retain this known unresolved
+                        // source even when every healthy sibling reuses its
+                        // receipt. Do not force a sibling's history through
+                        // publication again merely to keep that debt alive.
+                        remaining_conversations == 0
+                            && !publication_complete
+                            && !absent_source_recovery.unresolved_source,
                     )?;
                 }
             }
@@ -33358,11 +34215,17 @@ fn reindex_paths_with_semantic_delta(
         // follows the old return shape (scanned conversations, not newly
         // inserted rows) while including quarantined single-conversation OOMs
         // as forward progress so watch mode does not wedge on a poison file.
-        outcome.indexed = outcome.indexed.saturating_add(processed_conversations);
+        outcome.indexed = outcome
+            .indexed
+            .saturating_add(processed_conversations)
+            .saturating_add(absent_source_recovery.published_conversations);
         outcome.published_conversations = outcome
             .published_conversations
             .saturating_add(published_conversations);
-        if lexical_replay_deferred || deferred_conversations > 0 {
+        if lexical_replay_deferred
+            || deferred_conversations > 0
+            || (absent_source_recovery.retry_unproven_source && quarantined_conversations == 0)
+        {
             // An Ok callback consumes its triggering event. Retained durable
             // debt must also remain in the live pending queue, or a transient
             // publication/NoMem failure waits forever for an unrelated event.
@@ -33596,6 +34459,424 @@ fn watch_lexical_replay_debt_for_root(
         }
     }
     Ok(pending)
+}
+
+/// A failed callback retains its notification paths. If a transcript is moved
+/// before retry, classification can no longer stat that leaf to select its
+/// owning root. Durable debt still authorizes recovery under an extant current
+/// root; a missing path alone does not authorize a scan or resurrect a source.
+fn promote_missing_watch_replay_paths(
+    paths: &mut Vec<PathBuf>,
+    roots: &[(ConnectorKind, ScanRoot)],
+    storage: &Mutex<FrankenStorage>,
+    progress: Option<&Arc<IndexingProgress>>,
+) -> Result<()> {
+    let mut missing = BTreeSet::new();
+    for path in paths.iter() {
+        if let Some(progress) = progress {
+            progress.check_stop()?;
+        }
+        let metadata = fs::metadata(path);
+        if let Some(progress) = progress {
+            progress.tick_activity();
+        }
+        if metadata.is_err_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            )
+        }) {
+            missing.insert(crate::normalize_path_identity(path));
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let debts = {
+        let storage = storage
+            .lock()
+            .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+        load_watch_lexical_replay_debt(&storage)?
+    };
+    if debts.is_empty() {
+        return Ok(());
+    }
+    let debts: Vec<_> = debts
+        .into_iter()
+        .map(|debt| {
+            let path = crate::normalize_path_identity(&debt.path);
+            (debt.connector, debt.source_id, path)
+        })
+        .collect();
+    let roots: Vec<_> = roots
+        .iter()
+        .map(|(kind, root)| (*kind, root, crate::normalize_path_identity(&root.path)))
+        .collect();
+    let mut extant_roots = BTreeMap::new();
+    let mut promoted = BTreeSet::new();
+    for missing_path in missing {
+        if let Some(progress) = progress {
+            progress.check_stop()?;
+        }
+        let mut selected: Vec<(ConnectorKind, &ScanRoot, &PathBuf)> = Vec::new();
+        for (kind, root, root_path) in &roots {
+            if !missing_path.starts_with(root_path)
+                || !debts.iter().any(|(debt_kind, source_id, debt_path)| {
+                    debt_kind == kind
+                        && source_id == &root.origin.source_id
+                        && (missing_path.starts_with(debt_path)
+                            || debt_path.starts_with(&missing_path))
+                })
+            {
+                continue;
+            }
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                extant_roots.entry(root.path.clone())
+            {
+                if let Some(progress) = progress {
+                    progress.check_stop()?;
+                }
+                let metadata = fs::metadata(&root.path);
+                if let Some(progress) = progress {
+                    progress.tick_activity();
+                }
+                let is_directory = match metadata {
+                    Ok(metadata) => metadata.is_dir(),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        false
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("checking watch replay root {}", root.path.display())
+                        });
+                    }
+                };
+                entry.insert(is_directory);
+            }
+            if !extant_roots[&root.path] {
+                continue;
+            }
+            if let Some(previous) = selected
+                .iter_mut()
+                .find(|(selected_kind, selected_root, _)| {
+                    *selected_kind == *kind && selected_root.origin == root.origin
+                })
+            {
+                if root_path.components().count() > previous.2.components().count() {
+                    *previous = (*kind, *root, root_path);
+                }
+            } else {
+                selected.push((*kind, *root, root_path));
+            }
+        }
+        promoted.extend(selected.into_iter().map(|(_, root, _)| root.path.clone()));
+    }
+    paths.extend(promoted);
+    Ok(())
+}
+
+#[derive(Default)]
+struct WatchAbsentSourceRecovery {
+    published_conversations: usize,
+    completed_debts: Vec<usize>,
+    unresolved_source: bool,
+    retry_unproven_source: bool,
+}
+
+/// Evidence that an existing source was either reused from a publication
+/// receipt or delivered a stable, complete stream in the current scan. The
+/// latter is conditional on the caller committing every admitted batch.
+struct WatchRecoverySourceCoverage {
+    fingerprints: Vec<[u8; 32]>,
+}
+
+impl WatchRecoverySourceCoverage {
+    fn capture(
+        ledger: &watch_source_ledger::WatchSourceLedger,
+        progress: Option<&IndexingProgress>,
+    ) -> Result<Self> {
+        // Each bounded ledger can retain at most this many reused sources and
+        // completions. Fixed-size native-path digests avoid duplicating long
+        // normalized paths: the additional payload is at most four MiB.
+        // Any evidence omitted by a budget remains conservatively uncovered.
+        const MAX_FINGERPRINTS: usize = 2 * watch_source_cache::MAX_WATCH_SOURCE_LEDGER_ENTRIES;
+        let paths = ledger
+            .completed_source_paths()
+            .chain(ledger.reused_sources.iter())
+            .take(MAX_FINGERPRINTS);
+        let mut fingerprints = Vec::with_capacity(paths.size_hint().1.unwrap_or(MAX_FINGERPRINTS));
+        for path in paths {
+            if let Some(progress) = progress {
+                progress.check_stop()?;
+            }
+            let normalized = crate::normalize_path_identity(path);
+            fingerprints.push(Self::fingerprint(&normalized));
+            if let Some(progress) = progress {
+                progress.tick_activity();
+            }
+        }
+        fingerprints.sort_unstable();
+        fingerprints.dedup();
+        if let Some(progress) = progress {
+            progress.check_stop()?;
+        }
+        Ok(Self { fingerprints })
+    }
+
+    fn fingerprint(path: &Path) -> [u8; 32] {
+        // Keep non-Unicode paths distinct; these fingerprints never persist
+        // across platforms and use no lossy path-to-string conversion.
+        *blake3::hash(path.as_os_str().as_encoded_bytes()).as_bytes()
+    }
+
+    fn contains_normalized(&self, path: &Path) -> bool {
+        self.fingerprints
+            .binary_search(&Self::fingerprint(path))
+            .is_ok()
+    }
+}
+
+/// A successful raw-source census cannot prove that every older canonical
+/// mutation has published: its transcript may have been rotated away after
+/// the canonical transaction. Visit only this connector/source's identities in
+/// bounded pages and reconcile absent sources from the canonical archive.
+/// Existing files remain the ordinary source-ingest path's responsibility.
+/// An older ancestor obligation permits replay only within the current root;
+/// that narrower census never certifies the whole ancestor debt as complete.
+///
+/// Every census supplies bounded source coverage. An existing source without
+/// a reused publication receipt or complete delivery cannot be certified by a
+/// successful sibling. Codex and Claude omit completion for zero-output files,
+/// so those identities retain debt until a later scan supplies the evidence.
+/// A partial evidence cache can withhold clearance, never certify omitted work.
+#[allow(clippy::too_many_arguments)]
+fn recover_absent_watch_source_publications(
+    opts: &IndexOptions,
+    kind: ConnectorKind,
+    root: &ScanRoot,
+    debts: &[WatchLexicalReplayDebt],
+    source_coverage: Option<&WatchRecoverySourceCoverage>,
+    storage: &FrankenStorage,
+    t_index: &Mutex<Option<TantivyIndex>>,
+    index_path: &Path,
+) -> Result<WatchAbsentSourceRecovery> {
+    let selected_path = crate::normalize_path_identity(&root.path);
+    // (input index, effective scope, saw absent source, existing coverage,
+    //  whole debt is inside this current root and may be discharged)
+    let mut scopes: Vec<_> = debts
+        .iter()
+        .enumerate()
+        .filter(|(_, debt)| {
+            !debt.discovery_only
+                && debt.connector == kind
+                && debt.source_id == root.origin.source_id
+        })
+        .filter_map(|(index, debt)| {
+            let path = crate::normalize_path_identity(&debt.path);
+            if path.starts_with(&selected_path) {
+                Some((index, path, false, true, true))
+            } else if selected_path.starts_with(&path) {
+                // A narrowed configuration may retain older parent debt.
+                // Recover only the current child's canonical rows; its census
+                // cannot certify or authorize replay of any former siblings.
+                Some((index, selected_path.clone(), false, true, false))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if scopes.is_empty() {
+        return Ok(WatchAbsentSourceRecovery::default());
+    }
+    let provider = crate::connectors::archive_provider_slug(kind.slug());
+    let legacy_provider = if kind == ConnectorKind::Claude {
+        "claude-code"
+    } else {
+        provider
+    };
+    let page_rows = watch_ingest_chunk_size().clamp(1, 256);
+    let mut after = 0_i64;
+    let mut writer_reset = false;
+    let mut recovered = WatchAbsentSourceRecovery::default();
+    let mut index = t_index
+        .lock()
+        .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
+    loop {
+        if let Some(progress) = &opts.progress {
+            progress.check_stop()?;
+        }
+        // Compare native path identities in Rust, including legacy spellings
+        // through a symlinked existing parent of a now-missing transcript.
+        // SQL still scopes the scan to the actual canonical source/provider;
+        // unrelated providers or source identities cannot be published here.
+        let page: Vec<(i64, String)> = storage.raw().query_map_collect(
+            "SELECT c.id, c.source_path FROM conversations c \
+             JOIN agents a ON a.id = c.agent_id \
+             WHERE c.source_id = ?1 AND c.id > ?2 \
+               AND (a.slug = ?3 OR a.slug = ?4 OR a.slug = ?5) \
+             ORDER BY c.id LIMIT ?6",
+            &[
+                ParamValue::from(root.origin.source_id.as_str()),
+                ParamValue::from(after),
+                ParamValue::from(kind.slug()),
+                ParamValue::from(provider),
+                ParamValue::from(legacy_provider),
+                ParamValue::from(i64::try_from(page_rows)?),
+            ],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )?;
+        if let Some(progress) = &opts.progress {
+            progress.tick_activity();
+            progress.check_stop()?;
+        }
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len();
+        let mut page_replayed = 0_usize;
+        for (conversation_id, source_path) in page {
+            anyhow::ensure!(
+                conversation_id > after,
+                "watch recovery cursor did not advance"
+            );
+            after = conversation_id;
+            if let Some(progress) = &opts.progress {
+                progress.check_stop()?;
+            }
+            let path = crate::normalize_path_identity(Path::new(&source_path));
+            if !scopes
+                .iter()
+                .any(|(_, scope, _, _, _)| path.starts_with(scope))
+            {
+                continue;
+            }
+            let missing = match fs::metadata(&path) {
+                Ok(_) => false,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    true
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("checking canonical watch source {}", path.display())
+                    });
+                }
+            };
+            if let Some(progress) = &opts.progress {
+                progress.tick_activity();
+            }
+            let source_is_covered = missing
+                || source_coverage.is_some_and(|coverage| coverage.contains_normalized(&path));
+            if !source_is_covered {
+                recovered.unresolved_source = true;
+                tracing::debug!(
+                    conversation_id,
+                    source_path = %path.display(),
+                    "watch source has no complete publication evidence; retaining replay debt"
+                );
+            }
+            for (_, scope, saw_absent, existing_covered, _) in &mut scopes {
+                if path.starts_with(scope) {
+                    if missing {
+                        *saw_absent = true;
+                    } else if !source_is_covered {
+                        *existing_covered = false;
+                    }
+                }
+            }
+            if !missing && source_is_covered {
+                continue;
+            }
+            let messages: Vec<i64> = storage.raw().query_map_collect(
+                "SELECT id FROM messages WHERE conversation_id = ?1 LIMIT 1",
+                &[ParamValue::from(conversation_id)],
+                |row| row.get_typed(0),
+            )?;
+            if messages.is_empty() {
+                // The ordinary canonical replay has no deletion selector for
+                // an empty conversation. Do not claim that skipping it proved
+                // there are no stale lexical documents under its identity.
+                recovered.unresolved_source = true;
+                for (_, scope, _, existing_covered, _) in &mut scopes {
+                    if path.starts_with(scope) {
+                        *existing_covered = false;
+                    }
+                }
+                tracing::warn!(
+                    conversation_id,
+                    source_path = %path.display(),
+                    "empty canonical watch source cannot certify lexical recovery; retaining debt"
+                );
+                continue;
+            }
+            if !missing {
+                // An extant source with canonical messages but no completion
+                // evidence may recover on another read without another event.
+                // Preserve that live retry separately from empty canonical
+                // identities, for which this path cannot prove a repair.
+                recovered.retry_unproven_source = true;
+                continue;
+            }
+            if !writer_reset {
+                // A failed previous callback can retain an uncommitted
+                // writer. Start from the last published generation exactly
+                // as ordinary durable watch replay does.
+                *index = None;
+                *index = Some(open_lexical_index_with_heartbeat(
+                    index_path,
+                    opts.progress.as_ref(),
+                )?);
+                writer_reset = true;
+            }
+            persist::replay_watch_canonical_conversation(
+                storage,
+                index
+                    .as_mut()
+                    .expect("canonical watch replay writer is open"),
+                conversation_id,
+            )?;
+            page_replayed = page_replayed.saturating_add(1);
+            if let Some(progress) = &opts.progress {
+                progress.tick_activity();
+                progress.check_stop()?;
+            }
+        }
+        if page_replayed > 0 {
+            #[cfg(test)]
+            inject_watch_lexical_test_failure(WatchLexicalTestFault::Commit)?;
+            index
+                .as_mut()
+                .expect("canonical watch replay writer is open")
+                .commit()?;
+            recovered.published_conversations = recovered
+                .published_conversations
+                .saturating_add(page_replayed);
+            if let Some(progress) = &opts.progress {
+                progress.total.fetch_add(page_replayed, Ordering::Relaxed);
+                progress.current.fetch_add(page_replayed, Ordering::Relaxed);
+                progress.tick_activity();
+            }
+        }
+        if page_len < page_rows {
+            break;
+        }
+    }
+    recovered.completed_debts = scopes
+        .into_iter()
+        .filter_map(|(index, _, saw_absent, existing_covered, can_clear)| {
+            (can_clear && saw_absent && existing_covered).then_some(index)
+        })
+        .collect();
+    Ok(recovered)
 }
 
 fn persist_watch_lexical_replay_debt(
@@ -34689,12 +35970,13 @@ fn expand_local_scan_root_path(path: &str) -> PathBuf {
 fn additional_scan_roots_for_scan_or_watch(
     storage: &FrankenStorage,
     data_dir: &Path,
+    retain_missing: bool,
 ) -> Vec<ScanRoot> {
     // Source-config syncing and scan-root discovery can be expensive on large
     // machines with many historical bundles and configured mirrors. Defer that
     // work until a source scan or watch session actually needs it.
     sync_sources_config_to_db(storage);
-    build_scan_roots(Some(storage), data_dir)
+    build_scan_roots_with_missing(Some(storage), data_dir, retain_missing)
         .into_iter()
         .filter(|root| !(root.origin.source_id == LOCAL_SOURCE_ID && root.path == data_dir))
         .collect()
@@ -34703,6 +35985,17 @@ fn additional_scan_roots_for_scan_or_watch(
 /// When no storage is supplied, discover configured paths without opening the
 /// archive. This permits mirror previews before acquiring the indexing lock.
 pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Vec<ScanRoot> {
+    build_scan_roots_with_missing(storage, data_dir, false)
+}
+
+/// A resident watcher must retain explicitly configured roots while they are
+/// absent, so registration can start when they appear. Ordinary source scans
+/// and previews retain their existing present-path-only behavior.
+fn build_scan_roots_with_missing(
+    storage: Option<&FrankenStorage>,
+    data_dir: &Path,
+    retain_missing: bool,
+) -> Vec<ScanRoot> {
     let mut roots = Vec::new();
 
     // Add local default root with local provenance
@@ -34740,6 +36033,7 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
                         continue;
                     }
 
+                    let roots_before_legacy_lookup = roots.len();
                     if path.starts_with("~/") {
                         let suffix = path.trim_start_matches("~/");
                         let safe_suffix = path_to_safe_dirname(suffix);
@@ -34758,9 +36052,15 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
                             }
                         }
                     }
+                    if retain_missing && roots.len() == roots_before_legacy_lookup {
+                        let mut scan_root = ScanRoot::remote(mirror_path, origin.clone(), platform)
+                            .with_mirrored_source_path(path);
+                        scan_root.workspace_rewrites = workspace_rewrites.clone();
+                        roots.push(scan_root);
+                    }
                 } else {
                     let local_path = expand_local_scan_root_path(path);
-                    if !local_path.exists() {
+                    if !retain_missing && !local_path.exists() {
                         continue;
                     }
                     let mut scan_root = ScanRoot::local(local_path);
@@ -34834,7 +36134,7 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
                             .join(&source.id)
                             .join("mirror")
                             .join(&safe_name);
-                        if !mirror_path.exists() {
+                        if !retain_missing && !mirror_path.exists() {
                             continue;
                         }
 
@@ -34849,7 +36149,7 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
                         roots.push(scan_root);
                     } else {
                         let local_path = expand_local_scan_root_path(path);
-                        if !local_path.exists() {
+                        if !retain_missing && !local_path.exists() {
                             continue;
                         }
 
@@ -34871,7 +36171,7 @@ pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Ve
             // Remote mirror directory: data_dir/remotes/<source_id>/mirror
             let mirror_path = data_dir.join("remotes").join(&source.id).join("mirror");
 
-            if source.kind.is_remote() && mirror_path.exists() {
+            if source.kind.is_remote() && (retain_missing || mirror_path.exists()) {
                 let origin = Origin {
                     source_id: source.id.clone(),
                     kind: source.kind,
@@ -71976,6 +73276,69 @@ c.close()
         assert_eq!(backup_scan_root.path, backup_root);
         assert!(!backup_scan_root.origin.is_remote());
         assert_eq!(backup_scan_root.platform, Some(Platform::Linux));
+    }
+
+    #[test]
+    #[serial]
+    fn gh538_watch_roots_retain_missing_configured_paths_and_provenance() {
+        let _guard = ignore_sources_config();
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let storage = FrankenStorage::open(&data_dir.join("archive.db")).unwrap();
+        let local_path = temp.path().join("future-local/.codex/sessions");
+        for (id, kind, path) in [
+            (
+                "future-local",
+                SourceKind::Local,
+                local_path.to_string_lossy().into_owned(),
+            ),
+            (
+                "future-remote",
+                SourceKind::Ssh,
+                "~/.codex/sessions".to_string(),
+            ),
+        ] {
+            storage
+                .upsert_source(&Source {
+                    id: id.to_string(),
+                    kind,
+                    host_label: Some("source-host".to_string()),
+                    machine_id: None,
+                    platform: Some("linux".to_string()),
+                    config_json: Some(serde_json::json!({
+                        "paths": [path],
+                        "path_mappings": [{"from": "/source/work", "to": "/mapped/work"}]
+                    })),
+                    created_at: None,
+                    updated_at: None,
+                })
+                .unwrap();
+        }
+        assert_eq!(build_scan_roots(Some(&storage), &data_dir).len(), 1);
+        let roots = build_scan_roots_with_missing(Some(&storage), &data_dir, true);
+        assert_eq!(roots.len(), 3);
+        for (source_id, expected_path) in [
+            ("future-local", local_path),
+            (
+                "future-remote",
+                data_dir
+                    .join("remotes/future-remote/mirror")
+                    .join(path_to_safe_dirname("~/.codex/sessions")),
+            ),
+        ] {
+            let root = roots
+                .iter()
+                .find(|root| root.origin.source_id == source_id)
+                .unwrap();
+            assert_eq!(root.path, expected_path);
+            assert!(!root.path.exists());
+            assert_eq!(root.origin.host.as_deref(), Some("source-host"));
+            assert_eq!(root.platform, Some(Platform::Linux));
+            assert_eq!(root.workspace_rewrites.len(), 1);
+            assert_eq!(root.workspace_rewrites[0].from, "/source/work");
+            assert_eq!(root.workspace_rewrites[0].to, "/mapped/work");
+        }
     }
 
     #[test]

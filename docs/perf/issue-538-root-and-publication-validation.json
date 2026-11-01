@@ -1,0 +1,812 @@
+{
+  "schema_version": 2,
+  "issue": "https://github.com/Dicklesworthstone/coding_agent_session_search/issues/538",
+  "reporter_evidence": "https://github.com/Dicklesworthstone/coding_agent_session_search/issues/538#issuecomment-6539798177",
+  "baseline_commit": "5cfb9d6a033927255a8a4befad153a44c8ed36e4",
+  "qualification": "Native component regressions and formatting passed; application execution and full repository gate remain unqualified.",
+  "reporter_archive_used": false,
+  "native_macos_executed": false,
+  "candidate_source_sha256": {
+    "src/indexer/mod.rs": "0dfe220bf273c488349bcb343a97b36e33433338b1dd2bf578077ec7bafa27c0",
+    "src/indexer/watch_ingestion_tests.rs": "4d0c5c414a634e78b5c41b6f5aa24b371bc515e0d029af87bfab0bfc5b57373e",
+    "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
+    "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747"
+  },
+  "preserved_changes": [
+    "7db0e0902cceae5052d42947955ea71fe230cbd0",
+    "e69fe41b634a51a914697af81a3f951b39cd9263",
+    "8b5441a955d9ed50f05ee9c92506e1e4c6fe1a1f"
+  ],
+  "native_component": {
+    "platform": "Linux",
+    "passed": 8,
+    "failed": 0,
+    "test_runtime_seconds": 20.08,
+    "receipt": {
+      "started_at": "2026-11-01T02:31:42.826820+00:00",
+      "completed_at": "2026-11-01T02:32:04.768690+00:00",
+      "elapsed_seconds": 21.94193359900237,
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "--manifest-path",
+        "registration-probe/Cargo.toml",
+        "--lib",
+        "watch_registration_tests",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "returncode": 0,
+      "source_sha256": "0dfe220bf273c488349bcb343a97b36e33433338b1dd2bf578077ec7bafa27c0",
+      "harness_sha256": "8b7a543a1e5be3530b880f96d6df79eee978666effc1e5092cf215acf34d69ae",
+      "log": "registration-final8-20261101.log",
+      "log_sha256": "3a9c427cdd7b60ae5436b34320bacc98234530ba9a982cac2caf1092287f6834",
+      "proof_scope": "Eight exact-source real native notify and PollWatcher component tests on Linux; callback observes source bytes. No CASS canonical indexing, search publication, macOS, or reporter archive is tested."
+    },
+    "production_block_selections": [
+      {
+        "start": "#[derive(Debug, Clone)]\npub enum ReindexCommand {",
+        "end": "/// Per-connector statistics for structured logging",
+        "sha256": "ca526832017e178be281ba3c34a4f9cac35187600869d27cd09fb7bd1fddb79b"
+      },
+      {
+        "start": "fn database_sidecar_paths(",
+        "end": "/// GH #450: how long",
+        "sha256": "48f49899e6fbda0fef27b24c6dd179ada8c153f7bf83297027856b059181990d"
+      },
+      {
+        "start": "fn database_path_with_suffix(",
+        "end": "\nfn ",
+        "sha256": "32130a1e87bdc04a6a46496affc05f593354406abf4fdd13925e2682801b73ce"
+      },
+      {
+        "start": "/// Keep deferred sources in the watch loop,",
+        "end": "#[cfg(test)]\nfn reset_storage(",
+        "sha256": "f3eaf72e2a68d9e6f0c6367f71641b6a2d1198001c82d32f6e4ac386bcd4c8b9"
+      },
+      {
+        "start": "fn watch_event_should_trigger_reindex(",
+        "end": "\nfn sync_sources_config_to_db(",
+        "sha256": "17235095f5ca840550dfeeaefd45e01c85a4c8e7f057c4bc1b083a03c7c4b0fc"
+      }
+    ],
+    "final_candidate_blocks_match_tested_blocks_verbatim": true,
+    "resolved_dependencies_matching_repository_lock": 53,
+    "adapters_and_limits": "ConnectorKind carries tested variants, ScanRoot carries only path, atomic progress carrier omits SQL cancellation. Entire native watch loop, backlog, polling, stale detector, event filters, registration helpers and regression tests are verbatim. Callback observes source bytes; canonical indexing/search are not tested.",
+    "log": {
+      "file": "registration-final8-20261101.log",
+      "bytes": 1217,
+      "sha256": "3a9c427cdd7b60ae5436b34320bacc98234530ba9a982cac2caf1092287f6834"
+    },
+    "negative_controls": {
+      "baseline_missing_and_replaced_root": {
+        "passed": 0,
+        "failed": 2,
+        "reason": "native callback observation timeouts, not compilation failure",
+        "elapsed_seconds": 30.03,
+        "log": {
+          "name": "registration-baseline.log",
+          "sha256": "e626653c4718947f59fe7f68136b93c7a5f6a8fd32b7aee6931c2c24e10df8f9",
+          "bytes": 2030
+        }
+      },
+      "intermediate_alias_sharing": {
+        "started_at": "2026-11-01T02:14:49.216181+00:00",
+        "elapsed_seconds": 4.762344686998404,
+        "returncode": 101,
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "--manifest-path",
+          "registration-alias-probe/Cargo.toml",
+          "--lib",
+          "alias_rearm_review::gh538_retargeted_alias_keeps_original_root_watched",
+          "--",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "harness_sha256": "1ac1b70f730de0fb975f46ea47f813110a815d184e677865a80833252fa91513",
+        "log_sha256": "f37c603ec20f24567e312c7e248eca2323b4c62647738bd9c93079c7ece81fb8"
+      },
+      "intermediate_source_binding": {
+        "started_at": "2026-11-01T02:27:13.398416+00:00",
+        "elapsed_seconds": 1.437335610993614,
+        "returncode": 101,
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "--manifest-path",
+          "registration-probe/Cargo.toml",
+          "--lib",
+          "watch_registration_tests::gh538_native_watch_retargets_alias_within_registered_ancestor",
+          "--",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "source_sha256": "6746b91781b047e87d625b03b621fa0389b25d7115e8204124a154ad07d8ce25",
+        "harness_sha256": "094d80049527616cdcb265ea8cb1a96c07d2067526e8e8894fb65dbb060763d1",
+        "log_sha256": "9e8bc526a0979c3f9ccd50a220218e7b5a1f66572fdec9d24c01f7e3c3ccbdaa"
+      }
+    },
+    "native_macos_executed": false,
+    "fsevents_policy_basis": "Pinned notify 8.2.0 watch_inner/unwatch_inner restart the entire SinceNow stream even when append/remove fails; backend-specific reconciliation is source-audited only."
+  },
+  "formatting": {
+    "toolchain": "nightly-2026-08-31",
+    "commands": [
+      "scripts/gate.sh --verify-fmt",
+      "git diff --check"
+    ],
+    "status": "passed",
+    "source_hashes": {
+      "src/indexer/mod.rs": "0dfe220bf273c488349bcb343a97b36e33433338b1dd2bf578077ec7bafa27c0",
+      "src/indexer/watch_ingestion_tests.rs": "4d0c5c414a634e78b5c41b6f5aa24b371bc515e0d029af87bfab0bfc5b57373e",
+      "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
+      "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747"
+    },
+    "log": {
+      "file": "cass-nov01-final-fmt.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "ubs": {
+    "status": "VALID_SCAN_FAILED_GATE",
+    "returncode": 1,
+    "totals": {
+      "files": 4,
+      "critical": 49,
+      "warning": 11025,
+      "info": 3038
+    },
+    "summary": {
+      "baseline": "5cfb9d6a033927255a8a4befad153a44c8ed36e4",
+      "scan_validity": "VALID_STATIC_SCAN_WITH_FINDINGS",
+      "gate_status": "NOT_PASSED",
+      "run_receipt": "cass-ubs-nov01-final-ast-run.json",
+      "log": "cass-ubs-nov01-final-ast-verified.log",
+      "returncode": 1,
+      "totals": {
+        "files": 4,
+        "critical": 49,
+        "warning": 11025,
+        "info": 3038
+      },
+      "source_record_counts": {
+        "warning": 11025,
+        "critical": 49,
+        "info": 3033
+      },
+      "non_source_info": 5,
+      "files": [
+        {
+          "path": "src/indexer/mod.rs",
+          "sha256": "0dfe220bf273c488349bcb343a97b36e33433338b1dd2bf578077ec7bafa27c0",
+          "matches_launch_hash": true,
+          "scanner_content_blake2b_128": "40c56aad7efaab4806fed37ea5322254",
+          "cache": "/root/.cache/ubs/c46576762e0ac846074ab12e463ce14f/files/7d/7d01c2b8c40972712882316f2184f2c9.json",
+          "cache_sha256": "be83d00b6020223dafa3fdc0923ea28a434c50808dcfbc5e999a2953c9a578f9",
+          "cache_stored_at": 1793500590.7249856,
+          "records": 13398,
+          "ast_only_findings": 6589
+        },
+        {
+          "path": "src/indexer/watch_ingestion_tests.rs",
+          "sha256": "4d0c5c414a634e78b5c41b6f5aa24b371bc515e0d029af87bfab0bfc5b57373e",
+          "matches_launch_hash": true,
+          "scanner_content_blake2b_128": "b99e443c7fb05022678c95c41ad43353",
+          "cache": "/root/.cache/ubs/c46576762e0ac846074ab12e463ce14f/files/a4/a4530ec9f4703dce1c4ef34f5d152105.json",
+          "cache_sha256": "281f66ef9d1679ded5396d1da70cfc2ccd7fe662f10ad8a9f5621f553abc0771",
+          "cache_stored_at": 1793500590.8186114,
+          "records": 351,
+          "ast_only_findings": 18
+        },
+        {
+          "path": "src/indexer/watch_source_ledger.rs",
+          "sha256": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
+          "matches_launch_hash": true,
+          "scanner_content_blake2b_128": "8dc34884bb4a2bc543eade6262473afc",
+          "cache": "/root/.cache/ubs/c46576762e0ac846074ab12e463ce14f/files/a9/a9ca8c135aef0189e125632b05e9b111.json",
+          "cache_sha256": "8ea7fb258efd7867fbe4351284a746b675cf6de9b7e40c85d02393777429696a",
+          "cache_stored_at": 1793500590.71959,
+          "records": 22,
+          "ast_only_findings": 6
+        },
+        {
+          "path": "tests/watch_e2e.rs",
+          "sha256": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747",
+          "matches_launch_hash": true,
+          "scanner_content_blake2b_128": "e8ee16aa894247cae2d1297ca6287d47",
+          "cache": "/root/.cache/ubs/c46576762e0ac846074ab12e463ce14f/files/45/4568b16969cfdd8bc660c35de95a60f8.json",
+          "cache_sha256": "fccf59e5ead756443b5348f457b3eb3909e6f2a8fa793689f14f5f679e6fbd54",
+          "cache_stored_at": 1793500590.8210652,
+          "records": 336,
+          "ast_only_findings": 137
+        }
+      ],
+      "positive_ast_only_records": {
+        "rust.ownership.unwrap-expect": 6600,
+        "rust.panic.direct-indexing": 150
+      },
+      "ast_evidence": "Fresh exact-content cached results for all four frozen sources include AST-only unwrap/expect and direct-indexing rules from the pinned rust_scan.py. This verifies structural execution; assertion counts alone and the staged-rule-pack message do not.",
+      "added_line_findings": {
+        "warning": 347,
+        "critical": 1,
+        "info": 67
+      },
+      "added_line_triage_scope": "Counts and full records retained; prior backlog audit not repeated. Native helper and publication source changes independently reviewed, and only native component tests executed in the extracted harness.",
+      "invalid_preceding_run": {
+        "receipt": "cass-ubs-nov01-final-run.json",
+        "reason": "AST_NOT_AVAILABLE",
+        "reported_totals": {
+          "files": 4,
+          "critical": 2,
+          "warning": 4157,
+          "info": 1738
+        }
+      }
+    },
+    "log": {
+      "file": "cass-ubs-nov01-final-ast-verified.log",
+      "bytes": 52414,
+      "sha256": "9a00eca68cda2b151bb25a92eb08d9eb5a61e0fa7262a0f735d18a5170da33fa"
+    },
+    "invocation": {
+      "file": "cass-ubs-nov01-final-ast-run.json",
+      "bytes": 1823,
+      "sha256": "f57104b91556a3ed311bcfad7bd75b6d2a3fefc87634b512c8b5ad11a4a137b0"
+    },
+    "full_findings": {
+      "file": "cass-ubs-nov01-final-full-findings.ndjson",
+      "bytes": 7018180,
+      "sha256": "06321a5e6e43807ba3eef13b63bb3e72336526726e5e610119a88267b4969c3f"
+    },
+    "added_line_findings": {
+      "file": "cass-ubs-nov01-final-added-line-findings.json",
+      "bytes": 236740,
+      "sha256": "bf92967809e623994afe6b91996caad6d6754c7246ecdbd9134407477d55a18a"
+    },
+    "source_sha256": {
+      "src/indexer/mod.rs": "0dfe220bf273c488349bcb343a97b36e33433338b1dd2bf578077ec7bafa27c0",
+      "src/indexer/watch_ingestion_tests.rs": "4d0c5c414a634e78b5c41b6f5aa24b371bc515e0d029af87bfab0bfc5b57373e",
+      "src/indexer/watch_source_ledger.rs": "4400b9185e4562f0bfd102471b864830e929d29753647f47671c44efe3dc3e3f",
+      "tests/watch_e2e.rs": "435c6fd61b43a8ebaed115d0e5f6bf3abaa0002da6a07ace9c2e6bb79ba1e747"
+    },
+    "gate_passed": false,
+    "suppressions_added": false,
+    "new_production_review": {
+      "warning_records": 18,
+      "rules": {
+        "rust.ownership.unwrap-expect": 2,
+        "rust.collections.clone-in-loop": 12,
+        "rust.panic.direct-indexing": 2,
+        "rust.perf.string-alloc-in-loop": 2
+      },
+      "concrete_new_defect_identified": false,
+      "basis": "Owned clones are bounded by configured source maps; writer initialization precedes both expect calls; debt indices are enumerated from the unchanged debt vector; root lookup follows insertion; error formatting is lazy. This review does not change the failing gate result."
+    }
+  },
+  "application": {
+    "status": "application_validation_blocked_by_build_memory",
+    "application_tests_executed": 0,
+    "baseline_negative_tests_executed": 0,
+    "candidate_application_tests_executed": 0,
+    "cass_compilation_reached": false,
+    "ordinary_repository_profile_build_completed": false,
+    "full_repository_gate_completed": false,
+    "pins": {
+      "configuration_files_unchanged_from_head": true,
+      "configuration_sha256": {
+        "Cargo.toml": "b28a7edbec9ce7cbebbdeacc04c6333e2c40ef4acd795ce29afebfca38dd11c0",
+        "Cargo.lock": "1daeb680b1db621c270a7c56f04dbc0b20e3e8b21186a266aa859c40ceab8d6d",
+        "rust-toolchain.toml": "7fab71eddf5e49029d9df39990f4ad5809b9218804a363a2e10d7c4ea2de06bc",
+        ".cargo/config.toml": "8a7c49456694f211b2f14d72d8d4ddf8c8ec511c80ab78009aa77fd42ecd78f2"
+      },
+      "toolchain": {
+        "toolchain": {
+          "channel": "nightly-2026-08-31",
+          "components": [
+            "rustfmt",
+            "clippy"
+          ],
+          "profile": "default"
+        }
+      },
+      "rustc_verbose_version": "rustc 1.100.0-nightly (908501772 2026-08-30)\nbinary: rustc\ncommit-hash: 90850177249efe0321573c569aec5d12b257f8d6\ncommit-date: 2026-08-30\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0",
+      "asupersync": [
+        {
+          "name": "asupersync",
+          "version": "0.5.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "f34b1a19ffd6b74570339a156912436335bb09c594c675c62ea164b19a1f2511",
+          "dependencies": [
+            "aes-gcm",
+            "asupersync-macros",
+            "base64 0.23.1",
+            "bincode-next",
+            "chacha20poly1305",
+            "crc32fast",
+            "crossbeam-queue",
+            "franken-decision",
+            "franken-evidence",
+            "franken-kernel",
+            "futures-lite",
+            "getrandom 0.4.3",
+            "hashbrown 0.17.1",
+            "hex",
+            "hmac",
+            "js-sys",
+            "libc",
+            "memchr",
+            "nix 0.31.3",
+            "nkeys",
+            "parking_lot",
+            "pin-project",
+            "polling",
+            "prost",
+            "rmp-serde",
+            "rustls",
+            "rustls-native-certs",
+            "rustls-pki-types",
+            "semver",
+            "serde",
+            "serde_json",
+            "sha1 0.11.0",
+            "sha2 0.11.0",
+            "signal-hook 0.4.4",
+            "slab",
+            "smallvec",
+            "socket2",
+            "subtle",
+            "sysinfo",
+            "tempfile",
+            "thiserror 2.0.21",
+            "tracing",
+            "tracing-log",
+            "tracing-subscriber",
+            "unicode-normalization",
+            "visibility",
+            "wasm-bindgen",
+            "wasm-bindgen-futures",
+            "web-sys",
+            "windows-sys 0.61.2",
+            "x509-parser",
+            "xattr",
+            "zeroize"
+          ]
+        }
+      ],
+      "fsqlite_family_versions": [
+        "0.4.12"
+      ],
+      "registry_integrity": {
+        "verified_packages": 696,
+        "verified_source_files": 36032,
+        "mismatches": [],
+        "unavailable_at_integrity_check": 67,
+        "receipt": "cass-registry-validation.json"
+      },
+      "required_asupersync_features_preserved": [
+        "default",
+        "nightly-outcome-try",
+        "proc-macros",
+        "test-internals",
+        "tls",
+        "tls-native-roots"
+      ]
+    },
+    "resources": {
+      "memory_max_bytes": 8589934592,
+      "cpu_max": "800000 100000",
+      "memory_events_current": "low 0\nhigh 0\nmax 46153813\noom 229\noom_kill 24\noom_group_kill 0",
+      "disk_available_bytes": 12237774848,
+      "shared_with_unrelated_compiler_pipelines": true,
+      "foreign_cargo_pipeline_count_at_summary": 1,
+      "active_owned_build": false,
+      "admission_policy": "No new build while any foreign Cargo pipeline is active; bounded wait, then at most one same-configuration guarded attempt."
+    },
+    "latest_environment_only_controls": {
+      "environment": {
+        "RUSTFLAGS": "-Z threads=1 -C debuginfo=0 -C link-arg=-fuse-ld=lld",
+        "RUST_MIN_STACK": "134217728",
+        "CARGO_HOME": "cass-cargo-home",
+        "CARGO_TARGET_DIR": "cass-target",
+        "CARGO_BUILD_JOBS": "1",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+        "MALLOC_CONF": "narenas:1,dirty_decay_ms:0,muzzy_decay_ms:0",
+        "CASS_BUILD_CHILD_OOM_SCORE_ADJ": "1000"
+      },
+      "asupersync_dev_and_test_profile": {
+        "opt-level": 0,
+        "codegen-units": 256,
+        "rustflags": [
+          "-Zmir-opt-level=0",
+          "-Zunstable-options",
+          "--jobs-backend=1",
+          "-Ztime-passes=yes",
+          "-Ztime-passes-format=json"
+        ]
+      },
+      "runner_oom_score_adj_before_after": [
+        "0",
+        "0"
+      ],
+      "cargo_and_rustc_oom_score_adj": 1000,
+      "foreign_processes_signalled_or_reconfigured": false,
+      "shared_cgroup_limits_changed": false,
+      "repository_dependency_pins_features_or_gate_checks_changed": false
+    },
+    "meaningful_compile_attempts": [
+      {
+        "name": "cass-watch-build",
+        "outcome": "resource_cancellation",
+        "stage": "dependency_asupersync_0.5.0",
+        "started_at": "2026-10-31T19:02:26.261251+00:00",
+        "elapsed_seconds": 905.307,
+        "returncode": 101,
+        "maximum_child_rss_kib": 6537000,
+        "application_tests_executed": 0,
+        "receipt": "cass-watch-build-receipt.json",
+        "log": "cass-watch-build.log",
+        "cancellation_receipt": "cass-build-cancellation.json"
+      },
+      {
+        "name": "cass-watch-build-asupersync-opt0",
+        "outcome": "oom_sigkill",
+        "stage": "dependency_asupersync_0.5.0",
+        "started_at": "2026-10-31T19:18:20.576017+00:00",
+        "elapsed_seconds": 201.07,
+        "returncode": 101,
+        "maximum_child_rss_kib": 6548520,
+        "application_tests_executed": 0,
+        "receipt": "cass-watch-build-asupersync-opt0-receipt.json",
+        "log": "cass-watch-build-asupersync-opt0.log",
+        "rustc_sigkill_confirmed_in_log": true
+      },
+      {
+        "name": "cass-watch-build-asupersync-mir0-timed",
+        "outcome": "resource_cancellation",
+        "stage": "dependency_asupersync_0.5.0",
+        "started_at": "2026-10-31T19:22:49.202716+00:00",
+        "elapsed_seconds": 146.521,
+        "returncode": 101,
+        "maximum_child_rss_kib": 3682132,
+        "application_tests_executed": 0,
+        "receipt": "cass-watch-build-asupersync-mir0-timed-receipt.json",
+        "log": "cass-watch-build-asupersync-mir0-timed.log",
+        "cancellation_receipt": "cass-build-mir0-cancellation.json"
+      },
+      {
+        "name": "cass-watch-build-asupersync-purge",
+        "outcome": "resource_cancellation",
+        "stage": "dependency_asupersync_0.5.0",
+        "started_at": "2026-10-31T19:28:15.387557+00:00",
+        "elapsed_seconds": 90.165,
+        "returncode": 101,
+        "maximum_child_rss_kib": 3340704,
+        "application_tests_executed": 0,
+        "receipt": "cass-watch-build-asupersync-purge-receipt.json",
+        "log": "cass-watch-build-asupersync-purge.log",
+        "cancellation_receipt": "cass-build-purge-cancellation.json"
+      },
+      {
+        "name": "cass-watch-build-asupersync-one-arena",
+        "outcome": "resource_cancellation",
+        "stage": "dependency_asupersync_0.5.0",
+        "started_at": "2026-10-31T19:33:01.344520+00:00",
+        "elapsed_seconds": 162.914,
+        "returncode": 101,
+        "maximum_child_rss_kib": 5444696,
+        "application_tests_executed": 0,
+        "receipt": "cass-watch-build-asupersync-one-arena-receipt.json",
+        "log": "cass-watch-build-asupersync-one-arena.log",
+        "cancellation_receipt": "cass-build-one-arena-cancellation.json"
+      },
+      {
+        "name": "cass-watch-build-asupersync-guarded",
+        "outcome": "oom_sigkill",
+        "stage": "dependency_asupersync_0.5.0",
+        "started_at": "2026-10-31T19:38:44.617393+00:00",
+        "elapsed_seconds": 206.739,
+        "returncode": 101,
+        "maximum_child_rss_kib": 6542932,
+        "application_tests_executed": 0,
+        "receipt": "cass-watch-build-asupersync-guarded-receipt.json",
+        "log": "cass-watch-build-asupersync-guarded.log",
+        "rustc_sigkill_confirmed_in_log": true
+      },
+      {
+        "name": "cass-watch-build-asupersync-guarded-quiet",
+        "outcome": "oom_sigkill",
+        "stage": "dependency_asupersync_0.5.0",
+        "started_at": "2026-10-31T19:51:54.596017+00:00",
+        "elapsed_seconds": 294.26,
+        "returncode": 101,
+        "maximum_child_rss_kib": 5451680,
+        "application_tests_executed": 0,
+        "receipt": "cass-watch-build-asupersync-guarded-quiet-receipt.json",
+        "log": "cass-watch-build-asupersync-guarded-quiet.log",
+        "rustc_sigkill_confirmed_in_log": true
+      }
+    ],
+    "compiler_option_probe": {
+      "receipt": "cass-watch-build-asupersync-mir0-receipt.json",
+      "outcome": "jobs-backend rejected without -Zunstable-options; corrected in all later attempts",
+      "application_tests_executed": 0
+    },
+    "observed_blocking_phase": "Asupersync MIR_borrow_checking, after type_check_crate; no CASS source compiled.",
+    "pending_validation": [
+      "Candidate watch_e2e::deferred_watch_sources live integration tests",
+      "Baseline negative controls for disappeared-source publication, disappeared notification leaf, and narrowed ancestor debt",
+      "Candidate library GH538 and watch_registration_tests regressions",
+      "Unchanged repository gate including clippy, bin tests, golden tests, and UBS"
+    ],
+    "remote_build_and_cache": {
+      "rch_executable_found": false,
+      "configured_rch_or_dsr_fleet_found": false,
+      "configured_ssh_host_found": false,
+      "remote_connections_attempted": 0,
+      "dsr_source_script_found_but_unconfigured": true,
+      "sccache_executable_config_or_cache_found": false,
+      "exact_compatible_asupersync_artifact_found": false,
+      "installed_or_prior_cass_binary_found": false
+    },
+    "rejected_alternatives": {
+      "mir_debug_stripping": "Exact pinned compiler applies it after borrow checking, too late for the observed peak; no attempt spent on it.",
+      "native_i686_compiler_host": {
+        "kernel_ia32_emulation_disabled": true,
+        "kernel_x32_abi_disabled": true,
+        "toolchain_installed_or_build_attempted": false
+      }
+    },
+    "admission_wait": {
+      "ended_at": "2026-10-31T20:03:13.000581+00:00",
+      "deadline": "2026-10-31T20:03:00+00:00",
+      "outcome": "No zero-foreign-Cargo window; no further build launched.",
+      "snapshots": "cass-final-admission-watch.jsonl"
+    },
+    "summary_generated_at": "2026-10-31T20:03:12.755243+00:00",
+    "final_resource_check": {
+      "utc": "2026-10-31T20:06:50.676717+00:00",
+      "memory_max_bytes": 8589934592,
+      "memory_current_bytes": 8502059008,
+      "memory": {
+        "anon": 3171864576,
+        "file": 3840724992,
+        "kernel": 1488580608,
+        "slab_reclaimable": 1471316736,
+        "slab_unreclaimable": 2034328
+      },
+      "memory_events": "low 0\nhigh 0\nmax 46180949\noom 229\noom_kill 24\noom_group_kill 0",
+      "foreign_cargo_pipelines": [
+        {
+          "pid": "346154",
+          "program": "cargo",
+          "rss_kib": 62900,
+          "mode": "check"
+        },
+        {
+          "pid": "348499",
+          "program": "cargo",
+          "rss_kib": 18496,
+          "mode": "test"
+        }
+      ],
+      "large_compilers": [
+        {
+          "pid": "348035",
+          "program": "rustc",
+          "rss_kib": 3060700,
+          "crate": "asupersync",
+          "owned": false
+        }
+      ],
+      "owned_build_or_test_processes": [],
+      "zero_foreign_cargo": false,
+      "possible_admission_window": false
+    },
+    "followup": {
+      "generated_at": "2026-11-01T02:29:33.898138+00:00",
+      "application_tests_executed": 0,
+      "candidate_application_or_test_typecheck_completed": false,
+      "candidate_compiler_errors_observed": [],
+      "candidate_typecheck_started": false,
+      "candidate_source_note": "Both attempts stopped in the pinned Asupersync dependency before CASS library or tests were typechecked. Candidate sources evolved during the dependency-only all-targets check. No CASS package-check announcement was observed.",
+      "dependency_pins_and_configuration_unchanged": true,
+      "memory_limit_bytes": 8589934592,
+      "attempts": [
+        {
+          "label": "cass-nov01-watch-qualification",
+          "kind": "full_application_build_and_selected_watch_tests",
+          "outcome": "dependency_compiler_SIGKILL_with_cgroup_OOM_evidence",
+          "phase": "Asupersync monomorphization after completed MIR borrow checking",
+          "started_at": "2026-11-01T02:10:04.441118+00:00",
+          "elapsed_seconds": 262.3430904730012,
+          "maximum_child_rss_kib": 7302524,
+          "returncode": 101,
+          "sigkill_confirmed": true,
+          "source_before": {
+            "head": "5cfb9d6a033927255a8a4befad153a44c8ed36e4",
+            "diff_sha256": "0017e0f7b6c516aa5ece110e2aa869b8e2eaca3305b155796f3162b7513521c2"
+          },
+          "source_after": {
+            "head": "5cfb9d6a033927255a8a4befad153a44c8ed36e4",
+            "diff_sha256": "0017e0f7b6c516aa5ece110e2aa869b8e2eaca3305b155796f3162b7513521c2"
+          },
+          "receipt": "cass-nov01-watch-qualification-receipt.json",
+          "log": "cass-nov01-watch-qualification.log",
+          "resource_samples": "cass-nov01-watch-qualification-resources.jsonl"
+        },
+        {
+          "label": "cass-nov01-check-all-targets",
+          "kind": "metadata_only_all_targets_check",
+          "outcome": "dependency_compiler_SIGKILL_with_cgroup_OOM_evidence",
+          "phase": "Asupersync MIR borrow checking",
+          "started_at": "2026-11-01T02:15:26.463224+00:00",
+          "elapsed_seconds": 214.8112514179993,
+          "maximum_child_rss_kib": 5697400,
+          "returncode": 101,
+          "sigkill_confirmed": true,
+          "source_before": {
+            "head": "5cfb9d6a033927255a8a4befad153a44c8ed36e4",
+            "diff_sha256": "98e533c1debc4e404009c44409e34f5b37e972469ce325229e9f918ff479e74e"
+          },
+          "source_after": {
+            "head": "5cfb9d6a033927255a8a4befad153a44c8ed36e4",
+            "diff_sha256": "681ad0851c2abc24cd62691316ec25c286d3cacbd0e377fbca450b7f4e2b529b"
+          },
+          "receipt": "cass-nov01-check-all-targets-receipt.json",
+          "log": "cass-nov01-check-all-targets.log",
+          "resource_samples": "cass-nov01-check-all-targets-resources.jsonl"
+        }
+      ],
+      "source_snapshots": "cass-nov01-check-all-targets-source-snapshots.jsonl",
+      "admission_before_full_attempt": "cass-nov01-admission.json",
+      "current_followup": "The sole permitted identical metadata-only retry is running after a fresh 30-second clear window and successful immediate preflight. No further retries are authorized.",
+      "clear_window_samples": "cass-nov01-clear-window-watch.jsonl",
+      "owned_build_or_check_running": true,
+      "source_monitor_running": true,
+      "clear_window_monitor_running": false,
+      "active_retry": {
+        "label": "cass-nov01-check-clear-window",
+        "admission": "cass-nov01-check-clear-window-admitted-preflight.json",
+        "qualified_window": "cass-nov01-clear-window-resumed-result.json",
+        "log": "cass-nov01-check-clear-window.log",
+        "source_snapshots": "cass-nov01-check-clear-window-source-snapshots.jsonl"
+      }
+    },
+    "followup_progress": {
+      "status": "Final metadata-only retry passed Asupersync and is continuing; CASS package check has not started at this checkpoint.",
+      "application_tests_executed": 0,
+      "log": "cass-nov01-check-clear-window.log",
+      "source_snapshots": "cass-nov01-check-clear-window-source-snapshots.jsonl"
+    }
+  },
+  "remaining_scope_limits": [
+    "No reporter archive was accessed.",
+    "No native macOS/FSEvents runtime, launchd, or original-archive throughput qualification was executed.",
+    "Whole absent current roots retain debt until they return.",
+    "Empty canonical identities retain debt because the current replay API cannot certify stale lexical-document removal.",
+    "Existing zero-emission sources retain debt and eligible cooldown retries until source completion evidence becomes available.",
+    "Replay identity pages are bounded; existing per-conversation message-footprint hydration remains.",
+    "Exactly-once assertions concern canonical rows and searchable identities; replay can execute repeatedly.",
+    "Application regressions, including new conversations, appends, restart and exact-once assertions, remain unexecuted."
+  ],
+  "publication": {
+    "base_main": "5cfb9d6a033927255a8a4befad153a44c8ed36e4",
+    "requested_branch": "main",
+    "pull_request_requested": false,
+    "authorization": "User renewed the explicit direct-to-main instruction after receiving missing application and failing UBS qualification details.",
+    "status": "Substantive recovery correction prepared for direct-main publication; the containing commit identifies the immutable candidate.",
+    "full_gate_passed": false,
+    "issue_resolved": false,
+    "ingestion_bead_status": "in_progress"
+  },
+  "recorded_at_utc": "2026-11-01T02:35:56.932694+00:00",
+  "prior_native_component": {
+    "production_block_selections": [
+      {
+        "start": "#[derive(Debug, Clone)]\npub enum ReindexCommand {",
+        "end": "/// Per-connector statistics for structured logging",
+        "sha256": "ca526832017e178be281ba3c34a4f9cac35187600869d27cd09fb7bd1fddb79b"
+      },
+      {
+        "start": "fn database_sidecar_paths(",
+        "end": "/// GH #450: how long",
+        "sha256": "48f49899e6fbda0fef27b24c6dd179ada8c153f7bf83297027856b059181990d"
+      },
+      {
+        "start": "fn database_path_with_suffix(",
+        "end": "\nfn ",
+        "sha256": "32130a1e87bdc04a6a46496affc05f593354406abf4fdd13925e2682801b73ce"
+      },
+      {
+        "start": "/// Keep deferred sources in the watch loop,",
+        "end": "#[cfg(test)]\nfn reset_storage(",
+        "sha256": "d441e54882486c4a0e899240d496d954bd59c8c201f97dd3b9f4d3be02bd09cc"
+      },
+      {
+        "start": "fn watch_event_should_trigger_reindex(",
+        "end": "\nfn sync_sources_config_to_db(",
+        "sha256": "17235095f5ca840550dfeeaefd45e01c85a4c8e7f057c4bc1b083a03c7c4b0fc"
+      }
+    ],
+    "final_candidate_blocks_match_tested_blocks_verbatim": true,
+    "adapters_and_limits": "ConnectorKind carries tested variants, ScanRoot carries only path, atomic progress carrier omits SQL cancellation. Entire native watch loop, backlog, polling, stale detector, event filters, registration helpers and regression tests are verbatim. Callback observes source bytes; canonical indexing/search are not tested.",
+    "resolved_dependencies_matching_repository_lock": 52,
+    "probe_lock_sha256": "dfab24d5bbedb3df80e50885ba90a6a4f975b2303dce94aed9038dbf4be417dd",
+    "baseline": {
+      "passed": 0,
+      "failed": 2,
+      "reason": "native callback observation timeouts, not compilation failure",
+      "elapsed_seconds": 30.03,
+      "log": {
+        "name": "registration-baseline.log",
+        "sha256": "e626653c4718947f59fe7f68136b93c7a5f6a8fd32b7aee6931c2c24e10df8f9",
+        "bytes": 2030
+      }
+    },
+    "candidate": {
+      "passed": 5,
+      "failed": 0,
+      "elapsed_seconds": 21.51,
+      "log": {
+        "name": "registration-final.log",
+        "sha256": "02a8ffa8b2f17a89ecf10948991f422ba66b36ca14fb7aef1e328494b28ef2bb",
+        "bytes": 928
+      }
+    },
+    "command": "cargo test --offline --locked --manifest-path ../registration-probe/Cargo.toml --lib watch_registration_tests -- --nocapture --test-threads=1"
+  },
+  "prior_valid_ubs": {
+    "version": "v5.4.4",
+    "exit_code": 1,
+    "status": "NOT_PASSED",
+    "runner_sha256": "bdeccbb35f2056e6177c73b3f0f9966d20d1cbeff22b7f084133c4a6ac625ee2",
+    "contract_sha256": "7319b2e5e085d0dd2434e5114291b2dee9fbbb96e2cfe02027eb263abcb06ac3",
+    "totals": {
+      "files": 3,
+      "critical": 49,
+      "warning": 10905,
+      "info": 3010
+    },
+    "added_line_counts": {
+      "warning": 241,
+      "critical": 1,
+      "info": 47
+    },
+    "positive_ast_results": {
+      "rust.ownership.unwrap-expect": 6548,
+      "rust.panic.assert-macros": 3620,
+      "rust.panic.direct-indexing": 149
+    },
+    "review": "One added critical is an intentional native test timeout panic. All48other critical snippets are present in baseline. Added production warnings16, reviewed as necessary clones, guarded writer/index access, or error-only formatting;225other added warnings are tests. No new concrete production defect found; no suppressions or gate changes.",
+    "invalid_zero_finding_sandbox_run_rejected": true,
+    "final_log": {
+      "name": "cass-ubs-final-verified.log",
+      "sha256": "3516b9342ab011f455a700397ee7b67e8c18c6763bf5325a9cd7f68031a5b075",
+      "bytes": 51844
+    },
+    "triage": {
+      "name": "cass-ubs-final-triage.json",
+      "sha256": "afa58c3262f2e0fe5e97157c8428d7575d072e01422c932064a2f429b55b0a43",
+      "bytes": 20859
+    },
+    "full_findings": {
+      "name": "cass-ubs-final-full-findings.ndjson",
+      "sha256": "a95ab6ae4a988855072efb231d5236e70c5ee9b4c8346bf8d3b99d1a638e953d",
+      "bytes": 7884171
+    }
+  }
+}

@@ -897,6 +897,123 @@ mod deferred_watch_sources {
         );
     }
 
+    /// Native directory watches follow filesystem objects. Replacing an agent
+    /// root must restore delivery for its new inode while retaining the old
+    /// canonical history, including across a later process restart.
+    #[cfg(unix)]
+    #[test]
+    fn gh538_live_watch_recovers_replaced_root_and_retains_history() {
+        let home = indexed_watch_home();
+        let data = home.path().join("cass-data");
+        let agent_root = home.path().join(".codex");
+        let preserved_root = home.path().join("preserved-codex");
+        let baseline_relative = Path::new("sessions/rollout-baseline.jsonl");
+        let baseline_bytes = fs::read(agent_root.join(baseline_relative)).expect("baseline source");
+        let preserved_mirror = snapshot_mirror(&data);
+        let environment = [
+            ("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0"),
+            ("CASS_RAW_MIRROR_MAX_BYTES", "1"),
+            ("CASS_RAW_MIRROR_MIN_FREE_BYTES", "67108864"),
+        ];
+        let (mut child, log) = start_watch_with_env(home.path(), &data, true, &environment);
+        wait_for_hit(&mut child, home.path(), &data, &log, "baselinewatch");
+
+        // Preserve, rather than delete, every original source. No watched
+        // ancestor of the replacement remains at its original filesystem
+        // identity; subsequent writes need a newly established registration.
+        fs::rename(&agent_root, &preserved_root).expect("park original agent root");
+        let sessions = agent_root.join("sessions");
+        fs::create_dir_all(&sessions).expect("replace agent source root");
+        let source = sessions.join("rollout-replacement.jsonl");
+        write_codex_session(&source, "rootreplacementgh538", "root-replacement-gh538");
+        wait_for_hit(&mut child, home.path(), &data, &log, "rootreplacementgh538");
+        for needle in ["rootappendonegh538", "rootappendtwogh538"] {
+            append_user(&source, needle);
+            wait_for_hit(&mut child, home.path(), &data, &log, needle);
+        }
+        child
+            .0
+            .kill()
+            .expect("interrupt watcher after root recovery");
+        child.0.wait().expect("reap interrupted watcher");
+
+        append_user(&source, "rootdowntimegh538");
+        let (mut restarted, restart_log) =
+            start_watch_with_env(home.path(), &data, true, &environment);
+        wait_for_hit(
+            &mut restarted,
+            home.path(),
+            &data,
+            &restart_log,
+            "rootdowntimegh538",
+        );
+        append_user(&source, "rootafterrestartgh538");
+        wait_for_hit(
+            &mut restarted,
+            home.path(),
+            &data,
+            &restart_log,
+            "rootafterrestartgh538",
+        );
+        for needle in [
+            "baselinewatch",
+            "rootreplacementgh538",
+            "rootappendonegh538",
+            "rootappendtwogh538",
+            "rootdowntimegh538",
+            "rootafterrestartgh538",
+        ] {
+            assert_eq!(
+                content_hit_count(&search(home.path(), &data, needle), needle),
+                1,
+                "historical and replacement content must remain searchable once: {needle}"
+            );
+        }
+        restarted.0.kill().expect("stop recovered watcher");
+        restarted.0.wait().expect("reap recovered watcher");
+
+        let storage = SqliteStorage::open_readonly(&data.join("agent_search.db"))
+            .expect("inspect recovered canonical archive");
+        let conversations: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                row.get_typed(0)
+            })
+            .expect("count historical and replacement conversations");
+        assert_eq!(
+            conversations, 2,
+            "root recovery must not duplicate a conversation"
+        );
+        let rows: Vec<(i64, String)> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT idx, content FROM messages ORDER BY conversation_id, idx",
+                &[],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .expect("inspect every canonical message");
+        assert_eq!(
+            rows,
+            [
+                (0, "baselinewatch"),
+                (1, "acknowledged"),
+                (0, "rootreplacementgh538"),
+                (1, "acknowledged"),
+                (2, "rootappendonegh538"),
+                (3, "rootappendtwogh538"),
+                (4, "rootdowntimegh538"),
+                (5, "rootafterrestartgh538"),
+            ]
+            .map(|(idx, content)| (idx, content.to_string())),
+            "recovery must preserve message order, repeated text and exactly one canonical row"
+        );
+        assert_eq!(
+            fs::read(preserved_root.join(baseline_relative)).expect("preserved original source"),
+            baseline_bytes
+        );
+        assert_eq!(snapshot_mirror(&data), preserved_mirror);
+    }
+
     /// A real contended filesystem lease must remain diagnosable and abortable,
     /// then leave the next watcher able to recover the unfinished source. This
     /// exercises the production watcher/watchdog/lock path, not a timer that

@@ -38,6 +38,13 @@ pub(super) struct WatchSourceLedger {
 }
 
 impl WatchSourceLedger {
+    /// Sources whose complete delivered stream and reconstruction inputs were
+    /// observed stable. These paths certify parsing, not publication: callers
+    /// must still require every admitted canonical/lexical batch to commit.
+    pub(super) fn completed_source_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.completions.keys()
+    }
+
     /// Discover with no wall-clock cutoff when the connector can identify
     /// sources. This also finds imported/backdated files and restart gaps.
     #[allow(clippy::too_many_arguments)]
