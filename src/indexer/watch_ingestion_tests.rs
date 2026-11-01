@@ -171,12 +171,18 @@ fn canonical_rows(handles: &Handles) -> Result<Vec<(i64, i64, i64, String)>> {
 }
 
 fn search_ids(fixture: &Fixture, term: &str) -> Result<BTreeSet<String>> {
+    // These assertions identify message bodies. An unscoped query also
+    // matches the conversation title, which every appended message inherits.
+    search_ids_for_query(fixture, &format!("content:{term}"))
+}
+
+fn search_ids_for_query(fixture: &Fixture, text: &str) -> Result<BTreeSet<String>> {
     let reader = crate::search::quill_bridge::open_cass_reader(&fixture.index_path)?;
     let parser = frankensearch::quill::query::CassQueryParser::new(
         frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
     )?;
     let query = parser.parse(
-        term,
+        text,
         &frankensearch::quill::query::CassQueryFilters::default(),
     );
     let page = crate::search::quill_bridge::search_paginated(&reader, &query.query, 512, 0, true)?;
@@ -188,6 +194,62 @@ fn search_ids(fixture: &Fixture, term: &str) -> Result<BTreeSet<String>> {
     assert_eq!(ids.len(), page.hits.len(), "duplicate lexical identities");
     assert_eq!(page.total_count, Some(ids.len()), "truncated search proof");
     Ok(ids)
+}
+
+#[test]
+#[serial]
+fn gh538_body_probe_distinguishes_inherited_title_from_message_content() -> Result<()> {
+    let fixture = Fixture::new(ConnectorKind::Codex)?;
+    let path = fixture.source("oracle", "contentprobeoriginalgh538")?;
+    let handles = Handles::open(&fixture)?;
+    assert_eq!(handles.scan(&fixture, true)?.0.published_conversations, 1);
+    let original = search_ids(&fixture, "contentprobeoriginalgh538")?;
+    assert_eq!(original.len(), 1);
+
+    fixture.append(&path, "oracle", "contentprobeappendgh538")?;
+    assert_eq!(handles.scan(&fixture, false)?.0.published_conversations, 1);
+    let appended = search_ids(&fixture, "contentprobeappendgh538")?;
+    assert_eq!(appended.len(), 1);
+    assert!(original.is_disjoint(&appended));
+    let both: BTreeSet<_> = original.union(&appended).cloned().collect();
+    assert_eq!(canonical_rows(&handles)?.len(), 2);
+    assert_eq!(
+        search_ids_for_query(&fixture, "contentprobeoriginalgh538")?,
+        both,
+        "the old all-fields oracle also selects the appended row through its title"
+    );
+    assert_eq!(search_ids(&fixture, "contentprobeoriginalgh538")?, original);
+    assert!(search_ids(&fixture, "contentprobenotpresentgh538")?.is_empty());
+
+    // Check the actual stored columns independently of the scoped-query
+    // oracle: the extra broad-query hit carries the old title but a new body.
+    let reader = crate::search::quill_bridge::open_cass_reader(&fixture.index_path)?;
+    let parser = frankensearch::quill::query::CassQueryParser::new(
+        frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+    )?;
+    let query = parser.parse(
+        "contentprobeoriginalgh538",
+        &frankensearch::quill::query::CassQueryFilters::default(),
+    );
+    let page = crate::search::quill_bridge::search_paginated(&reader, &query.query, 8, 0, true)?;
+    let hit = page
+        .hits
+        .iter()
+        .find(|hit| appended.contains(&hit.document_id))
+        .context("all-fields query must include the appended message")?;
+    let fields = crate::search::quill_bridge::QuillCassFields::compiled();
+    assert_eq!(
+        crate::search::quill_bridge::stored_text(&reader, fields.content, hit.global_docid)?
+            .as_deref(),
+        Some("contentprobeappendgh538")
+    );
+    assert!(
+        crate::search::quill_bridge::stored_text(&reader, fields.title, hit.global_docid)?
+            .is_some_and(|title| title.contains("contentprobeoriginalgh538"))
+    );
+    drop(reader);
+    handles.close()?;
+    Ok(())
 }
 
 fn assert_publication_receipts(handles: &Handles, expected: usize) -> Result<()> {
@@ -765,8 +827,19 @@ fn gh538_watch_absent_source_recovery_preserves_debt_until_commit() -> Result<()
         assert!(error.to_string().contains("injected watch lexical"));
     }
     assert_eq!(canonical_rows(&handles)?, committed);
-    assert_eq!(published_state(&fixture, &handles)?, published);
-    assert!(search_ids(&fixture, "missingretrypublicationgh538")?.is_empty());
+    let failed_state = published_state(&fixture, &handles)?;
+    assert_eq!(
+        failed_state.0, published.0,
+        "failed final commit is not completion"
+    );
+    // Pinned Quill upsert publishes a bounded replacement itself. A later
+    // caller-commit error must retain debt even when that content is visible;
+    // it cannot promise whole-callback atomicity or an unchanged MANIFEST.
+    assert_ne!(failed_state.1, published.1);
+    assert_eq!(
+        search_ids(&fixture, "missingretrypublicationgh538")?.len(),
+        1
+    );
     assert!(!load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
 
     // An active changed sibling keeps the census incomplete. Do not clear the
@@ -778,7 +851,7 @@ fn gh538_watch_absent_source_recovery_preserves_debt_until_commit() -> Result<()
     assert_eq!(held.published_conversations, 0);
     assert_eq!(deferred, BTreeSet::from([sibling]));
     assert_eq!(canonical_rows(&handles)?, committed);
-    assert_eq!(published_state(&fixture, &handles)?, published);
+    assert_eq!(published_state(&fixture, &handles)?, failed_state);
     assert!(!load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
     lease.unlock()?;
     drop(lease);
@@ -1438,10 +1511,18 @@ fn gh538_watch_absent_root_recovery_requires_commit_before_debt_clearance() -> R
         ));
     }
     assert_eq!(pending, retained);
-    assert_eq!(published_state(&fixture, &handles)?, published);
+    let failed_state = published_state(&fixture, &handles)?;
+    assert_eq!(
+        failed_state.0, published.0,
+        "failed final commit is not completion"
+    );
+    assert_ne!(
+        failed_state.1, published.1,
+        "bounded Quill upsert already published"
+    );
     assert_eq!(canonical_rows(&handles)?, rows);
     assert_eq!(load_watch_state(&fixture.options.data_dir), watch_state);
-    assert!(search_ids(&fixture, "absentrootpublicationgh538")?.is_empty());
+    assert_eq!(search_ids(&fixture, "absentrootpublicationgh538")?.len(), 1);
     assert!(!load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
     assert_eq!(
         fixture
