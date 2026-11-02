@@ -5058,9 +5058,19 @@ mod tests {
             std::slice::from_ref(&db_link),
         )
         .expect_err("symlink manifest should be rejected");
+        assert_eq!(
+            err.to_string(),
+            "raw mirror manifest path contains a symlink"
+        );
+        assert_eq!(
+            fs::read(&outside).expect("unchanged outside manifest"),
+            b"{}"
+        );
         assert!(
-            err.to_string().contains("symlink raw mirror manifest"),
-            "unexpected symlink-manifest error: {err}"
+            fs::symlink_metadata(manifest_dir.join("link.json"))
+                .expect("preserved manifest symlink")
+                .file_type()
+                .is_symlink()
         );
     }
 
