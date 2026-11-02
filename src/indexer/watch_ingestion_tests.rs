@@ -3,6 +3,7 @@
 //! Quill publication; the active-source control holds a real advisory lock.
 
 use super::*;
+use frankensearch::quill::query::{Query, QueryField};
 use serial_test::serial;
 use tempfile::TempDir;
 
@@ -173,19 +174,22 @@ fn canonical_rows(handles: &Handles) -> Result<Vec<(i64, i64, i64, String)>> {
 fn search_ids(fixture: &Fixture, term: &str) -> Result<BTreeSet<String>> {
     // These assertions identify message bodies. An unscoped query also
     // matches the conversation title, which every appended message inherits.
-    search_ids_for_query(fixture, &format!("content:{term}"))
+    // CASS's parser sanitizes ':' rather than implementing field syntax.
+    assert!(
+        !term.is_empty()
+            && term
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+        "body probes require one normalized term"
+    );
+    let fields = crate::search::quill_bridge::QuillCassFields::compiled();
+    let query = Query::term(vec![QueryField::new(fields.content, 1.0)], term.to_owned());
+    search_ids_for_query(fixture, &query)
 }
 
-fn search_ids_for_query(fixture: &Fixture, text: &str) -> Result<BTreeSet<String>> {
+fn search_ids_for_query(fixture: &Fixture, query: &Query) -> Result<BTreeSet<String>> {
     let reader = crate::search::quill_bridge::open_cass_reader(&fixture.index_path)?;
-    let parser = frankensearch::quill::query::CassQueryParser::new(
-        frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
-    )?;
-    let query = parser.parse(
-        text,
-        &frankensearch::quill::query::CassQueryFilters::default(),
-    );
-    let page = crate::search::quill_bridge::search_paginated(&reader, &query.query, 512, 0, true)?;
+    let page = crate::search::quill_bridge::search_paginated(&reader, query, 512, 0, true)?;
     let ids: BTreeSet<_> = page
         .hits
         .iter()
@@ -213,8 +217,15 @@ fn gh538_body_probe_distinguishes_inherited_title_from_message_content() -> Resu
     assert!(original.is_disjoint(&appended));
     let both: BTreeSet<_> = original.union(&appended).cloned().collect();
     assert_eq!(canonical_rows(&handles)?.len(), 2);
+    let parser = frankensearch::quill::query::CassQueryParser::new(
+        frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+    )?;
+    let query = parser.parse(
+        "contentprobeoriginalgh538",
+        &frankensearch::quill::query::CassQueryFilters::default(),
+    );
     assert_eq!(
-        search_ids_for_query(&fixture, "contentprobeoriginalgh538")?,
+        search_ids_for_query(&fixture, &query.query)?,
         both,
         "the old all-fields oracle also selects the appended row through its title"
     );
@@ -224,13 +235,6 @@ fn gh538_body_probe_distinguishes_inherited_title_from_message_content() -> Resu
     // Check the actual stored columns independently of the scoped-query
     // oracle: the extra broad-query hit carries the old title but a new body.
     let reader = crate::search::quill_bridge::open_cass_reader(&fixture.index_path)?;
-    let parser = frankensearch::quill::query::CassQueryParser::new(
-        frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
-    )?;
-    let query = parser.parse(
-        "contentprobeoriginalgh538",
-        &frankensearch::quill::query::CassQueryFilters::default(),
-    );
     let page = crate::search::quill_bridge::search_paginated(&reader, &query.query, 8, 0, true)?;
     let hit = page
         .hits
