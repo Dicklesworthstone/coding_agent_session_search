@@ -130,6 +130,51 @@ RECEIPT
     awk '/; echo STAGE=ubs EXIT=/ { print }' "$proof_dir/inspect-real-batch.log" > "$proof_dir/scope-invocation.txt"
     check_exit acquired-scanner-not-selected 1 grep -F './.rch-tmp/' "$proof_dir/scope-invocation.txt"
 
+    # Execute the real batch's setup with an inherited worker profile. These
+    # are environment/quoting checks, not substitutes for Cargo or RCH proof.
+    # Leave every compiler, test, scanner and receipt requirement untouched.
+    check_exit requested-job-profile 0 env GATE_BASE=HEAD CARGO_BUILD_JOBS=1 \
+        CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+        bash "$scope_root/scripts/gate.sh" --no-lib --no-bin --no-goldens \
+        --integration '' --print-remote-script
+    awk '/^test_log_counts \(\)/ { batch=1 } batch && /^echo SOURCE_HEAD=/ { exit } batch { print }' "$proof_dir/requested-job-profile.log" \
+        > "$proof_dir/requested-job-setup.sh"
+    check_exit requested-profile-overrides-worker-defaults 0 env \
+        CARGO_BUILD_JOBS=7 CARGO_INCREMENTAL=1 CARGO_PROFILE_DEV_DEBUG=line-tables-only \
+        CARGO_PROFILE_TEST_DEBUG=line-tables-only RCH_ENV_ALLOWLIST=RUSTFLAGS \
+        bash -c 'source "$1"; test "$CARGO_BUILD_JOBS" = 1 &&
+            test "$CARGO_INCREMENTAL" = 0 && test "$CARGO_PROFILE_DEV_DEBUG" = 0 &&
+            test "$CARGO_PROFILE_TEST_DEBUG" = 0 && test "$RCH_ENV_ALLOWLIST" = RUSTFLAGS' \
+        _ "$proof_dir/requested-job-setup.sh"
+    check_exit unset-job-profile 0 env -u CARGO_BUILD_JOBS -u CARGO_INCREMENTAL \
+        -u CARGO_PROFILE_DEV_DEBUG -u CARGO_PROFILE_TEST_DEBUG GATE_BASE=HEAD \
+        bash "$scope_root/scripts/gate.sh" --no-lib --no-bin --no-goldens \
+        --integration '' --print-remote-script
+    awk '/^test_log_counts \(\)/ { batch=1 } batch && /^echo SOURCE_HEAD=/ { exit } batch { print }' "$proof_dir/unset-job-profile.log" \
+        > "$proof_dir/unset-job-setup.sh"
+    check_exit unset-profile-preserves-worker-defaults 0 env \
+        CARGO_BUILD_JOBS=7 CARGO_INCREMENTAL=1 CARGO_PROFILE_DEV_DEBUG=line-tables-only \
+        CARGO_PROFILE_TEST_DEBUG=line-tables-only bash -c 'source "$1";
+            test "$CARGO_BUILD_JOBS" = 7 && test "$CARGO_INCREMENTAL" = 1 &&
+            test "$CARGO_PROFILE_DEV_DEBUG" = line-tables-only &&
+            test "$CARGO_PROFILE_TEST_DEBUG" = line-tables-only' _ "$proof_dir/unset-job-setup.sh"
+    literal_profile='$(touch '"$proof_dir"'/job-env-injected)'
+    check_exit literal-job-profile 0 env GATE_BASE=HEAD "CARGO_PROFILE_DEV_DEBUG=$literal_profile" \
+        CARGO_PROFILE_TEST_DEBUG='' CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=false \
+        CASS_RAW_MIRROR_MIN_FREE_BYTES=0 bash "$scope_root/scripts/gate.sh" \
+        --no-lib --no-bin --no-goldens --integration '' --print-remote-script
+    check_exit literal-job-profile-is-shell 0 bash -n "$proof_dir/literal-job-profile.log"
+    awk '/^test_log_counts \(\)/ { batch=1 } batch && /^echo SOURCE_HEAD=/ { exit } batch { print }' "$proof_dir/literal-job-profile.log" \
+        > "$proof_dir/literal-job-setup.sh"
+    check_exit literal-and-empty-profile-preserved 0 env CARGO_PROFILE_TEST_DEBUG=line-tables-only \
+        bash -c 'source "$1"; test "$CARGO_PROFILE_DEV_DEBUG" = "$2" &&
+            test "${CARGO_PROFILE_TEST_DEBUG+x}" = x && test -z "$CARGO_PROFILE_TEST_DEBUG"' \
+        _ "$proof_dir/literal-job-setup.sh" "$literal_profile"
+    check_exit profile-cannot-execute-shell-input 1 test -e "$proof_dir/job-env-injected"
+    check_exit assertions-and-storage-policy-not-forwarded 1 \
+        grep -E '^export (CARGO_PROFILE_TEST_DEBUG_ASSERTIONS|CASS_RAW_MIRROR_MIN_FREE_BYTES)=' \
+        "$proof_dir/literal-job-profile.log"
+
     printf 'running 3 tests\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out\n' > "$proof_dir/tests-positive.txt"
     printf 'running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out\n' > "$proof_dir/tests-empty.txt"
     printf 'running 3 tests\n' > "$proof_dir/tests-truncated.txt"
@@ -216,7 +261,7 @@ TESTS
         echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
     } > "$proof_dir/tests-nested-filter.txt"
     check_exit child-only-filter-match-rejected 1 bash "$gate" --verify-test-log "$proof_dir/tests-nested-filter.txt" parent::real_match child::only_match
-    check_exit repeated-integration-target 2 bash "$gate" --integration 'e2e_lexical_fail_open:a,e2e_lexical_fail_open:b'
+    check_exit repeated-integration-target 2 env GATE_BASE=HEAD bash "$scope_root/scripts/gate.sh" --integration 'e2e_lexical_fail_open:a,e2e_lexical_fail_open:b'
 
     # Exercise actual source admission and filesystem timestamps, without
     # invoking or substituting Cargo. An old build-script fingerprint must

@@ -521,8 +521,21 @@ fi;"
     EXPECTED_STAGES+=(docs-build docs-binary-identity docs-truth)
 fi
 
+# RCH does not forward ambient Cargo settings unless they are allowlisted,
+# and its worker profile can then replace the requested debug-info setting.
+# Carry only these build-resource choices in the actual batch. Unset values
+# retain worker defaults; assertion, feature, scanner and timeout policy stays
+# unchanged. Quote values as shell data, including empty or invalid values,
+# so Cargo still validates them instead of executing or silently dropping them.
+cargo_profile_env=""
+for cargo_env_key in CARGO_BUILD_JOBS CARGO_INCREMENTAL CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG; do
+    if [[ -v "$cargo_env_key" ]]; then
+        printf -v cargo_env_export 'export %s=%q\n' "$cargo_env_key" "${!cargo_env_key}"
+        cargo_profile_env+="$cargo_env_export"
+    fi
+done
 REMOTE_SCRIPT="$(declare -f test_log_counts run_tests run_fmt run_ubs prepare_compile_inputs)
-set -o pipefail
+${cargo_profile_env}set -o pipefail
 echo SOURCE_HEAD=${SOURCE_HEAD}
 prepare_compile_inputs '${SOURCE_PATHS}' '${SOURCE_CONTENT}' || exit 1
 run_fmt; echo STAGE=fmt EXIT=\$?; \
