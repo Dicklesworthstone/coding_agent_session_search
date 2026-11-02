@@ -216,7 +216,9 @@ fn gh538_body_probe_distinguishes_inherited_title_from_message_content() -> Resu
     assert_eq!(appended.len(), 1);
     assert!(original.is_disjoint(&appended));
     let both: BTreeSet<_> = original.union(&appended).cloned().collect();
-    assert_eq!(canonical_rows(&handles)?.len(), 2);
+    let rows = canonical_rows(&handles)?;
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.0 == rows[0].0));
     let parser = frankensearch::quill::query::CassQueryParser::new(
         frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
     )?;
@@ -232,8 +234,9 @@ fn gh538_body_probe_distinguishes_inherited_title_from_message_content() -> Resu
     assert_eq!(search_ids(&fixture, "contentprobeoriginalgh538")?, original);
     assert!(search_ids(&fixture, "contentprobenotpresentgh538")?.is_empty());
 
-    // Check the actual stored columns independently of the scoped-query
-    // oracle: the extra broad-query hit carries the old title but a new body.
+    // Content is indexed but not stored in CASS_SEMANTIC_SCHEMA. Bind the
+    // hit's stored message index to its canonical SQLite body instead; the
+    // independently stored title still carries the original term.
     let reader = crate::search::quill_bridge::open_cass_reader(&fixture.index_path)?;
     let page = crate::search::quill_bridge::search_paginated(&reader, &query.query, 8, 0, true)?;
     let hit = page
@@ -243,15 +246,251 @@ fn gh538_body_probe_distinguishes_inherited_title_from_message_content() -> Resu
         .context("all-fields query must include the appended message")?;
     let fields = crate::search::quill_bridge::QuillCassFields::compiled();
     assert_eq!(
-        crate::search::quill_bridge::stored_text(&reader, fields.content, hit.global_docid)?
-            .as_deref(),
-        Some("contentprobeappendgh538")
+        crate::search::quill_bridge::stored_u64(&reader, fields.conversation_id, hit.global_docid)?,
+        Some(u64::try_from(rows[0].0)?)
+    );
+    assert_eq!(
+        crate::search::quill_bridge::stored_u64(&reader, fields.msg_idx, hit.global_docid)?,
+        Some(1)
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.2 == 1)
+            .map(|row| row.3.as_str())
+            .collect::<Vec<_>>(),
+        vec!["contentprobeappendgh538"]
     );
     assert!(
         crate::search::quill_bridge::stored_text(&reader, fields.title, hit.global_docid)?
             .is_some_and(|title| title.contains("contentprobeoriginalgh538"))
     );
     drop(reader);
+    handles.close()?;
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn gh538_watch_checkpoint_requires_published_coverage_and_no_replay_debt() -> Result<()> {
+    let fixture = Fixture::new(ConnectorKind::Codex)?;
+    let source = fixture.source("checkpoint", "checkpointbaselinegh538")?;
+    let handles = Handles::open(&fixture)?;
+    let refresh = || -> Result<bool> {
+        let storage = handles.storage.lock().unwrap();
+        let index = handles.index.lock().unwrap();
+        refresh_completed_watch_lexical_checkpoint(
+            &storage,
+            index.as_ref().context("live lexical writer")?,
+            &fixture.options.db_path,
+            &fixture.index_path,
+        )
+    };
+    assert_eq!(handles.scan(&fixture, true)?.0.published_conversations, 1);
+    assert!(refresh()?);
+    let baseline =
+        load_lexical_rebuild_checkpoint(&fixture.index_path)?.context("baseline checkpoint")?;
+    assert_eq!(baseline.indexed_docs, 1);
+    // Ordinary indexing may do the independent full verification; the live
+    // callback must use that observation without cold-scanning old bodies.
+    assert_eq!(
+        expected_live_lexical_doc_count_cached(
+            &handles.storage.lock().unwrap(),
+            &fixture.index_path,
+            &fixture.options.db_path.to_string_lossy(),
+            1,
+            None,
+        )?,
+        1
+    );
+
+    // Deliberately omit replay debt as an independent negative control:
+    // canonical coverage alone must still reject the old lexical writer.
+    let conversation_id = canonical_rows(&handles)?[0].0;
+    handles.storage.lock().unwrap().raw().execute_compat(
+        "INSERT INTO messages(conversation_id, idx, role, content)
+         VALUES(?1, 1, 'user', 'checkpointappendgh538')",
+        &[ParamValue::from(conversation_id)],
+    )?;
+    assert!(!refresh()?);
+    assert_eq!(
+        load_lexical_rebuild_checkpoint(&fixture.index_path)?.context("preserved checkpoint")?,
+        baseline
+    );
+    // Even a checkpoint claiming this canonical fingerprint and the old
+    // writer's count cannot substitute for independent coverage validation.
+    let mut claimed = load_lexical_rebuild_state(&fixture.index_path)?
+        .context("checkpoint state to challenge")?;
+    claimed.db =
+        lexical_rebuild_db_state(&handles.storage.lock().unwrap(), &fixture.options.db_path)?;
+    persist_lexical_rebuild_state(&fixture.index_path, &claimed)?;
+    let unverified =
+        load_lexical_rebuild_checkpoint(&fixture.index_path)?.context("unverified checkpoint")?;
+    assert!(!refresh()?);
+    assert_eq!(
+        load_lexical_rebuild_checkpoint(&fixture.index_path)?.context("refused certification")?,
+        unverified
+    );
+    // Real watch ingestion records replay debt in the same canonical
+    // transaction. Restore that obligation before exercising its recovery.
+    persist_watch_lexical_replay_debt(
+        &handles.storage.lock().unwrap(),
+        &WatchLexicalReplayDebt::for_root(fixture.kind, &fixture.root),
+    )?;
+    fixture.append(&source, "checkpoint", "checkpointappendgh538")?;
+    assert_eq!(handles.scan(&fixture, false)?.0.published_conversations, 1);
+    assert_eq!(search_ids(&fixture, "checkpointappendgh538")?.len(), 1);
+    assert!(refresh()?);
+    assert_eq!(
+        load_lexical_rebuild_checkpoint(&fixture.index_path)?
+            .context("advanced checkpoint")?
+            .indexed_docs,
+        2
+    );
+
+    // Canonical hard noise is intentionally absent from the lexical sink.
+    // Preserve the existing independent noise-adjusted coverage criterion.
+    handles.storage.lock().unwrap().raw().execute_compat(
+        "INSERT INTO messages(conversation_id, idx, role, content)
+         VALUES(?1, 2, 'tool', '')",
+        &[ParamValue::from(conversation_id)],
+    )?;
+    assert_eq!(canonical_rows(&handles)?.len(), 3);
+    assert!(refresh()?);
+    let published = load_lexical_rebuild_checkpoint(&fixture.index_path)?
+        .context("noise-adjusted checkpoint")?;
+    assert_eq!(published.indexed_docs, 2);
+    persist_watch_lexical_replay_debt(
+        &handles.storage.lock().unwrap(),
+        &WatchLexicalReplayDebt::for_root(fixture.kind, &fixture.root),
+    )?;
+    assert!(!refresh()?);
+    assert_eq!(
+        load_lexical_rebuild_checkpoint(&fixture.index_path)?.context("debt checkpoint")?,
+        published
+    );
+    handles.close()?;
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn gh538_bounded_watch_count_cache_defers_cold_and_expired_verification() -> Result<()> {
+    let fixture = Fixture::new(ConnectorKind::Codex)?;
+    let source = fixture.source("bounded", "boundedbaselinegh538")?;
+    let handles = Handles::open(&fixture)?;
+    assert_eq!(handles.scan(&fixture, true)?.0.published_conversations, 1);
+    let count = |allow_full_scan| -> Result<Option<usize>> {
+        let storage = handles.storage.lock().unwrap();
+        expected_live_lexical_doc_count_cached_with_scan_policy(
+            &storage,
+            &fixture.index_path,
+            &fixture.options.db_path.to_string_lossy(),
+            count_total_messages_exact(&storage)?,
+            None,
+            allow_full_scan,
+        )
+    };
+    let cache_path = expected_lexical_docs_cache_path(&fixture.index_path)
+        .context("expected document cache path")?;
+    assert!(!cache_path.exists());
+    assert_eq!(count(false)?, None);
+    assert!(
+        !cache_path.exists(),
+        "bounded lookup must not create a full-scan observation"
+    );
+    assert_eq!(count(true)?, Some(1));
+    assert_eq!(count(false)?, Some(1));
+
+    let mut cached: ExpectedLexicalDocsCache = serde_json::from_slice(&fs::read(&cache_path)?)?;
+    cached.delta_generations = EXPECTED_LEXICAL_DOCS_MAX_DELTA_GENERATIONS;
+    fs::write(&cache_path, serde_json::to_vec(&cached)?)?;
+    let capped = fs::read(&cache_path)?;
+    fixture.append(&source, "bounded", "boundedappendgh538")?;
+    assert_eq!(handles.scan(&fixture, false)?.0.published_conversations, 1);
+    assert_eq!(canonical_rows(&handles)?.len(), 2);
+    assert_eq!(search_ids(&fixture, "boundedappendgh538")?.len(), 1);
+    assert_eq!(count(false)?, None);
+    assert_eq!(
+        fs::read(&cache_path)?,
+        capped,
+        "no hidden full-scan cache refresh"
+    );
+    assert_eq!(count(true)?, Some(2));
+    let verified: ExpectedLexicalDocsCache = serde_json::from_slice(&fs::read(&cache_path)?)?;
+    assert_eq!(verified.delta_generations, 0);
+    assert_eq!(count(false)?, Some(2));
+    handles.close()?;
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn gh538_failed_full_watch_census_preserves_durable_watermarks_until_publication() -> Result<()> {
+    let fixture = Fixture::new(ConnectorKind::Codex)?;
+    fixture.source("watermark-base", "watermarkbaselinegh538")?;
+    let handles = Handles::open(&fixture)?;
+    assert_eq!(handles.scan(&fixture, true)?.0.published_conversations, 1);
+    let baseline_ids = search_ids(&fixture, "watermarkbaselinegh538")?;
+    fixture.source("watermark-arriving", "watermarkarrivalgh538")?;
+    // Seed older durable progress, then observe the actual trigger and
+    // payload timestamps. Opening a directory just to set its mtime requires
+    // platform-specific handle flags on Windows.
+    let root_timestamp = i64::try_from(
+        fs::metadata(&fixture.root.path)?
+            .modified()?
+            .duration_since(UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    let payload_timestamp =
+        chrono::DateTime::parse_from_rfc3339("2025-09-30T15:43:00.000Z")?.timestamp_millis();
+    let next_watermark = root_timestamp.max(payload_timestamp);
+    {
+        let mut state = handles.state.lock().unwrap();
+        state.insert(fixture.kind, next_watermark.saturating_sub(60_000));
+        save_watch_state(&fixture.options.data_dir, &state)?;
+    }
+    let watermark_before = fs::read(state_path(&fixture.options.data_dir))?;
+    assert_eq!(
+        load_watch_state(&fixture.options.data_dir).get(&fixture.kind),
+        Some(&next_watermark.saturating_sub(60_000))
+    );
+    let census = || {
+        reindex_full_watch_roots(
+            &fixture.options,
+            &fixture.roots(),
+            &handles.state,
+            &handles.storage,
+            &handles.index,
+            &fixture.index_path,
+            &ActiveSessionSourceFilter::with_recent_write_window_for_test(None),
+        )
+    };
+    {
+        let _fault = FaultGuard::set(WatchLexicalTestFault::Commit);
+        assert!(census().is_err());
+    }
+    assert_eq!(
+        fs::read(state_path(&fixture.options.data_dir))?,
+        watermark_before
+    );
+    assert_eq!(
+        search_ids(&fixture, "watermarkbaselinegh538")?,
+        baseline_ids
+    );
+    assert!(search_ids(&fixture, "watermarkarrivalgh538")?.is_empty());
+    assert!(!load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+    assert!(census()?.published_conversations > 0);
+    assert_eq!(search_ids(&fixture, "watermarkarrivalgh538")?.len(), 1);
+    assert_eq!(
+        search_ids(&fixture, "watermarkbaselinegh538")?,
+        baseline_ids
+    );
+    assert_eq!(canonical_rows(&handles)?.len(), 2);
+    assert!(load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+    assert_eq!(
+        load_watch_state(&fixture.options.data_dir).get(&fixture.kind),
+        Some(&next_watermark)
+    );
     handles.close()?;
     Ok(())
 }

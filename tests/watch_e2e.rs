@@ -801,7 +801,22 @@ mod deferred_watch_sources {
         assert_eq!(status["pending"]["watch_active"], true, "{status}");
         assert_eq!(status["pending"]["sessions"], 0, "{status}");
         assert_eq!(status["index"]["status"], "ready", "{status}");
-        assert_eq!(status["index"]["documents"], 23, "{status}");
+        // The five Codex fixture conversations each contain one
+        // "acknowledged" assistant message. They remain canonical evidence
+        // but are intentionally excluded from lexical search as hard noise.
+        assert_eq!(status["database"]["messages"], 23, "{status}");
+        assert_eq!(status["index"]["documents"], 18, "{status}");
+        assert_eq!(status["index"]["live_documents"], 18, "{status}");
+        assert_eq!(
+            content_hit_count(&search(home.path(), &data, "ready"), "ready"),
+            2,
+            "both Claude assistant bodies must remain searchable"
+        );
+        assert_eq!(
+            content_hit_count(&search(home.path(), &data, "acknowledged"), "acknowledged"),
+            0,
+            "canonical acknowledgements must stay out of the lexical sink"
+        );
 
         let restarted_logs = fs::read_to_string(&restart_log).expect("restart watch evidence");
         assert!(
@@ -876,6 +891,13 @@ mod deferred_watch_sources {
             ),
         ];
         assert_eq!(rows.len(), 23, "no hidden or duplicate canonical messages");
+        assert_eq!(
+            rows.iter()
+                .filter(|(_, content)| content == "acknowledged")
+                .count(),
+            5,
+            "all five excluded lexical acknowledgements remain canonical"
+        );
         for (path, messages) in expected {
             let canonical = fs::canonicalize(path).expect("canonical fixture path");
             let actual: Vec<&str> = rows

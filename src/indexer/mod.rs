@@ -11180,6 +11180,25 @@ fn expected_live_lexical_doc_count_cached(
     total_messages: usize,
     progress: Option<&IndexingProgress>,
 ) -> Result<usize> {
+    expected_live_lexical_doc_count_cached_with_scan_policy(
+        storage,
+        index_path,
+        db_path,
+        total_messages,
+        progress,
+        true,
+    )?
+    .context("full expected lexical document verification did not return a count")
+}
+
+fn expected_live_lexical_doc_count_cached_with_scan_policy(
+    storage: &FrankenStorage,
+    index_path: &Path,
+    db_path: &str,
+    total_messages: usize,
+    progress: Option<&IndexingProgress>,
+    allow_full_scan: bool,
+) -> Result<Option<usize>> {
     let current = expected_lexical_docs_identity(storage, total_messages)?;
     let cache_path = expected_lexical_docs_cache_path(index_path)
         .filter(|path| path.parent().is_some_and(Path::is_dir));
@@ -11194,7 +11213,10 @@ fn expected_live_lexical_doc_count_cached(
             cached.schema_version == EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION
                 && lexical_rebuild_db_paths_match(&cached.db_path, db_path)
         });
-    let full_scan = || {
+    let full_scan = || -> Result<Option<usize>> {
+        if !allow_full_scan {
+            return Ok(None);
+        }
         expected_live_lexical_doc_count_resumable(
             storage,
             partial_path.as_deref(),
@@ -11202,18 +11224,25 @@ fn expected_live_lexical_doc_count_cached(
             &current,
             progress,
         )
+        .map(Some)
     };
     let (expected_docs, delta_generations, source) = match cached {
         Some(cached) if cached.identity == current => {
-            return Ok(cached.expected_docs);
+            return Ok(Some(cached.expected_docs));
         }
         Some(cached) if cached.delta_generations < EXPECTED_LEXICAL_DOCS_MAX_DELTA_GENERATIONS => {
             match expected_live_lexical_doc_count_delta(storage, &cached, &current)? {
                 Some(expected) => (expected, cached.delta_generations + 1, "delta"),
-                None => (full_scan()?, 0, "full"),
+                None => match full_scan()? {
+                    Some(expected) => (expected, 0, "full"),
+                    None => return Ok(None),
+                },
             }
         }
-        _ => (full_scan()?, 0, "full"),
+        _ => match full_scan()? {
+            Some(expected) => (expected, 0, "full"),
+            None => return Ok(None),
+        },
     };
     tracing::debug!(
         expected_lexical_docs = expected_docs,
@@ -11233,7 +11262,7 @@ fn expected_live_lexical_doc_count_cached(
             },
         );
     }
-    Ok(expected_docs)
+    Ok(Some(expected_docs))
 }
 
 fn max_conversation_id_exact(storage: &FrankenStorage) -> Result<Option<i64>> {
@@ -13261,6 +13290,7 @@ fn published_lexical_index_validated_for_current_data(index_path: &Path, db_path
     }
 }
 
+/// Whether independent coverage validation certified the completed checkpoint.
 fn persist_completed_lexical_rebuild_checkpoint_from_observations(
     storage: &FrankenStorage,
     index_path: &Path,
@@ -13268,13 +13298,14 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
     total_messages: usize,
     max_conversation_id: Option<i64>,
     observed_tantivy_docs: Option<usize>,
-) -> Result<()> {
+    allow_full_expected_doc_scan: bool,
+) -> Result<bool> {
     let total_conversations = db_state.total_conversations;
     let observed_tantivy_docs = match observed_tantivy_docs {
         Some(observed_tantivy_docs) => observed_tantivy_docs,
         None => {
             let Some(observed_tantivy_docs) = live_tantivy_doc_count(index_path)? else {
-                return Ok(());
+                return Ok(false);
             };
             observed_tantivy_docs
         }
@@ -13291,13 +13322,22 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
     let expected_docs = if observed_tantivy_docs == total_messages {
         total_messages
     } else {
-        expected_live_lexical_doc_count_cached(
+        let Some(expected_docs) = expected_live_lexical_doc_count_cached_with_scan_policy(
             storage,
             index_path,
             &db_state.db_path,
             total_messages,
             None,
+            allow_full_expected_doc_scan,
         )?
+        else {
+            tracing::debug!(
+                path = %index_path.display(),
+                "deferring watch checkpoint refresh until full expected-document verification"
+            );
+            return Ok(false);
+        };
+        expected_docs
     };
     if observed_tantivy_docs != expected_docs {
         tracing::debug!(
@@ -13307,7 +13347,7 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
             canonical_messages = total_messages,
             "skipping lexical checkpoint refresh because the live Tantivy index does not match the noise-adjusted expected document count"
         );
-        return Ok(());
+        return Ok(false);
     }
 
     let committed_meta_fingerprint = index_meta_fingerprint(index_path)?;
@@ -13358,7 +13398,7 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
             total_messages,
             "skipping lexical checkpoint rewrite because the completed state already matches the live Tantivy index"
         );
-        return Ok(());
+        return Ok(true);
     }
 
     state.db = db_state;
@@ -13375,7 +13415,8 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
     state.completed = true;
     state.committed_meta_fingerprint = committed_meta_fingerprint;
     state.updated_at_ms = FrankenStorage::now_millis();
-    persist_lexical_rebuild_state(index_path, &state)
+    persist_lexical_rebuild_state(index_path, &state)?;
+    Ok(true)
 }
 
 /// 5ajer: the final checkpoint refresh runs after the scan has parked every
@@ -13412,6 +13453,46 @@ fn refresh_completed_lexical_rebuild_checkpoint(
         total_messages,
         max_conversation_id,
         None,
+        true,
+    )
+    .map(|_| ())
+}
+
+fn refresh_completed_watch_lexical_checkpoint(
+    storage: &FrankenStorage,
+    index: &TantivyIndex,
+    db_path: &Path,
+    index_path: &Path,
+) -> Result<bool> {
+    // An absent, invalidated or expired expectation must not trigger a scan
+    // of old message bodies on the live callback. Ordinary indexing performs
+    // that verification; until then this checkpoint stays uncertified.
+    // A successful source can publish while another source still owes a
+    // replay. Never certify that partially published canonical archive.
+    if !load_watch_lexical_replay_debt(storage)?.is_empty() {
+        return Ok(false);
+    }
+    let observed_docs = usize::try_from(index.doc_count()?)?;
+    let total_conversations = count_total_conversations_exact(storage)?;
+    let total_messages = count_total_messages_exact(storage)?;
+    let max_conversation_id = max_conversation_id_exact(storage)?;
+    let db_state = lexical_rebuild_db_state_with_exact_totals(
+        storage,
+        db_path,
+        total_conversations,
+        total_messages,
+    )?;
+    // Use the committed writer's verified count rather than opening a new
+    // reader and hashing every lexical segment on each watch callback. The
+    // existing independent, noise-adjusted coverage check still applies.
+    persist_completed_lexical_rebuild_checkpoint_from_observations(
+        storage,
+        index_path,
+        db_state,
+        total_messages,
+        max_conversation_id,
+        Some(observed_docs),
+        false,
     )
 }
 
@@ -13446,7 +13527,9 @@ fn refresh_completed_lexical_rebuild_checkpoint_for_final_state(
             total_messages,
             max_conversation_id,
             None,
-        );
+            true,
+        )
+        .map(|_| ());
     }
 
     if keep_storage_open {
@@ -13483,9 +13566,10 @@ fn refresh_completed_lexical_rebuild_checkpoint_for_final_state(
         total_messages,
         max_conversation_id,
         None,
+        true,
     );
     settled.close_best_effort_in_place();
-    result
+    result.map(|_| ())
 }
 
 fn persist_final_index_run_metadata(
@@ -20161,6 +20245,7 @@ fn run_index_with_storage_ownership(
             .filter(|&v| v > 0) // guard against division by zero
             .unwrap_or(50); // recycle every 50 watch callbacks
         let watch_storage_reopen_pending = std::cell::Cell::new(false);
+        let watch_lexical_checkpoint_pending = std::cell::Cell::new(false);
 
         // Semantic embedding cooldown state for watch mode.
         // The initial pass already embedded everything, so we start the clock
@@ -20246,33 +20331,27 @@ fn run_index_with_storage_ownership(
                 let active_source_filter = ActiveSessionSourceFilter::new(!watch_once_mode);
                 let mut retry_sources = BTreeSet::new();
                 let indexed = if is_rebuild {
-                    if let Ok(mut g) = state.lock() {
-                        g.clear();
-                        if let Err(e) = save_watch_state(&opts_clone.data_dir, &g) {
-                            tracing::warn!("failed to save watch state: {e}");
-                        }
-                    }
                     // Reset stale detector on rebuild
                     detector_clone.reset();
                     // For rebuild, trigger reindex on all active roots
-                    let all_root_paths: Vec<PathBuf> =
-                        roots.iter().map(|(_, root)| root.path.clone()).collect();
-                    let indexed = reindex_paths_with_semantic_delta(
+                    let indexed = reindex_full_watch_roots(
                         &opts_clone,
-                        all_root_paths,
                         roots,
                         &state,
                         &storage_for_watch,
                         &t_index,
                         &index_path_for_watch,
-                        true,
-                        None,
                         &active_source_filter,
                     )
                     .map(|outcome| {
                         retry_sources.extend(outcome.retry_sources);
                         outcome.published_conversations
                     });
+                    if !watch_once_mode
+                        && (indexed.is_err() || indexed.as_ref().is_ok_and(|count| *count > 0))
+                    {
+                        watch_lexical_checkpoint_pending.set(true);
+                    }
                     finalize_watch_reindex_result(
                         indexed,
                         &detector_clone,
@@ -20340,23 +20419,27 @@ fn run_index_with_storage_ownership(
                     }
                     indexed
                 } else {
+                    let indexed = reindex_paths_with_semantic_delta(
+                        &opts_clone,
+                        paths,
+                        roots,
+                        &state,
+                        &storage_for_watch,
+                        &t_index,
+                        &index_path_for_watch,
+                        false,
+                        None,
+                        &active_source_filter,
+                    )
+                    .map(|outcome| {
+                        retry_sources.extend(outcome.retry_sources);
+                        outcome.published_conversations
+                    });
+                    if indexed.is_err() || indexed.as_ref().is_ok_and(|count| *count > 0) {
+                        watch_lexical_checkpoint_pending.set(true);
+                    }
                     let indexed = finalize_watch_reindex_result(
-                        reindex_paths_with_semantic_delta(
-                            &opts_clone,
-                            paths,
-                            roots,
-                            &state,
-                            &storage_for_watch,
-                            &t_index,
-                            &index_path_for_watch,
-                            false,
-                            None,
-                            &active_source_filter,
-                        )
-                        .map(|outcome| {
-                            retry_sources.extend(outcome.retry_sources);
-                            outcome.published_conversations
-                        }),
+                        indexed,
                         &detector_clone,
                         opts_clone.progress.as_ref(),
                         "watch incremental reindex",
@@ -20379,6 +20462,34 @@ fn run_index_with_storage_ownership(
                     }
                     indexed
                 };
+
+                if !watch_once_mode && watch_lexical_checkpoint_pending.get() {
+                    let refreshed = (|| -> Result<bool> {
+                        let storage = storage_for_watch
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+                        let index = t_index
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("lexical index lock poisoned"))?;
+                        let Some(index) = index.as_ref() else {
+                            return Ok(false);
+                        };
+                        refresh_completed_watch_lexical_checkpoint(
+                            &storage,
+                            index,
+                            &opts_clone.db_path,
+                            &index_path_for_watch,
+                        )
+                    })();
+                    match refreshed {
+                        Ok(true) => watch_lexical_checkpoint_pending.set(false),
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "watch lexical checkpoint refresh failed; retaining pending refresh"
+                        ),
+                    }
+                }
 
                 // Reconcile every pending canonical change, including earlier
                 // cooldown-skipped callbacks, before publishing current coverage.
@@ -32082,12 +32193,65 @@ impl WatchEventBacklog {
     }
 }
 
-/// The notify thread must never wait for indexing or retain an unbounded event
-/// queue. Contention is treated like a kernel event overflow: the next scan
-/// visits every watched root without trusting its prior event watermark.
+/// Notification producers share one path/count budget across the coalesced
+/// backlog and its nonblocking contention handoff. The consumer never holds
+/// the backlog lock while scanning, and producers never wait for that lock.
+struct WatchNotificationMailbox {
+    backlog: Mutex<WatchEventBacklog>,
+    deferred_tx: Sender<PathBuf>,
+    deferred_rx: Receiver<PathBuf>,
+    // High 32 bits count paths; low 32 bits charge PathBuf capacities. Both
+    // limits fit their halves, so one atomic reservation covers both queues.
+    retained: AtomicU64,
+}
+
+impl Default for WatchNotificationMailbox {
+    fn default() -> Self {
+        let (deferred_tx, deferred_rx) = bounded(WATCH_PENDING_MAX_PATHS);
+        Self {
+            backlog: Mutex::new(WatchEventBacklog::default()),
+            deferred_tx,
+            deferred_rx,
+            retained: AtomicU64::new(0),
+        }
+    }
+}
+
+impl WatchNotificationMailbox {
+    const PATH_CHARGE: u64 = 1 << 32;
+
+    fn reserve_path(&self, path: &PathBuf) -> bool {
+        let Ok(bytes) = u64::try_from(path.capacity()) else {
+            return false;
+        };
+        if bytes > WATCH_PENDING_MAX_PATH_BYTES as u64 {
+            return false;
+        }
+        self.retained
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
+                let paths = retained >> 32;
+                let path_bytes = retained & u64::from(u32::MAX);
+                (paths < WATCH_PENDING_MAX_PATHS as u64
+                    && path_bytes + bytes <= WATCH_PENDING_MAX_PATH_BYTES as u64)
+                    .then_some(retained + Self::PATH_CHARGE + bytes)
+            })
+            .is_ok()
+    }
+
+    fn release_paths(&self, paths: usize, bytes: usize) {
+        self.retained.fetch_sub(
+            (paths as u64) * Self::PATH_CHARGE + bytes as u64,
+            Ordering::AcqRel,
+        );
+    }
+}
+
+/// Preserve event paths even when a producer overlaps the consumer's brief
+/// mailbox drain. Only actual event loss (kernel errors or a full budget)
+/// requires a watermark-free full-root census.
 fn enqueue_watch_notification(
     result: notify::Result<notify::Event>,
-    backlog: &Mutex<WatchEventBacklog>,
+    mailbox: &WatchNotificationMailbox,
     rescan: &AtomicBool,
     wake: &Sender<()>,
 ) {
@@ -32097,13 +32261,42 @@ fn enqueue_watch_notification(
             if !watch_event_should_trigger_reindex(&event) || event.paths.is_empty() {
                 return;
             }
-            match backlog.try_lock() {
+            match mailbox.backlog.try_lock() {
                 Ok(mut backlog) => {
-                    if !backlog.extend(event.paths) {
-                        rescan.store(true, Ordering::Release);
+                    for path in event.paths {
+                        if backlog.paths.contains(&path) {
+                            continue;
+                        }
+                        let previous_paths = backlog.paths.len();
+                        let previous_bytes = backlog.path_bytes;
+                        if !mailbox.reserve_path(&path) {
+                            backlog.clear();
+                            mailbox.release_paths(previous_paths, previous_bytes);
+                            rescan.store(true, Ordering::Release);
+                            break;
+                        }
+                        let path_bytes = path.capacity();
+                        if !backlog.extend([path]) {
+                            mailbox.release_paths(previous_paths + 1, previous_bytes + path_bytes);
+                            rescan.store(true, Ordering::Release);
+                            break;
+                        }
                     }
                 }
-                Err(_) => rescan.store(true, Ordering::Release),
+                Err(_) => {
+                    for path in event.paths {
+                        if !mailbox.reserve_path(&path) {
+                            rescan.store(true, Ordering::Release);
+                            break;
+                        }
+                        if let Err(error) = mailbox.deferred_tx.try_send(path) {
+                            let path = error.into_inner();
+                            mailbox.release_paths(1, path.capacity());
+                            rescan.store(true, Ordering::Release);
+                            break;
+                        }
+                    }
+                }
             }
         }
         Err(error) => {
@@ -32116,20 +32309,36 @@ fn enqueue_watch_notification(
 }
 
 fn collect_watch_notifications(
-    backlog: &Mutex<WatchEventBacklog>,
+    mailbox: &WatchNotificationMailbox,
     rescan: &AtomicBool,
     pending: &mut WatchEventBacklog,
     pending_rescan: &mut bool,
 ) {
     let received = {
-        let mut backlog = backlog.lock().unwrap_or_else(|error| error.into_inner());
+        let mut backlog = mailbox
+            .backlog
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         std::mem::take(&mut *backlog)
     };
+    mailbox.release_paths(received.paths.len(), received.path_bytes);
     *pending_rescan |= rescan.swap(false, Ordering::AcqRel);
     if *pending_rescan {
         pending.clear();
     } else if !pending.extend(received.paths) {
         *pending_rescan = true;
+    }
+    // Drain only the observed bounded batch. A producer that keeps adding
+    // events must not delay cancellation or control commands indefinitely.
+    let deferred_count = mailbox.deferred_rx.len();
+    for _ in 0..deferred_count {
+        let Ok(path) = mailbox.deferred_rx.try_recv() else {
+            break;
+        };
+        mailbox.release_paths(1, path.capacity());
+        if !*pending_rescan && !pending.extend([path]) {
+            *pending_rescan = true;
+        }
     }
 }
 
@@ -32251,7 +32460,7 @@ fn explicit_watch_once_file_may_be_database(kind: ConnectorKind, path: &Path) ->
 fn database_root_poller(
     databases: &BTreeSet<PathBuf>,
     interval: Duration,
-    backlog: Arc<Mutex<WatchEventBacklog>>,
+    backlog: Arc<WatchNotificationMailbox>,
     rescan: Arc<AtomicBool>,
     wake: Sender<()>,
 ) -> (Option<notify::PollWatcher>, bool) {
@@ -32641,7 +32850,7 @@ where
         .map(|(sender, receiver)| (Some(sender), receiver))
         .unwrap_or_else(|| (None, never()));
     let (wake, notifications) = bounded(1);
-    let notification_backlog = Arc::new(Mutex::new(WatchEventBacklog::default()));
+    let notification_backlog = Arc::new(WatchNotificationMailbox::default());
     let notification_rescan = Arc::new(AtomicBool::new(false));
     let backlog_for_watcher = Arc::clone(&notification_backlog);
     let rescan_for_watcher = Arc::clone(&notification_rescan);
@@ -33306,7 +33515,7 @@ mod watch_registration_tests {
         // still returns Ok from PollWatcher::watch, leaving no poll enrolled.
         let preserved = temp.path().join("preserved-provider");
         fs::rename(&parent, &preserved).unwrap();
-        let backlog = Arc::new(Mutex::new(WatchEventBacklog::default()));
+        let backlog = Arc::new(WatchNotificationMailbox::default());
         let rescan = Arc::new(AtomicBool::new(false));
         let (wake, notifications) = bounded(1);
         let (poller, retry) = database_root_poller(
@@ -33321,7 +33530,9 @@ mod watch_registration_tests {
             retry,
             "a callback registration error must request re-enrollment"
         );
-        assert!(backlog.lock().unwrap().paths.is_empty());
+        assert!(backlog.backlog.lock().unwrap().paths.is_empty());
+        assert!(backlog.deferred_rx.is_empty());
+        assert_eq!(backlog.retained.load(Ordering::Acquire), 0);
         assert!(!rescan.load(Ordering::Acquire));
         assert!(notifications.try_recv().is_err());
         drop(poller);
@@ -33453,7 +33664,7 @@ mod watch_registration_tests {
         );
         assert_ne!(before.database_roots, after.database_roots);
 
-        let backlog = Arc::new(Mutex::new(WatchEventBacklog::default()));
+        let backlog = Arc::new(WatchNotificationMailbox::default());
         let rescan = Arc::new(AtomicBool::new(false));
         let (wake, notifications) = bounded(1);
         let (_poller, retry) = database_root_poller(
@@ -33559,6 +33770,36 @@ struct WatchReindexOutcome {
     /// a committed lexical generation. Parsing old packets is not ingestion.
     published_conversations: usize,
     retry_sources: BTreeSet<PathBuf>,
+}
+
+fn reindex_full_watch_roots(
+    opts: &IndexOptions,
+    roots: &[(ConnectorKind, ScanRoot)],
+    state: &Mutex<HashMap<ConnectorKind, i64>>,
+    storage: &Mutex<FrankenStorage>,
+    t_index: &Mutex<Option<TantivyIndex>>,
+    index_path: &Path,
+    active_source_filter: &ActiveSessionSourceFilter,
+) -> Result<WatchReindexOutcome> {
+    // A forced census ignores old watermarks in memory. Persist replacement
+    // watermarks only at the existing successful-publication boundaries: a
+    // blocked or failed census must not erase the durable restart position.
+    state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("state lock poisoned"))?
+        .clear();
+    reindex_paths_with_semantic_delta(
+        opts,
+        roots.iter().map(|(_, root)| root.path.clone()).collect(),
+        roots,
+        state,
+        storage,
+        t_index,
+        index_path,
+        true,
+        None,
+        active_source_filter,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -67615,7 +67856,7 @@ c.close()
         std::fs::write(&database, b"database").unwrap();
         let neighbour = tmp.path().join("notes.txt");
         std::fs::write(&neighbour, b"before").unwrap();
-        let backlog = Arc::new(Mutex::new(WatchEventBacklog::default()));
+        let backlog = Arc::new(WatchNotificationMailbox::default());
         let rescan = Arc::new(AtomicBool::new(false));
         let (wake, woken) = bounded(1);
 
@@ -67679,13 +67920,16 @@ c.close()
         provider.sync_all().unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !backlog.lock().unwrap().paths.contains(&wal) {
-            assert!(Instant::now() < deadline, "the WAL commit was never queued");
-            std::thread::sleep(Duration::from_millis(25));
+        let mut queued = WatchEventBacklog::default();
+        let mut pending_rescan = false;
+        while !queued.paths.contains(&wal) {
+            woken
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("the WAL commit must wake the watch loop");
+            collect_watch_notifications(&backlog, &rescan, &mut queued, &mut pending_rescan);
         }
-        assert!(woken.try_recv().is_ok(), "the watch loop is woken");
-        let queued = backlog.lock().unwrap().paths.clone();
-        assert!(!queued.contains(&neighbour), "{queued:?}");
+        assert!(!pending_rescan, "a retained WAL event stays scoped");
+        assert!(!queued.paths.contains(&neighbour), "{:?}", queued.paths);
         assert!(!rescan.load(Ordering::Acquire));
         drop(provider);
     }
@@ -69198,7 +69442,7 @@ c.close()
 
     #[test]
     fn watch_notification_backlog_coalesces_and_overflow_retains_a_full_scan() {
-        let backlog = Mutex::new(WatchEventBacklog::default());
+        let backlog = WatchNotificationMailbox::default();
         let rescan = AtomicBool::new(false);
         let (wake, notifications) = bounded(1);
         for _ in 0..10_000 {
@@ -69211,7 +69455,7 @@ c.close()
             );
         }
         assert_eq!(notifications.len(), 1, "wakeups must coalesce");
-        assert_eq!(backlog.lock().unwrap().paths.len(), 1);
+        assert_eq!(backlog.backlog.lock().unwrap().paths.len(), 1);
         assert!(!rescan.load(Ordering::Acquire));
 
         // Simulate a filesystem flood while indexing owns the consumer thread.
@@ -69226,7 +69470,7 @@ c.close()
         }
         assert_eq!(notifications.len(), 1);
         assert!(rescan.load(Ordering::Acquire));
-        assert!(backlog.lock().unwrap().paths.len() <= WATCH_PENDING_MAX_PATHS);
+        assert!(backlog.backlog.lock().unwrap().paths.len() <= WATCH_PENDING_MAX_PATHS);
         let mut pending = WatchEventBacklog::default();
         let mut pending_rescan = false;
         collect_watch_notifications(&backlog, &rescan, &mut pending, &mut pending_rescan);
@@ -69266,7 +69510,7 @@ c.close()
 
     #[test]
     fn watch_notification_backlog_bounds_retained_path_capacity_and_pending_paths() {
-        let backlog = Mutex::new(WatchEventBacklog::default());
+        let backlog = WatchNotificationMailbox::default();
         let rescan = AtomicBool::new(false);
         let (wake, notifications) = bounded(1);
         let mut overallocated = PathBuf::with_capacity(WATCH_PENDING_MAX_PATH_BYTES + 1);
@@ -69279,7 +69523,7 @@ c.close()
         );
         assert!(rescan.load(Ordering::Acquire));
         assert_eq!(notifications.len(), 1, "an empty queue must still wake");
-        assert_eq!(backlog.lock().unwrap().path_bytes, 0);
+        assert_eq!(backlog.backlog.lock().unwrap().path_bytes, 0);
 
         let mut pending = WatchEventBacklog::default();
         assert!(pending.extend(
@@ -69311,11 +69555,11 @@ c.close()
 
     #[test]
     fn watch_notification_backlog_never_waits_for_the_consumer_lock() {
-        let backlog = Arc::new(Mutex::new(WatchEventBacklog::default()));
+        let backlog = Arc::new(WatchNotificationMailbox::default());
         let rescan = Arc::new(AtomicBool::new(false));
         let (wake, notifications) = bounded(1);
         let (done, completed) = bounded(1);
-        let held = backlog.lock().unwrap();
+        let held = backlog.backlog.lock().unwrap();
         let producer_backlog = Arc::clone(&backlog);
         let producer_rescan = Arc::clone(&rescan);
         let producer = thread::spawn(move || {
@@ -69332,13 +69576,199 @@ c.close()
         drop(held);
         producer.join().unwrap();
         assert!(finished_without_lock, "notify must never wait for indexing");
-        assert!(rescan.load(Ordering::Acquire));
+        assert!(
+            !rescan.load(Ordering::Acquire),
+            "a retained event must not force an archive-wide census"
+        );
         assert_eq!(notifications.len(), 1);
+        let mut pending = WatchEventBacklog::default();
+        let mut pending_rescan = false;
+        collect_watch_notifications(&backlog, &rescan, &mut pending, &mut pending_rescan);
+        assert!(!pending_rescan);
+        assert_eq!(
+            pending.paths,
+            BTreeSet::from([PathBuf::from("sessions/changed-while-locked.jsonl")])
+        );
+        assert_eq!(backlog.retained.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn watch_notification_backlog_contended_handoff_shares_the_path_limit() {
+        let mailbox = WatchNotificationMailbox::default();
+        let rescan = AtomicBool::new(false);
+        let (wake, _notifications) = bounded(1);
+        enqueue_watch_notification(
+            Ok(notify::Event::new(notify::EventKind::Any)
+                .add_path(PathBuf::from("sessions/coalesced.jsonl"))),
+            &mailbox,
+            &rescan,
+            &wake,
+        );
+        let held = mailbox.backlog.lock().unwrap();
+        for index in 1..WATCH_PENDING_MAX_PATHS {
+            enqueue_watch_notification(
+                Ok(notify::Event::new(notify::EventKind::Any)
+                    .add_path(PathBuf::from(format!("sessions/deferred-{index}.jsonl")))),
+                &mailbox,
+                &rescan,
+                &wake,
+            );
+        }
+        assert!(!rescan.load(Ordering::Acquire));
+        assert_eq!(
+            held.paths.len() + mailbox.deferred_rx.len(),
+            WATCH_PENDING_MAX_PATHS
+        );
+        assert_eq!(
+            mailbox.retained.load(Ordering::Acquire) >> 32,
+            WATCH_PENDING_MAX_PATHS as u64
+        );
+        enqueue_watch_notification(
+            Ok(notify::Event::new(notify::EventKind::Any)
+                .add_path(PathBuf::from("sessions/one-too-many.jsonl"))),
+            &mailbox,
+            &rescan,
+            &wake,
+        );
+        assert!(
+            rescan.load(Ordering::Acquire),
+            "actual loss still requires a full census"
+        );
+        assert_eq!(
+            held.paths.len() + mailbox.deferred_rx.len(),
+            WATCH_PENDING_MAX_PATHS
+        );
+        drop(held);
+        let mut pending = WatchEventBacklog::default();
+        let mut pending_rescan = false;
+        collect_watch_notifications(&mailbox, &rescan, &mut pending, &mut pending_rescan);
+        assert!(pending_rescan);
+        assert!(pending.paths.is_empty());
+        assert!(mailbox.deferred_rx.is_empty());
+        assert_eq!(mailbox.retained.load(Ordering::Acquire), 0);
+
+        // Completing that recovery releases all reservations for later events.
+        dispatch_pending_watch_callback(
+            &mut pending,
+            &mut pending_rescan,
+            &[],
+            &|paths, _, rebuilding| {
+                assert!(paths.is_empty() && rebuilding);
+                Ok(BTreeSet::new())
+            },
+        );
+        enqueue_watch_notification(
+            Ok(notify::Event::new(notify::EventKind::Any)
+                .add_path(PathBuf::from("sessions/after-recovery.jsonl"))),
+            &mailbox,
+            &rescan,
+            &wake,
+        );
+        collect_watch_notifications(&mailbox, &rescan, &mut pending, &mut pending_rescan);
+        assert!(!pending_rescan);
+        assert_eq!(
+            pending.paths,
+            BTreeSet::from([PathBuf::from("sessions/after-recovery.jsonl")])
+        );
+        assert_eq!(mailbox.retained.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn watch_notification_backlog_contended_handoff_shares_the_byte_limit() {
+        let mailbox = WatchNotificationMailbox::default();
+        let rescan = AtomicBool::new(false);
+        let (wake, _notifications) = bounded(1);
+        let mut coalesced = PathBuf::with_capacity(WATCH_PENDING_MAX_PATH_BYTES / 2);
+        coalesced.push("sessions/coalesced.jsonl");
+        let reserved_bytes = coalesced.capacity();
+        assert!(reserved_bytes < WATCH_PENDING_MAX_PATH_BYTES);
+        enqueue_watch_notification(
+            Ok(notify::Event::new(notify::EventKind::Any).add_path(coalesced)),
+            &mailbox,
+            &rescan,
+            &wake,
+        );
+        let held = mailbox.backlog.lock().unwrap();
+        let mut too_large =
+            PathBuf::with_capacity(WATCH_PENDING_MAX_PATH_BYTES - reserved_bytes + 1);
+        too_large.push("sessions/deferred.jsonl");
+        assert!(too_large.capacity() <= WATCH_PENDING_MAX_PATH_BYTES);
+        enqueue_watch_notification(
+            Ok(notify::Event::new(notify::EventKind::Any).add_path(too_large)),
+            &mailbox,
+            &rescan,
+            &wake,
+        );
+        assert!(rescan.load(Ordering::Acquire));
+        assert!(mailbox.deferred_rx.is_empty());
+        assert_eq!(held.path_bytes, reserved_bytes);
+        assert_eq!(
+            mailbox.retained.load(Ordering::Acquire) & u64::from(u32::MAX),
+            reserved_bytes as u64
+        );
+        drop(held);
+        let mut pending = WatchEventBacklog::default();
+        let mut pending_rescan = false;
+        collect_watch_notifications(&mailbox, &rescan, &mut pending, &mut pending_rescan);
+        assert!(pending_rescan);
+        assert!(pending.paths.is_empty());
+        assert_eq!(mailbox.retained.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn watch_notification_backlog_concurrent_handoffs_retain_every_source() {
+        let mailbox = WatchNotificationMailbox::default();
+        let rescan = AtomicBool::new(false);
+        let (wake, _notifications) = bounded(1);
+        let barrier = std::sync::Barrier::new(3);
+        let mut pending = WatchEventBacklog::default();
+        let mut pending_rescan = false;
+        thread::scope(|scope| {
+            for producer in 0..2 {
+                let mailbox = &mailbox;
+                let rescan = &rescan;
+                let wake = &wake;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for index in 0..512 {
+                        enqueue_watch_notification(
+                            Ok(
+                                notify::Event::new(notify::EventKind::Any).add_path(PathBuf::from(
+                                    format!("sessions/producer-{producer}-{index}.jsonl"),
+                                )),
+                            ),
+                            mailbox,
+                            rescan,
+                            wake,
+                        );
+                    }
+                });
+            }
+            barrier.wait();
+            for _ in 0..1024 {
+                collect_watch_notifications(&mailbox, &rescan, &mut pending, &mut pending_rescan);
+                thread::yield_now();
+            }
+        });
+        collect_watch_notifications(&mailbox, &rescan, &mut pending, &mut pending_rescan);
+        assert!(!pending_rescan);
+        assert!(!rescan.load(Ordering::Acquire));
+        let expected: BTreeSet<_> = (0..2)
+            .flat_map(|producer| {
+                (0..512).map(move |index| {
+                    PathBuf::from(format!("sessions/producer-{producer}-{index}.jsonl"))
+                })
+            })
+            .collect();
+        assert_eq!(pending.paths, expected);
+        assert_eq!(mailbox.retained.load(Ordering::Acquire), 0);
+        assert!(mailbox.deferred_rx.is_empty());
     }
 
     #[test]
     fn watch_notification_backlog_preserves_changes_during_a_failed_full_scan() {
-        let backlog = Mutex::new(WatchEventBacklog::default());
+        let backlog = WatchNotificationMailbox::default();
         let rescan = AtomicBool::new(false);
         let (wake, _notifications) = bounded(1);
         let roots = [(
@@ -71126,7 +71556,7 @@ c.close()
         let recovered_rows = watch_lexical_canonical_rows(&storage.lock().unwrap());
         assert_eq!(recovered_rows.len(), 2);
 
-        let backlog = Mutex::new(WatchEventBacklog::default());
+        let backlog = WatchNotificationMailbox::default();
         let rescan = AtomicBool::new(false);
         let (wake, _notifications) = bounded(1);
         for index in 0..=WATCH_PENDING_MAX_PATHS {
