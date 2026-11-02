@@ -239,8 +239,12 @@ pub(super) fn record_file_size_change(root: &Path, previous: u64, current: u64) 
 /// Usage to admit `bytes` against under `policy`: the shared total when it
 /// decides clearly (see MEASURED_USAGE), otherwise a new walk.
 fn shared_usage(root: &Path, policy: RawMirrorRetentionPolicy, bytes: u64) -> Result<u64> {
+    // Admission can now precede our own mutation fence. Never reuse an
+    // inventory from before a peer's capture or prune, even on a refusal.
+    let generation = read_usage_generation(root)?;
     let previous = measured_usage_cache().get(root).copied();
     if let Some(entry) = previous
+        && entry.mutation_generation == generation
         && let Some(measured_at) = entry.measured_at
     {
         let refresh_after = entry.walk.saturating_mul(20).max(Duration::from_secs(60));
@@ -270,7 +274,7 @@ fn shared_usage(root: &Path, policy: RawMirrorRetentionPolicy, bytes: u64) -> Re
             measured_at: Some(std::time::Instant::now()),
             walk: started.elapsed(),
             walks: previous.map_or(0, |entry| entry.walks) + 1,
-            mutation_generation: previous.map_or(0, |entry| entry.mutation_generation),
+            mutation_generation: generation,
         },
     );
     Ok(measured)
@@ -344,33 +348,53 @@ impl Budget<'_> {
 // Own only files successfully created by THIS capture. In particular, a failed
 // write/read/verification never leaves a growing staging directory behind.
 struct Staging {
-    directory: PathBuf,
+    root: PathBuf,
+    directory: Option<PathBuf>,
     files: Vec<PathBuf>,
+    mutation_noted: bool,
 }
 impl Staging {
-    fn new(root: &Path) -> Result<Self> {
-        ensure_private_dir_descendant(root, &root.join("tmp"))?;
-        let directory = unique_capture_temp_dir(root);
-        raw_mirror_io("create_staging_dir", &directory, || {
-            fs::create_dir(&directory)
-        })?;
-        let staging = Self {
-            directory,
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            directory: None,
             files: Vec::new(),
-        };
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            raw_mirror_tracked_io("set_staging_permissions", &staging.directory, || {
-                fs::set_permissions(&staging.directory, fs::Permissions::from_mode(0o700))
-            })?;
+            mutation_noted: false,
         }
-        Ok(staging)
+    }
+
+    fn note_mutation(&mut self) -> Result<()> {
+        if !self.mutation_noted {
+            note_mutation(&self.root)?;
+            self.mutation_noted = true;
+        }
+        Ok(())
     }
 
     fn write(&mut self, budget: &mut Budget<'_>, name: &str, bytes: &[u8]) -> Result<PathBuf> {
         budget.reserve(bytes.len() as u64)?;
-        let path = unique_temp_path(&self.directory, name);
+        self.note_mutation()?;
+        if self.directory.is_none() {
+            ensure_private_dir_descendant(&self.root, &self.root.join("tmp"))?;
+            let directory = unique_capture_temp_dir(&self.root);
+            raw_mirror_io("create_staging_dir", &directory, || {
+                fs::create_dir(&directory)
+            })?;
+            self.directory = Some(directory);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let directory = self.directory.as_ref().expect("created staging directory");
+                raw_mirror_tracked_io("set_staging_permissions", directory, || {
+                    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                })?;
+            }
+        }
+        let directory = self
+            .directory
+            .as_ref()
+            .expect("initialized staging directory");
+        let path = unique_temp_path(directory, name);
         let mut file = private_create_new_file(&path)?;
         self.files.push(path.clone());
         raw_mirror_io("write_staging", &path, || file.write_all(bytes))?;
@@ -385,7 +409,9 @@ impl Drop for Staging {
         for path in &self.files {
             remove_temp_best_effort(path);
         }
-        remove_empty_temp_dir_best_effort(&self.directory);
+        if let Some(directory) = &self.directory {
+            remove_empty_temp_dir_best_effort(directory);
+        }
     }
 }
 
@@ -549,7 +575,7 @@ pub(super) fn prepare_for_test(
         source_path,
         db_links: &[],
     };
-    let mut staging = Staging::new(root)?;
+    let mut staging = Staging::new(root);
     let mut budget = Budget {
         root,
         policy: RawMirrorRetentionPolicy::from_env()?,
@@ -669,25 +695,21 @@ pub(crate) fn capture(
     let key = raw_mirror_blob_cache_key(&input, &metadata, threshold, chunk_size);
     let cached = cached_record(&root, &key);
     let was_cached = cached.is_some();
-    let mut staging = None;
+    let mut staging = Staging::new(&root);
     let prepared = match cached {
         Some(record) => PreparedRawMirrorContent {
             record,
             files: Vec::new(),
         },
-        None => {
-            note_mutation(&root)?;
-            let staged = staging.insert(Staging::new(&root)?);
-            prepare_bounded(
-                &root,
-                &input,
-                &metadata,
-                threshold,
-                chunk_size,
-                staged,
-                &mut budget,
-            )?
-        }
+        None => prepare_bounded(
+            &root,
+            &input,
+            &metadata,
+            threshold,
+            chunk_size,
+            &mut staging,
+            &mut budget,
+        )?,
     };
     let record = prepared.record;
     let path_hash = raw_mirror_original_path_blake3(&input.source_path.display().to_string());
@@ -760,9 +782,6 @@ pub(crate) fn capture(
     });
     // Reserve publication BEFORE making any staged blob visible. A budget
     // refusal therefore leaves neither a partial manifest nor new orphan blobs.
-    if was_cached && (existing.is_none() || needs_merge) {
-        note_mutation(&root)?;
-    }
     if existing.is_none() {
         budget.reserve(bytes.len() as u64)?;
     } else if needs_merge {
@@ -771,6 +790,9 @@ pub(crate) fn capture(
                 .len()
                 .saturating_add(bytes.len() as u64),
         )?;
+    }
+    if existing.is_none() || needs_merge {
+        staging.note_mutation()?;
     }
     let mut already_present = existing.is_some();
     for file in prepared.files {
@@ -794,10 +816,10 @@ pub(crate) fn capture(
     } else {
         publish_manifest_bytes_create_new(&root, &path, &bytes, &record.blob_blake3)?;
     }
-    if let Some(staging) = staging.as_mut() {
+    if !was_cached {
         // Cache admission is optional; successfully preserving the source must
         // not be reported as a failed capture merely because its cache cannot fit.
-        if let Err(error) = save_cache(&root, key, record.clone(), staging, &mut budget) {
+        if let Err(error) = save_cache(&root, key, record.clone(), &mut staging, &mut budget) {
             tracing::debug!(%error, "raw-mirror capture cache not persisted");
         }
     }

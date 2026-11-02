@@ -142,6 +142,69 @@ fn gh538_unchanged_watch_captures_do_not_mutate_the_mirror() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn gh538_refused_watch_captures_do_not_mutate_the_mirror() -> Result<()> {
+    type MirrorSnapshot = Vec<(PathBuf, SystemTime, Option<Vec<u8>>)>;
+    fn snapshot(root: &Path) -> Result<MirrorSnapshot> {
+        let mut entries = Vec::new();
+        for entry in walkdir::WalkDir::new(root) {
+            let entry = entry?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            let bytes = metadata.is_file().then(|| fs::read(entry.path())).transpose()?;
+            entries.push((entry.path().strip_prefix(root)?.to_path_buf(), metadata.modified()?, bytes));
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(entries)
+    }
+
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let source = temp.path().join("session.jsonl");
+    let original = transcript(0, 2048);
+    fs::write(&source, &original)?;
+    let first = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(1024 * 1024))?;
+    let root = raw_mirror_root(&data);
+    let before = snapshot(&root)?;
+    let next = temp.path().join("next.jsonl");
+    fs::write(&next, transcript(1, 2048))?;
+
+    for refused_policy in [policy(0), RawMirrorRetentionPolicy {
+        max_bytes: u64::MAX, min_free_bytes: u64::MAX,
+    }] {
+        for _ in 0..3 {
+            let error = capture(input(&data, &next), CHUNK as u64, CHUNK, refused_policy)
+                .expect_err("a new capture must obey both retention and free-space limits");
+            assert!(error.is::<RawMirrorCapturePaused>(), "{error:#}");
+            assert_eq!(snapshot(&root)?, before, "refused writes must leave files and directory times intact");
+        }
+    }
+
+    // A cached blob still needs admission before adding a canonical DB link.
+    let links = [RawMirrorDbLink {
+        conversation_id: Some(538), message_count: Some(1),
+        source_path: None, started_at_ms: None,
+    }];
+    let error = capture(RawMirrorCaptureInput { db_links: &links, ..input(&data, &source) },
+        CHUNK as u64, CHUNK, policy(0)).expect_err("manifest growth must be admitted too");
+    assert!(error.is::<RawMirrorCapturePaused>(), "{error:#}");
+    assert_eq!(snapshot(&root)?, before, "refused metadata must not advance the generation fence");
+
+    OpenOptions::new().append(true).open(&source)?.write_all(&transcript(2, 2048))?;
+    let error = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(0))
+        .expect_err("an appended source must not consume a full mirror");
+    assert!(error.is::<RawMirrorCapturePaused>(), "{error:#}");
+    assert_eq!(snapshot(&root)?, before);
+    assert_eq!(contents(&data, &first), original, "every prior recovery copy remains valid");
+
+    let resumed = capture(input(&data, &source), CHUNK as u64, CHUNK, policy(1024 * 1024))?;
+    assert_eq!(contents(&data, &resumed), fs::read(&source)?);
+    assert_ne!(fs::read(root.join(USAGE_GENERATION_FILE))?,
+        before.iter().find(|entry| entry.0 == Path::new(USAGE_GENERATION_FILE))
+            .and_then(|entry| entry.2.as_ref()).expect("baseline generation").as_slice());
+    assert_eq!(contents(&data, &first), original);
+    Ok(())
+}
+
 /// Match the reporter's filesystem cardinality and logical mirror size without
 /// allocating 11 GiB: valid manifests share a verified small blob, and sparse
 /// abandoned staging represents recoverable work from interrupted captures.
@@ -331,7 +394,7 @@ fn growing_source_reads_only_the_admitted_length_and_publishes_nothing() {
     let metadata = fs::metadata(&source).unwrap();
     OpenOptions::new().append(true).open(&source).unwrap().write_all(&transcript(1, 1024 * 1024)).unwrap();
     let root = ensure_raw_mirror_root(&data).unwrap();
-    let mut staging = Staging::new(&root).unwrap();
+    let mut staging = Staging::new(&root);
     let mut budget = Budget { root: &root, policy: policy(2 * 1024 * 1024), used: 0, inventoried: true };
     let result = prepare_bounded(&root, &input(&data, &source), &metadata, 1, CHUNK, &mut staging, &mut budget);
     assert!(result.is_err());
