@@ -586,6 +586,9 @@ fn watch_once_reads_committed_wal_without_scanning_adjacent_workspaces() -> Resu
             &json!([session("checkpointed", "copilottargetedseed")]),
             true,
         )?;
+        // Explicit watch-once routing canonicalizes its target before scan.
+        // macOS spells this /private/var even when TempDir returned /var.
+        let canonical_database = dunce::canonicalize(&path)?;
         let writer = Connection::open(path.to_string_lossy().as_ref())?;
         writer.execute("PRAGMA journal_mode = WAL")?;
         writer.execute("PRAGMA wal_autocheckpoint = 0")?;
@@ -609,6 +612,7 @@ fn watch_once_reads_committed_wal_without_scanning_adjacent_workspaces() -> Resu
             &json!([session("adjacent", "copilottargetedneighbor")]),
             false,
         )?;
+        let canonical_adjacent = dunce::canonicalize(&adjacent)?;
         let adjacent_before = bundle(&adjacent_path)?;
         let checkpoint = bundle(&path)?;
         let search = |needle: &str| -> Result<Value> {
@@ -666,7 +670,10 @@ fn watch_once_reads_committed_wal_without_scanning_adjacent_workspaces() -> Resu
             assert_eq!(hits.len(), 1, "{streaming}/{id}: {value}");
             assert_eq!(hits[0]["agent"], "copilot");
             assert_eq!(hits[0]["source_id"], "local");
-            assert_eq!(hits[0]["source_path"], path.to_string_lossy().as_ref());
+            assert_eq!(
+                hits[0]["source_path"],
+                canonical_database.to_string_lossy().as_ref()
+            );
             assert_eq!(
                 search("copilottargetedneighbor")?["hits"]
                     .as_array()
@@ -690,7 +697,9 @@ fn watch_once_reads_committed_wal_without_scanning_adjacent_workspaces() -> Resu
             "fixture raw mirroring must be active"
         );
         assert!(
-            captures.iter().all(|source| !source.starts_with(&adjacent)),
+            captures.iter().all(|source| {
+                !source.starts_with(&adjacent) && !source.starts_with(&canonical_adjacent)
+            }),
             "targeted indexing must not mirror the adjacent workspace"
         );
         writer.close()?;
