@@ -102,13 +102,21 @@ fn db_digest(data_dir: &Path) -> blake3::Hash {
 }
 
 fn configure_remote(home: &Path, remote_path: &str) -> std::path::PathBuf {
-    use coding_agent_search::sources::config::{SourceDefinition, SourcesConfig};
-    let config_dir = home.join("xdg-config/cass");
-    std::fs::create_dir_all(&config_dir).expect("config directory");
+    use coding_agent_search::sources::config::SourceDefinition;
     let mut source = SourceDefinition::ssh("guide-remote", "fixture.invalid");
     source.paths = vec![remote_path.into()];
+    configure_sources(home, vec![source])
+}
+
+fn configure_sources(
+    home: &Path,
+    sources: Vec<coding_agent_search::sources::config::SourceDefinition>,
+) -> std::path::PathBuf {
+    use coding_agent_search::sources::config::SourcesConfig;
+    let config_dir = home.join("xdg-config/cass");
+    std::fs::create_dir_all(&config_dir).expect("config directory");
     let config = SourcesConfig {
-        sources: vec![source],
+        sources,
         ..Default::default()
     };
     let path = config_dir.join("sources.toml");
@@ -154,6 +162,115 @@ fn onboard(home: &Path, data_dir: &Path, db: &Path, confirm: bool) -> Value {
         command.args(["--confirm-step", "3"]);
     }
     run(&mut command, data_dir).1
+}
+
+#[test]
+fn live_onboarding_indexes_configured_local_sources_only_after_confirmation() {
+    use coding_agent_search::sources::config::SourceDefinition;
+    for relative in [false, true] {
+        let home = tempfile::tempdir().expect("home");
+        let data_dir = home.path().join("data with spaces");
+        let db = home.path().join("selected local archive.db");
+        let source_root = home.path().join("configured codex");
+        util::seed_codex_session(&source_root, "rollout-guide-local.jsonl", PRIVATE_BODY, true);
+        let mut source = SourceDefinition::local("guide-local");
+        source.paths = vec![if relative {
+            "~/configured codex".into()
+        } else {
+            source_root.to_string_lossy().into_owned()
+        }];
+        let config = configure_sources(home.path(), vec![source]);
+        let config_before = std::fs::read(&config).expect("configuration bytes");
+        let session = source_root.join("sessions/2026/04/23/rollout-guide-local.jsonl");
+        let session_before = std::fs::read(&session).expect("session bytes");
+
+        let unconfirmed = onboard(home.path(), &data_dir, &db, false);
+        let preview = step(&unconfirmed, "sources.dry-sync");
+        assert_eq!(preview["proof_gate"]["result"], "passed", "{unconfirmed}");
+        assert_eq!(preview["proof_gate"]["source"], "source-config");
+        assert_eq!(preview["observation"]["configured_local_sources"], 1);
+        assert_eq!(preview["observation"]["configured_remote_sources"], 0);
+        assert_eq!(preview["observation"]["local_paths_checked"], 1);
+        assert_eq!(preview["observation"]["transport_started"], false);
+        assert_eq!(preview["observation"]["sources_registered"], false);
+        assert_eq!(step(&unconfirmed, "index.incremental")["result"], "awaiting-confirmation");
+        assert_eq!(unconfirmed["execution"]["attempted_mutation_count"], 0);
+        assert!(!db.exists());
+
+        let output = onboard(home.path(), &data_dir, &db, true);
+        let indexed = step(&output, "index.incremental");
+        assert_eq!(indexed["result"], "executed", "{output}");
+        assert_eq!(indexed["proof_gate"]["result"], "passed");
+        assert_eq!(indexed["observation"]["conversations"], 1);
+        assert_eq!(output["mutation_contract"]["touches_network"], false);
+        assert!(!data_dir.join("agent_search.db").exists());
+        assert_eq!(std::fs::read(&config).expect("config after"), config_before);
+        assert_eq!(std::fs::read(&session).expect("session after"), session_before);
+        let (success, hits) = run_on_archive(home.path(), &data_dir, &db, &[
+            "search", PRIVATE_BODY, "--mode", "lexical", "--source", "guide-local", "--json",
+        ]);
+        assert!(success, "{hits}");
+        assert_eq!(hits["hits"].as_array().expect("hits").len(), 1);
+        assert!(!output.to_string().contains(PRIVATE_BODY));
+    }
+}
+
+#[test]
+fn live_onboarding_refuses_missing_or_invalid_local_sources() {
+    use coding_agent_search::sources::config::SourceDefinition;
+    for scenario in ["missing-root", "empty-path", "no-paths", "empty-config"] {
+        let home = tempfile::tempdir().expect("home");
+        let data_dir = home.path().join("data");
+        let db = data_dir.join("agent_search.db");
+        let mut source = SourceDefinition::local("guide-local");
+        source.paths = match scenario {
+            "missing-root" => vec![home.path().join("missing").to_string_lossy().into_owned()],
+            "empty-path" => vec![String::new()],
+            _ => Vec::new(),
+        };
+        configure_sources(home.path(), if scenario == "empty-config" { Vec::new() } else { vec![source] });
+        let output = onboard(home.path(), &data_dir, &db, true);
+        assert_eq!(step(&output, "sources.dry-sync")["proof_gate"]["result"], "failed", "{scenario}: {output}");
+        assert_eq!(output["execution"]["attempted_mutation_count"], 0, "{output}");
+        assert!(!db.exists());
+    }
+}
+
+#[test]
+fn live_onboarding_mixed_sources_requires_every_configured_local_path() {
+    use coding_agent_search::sources::config::{SourceDefinition, SourcesConfig};
+    for missing in [false, true] {
+        let home = tempfile::tempdir().expect("home");
+        let data_dir = home.path().join("data");
+        let db = data_dir.join("agent_search.db");
+        let config = configure_remote(home.path(), "~/.codex");
+        let mut sources = SourcesConfig::load_from(&config).expect("remote config").sources;
+        let mirror = data_dir.join("remotes/guide-remote/mirror").join(
+            coding_agent_search::sources::sync::path_to_safe_dirname("~/.codex"),
+        );
+        util::seed_codex_session(&mirror, "rollout-mixed-remote.jsonl", "mixedremotemarker", true);
+        let local_root = home.path().join("configured codex");
+        util::seed_codex_session(&local_root, "rollout-mixed-local.jsonl", "mixedlocalmarker", true);
+        let mut local = SourceDefinition::local("guide-local");
+        local.paths = vec![local_root.to_string_lossy().into_owned()];
+        if missing { local.paths.push(home.path().join("missing").to_string_lossy().into_owned()); }
+        sources.push(local);
+        configure_sources(home.path(), sources);
+        let output = onboard(home.path(), &data_dir, &db, true);
+        let preview = step(&output, "sources.dry-sync");
+        if missing {
+            assert_eq!(preview["proof_gate"]["result"], "failed", "{output}");
+            assert_eq!(output["execution"]["attempted_mutation_count"], 0);
+            assert!(!db.exists());
+        } else {
+            assert_eq!(preview["proof_gate"]["result"], "passed", "{output}");
+            assert_eq!(preview["observation"]["configured_local_sources"], 1);
+            assert_eq!(preview["observation"]["configured_remote_sources"], 1);
+            assert_eq!(preview["observation"]["local_paths_checked"], 1);
+            assert_eq!(step(&output, "index.incremental")["result"], "executed", "{output}");
+            assert_eq!(step(&output, "index.incremental")["observation"]["conversations"], 2);
+        }
+    }
 }
 
 #[test]
