@@ -36389,7 +36389,7 @@ fn classify_paths(
             // root derives different root-relative external IDs for the same
             // transcript, so retain only the deepest root per connector and
             // source provenance. Distinct sources remain distinct scans.
-            let mut matching_roots: Vec<(ConnectorKind, &ScanRoot, &PathBuf)> = Vec::new();
+            let mut matching_roots: Vec<(ConnectorKind, &ScanRoot, &PathBuf, usize)> = Vec::new();
             for (((kind, root), match_root_path), alternate_root_path) in roots
                 .iter()
                 .zip(&match_root_paths)
@@ -36412,26 +36412,32 @@ fn classify_paths(
                             && database_sidecar_paths(candidate).contains(p))
                 };
                 if under(match_root_path) || alternate_root_path.as_ref().is_some_and(under) {
+                    // Aliases can make a physical descendant's configured
+                    // spelling shorter than its ancestor's (or vice versa).
+                    // Compare their resolved coverage, but scan the original
+                    // configured root so source identity stays consistent.
+                    let depth = alternate_root_path
+                        .as_ref()
+                        .unwrap_or(match_root_path)
+                        .components()
+                        .count();
                     if let Some(index) =
                         matching_roots
                             .iter()
-                            .position(|(selected_kind, selected_root, _)| {
+                            .position(|(selected_kind, selected_root, _, _)| {
                                 *selected_kind == *kind && selected_root.origin == root.origin
                             })
                     {
-                        if match_root_path.components().count()
-                            > matching_roots[index].2.components().count()
-                        {
-                            matching_roots[index].1 = root;
-                            matching_roots[index].2 = match_root_path;
+                        if depth > matching_roots[index].3 {
+                            matching_roots[index] = (*kind, root, match_root_path, depth);
                         }
                     } else {
-                        matching_roots.push((*kind, root, match_root_path));
+                        matching_roots.push((*kind, root, match_root_path, depth));
                     }
                 }
             }
             let matched_root = !matching_roots.is_empty();
-            for (kind, root, match_root_path) in matching_roots {
+            for (kind, root, match_root_path, _) in matching_roots {
                 let scan_path = if prefer_explicit_paths && !is_database_watch_root(kind, root) {
                     explicit_watch_once_scan_path(kind, &requested, p)
                 } else {
@@ -67814,6 +67820,83 @@ c.close()
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Omp);
         assert_eq!(classified[0].1.path, profile_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh538_classify_paths_prefers_a_physical_descendant_through_a_short_alias() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("storage/user/omp");
+        let child = parent.join("profiles/work");
+        let session = child.join("sessions/session.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, b"{}\n").unwrap();
+        let alias = tmp.path().join("work");
+        std::os::unix::fs::symlink(&child, &alias).unwrap();
+        let origin = Origin::remote_with_host("work-machine", "work-host");
+        let nested = ScanRoot::remote(alias, origin.clone(), None);
+        let ancestor = ScanRoot::remote(parent.clone(), origin.clone(), None);
+        let other = ScanRoot::remote(parent, Origin::remote("other-machine"), None);
+        let event = dunce::canonicalize(&session).unwrap();
+
+        for ordered in [
+            [ancestor.clone(), nested.clone()],
+            [nested.clone(), ancestor.clone()],
+        ] {
+            let mut roots: Vec<_> = ordered
+                .into_iter()
+                .map(|root| (ConnectorKind::Omp, root))
+                .collect();
+            roots.push((ConnectorKind::Omp, other.clone()));
+            let classified = classify_paths(vec![event.clone()], &roots, false);
+            assert_eq!(classified.len(), 2, "distinct sources must remain distinct");
+            for (_, selected, since, watermark) in &classified {
+                let expected = if selected.origin == origin {
+                    &nested
+                } else {
+                    &other
+                };
+                assert_eq!(selected.path, expected.path);
+                assert_eq!(selected.origin, expected.origin);
+                assert_eq!(selected.platform, expected.platform);
+                assert!(since.is_some() && watermark.is_some());
+            }
+            let outside = tmp.path().join("outside.jsonl");
+            std::fs::write(&outside, b"{}\n").unwrap();
+            assert!(classify_paths(vec![outside], &roots, false).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh538_classify_paths_does_not_prefer_a_long_alias_to_an_ancestor() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("omp");
+        let child = parent.join("profiles/work");
+        let session = child.join("sessions/session.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, b"{}\n").unwrap();
+        let alias = tmp.path().join("long/configured/path/to/shared/omp");
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&parent, &alias).unwrap();
+        let ancestor = ScanRoot::local(alias);
+        let nested = ScanRoot::local(child);
+        let event = dunce::canonicalize(&session).unwrap();
+
+        for ordered in [
+            [ancestor.clone(), nested.clone()],
+            [nested.clone(), ancestor.clone()],
+        ] {
+            let roots: Vec<_> = ordered
+                .into_iter()
+                .map(|root| (ConnectorKind::Omp, root))
+                .collect();
+            let classified = classify_paths(vec![event.clone()], &roots, false);
+            assert_eq!(classified.len(), 1, "one scan per connector and source");
+            assert_eq!(classified[0].0, ConnectorKind::Omp);
+            assert_eq!(classified[0].1.path, nested.path);
+            assert_eq!(classified[0].1.origin, nested.origin);
+        }
     }
 
     /// A live watch must match an event in the canonical spelling of its root:
