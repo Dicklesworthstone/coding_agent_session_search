@@ -20,7 +20,8 @@ turns semantic search off until the next backfill (GH #458, reproduced on HEAD).
 
 v0.10.0 is still the latest release after 32 days. Main is 838 commits ahead. 14 of
 the 35 open GitHub issues are fixed only on main, and six owner comments promised those fixes "in the next
-release" two to four weeks ago. Three independent blockers stop delivery:
+release" two to four weeks ago. Three independent blockers stop delivery. Separately, main's full lib suite is red by 16
+tests, 12 of them from one commit that landed without a runtime result:
 
 1. the owner's release-bar decision (`hutyl`, open 12 days);
 2. a strict-UBS scope that fails any change to a monolith on findings older than
@@ -95,20 +96,40 @@ No peer bead was claimed or closed.
 The synthetic corpus makes per-message overhead look worse than on real archives,
 whose messages are longer. The ratios are reported, not extrapolated.
 
-**Gate on HEAD.** Default `scripts/gate.sh` (fmt, all-target clippy `-D warnings`,
-full lib tests, `cli_robot`, `bookmarks_cli`, `search_metamorphic`, `pages_bundle`,
-`search_service`, bin tests with the two named `svhcf`/`p94yt` skips, goldens,
-changed-file UBS), launched 20:12Z from a fresh detached worktree at `8c0f8928` on a
-cold rch path with no retries used:
+**Gate on HEAD: `gate: RED`, on the lib suite only.** I ran the default `scripts/gate.sh`
+with no filters and no retries from a fresh detached worktree at `8c0f8928`, on rch
+vmi1152480 with a cold target, from 20:10Z to 22:20Z. `SOURCE_CONTENT_SHA256 11559d02…`.
 
-- `STAGE=source-identity EXIT=0`, `STAGE=source-freshness EXIT=0`, `STAGE=fmt EXIT=0`,
-  `STAGE=clippy EXIT=0`.
-- The test stages were still compiling when this section was written. Their receipts
-  are appended below when the run ends. Until then this is **no verdict on tests**:
-  neither a pass nor a fail.
-- The changed-file UBS stage scans files changed against `origin/main`. On an
-  unmodified checkout that set is empty, so it says nothing about the whole-file
-  backlog described below.
+- Green: source-identity, source-freshness, fmt, all-target clippy `-D warnings`,
+  lib-build, `cli_robot` (329), `bookmarks_cli` (9), `search_metamorphic` (11),
+  `pages_bundle` (65), `search_service` (175 / 8 ignored), bin-build, bin-cass (230 / 1
+  ignored, two named skips) and goldens (16 + 52).
+- The UBS stage scanned zero files, because an unmodified checkout has no diff against
+  `origin/main`. It says nothing about the whole-file backlog below.
+- **lib-tests failed: 9,086 passed, 16 failed, 63 ignored.**
+  - **12** are all of `indexer::semantic::delegate::hnsw::incremental_tests`. Each fails
+    with `Index version mismatch: expected v1, found v2`. They landed in `92b93c04`
+    (10-27, `of9i7`) with "no runtime result yet", so main's full lib suite has been red
+    since then.
+  - **2** are the known `ann_shards::wal_tests` (`55wh0` / `ds7uy.3.3`, red since 10-22).
+  - **1** is the known GH #515 watch-once case (`362yj` / `0m49m`).
+  - **1** is new and unowned: `storage::sqlite::tests::reinclude_exact_session_preserves_provenance_siblings_and_pending_work`.
+    A workspace `forget` deleted 3 conversations where 4 were expected. This may be a
+    stale expectation (`UNIQUE(source_id, agent_id, external_id)` collapses one fixture
+    variant) or a real retention defect in the README-documented `forget --workspace-glob`.
+    It needs triage before the expected value changes (`fx9fd`).
+- Receipts and comments are on `55wh0`, `hutyl`, `of9i7` and `fx9fd`. The receipt and
+  console log are in the receipts directory.
+
+For the release bar this matters as follows:
+- The 12 HNSW tests and the forget test cover features that do not exist in v0.10.0
+  (native HNSW append, forget re-inclusion).
+- The 3 owned reds predate this check.
+- Under "no worse than v0.10.0", the HNSW append path must stay unadvertised and
+  unreachable by default until `of9i7` lands. That is already true per the code audit:
+  only test callers.
+- The forget failure must be triaged, because `forget --workspace-glob` is a documented
+  feature of the candidate.
 
 ### Delta against the 2026-10-27 vision table
 
@@ -233,6 +254,9 @@ shipped fix until blocker 1 or 2 moves.
    - Indexing has a high fixed memory floor (~700 MB peak for a 9 MB corpus on both binaries).
    - The owner's own archive is not running anywhere current.
    - Large-archive memory and read amplification remain partial (#496, #461, #320).
+   - The full lib suite on main is red: 9,086 passed / 16 failed. 12 are native-HNSW
+     append tests that have never passed (FSVI v1/v2). The others are 2 known ANN WAL
+     cases, 1 known GH #515 case and 1 unowned forget re-include case.
 3. **What blocks:** the decision, the scanner scope and the capacity layers above.
    Technical work items (semantic serving, ANN, `.72` RSS) block quality, not delivery.
 4. **Would finishing all open and in-progress beads close the gap? No.**
