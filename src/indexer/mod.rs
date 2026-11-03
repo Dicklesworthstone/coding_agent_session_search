@@ -20330,37 +20330,100 @@ fn run_index_with_storage_ownership(
                 };
                 let active_source_filter = ActiveSessionSourceFilter::new(!watch_once_mode);
                 let mut retry_sources = BTreeSet::new();
-                let indexed = if is_rebuild {
-                    // Reset stale detector on rebuild
-                    detector_clone.reset();
-                    // For rebuild, trigger reindex on all active roots
-                    let indexed = reindex_full_watch_roots(
-                        &opts_clone,
-                        roots,
-                        &state,
-                        &storage_for_watch,
-                        &t_index,
-                        &index_path_for_watch,
-                        &active_source_filter,
-                    )
-                    .map(|outcome| {
-                        retry_sources.extend(outcome.retry_sources);
-                        outcome.published_conversations
-                    });
-                    if !watch_once_mode
-                        && (indexed.is_err() || indexed.as_ref().is_ok_and(|count| *count > 0))
-                    {
-                        watch_lexical_checkpoint_pending.set(true);
-                    }
-                    finalize_watch_reindex_result(
-                        indexed,
-                        &detector_clone,
-                        opts_clone.progress.as_ref(),
-                        "watch rebuild reindex",
-                    )?
-                } else if watch_once_mode {
-                    let indexed = finalize_watch_once_reindex_result(
-                        reindex_paths_with_semantic_delta(
+                // Collect discovered retries even when a later operation fails.
+                // The original event may name a different, transient leaf and
+                // cannot stand in for an active source discovered by this scan.
+                let result = (|| -> Result<()> {
+                    let indexed = if is_rebuild {
+                        // Reset stale detector on rebuild
+                        detector_clone.reset();
+                        // For rebuild, trigger reindex on all active roots
+                        let indexed = reindex_full_watch_roots(
+                            &opts_clone,
+                            roots,
+                            &state,
+                            &storage_for_watch,
+                            &t_index,
+                            &index_path_for_watch,
+                            &active_source_filter,
+                        )
+                        .map(|outcome| {
+                            retry_sources.extend(outcome.retry_sources);
+                            outcome.published_conversations
+                        });
+                        if !watch_once_mode
+                            && (indexed.is_err() || indexed.as_ref().is_ok_and(|count| *count > 0))
+                        {
+                            watch_lexical_checkpoint_pending.set(true);
+                        }
+                        finalize_watch_reindex_result(
+                            indexed,
+                            &detector_clone,
+                            opts_clone.progress.as_ref(),
+                            "watch rebuild reindex",
+                        )?
+                    } else if watch_once_mode {
+                        let indexed = finalize_watch_once_reindex_result(
+                            reindex_paths_with_semantic_delta(
+                                &opts_clone,
+                                paths,
+                                roots,
+                                &state,
+                                &storage_for_watch,
+                                &t_index,
+                                &index_path_for_watch,
+                                false,
+                                None,
+                                &active_source_filter,
+                            )
+                            .map(|outcome| {
+                                retry_sources.extend(outcome.retry_sources);
+                                outcome.indexed
+                            }),
+                            &detector_clone,
+                            opts_clone.progress.as_ref(),
+                            "watch incremental reindex",
+                        )?;
+
+                        // Only attempt segment merge when the scan actually
+                        // ingested something. Empty watch scans must not wake the
+                        // optimizer (#194), and targeted semantic watch-once must
+                        // proceed directly to reconciliation rather than spending
+                        // hours compacting an unrelated large lexical index (#336).
+                        if should_optimize_tantivy_after_watch_once_ingest(
+                            indexed,
+                            targeted_semantic_watch_once,
+                        ) && let Ok(mut guard) = t_index.lock()
+                            && let Some(t_index) = guard.as_mut()
+                            && let Err(e) = t_index.optimize_if_idle()
+                        {
+                            tracing::warn!(error = %e, "segment merge failed during watch");
+                        }
+                        if targeted_semantic_watch_once {
+                            // The lexical ingest is complete. Park its progress
+                            // atomics in the semantic-aware phase-0 state before
+                            // scanning/copying a potentially million-record FSVI.
+                            // Otherwise the generic phase-2 stall watchdog can
+                            // abort a healthy targeted semantic repair after 300 s.
+                            prepare_progress_for_semantic_build(opts_clone.progress.as_ref());
+                            let stats = run_targeted_semantic_watch_once_publish(
+                                &embedder_id,
+                                &data_dir_for_semantic,
+                                &storage_for_watch,
+                                indexed,
+                                pre_watch_semantic_conversations,
+                            )?;
+                            if opts_clone.build_hnsw {
+                                if let Some(progress) = opts_clone.progress.as_ref() {
+                                    progress.set_phase_progress(INDEX_PHASE_SEMANTIC_HNSW, 0, 0);
+                                }
+                                maintain_requested_hnsw(&data_dir_for_semantic, &embedder_id)?;
+                            }
+                            record_semantic_watch_once_stats(opts_clone.progress.as_ref(), stats);
+                        }
+                        indexed
+                    } else {
+                        let indexed = reindex_paths_with_semantic_delta(
                             &opts_clone,
                             paths,
                             roots,
@@ -20374,171 +20437,114 @@ fn run_index_with_storage_ownership(
                         )
                         .map(|outcome| {
                             retry_sources.extend(outcome.retry_sources);
-                            outcome.indexed
-                        }),
-                        &detector_clone,
-                        opts_clone.progress.as_ref(),
-                        "watch incremental reindex",
-                    )?;
+                            outcome.published_conversations
+                        });
+                        if indexed.is_err() || indexed.as_ref().is_ok_and(|count| *count > 0) {
+                            watch_lexical_checkpoint_pending.set(true);
+                        }
+                        let indexed = finalize_watch_reindex_result(
+                            indexed,
+                            &detector_clone,
+                            opts_clone.progress.as_ref(),
+                            "watch incremental reindex",
+                        )?;
 
-                    // Only attempt segment merge when the scan actually
-                    // ingested something. Empty watch scans must not wake the
-                    // optimizer (#194), and targeted semantic watch-once must
-                    // proceed directly to reconciliation rather than spending
-                    // hours compacting an unrelated large lexical index (#336).
-                    if should_optimize_tantivy_after_watch_once_ingest(
-                        indexed,
-                        targeted_semantic_watch_once,
-                    ) && let Ok(mut guard) = t_index.lock()
-                        && let Some(t_index) = guard.as_mut()
-                        && let Err(e) = t_index.optimize_if_idle()
-                    {
-                        tracing::warn!(error = %e, "segment merge failed during watch");
+                        // Merge Tantivy segments if idle conditions are met.
+                        // Without this, each reindex_paths() commit creates a new
+                        // segment, leading to unbounded accumulation over weeks of
+                        // continuous watch mode operation. The cooldown logic inside
+                        // optimize_if_idle() (300s, 4-segment threshold) prevents
+                        // over-merging. See issue #87.
+                        // Also gated on `indexed > 0` so empty watch scans don't
+                        // wake the optimizer. See issue #194.
+                        if indexed > 0
+                            && let Ok(mut guard) = t_index.lock()
+                            && let Some(t_index) = guard.as_mut()
+                            && let Err(e) = t_index.optimize_if_idle()
+                        {
+                            tracing::warn!(error = %e, "segment merge failed during watch");
+                        }
+                        indexed
+                    };
+
+                    if !watch_once_mode && watch_lexical_checkpoint_pending.get() {
+                        let refreshed = (|| -> Result<bool> {
+                            let storage = storage_for_watch
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+                            let index = t_index
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("lexical index lock poisoned"))?;
+                            let Some(index) = index.as_ref() else {
+                                return Ok(false);
+                            };
+                            refresh_completed_watch_lexical_checkpoint(
+                                &storage,
+                                index,
+                                &opts_clone.db_path,
+                                &index_path_for_watch,
+                            )
+                        })();
+                        match refreshed {
+                            Ok(true) => watch_lexical_checkpoint_pending.set(false),
+                            Ok(false) => {}
+                            Err(error) => tracing::warn!(
+                                %error,
+                                "watch lexical checkpoint refresh failed; retaining pending refresh"
+                            ),
+                        }
                     }
-                    if targeted_semantic_watch_once {
-                        // The lexical ingest is complete. Park its progress
-                        // atomics in the semantic-aware phase-0 state before
-                        // scanning/copying a potentially million-record FSVI.
-                        // Otherwise the generic phase-2 stall watchdog can
-                        // abort a healthy targeted semantic repair after 300 s.
-                        prepare_progress_for_semantic_build(opts_clone.progress.as_ref());
-                        let stats = run_targeted_semantic_watch_once_publish(
+
+                    // Reconcile every pending canonical change, including earlier
+                    // cooldown-skipped callbacks, before publishing current coverage.
+                    if semantic_enabled && !targeted_semantic_watch_once {
+                        let mut maintenance = semantic_maintenance.borrow_mut();
+                        maintenance.record_ingest(indexed, semantic_retry_paths);
+                        match maintenance.reconcile_if_due(
                             &embedder_id,
                             &data_dir_for_semantic,
                             &storage_for_watch,
-                            indexed,
-                            pre_watch_semantic_conversations,
-                        )?;
-                        if opts_clone.build_hnsw {
-                            if let Some(progress) = opts_clone.progress.as_ref() {
-                                progress.set_phase_progress(INDEX_PHASE_SEMANTIC_HNSW, 0, 0);
-                            }
-                            maintain_requested_hnsw(&data_dir_for_semantic, &embedder_id)?;
+                            semantic_cooldown,
+                            opts_clone.progress.as_ref(),
+                        ) {
+                            Ok(Some(stats)) => tracing::info!(
+                                selected_docs = stats.selected_docs,
+                                embedded_docs = stats.embedded_docs,
+                                reason = %stats.reason,
+                                "watch semantic coverage reconciled and published"
+                            ),
+                            Ok(None) => {}
+                            Err(error) => tracing::warn!(
+                                %error,
+                                "watch semantic maintenance failed; retaining sources for retry"
+                            ),
                         }
-                        record_semantic_watch_once_stats(opts_clone.progress.as_ref(), stats);
                     }
-                    indexed
-                } else {
-                    let indexed = reindex_paths_with_semantic_delta(
-                        &opts_clone,
-                        paths,
-                        roots,
-                        &state,
-                        &storage_for_watch,
-                        &t_index,
-                        &index_path_for_watch,
-                        false,
-                        None,
-                        &active_source_filter,
-                    )
-                    .map(|outcome| {
-                        retry_sources.extend(outcome.retry_sources);
-                        outcome.published_conversations
-                    });
-                    if indexed.is_err() || indexed.as_ref().is_ok_and(|count| *count > 0) {
-                        watch_lexical_checkpoint_pending.set(true);
-                    }
-                    let indexed = finalize_watch_reindex_result(
-                        indexed,
-                        &detector_clone,
-                        opts_clone.progress.as_ref(),
-                        "watch incremental reindex",
-                    )?;
 
-                    // Merge Tantivy segments if idle conditions are met.
-                    // Without this, each reindex_paths() commit creates a new
-                    // segment, leading to unbounded accumulation over weeks of
-                    // continuous watch mode operation. The cooldown logic inside
-                    // optimize_if_idle() (300s, 4-segment threshold) prevents
-                    // over-merging. See issue #87.
-                    // Also gated on `indexed > 0` so empty watch scans don't
-                    // wake the optimizer. See issue #194.
-                    if indexed > 0
-                        && let Ok(mut guard) = t_index.lock()
-                        && let Some(t_index) = guard.as_mut()
-                        && let Err(e) = t_index.optimize_if_idle()
-                    {
-                        tracing::warn!(error = %e, "segment merge failed during watch");
-                    }
-                    indexed
-                };
-
-                if !watch_once_mode && watch_lexical_checkpoint_pending.get() {
-                    let refreshed = (|| -> Result<bool> {
-                        let storage = storage_for_watch
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
-                        let index = t_index
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("lexical index lock poisoned"))?;
-                        let Some(index) = index.as_ref() else {
-                            return Ok(false);
-                        };
-                        refresh_completed_watch_lexical_checkpoint(
-                            &storage,
-                            index,
+                    // CASS #163 item 3: Periodically recycle the long-lived read
+                    // handle to shed accumulated MVCC snapshots when
+                    // autocommit_retain could not be disabled.
+                    let count = watch_recycle_counter.get().wrapping_add(1);
+                    watch_recycle_counter.set(count);
+                    if count.is_multiple_of(watch_recycle_interval) {
+                        close_watch_storage_for_recycle(
+                            &storage_for_watch,
+                            &watch_storage_reopen_pending,
+                        )?;
+                        reopen_watch_storage_if_pending(
+                            &storage_for_watch,
                             &opts_clone.db_path,
-                            &index_path_for_watch,
-                        )
-                    })();
-                    match refreshed {
-                        Ok(true) => watch_lexical_checkpoint_pending.set(false),
-                        Ok(false) => {}
-                        Err(error) => tracing::warn!(
-                            %error,
-                            "watch lexical checkpoint refresh failed; retaining pending refresh"
-                        ),
+                            &watch_storage_reopen_pending,
+                            opts_clone.watch,
+                            opts_clone.progress.as_ref(),
+                        )?;
+                        tracing::debug!(
+                            cycle = count,
+                            "recycled long-lived storage handle to shed MVCC state"
+                        );
                     }
-                }
-
-                // Reconcile every pending canonical change, including earlier
-                // cooldown-skipped callbacks, before publishing current coverage.
-                if semantic_enabled && !targeted_semantic_watch_once {
-                    let mut maintenance = semantic_maintenance.borrow_mut();
-                    maintenance.record_ingest(indexed, semantic_retry_paths);
-                    match maintenance.reconcile_if_due(
-                        &embedder_id,
-                        &data_dir_for_semantic,
-                        &storage_for_watch,
-                        semantic_cooldown,
-                        opts_clone.progress.as_ref(),
-                    ) {
-                        Ok(Some(stats)) => tracing::info!(
-                            selected_docs = stats.selected_docs,
-                            embedded_docs = stats.embedded_docs,
-                            reason = %stats.reason,
-                            "watch semantic coverage reconciled and published"
-                        ),
-                        Ok(None) => {}
-                        Err(error) => tracing::warn!(
-                            %error,
-                            "watch semantic maintenance failed; retaining sources for retry"
-                        ),
-                    }
-                }
-
-                // CASS #163 item 3: Periodically recycle the long-lived read
-                // handle to shed accumulated MVCC snapshots when
-                // autocommit_retain could not be disabled.
-                let count = watch_recycle_counter.get().wrapping_add(1);
-                watch_recycle_counter.set(count);
-                if count.is_multiple_of(watch_recycle_interval) {
-                    close_watch_storage_for_recycle(
-                        &storage_for_watch,
-                        &watch_storage_reopen_pending,
-                    )?;
-                    reopen_watch_storage_if_pending(
-                        &storage_for_watch,
-                        &opts_clone.db_path,
-                        &watch_storage_reopen_pending,
-                        opts_clone.watch,
-                        opts_clone.progress.as_ref(),
-                    )?;
-                    tracing::debug!(
-                        cycle = count,
-                        "recycled long-lived storage handle to shed MVCC state"
-                    );
-                }
+                    Ok(())
+                })();
 
                 let mut deferred = active_source_filter.take_deferred_sources();
                 // A long-lived watch retries these itself; a single
@@ -20548,7 +20554,7 @@ fn run_index_with_storage_ownership(
                 }
                 deferred.extend(retry_sources);
                 deferred.extend(semantic_maintenance.borrow().pending_paths.iter().cloned());
-                Ok(deferred)
+                finish_watch_callback(result, deferred)
             },
         );
 
@@ -32123,6 +32129,31 @@ impl WatchConversationBatches {
     }
 }
 
+/// An error must retain sources discovered before the failure as well as the
+/// original notification paths. In particular, an active writer can close
+/// without another event after a later publication or storage-recycle failure.
+#[derive(Debug)]
+struct WatchCallbackRetrySources(BTreeSet<PathBuf>);
+
+impl std::fmt::Display for WatchCallbackRetrySources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "watch callback retained {} source retries", self.0.len())
+    }
+}
+
+fn finish_watch_callback(
+    result: Result<()>,
+    deferred: BTreeSet<PathBuf>,
+) -> Result<BTreeSet<PathBuf>> {
+    match result {
+        Ok(()) => Ok(deferred),
+        Err(error) if deferred.is_empty() => Err(error),
+        // Anyhow's typed context preserves the original error identity and
+        // cause chain, including cancellation, while carrying discovered work.
+        Err(error) => Err(error.context(WatchCallbackRetrySources(deferred))),
+    }
+}
+
 /// Keep deferred sources in the watch loop, including sources skipped during
 /// startup. An active writer may close without producing another filesystem
 /// event; the cooldown must therefore drive retries itself (GH455).
@@ -32146,7 +32177,10 @@ where
             true
         }
         Err(error) => {
-            tracing::warn!(%error, is_rebuild, "watch callback failed; retaining sources for retry");
+            tracing::warn!(error = %format_args!("{error:#}"), is_rebuild, "watch callback failed; retaining sources for retry");
+            if let Some(retries) = error.downcast_ref::<WatchCallbackRetrySources>() {
+                pending.extend(retries.0.iter().cloned());
+            }
             if is_rebuild {
                 pending.extend(roots.iter().map(|(_, root)| root.path.clone()));
             }
@@ -32200,6 +32234,11 @@ struct WatchNotificationMailbox {
     backlog: Mutex<WatchEventBacklog>,
     deferred_tx: Sender<PathBuf>,
     deferred_rx: Receiver<PathBuf>,
+    // A native error or dropped kernel event can leave recursive children
+    // unenrolled even though the configured root's inode is unchanged. This
+    // is separate from our bounded queue overflowing: that loses scan work,
+    // not the backend's registrations.
+    native_registration_invalidated: AtomicBool,
     // High 32 bits count paths; low 32 bits charge PathBuf capacities. Both
     // limits fit their halves, so one atomic reservation covers both queues.
     retained: AtomicU64,
@@ -32212,6 +32251,7 @@ impl Default for WatchNotificationMailbox {
             backlog: Mutex::new(WatchEventBacklog::default()),
             deferred_tx,
             deferred_rx,
+            native_registration_invalidated: AtomicBool::new(false),
             retained: AtomicU64::new(0),
         }
     }
@@ -32256,7 +32296,12 @@ fn enqueue_watch_notification(
     wake: &Sender<()>,
 ) {
     match result {
-        Ok(event) if event.need_rescan() => rescan.store(true, Ordering::Release),
+        Ok(event) if event.need_rescan() => {
+            mailbox
+                .native_registration_invalidated
+                .store(true, Ordering::Release);
+            rescan.store(true, Ordering::Release);
+        }
         Ok(event) => {
             if !watch_event_should_trigger_reindex(&event) || event.paths.is_empty() {
                 return;
@@ -32300,7 +32345,10 @@ fn enqueue_watch_notification(
             }
         }
         Err(error) => {
-            tracing::warn!(%error, "filesystem watcher error; scheduling a full-root scan");
+            tracing::warn!(%error, "filesystem watcher error; scheduling registration recovery and a full-root scan");
+            mailbox
+                .native_registration_invalidated
+                .store(true, Ordering::Release);
             rescan.store(true, Ordering::Release);
         }
     }
@@ -32825,6 +32873,42 @@ fn refresh_watch_root_registrations<W: Watcher>(
     Ok(refreshed)
 }
 
+/// Lost recursive enrollment is not visible in the root's filesystem identity.
+/// Rebuild native coverage before the usual post-registration census. The
+/// resident loop calls this only at its existing registration cooldown, so a
+/// persistent backend error cannot turn recovery into a hot retry loop.
+fn refresh_watch_roots_after_notifications<W: Watcher>(
+    watcher: &mut W,
+    roots: &[(ConnectorKind, ScanRoot)],
+    registered: &mut BTreeMap<PathBuf, WatchRootRegistration>,
+    mailbox: &WatchNotificationMailbox,
+    progress: Option<&Arc<IndexingProgress>>,
+) -> Result<WatchRootRefresh> {
+    if mailbox
+        .native_registration_invalidated
+        .swap(false, Ordering::AcqRel)
+    {
+        // Consume before calling the backend: another error delivered during
+        // re-enrollment must survive for the next cooldown. Re-registering a
+        // still-recorded root alone can retain a partial recursive watch.
+        for path in registered.keys() {
+            if let Some(progress) = progress {
+                progress.check_stop()?;
+            }
+            let _ = watcher.unwatch(path);
+            if let Some(progress) = progress {
+                progress.tick_activity();
+                progress.check_stop()?;
+            }
+        }
+        registered.clear();
+    }
+    // A fresh registration reconciles every configured source it covers,
+    // including FSEvents peers whose shared stream restarts with SinceNow.
+    // The independent full-root rescan obligation remains in the mailbox.
+    refresh_watch_root_registrations(watcher, roots, registered, progress)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn watch_sources<F>(
     watch_once_paths: Option<Vec<PathBuf>>,
@@ -32865,8 +32949,13 @@ where
     })?;
 
     let mut registered_roots = BTreeMap::new();
-    let initial_roots =
-        refresh_watch_root_registrations(&mut watcher, &roots, &mut registered_roots, progress)?;
+    let initial_roots = refresh_watch_roots_after_notifications(
+        &mut watcher,
+        &roots,
+        &mut registered_roots,
+        &notification_backlog,
+        progress,
+    )?;
     let mut polled_database_roots = initial_roots.database_roots;
     let (mut database_poller, mut retry_database_registration) = database_root_poller(
         &polled_database_roots,
@@ -32919,10 +33008,11 @@ where
             progress.check_stop()?;
         }
         if last_registration_check.elapsed() >= min_scan_interval {
-            let mut refreshed = refresh_watch_root_registrations(
+            let mut refreshed = refresh_watch_roots_after_notifications(
                 &mut watcher,
                 &roots,
                 &mut registered_roots,
+                &notification_backlog,
                 progress,
             )?;
             if refreshed.database_roots != polled_database_roots
@@ -33274,6 +33364,174 @@ mod watch_registration_tests {
             watch.observed.recv_timeout(Duration::from_secs(3)).is_err(),
             "healthy root checks must not manufacture indexing work"
         );
+    }
+
+    fn watcher_with_mailbox(
+        mailbox: Arc<WatchNotificationMailbox>,
+        rescan: Arc<AtomicBool>,
+        wake: Sender<()>,
+    ) -> (
+        notify::RecommendedWatcher,
+        Receiver<notify::Result<notify::Event>>,
+    ) {
+        let (events_tx, events) = crossbeam_channel::unbounded();
+        let watcher = recommended_watcher(move |result: notify::Result<notify::Event>| {
+            // notify::Error is not Clone. Preserve its diagnostic text/paths
+            // for the test tap while the original reaches production intact.
+            let observation = match &result {
+                Ok(event) => Ok(event.clone()),
+                Err(error) => {
+                    Err(notify::Error::generic(&error.to_string()).set_paths(error.paths.clone()))
+                }
+            };
+            let _ = events_tx.send(observation);
+            enqueue_watch_notification(result, &mailbox, &rescan, &wake);
+        })
+        .unwrap();
+        (watcher, events)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gh538_native_watch_repairs_lost_recursive_coverage_after_backend_error_or_rescan() {
+        for backend_error in [true, false] {
+            let temp = TempDir::new().unwrap();
+            let root = temp.path().join("sessions");
+            let child = root.join("project");
+            fs::create_dir_all(&child).unwrap();
+            let roots = vec![(ConnectorKind::Codex, ScanRoot::local(root.clone()))];
+            let mailbox = Arc::new(WatchNotificationMailbox::default());
+            let rescan = Arc::new(AtomicBool::new(false));
+            let (wake, _notifications) = bounded(1);
+            let (mut watcher, events) =
+                watcher_with_mailbox(Arc::clone(&mailbox), Arc::clone(&rescan), wake.clone());
+            let mut registered = BTreeMap::new();
+            refresh_watch_roots_after_notifications(
+                &mut watcher,
+                &roots,
+                &mut registered,
+                &mailbox,
+                None,
+            )
+            .unwrap();
+            let baseline = child.join("baseline.jsonl");
+            fs::write(&baseline, "initial native coverage").unwrap();
+            wait_for_native_write(&events, &baseline);
+
+            // Fault-inject the state notify reaches after recursive child
+            // enrollment fails or its directory-create event is dropped.
+            // This removes a real private inotify watch; no global kernel
+            // watch limit is changed, and the configured root inode survives.
+            watcher.unwatch(&child).unwrap();
+            let missed = child.join("missed.jsonl");
+            fs::write(&missed, "written without a child watch").unwrap();
+            let expected = dunce::canonicalize(&missed).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(Ok(event)) => assert!(
+                        !watch_event_should_trigger_reindex(&event)
+                            || !event.paths.contains(&expected),
+                        "the injected missing child watch still delivered its write: {event:?}"
+                    ),
+                    Ok(Err(error)) => panic!("unexpected native watcher failure: {error}"),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                    Err(error) => panic!("native event channel closed: {error}"),
+                }
+            }
+
+            let failure = if backend_error {
+                Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch).add_path(child))
+            } else {
+                Ok(notify::Event::new(notify::EventKind::Other)
+                    .set_flag(notify::event::Flag::Rescan))
+            };
+            enqueue_watch_notification(failure, &mailbox, &rescan, &wake);
+            let mut pending = WatchEventBacklog::default();
+            let mut pending_rescan = false;
+            collect_watch_notifications(&mailbox, &rescan, &mut pending, &mut pending_rescan);
+            assert!(pending_rescan, "lost events still require a full census");
+
+            let refreshed = refresh_watch_roots_after_notifications(
+                &mut watcher,
+                &roots,
+                &mut registered,
+                &mailbox,
+                None,
+            )
+            .unwrap();
+            let mut source = OpenOptions::new().append(true).open(&missed).unwrap();
+            source.write_all(b"; append after native recovery").unwrap();
+            drop(source);
+            wait_for_native_write(&events, &missed);
+            assert_eq!(refreshed.reconcile, BTreeSet::from([root]));
+            assert!(pending_rescan, "rearming must not discharge scan debt");
+            assert!(
+                refresh_watch_roots_after_notifications(
+                    &mut watcher,
+                    &roots,
+                    &mut registered,
+                    &mailbox,
+                    None,
+                )
+                .unwrap()
+                .reconcile
+                .is_empty(),
+                "ordinary writes after repair must not rearm native watches"
+            );
+        }
+    }
+
+    #[test]
+    fn gh538_watch_mailbox_overflow_does_not_invalidate_native_coverage() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("sessions");
+        fs::create_dir(&root).unwrap();
+        let roots = vec![(ConnectorKind::Codex, ScanRoot::local(root.clone()))];
+        let mailbox = Arc::new(WatchNotificationMailbox::default());
+        let rescan = Arc::new(AtomicBool::new(false));
+        let (wake, _notifications) = bounded(1);
+        let (mut watcher, events) =
+            watcher_with_mailbox(Arc::clone(&mailbox), Arc::clone(&rescan), wake.clone());
+        let mut registered = BTreeMap::new();
+        refresh_watch_roots_after_notifications(
+            &mut watcher,
+            &roots,
+            &mut registered,
+            &mailbox,
+            None,
+        )
+        .unwrap();
+        for index in 0..=WATCH_PENDING_MAX_PATHS {
+            enqueue_watch_notification(
+                Ok(notify::Event::new(notify::EventKind::Any)
+                    .add_path(root.join(format!("source-{index}.jsonl")))),
+                &mailbox,
+                &rescan,
+                &wake,
+            );
+        }
+        let mut pending = WatchEventBacklog::default();
+        let mut pending_rescan = false;
+        collect_watch_notifications(&mailbox, &rescan, &mut pending, &mut pending_rescan);
+        assert!(pending_rescan, "bounded queue overflow needs a full census");
+        assert!(
+            refresh_watch_roots_after_notifications(
+                &mut watcher,
+                &roots,
+                &mut registered,
+                &mailbox,
+                None,
+            )
+            .unwrap()
+            .reconcile
+            .is_empty(),
+            "application queue pressure must not restart healthy native streams"
+        );
+        assert!(pending_rescan);
+        let source = root.join("still-watched.jsonl");
+        fs::write(&source, "native coverage remains enrolled").unwrap();
+        wait_for_native_write(&events, &source);
     }
 
     #[test]
