@@ -1,9 +1,132 @@
 {
   "schema_version": 2,
+  "continued_recovery_20261103": {
+    "source_commit": "9995f13024f1f239b9cfe4027f412ea11f967294",
+    "parent_commit": "1e68fdf942b9647e9ef515096e8004c0373cbbc6",
+    "negative_control_commit": "c33558fd28e03cf6519dc11c20eece770533973d",
+    "bead": "coding_agent_session_search-gh538-watch-ingestion-20261031",
+    "bead_closed": false,
+    "native_macos_executed": false,
+    "reporter_archive_used": false,
+    "source_sha256": {
+      "src/indexer/mod.rs": "aca117d338b08b8ea1b4e82d86307c92a17f0ff9318cac39be038f63fbddf462",
+      "src/indexer/watch_ingestion_tests.rs": "0b4ba3ee3fc174d68d870d00682dc1e211577c0bdf690a726fdc5504adcb931f"
+    },
+    "published_git_blobs_verified": {
+      "src/indexer/mod.rs": "d030122c9fad76d1e6b1bae3c2414e9fbb348919",
+      "src/indexer/watch_ingestion_tests.rs": "32630d9d563877387ef5a15df571687dd905e73c"
+    },
+    "pins_sha256": {
+      "Cargo.toml": "b28a7edbec9ce7cbebbdeacc04c6333e2c40ef4acd795ce29afebfca38dd11c0",
+      "Cargo.lock": "1daeb680b1db621c270a7c56f04dbc0b20e3e8b21186a266aa859c40ceab8d6d",
+      "rust-toolchain.toml": "7fab71eddf5e49029d9df39990f4ad5809b9218804a363a2e10d7c4ea2de06bc",
+      ".cargo/config.toml": "8a7c49456694f211b2f14d72d8d4ddf8c8ec511c80ab78009aa77fd42ecd78f2"
+    },
+    "component_environment": {
+      "platform": "Linux x86_64",
+      "rustc": "1.100.0-nightly (908501772 2026-08-30)",
+      "toolchain": "nightly-2026-08-31",
+      "RUST_MIN_STACK": "134217728",
+      "registry_identities_and_checksums_matching_root_lock": 48,
+      "full_application_features_qualified": false
+    },
+    "components": {
+      "candidate_passed": 4,
+      "candidate_failed": 0,
+      "candidate_ignored": 0,
+      "baseline_expected_assertion_failures": 3,
+      "baseline_healthy_control_passed": 1,
+      "tests": [
+        "gh538_watch_callback_error_preserves_cause_and_exact_retries",
+        "gh538_watch_callback_error_retries_keep_backlog_bounds_and_full_scan_debt",
+        "gh538_native_watch_repairs_lost_recursive_coverage_after_backend_error_or_rescan",
+        "gh538_watch_mailbox_overflow_does_not_invalidate_native_coverage"
+      ],
+      "native_fault": "A real private child inotify registration is removed while the root identity remains unchanged. Both notify error and rescan signals are injected at the callback boundary; a real subsequent append must arrive. No actual kernel exhaustion or overflow is claimed.",
+      "native_baseline_adapter": "Forwards the candidate test entry point to the original refresh function; original production notification and registration blocks remain unchanged.",
+      "dispatcher_baseline_adapter": "Candidate typed error context producer and tests feed the original dispatcher. Qualifies dispatcher retry loss only, not execution of the old production callback.",
+      "initial_test_correction": "The new backlog test initially expected individual paths after a failed full census. Its corrected assertion requires the existing empty bounded backlog and retained full flag, then verifies force_full=true on the next callback. Original failure evidence retained; no production change or deadline relaxation.",
+      "excluded": [
+        "Full CASS application and production callback lifecycle",
+        "Canonical/lexical publication, provider authorization and restart receipts",
+        "Native component cancellation/progress scaffold runtime behavior",
+        "Native macOS FSEvents and reporter workload"
+      ]
+    },
+    "formatting": {
+      "rustfmt_edition": "2024",
+      "pinned_changed_source_check_exit_code": 0,
+      "git_diff_check_exit_code": 0
+    },
+    "ubs": {
+      "version": "v5.4.4",
+      "runner_sha256": "bdeccbb35f2056e6177c73b3f0f9966d20d1cbeff22b7f084133c4a6ac625ee2",
+      "ast_grep_version": "0.45.3",
+      "exit_code": 1,
+      "elapsed_seconds": 105.369,
+      "source_unchanged_during_final_scan": true,
+      "critical": 48,
+      "warning": 11242,
+      "info": 3058,
+      "added_line_findings": {"critical": 2, "warning": 134, "info": 36},
+      "substantive_production_findings": {"critical": 0, "warning": 0, "info": 2},
+      "critical_review": "46 sites match unchanged baseline lines. The two added sites deliberately fail a Linux native regression on unexpected watcher error or channel disconnection.",
+      "warning_review": "All 134 added-line warnings concern test assertions or fixture operations. Two substantive production informational findings mistake tracing display syntax for modulo.",
+      "actual_ast_evidence": {"unwrap_expect": 6579, "panic": 45, "clone": 756},
+      "ast_evidence_basis": "Content-matched cache records and AST-only branches of pinned rust_scan.py cat_1/cat_5; complete per-subprocess AST coverage is not claimed.",
+      "cargo_phases_evaluated": false,
+      "cargo_exclusion": "UBS_SKIP_RUST_BUILD=1 while full application compilation ran separately",
+      "suppressions_added": false,
+      "gate_passed": false
+    },
+    "full_application": {
+      "status": "blocked_before_cass_compilation",
+      "command": "cargo test --offline --locked --test watch_e2e --no-run",
+      "exit_code": 101,
+      "elapsed_seconds": 1530.516,
+      "failure": "Pinned asupersync 0.5.0 library compiler was terminated by signal 9 (SIGKILL) before CASS compiled; shared 8 GiB cgroup OOM-kill counter increased during that phase.",
+      "runtime_tests_executed": 0,
+      "source_frozen_before_cass_compilation": true,
+      "initial_invocation_note": "Dependency compilation started on c33558fd; incoming main and candidate were integrated before CASS compilation. A successful initial build requires a fresh stable-source test invocation before qualification.",
+      "unchanged_dependency_graph": true,
+      "watchdog_or_test_deadlines_changed": false,
+      "full_gate_passed": false
+    },
+    "all_target_clippy": {
+      "command": "cargo clippy --offline --locked --all-targets -- -D warnings",
+      "exit_code": 101,
+      "elapsed_seconds": 597.52,
+      "compiler_mode": "--emit=dep-info,metadata",
+      "failure": "Pinned asupersync 0.5.0 library compiler terminated by signal 9 (SIGKILL) before CASS was checked.",
+      "cass_source_diagnostics": 0,
+      "passed": false,
+      "rust_source_and_pin_hashes_unchanged": true,
+      "only_documentation_changed_during_run": true
+    },
+    "application_build_environment": {
+      "memory_limit_bytes": 8589934592,
+      "other_compilers_shared_limit": true,
+      "CARGO_BUILD_JOBS": "1",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_TEST_DEBUG": "0",
+      "RUSTFLAGS": "-Z threads=1 -C link-arg=-fuse-ld=lld",
+      "dependency_optimization_and_features_unchanged": true,
+      "selected_linux_package_count": 659,
+      "asupersync_features": ["default", "nightly-outcome-try", "proc-macros", "test-internals", "tls", "tls-native-roots"],
+      "termination_precision": "SIGKILL and rising shared cgroup OOM counters are observed. No per-victim kernel OOM log or exact internal compiler phase at first termination was available.",
+      "native_macos_or_configured_dsr_rch_route_available": false,
+      "heavy_attempts_still_running": false
+    },
+    "build_log_sha256": {
+      "watcher-build-baseline.log": "6ed94de4e5e3de6cb3f2e3610a660ccf7795420adfaa59491d8a1a8a60464c56",
+      "clippy-all-targets.log": "f3be12eefb6f219f5ffb576dfd33104ff55b7ed821cad57cfd1f91e778852379"
+    }
+  },
   "issue": "https://github.com/Dicklesworthstone/coding_agent_session_search/issues/538",
   "reporter_evidence": "https://github.com/Dicklesworthstone/coding_agent_session_search/issues/538#issuecomment-6539798177",
   "baseline_commit": "5cfb9d6a033927255a8a4befad153a44c8ed36e4",
-  "qualification": "Nine native component regressions, final all-target metadata checking, all-target Clippy with denied warnings, and formatting passed; application execution and the full repository gate remain unqualified.",
+  "qualification": "Historical root/publication checkpoint: nine native component regressions, all-target metadata checking, all-target Clippy with denied warnings, and formatting passed. See continued_recovery_20261103 for the newer published source and its failed compilation/Clippy attempts. Application execution and the full repository gate remain unqualified.",
   "reporter_archive_used": false,
   "native_macos_executed": false,
   "candidate_source_sha256": {
