@@ -22299,9 +22299,9 @@ pub(crate) fn normalize_path_identity(path: &Path) -> PathBuf {
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     };
-    let lexical = {
+    let lexical = |path: &Path| {
         let mut normalized = PathBuf::new();
-        for component in absolute.components() {
+        for component in path.components() {
             match component {
                 std::path::Component::CurDir => {}
                 std::path::Component::ParentDir => {
@@ -22327,31 +22327,37 @@ pub(crate) fn normalize_path_identity(path: &Path) -> PathBuf {
     // checkpoints, so keep it out of the \\?\ verbatim form (txc9h). Readers
     // that compare a saved value re-normalize it (path_identities_match, watch
     // replay debt), so values saved by an older build still match.
-    dunce::canonicalize(&lexical).unwrap_or_else(|_| {
-        let mut suffix = Vec::new();
-        let mut cursor = lexical.as_path();
-        loop {
-            match dunce::canonicalize(cursor) {
-                Ok(prefix) => {
-                    let mut resolved = prefix;
-                    for component in suffix.iter().rev() {
-                        resolved.push(component);
-                    }
-                    return resolved;
+    // Resolve the original spelling first: `link/..` names the parent of
+    // the link's TARGET, not the directory containing the link. A missing
+    // leaf must retain that same identity before and after it is created.
+    let mut suffix = Vec::new();
+    let mut cursor = absolute.as_path();
+    loop {
+        match dunce::canonicalize(cursor) {
+            Ok(mut resolved) => {
+                for component in suffix.iter().rev() {
+                    resolved.push(component);
                 }
-                Err(_) => {
-                    let Some(name) = cursor.file_name() else {
-                        return lexical.clone();
-                    };
-                    suffix.push(name.to_os_string());
-                    let Some(parent) = cursor.parent() else {
-                        return lexical.clone();
-                    };
-                    cursor = parent;
+                return lexical(&resolved);
+            }
+            Err(_) => {
+                let Some(component) = cursor.components().next_back() else {
+                    return lexical(&absolute);
+                };
+                if !matches!(
+                    component,
+                    std::path::Component::Normal(_) | std::path::Component::ParentDir
+                ) {
+                    return lexical(&absolute);
                 }
+                suffix.push(component.as_os_str().to_os_string());
+                let Some(parent) = cursor.parent() else {
+                    return lexical(&absolute);
+                };
+                cursor = parent;
             }
         }
-    })
+    }
 }
 
 pub(crate) fn path_identities_match(lhs: &Path, rhs: &Path) -> bool {
@@ -91746,6 +91752,52 @@ mod cli_read_db_tests {
             normalize_path_identity(&via_real_dir)
         );
         assert!(path_identities_match(&via_symlink, &via_real_dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_path_identity_resolves_symlinks_before_parent_components() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let physical = temp.path().join("physical");
+        std::fs::create_dir_all(physical.join("nested"))?;
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(physical.join("nested"), &alias)?;
+        let decoy = temp.path().join("archive.db");
+        std::fs::write(&decoy, b"distinct archive")?;
+
+        for tail in [
+            "archive.db",
+            "missing/../archive.db",
+            "missing/deeper/archive.db",
+        ] {
+            let spelling = alias.join("..").join(tail);
+            let expected = physical.join(tail);
+            assert!(path_identities_match(&spelling, &expected));
+            assert!(!path_identities_match(&spelling, &decoy));
+            assert!(stored_path_identity_matches(
+                &spelling.to_string_lossy(),
+                &expected
+            ));
+            assert!(
+                !expected.exists(),
+                "identity lookup must not create its target"
+            );
+        }
+
+        let archive = physical.join("archive.db");
+        let spelling = alias.join("../archive.db");
+        let before_creation = normalize_path_identity(&spelling);
+        std::fs::write(&archive, b"canonical archive")?;
+        assert_eq!(before_creation, dunce::canonicalize(&archive)?);
+        assert_eq!(normalize_path_identity(&spelling), before_creation);
+        assert!(!path_identities_match(&spelling, &decoy));
+        assert_eq!(std::fs::read(&archive)?, b"canonical archive");
+        assert_eq!(std::fs::read(&decoy)?, b"distinct archive");
+        assert_eq!(
+            normalize_path_identity(Path::new("/../../")),
+            Path::new("/")
+        );
+        Ok(())
     }
 
     #[test]

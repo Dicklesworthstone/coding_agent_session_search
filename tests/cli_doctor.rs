@@ -2718,6 +2718,76 @@ fn doctor_check_json_reports_read_only_truth_surface_without_writes() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_owner_matches_symlink_parent_archive_without_conflating_a_decoy() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let data = home.path().join("cass-data");
+    fs::create_dir(&data)?;
+    let physical = home.path().join("physical");
+    fs::create_dir_all(physical.join("nested"))?;
+    let alias = home.path().join("alias");
+    std::os::unix::fs::symlink(physical.join("nested"), &alias)?;
+    let archive = physical.join("archive.db");
+    let spelling = alias.join("../archive.db");
+    let decoy = home.path().join("archive.db");
+    let metadata = format!(
+        "pid={}\nstarted_at_ms=1793670000000\ndb_path={}\nmode=index\n",
+        std::process::id(),
+        archive.display()
+    );
+    let lock_path = data.join("index-run.lock");
+    let mut held = fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    held.write_all(metadata.as_bytes())?;
+    held.flush()?;
+    held.try_lock_exclusive()?;
+    let before = doctor_no_write_snapshot(home.path());
+
+    for (requested, matches) in [(&archive, true), (&spelling, true), (&decoy, false)] {
+        let output = cass_cmd(home.path())
+            .args(["doctor", "--check", "--json", "--data-dir"])
+            .arg(&data)
+            .arg("--db")
+            .arg(requested)
+            .timeout(Duration::from_secs(30))
+            .output()?;
+        let report: Value = serde_json::from_slice(&output.stdout)?;
+        let operation = &report["operation_state"];
+        let owner = operation["owners"]
+            .as_array()
+            .and_then(|owners| {
+                owners
+                    .iter()
+                    .find(|owner| owner["lock_kind"] == "index_run")
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing index owner: {report}; stderr={}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            })?;
+        assert_eq!(
+            output.status.code(),
+            Some(5),
+            "missing archive health failure"
+        );
+        assert_eq!(owner["active"], true);
+        assert_eq!(
+            owner["db_path_matches_requested"], matches,
+            "{requested:?}: {report}"
+        );
+        assert_eq!(operation["active_index_maintenance"], matches);
+        assert_eq!(fs::read(&lock_path)?, metadata.as_bytes());
+    }
+    assert_eq!(doctor_no_write_snapshot(home.path()), before);
+    assert!(!archive.exists() && !decoy.exists());
+    Ok(())
+}
+
 #[test]
 fn legacy_doctor_json_realizes_read_only_check_without_writes() {
     let test_home = tempfile::tempdir().expect("tempdir");

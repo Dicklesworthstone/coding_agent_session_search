@@ -71754,6 +71754,58 @@ c.close()
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn gh538_watch_replay_resolves_symlinks_before_parent_components() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let physical = tmp.path().join("physical");
+        fs::create_dir_all(physical.join("nested"))?;
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(physical.join("nested"), &alias)?;
+        let storage = FrankenStorage::open(&tmp.path().join("agent_search.db"))?;
+
+        for source_exists in [false, true] {
+            let source = physical.join("source");
+            let decoy = tmp.path().join("source");
+            if source_exists {
+                fs::create_dir(&source)?;
+                fs::create_dir(&decoy)?;
+            }
+            let root = ScanRoot::local(source.clone());
+            let alias_root = ScanRoot::local(alias.join("../source"));
+            let decoy_root = ScanRoot::local(decoy);
+            let debt = WatchLexicalReplayDebt::for_root(ConnectorKind::Amp, &alias_root);
+            persist_watch_lexical_replay_debt(&storage, &debt)?;
+            let unrelated = WatchLexicalReplayDebt::for_root(ConnectorKind::Amp, &decoy_root);
+            persist_watch_lexical_replay_debt(&storage, &unrelated)?;
+
+            let pending = watch_lexical_replay_debt_for_root(&storage, ConnectorKind::Amp, &root)?;
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                pending[0].path,
+                dunce::canonicalize(&physical)?.join("source")
+            );
+            assert_eq!(
+                watch_lexical_replay_sources(&storage, &[(ConnectorKind::Amp, root.clone())])?,
+                BTreeSet::from([source.clone()])
+            );
+            clear_watch_lexical_replay_debt(&storage, &pending[0])?;
+            assert!(
+                watch_lexical_replay_debt_for_root(&storage, ConnectorKind::Amp, &root)?.is_empty()
+            );
+            assert!(
+                watch_lexical_replay_sources(&storage, &[(ConnectorKind::Amp, root)])?.is_empty()
+            );
+            assert_eq!(
+                watch_lexical_replay_debt_for_root(&storage, ConnectorKind::Amp, &decoy_root)?
+                    .len(),
+                1
+            );
+            clear_watch_lexical_replay_debt(&storage, &unrelated)?;
+        }
+        Ok(())
+    }
+
     /// txc9h upgrade case: builds before txc9h saved debts with the
     /// std::fs::canonicalize spelling (\\?\C:\... on Windows); identities are
     /// now dunce-normalized (C:\...). Such a debt must still match its root.
