@@ -4285,7 +4285,12 @@
     {
       "name": "CASS_AUTO_REFRESH",
       "default": "1",
-      "description": "Stale-on-read catch-up: search/pack/TUI may spawn a detached low-priority `cass index --background` when the index is stale, partial, or behind. Set 0 to disable globally; `search --no-maintenance` always disables it for that request."
+      "description": "Read-triggered catch-up: search/pack/TUI may spawn a detached low-priority `cass index --background` when the index is stale, partial, behind, or its source scan is overdue. Set 0 to disable globally; `search --no-maintenance` always disables it for that request."
+    },
+    {
+      "name": "CASS_AUTO_REFRESH_SOURCE_SCAN_SECS",
+      "default": "300",
+      "description": "Source-scan age in seconds before an eligible read requests incremental catch-up, including for a healthy lexical index. Set 0 to disable only this cadence; stale/partial/pending catch-up and the daemon timer remain enabled. The spawn cooldown, archive lock and failed-run breaker still apply. This is an on-demand check, not a timer or an indexing-completion deadline."
     },
     {
       "name": "CASS_AUTO_REFRESH_COOLDOWN_SECS",

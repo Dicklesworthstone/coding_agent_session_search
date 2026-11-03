@@ -27993,7 +27993,8 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_DEFER_ANALYTICS_UPDATES=1             defer derived analytics writes during indexing; a pending legacy OMP rebuild resumes on a later run with this unset".to_string(),
             "  CASS_STORAGE_PROBE_TIMEOUT_MS=<N>        budget for the dedicated typed storage probes on status/search/doctor (default 100; clamped 10..10000) — widen on slow hosts where schema/contention classification times out to `unchecked`".to_string(),
             "  CASS_RAW_MIRROR=0                        stop copying session files into the raw mirror (default on); indexing continues, doctor reports raw_mirror_capture_disabled".to_string(),
-            "  CASS_AUTO_REFRESH=0                      disable stale-on-read catch-up (detached `cass index --background` after a stale search/pack/TUI launch)".to_string(),
+            "  CASS_AUTO_REFRESH=0                      disable all read-triggered catch-up (stale/partial/behind index or overdue source scan)".to_string(),
+            "  CASS_AUTO_REFRESH_SOURCE_SCAN_SECS=<N>   source-scan age before an eligible read requests catch-up (default 300; 0 disables only this cadence; cooldown still applies)".to_string(),
             "  CASS_AUTO_REFRESH_COOLDOWN_SECS=<N>      min seconds between auto-spawned catch-up runs (default 300)".to_string(),
             "  CASS_BACKGROUND_NICE=<N>                 nice value for `cass index --background` (default 15)".to_string(),
             "  CASS_BACKGROUND_IONICE_CLASS=<N>         ionice class for `cass index --background` on Linux (default 3 = idle)".to_string(),
@@ -98969,7 +98970,12 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
         env_var_capability(
             "CASS_AUTO_REFRESH",
             Some("1"),
-            "Stale-on-read catch-up: search/pack/TUI may spawn a detached low-priority `cass index --background` when the index is stale, partial, or behind. Set 0 to disable globally; `search --no-maintenance` always disables it for that request.",
+            "Read-triggered catch-up: search/pack/TUI may spawn a detached low-priority `cass index --background` when the index is stale, partial, behind, or its source scan is overdue. Set 0 to disable globally; `search --no-maintenance` always disables it for that request.",
+        ),
+        env_var_capability(
+            "CASS_AUTO_REFRESH_SOURCE_SCAN_SECS",
+            Some("300"),
+            "Source-scan age in seconds before an eligible read requests incremental catch-up, including for a healthy lexical index. Set 0 to disable only this cadence; stale/partial/pending catch-up and the daemon timer remain enabled. The spawn cooldown, archive lock and failed-run breaker still apply. This is an on-demand check, not a timer or an indexing-completion deadline.",
         ),
         env_var_capability(
             "CASS_AUTO_REFRESH_COOLDOWN_SECS",

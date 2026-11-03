@@ -419,6 +419,7 @@ fn api_version_reports_contract() {
 #[test]
 fn capabilities_are_self_describing_for_agents() {
     let mut cmd = base_cmd();
+    cmd.env("CASS_AUTO_REFRESH_SOURCE_SCAN_SECS", "17");
     cmd.args(["capabilities", "--json"]);
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -511,6 +512,7 @@ fn capabilities_are_self_describing_for_agents() {
         "CASS_SEARCH_BUDGET_MS",
         "CASS_TRIAGE_BUDGET_MS",
         "CASS_PACK_BUDGET_MS",
+        "CASS_AUTO_REFRESH_SOURCE_SCAN_SECS",
         "CASS_FLEET_PER_HOST_BUDGET_MS",
         "CASS_FLEET_BUDGET_MS",
     ] {
@@ -540,6 +542,17 @@ fn capabilities_are_self_describing_for_agents() {
             "capabilities should advertise the runtime default for {name}"
         );
     }
+    let source_scan = env_vars
+        .iter()
+        .find(|entry| entry["name"] == "CASS_AUTO_REFRESH_SOURCE_SCAN_SECS")
+        .expect("source-scan cadence capability");
+    assert_eq!(
+        source_scan["default"]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok()),
+        Some(coding_agent_search::indexer::background_refresh::DEFAULT_SOURCE_SCAN_SECS),
+        "discovery must advertise the actual source-scan policy default"
+    );
     let pi_sessions_dir = env_vars
         .iter()
         .find(|env_var| env_var["name"] == "PI_SESSIONS_DIR")
@@ -2550,6 +2563,7 @@ fn robot_docs_env_lists_key_vars_and_no_ansi() {
         "CASS_SEARCH_BUDGET_MS",
         "CASS_TRIAGE_BUDGET_MS",
         "CASS_PACK_BUDGET_MS",
+        "CASS_AUTO_REFRESH_SOURCE_SCAN_SECS",
         "CASS_FLEET_PER_HOST_BUDGET_MS",
         "CASS_FLEET_BUDGET_MS",
     ] {

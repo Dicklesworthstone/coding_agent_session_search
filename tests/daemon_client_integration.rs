@@ -989,22 +989,23 @@ mod indexer_process_coexistence {
         }
     }
 
-    /// The periodic child belongs to the daemon's reaper, so this test cannot
-    /// waitpid it directly. Keep its unique archive identity for bounded
+    /// A detached child belongs to the daemon's reaper or outlives its search
+    /// parent. Keep its unique archive identity and reason for bounded
     /// cleanup without ever signalling an unrelated process after PID reuse.
-    struct PeriodicIndexGuard {
+    struct BackgroundIndexGuard {
         data: PathBuf,
         db: PathBuf,
+        reason: &'static str,
         release: PathBuf,
         finished: bool,
     }
 
-    impl PeriodicIndexGuard {
+    impl BackgroundIndexGuard {
         fn owned_pid(&self) -> Result<Option<u32>> {
             let Some(state) = background_refresh::load_state(&self.data) else {
                 return Ok(None);
             };
-            if state.last_reason != "daemon-periodic" || state.last_pid == 0 {
+            if state.last_reason != self.reason || state.last_pid == 0 {
                 return Ok(None);
             }
             let output = Command::new("/bin/ps")
@@ -1035,7 +1036,7 @@ mod indexer_process_coexistence {
         }
     }
 
-    impl Drop for PeriodicIndexGuard {
+    impl Drop for BackgroundIndexGuard {
         fn drop(&mut self) {
             if self.finished {
                 return;
@@ -1090,7 +1091,10 @@ mod indexer_process_coexistence {
         }
 
         fn command(&self) -> Command {
-            let mut command = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+            let binary = dotenvy::var("CARGO_BIN_EXE_cass")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| assert_cmd::cargo::cargo_bin!("cass").to_owned());
+            let mut command = Command::new(binary);
             command
                 .env_clear()
                 .current_dir(&self.home)
@@ -1402,6 +1406,157 @@ mod indexer_process_coexistence {
     }
 
     #[test]
+    fn gh514_search_catches_new_sources_before_the_health_stale_threshold() -> Result<()> {
+        use coding_agent_search::storage::sqlite::FrankenStorage;
+
+        // Read-triggered maintenance intentionally excludes OS temporary
+        // directories. Use a private, disposable directory under this test
+        // user's home, while every child sees only the nested fixture HOME.
+        let temp = tempfile::Builder::new()
+            .prefix(".cass-gh514-")
+            .tempdir_in(dirs::home_dir().context("test user's home directory")?)?;
+        let home = temp.path().join("home");
+        let data = temp.path().join("data");
+        let db = data.join("agent_search.db");
+        let socket = temp.path().join("unused.sock");
+        fs::create_dir_all(&home)?;
+        fs::create_dir_all(&data)?;
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(home.join(".env"))?;
+        let fixture = Fixture {
+            _temp: temp,
+            home,
+            data,
+            db,
+            socket,
+        };
+        fixture.seed(0)?;
+        fixture.index("gh514-initial", &["--full"])?;
+
+        let search = |label: &str, cadence: Option<&str>| -> Result<serde_json::Value> {
+            let mut command = fixture.command();
+            command
+                .env_remove("TUI_HEADLESS")
+                .env("CASS_AUTO_REFRESH", "1")
+                .args([
+                    "search",
+                    "coexistenceprobe",
+                    "--mode",
+                    "lexical",
+                    "--agent",
+                    "codex",
+                    "--robot",
+                    "--robot-meta",
+                    "--data-dir",
+                ])
+                .arg(&fixture.data)
+                .arg("--db")
+                .arg(&fixture.db);
+            if let Some(cadence) = cadence {
+                command.env("CASS_AUTO_REFRESH_SOURCE_SCAN_SECS", cadence);
+            }
+            let mut process = fixture.spawn(label, command)?;
+            assert!(
+                process.wait(Duration::from_secs(60))?.success(),
+                "{}",
+                process.diagnostics()
+            );
+            serde_json::from_slice(&fs::read(&process.stdout)?)
+                .with_context(|| process.diagnostics())
+        };
+        let fresh = search("gh514-fresh", None)?;
+        assert_eq!(fresh["hits"].as_array().context("fresh hits")?.len(), 1);
+        assert_eq!(fresh["_meta"]["index_freshness"]["stale"], false);
+        assert!(
+            fresh["_meta"]["index_freshness"]
+                .get("auto_refresh")
+                .is_none()
+        );
+        assert!(background_refresh::load_state(&fixture.data).is_none());
+
+        // Move only this synthetic archive's successful-scan clocks ten
+        // minutes back: overdue at the real five-minute default, yet still
+        // healthy under the independent thirty-minute stale threshold.
+        {
+            let storage = FrankenStorage::open(&fixture.db)?;
+            let aged = FrankenStorage::now_millis().saturating_sub(600_000);
+            storage.set_last_scan_ts(aged)?;
+            storage.set_connector_last_scan_ts("codex", aged)?;
+            storage.set_last_indexed_at(aged)?;
+        }
+        fixture.seed(1)?;
+        let source = fixture
+            .home
+            .join(".codex/sessions/2026/10/08/rollout-coexistence-1.jsonl");
+        OpenOptions::new().write(true).open(&source)?.set_times(
+            fs::FileTimes::new().set_modified(
+                std::time::SystemTime::now()
+                    .checked_sub(Duration::from_secs(60))
+                    .context("completed source timestamp")?,
+            ),
+        )?;
+        let source_before = fs::read(&source)?;
+        let disabled = search("gh514-cadence-disabled", Some("0"))?;
+        assert_eq!(
+            disabled["hits"].as_array().context("disabled hits")?.len(),
+            1
+        );
+        assert_eq!(disabled["_meta"]["index_freshness"]["stale"], false);
+        assert!(
+            disabled["_meta"]["index_freshness"]
+                .get("auto_refresh")
+                .is_none()
+        );
+        assert!(background_refresh::load_state(&fixture.data).is_none());
+
+        let mut background = BackgroundIndexGuard {
+            data: fixture.data.clone(),
+            db: fixture.db.clone(),
+            reason: "source-scan-overdue",
+            release: fixture.data.join("unused-search-release"),
+            finished: false,
+        };
+        let triggered = search("gh514-overdue", None)?;
+        assert_eq!(
+            triggered["hits"].as_array().context("current hits")?.len(),
+            1
+        );
+        let freshness = &triggered["_meta"]["index_freshness"];
+        assert_eq!(freshness["stale"], false);
+        assert_eq!(freshness["auto_refresh"]["outcome"], "spawned");
+        assert_eq!(freshness["auto_refresh"]["trigger"], "source-scan-overdue");
+        let spawned = background_refresh::load_state(&fixture.data).context("catch-up state")?;
+        assert_eq!(spawned.last_reason, "source-scan-overdue");
+        assert_eq!(freshness["auto_refresh"]["pid"], spawned.last_pid);
+        background.wait(Duration::from_secs(60))?;
+        fixture.assert_lock_released()?;
+
+        let caught_up = search("gh514-caught-up", None)?;
+        assert_eq!(
+            caught_up["hits"]
+                .as_array()
+                .context("caught-up hits")?
+                .len(),
+            2
+        );
+        assert!(
+            caught_up["_meta"]["index_freshness"]
+                .get("auto_refresh")
+                .is_none()
+        );
+        assert_eq!(
+            background_refresh::load_state(&fixture.data).context("retained catch-up state")?,
+            spawned,
+            "a completed source scan must prevent another refresh evaluation"
+        );
+        fixture.assert_archive(2)?;
+        assert_eq!(fs::read(&source)?, source_before);
+        Ok(())
+    }
+
+    #[test]
     fn gh515_resident_daemon_allows_fresh_schema_upgrade_and_repeated_indexing() -> Result<()> {
         let fixture = Fixture::new()?;
         fixture.seed(0)?;
@@ -1438,9 +1593,10 @@ mod indexer_process_coexistence {
         )?;
         let sentinel = fixture.data.join("periodic-commit-window.json");
         let release = fixture.data.join("periodic-commit-release");
-        let periodic = PeriodicIndexGuard {
+        let periodic = BackgroundIndexGuard {
             data: fixture.data.clone(),
             db: fixture.db.clone(),
+            reason: "daemon-periodic",
             release: release.clone(),
             finished: false,
         };
@@ -1607,9 +1763,10 @@ mod indexer_process_coexistence {
 
         let periodic_ready = fixture.data.join("replacement-commit-window.json");
         let release = fixture.data.join("replacement-commit-release");
-        let periodic = PeriodicIndexGuard {
+        let periodic = BackgroundIndexGuard {
             data: fixture.data.clone(),
             db: fixture.db.clone(),
+            reason: "daemon-periodic",
             release: release.clone(),
             finished: false,
         };
