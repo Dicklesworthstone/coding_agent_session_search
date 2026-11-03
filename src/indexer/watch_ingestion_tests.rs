@@ -1260,6 +1260,317 @@ fn gh538_watch_retries_disappeared_notification_leaf_without_another_event() -> 
 }
 
 #[test]
+fn gh538_watch_callback_error_preserves_cause_and_exact_retries() {
+    let notification = PathBuf::from("sessions/transient.marker");
+    let unmatched = PathBuf::from("unconfigured/retained.marker");
+    let deferred = BTreeSet::from([
+        PathBuf::from("sessions/active.jsonl"),
+        PathBuf::from("sessions/lexical.jsonl"),
+        PathBuf::from("sessions/semantic.jsonl"),
+    ]);
+    let roots = [
+        (
+            ConnectorKind::Codex,
+            ScanRoot::local(PathBuf::from("sessions")),
+        ),
+        (
+            ConnectorKind::Codex,
+            ScanRoot::local(PathBuf::from("unrelated")),
+        ),
+    ];
+    for force_full in [false, true] {
+        let original = BTreeSet::from([notification.clone(), unmatched.clone()]);
+        let mut pending = original.clone();
+        assert!(!dispatch_watch_callback(
+            &mut pending,
+            &roots,
+            force_full,
+            &|paths, _, rebuilding| {
+                assert_eq!(rebuilding, force_full);
+                assert_eq!(
+                    paths,
+                    if force_full {
+                        Vec::new()
+                    } else {
+                        original.iter().cloned().collect()
+                    }
+                );
+                let error = finish_watch_callback(Err(IndexInterrupted.into()), deferred.clone())
+                    .unwrap_err()
+                    .context("later callback failure");
+                assert!(error.downcast_ref::<IndexInterrupted>().is_some());
+                assert!(
+                    format!("{error:#}").contains("indexing interrupted after committed batch"),
+                    "the retained retry context must preserve the original diagnostic"
+                );
+                Err(error)
+            },
+        ));
+        let mut expected = original;
+        expected.extend(deferred.iter().cloned());
+        if force_full {
+            expected.extend(roots.iter().map(|(_, root)| root.path.clone()));
+        }
+        assert_eq!(pending, expected);
+    }
+    let error = finish_watch_callback(Err(IndexInterrupted.into()), BTreeSet::new()).unwrap_err();
+    assert!(error.downcast_ref::<IndexInterrupted>().is_some());
+    assert!(error.downcast_ref::<WatchCallbackRetrySources>().is_none());
+}
+
+#[test]
+fn gh538_watch_callback_error_retries_keep_backlog_bounds_and_full_scan_debt() {
+    let roots = [(
+        ConnectorKind::Codex,
+        ScanRoot::local(PathBuf::from("sessions")),
+    )];
+    let mut pending = WatchEventBacklog::default();
+    assert!(pending.extend(
+        (0..WATCH_PENDING_MAX_PATHS).map(|index| PathBuf::from(format!("sessions/source-{index}")))
+    ));
+    let newly_deferred = PathBuf::from("sessions/discovered-active.jsonl");
+    let mut pending_rescan = false;
+    dispatch_pending_watch_callback(
+        &mut pending,
+        &mut pending_rescan,
+        &roots,
+        &|_, _, force_full| {
+            assert!(!force_full);
+            finish_watch_callback(
+                Err(anyhow::anyhow!("failure after discovering another source")),
+                BTreeSet::from([newly_deferred.clone()]),
+            )
+        },
+    );
+    assert!(
+        pending_rescan,
+        "overflowed discovered work requires a full census"
+    );
+    assert!(pending.paths.is_empty());
+    assert_eq!(pending.path_bytes, 0);
+    dispatch_pending_watch_callback(
+        &mut pending,
+        &mut pending_rescan,
+        &roots,
+        &|paths, _, force_full| {
+            assert!(force_full);
+            assert!(paths.is_empty());
+            finish_watch_callback(
+                Err(anyhow::anyhow!("full census failed after source discovery")),
+                BTreeSet::from([newly_deferred.clone()]),
+            )
+        },
+    );
+    assert!(
+        pending_rescan,
+        "a failed full census must remain watermark-free"
+    );
+    assert!(
+        pending.paths.is_empty(),
+        "the retained full census subsumes its individual source retries"
+    );
+    assert_eq!(pending.path_bytes, 0);
+    dispatch_pending_watch_callback(
+        &mut pending,
+        &mut pending_rescan,
+        &roots,
+        &|paths, _, force_full| {
+            assert!(force_full);
+            assert!(paths.is_empty());
+            Ok(BTreeSet::new())
+        },
+    );
+    assert!(!pending_rescan);
+    assert!(pending.paths.is_empty());
+}
+
+#[test]
+#[serial]
+fn gh538_watch_keeps_discovered_active_source_after_recycle_failure() -> Result<()> {
+    for kind in [ConnectorKind::Codex, ConnectorKind::Claude] {
+        let mut fixture = Fixture::new(kind)?;
+        let archive = fixture._temp.path().join("archive");
+        let parked_archive = fixture._temp.path().join("parked-archive");
+        fixture.options.db_path = archive.join("agent_search.db");
+        let progress = Arc::new(IndexingProgress::default());
+        fixture.options.progress = Some(Arc::clone(&progress));
+        let source = fixture.source("held", "recycledeferredgh538")?;
+        let source_before = fs::read(&source)?;
+        let modified_before = fs::metadata(&source)?.modified()?;
+        let lease = OpenOptions::new().read(true).write(true).open(&source)?;
+        lease.try_lock()?;
+        assert!(source_file_has_active_advisory_lock(&source));
+
+        let unrelated_root = fixture._temp.path().join("unrelated-sessions");
+        fs::create_dir_all(&unrelated_root)?;
+        let unrelated_source = fixture.source("unrelated", "recycleunrelatedgh538")?;
+        fs::rename(
+            &unrelated_source,
+            unrelated_root.join(unrelated_source.file_name().unwrap()),
+        )?;
+        let roots = [
+            (kind, fixture.root.clone()),
+            (kind, ScanRoot::local(unrelated_root)),
+        ];
+        let notification = fixture.root.path.join("transient.marker");
+        fs::write(&notification, b"transient directory change")?;
+        let handles = Handles::open(&fixture)?;
+        assert!(canonical_rows(&handles)?.is_empty());
+        assert_publication_receipts(&handles, 0)?;
+        assert!(load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+        let initial_publication = published_state(&fixture, &handles)?;
+        let reopen_pending = std::cell::Cell::new(false);
+        let fail_after_scan = std::cell::Cell::new(true);
+        let callback = |paths, roots: &[(ConnectorKind, ScanRoot)], force_full: bool| {
+            assert!(
+                !force_full,
+                "a callback error must not force a full rebuild"
+            );
+            reopen_watch_storage_if_pending(
+                &handles.storage,
+                &fixture.options.db_path,
+                &reopen_pending,
+                true,
+                Some(&progress),
+            )?;
+            let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+            let mut retry_sources = BTreeSet::new();
+            let result = (|| -> Result<()> {
+                let outcome = reindex_paths_with_semantic_delta(
+                    &fixture.options,
+                    paths,
+                    roots,
+                    &handles.state,
+                    &handles.storage,
+                    &handles.index,
+                    &fixture.index_path,
+                    force_full,
+                    None,
+                    &filter,
+                )?;
+                retry_sources.extend(outcome.retry_sources);
+                if fail_after_scan.replace(false) {
+                    assert_eq!(outcome.indexed, 0);
+                    assert_eq!(outcome.published_conversations, 0);
+                    assert!(retry_sources.is_empty());
+                    assert_eq!(
+                        *filter.deferred_sources.lock().unwrap(),
+                        BTreeSet::from([source.clone()]),
+                        "the real connector must discover a different active source"
+                    );
+                    assert!(canonical_rows(&handles)?.is_empty());
+                    assert_publication_receipts(&handles, 0)?;
+                    assert!(
+                        load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?
+                            .is_empty(),
+                        "durable replay debt cannot rescue an unadmitted active source"
+                    );
+                    assert_eq!(published_state(&fixture, &handles)?, initial_publication);
+                    close_watch_storage_for_recycle(&handles.storage, &reopen_pending)?;
+                    // Preserve the whole archive while causing a real ENOTDIR
+                    // open failure after the scan discovered its active source.
+                    fs::rename(&archive, &parked_archive)?;
+                    fs::write(&archive, b"temporarily unavailable archive directory")?;
+                    reopen_watch_storage_if_pending(
+                        &handles.storage,
+                        &fixture.options.db_path,
+                        &reopen_pending,
+                        true,
+                        Some(&progress),
+                    )?;
+                    anyhow::bail!("storage recycle unexpectedly bypassed the path obstruction");
+                }
+                Ok(())
+            })();
+            let mut deferred = filter.take_deferred_sources();
+            deferred.extend(retry_sources);
+            finish_watch_callback(result, deferred)
+        };
+
+        let mut pending = BTreeSet::from([notification.clone()]);
+        assert!(!dispatch_watch_callback(
+            &mut pending,
+            &roots,
+            false,
+            &callback
+        ));
+        assert!(!fail_after_scan.get());
+        assert!(reopen_pending.get());
+        let retained = BTreeSet::from([notification.clone(), source.clone()]);
+        assert_eq!(pending, retained);
+        assert!(
+            progress
+                .last_error
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|error| {
+                    error.contains("reopening canonical db after watch recycle")
+                })
+        );
+        assert!(search_ids(&fixture, "recycledeferredgh538")?.is_empty());
+
+        // The original notification vanishes and the active writer closes
+        // without changing its content or mtime. No new event is delivered.
+        fs::rename(&notification, fixture._temp.path().join("retired-marker"))?;
+        lease.unlock()?;
+        drop(lease);
+        assert_eq!(fs::read(&source)?, source_before);
+        assert_eq!(fs::metadata(&source)?.modified()?, modified_before);
+        // A second failure occurs before any connector scan can rediscover the
+        // source. Its retained identity must survive that failure too.
+        assert!(!dispatch_watch_callback(
+            &mut pending,
+            &roots,
+            false,
+            &callback
+        ));
+        assert_eq!(pending, retained);
+        fs::rename(&archive, fixture._temp.path().join("retired-path-blocker"))?;
+        fs::rename(&parked_archive, &archive)?;
+
+        assert!(dispatch_watch_callback(
+            &mut pending,
+            &roots,
+            false,
+            &callback
+        ));
+        assert!(pending.is_empty());
+        assert!(!reopen_pending.get());
+        assert!(progress.last_error.lock().unwrap().is_none());
+        let recovered = canonical_rows(&handles)?;
+        assert_eq!(recovered.len(), 1);
+        let recovered_ids = search_ids(&fixture, "recycledeferredgh538")?;
+        assert_eq!(recovered_ids.len(), 1);
+        assert!(
+            search_ids(&fixture, "recycleunrelatedgh538")?.is_empty(),
+            "recovery must not broaden the scan to an unrelated configured root"
+        );
+        assert_publication_receipts(&handles, 1)?;
+        assert!(load_watch_lexical_replay_debt(&handles.storage.lock().unwrap())?.is_empty());
+        let published = published_state(&fixture, &handles)?;
+        handles.close()?;
+
+        // The recovered source's publication receipt survives a real storage
+        // restart, without duplicating identities or refreshing publication.
+        let handles = Handles::open(&fixture)?;
+        let (outcome, deferred) = handles.scan(&fixture, false)?;
+        assert_eq!(outcome.indexed, 0);
+        assert_eq!(outcome.published_conversations, 0);
+        assert!(deferred.is_empty());
+        assert!(outcome.retry_sources.is_empty());
+        assert_eq!(canonical_rows(&handles)?, recovered);
+        assert_eq!(search_ids(&fixture, "recycledeferredgh538")?, recovered_ids);
+        assert_eq!(published_state(&fixture, &handles)?, published);
+        assert_publication_receipts(&handles, 1)?;
+        assert_eq!(fs::read(&source)?, source_before);
+        assert_eq!(fs::metadata(&source)?.modified()?, modified_before);
+        handles.close()?;
+    }
+    Ok(())
+}
+
+#[test]
 #[serial]
 fn gh538_watch_missing_leaf_promotion_requires_current_matching_debt() -> Result<()> {
     let fixture = Fixture::new(ConnectorKind::Codex)?;
