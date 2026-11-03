@@ -12,7 +12,7 @@ use std::time::Duration;
 const PRIVATE_BODY: &str = "guide-live-private-session-body-sentinel";
 
 fn cass(home: &Path) -> Command {
-    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    let mut command = Command::new(util::cass_bin());
     // Do not inherit connector roots, remote sources, or agent-home overrides
     // from the developer or RCH worker running this test. Keep only OS/loader
     // infrastructure needed to launch the already-built executable.
@@ -476,6 +476,154 @@ fn live_onboarding_preserves_the_archive_when_another_indexer_holds_the_lock() {
     assert_eq!(output["execution"]["applied_mutation_count"], 0);
     assert_eq!(db_digest(&data_dir), before);
     fs2::FileExt::unlock(&holder).expect("release actual index lock");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn live_onboarding_times_out_a_blocked_indexer_and_releases_its_archive_lock() {
+    use coding_agent_search::sources::config::SourceDefinition;
+    use std::fs::{self, OpenOptions};
+    use std::os::unix::ffi::OsStrExt;
+    use std::time::Instant;
+
+    let home = tempfile::tempdir().expect("home");
+    let data_dir = home.path().join("timeout data");
+    let db = data_dir.join("agent_search.db");
+    seed_archive(home.path(), &data_dir);
+    let source_root = home.path().join("configured codex");
+    util::seed_codex_session(
+        &source_root,
+        "rollout-guide-timeout.jsonl",
+        "guidetimeoutpending",
+        false,
+    );
+    let mut source = SourceDefinition::local("guide-timeout");
+    source.paths = vec![source_root.to_string_lossy().into_owned()];
+    let config = configure_sources(home.path(), vec![source]);
+    let session = source_root.join("sessions/2026/04/23/rollout-guide-timeout.jsonl");
+    let config_before = fs::read(&config).expect("configuration bytes");
+    let session_before = fs::read(&session).expect("session bytes");
+
+    let mirror_lease = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(data_dir.join("raw-mirror/v1/.mutation.lock"))
+        .expect("existing mirror mutation lease");
+    fs2::FileExt::try_lock_exclusive(&mirror_lease).expect("block actual mirror capture");
+    let resolved_data = data_dir.canonicalize().expect("resolved data directory");
+    let started = Instant::now();
+    let (child_pid, output) = std::thread::scope(|scope| {
+        let execution = scope.spawn(|| onboard(home.path(), &data_dir, &db, true));
+        let admission_deadline = Instant::now() + Duration::from_secs(30);
+        let child_pid = loop {
+            let pid = fs::read_to_string(data_dir.join("index-run.lock"))
+                .ok()
+                .and_then(|metadata| {
+                    metadata.lines().find_map(|line| {
+                        line.strip_prefix("pid=")
+                            .and_then(|value| value.parse::<u32>().ok())
+                    })
+                });
+            if let Some(pid) = pid
+                && let Ok(argv) = fs::read(format!("/proc/{pid}/cmdline"))
+                && argv.split(|byte| *byte == 0).any(|arg| arg == b"index")
+                && argv
+                    .split(|byte| *byte == 0)
+                    .any(|arg| arg == resolved_data.as_os_str().as_bytes())
+            {
+                break pid;
+            }
+            assert!(
+                !execution.is_finished(),
+                "guide must start a real index child before reporting the blocked operation"
+            );
+            assert!(
+                Instant::now() < admission_deadline,
+                "guide did not acquire the archive for its actual index child"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+
+        let competing = cass(home.path())
+            .args(["index", "--json"])
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .arg("--db")
+            .arg(&db)
+            .timeout(Duration::from_secs(20))
+            .output()
+            .expect("competing real indexer");
+        assert_eq!(
+            competing.status.code(),
+            Some(7),
+            "blocked guide child must retain archive ownership: {}",
+            String::from_utf8_lossy(&competing.stderr)
+        );
+        (child_pid, execution.join().expect("guided index thread"))
+    });
+
+    // The real adapter owns a 120-second budget. The mirror lease stays held
+    // through these checks, so normal indexing completion cannot impersonate
+    // timeout cleanup or release of the child's archive ownership.
+    assert!(started.elapsed() >= Duration::from_secs(120));
+    assert!(started.elapsed() < Duration::from_secs(180));
+    let indexed = step(&output, "index.incremental");
+    assert_eq!(indexed["result"], "failed", "{output}");
+    assert_eq!(indexed["detail"], "cass command deadline exceeded");
+    assert_eq!(indexed["mutation_started"], true);
+    assert_eq!(indexed["proof_gate"]["result"], "failed");
+    assert_eq!(output["execution"]["attempted_mutation_count"], 1);
+    assert_eq!(output["execution"]["applied_mutation_count"], 0);
+    assert!(
+        !Path::new(&format!("/proc/{child_pid}")).exists(),
+        "guide must reap the child it timed out"
+    );
+    let archive_owner = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(data_dir.join("index-run.lock"))
+        .expect("retained archive owner metadata");
+    fs2::FileExt::try_lock_exclusive(&archive_owner)
+        .expect("timed-out child released archive ownership");
+    fs2::FileExt::unlock(&archive_owner).expect("release archive ownership probe");
+    assert_eq!(
+        fs::read(&config).expect("config after timeout"),
+        config_before
+    );
+    assert_eq!(
+        fs::read(&session).expect("session after timeout"),
+        session_before
+    );
+    assert!(!output.to_string().contains(PRIVATE_BODY));
+
+    fs2::FileExt::unlock(&mirror_lease).expect("allow real mirror capture to resume");
+    let recovered = onboard(home.path(), &data_dir, &db, true);
+    let indexed = step(&recovered, "index.incremental");
+    assert_eq!(indexed["result"], "executed", "{recovered}");
+    assert_eq!(indexed["proof_gate"]["result"], "passed");
+    assert_eq!(recovered["execution"]["applied_mutation_count"], 1);
+    let (success, hits) = run_on_archive(
+        home.path(),
+        &data_dir,
+        &db,
+        &[
+            "search",
+            "guidetimeoutpending",
+            "--mode",
+            "lexical",
+            "--source",
+            "guide-timeout",
+            "--json",
+        ],
+    );
+    assert!(success, "{hits}");
+    assert_eq!(hits["hits"].as_array().expect("recovered hits").len(), 1);
+    assert_eq!(
+        fs::read(&config).expect("final configuration"),
+        config_before
+    );
+    assert_eq!(fs::read(&session).expect("final session"), session_before);
+    assert!(!recovered.to_string().contains(PRIVATE_BODY));
 }
 
 #[test]
