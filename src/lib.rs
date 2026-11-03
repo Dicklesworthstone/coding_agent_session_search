@@ -25448,11 +25448,12 @@ fn analytics_requests_structured_output(cmd: &AnalyticsCommand, cli: &Cli) -> bo
 /// dot-separated targets (`fsqlite.statement_reuse`, `fsqlite.compat`, etc.) are
 /// NOT matched by the hierarchical prefix, so each must be listed explicitly.
 ///
-/// This list is only consulted in interactive human mode (and only when
-/// `RUST_LOG` is unset). Robot/quiet mode never reaches it — those modes pin the
-/// filter to `error` via [`robot_aware_log_directive`], which is the actual
-/// stdout/stderr hygiene guarantee. A missing entry here can therefore only make
-/// human-mode stderr noisier, never corrupt a robot JSON stream.
+/// Interactive human mode uses this fallback when `RUST_LOG` is unset.
+/// Verbose mode retains the same dependency limits while raising the global
+/// level to DEBUG: enabling statement telemetry also disables FrankenSQLite's
+/// fast DML lane and can stall watch startup. Nonverbose robot/quiet mode pins
+/// the entire filter to ERROR via [`robot_aware_log_directive`]. Explicit
+/// trace-file filters can still request dependency instrumentation.
 const DEFAULT_DEP_LOG_SUPPRESSION: &str = concat!(
     "info",
     // Hierarchical (::) targets
@@ -25468,6 +25469,15 @@ const DEFAULT_DEP_LOG_SUPPRESSION: &str = concat!(
     ",fsqlite_planner=warn",
     ",fsqlite_types=warn",
     ",fsqlite_observability=warn",
+    ",fsqlite_ast=warn",
+    ",fsqlite_btree=warn",
+    ",fsqlite_error=warn",
+    ",fsqlite_ext_fts5=warn",
+    ",fsqlite_ext_icu=warn",
+    ",fsqlite_ext_json=warn",
+    ",fsqlite_ext_misc=warn",
+    ",fsqlite_ext_rtree=warn",
+    ",fsqlite_parser=warn",
     // Dot-separated custom targets
     ",fsqlite.compat=warn",
     ",fsqlite.compat_trace=warn",
@@ -25528,6 +25538,8 @@ fn robot_aware_log_directive(robot_mode: bool, verbose: bool, quiet: bool) -> Op
 /// robot/quiet hygiene policy from [`robot_aware_log_directive`].
 fn build_robot_aware_log_filter(robot_mode: bool, verbose: bool, quiet: bool) -> EnvFilter {
     match robot_aware_log_directive(robot_mode, verbose, quiet) {
+        Some("debug") => EnvFilter::new(DEFAULT_DEP_LOG_SUPPRESSION)
+            .add_directive(tracing_subscriber::filter::LevelFilter::DEBUG.into()),
         Some(directive) => EnvFilter::new(directive),
         None => EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new(DEFAULT_DEP_LOG_SUPPRESSION)),
@@ -26479,9 +26491,9 @@ fn init_cli_tracing(
 mod log_hygiene_tests {
     use super::{
         BoundedTraceMakeWriter, DEFAULT_DEP_LOG_SUPPRESSION, DEFAULT_TRACE_FILE_LOG_DIRECTIVE,
-        MIN_TRACE_FILE_MAX_BYTES, TraceSuppressionReason, default_trace_metadata_enabled,
-        enrich_trace_json, redact_bounded_trace_text, redact_trace_args, redact_trace_json,
-        robot_aware_log_directive,
+        MIN_TRACE_FILE_MAX_BYTES, TraceSuppressionReason, build_robot_aware_log_filter,
+        default_trace_metadata_enabled, enrich_trace_json, redact_bounded_trace_text,
+        redact_trace_args, redact_trace_json, robot_aware_log_directive,
     };
     use std::sync::{
         Arc,
@@ -26562,6 +26574,64 @@ mod log_hygiene_tests {
         assert!(DEFAULT_DEP_LOG_SUPPRESSION.starts_with("info"));
         assert!(DEFAULT_DEP_LOG_SUPPRESSION.contains("fsqlite=warn"));
         assert!(DEFAULT_DEP_LOG_SUPPRESSION.contains("fsqlite_core=warn"));
+    }
+
+    #[test]
+    fn verbose_filter_keeps_debug_and_dependency_warnings_without_sql_telemetry() -> TraceTestResult
+    {
+        let temp = tempfile::tempdir()?;
+        for (index, (robot, quiet)) in [(false, false), (true, false), (true, true)]
+            .into_iter()
+            .enumerate()
+        {
+            let path = temp.path().join(format!("verbose-{index}.log"));
+            let file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)?;
+            let subscriber = tracing_subscriber::registry()
+                .with(build_robot_aware_log_filter(robot, true, quiet))
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .without_time()
+                        .with_writer(std::sync::Mutex::new(file)),
+                );
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::debug!(target: "coding_agent_search::indexer", "cass_debug_retained");
+                tracing::debug!(target: "cass::redact", "cass_custom_debug_retained");
+                tracing::debug!(target: "reqwest", "other_dependency_debug_retained");
+                tracing::warn!(target: "fsqlite.statement", "sqlite_warning_retained");
+                tracing::error!(target: "fsqlite_core", "sqlite_error_retained");
+                tracing::debug!(target: "fsqlite.statement", "sqlite_debug_excluded");
+                tracing::info!(target: "fsqlite.statement_reuse", "sqlite_reuse_excluded");
+                tracing::debug!(target: "fsqlite_core::connection", "sqlite_internal_excluded");
+                tracing::debug!(target: "fsqlite_parser::lexer", "sqlite_parser_excluded");
+                tracing::info!(target: "fsqlite_ext_icu", "sqlite_extension_excluded");
+                tracing::debug!(target: "fsqlite_btree::cursor", "sqlite_btree_excluded");
+            });
+            let output = std::fs::read_to_string(&path)?;
+            for marker in [
+                "cass_debug_retained",
+                "cass_custom_debug_retained",
+                "other_dependency_debug_retained",
+                "sqlite_warning_retained",
+                "sqlite_error_retained",
+            ] {
+                trace_test_require!(output.contains(marker), "missing {marker}: {output}");
+            }
+            for marker in [
+                "sqlite_debug_excluded",
+                "sqlite_reuse_excluded",
+                "sqlite_internal_excluded",
+                "sqlite_parser_excluded",
+                "sqlite_extension_excluded",
+                "sqlite_btree_excluded",
+            ] {
+                trace_test_require!(!output.contains(marker), "unexpected {marker}: {output}");
+            }
+        }
+        Ok(())
     }
 
     #[test]
