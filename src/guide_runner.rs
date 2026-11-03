@@ -668,36 +668,125 @@ fn evaluate_sources_dry_sync(
     request: &GuideRunRequest<'_>,
     deadline: Instant,
 ) -> ProofResult {
+    if Instant::now() >= deadline {
+        return unavailable_live_proof("source preview deadline exhausted; no child started");
+    }
     let before = match sources_fingerprint() {
         Ok(value) => value,
         Err(detail) => return failed_sources_proof(detail),
     };
-    let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
-        return unavailable_live_proof("source preview deadline exhausted; no child started");
+    let config = match crate::sources::config::SourcesConfig::load() {
+        Ok(config) if fingerprint_sources(&config).as_ref() == Ok(&before) => config,
+        _ => return failed_sources_proof("configured sources changed before preview"),
     };
-    let Some(argv) = allowlisted_argv(command, request.data_dir, request.db_path) else {
-        return failed_sources_proof(
-            "configured source preview scope cannot be represented by safe argv",
-        );
-    };
-    let output = match run_bounded_cass_with_scope(&argv, timeout, false, Some(request.data_dir)) {
-        Ok(output) => output,
-        Err(error) => return failed_sources_proof(error.detail),
-    };
-    let payload = match serde_json::from_slice(&output.stdout) {
-        Ok(payload) => payload,
-        Err(_) => {
-            return failed_sources_proof(
-                "dry sync returned malformed output; preview is unverified",
-            );
+    let local_sources: Vec<_> = config
+        .sources
+        .iter()
+        .filter(|source| !source.is_remote())
+        .collect();
+    let mut local_paths_checked = 0usize;
+    if !local_sources.is_empty() {
+        if local_sources
+            .iter()
+            .any(|source| source.validate().is_err())
+        {
+            return failed_sources_proof("configured local source paths are invalid");
         }
+        // Reuse the indexer's root resolution (including home expansion and
+        // source identity) without opening the archive or walking any source.
+        let roots = crate::indexer::build_scan_roots(None, request.data_dir);
+        for source in &local_sources {
+            let selected: Vec<_> = roots
+                .iter()
+                .filter(|root| {
+                    root.origin.source_id == source.name && root.origin.kind == source.source_type
+                })
+                .collect();
+            if source.paths.is_empty() || selected.len() != source.paths.len() {
+                return failed_sources_proof("a configured local source path is missing");
+            }
+            for root in selected {
+                if Instant::now() >= deadline {
+                    return unavailable_live_proof("source preview deadline exhausted");
+                }
+                let readable = match std::fs::metadata(&root.path) {
+                    Ok(metadata) if metadata.is_dir() => std::fs::read_dir(&root.path).is_ok(),
+                    Ok(metadata) if metadata.is_file() => std::fs::File::open(&root.path).is_ok(),
+                    _ => false,
+                };
+                if !readable {
+                    return failed_sources_proof("a configured local source path is unreadable");
+                }
+                local_paths_checked += 1;
+            }
+        }
+    }
+    let mut proof = if config.remote_sources().next().is_none() {
+        if local_sources.is_empty() {
+            return failed_sources_proof("configure a source before onboarding");
+        }
+        ProofResult {
+            result: "passed",
+            source: "source-config",
+            detail:
+                "configured local paths are readable; no remote sync or registration was performed"
+                    .into(),
+            observation: Some(json!({
+                "configured_remote_sources": 0,
+                "configured_paths": 0,
+                "transport_started": false,
+                "sources_registered": false,
+                "files_transferred": 0,
+                "reindexed": false
+            })),
+        }
+    } else {
+        let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
+            return unavailable_live_proof("source preview deadline exhausted; no child started");
+        };
+        let Some(argv) = allowlisted_argv(command, request.data_dir, request.db_path) else {
+            return failed_sources_proof(
+                "configured source preview scope cannot be represented by safe argv",
+            );
+        };
+        let output =
+            match run_bounded_cass_with_scope(&argv, timeout, false, Some(request.data_dir)) {
+                Ok(output) => output,
+                Err(error) => return failed_sources_proof(error.detail),
+            };
+        let payload = match serde_json::from_slice(&output.stdout) {
+            Ok(payload) => payload,
+            Err(_) => {
+                return failed_sources_proof(
+                    "dry sync returned malformed output; preview is unverified",
+                );
+            }
+        };
+        classify_sources_dry_sync(output.status.code(), &payload)
     };
+    if Instant::now() >= deadline {
+        return unavailable_live_proof("source preview deadline exhausted");
+    }
     if sources_fingerprint().as_ref() != Ok(&before) {
         return failed_sources_proof("configured sources changed during preview; rerun the guide");
     }
-    let mut proof = classify_sources_dry_sync(output.status.code(), &payload);
     if let Some(observation) = proof.observation.as_mut().and_then(Value::as_object_mut) {
         observation.insert("source_config_blake3".into(), json!(before));
+        if !local_sources.is_empty() {
+            let remote_paths = observation
+                .get("configured_paths")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            observation.insert(
+                "configured_local_sources".into(),
+                json!(local_sources.len()),
+            );
+            observation.insert("local_paths_checked".into(), json!(local_paths_checked));
+            observation.insert(
+                "configured_paths".into(),
+                json!(remote_paths + local_paths_checked as u64),
+            );
+        }
     }
     proof
 }
@@ -1452,14 +1541,14 @@ fn execute_mutation(
     }
 }
 
-fn incremental_index_scope() -> Value {
+fn incremental_index_scope(requires_staged_mirrors: bool) -> Value {
     json!({
         "assets": "canonical-and-lexical",
         "source_scope": "configured-sources-and-local-discovery",
         "source_scan": true,
         "source_registration": false,
         "remote_sync": false,
-        "requires_staged_mirrors": true,
+        "requires_staged_mirrors": requires_staged_mirrors,
         "semantic_rebuild": false,
         "timeout_seconds": 120
     })
@@ -1660,6 +1749,7 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
     let mut awaiting_confirmation = false;
     let mut blocked_step = false;
     let mut source_preview_fingerprint = None;
+    let mut source_preview_requires_mirrors = true;
 
     let proof_deadline = Instant::now() + Duration::from_secs(15);
     for step in &steps {
@@ -1752,7 +1842,10 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
             if command.adapter == Adapter::IncrementalIndex
                 && let Some(entry) = transcript.last_mut().and_then(Value::as_object_mut)
             {
-                entry.insert("execution_scope".into(), incremental_index_scope());
+                entry.insert(
+                    "execution_scope".into(),
+                    incremental_index_scope(source_preview_requires_mirrors),
+                );
             }
             if command.adapter == Adapter::SourcesDrySync
                 && let Some(entry) = transcript.last_mut().and_then(Value::as_object_mut)
@@ -1787,6 +1880,12 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
             };
             prior_proofs_passed &= proof.result == "passed";
             if command.adapter == Adapter::SourcesDrySync && proof.result == "passed" {
+                source_preview_requires_mirrors = proof
+                    .observation
+                    .as_ref()
+                    .and_then(|value| value.get("configured_remote_sources"))
+                    .and_then(Value::as_u64)
+                    .is_none_or(|count| count > 0);
                 source_preview_fingerprint = proof
                     .observation
                     .as_ref()
@@ -1925,7 +2024,10 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
         if command.adapter == Adapter::IncrementalIndex
             && let Some(entry) = transcript.last_mut().and_then(Value::as_object_mut)
         {
-            entry.insert("execution_scope".into(), incremental_index_scope());
+            entry.insert(
+                "execution_scope".into(),
+                incremental_index_scope(source_preview_requires_mirrors),
+            );
         }
     }
 

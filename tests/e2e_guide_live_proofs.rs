@@ -172,7 +172,12 @@ fn live_onboarding_indexes_configured_local_sources_only_after_confirmation() {
         let data_dir = home.path().join("data with spaces");
         let db = home.path().join("selected local archive.db");
         let source_root = home.path().join("configured codex");
-        util::seed_codex_session(&source_root, "rollout-guide-local.jsonl", PRIVATE_BODY, true);
+        util::seed_codex_session(
+            &source_root,
+            "rollout-guide-local.jsonl",
+            PRIVATE_BODY,
+            false,
+        );
         let mut source = SourceDefinition::local("guide-local");
         source.paths = vec![if relative {
             "~/configured codex".into()
@@ -193,7 +198,10 @@ fn live_onboarding_indexes_configured_local_sources_only_after_confirmation() {
         assert_eq!(preview["observation"]["local_paths_checked"], 1);
         assert_eq!(preview["observation"]["transport_started"], false);
         assert_eq!(preview["observation"]["sources_registered"], false);
-        assert_eq!(step(&unconfirmed, "index.incremental")["result"], "awaiting-confirmation");
+        assert_eq!(
+            step(&unconfirmed, "index.incremental")["result"],
+            "awaiting-confirmation"
+        );
         assert_eq!(unconfirmed["execution"]["attempted_mutation_count"], 0);
         assert!(!db.exists());
 
@@ -202,13 +210,28 @@ fn live_onboarding_indexes_configured_local_sources_only_after_confirmation() {
         assert_eq!(indexed["result"], "executed", "{output}");
         assert_eq!(indexed["proof_gate"]["result"], "passed");
         assert_eq!(indexed["observation"]["conversations"], 1);
+        assert_eq!(indexed["execution_scope"]["requires_staged_mirrors"], false);
         assert_eq!(output["mutation_contract"]["touches_network"], false);
         assert!(!data_dir.join("agent_search.db").exists());
         assert_eq!(std::fs::read(&config).expect("config after"), config_before);
-        assert_eq!(std::fs::read(&session).expect("session after"), session_before);
-        let (success, hits) = run_on_archive(home.path(), &data_dir, &db, &[
-            "search", PRIVATE_BODY, "--mode", "lexical", "--source", "guide-local", "--json",
-        ]);
+        assert_eq!(
+            std::fs::read(&session).expect("session after"),
+            session_before
+        );
+        let (success, hits) = run_on_archive(
+            home.path(),
+            &data_dir,
+            &db,
+            &[
+                "search",
+                PRIVATE_BODY,
+                "--mode",
+                "lexical",
+                "--source",
+                "guide-local",
+                "--json",
+            ],
+        );
         assert!(success, "{hits}");
         assert_eq!(hits["hits"].as_array().expect("hits").len(), 1);
         assert!(!output.to_string().contains(PRIVATE_BODY));
@@ -228,10 +251,24 @@ fn live_onboarding_refuses_missing_or_invalid_local_sources() {
             "empty-path" => vec![String::new()],
             _ => Vec::new(),
         };
-        configure_sources(home.path(), if scenario == "empty-config" { Vec::new() } else { vec![source] });
+        configure_sources(
+            home.path(),
+            if scenario == "empty-config" {
+                Vec::new()
+            } else {
+                vec![source]
+            },
+        );
         let output = onboard(home.path(), &data_dir, &db, true);
-        assert_eq!(step(&output, "sources.dry-sync")["proof_gate"]["result"], "failed", "{scenario}: {output}");
-        assert_eq!(output["execution"]["attempted_mutation_count"], 0, "{output}");
+        assert_eq!(
+            step(&output, "sources.dry-sync")["proof_gate"]["result"],
+            "failed",
+            "{scenario}: {output}"
+        );
+        assert_eq!(
+            output["execution"]["attempted_mutation_count"], 0,
+            "{output}"
+        );
         assert!(!db.exists());
     }
 }
@@ -244,16 +281,32 @@ fn live_onboarding_mixed_sources_requires_every_configured_local_path() {
         let data_dir = home.path().join("data");
         let db = data_dir.join("agent_search.db");
         let config = configure_remote(home.path(), "~/.codex");
-        let mut sources = SourcesConfig::load_from(&config).expect("remote config").sources;
+        let mut sources = SourcesConfig::load_from(&config)
+            .expect("remote config")
+            .sources;
         let mirror = data_dir.join("remotes/guide-remote/mirror").join(
             coding_agent_search::sources::sync::path_to_safe_dirname("~/.codex"),
         );
-        util::seed_codex_session(&mirror, "rollout-mixed-remote.jsonl", "mixedremotemarker", true);
+        util::seed_codex_session(
+            &mirror,
+            "rollout-mixed-remote.jsonl",
+            "mixedremotemarker",
+            true,
+        );
         let local_root = home.path().join("configured codex");
-        util::seed_codex_session(&local_root, "rollout-mixed-local.jsonl", "mixedlocalmarker", true);
+        util::seed_codex_session(
+            &local_root,
+            "rollout-mixed-local.jsonl",
+            "mixedlocalmarker",
+            true,
+        );
         let mut local = SourceDefinition::local("guide-local");
         local.paths = vec![local_root.to_string_lossy().into_owned()];
-        if missing { local.paths.push(home.path().join("missing").to_string_lossy().into_owned()); }
+        if missing {
+            local
+                .paths
+                .push(home.path().join("missing").to_string_lossy().into_owned());
+        }
         sources.push(local);
         configure_sources(home.path(), sources);
         let output = onboard(home.path(), &data_dir, &db, true);
@@ -267,8 +320,20 @@ fn live_onboarding_mixed_sources_requires_every_configured_local_path() {
             assert_eq!(preview["observation"]["configured_local_sources"], 1);
             assert_eq!(preview["observation"]["configured_remote_sources"], 1);
             assert_eq!(preview["observation"]["local_paths_checked"], 1);
-            assert_eq!(step(&output, "index.incremental")["result"], "executed", "{output}");
-            assert_eq!(step(&output, "index.incremental")["observation"]["conversations"], 2);
+            assert_eq!(preview["observation"]["configured_paths"], 2);
+            assert_eq!(
+                step(&output, "index.incremental")["execution_scope"]["requires_staged_mirrors"],
+                true
+            );
+            assert_eq!(
+                step(&output, "index.incremental")["result"],
+                "executed",
+                "{output}"
+            );
+            assert_eq!(
+                step(&output, "index.incremental")["observation"]["conversations"],
+                2
+            );
         }
     }
 }
