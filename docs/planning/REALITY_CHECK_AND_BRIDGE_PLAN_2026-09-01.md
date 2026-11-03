@@ -1,4 +1,315 @@
-# Reality Check and Bridge Plan — refreshed 2026-10-28
+# Reality Check and Bridge Plan — refreshed 2026-11-03
+
+## Assessment: 2026-11-03 (SapphireDeer)
+
+**Verdict: main is a better product than anything a user can install, and the
+project has no working path to ship it.** On a synthetic real-format corpus, the
+published v0.10.0 binary and a HEAD build ran the same 43-step journey plus
+Boolean, watch, TUI and real-MiniLM probes. Both index, search, apply the Boolean grammar correctly (6/6 title-free probes), filter, append
+without duplicates, forget and serve the TUI. The two user-visible defects found in
+the release are fixed on HEAD:
+
+- v0.10.0's HTML and Markdown exports contain synthetic GitHub and AWS credentials
+  verbatim; HEAD's do not;
+- v0.10.0's archive error envelope lacks `hint`.
+
+HEAD is no slower in wall time and uses about 6% more peak RSS on this corpus. On
+both binaries, watch takes two to three minutes, not the documented 5 s, to make an
+appended message searchable. On the scheduler's backfill path, one ordinary ingest
+turns semantic search off until the next backfill (GH #458, reproduced on HEAD).
+
+v0.10.0 is still the latest release after 32 days. Main is 838 commits ahead. 14 of
+the 35 open GitHub issues are fixed only on main, and six owner comments promised those fixes "in the next
+release" two to four weeks ago. Three independent blockers stop delivery:
+
+1. the owner's release-bar decision (`hutyl`, open 12 days);
+2. a strict-UBS scope that fails any change to a monolith on findings older than
+   the change;
+3. dsr build capacity: 0 of 3 hosts are healthy.
+
+None of these is a product defect, and no amount of feature or proof work closes
+them.
+
+This section supersedes the 2026-10-27 assessment and the 2026-10-28 follow-up
+where they disagree. It changes no gate, test, golden, dependency or bead status.
+No peer bead was claimed or closed.
+
+### Scope, identity and evidence boundaries
+
+- **Docs read in full:** `/data/projects/AGENTS.md`, the repository `AGENTS.md` (1,388
+  lines), all 3,938 lines of `README.md`, and the 2026-10-27/28 sections of this
+  document.
+- **Source reviewed:** `main` = `origin/main` = `8c0f8928`. That is 64 commits after the
+  10-27 SHA `1bf194de` and 838 after `v0.10.0`. `Cargo.toml` still says `0.10.0`.
+- **Released binary:** `/home/ubuntu/.local/bin/cass`, SHA-256 `d221153d…`. This is the
+  published v0.10.0 Linux asset; the 10-28 follow-up matched it to the release digest.
+- **HEAD binary:** built on rch hz4 from a detached worktree at `8c0f8928` with
+  `cargo build --locked --release`, thin LTO and 16 codegen units (functionally the
+  shipped profile, not its fat-LTO performance). SHA-256 `8f42d1d8…`. It too reports
+  `cass 0.10.0` with `build_commit: unknown`, so an unreleased build cannot be told
+  apart from the release by `--version`.
+- **Corpus:** each binary ran the same journey (`journey.sh`, `watch_probe.sh`) in its own
+  isolated `HOME`, with `CASS_AUTO_REFRESH=0`, against the same deterministic synthetic
+  corpus (seed 20261103). The corpus has 456 conversations and 12,038 messages: 300
+  Claude Code sessions in 6 projects, 150 Codex rollouts, one 3,000-message session,
+  a 60-day-old session, a Boolean probe session, a session carrying synthetic GitHub
+  and AWS credentials, and a two-session project to forget.
+- **What the corpus is not:** it is not the reporter's provider mix, scale or raw-mirror
+  history. Scale and memory claims below are only what was measured on it.
+- **Receipts:** scripts and per-step stdout/stderr/exit/time/RSS are copied to
+  `/data/tmp/cass-reality-check-20261103-sapphiredeer/`.
+- **Host state:** ts1 has no owner archive. `~/.local/share/coding-agent-search/` holds only
+  `RELOCATED.md`: it was moved to `trj:/bulk/relocated-2026-10-24/...` because the disk
+  was full. `/` is still at 100% with 13 GB free. No real archive was opened, indexed
+  or repaired by this check.
+
+### What actually ran (same corpus, same host, same session)
+
+| Step | Published v0.10.0 (`d221153d`) | HEAD build (`8f42d1d8`) | What it establishes |
+|---|---|---|---|
+| `selftest`, `health` on an empty dir, `index --full` | ok; exit 1 `not_initialized`; exit 0, 456 / 12,038, 27.4 s, 693 MB peak RSS | same; 30.4 s, 727 MB | First-run journey works on both |
+| `health` / `status` / `stats` after | healthy, fresh, exact counts | same | Truth surfaces agree with the corpus |
+| Marker searches (Claude, Codex, 3,000-message session) | 1 exact hit each, ~0.11 s wall | 1 each, ~0.13 s | Real retrieval across connectors and skew |
+| Common term `checkpoint` | 10,524, `count_precision: exact` | same | Exact totals at this size |
+| Boolean grammar, title-free probe (6 queries: `a OR b c`, `(a OR b) c`, `x NOT y`, `x -y`, OR chain, phrase) | **6/6 PASS** | **6/6 PASS** | NOT > AND > OR and parentheses are already in the release |
+| Same queries where the conversation title holds the terms | 4, 4, 0 | 4, 4, 0 | **Message search also matches the conversation title (first prompt)**, so `x NOT y` drops every message of a conversation whose first prompt mentions `y`. Not documented |
+| `--days 30` / `--days 90` on a 60-day-old session | 0 / 1 | same | Time window applies |
+| `--since not-a-date` | exit 2 `usage` | same | No silent substitution |
+| `--agent claude_code` on a Codex marker | 0 | same | Agent filter applies |
+| Default hybrid, no model / `--mode semantic` | realized lexical with reason / exit 15 | same | Truthful fail-open, no hash substitution |
+| `status --jsn` | runs `status` | same | Typo recovery as documented |
+| `view`, `expand`, `pack --require-evidence` | ok; pack 1 evidence, redaction applied | same | Drill-down and pack |
+| `export-html` / `export --format markdown` of the secret session | **both credentials verbatim, 0 `[REDACTED]`** | redacted (5 / 3 markers), receipt `policy: redact-secrets` | `.84` defect shipped; fixed on HEAD |
+| `archive verify <missing>` | exit 14, fields `code,kind,message,retryable` | exit 14, plus `hint` (null) | `.85` fixed on HEAD |
+| Re-index with no change | +0 messages, 2.85 s | +0, 1.54 s | No duplicate work at this size |
+| Append 5 messages, incremental index | exactly +5, 3.66 s | exactly +5, 2.25 s | Incremental correctness |
+| `forget` preview / `--apply` / re-index | read-only; removes 2 / 20 (23.3 s, 794 MB); stays forgotten | same (20.3 s, 854 MB) | Forget persistence |
+| `index --watch`, append to an active session | searchable after ~123 s (189 s on a second run); ignored SIGINT for 5 s, SIGTERM needed | searchable after ~139 s (polls every ~30 s); same SIGINT behaviour | README's 2 s debounce / 5 s maximum wait is not what users get |
+| Real TUI in a pty: launch, type the marker, Esc, Ctrl+C | first launch: query typed at 6 s not drawn within 4.6 s; 3 later launches drew the hit | same (1 miss on first launch, 2 passes) | Search-as-you-type works warm; a cold first launch can drop early keystrokes |
+| Interleaved `index --full` ABAB, fresh data dirs | 31.7 s, 27.5 s; 676, 690 MB | 27.7 s, 27.0 s; 729, 728 MB | Wall time within noise; HEAD +~6% peak RSS. A small corpus, not a scale claim |
+| Real MiniLM, `models install` + `index --semantic`, paraphrase query (lexical: 0 hits), then a one-message ingest | before: semantic/hybrid top-2 correct; **after: semantic exit 15, hybrid lexical 0 hits** | before: correct; **after: unchanged, still semantic** | The README first-run path keeps semantic through ingest only on HEAD: another unreleased fix |
+| Real MiniLM, `models install` + `models backfill --tier quality`, same ingest | before: correct; after: semantic exit 15, hybrid lexical **0 hits** | identical | #458 reproduced on both (180 messages); not a regression |
+| Robot parse error (`models install --json`, `stats --json --bogus`, `search foo --robot --bogus-flag`) | exit 2, `{status, error:<string>, kind:"argument_parsing", examples…}`; `models install` / `stats` examples suggest `cass view` | identical | Undocumented second envelope for exit 2 (new bead) |
+| Data dir after the journey | ~405 MB from 8.7 MB of sources: live lexical 155 MB, one retained publish backup 172 MB, DB ~48 MB, raw mirror 13 MB | live lexical 172 MB (+11%) | ~13 KB of lexical per short message, doubled by the default one-generation backup |
+
+The synthetic corpus makes per-message overhead look worse than on real archives,
+whose messages are longer. The ratios are reported, not extrapolated.
+
+**Gate on HEAD.** Default `scripts/gate.sh` (fmt, all-target clippy `-D warnings`,
+full lib tests, `cli_robot`, `bookmarks_cli`, `search_metamorphic`, `pages_bundle`,
+`search_service`, bin tests with the two named `svhcf`/`p94yt` skips, goldens,
+changed-file UBS), launched 20:12Z from a fresh detached worktree at `8c0f8928` on a
+cold rch path with no retries used:
+
+- `STAGE=source-identity EXIT=0`, `STAGE=source-freshness EXIT=0`, `STAGE=fmt EXIT=0`,
+  `STAGE=clippy EXIT=0`.
+- The test stages were still compiling when this section was written. Their receipts
+  are appended below when the run ends. Until then this is **no verdict on tests**:
+  neither a pass nor a fail.
+- The changed-file UBS stage scans files changed against `origin/main`. On an
+  unmodified checkout that set is empty, so it says nothing about the whole-file
+  backlog described below.
+
+### Delta against the 2026-10-27 vision table
+
+Rows that did not change keep their 10-27 status and ownership. Changed or newly
+measured rows:
+
+| # | Promise | 10-27 | 2026-11-03 evidence | Owner |
+|---|---|---|---|---|
+| 10 | Correct Boolean/phrase/wildcard/filter search | WORKING* (basic lexical) | **WORKING on both binaries** (title-free probe, 6/6, `_meta.effective.query_structure` matches the executed grouping). Undocumented semantics: message search also matches the conversation title (first prompt), so `x NOT y` excludes every message of a conversation whose first prompt contains `y` | `2l1b0.26` (document it) |
+| 12 | Default hybrid with explicit degradation | WORKING* | Fail-open is unchanged on both binaries: requested hybrid, realized lexical, explicit reason; `--mode semantic` exits 15. **With real MiniLM on HEAD** (30 sessions / 180 messages; paraphrase query "automobile ignition failure low power", which lexical misses): after `models install` + `index --semantic`, semantic and hybrid rank the car/battery sessions first. On HEAD they **keep doing so after an ordinary one-message ingest**; on v0.10.0 the same ingest switches semantic off (exit 15, hybrid lexical 0 hits). After `models install` + **`models backfill --tier quality`** (the path the nightly scheduler runs), the same one-message ingest makes `--mode semantic` exit 15 ("semantic assets not current") and default hybrid return **0 hits** via lexical. That is GH #458, reproduced on both binaries: for a scheduler user, semantic search is off between nightly backfills | `962e8` (repro + design comments filed), `ds7uy.*` |
+| 14 | Progressive quality/fast refinement | PARTIAL | Unchanged and fail-closed: `vector_index.rs:223-228` hard-codes `owner_backed_progressive_reader: false`; hybrid hard-codes `SemanticTierMode::Single` (`query.rs:7682`); `two_tier_search.rs` has no production caller; the TUI's `CASS_TUI_TWO_TIER` path falls through to exact single-tier | `ds7uy.1`–`.5` |
+| 16 | ANN truthful readiness | PARTIAL | `hnsw_ready` is now hard-coded `false` (`asset_state.rs:984-988`, ecfaafe5) and presence is `hnsw_present`; **README.md:323 still says `hnsw_ready` means the sidecar is present.** `append_hnsw_generation` (92b93c04) has only test callers | `wfm4e`, `of9i7`, `2l1b0.26` |
+| 27 | Safe HTML/generic export | PARTIAL (`.84` open) | **Shipped defect, fixed on HEAD.** v0.10.0 HTML (77,534 bytes) and Markdown exports contain both synthetic credentials verbatim, with no `[REDACTED]`. HEAD: neither credential, 5 / 3 `[REDACTED]` markers, the session marker preserved, receipt `{policy: redact-secrets, redaction_applied: true}` | `.84` (blocked on UBS only) |
+| 19 | Robot envelope consistency | PARTIAL (`.85`) | v0.10.0 `archive verify <missing>`: exit 14, fields `code,kind,message,retryable`. HEAD: the same plus `hint` (null), the five-field envelope. Separately, **argument-parsing errors (exit 2) bypass the envelope on both binaries**: `error` is a string, `kind: argument_parsing`, and the examples name the wrong command | `.85` (blocked on UBS only); new bead `robot-parse-error-envelope` |
+| 31 | Freshness through watch | UNPROVEN | Measured on both binaries: a message appended to an active Claude Code session under `index --watch` became searchable after ~123 s on v0.10.0 (189 s on a second run) and ~139 s on HEAD, which polls every ~30 s. README *Watch Mode Internals* promises a 2 s debounce and 5 s maximum wait. The 120 s `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` deferral dominates. Both ignored SIGINT for 5 s | new bead `watch-stable-prefix-ingest` |
+| 5/6 | Cheap, bounded indexing | PARTIAL | Interleaved A/B, 12k messages: wall time 31.7/27.5 s (v0.10.0) vs 27.7/27.0 s (HEAD); peak RSS 676/690 MB vs 729/728 MB (+~6%). No-op re-index 2.85 vs 1.54 s; 5-message append 3.66 vs 2.25 s. ~700 MB of RSS for a 9 MB corpus shows a large fixed floor; at-scale costs remain the domain of the existing beads | `.72`, `3zq55`, `irqgt` |
+| 33 | Current release on every channel | PARTIAL | **Blocked at three layers** (below). GitHub v0.10.0 (10-02), crates.io 0.7.0 (08-25), `dsr health all` 0/3 healthy | `hutyl`, new dsr-capacity bead, `yrjna`, `.25` |
+| new | Owner's own machine runs cass | — | **NOT WORKING:** the archive was relocated off ts1 on 10-24; agents on ts1 told by AGENTS.md to "use cass" search an empty data dir with v0.10.0 | new dogfood bead |
+
+Docs-truth defects found while reading the README in full (owned by `2l1b0.26`):
+
+- `README.md:323`: the `hnsw_ready` semantics above.
+- `:2391`: "The TUI has no bookmark keybindings today" contradicts `:1982` and `:3054`
+  (`Alt+E`) and the `event_mapping_alt_e_maps_to_bookmark_selected_hit` test.
+- `:2722`: "applies v14–v22, so a new database records versions 13–22" contradicts
+  `:2802` and `CURRENT_SCHEMA_VERSION = 23` (`src/storage/sqlite.rs:4100`).
+- `:1518-1521`: the table calls the 5,000,000-document exact-count threshold "Current
+  (unreleased)", but commit `81ea0649` is in v0.10.0.
+- `:51`/`:83`: the Agent Quickstart is "verified on 0.8.0".
+- `:3017`: the release-binary example still uses `VERSION=v0.2.0`.
+- *Watch Mode Internals* (`:2839-2856`): the 2 s/5 s claim above.
+- *Query Language* (`:1748` onward): "Messages containing ..." omits that a message also
+  matches through its conversation title (the first prompt). With the title
+  `zzbool alphaq betaq`, `zzbool NOT alphaq` returns 0 of 4 messages on both binaries.
+
+### Shipped state: what users have
+
+A fix matrix of all 35 open issues (`gh` plus `git merge-base --is-ancestor <fix>
+v0.10.0` plus beads) found:
+
+- **14 FIXED_UNRELEASED** (#530 #525 #522 #521 #520 #519 #517 #516 #514 #512 #511 #510 #508
+  #426). 11 are firm; #530, #525 and #508 await reporter or scale confirmation.
+- **11 PARTIAL**, **4 STALE** (#495, #462, #443 and #379: fixes shipped in v0.8.0–v0.10.0,
+  no reporter retest), **2 UPSTREAM** (#515, #349), **2 FEATURE** (#537, #481) and
+  **2 OPEN** (#460, #391).
+- Every open issue has a bead. #530's bead arrived after ~92 h, and #538's and #508's
+  after ~38 h, against the 24 h rule.
+- Reporters active since 10-20: #538, #537, #530, #458 and #496. per0733 alone is active
+  on #530, #537 and #496, reported #521 and #522, and runs released binaries only.
+- Owner comments promising the "next release": #522 (10-19), #512 (10-12), #481 (10-19),
+  plus "stays open until a release carries it" on #519, #517 and #516.
+
+### Why nothing ships: three independent blockers
+
+1. **Decision.** `release-bar-decision-hutyl` (P0 question, filed 10-22, last touched
+   10-27) proposes cutting 0.11.0 under a "no worse than v0.10.0" bar. No owner answer
+   is recorded. `yrjna` still names `p3gh0`, `55wh0`, `5v57k` and `irqgt` as blockers.
+   - `p3gh0` is the #462 bead. #462's engine fix shipped in v0.9.0; a retest was
+     requested on 10-03 and never answered. So one release blocker holds an issue
+     whose fix users already have.
+2. **Scanner scope.** `scripts/gate.sh` runs pinned UBS `--ci --fail-on-warning` over every
+   file the change touches. Strict scans this week, all with the AST engine:
+   - `src/lib.rs` + `tests/cli_robot.rs` + `tests/daemon_client_integration.rs`:
+     77 critical / 7,713 warning.
+   - Four files including `src/indexer/mod.rs`: 82 / 19,121.
+   - A single test file: 2 / 238.
+
+   Each scope inherits every pre-existing finding in the touched files. A change that
+   introduces no finding still fails if it edits `lib.rs`, so the verdict measures the
+   file's history, not the change.
+
+   Today's `8c0f8928` correctly closed a scanner fail-open (no AST engine meant zero Rust
+   findings). That raises the measured count further. Under whole-file scope the release
+   needs the monoliths' entire backlog triaged, and there was no net movement in the
+   week since 10-27: one bead closed, `5v57k` still in progress.
+
+   The 2026-09-22 audit found about 30 code-complete bug beads whose only remaining
+   closure condition is this scan. That is why the ledger is frozen:
+   - 2,299 closed, against 2,298 on 10-27;
+   - 46 of 63 in-progress beads not updated since 10-20, and 18 not since before 09-01;
+   - 15 epics ready to close;
+   - 7 of 33 unfinished P0s are epics.
+
+   Changing that bar is the owner's decision, not an agent's, because it is the
+   proposal inside `hutyl`.
+3. **Capacity.** `dsr health all` at ~20:10Z: mmini 100% used (4.47 GiB free against a
+   40 GiB floor, down from 18.55 GiB at 09:32Z); trj's storage probe fails; wlap is
+   unreachable. ts1 is at 100% with 193 linked worktrees of this repository. rch
+   workers vmi1152480 (`No space left on device`), hz3, vmi1153651 and vmi1156319 are
+   disk-critical. **Even an approved bar could not produce a native release today.**
+   No open bead owned this before this check.
+
+The swarm's effort this week went where these blockers say it would: the GH #538
+watch-ingestion series (one macOS reporter), scanner integrity, and receipts. The
+receipts include bead comments of several hundred words of SHA-256 digests for scoped
+gates that end "no release clearance". That rigor is real, but under the current bar
+it is AGENTS.md's named pattern 10 (conformance metastasis): it cannot convert into a
+shipped fix until blocker 1 or 2 moves.
+
+### The five reality-check answers
+
+1. **What works:** the whole lexical journey on both binaries:
+   - discovery of Claude and Codex, canonical persistence, health/status truth;
+   - marker, agent, `--days` and invalid-`--since` handling;
+   - exact counts and incremental append with exactly +5 messages and no duplicates;
+   - a no-op re-index; forget preview/apply/re-index persistence;
+   - view/expand/pack, timeline, `doctor check`, fail-open hybrid and explicit semantic
+     refusal.
+
+   The same journey passes on HEAD, which also fixes the shipped export leak and the
+   archive-envelope gap, and keeps `index --semantic` vectors serving across an
+   ordinary ingest (v0.10.0 does not). Real MiniLM semantic and hybrid search answer
+   a paraphrase query that lexical misses.
+2. **What does not:**
+   - Users run a release whose exports carry credentials verbatim.
+   - On the scheduler's backfill path, one ordinary ingest switches semantic search off
+     until the next backfill (#458, reproduced on HEAD), and progressive refinement is
+     fail-closed.
+   - Robot argument-parsing errors (exit 2) use an undocumented envelope: `error` is a
+     string and `kind` is `argument_parsing`, on both binaries.
+   - Watch freshness for an active session is 2–3 minutes, not 5 s.
+   - Indexing has a high fixed memory floor (~700 MB peak for a 9 MB corpus on both binaries).
+   - The owner's own archive is not running anywhere current.
+   - Large-archive memory and read amplification remain partial (#496, #461, #320).
+3. **What blocks:** the decision, the scanner scope and the capacity layers above.
+   Technical work items (semantic serving, ANN, `.72` RSS) block quality, not delivery.
+4. **Would finishing all open and in-progress beads close the gap? No.**
+   - Before this pass, nothing owned the capacity outage, the dogfood outage or watch
+     latency.
+   - Several open beads are stale premises: `p3gh0` awaits a retest of a shipped fix;
+     the July `uojcg.*` epics are in progress at P0 with no update since 07-24; `g3zyo`
+     and `yxcga` still name fsqlite 0.3.x pins.
+   - Under the current UBS bar, the existing beads cannot close even when their code
+     is done. Completing them mechanically would still not cut a release.
+5. **Vision goals with no bead before this check:**
+   - native build capacity;
+   - the owner archive / dogfood loop;
+   - watch time-to-searchable for an active session;
+   - the robot argument-parsing error envelope;
+   - a release cadence that keeps users within one period of a landed fix.
+
+   The docs-truth list above goes to `2l1b0.26`, not to a new bead.
+
+### Bridge plan (ordered by user impact, not by ease)
+
+| Order | Outcome | Named acceptance / negative | Owner |
+|---|---|---|---|
+| 1 | **Owner decides the 0.11.0 bar** | A decision recorded on `hutyl`. The recommended form is no-worse-than-v0.10.0 plus a UBS **new-only delta** against a v0.10.0 baseline: zero new criticals, new warnings reviewed. Negative control: one added production `panic!` fails the delta while an unchanged pre-existing finding does not | owner; `hutyl` (comment filed with fresh numbers) |
+| 2 | **Restore native build capacity** | `dsr health all` shows a healthy host per target. The before-output (0/3) is retained as the negative pair; floors are not lowered | new bead `release-infra-dsr-capacity`; owner action (no deletion without permission) |
+| 3 | **Ship 0.11.0 from main** | Journey smoke on each dsr target, with the previous release and the candidate in the same invocation; release notes list known reds and beads; all 14 FIXED_UNRELEASED issues and six promise threads get the version | `yrjna`, `.25` (as narrowed by 1); `p3gh0` re-justified or dropped |
+| 4 | **Make shipping routine** | Two consecutive cadence releases at most 16 days apart, each with a journey receipt per target and a zero-new-critical UBS delta | new bead `release-train-ratchet` (blocked by 1 and 2) |
+| 5 | **Keep semantic serving through ingest on the backfill path** | Serve a quality generation by 2P-set coverage instead of exact fingerprint equality. Named probe: `sem_probe_backfill.sh`, where the paraphrase hit must survive a one-message ingest on the backfill path (it fails today). Old semantic-only hit still returned after a 68-message ingest; negatives for forgotten and Codebuff-updated conversations | `962e8` (design comment filed), `ds7uy.*` |
+| 6 | **Seconds, not minutes, for active sessions under watch** | Stable-prefix ingest for append-only JSONL. `watch_appended_jsonl_line_searchable_within_debounce` (<10 s); negatives for a partial trailing line (ingested exactly once), rewritten-in-place sources (still deferred) and truncation (no duplicates) | new bead `watch-stable-prefix-ingest` |
+| 7 | **One error envelope for robot callers** | `parse_error_envelope_matches_documented_shape`: exit 2 parse errors carry `error{code,kind,message,hint,retryable}` with the helpful extras nested. Negative: `models install --json` examples must start with `cass models`. Golden added with a GOLDEN-CHANGE note | new bead `robot-parse-error-envelope` |
+| 8 | **Owner archive back in service on current main** | `health` 0 and `last_indexed_at` < 24 h on the restored host, and a search for today's session hits (negative: before the restore it misses). Peak RSS, wall time and disk growth recorded on `.72`/`.46` | new bead `dogfood-owner-archive` |
+| 9 | **Current docs tell the truth** | The eight README items above corrected in place, with link/claim checks. Docs never close a feature bead | `2l1b0.26` (comment filed) |
+| 10 | Continue the existing quality work | Unchanged ownership: `.72`/`3zq55`/`irqgt` (whole-job RSS and I/O), `ds7uy.3.3`/`of9i7` (ANN), `5v57k` (UBS backlog burn-down, production criticals first) | existing owners |
+
+Items 1–4 are the whole delivery path, and none of them is code in `src/`. Item 4
+exists so that this check does not have to be repeated in a month with the same
+answer.
+
+### Ambition rounds and refinement (plan space, recorded briefly)
+
+1. **Round 1: from "unblock 0.11.0" to "never block again".** A single release
+   decision repeats the September–October pattern: each release accretes
+   prerequisites until it stops. The ratchet makes the previous release the
+   incumbent and runs it live in the same invocation as the candidate, which is
+   AGENTS.md's vs-incumbent rule applied to releases. That turned item 3 into item 4.
+2. **Round 2: attack where users lose, not where proof is easy.** The largest gap
+   between README promise and runtime is that, for a scheduler user, default hybrid is
+   lexical most of the day: the backfill-published tier is refused after any ingest.
+   This was reproduced with real MiniLM on HEAD. The second is minute-scale watch
+   latency for the session an agent is in. Both are cheaper to fix than to keep proving: one is a validity
+   predicate, the other a stable-prefix watermark on receipts that already exist. That
+   added items 5 and 6.
+3. **Round 3: the right math, kept small.** Canonical messages are a 2P-set: rows are
+   added, and removed only by explicit forget/dedup/purge. A derived vector generation
+   is valid exactly while its added set is still a subset of the archive and its
+   removal set has no new entries in covered conversations. That predicate replaces
+   exact-equality serving without weakening correctness: a removal or in-place update
+   is still caught. The same lens shows why the UBS delta is not a loosening. The
+   finding set is a multiset over (rule, content fingerprint), and the release check
+   asks whether the candidate's set is a sub-multiset of the baseline's plus reviewed
+   additions. The negative control proves the check can fail.
+
+Refinement passes over the new beads and comments:
+
+1. **Coverage:** each of the 5 NO_BEAD gaps has a leaf; the docs list went to
+   `.26`, not a new bead.
+2. **Falsifiability:** every new leaf names a populated probe and at least one
+   negative a naive fix would fail.
+3. **Proof class:** journey numbers are labelled as a small synthetic corpus, and the
+   HEAD build is labelled thin-LTO. No microbenchmark is presented as a whole-job
+   result.
+4. **Dependencies:** the ratchet is blocked by `hutyl` and the capacity bead; `yrjna`
+   gets the capacity bead as a blocker; `br dep cycles` stays empty.
+5. **Convergence:** a fifth read found nothing to add without duplicating an existing
+   owner.
+
+---
 
 ## Release qualification follow-up: 2026-10-28 (#537 / #530)
 
