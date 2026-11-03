@@ -4339,7 +4339,53 @@
     },
     {
       "name": "CASS_SEMANTIC_EMBEDDER",
-      "description": "Select the semantic embedder/model implementation when configured."
+      "description": "Select hash, minilm, multilingual-minilm, or external; external also requires CASS_EXTERNAL_EMBEDDINGS=1."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDINGS",
+      "default": "0",
+      "description": "Explicit consent to send text outside the process when external is selected. Accepts 0/false or 1/true; endpoint configuration alone sends nothing."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_URL",
+      "description": "Required external endpoint ending in /v1/embeddings. HTTPS, or HTTP on loopback only; credentials, query and fragment are refused. Configured values are not emitted by discovery."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_MODEL",
+      "description": "Required provider model, at most 512 bytes without control characters. Every response must identify this model; configured values are not emitted by discovery."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_DIMENSION",
+      "description": "Required provider output dimension, 1..16384. Vectors must be finite, unit-normalized and match this dimension."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_REVISION",
+      "default": "1",
+      "description": "Operator model revision, nonempty and at most 512 bytes without control characters. Endpoint, model, dimension and revision identify a separate vector space."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_API_KEY",
+      "description": "Optional bearer credential. Never emitted by discovery or provider diagnostics; rotating it does not change the embedding-space identity."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_BATCH_SIZE",
+      "default": "64",
+      "description": "Maximum inputs per external request, 1..128; the encoded request byte cap also applies."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_MAX_REQUEST_BYTES",
+      "default": "262144",
+      "description": "Maximum encoded JSON request bytes, 1024..4194304. Oversized inputs are refused before text from that call is sent."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_TIMEOUT_MS",
+      "default": "30000",
+      "description": "Per-request deadline in milliseconds, 1..120000. In-flight cancellation remains bounded by this deadline."
+    },
+    {
+      "name": "CASS_EXTERNAL_EMBEDDING_MAX_RETRIES",
+      "default": "0",
+      "description": "Explicit retries for transient external request failures, 0..5. Redirects are refused; implicit protocol retries are disabled."
     },
     {
       "name": "CASS_SEMANTIC_BATCH_SIZE",

@@ -27966,6 +27966,16 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_DOCTOR_WAL_CHECKPOINT_TIMEOUT_SECS=<N>  wall-clock budget in seconds for `cass doctor --fix` WAL checkpoint (default 120; 0 keeps default)".to_string(),
             "  CASS_EXCLUDE_PATHS=p1,p2                 comma/newline-delimited files or directory prefixes to skip without advancing scan/watch watermarks".to_string(),
             "  CASS_EXCLUDE_WORKSPACES=g1,g2            comma/newline-delimited workspace globs to exclude from future ingestion; scan watermarks advance, policy changes revisit sources".to_string(),
+            "  CASS_EXTERNAL_EMBEDDINGS=0|1            consent to sending text to an explicitly selected external embedder (default 0)".to_string(),
+            "  CASS_EXTERNAL_EMBEDDING_API_KEY=<secret> optional bearer credential; never printed by discovery or provider diagnostics".to_string(),
+            "  CASS_EXTERNAL_EMBEDDING_BATCH_SIZE=<N>   inputs per external request (1..128; default 64)".to_string(),
+            "  CASS_EXTERNAL_EMBEDDING_DIMENSION=<N>    required provider output dimension (1..16384)".to_string(),
+            "  CASS_EXTERNAL_EMBEDDING_MAX_REQUEST_BYTES=<N>  encoded JSON request cap (1024..4194304; default 262144)".to_string(),
+            "  CASS_EXTERNAL_EMBEDDING_MAX_RETRIES=<N>  explicit transient-request retries (0..5; default 0)".to_string(),
+            "  CASS_EXTERNAL_EMBEDDING_MODEL=<name>     required provider model; response must identify the same model".to_string(),
+            "  CASS_EXTERNAL_EMBEDDING_REVISION=<id>    operator model revision separating vector spaces (default 1)".to_string(),
+            "  CASS_EXTERNAL_EMBEDDING_TIMEOUT_MS=<N>   external request deadline (1..120000; default 30000)".to_string(),
+            "  CASS_EXTERNAL_EMBEDDING_URL=<url>        required /v1/embeddings endpoint; HTTPS or loopback HTTP, no credentials/query/fragment".to_string(),
             "  CASS_FTS_INLINE_BUDGET_SECS=<N>          wall-clock budget in seconds per index run for inline fts_messages shadow writes (default 300; 0 disables)".to_string(),
             "  CASS_FTS_REPAIR_PAGE_BUDGET_SECS=<N>     per-page budget in seconds for paged fts_messages shadow repair/rebuild (default 120; 0 disables)".to_string(),
             "  CASS_FTS_SHADOW_MAX_MESSAGES=<N>         max indexable message count for retaining the fts_messages SQL-fallback shadow (default 100000; 0 disables)".to_string(),
@@ -27988,7 +27998,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_RESPONSIVENESS_MAX_WORKERS=<N>      hard ceiling the load/PSI governor applies to indexing worker pools".to_string(),
             "  CASS_SEARCH_ACTIVE_REBUILD_WAIT_MS=<N>   max ms search waits for an active lexical rebuild before returning index-busy (default 30000)".to_string(),
             "  CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS=<N>  max index documents for computing exact total_matches on a full page (default 5000000; 0 disables)".to_string(),
-            "  CASS_SEMANTIC_EMBEDDER=hash|minilm|multilingual-minilm  force semantic embedder backend (default auto)".to_string(),
+            "  CASS_SEMANTIC_EMBEDDER=hash|minilm|multilingual-minilm|external  select backend (default auto); external also requires explicit consent".to_string(),
             "  CASS_SEMANTIC_PROGRESS_JSONL=<path>      append semantic backfill phase transition events as JSONL to <path>".to_string(),
             "  CASS_SSH_CONFIG=<path>                   SSH config file passed as `ssh -F <path>` for remote sources".to_string(),
             "  CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS=<N>  conversations per SQL message-fetch chunk during lexical rebuild".to_string(),
@@ -60650,7 +60660,7 @@ fn run_doctor_emit_capabilities(structured_format: Option<RobotFormat>) -> CliRe
         "env_vars": [
             {"name": "CASS_IGNORE_SOURCES_CONFIG", "purpose": "test isolation"},
             {"name": "CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "purpose": "lexical backup retention limit"},
-            {"name": "CASS_SEMANTIC_EMBEDDER", "purpose": "force hash embedder even when ML model is installed"},
+            {"name": "CASS_SEMANTIC_EMBEDDER", "purpose": "select a local semantic backend or an explicitly consented external provider"},
             {"name": "CASS_TEST_DOCTOR_CANDIDATE_PROMOTION_FAILPOINT", "purpose": "test failpoint"},
             {"name": "CASS_TEST_DOCTOR_RENAME_FAILURE", "purpose": "test failpoint"}
             // Pass-11 fix: removed the previously-advertised
@@ -98892,7 +98902,57 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
         env_var_capability(
             "CASS_SEMANTIC_EMBEDDER",
             None,
-            "Select the semantic embedder/model implementation when configured.",
+            "Select hash, minilm, multilingual-minilm, or external; external also requires CASS_EXTERNAL_EMBEDDINGS=1.",
+        ),
+        env_var_capability(
+            "CASS_EXTERNAL_EMBEDDINGS",
+            Some("0"),
+            "Explicit consent to send text outside the process when external is selected. Accepts 0/false or 1/true; endpoint configuration alone sends nothing.",
+        ),
+        env_var_capability(
+            "CASS_EXTERNAL_EMBEDDING_URL",
+            None,
+            "Required external endpoint ending in /v1/embeddings. HTTPS, or HTTP on loopback only; credentials, query and fragment are refused. Configured values are not emitted by discovery.",
+        ),
+        env_var_capability(
+            "CASS_EXTERNAL_EMBEDDING_MODEL",
+            None,
+            "Required provider model, at most 512 bytes without control characters. Every response must identify this model; configured values are not emitted by discovery.",
+        ),
+        env_var_capability(
+            "CASS_EXTERNAL_EMBEDDING_DIMENSION",
+            None,
+            "Required provider output dimension, 1..16384. Vectors must be finite, unit-normalized and match this dimension.",
+        ),
+        env_var_capability(
+            "CASS_EXTERNAL_EMBEDDING_REVISION",
+            Some("1"),
+            "Operator model revision, nonempty and at most 512 bytes without control characters. Endpoint, model, dimension and revision identify a separate vector space.",
+        ),
+        env_var_capability(
+            "CASS_EXTERNAL_EMBEDDING_API_KEY",
+            None,
+            "Optional bearer credential. Never emitted by discovery or provider diagnostics; rotating it does not change the embedding-space identity.",
+        ),
+        env_var_capability(
+            "CASS_EXTERNAL_EMBEDDING_BATCH_SIZE",
+            Some("64"),
+            "Maximum inputs per external request, 1..128; the encoded request byte cap also applies.",
+        ),
+        env_var_capability(
+            "CASS_EXTERNAL_EMBEDDING_MAX_REQUEST_BYTES",
+            Some("262144"),
+            "Maximum encoded JSON request bytes, 1024..4194304. Oversized inputs are refused before text from that call is sent.",
+        ),
+        env_var_capability(
+            "CASS_EXTERNAL_EMBEDDING_TIMEOUT_MS",
+            Some("30000"),
+            "Per-request deadline in milliseconds, 1..120000. In-flight cancellation remains bounded by this deadline.",
+        ),
+        env_var_capability(
+            "CASS_EXTERNAL_EMBEDDING_MAX_RETRIES",
+            Some("0"),
+            "Explicit retries for transient external request failures, 0..5. Redirects are refused; implicit protocol retries are disabled.",
         ),
         env_var_capability(
             "CASS_SEMANTIC_BATCH_SIZE",

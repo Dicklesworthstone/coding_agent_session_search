@@ -321,6 +321,145 @@ fn models_status_json_reports_explicit_multilingual_space_without_acquiring_it()
 }
 
 #[test]
+fn external_embedding_discovery_is_complete_private_and_passive() {
+    use coding_agent_search::search::external_embedder::ExternalEmbeddingConfig;
+    use serde_json::Value;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let home = tempfile::tempdir().expect("isolated home");
+    let data_dir = home.path().join("data");
+    let db = home.path().join("archive.db");
+    let endpoint = TcpListener::bind("127.0.0.1:0").expect("synthetic endpoint");
+    endpoint
+        .set_nonblocking(true)
+        .expect("nonblocking endpoint");
+    let url = format!("http://{}/v1/embeddings", endpoint.local_addr().unwrap());
+    let model = "synthetic-private-discovery-model";
+    let key = "synthetic-private-discovery-key-not-a-credential";
+    let config = BTreeMap::from([
+        ("CASS_EXTERNAL_EMBEDDINGS", "1"),
+        ("CASS_EXTERNAL_EMBEDDING_URL", url.as_str()),
+        ("CASS_EXTERNAL_EMBEDDING_MODEL", model),
+        ("CASS_EXTERNAL_EMBEDDING_DIMENSION", "384"),
+        ("CASS_EXTERNAL_EMBEDDING_API_KEY", key),
+    ]);
+    // Compare discovery with the actual provider parser's consumed settings,
+    // rather than another independently maintained list of variable names.
+    let mut consumed = BTreeSet::new();
+    ExternalEmbeddingConfig::from_lookup(|name| {
+        consumed.insert(name.to_owned());
+        config.get(name).map(|value| (*value).to_owned())
+    })
+    .expect("valid external configuration")
+    .expect("explicit consent");
+
+    let run = |args: &[&str]| {
+        let mut command = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command
+            .env_clear()
+            .envs(std::env::vars_os().filter(|(name, _)| {
+                matches!(
+                    name.to_str(),
+                    Some(
+                        "PATH"
+                            | "SystemRoot"
+                            | "WINDIR"
+                            | "TMP"
+                            | "TEMP"
+                            | "TMPDIR"
+                            | "LD_LIBRARY_PATH"
+                            | "DYLD_LIBRARY_PATH"
+                    )
+                )
+            }))
+            .envs(config.iter())
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_DATA_HOME", home.path().join("xdg-data"))
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .env("CASS_DATA_DIR", &data_dir)
+            .env("CASS_DB_PATH", &db)
+            .env("CASS_SEMANTIC_EMBEDDER", "external")
+            .env("CASS_EXTERNAL_EMBEDDING_TIMEOUT_MS", "100")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("NO_COLOR", "1")
+            .current_dir(home.path())
+            .timeout(Duration::from_secs(20))
+            .args(args);
+        let output = command.assert().success().get_output().clone();
+        let emitted = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for private in [url.as_str(), model, key] {
+            assert!(
+                !emitted.contains(private),
+                "discovery exposed configuration"
+            );
+        }
+        output.stdout
+    };
+
+    let capabilities: Value =
+        serde_json::from_slice(&run(&["capabilities", "--json"])).expect("capabilities JSON");
+    let entries = capabilities["env_vars"].as_array().expect("env registry");
+    let registry: BTreeMap<_, _> = entries
+        .iter()
+        .map(|entry| (entry["name"].as_str().expect("setting name"), entry))
+        .collect();
+    assert_eq!(registry.len(), entries.len(), "duplicate env setting");
+    let docs = String::from_utf8(run(&["robot-docs", "env"])).expect("robot docs");
+    for name in consumed {
+        assert!(registry.contains_key(name.as_str()), "missing {name}");
+        assert!(docs.contains(&name), "robot docs omitted {name}");
+    }
+    for (name, default) in [
+        ("CASS_EXTERNAL_EMBEDDINGS", "0"),
+        ("CASS_EXTERNAL_EMBEDDING_REVISION", "1"),
+        ("CASS_EXTERNAL_EMBEDDING_BATCH_SIZE", "64"),
+        ("CASS_EXTERNAL_EMBEDDING_MAX_REQUEST_BYTES", "262144"),
+        ("CASS_EXTERNAL_EMBEDDING_TIMEOUT_MS", "30000"),
+        ("CASS_EXTERNAL_EMBEDDING_MAX_RETRIES", "0"),
+    ] {
+        assert_eq!(registry[name]["default"], default, "default for {name}");
+    }
+    for name in [
+        "CASS_EXTERNAL_EMBEDDING_URL",
+        "CASS_EXTERNAL_EMBEDDING_MODEL",
+        "CASS_EXTERNAL_EMBEDDING_DIMENSION",
+        "CASS_EXTERNAL_EMBEDDING_API_KEY",
+    ] {
+        assert!(
+            registry[name].get("default").is_none(),
+            "default for {name}"
+        );
+    }
+    assert!(docs.contains("hash|minilm|multilingual-minilm|external"));
+    let doctor: Value = serde_json::from_slice(&run(&["doctor", "--emit-capabilities", "--json"]))
+        .expect("doctor capabilities JSON");
+    let selection = doctor["env_vars"]
+        .as_array()
+        .expect("doctor env settings")
+        .iter()
+        .find(|entry| entry["name"] == "CASS_SEMANTIC_EMBEDDER")
+        .expect("doctor embedder selection");
+    assert!(selection["purpose"].as_str().unwrap().contains("external"));
+    assert!(
+        matches!(endpoint.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    assert!(!db.exists(), "discovery created an archive");
+    assert!(
+        !data_dir.join("models").exists(),
+        "discovery acquired models"
+    );
+}
+
+#[test]
 fn models_remove_requires_explicit_model_and_yes_controls() -> Result<(), String> {
     run_on_large_stack(|| {
         let cli = parse(&[
