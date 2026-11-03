@@ -167,6 +167,42 @@ prepare_compile_inputs() (
     [ "$freshness_rc" -eq 0 ]
 )
 
+verify_ubs_rust_engine() {
+    local engine="$1" proof_dir="$2" probe matches errors
+    if [ -z "$engine" ] || [ ! -x "$engine" ]; then
+        echo "gate: Rust UBS requires an executable ast-grep; refusing a partial scan" >&2
+        return 2
+    fi
+    probe="$proof_dir/ubs-rust-engine-probe.rs"
+    matches="$proof_dir/ubs-rust-engine-probe.jsonl"
+    errors="$proof_dir/ubs-rust-engine-probe.stderr"
+    printf '%s\n' 'pub fn gate_probe() { panic!("scanner engine control"); }' > "$probe" || return 2
+    if ! timeout 30 "$engine" run --lang rust --pattern 'panic!($$$ARGS)' --json=stream "$probe" > "$matches" 2> "$errors"; then
+        cat "$errors" >&2
+        echo "gate: ast-grep failed its Rust parser control; refusing a partial scan" >&2
+        return 2
+    fi
+    if ! python3 - "$probe" "$matches" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+probe = Path(sys.argv[1]).resolve()
+matches = [json.loads(line) for line in Path(sys.argv[2]).read_text().splitlines() if line.strip()]
+if len(matches) != 1:
+    raise SystemExit("Rust parser control must report exactly one match")
+if Path(matches[0]["file"]).resolve() != probe:
+    raise SystemExit("Rust parser control returned another source")
+if not matches[0]["text"].startswith("panic!"):
+    raise SystemExit("Rust parser control did not recognize the panic")
+PY
+    then
+        echo "gate: ast-grep returned an invalid Rust parser control; refusing a partial scan" >&2
+        return 2
+    fi
+    echo "UBS_RUST_AST_ENGINE=$engine UBS_RUST_AST_PROBE=passed"
+}
+
 # Exercise the exact receipt parser without admitting a build or substituting
 # tools. The shell regression suite feeds it recorded terminal-output shapes.
 if [ "${1:-}" = --verify-receipt ]; then
@@ -181,6 +217,15 @@ if [ "${1:-}" = --verify-test-log ]; then
 fi
 if [ "${1:-}" = --verify-fmt ]; then
     run_fmt
+    exit $?
+fi
+if [ "${1:-}" = --verify-ubs-rust-engine ]; then
+    if [ "$#" -ne 2 ]; then
+        echo "gate: --verify-ubs-rust-engine requires one executable path" >&2
+        exit 2
+    fi
+    proof_dir="$(mktemp -d -t cass-gate-ast.XXXXXX)" || exit 2
+    verify_ubs_rust_engine "$2" "$proof_dir"
     exit $?
 fi
 if [ "${1:-}" = --verify-compile-inputs ]; then
@@ -357,7 +402,8 @@ run_tests() {
 }
 
 run_ubs() {
-    local expected actual scanner installed expected_sha expected_contract_sha tool_dir
+    local expected actual scanner installed installed_modules expected_sha expected_contract_sha tool_dir
+    local source rust_source=0 ast_engine="" ast_sha="" scanner_rc
     expected="$(tr -d '[:space:]' < scripts/ubs-version.txt)"
     # The runner verifies its language modules against embedded release hashes.
     # Updating the pin also requires reviewing the new runner digest here.
@@ -374,6 +420,12 @@ run_ubs() {
     installed="$(command -v ubs || true)"
     if [ -n "$installed" ] && [ "$(sha256sum "$installed" | cut -d' ' -f1)" = "$expected_sha" ]; then
         cp "$installed" "$scanner" || return 1
+        # Reuse the pinned bundle without sharing its writable cache. The
+        # runner still verifies every copied module/helper against its pins.
+        installed_modules="$(dirname "$installed")/modules"
+        if [ -d "$installed_modules" ]; then
+            cp -R "$installed_modules" "$tool_dir/modules" || return 1
+        fi
     else
         echo "gate: acquiring pinned UBS ${expected} in ${tool_dir}"
         curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
@@ -389,10 +441,13 @@ run_ubs() {
     # runner without its contract would classify every explicit target as
     # unsupported and exit without scanning anything.
     mkdir -p "$tool_dir/modules" || return 1
-    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-        --max-time 60 --user-agent 'cass-gate (+https://github.com/Dicklesworthstone/coding_agent_session_search)' \
-        "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/${expected}/modules/contract.json" \
-        --output "$tool_dir/modules/contract.json" || return 1
+    if [ ! -f "$tool_dir/modules/contract.json" ] || \
+       [ "$(sha256sum "$tool_dir/modules/contract.json" | cut -d' ' -f1)" != "$expected_contract_sha" ]; then
+        curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --max-time 60 --user-agent 'cass-gate (+https://github.com/Dicklesworthstone/coding_agent_session_search)' \
+            "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/${expected}/modules/contract.json" \
+            --output "$tool_dir/modules/contract.json" || return 1
+    fi
     if [ "$(sha256sum "$tool_dir/modules/contract.json" | cut -d' ' -f1)" != "$expected_contract_sha" ]; then
         echo "gate: UBS routing contract bytes differ from the pinned release" >&2
         return 1
@@ -406,8 +461,25 @@ run_ubs() {
         return 0
     fi
     printf 'UBS_FILE=%s\n' "$@"
+    for source in "$@"; do
+        [[ "$source" = *.rs ]] && rust_source=1
+    done
+    if [ "$rust_source" -eq 1 ]; then
+        ast_engine="$(command -v ast-grep)" || ast_engine=""
+        if [ -n "$ast_engine" ]; then
+            ast_sha="$(sha256sum "$ast_engine" | cut -d' ' -f1)" || return 2
+        fi
+        verify_ubs_rust_engine "$ast_engine" "$tool_dir" || return 2
+        echo "UBS_RUST_AST_SHA256=$ast_sha"
+    fi
     # Text retains categories and source samples needed to diagnose a red gate.
     bash "$scanner" --module-dir="$tool_dir/modules" --no-auto-update --format=text --ci --fail-on-warning "$@"
+    scanner_rc=$?
+    if [ "$rust_source" -eq 1 ] && [ "$(sha256sum "$ast_engine" | cut -d' ' -f1)" != "$ast_sha" ]; then
+        echo "gate: ast-grep changed during the Rust scan; refusing its result" >&2
+        return 2
+    fi
+    return "$scanner_rc"
 }
 
 # Every stage records its own exit code and preserves complete test output.
@@ -534,7 +606,7 @@ for cargo_env_key in CARGO_BUILD_JOBS CARGO_INCREMENTAL CARGO_PROFILE_DEV_DEBUG 
         cargo_profile_env+="$cargo_env_export"
     fi
 done
-REMOTE_SCRIPT="$(declare -f test_log_counts run_tests run_fmt run_ubs prepare_compile_inputs)
+REMOTE_SCRIPT="$(declare -f test_log_counts run_tests run_fmt run_ubs prepare_compile_inputs verify_ubs_rust_engine)
 ${cargo_profile_env}set -o pipefail
 echo SOURCE_HEAD=${SOURCE_HEAD}
 prepare_compile_inputs '${SOURCE_PATHS}' '${SOURCE_CONTENT}' || exit 1

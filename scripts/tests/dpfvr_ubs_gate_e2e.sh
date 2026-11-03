@@ -12,7 +12,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # These cases exercise the production batched-gate parsers directly. Inputs are
 # terminal-output fixtures, not substitute cargo/ubs executables or live proof.
-if [ "${1:-}" = --batched-only ] || [ "${1:-}" = --formatter-only ]; then
+if [ "${1:-}" = --batched-only ] || [ "${1:-}" = --formatter-only ] || [ "${1:-}" = --scanner-engine-only ]; then
     proof_dir="$(mktemp -d -t cass-gate-parser.XXXXXX)"
     gate="$PROJECT_ROOT/scripts/gate.sh"
     pass=0
@@ -30,6 +30,21 @@ if [ "${1:-}" = --batched-only ] || [ "${1:-}" = --formatter-only ]; then
             fail=$((fail + 1))
         fi
     }
+    if [ "${1:-}" = --scanner-engine-only ]; then
+        # Real tools only: the absent path and ordinary system executables
+        # cannot satisfy the parser protocol. Never replace the scanner.
+        real_ast="$(command -v ast-grep)" || exit 2
+        check_exit scanner-engine-real 0 bash "$gate" --verify-ubs-rust-engine "$real_ast"
+        check_exit scanner-engine-missing 2 bash "$gate" --verify-ubs-rust-engine "$proof_dir/absent-ast-grep"
+        check_exit scanner-engine-empty 2 bash "$gate" --verify-ubs-rust-engine /bin/true
+        check_exit scanner-engine-error 2 bash "$gate" --verify-ubs-rust-engine /bin/false
+        check_exit scanner-engine-invalid-json 2 bash "$gate" --verify-ubs-rust-engine /bin/echo
+        check_exit scanner-engine-optimized-valid 0 env PYTHONOPTIMIZE=2 bash "$gate" --verify-ubs-rust-engine "$real_ast"
+        check_exit scanner-engine-optimized-empty 2 env PYTHONOPTIMIZE=2 bash "$gate" --verify-ubs-rust-engine /bin/true
+        echo "Scanner engine gate: PASS=$pass FAIL=$fail fixtures=$proof_dir"
+        [ "$fail" -eq 0 ]
+        exit $?
+    fi
     if [ "${1:-}" = --formatter-only ]; then
         # Use real cargo-fmt and rustfmt for both format outcomes. Then inject
         # process failures through cargo-fmt's RUSTFMT override: the waiting
