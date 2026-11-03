@@ -233,7 +233,7 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 - **Zero-Stall Updates**: The background indexer commits changes atomically; `reader.reload()` ensures new messages appear in the search bar immediately without restarting.
 - **One-shot CLI overhead**: the sub-60ms figure is the engine query. A one-shot `cass search --robot` currently spends roughly a second in archive open and integrity preflight on a ~10 GB archive; `--robot-meta` reports that separately as `_meta.timing.other_ms`, while `search_ms` stays in the tens of milliseconds.
 
-### 🧠 Optional Semantic Search (Local Inference, No Network at Query Time)
+### 🧠 Optional Semantic Search (Local by Default)
 - **Local inference**: Uses frankensearch's pure-Rust native MiniLM implementation with local safetensors weights. Once MiniLM is installed, no network traffic is required to answer queries.
 - **Warm-daemon reuse**: Semantic and hybrid CLI searches automatically use an
   already-running local embedding daemon (including a socket selected with
@@ -265,6 +265,28 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
   - `tokenizer_config.json`
 - **Vector index**: Stored as `vector_index/index-<embedder>.fsvi` in the data directory.
 - **Lexical fail-open**: While the model is absent, `cass` returns lexical-only results and reports `fallback_mode="lexical"` in health/status; search never blocks on semantic assets.
+
+#### Opt-In External Embeddings
+
+An OpenAI-compatible embedding service can own inference, including any GPU it supports. Select `external` explicitly and set `CASS_EXTERNAL_EMBEDDINGS=1` to consent to sending selected archive text during backfill and query text during semantic search. Configuring a URL alone sends nothing. Local models and hash embeddings keep their existing behavior.
+
+Configure the endpoint's actual model name, output dimension and a stable model revision before backfilling. This example assumes a loopback service producing 384-dimensional vectors:
+
+```bash
+export CASS_EXTERNAL_EMBEDDINGS=1
+export CASS_EXTERNAL_EMBEDDING_URL='http://127.0.0.1:8000/v1/embeddings'
+export CASS_EXTERNAL_EMBEDDING_MODEL='your-model-name'
+export CASS_EXTERNAL_EMBEDDING_DIMENSION=384
+export CASS_EXTERNAL_EMBEDDING_REVISION='model-revision-1'
+# Set CASS_EXTERNAL_EMBEDDING_API_KEY separately if the service requires it.
+
+cass models backfill --tier quality --embedder external --data-dir /path/to/cass-data --json
+CASS_SEMANTIC_EMBEDDER=external cass search 'your query' --mode semantic --data-dir /path/to/cass-data --json
+```
+
+Use HTTPS for a non-loopback endpoint. Redirects and URLs containing credentials, a query or a fragment are refused. Responses must name the configured model and supply finite, unit-normalized vectors of the declared dimension. Fixed public probes check dimensions, normalization and repeatability before archive/query text is sent. Endpoint, model, dimension and revision identify a separate vector space; changing them requires its own completed backfill, while credential rotation preserves the space. Provider errors retain durable backfill checkpoints. A blocking request remains bounded by `CASS_EXTERNAL_EMBEDDING_TIMEOUT_MS` when cancellation occurs.
+
+The persistent service also accepts `--semantic-embedder external` with `--data-dir` and `--db`; it uses the same consent and publication admission. `cass capabilities --json` and `cass robot-docs env` list every provider setting and default without printing configured values or contacting the endpoint. External protocol tests use a synthetic loopback service; they establish neither GPU performance nor a provider's retrieval quality.
 
 #### Explicit Hash Vector Tier
 
@@ -3158,13 +3180,13 @@ Other subcommands (all present in the `Commands` enum in `src/lib.rs`):
 
 `cass guide repair-assets --apply` can rebuild the lexical index from the selected canonical database after the plan's step confirmation, cost acceptance, resource checks and stop-condition acknowledgement. It uses the existing bounded rebuild path and refuses missing or empty archives before source discovery. A successful receipt requires a fresh, complete lexical generation with unchanged canonical identity and conversation/message counts. Already-current assets are reported as `already-ready`; semantic enrichment remains a separate operation. Inspect the dry-run plan first for the exact confirmation flags and step number.
 
-`cass guide onboard-source --apply` validates the configured remote-source sync plan locally, then requires explicit confirmation before incremental indexing. Configure sources with `cass sources add` and stage their mirrors with `cass sources sync` first. The guide performs no registration, SSH transfer or model download. Indexing scans staged configured sources and normal local discovery roots, honors `--db` and `--data-dir`, and uses the existing index lock with a 120-second deadline. Completion requires an unchanged source configuration, a complete scan and a fresh canonical/lexical status check. The receipt separates indexer count observations from archive totals measured by that status check. Missing mirrors, scan errors, deferred work or a busy indexer fail the operation; a started operation may already have updated the archive. Review the dry-run plan for its exact privacy, cost, resource, stop-condition and step confirmations.
+`cass guide onboard-source --apply` previews configured sources, then requires explicit confirmation before incremental indexing. Configured `type = "local"` sources are checked for readable paths using the indexer's path resolution, including `~/`; they need no remote source or mirror. Remote sources retain the local dry-sync preview and require mirrors staged with `cass sources sync` first. Mixed configurations must pass both checks. The guide performs no registration, SSH transfer or model download. Indexing scans configured local paths, staged remote sources and normal local discovery roots, honors `--db` and `--data-dir`, and uses the existing index lock with a 120-second deadline. Completion requires an unchanged source configuration, a complete scan and a fresh canonical/lexical status check. The receipt separates indexer count observations from archive totals measured by that status check. Missing local paths or mirrors, scan errors, deferred work or a busy indexer fail the operation; a started operation may already have updated the archive. Review the dry-run plan for its exact privacy, cost, resource, stop-condition and step confirmations.
 
 Five more commands are dispatched before the main parser (registered via `allow_external_subcommands` in `src/main.rs`); use their own `--help`:
 
 | Command | Purpose |
 |---------|---------|
-| `serve --stdio [--mcp] (--data-dir DIR \| --index PATH)` | Persistent search service: reuses one read-only lexical index reader across a stream of newline-delimited JSON requests (or MCP with `--mcp`), with per-request deadlines (`--request-timeout-ms`), cross-process reader admission (`--admission-dir`, `--admission-slots`) and a resident-memory cap (`--max-resident-mib`). Search, status and startup never open the canonical database; `--db` opts in to canonical `view`/`view_batch` requests. Operations: `search`, `semantic_search`, `refine`, `view`, `view_batch`, `status`, `reload`, `unload`, `shutdown`. `search` is lexical; `semantic_search` needs `--semantic-embedder minilm\|multilingual-minilm\|hash` plus `--data-dir` and `--db`, and `refine` needs `--reranker-model PATH` (installed local assets only, never downloaded). See `docs/SEARCH_SERVICE.md` |
+| `serve --stdio [--mcp] (--data-dir DIR \| --index PATH)` | Persistent search service: reuses one read-only lexical index reader across a stream of newline-delimited JSON requests (or MCP with `--mcp`), with per-request deadlines (`--request-timeout-ms`), cross-process reader admission (`--admission-dir`, `--admission-slots`) and a resident-memory cap (`--max-resident-mib`). Search, status and startup never open the canonical database; `--db` opts in to canonical `view`/`view_batch` requests. Operations: `search`, `semantic_search`, `refine`, `view`, `view_batch`, `status`, `reload`, `unload`, `shutdown`. `search` is lexical; `semantic_search` needs `--semantic-embedder minilm\|multilingual-minilm\|hash\|external` plus `--data-dir` and `--db` (external also requires explicit endpoint consent), and `refine` needs `--reranker-model PATH` (installed local assets only, never downloaded). See `docs/SEARCH_SERVICE.md` |
 | `archive export\|verify\|search\|view\|import` | Bounded, versioned logical archive of the canonical rows: `export --output FILE --archive-id ID --include-private` streams a read-only snapshot to a new private JSONL file; `verify` checks framing, identities, counts and digest without a database; `search`/`view` read verified message bodies without restoring; `import` restores into a new database and never replaces an existing archive |
 | `codex-layout-migrate [--apply] [--json]` | Plan or apply canonical consolidation of duplicate Codex conversations caused by rollout path layout changes (`sessions/YYYY/MM/DD/...` vs flat rollouts) |
 | `lexical-quarantine [list\|inspect\|prune] [--json]` | Inspect or prune quarantined lexical index generations under `<data-dir>/quarantine/lexical/` |
@@ -3698,7 +3720,17 @@ Forgetting is always an explicit operation. CASS does not automatically delete o
 | `CASS_SEARCH_ACTIVE_REBUILD_WAIT_MS` | 30000 | How long a human-mode search, or a robot search whose index is still readable, waits for an active lexical rebuild before returning exit 7 `index-busy`. With `--timeout`, the wait also stops at nine tenths of the time remaining. A robot search with no searchable generation does not wait |
 | `CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES` | 1073741824 (1 GiB) | Largest archive (database plus WAL) that a search may repair inline; plain `cass index` compares the database file alone against the same value to decide whether to defer the authoritative lexical repair to `--full`. Over it, search refuses with `maintenance-required` and starts a detached `cass index --full --background` (see *When the Index Is Missing*) |
 | **Semantic Search** | | |
-| `CASS_SEMANTIC_EMBEDDER` | auto | Force embedder: `hash`, `minilm`, or explicit `multilingual-minilm` |
+| `CASS_SEMANTIC_EMBEDDER` | auto | Select `hash`, `minilm`, `multilingual-minilm`, or explicit `external` (also requires endpoint consent) |
+| `CASS_EXTERNAL_EMBEDDINGS` | 0 | Consent to text transmission with explicit external selection: `1`/`true` enables, `0`/`false` disables |
+| `CASS_EXTERNAL_EMBEDDING_URL` | unset | Required `/v1/embeddings` endpoint: HTTPS or loopback HTTP; no URL credentials, query or fragment |
+| `CASS_EXTERNAL_EMBEDDING_MODEL` | unset | Required response model identity, at most 512 bytes without control characters |
+| `CASS_EXTERNAL_EMBEDDING_DIMENSION` | unset | Required output dimension, 1..16384; vectors must be finite and unit-normalized |
+| `CASS_EXTERNAL_EMBEDDING_REVISION` | 1 | Stable operator revision identifying the vector space, nonempty and at most 512 bytes without control characters |
+| `CASS_EXTERNAL_EMBEDDING_API_KEY` | unset | Optional bearer credential; configured values are not emitted by discovery or provider diagnostics |
+| `CASS_EXTERNAL_EMBEDDING_BATCH_SIZE` | 64 | Inputs per external request, 1..128; the byte cap also applies |
+| `CASS_EXTERNAL_EMBEDDING_MAX_REQUEST_BYTES` | 262144 | Encoded JSON request cap, 1024..4194304 bytes; oversized inputs are refused before transmission |
+| `CASS_EXTERNAL_EMBEDDING_TIMEOUT_MS` | 30000 | Per-request deadline, 1..120000 milliseconds; bounds an in-flight request after cancellation |
+| `CASS_EXTERNAL_EMBEDDING_MAX_RETRIES` | 0 | Explicit transient-request retries, 0..5; implicit protocol retries are disabled |
 | `CASS_SEMANTIC_PROGRESS_JSONL` | unset | Absolute path to a JSONL file the semantic backfill appends one event per transition to (`selection_*`, `packet_replay_*`, `embed_batch_*`, `staging_write_*`, `checkpoint_save_*`, `publish_*`, `error`, `cancelled`, `complete`). Each line carries timestamp, phase + sub-phase, batch/row counters, byte counts, elapsed-since-start, and a cheap RSS estimate. Silent when unset. Best-effort writes — failures log at debug and never crash a backfill. See [cass#257](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/257). |
 | `CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS` | 30000 | Warn when one embedder batch takes more than 30s. Derived from cass#257 boxed quality-corpus telemetry: 60 MiniLM batches averaged ~5.95s, so the default is about 5x the observed healthy batch. Set `0` to disable warnings. |
 | `CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS` | 300000 | Abort a semantic backfill batch after a single embedder batch returns if it exceeded 5 minutes. Derived as a conservative ~50x multiple of the cass#257 healthy 128-doc MiniLM batch average. Set `0` to disable failure. |
