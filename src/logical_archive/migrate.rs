@@ -3,13 +3,16 @@
 //! Exact-schema restoration remains the default. Cross-version restoration is
 //! deliberately allowlisted rather than inferred from "compatible-looking" SQL
 //! shapes: data backfills can be semantically required even when columns appear
-//! additive. The reviewed bridges are storage schema v20, v21 and v22 -> v23.
+//! additive. The reviewed bridges are storage schema v20, v21, v22 and v23 -> v24.
 //! Repository migration fixtures establish what each step adds. v21 adds the
 //! conversation-context index. v22 adds the `forgotten_sources` table, the
 //! `cass forget` source tombstones; v23 adds durable per-session tombstones in
 //! `forgotten_conversations`. Tables introduced after the source version start
 //! empty, as in an in-place upgrade. Existing source tombstones from v22 must
-//! be preserved. Every other canonical table layout is unchanged.
+//! be preserved. v24 adds the semantic conversation journal. Old archives have
+//! no journal authority: read-only restoration retains strict serving until
+//! the first writable canonical open initializes a fresh archive incarnation
+//! and message-ID high water. Every other canonical table layout is unchanged.
 //!
 //! The current initializer remains the sole executable schema authority. Archived
 //! `_schema_migrations` rows and `meta.schema_version` are verified as input but
@@ -39,12 +42,22 @@ const META_TABLE: &str = "meta";
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// Storage schema versions an archive may be migrated from, into
 /// [`REVIEWED_TARGET_VERSION`] only.
-const REVIEWED_SOURCE_VERSIONS: [u32; 3] = [20, 21, 22];
-const REVIEWED_TARGET_VERSION: u32 = 23;
+const REVIEWED_SOURCE_VERSIONS: [u32; 4] = [20, 21, 22, 23];
+const REVIEWED_TARGET_VERSION: u32 = 24;
 /// The introducing version is part of the bridge: a table already present in
 /// the source must be replayed and compared, never silently replaced by empty.
-const ADDED_CANONICAL_TABLES: [(&str, u32); 2] =
-    [("forgotten_sources", 22), ("forgotten_conversations", 23)];
+const ADDED_CANONICAL_TABLES: [(&str, u32); 3] = [
+    ("forgotten_sources", 22),
+    ("forgotten_conversations", 23),
+    ("semantic_conversation_changes", 24),
+];
+
+fn is_semantic_authority_key(key: &str) -> bool {
+    matches!(
+        key,
+        "semantic_archive_state_v1" | "semantic_message_id_high_water_v1"
+    )
+}
 
 fn table_added_after_source(name: &str, source_version: u32) -> bool {
     ADDED_CANONICAL_TABLES
@@ -117,6 +130,12 @@ impl SourceSchemaMarker {
                 };
             }
             Record::Row { values } => {
+                if let Some((key, _)) = self.columns
+                    && self.version.parse::<u32>()? < 24
+                    && matches!(values.get(key), Some(Cell::Text(name)) if is_semantic_authority_key(name))
+                {
+                    bail!("pre-v24 logical archive cannot claim semantic journal authority");
+                }
                 if let Some((key, value)) = self.columns
                     && matches!(values.get(key), Some(Cell::Text(name)) if name == SCHEMA_VERSION_KEY)
                 {
@@ -928,9 +947,10 @@ fn migration_receipt(inspected: &Inspected) -> Result<SchemaMigrationReceipt> {
     require_reviewed_transition(source, target_version()?)?;
     Ok(SchemaMigrationReceipt {
         mode: match source {
-            20 => "reviewed_v20_to_v23",
-            21 => "reviewed_v21_to_v23",
-            22 => "reviewed_v22_to_v23",
+            20 => "reviewed_v20_to_v24",
+            21 => "reviewed_v21_to_v24",
+            22 => "reviewed_v22_to_v24",
+            23 => "reviewed_v23_to_v24",
             _ => bail!("no reviewed migration mode for storage schema {source}"),
         },
         from_storage_schema_version: inspected.header.storage_schema_version.clone(),
@@ -1766,6 +1786,8 @@ mod tests {
                 .join(", ");
             let predicate = if table.name == MIGRATIONS_TABLE {
                 format!(" WHERE version <= {source_version}")
+            } else if table.name == META_TABLE && source_version < 24 {
+                " WHERE key NOT IN ('semantic_archive_state_v1', 'semantic_message_id_high_water_v1')".to_owned()
             } else {
                 String::new()
             };
@@ -1899,9 +1921,10 @@ mod tests {
     #[test]
     fn reviewed_migrations_restore_rows_under_current_authority() -> Result<()> {
         for (source, mode) in [
-            (20, "reviewed_v20_to_v23"),
-            (21, "reviewed_v21_to_v23"),
-            (22, "reviewed_v22_to_v23"),
+            (20, "reviewed_v20_to_v24"),
+            (21, "reviewed_v21_to_v24"),
+            (22, "reviewed_v22_to_v24"),
+            (23, "reviewed_v23_to_v24"),
         ] {
             let root = tempfile::tempdir()?;
             let input = versioned_archive(root.path(), source, false, false)?;
@@ -1947,6 +1970,14 @@ mod tests {
                     .raw()
                     .query_row("SELECT COUNT(*) FROM forgotten_conversations")?
                     .get_typed::<i64>(0)?,
+                i64::from(source >= 23)
+            );
+            assert!(storage.semantic_archive_state()?.is_none());
+            assert_eq!(
+                storage
+                    .raw()
+                    .query_row("SELECT COUNT(*) FROM semantic_conversation_changes")?
+                    .get_typed::<i64>(0)?,
                 0
             );
         }
@@ -1969,13 +2000,34 @@ mod tests {
     }
 
     #[test]
-    fn exact_v23_restore_preserves_session_tombstones_and_retries_read_only() -> Result<()> {
+    fn migrated_v23_acquires_fresh_semantic_authority_only_on_writable_open() -> Result<()> {
         let root = tempfile::tempdir()?;
         let input = versioned_archive(root.path(), 23, false, false)?;
+        let destination = root.path().join("restored.db");
+        import_compatible(&input, &destination, "reviewed-migration", false)?;
+        let reader = SqliteStorage::open_readonly(&destination)?;
+        assert!(reader.semantic_archive_state()?.is_none());
+        drop(reader);
+        let writer = SqliteStorage::open(&destination)?;
+        let authority = writer
+            .semantic_archive_state()?
+            .context("initialized authority")?;
+        assert_eq!(authority.mutation_seq, 0);
+        drop(writer);
+        let reopened = SqliteStorage::open(&destination)?;
+        assert_eq!(reopened.semantic_archive_state()?, Some(authority));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_v24_restore_preserves_semantic_authority_and_session_tombstones() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let input = versioned_archive(root.path(), 24, false, false)?;
         let destination = root.path().join("restored.db");
         let outcome = import_compatible(&input, &destination, "reviewed-migration", false)?;
         assert!(outcome.migration.is_none());
         let storage = SqliteStorage::open_readonly(&destination)?;
+        assert!(storage.semantic_archive_state()?.is_some());
         let tombstones = storage.forgotten_conversation_keys()?;
         assert_eq!(tombstones.len(), 1);
         let key = tombstones
@@ -2023,7 +2075,7 @@ mod tests {
     #[test]
     fn reviewed_v3_migration_preserves_allocation_and_refuses_sequence_only_conflicts() -> Result<()>
     {
-        for source_version in [20, 21, 22] {
+        for source_version in [20, 21, 22, 23] {
             let root = tempfile::tempdir()?;
             let input = versioned_archive_with_format(
                 root.path(),
@@ -2084,7 +2136,7 @@ mod tests {
 
     #[test]
     fn reviewed_retry_rejects_sparse_current_history_even_when_projection_matches() -> Result<()> {
-        for source in [20, 21, 22] {
+        for source in [20, 21, 22, 23] {
             let root = tempfile::tempdir()?;
             let input = versioned_archive(root.path(), source, false, false)?;
             let destination = root.path().join("restored.db");
