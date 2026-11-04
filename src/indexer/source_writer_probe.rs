@@ -82,6 +82,19 @@ struct ProbeState {
     refresh_blocked: bool,
     #[cfg(test)]
     refresh_count: usize,
+    /// Why the last refresh kept the prior evidence. Live tests use it to
+    /// tell an unrelated process turning opaque mid-census (routine for a
+    /// non-root user on a busy host) from a probe defect (z6ycn).
+    #[cfg(test)]
+    last_refresh_block: Option<RefreshBlock>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Debug)]
+struct RefreshBlock {
+    complete: bool,
+    owners_visible: bool,
+    new_gap_pids: Vec<u32>,
 }
 
 #[cfg(target_os = "linux")]
@@ -179,6 +192,18 @@ impl ProbeState {
         } else {
             // Do not repeat an unreadable process-tree walk for every source,
             // and do not turn partial visibility into evidence of absence.
+            #[cfg(test)]
+            {
+                self.last_refresh_block = Some(RefreshBlock {
+                    complete: fresh.complete,
+                    owners_visible: all_owners_visible,
+                    new_gap_pids: fresh
+                        .visibility_gaps
+                        .difference(&self.initial_visibility_gaps)
+                        .map(|gap| gap.process.pid)
+                        .collect(),
+                });
+            }
             self.refresh_blocked = true;
             self.census.writers.extend(fresh.writers);
         }
