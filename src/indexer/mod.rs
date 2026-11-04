@@ -22103,7 +22103,7 @@ fn incremental_semantic_embed(
     // rows the existing index already holds, and appending from zero would
     // duplicate them; callers fall back to the bulk pass instead.
     let watermark = semantic_embed_watermark(
-        &storage
+        &*storage
             .lock()
             .map_err(|e| anyhow::anyhow!("lock storage for watermark read: {e}"))?,
         embedder,
