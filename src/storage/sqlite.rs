@@ -4977,6 +4977,16 @@ fn lexical_content_truncation_boundary(content: &str, cap: usize) -> usize {
 /// never surfaced to callers.
 const LEXICAL_REBUILD_STREAM_STOPPED: &str = "cass lexical rebuild stream stopped by caller";
 
+/// Keep the append stream's executed SQL and its rowid-seek regression on the
+/// same projection. A literal cap also lets the engine bound content reads.
+fn lexical_rebuild_message_after_id_sql(cap: usize) -> String {
+    format!(
+        "SELECT id, idx, role, author, created_at, \
+             substr(content, 1, {cap}), COALESCE(octet_length(content), 0), conversation_id \
+             FROM messages WHERE id > ?1 ORDER BY id"
+    )
+}
+
 /// One lexical-rebuild projection row (`id, idx, role, author, created_at,
 /// capped content, source byte length`) as a [`Message`] whose text is bounded
 /// by `cap` bytes on a UTF-8 boundary (#290).
@@ -13014,11 +13024,7 @@ impl FrankenStorage {
         F: FnMut(i64, Message) -> Result<()>,
     {
         let cap = lexical_max_message_content_bytes().min(i32::MAX as usize);
-        let sql = format!(
-            "SELECT id, idx, role, author, created_at, \
-                 substr(content, 1, {cap}), COALESCE(octet_length(content), 0), conversation_id \
-                 FROM messages WHERE id > ?1 ORDER BY id"
-        );
+        let sql = lexical_rebuild_message_after_id_sql(cap);
         let mut callback_error = None;
         let outcome = self.conn.query_with_params_for_each(
             &sql,
@@ -36681,6 +36687,75 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 .any(|detail| detail.contains("TEMP B-TREE")),
             "expected per-conversation lexical rebuild fetch to avoid sorter temp b-trees, got {message_plan_details:?}"
         );
+    }
+
+    #[test]
+    fn gh539_lexical_append_stream_seeks_past_existing_messages() -> Result<()> {
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("gh539-append-plan.db"))?;
+        storage.raw().execute("PRAGMA foreign_keys = OFF")?;
+        storage.raw().execute(
+            "INSERT INTO messages(id, conversation_id, idx, role, content) VALUES \
+             (1, 10, 0, 'user', 'old evidence'), \
+             (1000, 10, 1, 'assistant', 'watermark evidence'), \
+             (1001, 20, 0, 'user', 'first appended evidence'), \
+             (1003, 10, 2, 'tool', 'second appended evidence')",
+        )?;
+        let after_message_id = 1000_i64;
+        let sql = lexical_rebuild_message_after_id_sql(
+            lexical_max_message_content_bytes().min(i32::MAX as usize),
+        );
+        // Check the compiled program, not just EXPLAIN QUERY PLAN: fsqlite
+        // 0.4.12 can label a rowid range SCAN even when codegen emits SeekGT.
+        // The cursor's entry opcode establishes whether it visits old rows.
+        let opcodes: Vec<(String, i64, i64)> = storage.raw().query_map_collect(
+            &format!("EXPLAIN {sql}"),
+            fparams![after_message_id],
+            |row| Ok((row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+        )?;
+        let rootpage: i64 = storage.raw().query_row_map(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'messages'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        let cursor = opcodes
+            .iter()
+            .find_map(|(op, p1, p2)| (op == "OpenRead" && *p2 == rootpage).then_some(*p1))
+            .expect("the append stream opens the messages table");
+        assert!(
+            opcodes
+                .iter()
+                .any(|(op, p1, _)| op == "SeekGT" && *p1 == cursor),
+            "the message cursor must seek strictly past the bound: {opcodes:?}"
+        );
+        assert!(
+            !opcodes
+                .iter()
+                .any(|(op, p1, _)| matches!(op.as_str(), "Rewind" | "Last") && *p1 == cursor),
+            "the append stream must not walk historical messages: {opcodes:?}"
+        );
+        assert!(
+            !opcodes.iter().any(|(op, _, _)| matches!(
+                op.as_str(),
+                "SorterOpen" | "OpenEphemeral" | "OpenAutoindex"
+            )),
+            "the append stream must not materialize a sort or DISTINCT table: {opcodes:?}"
+        );
+
+        let mut visited = Vec::new();
+        storage.for_each_lexical_rebuild_message_after_id(after_message_id, |id, message| {
+            visited.push((id, message.id, message.idx, message.content));
+            Ok(())
+        })?;
+        assert_eq!(
+            visited,
+            vec![
+                (20, Some(1001), 0, "first appended evidence".to_string()),
+                (10, Some(1003), 2, "second appended evidence".to_string()),
+            ],
+            "the stream preserves rowid order, holes and conversation identity"
+        );
+        Ok(())
     }
 
     #[test]

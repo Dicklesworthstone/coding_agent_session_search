@@ -10964,22 +10964,33 @@ fn expected_appended_lexical_docs(
 ) -> Result<usize> {
     // The per-message cap makes every message's classification independent of
     // every other, so only the rows appended since the memo need classifying:
-    // a rowid-range scan over them, never a JOIN (fsqlite's join path used to
+    // stream them once, never a JOIN (fsqlite's join path used to
     // materialize every message row, content included: 20+ minutes on an
     // 8M-message archive) and never the older text of a touched conversation.
-    let touched: Vec<i64> = storage
-        .raw()
-        .query_map_collect(
-            "SELECT DISTINCT conversation_id FROM messages WHERE id > ?1",
-            &[ParamValue::from(after_message_id)],
-            |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
-        )
-        .context("listing conversations touched since the expected lexical docs memo")?;
+    // GH #539: collect per-conversation counts from that same stream instead
+    // of first issuing a DISTINCT query over messages. Only counters survive
+    // each callback; memory scales with touched conversations, not their text.
+    let mut appended_by_conversation = HashMap::<i64, usize>::new();
+    storage.for_each_lexical_rebuild_message_after_id(
+        after_message_id,
+        |conversation_id, message| {
+            let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
+            if !is_hard_message_noise(lexical_rebuild_noise_role(is_tool_role), &message.content) {
+                let count = appended_by_conversation.entry(conversation_id).or_default();
+                *count = count.saturating_add(1);
+            }
+            Ok(())
+        },
+    )?;
     // Live conversations only, like the full scan (orphaned rows are never
-    // indexed): one point lookup per touched conversation, resolved before the
-    // row stream so no query runs inside its callback.
-    let mut live_conversations = HashSet::with_capacity(touched.len());
-    for conversation_id in touched.into_iter().filter(|id| include(*id)) {
+    // indexed): one point lookup per included conversation with non-noise
+    // appends. Resolve these AFTER the stream, never from inside its callback
+    // while the owner connection is still executing the message query.
+    let mut expected_docs = 0usize;
+    for (conversation_id, appended_docs) in appended_by_conversation {
+        if !include(conversation_id) {
+            continue;
+        }
         let live: i64 = storage
             .raw()
             .query_row_map(
@@ -10989,25 +11000,9 @@ fn expected_appended_lexical_docs(
             )
             .context("checking a touched conversation for the expected lexical docs memo")?;
         if live != 0 {
-            live_conversations.insert(conversation_id);
+            expected_docs = expected_docs.saturating_add(appended_docs);
         }
     }
-    let mut expected_docs = 0usize;
-    storage.for_each_lexical_rebuild_message_after_id(
-        after_message_id,
-        |conversation_id, message| {
-            let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
-            if live_conversations.contains(&conversation_id)
-                && !is_hard_message_noise(
-                    lexical_rebuild_noise_role(is_tool_role),
-                    &message.content,
-                )
-            {
-                expected_docs = expected_docs.saturating_add(1);
-            }
-            Ok(())
-        },
-    )?;
     Ok(expected_docs)
 }
 
@@ -63306,6 +63301,74 @@ c.close()
             .unwrap();
         assert_eq!(cached(), full());
         assert_eq!(sidecar().delta_generations, 0, "a deletion must recount");
+    }
+
+    #[test]
+    fn gh539_appended_lexical_docs_count_each_live_message_once() -> Result<()> {
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("gh539-delta.db"))?;
+        seed_lexical_rebuild_fixture(&storage);
+        let conversations: Vec<i64> = storage.raw().query_map_collect(
+            "SELECT id FROM conversations ORDER BY id",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+        let (first, second) = (conversations[0], conversations[1]);
+        let before_docs = expected_live_lexical_doc_count(&storage)?;
+        let after_message_id = storage.max_message_id()?.expect("seed messages");
+        assert_eq!(
+            expected_appended_lexical_docs(&storage, after_message_id, |_| true)?,
+            0,
+            "the row at the watermark and all older rows are excluded"
+        );
+
+        // Interleave conversations in rowid order: the stream must aggregate
+        // every message, not just the first row of each touched conversation.
+        storage.raw().execute("PRAGMA foreign_keys = OFF")?;
+        for (conversation_id, idx, role, content) in [
+            (first, 10, "user", "first appended evidence"),
+            (second, 10, "assistant", "second conversation evidence"),
+            (first, 11, "user", "\u{2003}\n\t"),
+            (first + 1_000_000, 0, "user", "orphaned evidence"),
+            (first, 12, "tool", ""),
+            (first, 13, "assistant", "another appended answer"),
+            (second, 11, "tool", "useful diagnostic output"),
+        ] {
+            storage.raw().execute_compat(
+                "INSERT INTO messages(conversation_id, idx, role, content) VALUES(?1, ?2, ?3, ?4)",
+                &[
+                    ParamValue::from(conversation_id),
+                    ParamValue::from(idx),
+                    ParamValue::from(role),
+                    ParamValue::from(content),
+                ],
+            )?;
+        }
+        let delta = expected_appended_lexical_docs(&storage, after_message_id, |_| true)?;
+        assert_eq!(delta, 4, "noise and orphaned rows cannot certify coverage");
+        assert_eq!(
+            before_docs + delta,
+            expected_live_lexical_doc_count(&storage)?
+        );
+        assert_eq!(
+            expected_appended_lexical_docs(&storage, after_message_id, |id| id <= first)?,
+            2,
+            "a resumed recount adds only appends below its conversation cursor"
+        );
+        assert_eq!(
+            expected_appended_lexical_docs(&storage, after_message_id, |_| false)?,
+            0
+        );
+        assert_eq!(
+            expected_appended_lexical_docs(
+                &storage,
+                storage.max_message_id()?.expect("appended messages"),
+                |_| true,
+            )?,
+            0,
+            "a caught-up watermark has no delta"
+        );
+        Ok(())
     }
 
     /// GH #381 (ntxs1): an interrupted full expected-docs scan resumes from its
