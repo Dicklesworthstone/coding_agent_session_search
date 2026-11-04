@@ -344,6 +344,25 @@ struct CompletedBackfillCache {
     last_offset: i64,
 }
 
+/// The cache is a skip hint, so failing to save it only costs the next run a
+/// reconcile.
+fn persist_completed_backfill_cache(
+    data_dir: &Path,
+    cache_path: &Path,
+    cache: &CompletedBackfillCache,
+) {
+    let saved = (|| -> Result<()> {
+        let mut staged = tempfile::NamedTempFile::new_in(data_dir.join(VECTOR_INDEX_DIR))?;
+        serde_json::to_writer(staged.as_file_mut(), cache)?;
+        staged.as_file().sync_all()?;
+        staged.persist(cache_path)?;
+        Ok(())
+    })();
+    if let Err(error) = saved {
+        tracing::debug!(%error, "completed backfill cache unavailable; next run will reconcile");
+    }
+}
+
 impl SemanticBackfillBatchOutcome {
     pub fn progress_pct(&self) -> f64 {
         if self.total_conversations == 0 {
@@ -4185,9 +4204,19 @@ impl SemanticIndexer {
             plan.tier.as_str(),
             self.embedder_id()
         ));
-        if let Some((path, cache)) =
+        if let Some((path, mut cache)) =
             self.completed_backfill_cache(storage, data_dir, manifest, &plan)?
         {
+            // A deletion clears the watermark but also moves the archive, so a
+            // cache hit without one is a tier published before per-embedder
+            // watermarks. Record it once and rebind the cache to the archive
+            // as the write left it, so the next unchanged run still skips.
+            if self.certify_embed_watermark(storage)
+                && let Some(archive) = BackfillFilePair::archive(storage)
+            {
+                cache.archive = archive;
+                persist_completed_backfill_cache(data_dir, &cache_path, &cache);
+            }
             let artifact = cache.artifact;
             sink.emit(
                 SemanticProgressEvent::Complete,
@@ -4228,9 +4257,18 @@ impl SemanticIndexer {
         // Publish a cache only when the entire canonical scan observed a
         // stable archive. This is a skip hint, never serving authority: every
         // manifest, producer and artifact check above must also agree.
+        let archive_stable =
+            archive_before.is_some() && BackfillFilePair::archive(storage) == archive_before;
+        // Certify the published generation's watermark before the cache
+        // captures the archive: a later write would move the WAL and cost the
+        // next unchanged run its cache. An archive seen to move during the
+        // scan proves no coverage.
+        if outcome.published && (archive_stable || archive_before.is_none()) {
+            self.certify_embed_watermark(storage);
+        }
         if outcome.published
-            && let Some(archive) = archive_before
-            && BackfillFilePair::archive(storage).as_ref() == Some(&archive)
+            && archive_stable
+            && let Some(archive) = BackfillFilePair::archive(storage)
             && let Some(vectors) = BackfillFilePair::capture(
                 &outcome.index_path,
                 &fsvi_wal_path_for(&outcome.index_path),
@@ -4248,18 +4286,39 @@ impl SemanticIndexer {
                 vector_space_revision: self.vector_space_revision()?.into(),
                 last_offset: outcome.last_offset,
             };
-            let saved = (|| -> Result<()> {
-                let mut staged = tempfile::NamedTempFile::new_in(data_dir.join(VECTOR_INDEX_DIR))?;
-                serde_json::to_writer(staged.as_file_mut(), &cache)?;
-                staged.as_file().sync_all()?;
-                staged.persist(&cache_path)?;
-                Ok(())
-            })();
-            if let Err(error) = saved {
-                tracing::debug!(%error, "completed backfill cache unavailable; next run will reconcile");
-            }
+            persist_completed_backfill_cache(data_dir, &cache_path, &cache);
         }
         Ok(outcome)
+    }
+
+    /// 962e8: a published or verified-unchanged generation holds every
+    /// canonical row of the archive this batch read under the maintenance
+    /// lock (the build path keeps one fingerprint across batches; reconcile
+    /// compares exact document identities), so it certifies its own vector
+    /// space's embed watermark. Background `cass index` runs can then extend a
+    /// backfill-built tier with a delta. Writes only on change and returns
+    /// whether it wrote. Never fails the batch: the tier is already published,
+    /// and a missing watermark only leaves catch-up to the next backfill.
+    fn certify_embed_watermark(&self, storage: &FrankenStorage) -> bool {
+        if crate::search::external_embedder::is_external_identity(self.embedder_id()) {
+            return false;
+        }
+        let recorded = storage.max_message_id().and_then(|max_id| {
+            let max_id = max_id.unwrap_or(0);
+            if storage.get_last_embedded_message_id(self.embedder_id())? == Some(max_id) {
+                return Ok(false);
+            }
+            storage.set_last_embedded_message_id(self.embedder_id(), max_id)?;
+            Ok(true)
+        });
+        recorded.unwrap_or_else(|error| {
+            tracing::warn!(
+                %error,
+                embedder_id = self.embedder_id(),
+                "semantic backfill published but could not record its embed watermark"
+            );
+            false
+        })
     }
 
     fn build_backfill_from_storage(
