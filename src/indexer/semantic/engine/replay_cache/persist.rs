@@ -37,21 +37,33 @@ struct PayloadReader<R> {
     input: R,
     digest: blake3::Hasher,
     bytes_read: u64,
+    byte_limit: u64,
 }
 
 impl<R: Read> PayloadReader<R> {
-    fn new(input: R) -> Self {
+    fn new(input: R, byte_limit: u64) -> Self {
         Self {
             input,
             digest: blake3::Hasher::new(),
             bytes_read: 0,
+            byte_limit: byte_limit.min(MAX_INVENTORY_BYTES - 32),
         }
     }
 
     fn read_into(&mut self, bytes: &mut [u8]) -> io::Result<()> {
+        let next = self
+            .bytes_read
+            .checked_add(bytes.len() as u64)
+            .filter(|next| *next <= self.byte_limit)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "semantic replay payload exceeds its captured byte limit",
+                )
+            })?;
         self.input.read_exact(bytes)?;
         self.digest.update(bytes);
-        self.bytes_read = self.bytes_read.saturating_add(bytes.len() as u64);
+        self.bytes_read = next;
         Ok(())
     }
 
@@ -67,7 +79,7 @@ impl<R: Read> PayloadReader<R> {
         Ok(bytes)
     }
 
-    fn finish(mut self) -> Result<()> {
+    fn finish(mut self) -> Result<R> {
         let expected = self.digest.finalize();
         let mut actual = [0; 32];
         self.input
@@ -82,7 +94,7 @@ impl<R: Read> PayloadReader<R> {
             self.input.read(&mut extra)? == 0,
             "semantic replay has trailing bytes"
         );
-        Ok(())
+        Ok(self.input)
     }
 }
 
@@ -166,6 +178,7 @@ impl std::error::Error for FrameBudgetExceeded {}
 pub(super) struct InventoryReader {
     reader: Option<PayloadReader<BufReader<File>>>,
     file_bytes: u64,
+    metadata: fs::Metadata,
     frame_budget: usize,
     conversation_count: u64,
     document_count: u64,
@@ -173,12 +186,25 @@ pub(super) struct InventoryReader {
 }
 
 impl InventoryReader {
+    #[cfg(test)]
     pub(super) fn open(
         path: &Path,
         key: &ReplayKey,
         frame_budget: usize,
-        mut check_cancelled: impl FnMut() -> Result<()>,
+        check_cancelled: impl FnMut() -> Result<()>,
     ) -> Result<Option<Self>> {
+        Ok(Self::open_with_key(path, frame_budget, check_cancelled)?
+            .and_then(|(observed, reader)| (observed == *key).then_some(reader)))
+    }
+
+    /// The header is bounded but remains tentative until the caller consumes
+    /// and authenticates the complete stream. It may only select a replay plan,
+    /// never authorize results or publication on its own.
+    pub(super) fn open_with_key(
+        path: &Path,
+        frame_budget: usize,
+        mut check_cancelled: impl FnMut() -> Result<()>,
+    ) -> Result<Option<(ReplayKey, Self)>> {
         check_cancelled()?;
         let frame_budget = frame_budget.min(MAX_RETAINED_BYTES);
         if frame_budget == 0 {
@@ -203,7 +229,8 @@ impl InventoryReader {
         if !metadata.is_file() || metadata.len() > MAX_INVENTORY_BYTES {
             return Ok(None);
         }
-        let mut reader = PayloadReader::new(BufReader::new(file));
+        let mut reader =
+            PayloadReader::new(BufReader::new(file), metadata.len().saturating_sub(32));
         ensure!(
             reader.bytes::<8>()? == *MAGIC,
             "unsupported semantic replay inventory format"
@@ -223,17 +250,18 @@ impl InventoryReader {
         reader.read_into(&mut key_bytes)?;
         let observed_key: ReplayKey =
             serde_json::from_slice(&key_bytes).context("decode semantic replay key")?;
-        if observed_key != *key {
-            return Ok(None);
-        }
-        Ok(Some(Self {
-            reader: Some(reader),
-            file_bytes: metadata.len(),
-            frame_budget,
-            conversation_count: 0,
-            document_count: 0,
-            previous: None,
-        }))
+        Ok(Some((
+            observed_key,
+            Self {
+                reader: Some(reader),
+                file_bytes: metadata.len(),
+                metadata,
+                frame_budget,
+                conversation_count: 0,
+                document_count: 0,
+                previous: None,
+            },
+        )))
     }
 
     pub(super) fn next_conversation(
@@ -253,10 +281,17 @@ impl InventoryReader {
                     && declared_documents == self.document_count,
                 "semantic replay trailer count mismatch"
             );
-            self.reader
+            ensure!(
+                reader.bytes_read.checked_add(32) == Some(self.file_bytes),
+                "semantic replay has trailing bytes outside its captured payload"
+            );
+            verify_inventory_metadata(&self.metadata, &reader.input.get_ref().metadata()?)?;
+            let input = self
+                .reader
                 .take()
                 .context("semantic replay reader missing before checksum")?
                 .finish()?;
+            verify_inventory_metadata(&self.metadata, &input.get_ref().metadata()?)?;
             check_cancelled()?;
             return Ok(None);
         }
@@ -335,6 +370,27 @@ impl InventoryReader {
             documents: documents.into_boxed_slice(),
         }))
     }
+}
+
+fn verify_inventory_metadata(before: &fs::Metadata, after: &fs::Metadata) -> Result<()> {
+    ensure!(
+        before.len() == after.len() && before.modified()? == after.modified()?,
+        "semantic replay inventory changed while it was read"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            (
+                before.dev(),
+                before.ino(),
+                before.ctime(),
+                before.ctime_nsec()
+            ) == (after.dev(), after.ino(), after.ctime(), after.ctime_nsec()),
+            "semantic replay inventory identity changed while it was read"
+        );
+    }
+    Ok(())
 }
 
 /// A private streaming inventory. `push` never changes the installed cache;
@@ -594,6 +650,32 @@ mod tests {
             conversations,
             retained_bytes,
         })
+    }
+
+    #[test]
+    fn durable_inventory_preserves_optional_canonical_journal_boundary() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("inventory.bin");
+        let mut expected = inventory()?;
+        assert!(
+            expected.key.journal.is_none(),
+            "legacy keys have no journal authority"
+        );
+        expected.key.journal = Some(serde_json::from_value(json!({
+            "archive_id": "0123456789abcdef0123456789abcdef",
+            "mutation_seq": 42,
+        }))?);
+        save(&path, &expected, || Ok(()))?;
+        let (observed, mut reader) =
+            InventoryReader::open_with_key(&path, MAX_RETAINED_BYTES, || Ok(()))?
+                .context("inventory with journal boundary")?;
+        assert!(observed == expected.key);
+        let mut conversations = 0;
+        while reader.next_conversation(|| Ok(()))?.is_some() {
+            conversations += 1;
+        }
+        assert_eq!(conversations, expected.conversations.len());
+        Ok(())
     }
 
     fn load_fixture(path: &Path, inventory: &CachedReplay) -> Result<Option<CachedReplay>> {
@@ -897,6 +979,86 @@ mod tests {
                 .context("invalid trailer accepted")?
                 .to_string()
                 .contains("checksum")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_inventory_stops_at_captured_length_when_the_file_grows() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("growing.bin");
+        let key = inventory()?.key;
+        let mut writer = InventoryWriter::create(&path, &key, 1024, || Ok(()))?;
+        // Exceed BufReader's prefix so the reader actually reaches newly
+        // appended frames instead of validating an already-buffered trailer.
+        for conversation_id in 1..=1024 {
+            writer.push(
+                &ConversationIdentity {
+                    conversation_id,
+                    documents: Box::new([]),
+                },
+                || Ok(()),
+            )?;
+        }
+        writer.finish(|| Ok(()))?;
+        let original = fs::read(&path)?;
+        let mut reader =
+            InventoryReader::open(&path, &key, 1024, || Ok(()))?.context("growing reader")?;
+        assert!(reader.next_conversation(|| Ok(()))?.is_some());
+        let mut extended = original[..original.len() - TRAILER_BYTES].to_vec();
+        extended.push(CONVERSATION);
+        extended.extend_from_slice(&1025_i64.to_le_bytes());
+        extended.extend_from_slice(&0_u64.to_le_bytes());
+        extended.push(TRAILER);
+        extended.extend_from_slice(&1025_u64.to_le_bytes());
+        extended.extend_from_slice(&0_u64.to_le_bytes());
+        extended.extend_from_slice(blake3::hash(&extended).as_bytes());
+        fs::write(&path, extended)?;
+        let error = loop {
+            match reader.next_conversation(|| Ok(())) {
+                Ok(Some(_)) => {}
+                Ok(None) => anyhow::bail!("growing inventory was accepted"),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            error.to_string().contains("captured byte limit"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn streamed_inventory_rejects_rewritten_owner_even_with_restored_mtime() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("rewritten.bin");
+        let expected = inventory()?;
+        save(&path, &expected, || Ok(()))?;
+        let modified = fs::metadata(&path)?.modified()?;
+        let mut reader =
+            InventoryReader::open(&path, &expected.key, MAX_RETAINED_BYTES, || Ok(()))?
+                .context("rewritten reader")?;
+        assert!(reader.next_conversation(|| Ok(()))?.is_some());
+        let mut rewritten = fs::read(&path)?;
+        let marker = rewritten
+            .windows(5)
+            .position(|window| window == b"alpha")
+            .context("fixture identity")?;
+        rewritten[marker] = b'A';
+        update_checksum(&mut rewritten);
+        fs::write(&path, rewritten)?;
+        File::open(&path)?.set_modified(modified)?;
+        let error = loop {
+            match reader.next_conversation(|| Ok(())) {
+                Ok(Some(_)) => {}
+                Ok(None) => anyhow::bail!("rewritten inventory owner was accepted"),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            error.to_string().contains("changed while it was read"),
+            "{error:#}"
         );
         Ok(())
     }
