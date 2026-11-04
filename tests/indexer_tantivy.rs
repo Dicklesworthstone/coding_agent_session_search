@@ -111,7 +111,7 @@ fn optimize_if_idle_triggers_when_segment_threshold_met() {
         index.commit().expect("commit");
     }
 
-    let pre_segments = index.segment_count();
+    let pre_segments = index.segment_count().expect("segment count before merge");
 
     // Tantivy's merge policy may eagerly merge; only require trigger when threshold is met.
     let merged = index.optimize_if_idle().expect("optimize_if_idle");

@@ -5520,7 +5520,7 @@ fn build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
     })?;
     Ok(SearchableIndexSummary {
         docs: indexed_docs,
-        segments: shard_index.segment_count(),
+        segments: shard_index.segment_count()?,
     })
 }
 
@@ -5827,6 +5827,7 @@ fn spawn_lexical_rebuild_shard_merge_workers(
                                     &work.output_path,
                                     &input_paths,
                                 )
+                                .and_then(|index| index.segment_count())
                             },
                         )) {
                             Ok(result) => result,
@@ -5836,14 +5837,12 @@ fn spawn_lexical_rebuild_shard_merge_workers(
                             )),
                         };
                         match result {
-                            Ok(merged_index) => {
+                            Ok(segments) => {
                                 let docs = work
                                     .input_artifacts
                                     .iter()
                                     .map(|artifact| artifact.docs)
                                     .sum();
-                                let segments = merged_index.segment_count();
-                                drop(merged_index);
                                 tracing::info!(
                                     worker_idx,
                                     output_level = work.output_level,
@@ -15683,10 +15682,15 @@ impl StreamingCommitPacer {
         }
         self.last_fold_attempt = Some(std::time::Instant::now());
         match t_index.fold_largest_small_run() {
-            Ok(true) => tracing::info!(
-                segments = t_index.segment_count(),
-                "folded lexical segments during streaming ingest"
-            ),
+            Ok(true) => match t_index.segment_count() {
+                Ok(segments) => {
+                    tracing::info!(segments, "folded lexical segments during streaming ingest")
+                }
+                Err(error) => tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "streaming segment merge completed but its segment count could not be read"
+                ),
+            },
             Ok(false) => {}
             Err(error) => tracing::warn!(
                 error = %format!("{error:#}"),
@@ -19230,10 +19234,16 @@ fn run_index_with_storage_ownership(
                             progress.tick_activity();
                         }
                         match t_index.optimize_if_idle() {
-                            Ok(true) => tracing::info!(
-                                segments = t_index.segment_count(),
-                                "folded lexical segments after incremental index run (#441)"
-                            ),
+                            Ok(true) => match t_index.segment_count() {
+                                Ok(segments) => tracing::info!(
+                                    segments,
+                                    "folded lexical segments after incremental index run (#441)"
+                                ),
+                                Err(error) => tracing::warn!(
+                                    error = %format!("{error:#}"),
+                                    "incremental segment merge completed but its segment count could not be read"
+                                ),
+                            },
                             Ok(false) => {}
                             Err(err) => tracing::warn!(
                                 error = %format!("{err:#}"),
@@ -23284,7 +23294,7 @@ pub fn run_lexical_segment_gc(data_dir: &Path) -> Result<LexicalSegmentGcReport>
     // orphans and collects aged garbage before it hands the writer back.
     let index = QuillCassIndex::open_or_create(&index_path)
         .with_context(|| format!("opening the lexical writer at {}", index_path.display()))?;
-    let live_segments = index.segment_count();
+    let live_segments = index.segment_count()?;
     drop(index);
 
     let after = quill_directory_footprint(&index_path).with_context(|| {
@@ -28668,10 +28678,12 @@ fn rebuild_tantivy_from_db_once(
     if let Some(p) = &progress {
         p.tick_activity();
     }
+    let candidate_segments =
+        publication.run("count_candidate_segments", || t_index.segment_count())?;
     let merge_started = Instant::now();
     if lexical_post_run_maintenance_skipped_for_test() {
         tracing::warn!(
-            segments = t_index.segment_count(),
+            segments = candidate_segments,
             "post-rebuild segment merge skipped by CASS_TEST_SKIP_POST_RUN_LEXICAL_MAINTENANCE (test hook)"
         );
     } else if let Some(shortfall) = lexical_rebuild_fold_shortfall(&build_path) {
@@ -28679,17 +28691,21 @@ fn rebuild_tantivy_from_db_once(
         // on disk. Without room for that, publish the unmerged generation, as
         // a failed fold already does, instead of filling the filesystem.
         tracing::warn!(
-            segments = t_index.segment_count(),
+            segments = candidate_segments,
             shortfall = %shortfall,
             "skipping the post-rebuild segment fold for lack of disk space; publishing the unmerged generation (#441)"
         );
     } else {
         match t_index.force_merge() {
-            Ok(()) => tracing::info!(
-                merge_ms = merge_started.elapsed().as_millis() as u64,
-                segments = t_index.segment_count(),
-                "folded the rebuilt lexical generation before publish (#441)"
-            ),
+            Ok(()) => {
+                let segments =
+                    publication.run("count_merged_segments", || t_index.segment_count())?;
+                tracing::info!(
+                    merge_ms = merge_started.elapsed().as_millis() as u64,
+                    segments,
+                    "folded the rebuilt lexical generation before publish (#441)"
+                );
+            }
             Err(err) => tracing::warn!(
                 error = %format!("{err:#}"),
                 "segment merge after lexical rebuild failed; publishing the unmerged generation"
@@ -50492,7 +50508,7 @@ mod tests {
         crate::search::quill_bridge::refresh_reader(&reader).unwrap();
         assert_eq!(reader.doc_count().expect("doc count"), 8);
         assert_eq!(
-            merged_index.segment_count(),
+            merged_index.segment_count().expect("merged segment count"),
             1,
             "merged shard indices should collapse into a single final segment"
         );
@@ -50923,7 +50939,7 @@ mod tests {
         crate::search::quill_bridge::refresh_reader(&reader).unwrap();
         assert_eq!(reader.doc_count().expect("doc count"), 10);
         assert_eq!(
-            merged_index.segment_count(),
+            merged_index.segment_count().expect("merged segment count"),
             1,
             "tree-merged shard indices should collapse into a single final segment"
         );
@@ -60562,7 +60578,7 @@ mod tests {
         let (index_path, mut index) = plant_unmerged_quill_index(data_dir, rounds);
         index.force_merge().expect("force merge");
         assert_eq!(
-            index.segment_count(),
+            index.segment_count().expect("merged segment count"),
             1,
             "merge must leave one live segment"
         );
@@ -60639,7 +60655,7 @@ mod tests {
     fn streaming_commit_folds_small_segments_at_most_once_per_interval() {
         let data_dir = tempfile::tempdir().expect("data dir");
         let (index_path, planted) = plant_unmerged_quill_index(data_dir.path(), 6);
-        let planted_segments = planted.segment_count();
+        let planted_segments = planted.segment_count().expect("planted segment count");
         drop(planted);
         assert!(
             planted_segments >= 6,
@@ -60651,7 +60667,7 @@ mod tests {
         pacer.last_fold_attempt = Some(std::time::Instant::now());
         pacer.commit(Some(&mut t_index));
         assert_eq!(
-            t_index.segment_count(),
+            t_index.segment_count().expect("unmerged segment count"),
             planted_segments,
             "a fold attempted inside the spacing interval must be skipped"
         );
@@ -60662,10 +60678,10 @@ mod tests {
             pacer.last_fold_attempt.is_some(),
             "the attempt must be recorded"
         );
+        let folded_segments = t_index.segment_count().expect("folded segment count");
         assert!(
-            t_index.segment_count() < planted_segments,
-            "the small segments must be folded, still {} of {planted_segments}",
-            t_index.segment_count()
+            folded_segments < planted_segments,
+            "the small segments must be folded, still {folded_segments} of {planted_segments}"
         );
         assert_eq!(t_index.doc_count().expect("doc count"), 6);
     }
