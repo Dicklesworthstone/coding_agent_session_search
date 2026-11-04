@@ -109600,6 +109600,57 @@ const INDEX_STALL_HINT_PERSIST: &str = concat!(
     "disable detection/abort."
 );
 
+/// #496: a stall seen while the lexical rebuild controller is held below its
+/// memory reserve is the reduced startup budget at work, and the stack-trace
+/// advice in the generic hint points the wrong way. Under a cgroup limit the
+/// "available" figure also counts the headroom below `memory.max`, so it can
+/// be low on an idle host. The note names that limit and the knobs that help.
+/// `controller_reason` is the controller's own reason string, e.g.
+/// `host_available_memory_bytes_<n>_below_reserve_<m>`; any other reason
+/// yields `None`.
+fn index_stall_memory_reserve_note(
+    controller_reason: &str,
+    memory_limit_source: Option<&str>,
+) -> Option<String> {
+    let rest = controller_reason.strip_prefix("host_available_memory_bytes_")?;
+    let (available, kind, reserve) = [
+        ("_below_emergency_reserve_", "emergency memory reserve"),
+        ("_below_reserve_", "memory reserve"),
+    ]
+    .into_iter()
+    .find_map(|(marker, kind)| {
+        let (available, tail) = rest.split_once(marker)?;
+        let digits = tail
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap_or_default();
+        Some((
+            available.parse::<u64>().ok()?,
+            kind,
+            digits.parse::<u64>().ok()?,
+        ))
+    })?;
+    let knobs = "CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILD_MEMORY_RESERVE_BYTES (and \
+                 CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_MEMORY_RESERVE_BYTES), in bytes";
+    let cgroup_source = memory_limit_source.filter(|source| source.starts_with("cgroup"));
+    let note = match cgroup_source {
+        Some(source) => format!(
+            "Available memory ({available} bytes) is at or below the lexical rebuild's {kind} \
+             ({reserve} bytes). That figure is the smaller of free host memory and the headroom \
+             under the cgroup memory limit at {source}, so it can be low while the host has \
+             plenty free. The rebuild is held on its reduced startup budget and can stay there \
+             for the whole run. Leave more room between that limit and the working set, or \
+             lower {knobs}."
+        ),
+        None => format!(
+            "Available memory ({available} bytes) is at or below the lexical rebuild's {kind} \
+             ({reserve} bytes), so the rebuild is held on its reduced startup budget until \
+             memory frees up. Free memory on the host, or lower {knobs}."
+        ),
+    };
+    Some(note)
+}
+
 fn index_stall_threshold(progress_interval: Duration) -> Option<Duration> {
     let stall_threshold_secs = dotenvy::var("CASS_INDEX_STALL_DETECT_SECS")
         .ok()
@@ -110246,6 +110297,28 @@ impl IndexStallWatchdog {
                 INDEX_STALL_HINT_PERSIST
             } else {
                 INDEX_STALL_HINT
+            };
+            // #496: name what set the memory figures (host or a cgroup
+            // level, as `status --json` does), and say so in the hint when
+            // the rebuild is held below its memory reserve.
+            let memory_limit_source =
+                crate::indexer::responsiveness::memory_total().map(|total| total.limit_source);
+            let reserve_note = m
+                .get("rebuild_pipeline")
+                .and_then(|pipeline| pipeline.get("controller_reason"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|reason| {
+                    index_stall_memory_reserve_note(reason, memory_limit_source.as_deref())
+                });
+            if let Some(serde_json::Value::Object(pipeline)) = m.get_mut("rebuild_pipeline") {
+                pipeline.insert(
+                    "memory_limit_source".into(),
+                    serde_json::json!(memory_limit_source),
+                );
+            }
+            let hint = match reserve_note {
+                Some(note) => format!("{hint} {note}"),
+                None => hint.to_string(),
             };
             m.insert("hint".into(), serde_json::json!(hint));
             // fr7wp / gh#413: pre-index stall with recently-advancing block
@@ -111190,6 +111263,160 @@ mod stall_diagnostics_tests {
         assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["exit_code"], serde_json::json!(70));
         Ok(())
+    }
+
+    /// #496: a rebuild held below its memory reserve under a 12 GiB cgroup
+    /// aborted with exit 70 behind a hint that only asked for stack traces.
+    /// The stall record must say the rebuild is held by the reserve (the
+    /// exit-70 envelope copies the hint), name the knob, and report what set
+    /// the memory figures. A stall with any other controller reason keeps the
+    /// plain hint.
+    #[test]
+    fn stall_hint_explains_a_rebuild_held_below_its_memory_reserve() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog, index_stall_abort_envelope};
+        use crate::indexer::IndexingProgress;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        // A mid-run phase-2 stall with no persist or rebuild grace: the shape
+        // that aborts at the ordinary threshold.
+        let report_for = |tmp: &TempDir,
+                          controller_reason: &str|
+         -> anyhow::Result<serde_json::Value> {
+            let mut watchdog = IndexStallWatchdog::with_abort_policy(
+                tmp.path().to_path_buf(),
+                Duration::from_millis(50),
+                IndexStallAbortPolicy::AbortLexicalPhases,
+            );
+            watchdog.threshold = Some(Duration::from_millis(1));
+            watchdog.abort_threshold = Some(Duration::from_millis(2));
+            watchdog.last_phase = 2;
+            watchdog.last_current = 26_268;
+            watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+            let progress = Arc::new(IndexingProgress::default());
+            progress.phase.store(2, Ordering::Relaxed);
+            progress.total.store(33_641, Ordering::Relaxed);
+            progress.current.store(26_268, Ordering::Relaxed);
+            *progress
+                .rebuild_pipeline_controller_reason
+                .lock()
+                .map_err(|_| anyhow::anyhow!("controller reason lock poisoned"))? =
+                controller_reason.to_string();
+            let detected = watchdog
+                .observe(&progress, 100)
+                .ok_or_else(|| anyhow::anyhow!("rebuild stall did not report"))?;
+            assert_eq!(detected["event"], serde_json::json!("stall_detected"));
+            watchdog
+                .observe(&progress, 200)
+                .ok_or_else(|| anyhow::anyhow!("rebuild stall did not abort"))
+        };
+
+        let tmp = TempDir::new()?;
+        let abort = report_for(
+            &tmp,
+            "host_available_memory_bytes_1931636736_below_reserve_4294967296",
+        )?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+        let hint = abort["hint"].as_str().unwrap_or_default();
+        assert!(
+            hint.contains("memory reserve (4294967296 bytes)")
+                && hint.contains("Available memory (1931636736 bytes)")
+                && hint.contains("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILD_MEMORY_RESERVE_BYTES"),
+            "a reserve-held rebuild stall must explain the reserve, got: {hint}"
+        );
+        assert!(
+            hint.starts_with("Indexer made no forward progress"),
+            "the note is appended to the phase hint, not a replacement: {hint}"
+        );
+        let envelope = index_stall_abort_envelope(&abort)
+            .ok_or_else(|| anyhow::anyhow!("aborting stall produced no envelope"))?;
+        assert_eq!(envelope["hint"].as_str(), Some(hint));
+        let pipeline = &abort["rebuild_pipeline"];
+        assert!(
+            pipeline
+                .as_object()
+                .is_some_and(|fields| fields.contains_key("memory_limit_source")),
+            "the stall record must report what set the memory figures: {pipeline}"
+        );
+        let expected_source =
+            crate::indexer::responsiveness::memory_total().map(|total| total.limit_source);
+        assert_eq!(
+            pipeline["memory_limit_source"],
+            serde_json::json!(expected_source)
+        );
+
+        // Control: a stall for any other reason keeps the plain hint.
+        let tmp2 = TempDir::new()?;
+        let plain = report_for(&tmp2, "steady_budget_with_headroom")?;
+        let plain_hint = plain["hint"].as_str().unwrap_or_default();
+        assert!(
+            !plain_hint.contains("memory reserve"),
+            "an unrelated controller reason must not add the reserve note: {plain_hint}"
+        );
+        Ok(())
+    }
+
+    /// #496: the reserve note names a cgroup limit when one set the figures,
+    /// parses both reserve reasons, and stays silent for anything else.
+    #[test]
+    fn stall_memory_reserve_note_names_the_cgroup_limit_and_ignores_other_reasons() {
+        use super::index_stall_memory_reserve_note;
+
+        let cgroup = index_stall_memory_reserve_note(
+            "host_available_memory_bytes_1931636736_below_reserve_4294967296",
+            Some("cgroup_v2:/user.slice/cass-rebuild.service"),
+        )
+        .unwrap_or_default();
+        assert!(
+            cgroup.contains("cgroup memory limit at cgroup_v2:/user.slice/cass-rebuild.service")
+                && cgroup.contains("smaller of free host memory")
+                && cgroup.contains("memory reserve (4294967296 bytes)"),
+            "{cgroup}"
+        );
+
+        let host = index_stall_memory_reserve_note(
+            "host_available_memory_bytes_1931636736_below_reserve_4294967296",
+            Some("host"),
+        )
+        .unwrap_or_default();
+        assert!(
+            host.contains("until memory frees up") && !host.contains("cgroup"),
+            "{host}"
+        );
+        assert_eq!(
+            index_stall_memory_reserve_note(
+                "host_available_memory_bytes_1931636736_below_reserve_4294967296",
+                None,
+            ),
+            Some(host)
+        );
+
+        let emergency = index_stall_memory_reserve_note(
+            "host_available_memory_bytes_805306368_below_emergency_reserve_1073741824",
+            Some("host"),
+        )
+        .unwrap_or_default();
+        assert!(
+            emergency.contains("emergency memory reserve (1073741824 bytes)")
+                && emergency.contains("Available memory (805306368 bytes)"),
+            "{emergency}"
+        );
+
+        for other in [
+            "",
+            "steady_budget_with_headroom",
+            "host_loadavg_1m_12.50_reached_high_watermark_8.00",
+            "holding_conservative_budget_after_pressure_demote_for_30000ms",
+            "host_available_memory_bytes_x_below_reserve_4294967296",
+            "host_available_memory_bytes_1931636736_below_reserve_",
+        ] {
+            assert_eq!(
+                index_stall_memory_reserve_note(other, Some("host")),
+                None,
+                "{other}"
+            );
+        }
     }
 
     /// Regression for #311: in `cass index --watch` mode the post-publish
