@@ -815,6 +815,204 @@ fn replay_cache_fresh_indexer_reuses_disk_inventory_without_rewriting_it() -> Re
 
 #[test]
 #[cfg(unix)]
+fn replay_cache_streams_inventory_above_memory_budget_without_replaying_bodies() -> Result<()> {
+    let bodies: Vec<_> = (0..64)
+        .map(|ordinal| format!("streamed canonical evidence number {ordinal}"))
+        .collect();
+    let refs: Vec<_> = bodies.iter().map(String::as_str).collect();
+    let (dir, storage) = fixture(&refs)?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let plan = plan(2);
+    let budget = 1024;
+    let first_cache = cache(budget);
+    let (first, _) = select(
+        &first_cache,
+        &indexer,
+        &storage,
+        &HashSet::new(),
+        &plan,
+        SemanticCheckpointCaps::unlimited(),
+    )?;
+    assert_eq!(first.replayed_conversations, bodies.len());
+    assert_eq!(first.inputs.len(), 2);
+    assert!(first_cache.slot.lock().unwrap().is_none());
+    let path = persistent_path(dir.path(), plan.tier);
+    let stamp = backfill_file_stamp(&path)
+        .flatten()
+        .context("oversized inventory was not persisted")?;
+    assert!(fs::metadata(&path)?.len() > budget as u64);
+
+    let fresh_cache = cache(budget);
+    let (actual, proof) = select(
+        &fresh_cache,
+        &indexer,
+        &storage,
+        &first.selected_ids,
+        &plan,
+        SemanticCheckpointCaps::unlimited(),
+    )?;
+    let (expected, _) = select(
+        &cache_disabled(),
+        &indexer,
+        &storage,
+        &first.selected_ids,
+        &plan,
+        SemanticCheckpointCaps::unlimited(),
+    )?;
+    assert_eq!(actual.replayed_conversations, 0);
+    assert_eq!(actual.loaded_selected_conversations, 2);
+    assert_eq!(signature(&actual), signature(&expected));
+    assert_eq!(actual.current_ids, expected.current_ids);
+    assert_eq!(actual.covered_conversations, expected.covered_conversations);
+    assert!(fresh_cache.slot.lock().unwrap().is_none());
+    assert_eq!(backfill_file_stamp(&path).flatten(), Some(stamp));
+    proof.verify(&storage)?;
+
+    storage.raw().execute(
+        "UPDATE messages SET content = 'changed after streamed selection' WHERE conversation_id = 64",
+    )?;
+    assert!(proof.verify(&storage).is_err());
+    let (changed, proof) = select(
+        &cache(budget),
+        &indexer,
+        &storage,
+        &first.current_ids,
+        &plan,
+        SemanticCheckpointCaps::unlimited(),
+    )?;
+    assert_eq!(changed.replayed_conversations, bodies.len());
+    assert_eq!(changed.inputs.len(), 1);
+    assert_eq!(
+        changed.inputs[0].content,
+        "changed after streamed selection"
+    );
+    proof.verify(&storage)?;
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn replay_cache_corrupt_large_stream_discards_all_tentative_selection() -> Result<()> {
+    let bodies: Vec<_> = (0..32)
+        .map(|ordinal| format!("stream checksum evidence number {ordinal}"))
+        .collect();
+    let refs: Vec<_> = bodies.iter().map(String::as_str).collect();
+    let (dir, storage) = fixture(&refs)?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let plan = plan(3);
+    let budget = 1024;
+    let (first, _) = select(
+        &cache(budget),
+        &indexer,
+        &storage,
+        &HashSet::new(),
+        &plan,
+        SemanticCheckpointCaps::unlimited(),
+    )?;
+    let path = persistent_path(dir.path(), plan.tier);
+    let original = fs::read(&path)?;
+    assert!(original.len() > budget);
+    // Both faults are discovered after every frame was consumed and the
+    // selected conversations' text was loaded. No prefix may survive retry.
+    for trailing_byte in [false, true] {
+        let mut damaged = original.clone();
+        if trailing_byte {
+            damaged.push(0);
+        } else {
+            *damaged.last_mut().context("inventory checksum")? ^= 1;
+        }
+        fs::write(&path, damaged)?;
+        let (actual, proof) = select(
+            &cache(budget),
+            &indexer,
+            &storage,
+            &first.selected_ids,
+            &plan,
+            SemanticCheckpointCaps::unlimited(),
+        )?;
+        let (expected, _) = select(
+            &cache_disabled(),
+            &indexer,
+            &storage,
+            &first.selected_ids,
+            &plan,
+            SemanticCheckpointCaps::unlimited(),
+        )?;
+        assert_eq!(actual.replayed_conversations, bodies.len());
+        assert_eq!(actual.loaded_selected_conversations, 3);
+        assert_eq!(actual.selected_conversations, 3);
+        assert_eq!(signature(&actual), signature(&expected));
+        assert_eq!(actual.current_ids, expected.current_ids);
+        assert_eq!(actual.selected_ids, expected.selected_ids);
+        proof.verify(&storage)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn replay_cache_records_same_invocation_uncached_and_streamed_selection_work() -> Result<()> {
+    let bodies: Vec<_> = (0..128)
+        .map(|ordinal| format!("canonical stream measurement {ordinal} ").repeat(64))
+        .collect();
+    let refs: Vec<_> = bodies.iter().map(String::as_str).collect();
+    let (_dir, storage) = fixture(&refs)?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let cached = cache(4096);
+    let uncached = cache_disabled();
+    let plan = plan(1);
+    let empty = HashSet::new();
+    select(
+        &cached,
+        &indexer,
+        &storage,
+        &empty,
+        &plan,
+        SemanticCheckpointCaps::unlimited(),
+    )?;
+    assert!(cached.slot.lock().unwrap().is_none());
+    for round in 0..4 {
+        let mut previous = None;
+        for enabled in if round % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        } {
+            let started = Instant::now();
+            let (selection, proof) = select(
+                if enabled { &cached } else { &uncached },
+                &indexer,
+                &storage,
+                &empty,
+                &plan,
+                SemanticCheckpointCaps::unlimited(),
+            )?;
+            proof.verify(&storage)?;
+            let observed = signature(&selection);
+            if let Some(expected) = &previous {
+                assert_eq!(&observed, expected);
+            }
+            previous = Some(observed);
+            assert_eq!(
+                selection.replayed_conversations,
+                if enabled { 0 } else { 128 }
+            );
+            assert!(cached.slot.lock().unwrap().is_none());
+            eprintln!(
+                "{}",
+                json!({"scenario":"streamed_canonical_replay_cache", "round":round,
+                "cached":enabled, "elapsed_us":started.elapsed().as_micros(),
+                "canonical_conversations_replayed":selection.replayed_conversations,
+                "selected_conversations_reloaded":selection.loaded_selected_conversations,
+                "retained_cache_bytes":0})
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
 fn replay_cache_persisted_inventory_rejects_edits_deletions_and_producer_changes() -> Result<()> {
     let (_dir, storage) = fixture(&["old content", "deleted content", "retained content"])?;
     let indexer = SemanticIndexer::new("hash", None)?;

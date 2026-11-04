@@ -6,7 +6,8 @@
 //! Every pass still reads the candidate's identities; selected text is reloaded
 //! and checked against this inventory before embedding. A checksummed inventory
 //! can survive process restarts while the exact archive and input contract stay
-//! unchanged. Ingest, edits, deletion, or a producer change require fresh replay.
+//! unchanged, including when it is too large to retain in memory. Ingest, edits,
+//! deletion, or a producer change require fresh replay.
 
 use super::*;
 use std::mem::size_of;
@@ -82,6 +83,51 @@ struct CachedReplay {
     key: ReplayKey,
     conversations: Vec<ConversationIdentity>,
     retained_bytes: usize,
+}
+
+enum ReplayInventory {
+    Memory(std::vec::IntoIter<ConversationIdentity>),
+    Disk(Box<persist::InventoryReader>),
+}
+
+impl ReplayInventory {
+    fn next(&mut self, indexer: &SemanticIndexer) -> Result<Option<ConversationIdentity>> {
+        indexer.check_external_cancelled()?;
+        match self {
+            Self::Memory(conversations) => Ok(conversations.next()),
+            Self::Disk(reader) => reader.next_conversation(|| indexer.check_external_cancelled()),
+        }
+    }
+}
+
+fn retain_conversation(
+    building: &mut Option<CachedReplay>,
+    conversation: ConversationIdentity,
+    budget: usize,
+) {
+    let Some(cache) = building.as_mut() else {
+        return;
+    };
+    let bytes = conversation
+        .retained_bytes()
+        .and_then(|bytes| cache.retained_bytes.checked_add(bytes));
+    let Some(bytes) = bytes.filter(|bytes| *bytes <= budget) else {
+        // A partial memory inventory cannot be reused. The independent disk
+        // writer can still retain the complete stream without this allocation.
+        *building = None;
+        return;
+    };
+    let reserved = if cache.conversations.is_empty() {
+        cache.conversations.try_reserve_exact(1)
+    } else {
+        cache.conversations.try_reserve(1)
+    };
+    if reserved.is_err() {
+        *building = None;
+        return;
+    }
+    cache.retained_bytes = bytes;
+    cache.conversations.push(conversation);
 }
 
 /// One memory inventory per indexer, released with the indexer. The slot is taken
@@ -284,7 +330,7 @@ impl CanonicalReplayCache {
                 self.max_bytes,
             ));
         // Poison only disables the optimization, never canonical reconciliation.
-        let mut cached = self
+        let cached = self
             .slot
             .lock()
             .ok()
@@ -297,15 +343,18 @@ impl CanonicalReplayCache {
         // trust a previous process's inventory in such development builds.
         let cache_path = (budget > 0 && env!("CASS_SOURCE_INGEST_REUSE") == "true")
             .then(|| persistent_path(data_dir, plan.tier));
-        let mut disk_hit = false;
-        if cached.is_none()
+        let mut source =
+            cached.map(|cached| ReplayInventory::Memory(cached.conversations.into_iter()));
+        if source.is_none()
             && let (Some(path), Some(key)) = (cache_path.as_ref(), key.as_ref())
         {
-            match persist::load(path, key, budget, || indexer.check_external_cancelled()) {
-                Ok(inventory) => {
-                    disk_hit = inventory.is_some();
-                    cached = inventory;
+            match persist::InventoryReader::open(path, key, budget, || {
+                indexer.check_external_cancelled()
+            }) {
+                Ok(Some(reader)) => {
+                    source = Some(ReplayInventory::Disk(Box::new(reader)));
                 }
+                Ok(None) => {}
                 Err(error) => {
                     tracing::debug!(%error, "semantic replay inventory unavailable; reading canonical archive");
                 }
@@ -314,30 +363,69 @@ impl CanonicalReplayCache {
             // turn into an expensive uncached replay.
             indexer.check_external_cancelled()?;
         }
-        let cache_hit = cached.is_some();
         let proof = ReplayProof(key.as_ref().map(|key| key.archive.clone()));
         let mut selected = ReconcileSelection::default();
-        let inventory = if let Some(cached) = cached {
-            for conversation in &cached.conversations {
-                indexer.check_external_cancelled()?;
-                selected.visit(
-                    indexer,
-                    storage,
-                    conversation,
-                    None,
-                    existing_ids,
-                    plan,
-                    caps,
-                    sink,
-                )?;
-            }
-            Some(cached)
-        } else {
-            let mut building = key.clone().filter(|_| budget > 0).map(|key| CachedReplay {
+        let new_memory_inventory = || {
+            key.clone().filter(|_| budget > 0).map(|key| CachedReplay {
                 key,
                 conversations: Vec::new(),
                 retained_bytes: 0,
-            });
+            })
+        };
+        let mut inventory = new_memory_inventory();
+        let mut cache_hit = false;
+        let mut disk_hit = false;
+        if let Some(mut source) = source {
+            let from_disk = matches!(&source, ReplayInventory::Disk(_));
+            let replayed = (|| -> Result<()> {
+                while let Some(conversation) = source.next(indexer)? {
+                    selected.visit(
+                        indexer,
+                        storage,
+                        &conversation,
+                        None,
+                        existing_ids,
+                        plan,
+                        caps,
+                        sink,
+                    )?;
+                    retain_conversation(&mut inventory, conversation, budget);
+                }
+                // Disk records remain tentative until counts, checksum, and
+                // EOF agree. No partially checked inputs escape this scope.
+                proof.verify(storage)
+            })();
+            match replayed {
+                Ok(()) => {
+                    cache_hit = true;
+                    disk_hit = from_disk;
+                }
+                Err(error) => {
+                    indexer.check_external_cancelled()?;
+                    proof.verify(storage)?;
+                    tracing::debug!(%error, "semantic replay inventory rejected; discarding tentative selection");
+                    selected = ReconcileSelection::default();
+                    inventory = new_memory_inventory();
+                }
+            }
+        }
+        let mut writer = None;
+        if !cache_hit {
+            if let (Some(path), Some(key)) = (cache_path.as_ref(), key.as_ref()) {
+                let staged = (|| -> Result<persist::InventoryWriter> {
+                    fs::create_dir_all(data_dir.join(VECTOR_INDEX_DIR))?;
+                    persist::InventoryWriter::create(path, key, budget, || {
+                        indexer.check_external_cancelled()
+                    })
+                })();
+                match staged {
+                    Ok(staged) => writer = Some(staged),
+                    Err(error) => {
+                        tracing::debug!(%error, "semantic replay inventory could not be staged");
+                    }
+                }
+                indexer.check_external_cancelled()?;
+            }
             let mut after_id = None;
             loop {
                 indexer.check_external_cancelled()?;
@@ -379,48 +467,34 @@ impl CanonicalReplayCache {
                         caps,
                         sink,
                     )?;
-                    if let Some(cache) = building.as_mut() {
-                        let new_bytes = conversation
-                            .retained_bytes()
-                            .and_then(|bytes| cache.retained_bytes.checked_add(bytes));
-                        if let Some(bytes) = new_bytes.filter(|bytes| *bytes <= budget) {
-                            if cache.conversations.try_reserve(1).is_ok() {
-                                cache.retained_bytes = bytes;
-                                cache.conversations.push(conversation);
-                            } else {
-                                building = None;
-                            }
-                        } else {
-                            // Do not retain a partial inventory or replay it again.
-                            // The current uncached scan continues to completion.
-                            building = None;
-                        }
+                    if let Some(staged) = writer.as_mut()
+                        && let Err(error) =
+                            staged.push(&conversation, || indexer.check_external_cancelled())
+                    {
+                        tracing::debug!(%error, "semantic replay inventory exceeded its bounds or could not be written");
+                        writer = None;
+                        indexer.check_external_cancelled()?;
                     }
+                    retain_conversation(&mut inventory, conversation, budget);
                     after_id = Some(id);
                 }
             }
-            building
-        };
+        }
         indexer.check_external_cancelled()?;
         proof.verify(storage)?;
         let retained_bytes = inventory.as_ref().map_or(0, |cache| cache.retained_bytes);
-        if let Some(inventory) = inventory
-            && ReplayKey::capture(indexer, storage, plan)?.as_ref() == Some(&inventory.key)
-        {
-            // Serialize a complete cold inventory only once. A hit must not
-            // rewrite up to 128 MiB on every bounded checkpoint. Atomic install
-            // preserves the prior complete file if writing is interrupted.
-            if !cache_hit && let Some(path) = cache_path.as_ref() {
-                let saved = (|| -> Result<()> {
-                    fs::create_dir_all(data_dir.join(VECTOR_INDEX_DIR))?;
-                    persist::save(path, &inventory, || indexer.check_external_cancelled())
-                })();
-                if let Err(error) = saved {
+        if ReplayKey::capture(indexer, storage, plan)? == key {
+            // The cold pass streamed every frame to private scratch. Install
+            // only after source verification; a hit performs no cache writes.
+            if let Some(writer) = writer {
+                if let Err(error) = writer.finish(|| indexer.check_external_cancelled()) {
                     tracing::debug!(%error, "semantic replay inventory was not persisted; memory reuse remains available");
                 }
                 indexer.check_external_cancelled()?;
             }
-            if let Ok(mut slot) = self.slot.lock() {
+            if let Some(inventory) = inventory
+                && let Ok(mut slot) = self.slot.lock()
+            {
                 *slot = Some(inventory);
             }
         }

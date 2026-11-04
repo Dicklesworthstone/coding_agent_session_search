@@ -5,16 +5,19 @@
 //! A conversation declares its ID and document count; each document separately
 //! frames its message ID, projected byte count, and UTF-8 semantic identity.
 //! BLAKE3 covers every byte before the final 32-byte digest, including the
-//! trailer counts. No inventory is returned before the digest and EOF agree.
+//! trailer counts. Streamed records are tentative until the digest and EOF
+//! agree; callers must discard the entire selection when that validation fails.
 //! The caller must still verify the canonical source and producer identity:
 //! this file is neither a checkpoint nor authority to serve vectors.
 
-use super::{CachedReplay, ConversationIdentity, DocumentIdentity, MAX_RETAINED_BYTES, ReplayKey};
+#[cfg(test)]
+use super::CachedReplay;
+use super::{ConversationIdentity, DocumentIdentity, MAX_RETAINED_BYTES, ReplayKey};
 use anyhow::{Context, Result, ensure};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::mem::size_of;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"CASSRP01";
 const CONVERSATION: u8 = 1;
@@ -24,7 +27,11 @@ const MAX_KEY_BYTES: usize = 16 * 1024;
 const MAX_DOCUMENT_ID_BYTES: usize = 64 * 1024;
 const TRAILER_BYTES: usize = 1 + 8 + 8 + 32;
 const MIN_DOCUMENT_FRAME_BYTES: usize = 1 + 8 + 8 + 4;
+#[cfg(test)]
 const FIXED_FORMAT_BYTES: usize = MAGIC.len() + 4 + TRAILER_BYTES;
+// Disk retention is independent of the in-memory inventory budget. Keep one
+// replaceable file per tier, with an explicit ceiling on both reads and writes.
+const MAX_INVENTORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 struct PayloadReader<R> {
     input: R,
@@ -82,6 +89,7 @@ impl<R: Read> PayloadReader<R> {
 struct PayloadWriter<W> {
     output: W,
     digest: blake3::Hasher,
+    bytes_written: u64,
 }
 
 impl<W: Write> PayloadWriter<W> {
@@ -89,12 +97,24 @@ impl<W: Write> PayloadWriter<W> {
         Self {
             output,
             digest: blake3::Hasher::new(),
+            bytes_written: 0,
         }
     }
 
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let next = self
+            .bytes_written
+            .checked_add(bytes.len() as u64)
+            .filter(|next| *next <= MAX_INVENTORY_BYTES - 32)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "semantic replay inventory exceeds its disk byte limit",
+                )
+            })?;
         self.output.write_all(bytes)?;
         self.digest.update(bytes);
+        self.bytes_written = next;
         Ok(())
     }
 
@@ -129,85 +149,116 @@ impl Write for KeyBuffer {
     }
 }
 
-/// Missing, incompatible, and over-budget files are ordinary cache misses.
-/// Corruption and I/O errors carry diagnostics for the caller to log before
-/// falling back to canonical replay. Cancellation is checked within every
-/// bounded record; callers must preserve cancellation when handling a miss.
-pub(super) fn load(
-    path: &Path,
-    key: &ReplayKey,
-    budget: usize,
-    mut check_cancelled: impl FnMut() -> Result<()>,
-) -> Result<Option<CachedReplay>> {
-    check_cancelled()?;
-    let budget = budget.min(MAX_RETAINED_BYTES);
-    if budget == 0 {
-        return Ok(None);
-    }
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("inspect semantic replay inventory"),
-    };
-    // Refuse special files before opening them, including FIFOs and symlinks.
-    // Frame overhead is smaller than the retained-record allowance, so only
-    // the bounded key and fixed trailer need an extra on-disk allowance.
-    let max_file_bytes = budget + MAX_KEY_BYTES + FIXED_FORMAT_BYTES;
-    if !metadata.is_file() || metadata.len() > max_file_bytes as u64 {
-        return Ok(None);
-    }
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("open semantic replay inventory"),
-    };
-    let mut reader = PayloadReader::new(BufReader::new(file));
-    ensure!(
-        reader.bytes::<8>()? == *MAGIC,
-        "unsupported semantic replay inventory format"
-    );
-    let key_len = u32::from_le_bytes(reader.bytes()?) as usize;
-    ensure!(
-        key_len <= MAX_KEY_BYTES,
-        "semantic replay key exceeds its byte limit"
-    );
-    ensure!(
-        key_len as u64 <= reader.remaining_before_trailer(metadata.len()),
-        "semantic replay key length exceeds the remaining file"
-    );
-    let mut key_bytes = Vec::new();
-    key_bytes.try_reserve_exact(key_len)?;
-    key_bytes.resize(key_len, 0);
-    reader.read_into(&mut key_bytes)?;
-    let observed_key: ReplayKey =
-        serde_json::from_slice(&key_bytes).context("decode semantic replay key")?;
-    if observed_key != *key {
-        return Ok(None);
-    }
-    drop(key_bytes);
+#[derive(Debug)]
+struct FrameBudgetExceeded;
 
-    let mut conversations: Vec<ConversationIdentity> = Vec::new();
-    let mut retained_bytes = 0usize;
-    let mut document_count = 0u64;
-    let mut previous = None;
-    loop {
+impl std::fmt::Display for FrameBudgetExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("semantic replay conversation exceeds its retained byte limit")
+    }
+}
+
+impl std::error::Error for FrameBudgetExceeded {}
+
+/// A bounded sequential decoder. A returned conversation is not a validated
+/// inventory: only `next_conversation` returning `None` authenticates the final
+/// counts, checksum, and EOF. Never embed or publish from a partial traversal.
+pub(super) struct InventoryReader {
+    reader: Option<PayloadReader<BufReader<File>>>,
+    file_bytes: u64,
+    frame_budget: usize,
+    conversation_count: u64,
+    document_count: u64,
+    previous: Option<i64>,
+}
+
+impl InventoryReader {
+    pub(super) fn open(
+        path: &Path,
+        key: &ReplayKey,
+        frame_budget: usize,
+        mut check_cancelled: impl FnMut() -> Result<()>,
+    ) -> Result<Option<Self>> {
         check_cancelled()?;
+        let frame_budget = frame_budget.min(MAX_RETAINED_BYTES);
+        if frame_budget == 0 {
+            return Ok(None);
+        }
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("inspect semantic replay inventory"),
+        };
+        // Refuse special files, symlinks, and oversized inventories before
+        // opening. Repeat the regular-file/size bound on the opened owner.
+        if !metadata.is_file() || metadata.len() > MAX_INVENTORY_BYTES {
+            return Ok(None);
+        }
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("open semantic replay inventory"),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > MAX_INVENTORY_BYTES {
+            return Ok(None);
+        }
+        let mut reader = PayloadReader::new(BufReader::new(file));
+        ensure!(
+            reader.bytes::<8>()? == *MAGIC,
+            "unsupported semantic replay inventory format"
+        );
+        let key_len = u32::from_le_bytes(reader.bytes()?) as usize;
+        ensure!(
+            key_len <= MAX_KEY_BYTES,
+            "semantic replay key exceeds its byte limit"
+        );
+        ensure!(
+            key_len as u64 <= reader.remaining_before_trailer(metadata.len()),
+            "semantic replay key length exceeds the remaining file"
+        );
+        let mut key_bytes = Vec::new();
+        key_bytes.try_reserve_exact(key_len)?;
+        key_bytes.resize(key_len, 0);
+        reader.read_into(&mut key_bytes)?;
+        let observed_key: ReplayKey =
+            serde_json::from_slice(&key_bytes).context("decode semantic replay key")?;
+        if observed_key != *key {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            reader: Some(reader),
+            file_bytes: metadata.len(),
+            frame_budget,
+            conversation_count: 0,
+            document_count: 0,
+            previous: None,
+        }))
+    }
+
+    pub(super) fn next_conversation(
+        &mut self,
+        mut check_cancelled: impl FnMut() -> Result<()>,
+    ) -> Result<Option<ConversationIdentity>> {
+        check_cancelled()?;
+        let Some(reader) = self.reader.as_mut() else {
+            return Ok(None);
+        };
         let tag = reader.bytes::<1>()?[0];
         if tag == TRAILER {
             let declared_conversations = u64::from_le_bytes(reader.bytes()?);
             let declared_documents = u64::from_le_bytes(reader.bytes()?);
             ensure!(
-                declared_conversations == u64::try_from(conversations.len())?
-                    && declared_documents == document_count,
+                declared_conversations == self.conversation_count
+                    && declared_documents == self.document_count,
                 "semantic replay trailer count mismatch"
             );
-            reader.finish()?;
+            self.reader
+                .take()
+                .context("semantic replay reader missing before checksum")?
+                .finish()?;
             check_cancelled()?;
-            return Ok(Some(CachedReplay {
-                key: observed_key,
-                conversations,
-                retained_bytes,
-            }));
+            return Ok(None);
         }
         ensure!(
             tag == CONVERSATION,
@@ -215,30 +266,26 @@ pub(super) fn load(
         );
         let conversation_id = i64::from_le_bytes(reader.bytes()?);
         ensure!(
-            previous.is_none_or(|previous| conversation_id > previous),
+            self.previous
+                .is_none_or(|previous| conversation_id > previous),
             "semantic replay conversation order did not advance"
         );
-        previous = Some(conversation_id);
+        self.previous = Some(conversation_id);
         let declared_documents = u64::from_le_bytes(reader.bytes()?);
-        let Ok(count) = usize::try_from(declared_documents) else {
-            return Ok(None);
-        };
+        let count = usize::try_from(declared_documents).map_err(|_| FrameBudgetExceeded)?;
         // Charge the actual in-memory types before reserving any capacity.
-        // The outer Vec's growth has the same 2x allowance as the live cache.
-        let next_bytes = count
+        // Only this conversation is decoded; no archive-sized Vec is required.
+        let mut retained_bytes = count
             .checked_mul(size_of::<DocumentIdentity>())
             .and_then(|bytes| bytes.checked_add(size_of::<ConversationIdentity>() * 2))
-            .and_then(|bytes| retained_bytes.checked_add(bytes));
-        let Some(next_bytes) = next_bytes.filter(|bytes| *bytes <= budget) else {
-            return Ok(None);
-        };
+            .filter(|bytes| *bytes <= self.frame_budget)
+            .ok_or(FrameBudgetExceeded)?;
         ensure!(
             declared_documents
-                <= reader.remaining_before_trailer(metadata.len())
+                <= reader.remaining_before_trailer(self.file_bytes)
                     / MIN_DOCUMENT_FRAME_BYTES as u64,
             "semantic replay document count exceeds the remaining file"
         );
-        retained_bytes = next_bytes;
         let mut documents = Vec::new();
         documents.try_reserve_exact(count)?;
         for _ in 0..count {
@@ -256,16 +303,13 @@ pub(super) fn load(
                 "semantic replay document identity exceeds its byte limit"
             );
             ensure!(
-                id_len as u64 <= reader.remaining_before_trailer(metadata.len()),
+                id_len as u64 <= reader.remaining_before_trailer(self.file_bytes),
                 "semantic replay document identity length exceeds the remaining file"
             );
-            let Some(next_bytes) = retained_bytes
+            retained_bytes = retained_bytes
                 .checked_add(id_len)
-                .filter(|bytes| *bytes <= budget)
-            else {
-                return Ok(None);
-            };
-            retained_bytes = next_bytes;
+                .filter(|bytes| *bytes <= self.frame_budget)
+                .ok_or(FrameBudgetExceeded)?;
             let mut id = Vec::new();
             id.try_reserve_exact(id_len)?;
             id.resize(id_len, 0);
@@ -278,111 +322,219 @@ pub(super) fn load(
                 content_bytes,
             });
         }
-        document_count = document_count
+        self.document_count = self
+            .document_count
             .checked_add(declared_documents)
             .context("semantic replay document count overflow")?;
-        // Vec's first allocation normally reserves four records. Start with
-        // one explicitly, keeping even a one-conversation cache in its budget.
-        if conversations.is_empty() {
-            conversations.try_reserve_exact(1)?;
-        } else {
-            conversations.try_reserve(1)?;
-        }
-        conversations.push(ConversationIdentity {
+        self.conversation_count = self
+            .conversation_count
+            .checked_add(1)
+            .context("semantic replay conversation count overflow")?;
+        Ok(Some(ConversationIdentity {
             conversation_id,
             documents: documents.into_boxed_slice(),
-        });
+        }))
     }
 }
 
-/// Publish only a complete checksummed inventory. Failure or cancellation
-/// before the atomic rename leaves the previous cache intact. A directory-sync
-/// failure can follow publication, but never exposes an incomplete inventory.
-/// Canonical and vector files are never mutated.
-pub(super) fn save(
+/// A private streaming inventory. `push` never changes the installed cache;
+/// `finish` adds the trailer, syncs, and atomically installs the complete file.
+pub(super) struct InventoryWriter {
+    staged: tempfile::NamedTempFile,
+    writer: PayloadWriter<BufWriter<File>>,
+    path: PathBuf,
+    frame_budget: usize,
+    previous: Option<i64>,
+    conversation_count: u64,
+    document_count: u64,
+}
+
+impl InventoryWriter {
+    pub(super) fn create(
+        path: &Path,
+        key: &ReplayKey,
+        frame_budget: usize,
+        mut check_cancelled: impl FnMut() -> Result<()>,
+    ) -> Result<Self> {
+        check_cancelled()?;
+        let mut key_bytes = KeyBuffer::default();
+        serde_json::to_writer(&mut key_bytes, key).context("encode bounded semantic replay key")?;
+        let staged = tempfile::Builder::new()
+            .prefix(".semantic-replay-")
+            .tempfile_in(parent_directory(path))
+            .context("stage semantic replay inventory")?;
+        let mut writer = PayloadWriter::new(BufWriter::new(staged.as_file().try_clone()?));
+        writer.write(MAGIC)?;
+        writer.write(&u32::try_from(key_bytes.0.len())?.to_le_bytes())?;
+        writer.write(&key_bytes.0)?;
+        Ok(Self {
+            staged,
+            writer,
+            path: path.to_owned(),
+            frame_budget: frame_budget.min(MAX_RETAINED_BYTES),
+            previous: None,
+            conversation_count: 0,
+            document_count: 0,
+        })
+    }
+
+    pub(super) fn push(
+        &mut self,
+        conversation: &ConversationIdentity,
+        mut check_cancelled: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        check_cancelled()?;
+        ensure!(
+            self.previous
+                .is_none_or(|previous| conversation.conversation_id > previous),
+            "semantic replay conversation order did not advance"
+        );
+        let retained_bytes = conversation
+            .retained_bytes()
+            .context("semantic replay retained byte count overflow")?;
+        ensure!(
+            retained_bytes <= self.frame_budget,
+            "semantic replay conversation exceeds its retained byte limit"
+        );
+        self.previous = Some(conversation.conversation_id);
+        let count = u64::try_from(conversation.documents.len())?;
+        self.document_count = self
+            .document_count
+            .checked_add(count)
+            .context("semantic replay document count overflow")?;
+        self.conversation_count = self
+            .conversation_count
+            .checked_add(1)
+            .context("semantic replay conversation count overflow")?;
+        self.writer.write(&[CONVERSATION])?;
+        self.writer
+            .write(&conversation.conversation_id.to_le_bytes())?;
+        self.writer.write(&count.to_le_bytes())?;
+        for document in &conversation.documents {
+            check_cancelled()?;
+            ensure!(
+                document.id.len() <= MAX_DOCUMENT_ID_BYTES,
+                "semantic replay document identity exceeds its byte limit"
+            );
+            self.writer.write(&[DOCUMENT])?;
+            self.writer.write(&document.message_id.to_le_bytes())?;
+            self.writer
+                .write(&u64::try_from(document.content_bytes)?.to_le_bytes())?;
+            self.writer
+                .write(&u32::try_from(document.id.len())?.to_le_bytes())?;
+            self.writer.write(document.id.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish(mut self, mut check_cancelled: impl FnMut() -> Result<()>) -> Result<()> {
+        check_cancelled()?;
+        self.writer.write(&[TRAILER])?;
+        self.writer.write(&self.conversation_count.to_le_bytes())?;
+        self.writer.write(&self.document_count.to_le_bytes())?;
+        self.writer.finish()?;
+        check_cancelled()?;
+        self.staged
+            .as_file()
+            .sync_all()
+            .context("sync semantic replay inventory")?;
+        check_cancelled()?;
+        let _published = self
+            .staged
+            .persist(&self.path)
+            .map_err(|error| error.error)
+            .context("publish semantic replay inventory")?;
+        #[cfg(unix)]
+        File::open(parent_directory(&self.path))
+            .and_then(|directory| directory.sync_all())
+            .context("sync semantic replay inventory directory")?;
+        Ok(())
+    }
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// Collecting adapters keep the existing format tests exercising the same
+/// decoder/writer as production. Production selection consumes the stream.
+#[cfg(test)]
+fn load(
+    path: &Path,
+    key: &ReplayKey,
+    budget: usize,
+    mut check_cancelled: impl FnMut() -> Result<()>,
+) -> Result<Option<CachedReplay>> {
+    check_cancelled()?;
+    let budget = budget.min(MAX_RETAINED_BYTES);
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && metadata.len() > (budget + MAX_KEY_BYTES + FIXED_FORMAT_BYTES) as u64
+    {
+        return Ok(None);
+    }
+    let Some(mut reader) = InventoryReader::open(path, key, budget, &mut check_cancelled)? else {
+        return Ok(None);
+    };
+    let mut inventory = CachedReplay {
+        key: key.clone(),
+        conversations: Vec::new(),
+        retained_bytes: 0,
+    };
+    loop {
+        let conversation = match reader.next_conversation(&mut check_cancelled) {
+            Ok(Some(conversation)) => conversation,
+            Ok(None) => return Ok(Some(inventory)),
+            Err(error) if error.is::<FrameBudgetExceeded>() => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Some(bytes) = conversation
+            .retained_bytes()
+            .and_then(|bytes| inventory.retained_bytes.checked_add(bytes))
+            .filter(|bytes| *bytes <= budget)
+        else {
+            return Ok(None);
+        };
+        if inventory.conversations.is_empty() {
+            inventory.conversations.try_reserve_exact(1)?;
+        } else {
+            inventory.conversations.try_reserve(1)?;
+        }
+        inventory.retained_bytes = bytes;
+        inventory.conversations.push(conversation);
+    }
+}
+
+#[cfg(test)]
+fn save(
     path: &Path,
     inventory: &CachedReplay,
     mut check_cancelled: impl FnMut() -> Result<()>,
 ) -> Result<()> {
-    check_cancelled()?;
-    let mut key_bytes = KeyBuffer::default();
-    serde_json::to_writer(&mut key_bytes, &inventory.key)
-        .context("encode bounded semantic replay key")?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut staged = tempfile::Builder::new()
-        .prefix(".semantic-replay-")
-        .tempfile_in(parent)
-        .context("stage semantic replay inventory")?;
-    {
-        let mut writer = PayloadWriter::new(BufWriter::new(staged.as_file_mut()));
-        writer.write(MAGIC)?;
-        writer.write(&u32::try_from(key_bytes.0.len())?.to_le_bytes())?;
-        writer.write(&key_bytes.0)?;
-        let mut previous = None;
-        let mut retained_bytes = 0usize;
-        let mut document_count = 0u64;
-        for conversation in &inventory.conversations {
-            check_cancelled()?;
-            ensure!(
-                previous.is_none_or(|previous| conversation.conversation_id > previous),
-                "semantic replay conversation order did not advance"
-            );
-            previous = Some(conversation.conversation_id);
-            retained_bytes = conversation
-                .retained_bytes()
-                .and_then(|bytes| retained_bytes.checked_add(bytes))
-                .context("semantic replay retained byte count overflow")?;
-            ensure!(
-                retained_bytes <= MAX_RETAINED_BYTES,
-                "semantic replay inventory exceeds its retained byte limit"
-            );
-            let count = u64::try_from(conversation.documents.len())?;
-            document_count = document_count
-                .checked_add(count)
-                .context("semantic replay document count overflow")?;
-            writer.write(&[CONVERSATION])?;
-            writer.write(&conversation.conversation_id.to_le_bytes())?;
-            writer.write(&count.to_le_bytes())?;
-            for document in &conversation.documents {
-                check_cancelled()?;
-                ensure!(
-                    document.id.len() <= MAX_DOCUMENT_ID_BYTES,
-                    "semantic replay document identity exceeds its byte limit"
-                );
-                writer.write(&[DOCUMENT])?;
-                writer.write(&document.message_id.to_le_bytes())?;
-                writer.write(&u64::try_from(document.content_bytes)?.to_le_bytes())?;
-                writer.write(&u32::try_from(document.id.len())?.to_le_bytes())?;
-                writer.write(document.id.as_bytes())?;
-            }
-        }
+    let mut writer = InventoryWriter::create(
+        path,
+        &inventory.key,
+        MAX_RETAINED_BYTES,
+        &mut check_cancelled,
+    )?;
+    let mut retained_bytes = 0usize;
+    for conversation in &inventory.conversations {
+        retained_bytes = conversation
+            .retained_bytes()
+            .and_then(|bytes| retained_bytes.checked_add(bytes))
+            .context("semantic replay retained byte count overflow")?;
         ensure!(
-            retained_bytes == inventory.retained_bytes,
-            "semantic replay retained byte accounting mismatch"
+            retained_bytes <= MAX_RETAINED_BYTES,
+            "semantic replay inventory exceeds its retained byte limit"
         );
-        writer.write(&[TRAILER])?;
-        writer.write(&u64::try_from(inventory.conversations.len())?.to_le_bytes())?;
-        writer.write(&document_count.to_le_bytes())?;
-        writer.finish()?;
+        writer.push(conversation, &mut check_cancelled)?;
     }
-    check_cancelled()?;
-    staged
-        .as_file()
-        .sync_all()
-        .context("sync semantic replay inventory")?;
-    check_cancelled()?;
-    let _published = staged
-        .persist(path)
-        .map_err(|error| error.error)
-        .context("publish semantic replay inventory")?;
-    #[cfg(unix)]
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .context("sync semantic replay inventory directory")?;
-    Ok(())
+    ensure!(
+        retained_bytes == inventory.retained_bytes,
+        "semantic replay retained byte accounting mismatch"
+    );
+    writer.finish(check_cancelled)
 }
 
 #[cfg(test)]
@@ -668,6 +820,180 @@ mod tests {
             "d".repeat(MAX_DOCUMENT_ID_BYTES + 1).into_boxed_str();
         assert!(save(&path, &oversized_id, || Ok(())).is_err());
         assert!(!path.exists());
+        Ok(())
+    }
+
+    fn scale_conversation(conversation_id: i64, count: usize) -> ConversationIdentity {
+        let padding = "x".repeat(120);
+        let documents = (0..count)
+            .map(|ordinal| {
+                let message_id = conversation_id as u64 * count as u64 + ordinal as u64;
+                DocumentIdentity {
+                    id: format!("m{message_id:012}{padding}").into_boxed_str(),
+                    message_id,
+                    content_bytes: 2048,
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        ConversationIdentity {
+            conversation_id,
+            documents,
+        }
+    }
+
+    #[test]
+    fn streamed_inventory_reuses_complete_files_larger_than_the_memory_budget() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("streamed.bin");
+        let key = inventory()?.key;
+        let frame_budget = 4096;
+        let mut writer = InventoryWriter::create(&path, &key, frame_budget, || Ok(()))?;
+        for conversation_id in 0..256 {
+            writer.push(&scale_conversation(conversation_id, 16), || Ok(()))?;
+        }
+        writer.finish(|| Ok(()))?;
+        assert!(fs::metadata(&path)?.len() > frame_budget as u64);
+        assert!(load(&path, &key, frame_budget, || Ok(()))?.is_none());
+        let mut reader = InventoryReader::open(&path, &key, frame_budget, || Ok(()))?
+            .context("streamed inventory miss")?;
+        let mut count = 0;
+        while let Some(conversation) = reader.next_conversation(|| Ok(()))? {
+            assert!(conversation.retained_bytes().unwrap() <= frame_budget);
+            assert_eq!(conversation.conversation_id, count);
+            assert_eq!(
+                conversation.documents,
+                scale_conversation(count, 16).documents
+            );
+            count += 1;
+        }
+        assert_eq!(count, 256);
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_inventory_does_not_accept_a_valid_prefix_with_a_bad_trailer() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("streamed.bin");
+        let expected = inventory()?;
+        save(&path, &expected, || Ok(()))?;
+        let mut bytes = fs::read(&path)?;
+        *bytes.last_mut().context("fixture checksum")? ^= 1;
+        fs::write(&path, bytes)?;
+        let mut reader =
+            InventoryReader::open(&path, &expected.key, MAX_RETAINED_BYTES, || Ok(()))?
+                .context("streamed inventory miss")?;
+        for conversation in &expected.conversations {
+            let actual = reader
+                .next_conversation(|| Ok(()))?
+                .context("missing frame")?;
+            assert_eq!(actual.conversation_id, conversation.conversation_id);
+            assert_eq!(actual.documents, conversation.documents);
+        }
+        assert!(
+            reader
+                .next_conversation(|| Ok(()))
+                .err()
+                .context("invalid trailer accepted")?
+                .to_string()
+                .contains("checksum")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_inventory_bounds_frames_and_disk_without_replacing_a_complete_file() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("streamed.bin");
+        let expected = inventory()?;
+        save(&path, &expected, || Ok(()))?;
+        let before = fs::read(&path)?;
+        let mut oversized = InventoryWriter::create(&path, &expected.key, 1, || Ok(()))?;
+        assert!(
+            oversized
+                .push(&scale_conversation(0, 1), || Ok(()))
+                .is_err()
+        );
+        drop(oversized);
+        assert_eq!(fs::read(&path)?, before);
+
+        let mut cancelled = InventoryWriter::create(&path, &expected.key, 4096, || Ok(()))?;
+        cancelled.push(&scale_conversation(0, 16), || Ok(()))?;
+        assert!(
+            cancelled
+                .finish(|| anyhow::bail!("cancelled before install"))
+                .is_err()
+        );
+        assert_eq!(fs::read(&path)?, before);
+
+        let oversized_path = directory.path().join("oversized.bin");
+        File::create(&oversized_path)?.set_len(MAX_INVENTORY_BYTES + 1)?;
+        assert!(InventoryReader::open(&oversized_path, &expected.key, 4096, || Ok(()))?.is_none());
+        assert_eq!(fs::read(&path)?, before);
+        Ok(())
+    }
+
+    /// Format-scale probe, not a database, embedding, or search benchmark.
+    /// Run explicitly with --ignored --exact --nocapture.
+    #[test]
+    #[ignore = "writes and validates more than 128 MiB of real inventory records"]
+    fn streamed_inventory_retains_a_million_passages_above_the_old_ceiling() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("million.bin");
+        let key = inventory()?.key;
+        let frame_budget = 256 * 1024;
+        let conversations = 1024;
+        let documents_per_conversation = 1024;
+        let started = std::time::Instant::now();
+        let mut writer = InventoryWriter::create(&path, &key, frame_budget, || Ok(()))?;
+        for conversation_id in 0..conversations {
+            writer.push(
+                &scale_conversation(conversation_id, documents_per_conversation),
+                || Ok(()),
+            )?;
+        }
+        writer.finish(|| Ok(()))?;
+        let write_elapsed_us = started.elapsed().as_micros();
+        let disk_bytes = fs::metadata(&path)?.len();
+        assert!(disk_bytes > MAX_RETAINED_BYTES as u64);
+        assert!(load(&path, &key, MAX_RETAINED_BYTES, || Ok(()))?.is_none());
+        let started = std::time::Instant::now();
+        let mut reader = InventoryReader::open(&path, &key, frame_budget, || Ok(()))?
+            .context("million-passage inventory miss")?;
+        let mut observed_conversations = 0;
+        let mut observed_documents = 0;
+        let mut peak_retained_frame_bytes = 0;
+        while let Some(conversation) = reader.next_conversation(|| Ok(()))? {
+            let retained = conversation.retained_bytes().context("frame accounting")?;
+            peak_retained_frame_bytes = peak_retained_frame_bytes.max(retained);
+            assert!(retained <= frame_budget);
+            assert_eq!(conversation.conversation_id, observed_conversations);
+            assert_eq!(conversation.documents.len(), documents_per_conversation);
+            assert_eq!(
+                conversation.documents,
+                scale_conversation(observed_conversations, documents_per_conversation).documents
+            );
+            observed_conversations += 1;
+            observed_documents += conversation.documents.len();
+        }
+        assert_eq!(observed_conversations, conversations);
+        assert_eq!(observed_documents, 1_048_576);
+        let read_elapsed_us = started.elapsed().as_micros();
+        eprintln!(
+            "{}",
+            json!({
+                "scenario": "million_passage_replay_inventory_format",
+                "passage_documents": observed_documents,
+                "conversations": observed_conversations,
+                "disk_bytes": disk_bytes,
+                "memory_budget_bytes": MAX_RETAINED_BYTES,
+                "frame_budget_bytes": frame_budget,
+                "peak_retained_frame_bytes": peak_retained_frame_bytes,
+                "memory_cache_retained": false,
+                "write_elapsed_us": write_elapsed_us,
+                "read_elapsed_us": read_elapsed_us
+            })
+        );
         Ok(())
     }
 }
