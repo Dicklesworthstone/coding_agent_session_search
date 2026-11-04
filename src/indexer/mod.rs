@@ -9737,6 +9737,15 @@ pub(crate) fn has_usable_lexical_publication_receipt(index_path: &Path, db_path:
         if !crate::stored_path_identity_matches(&state.db.db_path, db_path) {
             return Ok(false);
         }
+        if let Some(saved) = state.resume_binding.as_ref()
+            && let Ok(Some(current)) = lexical_resume::Binding::capture(db_path)
+            && saved != &current
+        {
+            // An incomplete rebuild may still serve its prior publication,
+            // but never after a proven archive replacement at the same path.
+            // Failure to observe an identity is not evidence of replacement.
+            return Ok(false);
+        }
         lexical_publication_receipt_matches_live(index_path, &state)
     };
     match inspect() {
@@ -13137,25 +13146,141 @@ pub(crate) fn load_lexical_rebuild_checkpoint(
     let Some(state) = load_lexical_rebuild_state(index_path)? else {
         return Ok(None);
     };
+    Ok(Some(lexical_checkpoint_status(&state)))
+}
+
+fn lexical_checkpoint_status(state: &LexicalRebuildState) -> LexicalRebuildCheckpoint {
     let processed_conversations = state.reported_processed_conversations();
     let committed_conversation_id = state.reported_committed_conversation_id();
     let indexed_docs = state.reported_indexed_docs();
 
-    Ok(Some(LexicalRebuildCheckpoint {
-        db_path: state.db.db_path,
+    LexicalRebuildCheckpoint {
+        db_path: state.db.db_path.clone(),
         total_conversations: state.db.total_conversations,
-        storage_fingerprint: state.db.storage_fingerprint,
+        storage_fingerprint: state.db.storage_fingerprint.clone(),
         committed_offset: state.committed_offset,
         committed_conversation_id,
         processed_conversations,
         indexed_docs,
-        schema_hash: state.schema_hash,
+        schema_hash: state.schema_hash.clone(),
         page_size: state.page_size,
         // Historical status only. Rebuild admission additionally requires the
         // raw source epoch and native-generation binding, or a full audit.
         completed: state.completed,
         updated_at_ms: state.updated_at_ms,
-    }))
+    }
+}
+
+/// Freshness evidence is separate from the historical progress/status record.
+/// In particular, DB/WAL epoch drift may be an ordinary metadata write; it
+/// requires content verification but does not by itself prove missing data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LexicalCheckpointFreshness {
+    Current,
+    Unverified(&'static str),
+    Stale(&'static str),
+    Incompatible(&'static str),
+}
+
+impl LexicalCheckpointFreshness {
+    pub(crate) fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Current => None,
+            Self::Unverified(reason) | Self::Stale(reason) | Self::Incompatible(reason) => {
+                Some(reason)
+            }
+        }
+    }
+}
+
+/// Inspect only bounded checkpoint metadata, native publication metadata and
+/// filesystem identity. This never opens SQLite, hashes index segments or
+/// renews an epoch. Read callers can serve a complete, readable generation
+/// with `Unverified` evidence without scheduling a full audit on every read.
+pub(crate) fn completed_lexical_checkpoint_freshness(
+    index_path: &Path,
+    db_path: &Path,
+    checkpoint: &LexicalRebuildCheckpoint,
+) -> Result<LexicalCheckpointFreshness> {
+    let Some(state) = load_lexical_rebuild_state(index_path)? else {
+        return Ok(LexicalCheckpointFreshness::Unverified(
+            "lexical completion evidence is missing; content verification is required",
+        ));
+    };
+    if lexical_checkpoint_status(&state) != *checkpoint {
+        return Ok(LexicalCheckpointFreshness::Unverified(
+            "lexical completion evidence changed during observation; verification is deferred",
+        ));
+    }
+    completed_lexical_checkpoint_freshness_for_state(index_path, db_path, &state)
+}
+
+fn completed_lexical_checkpoint_freshness_for_state(
+    index_path: &Path,
+    db_path: &Path,
+    state: &LexicalRebuildState,
+) -> Result<LexicalCheckpointFreshness> {
+    use LexicalCheckpointFreshness::{Current, Incompatible, Stale, Unverified};
+
+    if !state.completed {
+        return Ok(Unverified("lexical rebuild is incomplete"));
+    }
+    let current_binding = match lexical_resume::Binding::capture(db_path) {
+        Ok(Some(current)) => current,
+        Ok(None) | Err(_) => {
+            return Ok(Unverified(
+                "lexical archive identity is unavailable; content verification is deferred",
+            ));
+        }
+    };
+    if !crate::stored_path_identity_matches(&state.db.db_path, db_path) {
+        return Ok(Incompatible(
+            "lexical completion evidence belongs to a different canonical archive",
+        ));
+    }
+    let Some(binding) = state.resume_binding.as_ref() else {
+        return Ok(Unverified(
+            "legacy lexical checkpoint has no source binding; content verification is required",
+        ));
+    };
+    if &current_binding != binding {
+        return Ok(Incompatible(
+            "lexical archive identity or projection configuration changed since verification",
+        ));
+    }
+    if !lexical_state_can_certify_publication(state) {
+        return Ok(Stale(
+            "lexical completion evidence no longer matches the active archive or contract",
+        ));
+    }
+    if crate::search::tantivy::searchable_index_live_docs(index_path).is_some_and(|live| {
+        live.manifest_source != crate::search::quill_bridge::QuillManifestSource::Current
+    }) || !lexical_publication_receipt_matches_live(index_path, state)?
+    {
+        return Ok(Stale(
+            "native lexical generation no longer matches its completed checkpoint",
+        ));
+    }
+    if !state.completed_source_matches(db_path) {
+        return Ok(Unverified(
+            "lexical source epoch changed or is unverified; content verification is required",
+        ));
+    }
+    // An atomic index swap or a count-only checkpoint refresh must not combine
+    // evidence from different generations during this passive observation.
+    if load_lexical_rebuild_state(index_path)?.as_ref() != Some(state)
+        || index_meta_fingerprint(index_path)? != state.committed_meta_fingerprint
+    {
+        return Ok(Unverified(
+            "lexical completion evidence changed during observation; verification is deferred",
+        ));
+    }
+    if !binding.matches(db_path) || !state.completed_source_matches(db_path) {
+        return Ok(Unverified(
+            "lexical source changed during observation; content verification is required",
+        ));
+    }
+    Ok(Current)
 }
 
 pub(crate) fn load_active_lexical_rebuild_pipeline_runtime(
@@ -13185,6 +13310,7 @@ pub(crate) fn lexical_storage_fingerprint_for_db(db_path: &Path) -> Result<Strin
 /// opener. Used by strict read-only search so a dirty WAL or duplicate schema
 /// is surfaced rather than repaired as a side effect of freshness validation.
 pub(crate) fn lexical_storage_fingerprint_for_db_strict(db_path: &Path) -> Result<String> {
+    let source_epoch = lexical_resume::ArchiveEpoch::capture(db_path)?;
     let storage = FrankenStorage::open_strict_readonly(db_path).with_context(|| {
         format!(
             "strictly opening readonly storage to compute lexical fingerprint for {}",
@@ -13199,6 +13325,9 @@ pub(crate) fn lexical_storage_fingerprint_for_db_strict(db_path: &Path) -> Resul
             db_path.display()
         )
     })?;
+    // COUNT and MAX are separate statements. A raw writer between them must
+    // not turn a mixed observation into evidence for either source epoch.
+    source_epoch.verify(db_path)?;
     Ok(fingerprint)
 }
 
@@ -13209,21 +13338,18 @@ pub(crate) fn lexical_storage_fingerprint_for_db_strict(db_path: &Path) -> Resul
 /// never hits on the path that matters most.
 pub(crate) const ARCHIVE_FINGERPRINT_CACHE_FILE: &str = ".archive-fingerprint-cache.json";
 
-const ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION: u32 = 1;
+// v1 could associate an old completed checkpoint with a newer physical
+// identity. Never reuse those entries after tightening the admission rule.
+const ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Physical identity of a canonical archive for fingerprint memoization: the
-/// size and mtime of the main database file and of its WAL sidecar. Any
-/// committed write touches at least one of them (a WAL append changes the WAL
-/// length and mtime; a checkpoint changes the main file), so an unchanged key
-/// means the strict fingerprint computed last time is still the current one.
+/// DB/WAL epoch, including native file identity where the platform exposes it.
+/// An equal-length database replacement with restored mtimes must not inherit
+/// the replaced archive's cached fingerprint. SHM is deliberately excluded:
+/// readers update it without changing canonical content.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 struct ArchivePhysicalIdentity {
-    db_len: u64,
-    db_mtime_secs: u64,
-    db_mtime_nanos: u32,
-    wal_len: u64,
-    wal_mtime_secs: u64,
-    wal_mtime_nanos: u32,
+    source_epoch: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -13235,34 +13361,13 @@ struct ArchiveFingerprintCache {
 }
 
 fn lexical_storage_physical_identity(db_path: &Path) -> Option<ArchivePhysicalIdentity> {
-    fn stamp(path: &Path) -> Option<(u64, u64, u32)> {
-        match fs::metadata(path) {
-            Ok(meta) => {
-                let modified = meta
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())?;
-                Some((meta.len(), modified.as_secs(), modified.subsec_nanos()))
-            }
-            // An absent WAL sidecar is a legitimate, stable state.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some((0, 0, 0)),
-            Err(_) => None,
-        }
-    }
-    let (db_len, db_mtime_secs, db_mtime_nanos) = stamp(db_path)?;
-    if db_len == 0 {
+    if fs::metadata(db_path).ok()?.len() == 0 {
         // No archive (or an empty placeholder): nothing worth memoizing.
         return None;
     }
-    let wal_path = crate::storage::sqlite::database_sidecar_path(db_path, "-wal");
-    let (wal_len, wal_mtime_secs, wal_mtime_nanos) = stamp(&wal_path)?;
+    let source_epoch = lexical_resume::ArchiveEpoch::capture(db_path).ok()?;
     Some(ArchivePhysicalIdentity {
-        db_len,
-        db_mtime_secs,
-        db_mtime_nanos,
-        wal_len,
-        wal_mtime_secs,
-        wal_mtime_nanos,
+        source_epoch: serde_json::to_string(&source_epoch).ok()?,
     })
 }
 
@@ -13300,31 +13405,53 @@ fn write_archive_fingerprint_cache_for_identity(
     }
 }
 
-pub(crate) fn write_archive_fingerprint_cache_best_effort(
-    db_path: &Path,
-    cache_dir: &Path,
-    fingerprint: &str,
-) {
-    let Some(identity) = lexical_storage_physical_identity(db_path) else {
-        return;
-    };
-    write_archive_fingerprint_cache_for_identity(&identity, cache_dir, fingerprint);
-}
-
 pub(crate) fn prime_archive_fingerprint_cache_from_completed_checkpoint(
     db_path: &Path,
     index_path: &Path,
 ) {
-    let Ok(Some(checkpoint)) = load_lexical_rebuild_checkpoint(index_path) else {
-        return;
-    };
-    if checkpoint.completed && crate::stored_path_identity_matches(&checkpoint.db_path, db_path) {
-        write_archive_fingerprint_cache_best_effort(
-            db_path,
-            index_path,
-            &checkpoint.storage_fingerprint,
-        );
+    if let Err(error) =
+        prime_archive_fingerprint_cache_from_verified_checkpoint(db_path, index_path, || Ok(()))
+    {
+        tracing::debug!(%error, "unverified lexical checkpoint did not prime archive fingerprint cache");
     }
+}
+
+fn prime_archive_fingerprint_cache_from_verified_checkpoint(
+    db_path: &Path,
+    index_path: &Path,
+    before_publish: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    let Some(identity) = lexical_storage_physical_identity(db_path) else {
+        return Ok(false);
+    };
+    let Some(state) = load_lexical_rebuild_state(index_path)? else {
+        return Ok(false);
+    };
+    if completed_lexical_checkpoint_freshness_for_state(index_path, db_path, &state)?
+        != LexicalCheckpointFreshness::Current
+    {
+        return Ok(false);
+    }
+    before_publish()?;
+    if lexical_storage_physical_identity(db_path).as_ref() != Some(&identity)
+        || completed_lexical_checkpoint_freshness_for_state(index_path, db_path, &state)?
+            != LexicalCheckpointFreshness::Current
+    {
+        return Ok(false);
+    }
+    // Keep the identity observed BEFORE verification. A writer arriving after
+    // the final check invalidates this key; never recapture its newer identity
+    // and associate it with the completed checkpoint's older fingerprint.
+    write_archive_fingerprint_cache_for_identity(
+        &identity,
+        index_path,
+        &state.db.storage_fingerprint,
+    );
+    Ok(true)
+}
+
+pub(crate) fn lexical_fingerprint_observation_changed(error: &anyhow::Error) -> bool {
+    error.is::<lexical_resume::SourceChanged>()
 }
 
 /// The on-disk layer of [`lexical_storage_fingerprint_for_db_cached`]: serve
@@ -13337,27 +13464,58 @@ fn lexical_storage_fingerprint_for_db_disk_cached(
     identity: &ArchivePhysicalIdentity,
     cache_dir: &Path,
 ) -> Result<String> {
+    lexical_storage_fingerprint_for_db_disk_cached_with_observer(
+        db_path,
+        identity,
+        cache_dir,
+        || Ok(()),
+    )
+}
+
+fn lexical_storage_fingerprint_for_db_disk_cached_with_observer(
+    db_path: &Path,
+    identity: &ArchivePhysicalIdentity,
+    cache_dir: &Path,
+    before_publish: impl FnOnce() -> Result<()>,
+) -> Result<String> {
     let cache_path = cache_dir.join(ARCHIVE_FINGERPRINT_CACHE_FILE);
-    if let Ok(raw) = fs::read(&cache_path)
-        && let Ok(cached) = serde_json::from_slice::<ArchiveFingerprintCache>(&raw)
+    let cached = if let Some(cached) =
+        lexical_resume::read_completed_artifact::<ArchiveFingerprintCache>(&cache_path)
+            .unwrap_or_else(|error| {
+                tracing::debug!(%error, "unreadable optional archive fingerprint cache ignored");
+                None
+            })
         && cached.schema_version == ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION
         && &cached.identity == identity
         && cached.fingerprint.starts_with("content-v1:")
     {
+        Some(cached.fingerprint)
+    } else {
+        None
+    };
+    let cache_hit = cached.is_some();
+    let fingerprint = if let Some(fingerprint) = cached {
         tracing::debug!(
             archive_fingerprint_cache = "hit",
             cache = %cache_path.display(),
             "archive fingerprint served from the identity sidecar"
         );
-        return Ok(cached.fingerprint);
+        fingerprint
+    } else {
+        tracing::debug!(
+            archive_fingerprint_cache = "miss",
+            cache = %cache_path.display(),
+            "archive fingerprint recomputed from the canonical database"
+        );
+        lexical_storage_fingerprint_for_db_strict(db_path)?
+    };
+    before_publish()?;
+    if lexical_storage_physical_identity(db_path).as_ref() != Some(identity) {
+        return Err(lexical_resume::SourceChanged.into());
     }
-    tracing::debug!(
-        archive_fingerprint_cache = "miss",
-        cache = %cache_path.display(),
-        "archive fingerprint recomputed from the canonical database"
-    );
-    let fingerprint = lexical_storage_fingerprint_for_db_strict(db_path)?;
-    write_archive_fingerprint_cache_for_identity(identity, cache_dir, &fingerprint);
+    if !cache_hit {
+        write_archive_fingerprint_cache_for_identity(identity, cache_dir, &fingerprint);
+    }
     Ok(fingerprint)
 }
 
@@ -13371,8 +13529,8 @@ fn lexical_storage_fingerprint_for_db_disk_cached(
 /// (measured: 201 MB of WAL read in 97k calls, 3.5–4 s) before the engine
 /// query even ran, and a one-shot CLI process cannot amortize it in memory.
 /// A search-time freshness check only needs the answer to change when the
-/// archive does, and any committed write moves the database or WAL
-/// size/mtime, so both layers are invalidated exactly when they must be. When
+/// archive does. The source epoch covers database/WAL metadata and native
+/// file identity, so replacement cannot inherit an older cache entry. When
 /// the identity cannot be read the strict path runs uncached.
 pub(crate) fn lexical_storage_fingerprint_for_db_cached(
     db_path: &Path,
@@ -13390,6 +13548,9 @@ pub(crate) fn lexical_storage_fingerprint_for_db_cached(
     );
     let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(fingerprint) = memo.lock().ok().and_then(|guard| guard.get(&key).cloned()) {
+        if lexical_storage_physical_identity(db_path).as_ref() != Some(&identity) {
+            return Err(lexical_resume::SourceChanged.into());
+        }
         return Ok(fingerprint);
     }
     let fingerprint =
@@ -13418,11 +13579,12 @@ pub(crate) fn lexical_storage_fingerprint_for_db_cached_readonly(
 ) -> Option<String> {
     let identity = lexical_storage_physical_identity(db_path)?;
     let cache_path = index_path.join(ARCHIVE_FINGERPRINT_CACHE_FILE);
-    let raw = fs::read(cache_path).ok()?;
-    let cached = serde_json::from_slice::<ArchiveFingerprintCache>(&raw).ok()?;
+    let cached: ArchiveFingerprintCache =
+        lexical_resume::read_completed_artifact(&cache_path).ok()??;
     (cached.schema_version == ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION
         && cached.identity == identity
-        && cached.fingerprint.starts_with("content-v1:"))
+        && cached.fingerprint.starts_with("content-v1:")
+        && lexical_storage_physical_identity(db_path).as_ref() == Some(&identity))
     .then_some(cached.fingerprint)
 }
 

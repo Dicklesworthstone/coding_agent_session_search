@@ -1662,6 +1662,12 @@ reject reuse. The rejected candidate is retained in a
 `.lexical-rebuild-quarantine-*` directory and a fresh replacement is built
 off-live. Explicit `--force-rebuild` still requests a fresh pass.
 
+The audit shares the immutable native snapshot admitted by the candidate's
+writer. It does not independently open an earlier generation and then assume
+the writer received the same one. Publication retains the fingerprint of the
+generation verified while that writer was held; a later native generation
+change returns a retryable failure without transferring the old content proof.
+
 Recovery checkpoints bind the archive's stable file identity, lexical schema,
 packet contract, and per-message content cap. Older version-three checkpoints
 that explicitly identify a staged single index can be adopted only through
@@ -1678,6 +1684,16 @@ rebuild authority. A matching audit retains the index without rewriting its
 documents; a mismatch starts a replacement off-live. Successful verification
 refreshes the paired generation and equivalence evidence before recording
 completion, while leaving the native index unchanged.
+
+Search and status distinguish a verified current generation from an
+`unverified` one. Bookkeeping or WAL changes can make source evidence
+unverified while the complete native generation remains readable. Reads keep
+serving that generation with the verification reason; the label alone does
+not start a full content audit or a rebuild loop. Ordinary count drift,
+pending replay work, and source-scan scheduling keep their existing refresh
+behavior. A confirmed archive-identity or projection-contract mismatch
+requires repair. The archive-fingerprint cache cannot renew an older
+checkpoint's authority under a newer database identity.
 
 Newly indexed batches are committed and checkpointed durably. A further
 interruption preserves those batches too. Readers keep the prior published
