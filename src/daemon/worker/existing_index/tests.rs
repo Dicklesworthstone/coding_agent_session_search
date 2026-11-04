@@ -20,7 +20,7 @@ fn message(id: i64, content: &str) -> MessageForEmbedding {
 
 fn row(message: &MessageForEmbedding) -> anyhow::Result<EmbeddedMessage> {
     let indexer = SemanticIndexer::new("hash", None)?;
-    let inputs: Vec<_> = canonical_message_inputs(message)?
+    let inputs: Vec<_> = canonical_message_inputs(message, None)?
         .into_iter()
         .map(|(_, input)| input)
         .collect();

@@ -5,6 +5,7 @@ fn source(content: &str) -> SourceMessage {
         message_id: 7,
         conversation_id: 12,
         content: content.to_owned(),
+        title: None,
         role: "assistant".into(),
         created_at: Some(42),
         agent_id: Some(3),
@@ -18,7 +19,7 @@ fn source(content: &str) -> SourceMessage {
 fn identity(content: &str, chunk: u8, projection: PassageProjection) -> SemanticDocId {
     let canonical = match projection {
         PassageProjection::CanonicalPrefixV1 => canonicalize_for_embedding(content),
-        PassageProjection::RawPassagesV2 => {
+        PassageProjection::RawPassagesV2 | PassageProjection::TitlePrefixedPassagesV1 => {
             canonicalize_for_embedding(embedding_passages(content)[usize::from(chunk)])
         }
     };
@@ -32,6 +33,39 @@ fn identity(content: &str, chunk: u8, projection: PassageProjection) -> Semantic
         created_at_ms: 42,
         content_hash: Some(content_hash(&canonical)),
     }
+}
+
+#[test]
+fn gh540_title_edits_invalidate_title_prefixed_passages_but_not_body_only() {
+    let mut actual = source("unchanged canonical body");
+    actual.title = Some("SSH commit signing".into());
+    let input = InputContext::TitlePrefix.document(
+        actual.title.as_deref(),
+        &actual.content,
+        MAX_EMBED_CHARS,
+    );
+    let canonical = canonicalize_for_embedding(&input);
+    let mut expected = identity(&actual.content, 0, PassageProjection::RawPassagesV2);
+    let body_only = expected;
+    expected.content_hash = Some(content_hash(&canonical));
+    assert_eq!(
+        verify_message(
+            &expected,
+            &actual,
+            PassageProjection::TitlePrefixedPassagesV1
+        ),
+        Ok(canonical)
+    );
+    actual.title = Some("Postgres password rotation".into());
+    assert_eq!(
+        verify_message(
+            &expected,
+            &actual,
+            PassageProjection::TitlePrefixedPassagesV1
+        ),
+        Err(HydrationError::StaleSource)
+    );
+    assert!(verify_message(&body_only, &actual, PassageProjection::RawPassagesV2).is_ok());
 }
 
 #[test]

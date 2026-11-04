@@ -266,6 +266,40 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 - **Vector index**: Stored as `vector_index/index-<embedder>.fsvi` in the data directory.
 - **Lexical fail-open**: While the model is absent, `cass` returns lexical-only results and reports `fallback_mode="lexical"` in health/status; search never blocks on semantic assets.
 
+#### Optional Conversation Title Context
+
+Set `CASS_SEMANTIC_INPUT_CONTEXT=title-prefix` to include a bounded conversation
+title in **every selected message passage**, after passage splitting and before
+canonicalization and hashing. The default, `body`, preserves body-only inputs.
+The title scan is capped at 512 Unicode characters, normalized to one line, and
+limited to 128 characters within the existing passage input budget. This is a
+character budget, not a tokenizer guarantee. Missing or blank titles preserve
+the original passage. Canonical messages, source IDs, roles, and citations stay
+unchanged; titles are never inserted as artificial messages.
+
+```bash
+export CASS_SEMANTIC_INPUT_CONTEXT=title-prefix
+cass index --semantic --embedder minilm
+cass search "SSH commit signing" --mode semantic --robot --robot-meta
+```
+
+Keep this setting consistent for indexing, backfill, searches, and the daemon
+(restart an already-running daemon after changing it). Switching the setting
+changes the vector input revision: old-policy indexes are refused until rebuilt
+or reconciled, and lexical search remains available. Authoritative canonical
+title edits invalidate semantic watermarks even if no message ID changed.
+`--robot-meta` echoes the selected policy under
+`_meta.effective.semantic_input_context`. Unknown values are configuration errors
+when semantic inputs are constructed or validated. This policy currently supports
+local MiniLM, multilingual MiniLM, and explicit hash-control indexes; the external
+provider path requires `body`.
+
+This implements one opt-in input representation from [issue #540](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/540).
+It is **not** the separate-title-vector/max-score prototype reported there, and
+those benchmark gains must not be attributed to this prefix policy. A separate
+title channel and configurable title/body fusion remain future work; generic or
+misleading titles can reduce retrieval quality.
+
 #### Opt-In External Embeddings
 
 An OpenAI-compatible embedding service can own inference, including any GPU it supports. Select `external` explicitly and set `CASS_EXTERNAL_EMBEDDINGS=1` to consent to sending selected archive text during backfill and query text during semantic search. Configuring a URL alone sends nothing. Local models and hash embeddings keep their existing behavior.

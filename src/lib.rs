@@ -37561,6 +37561,14 @@ fn search_effective_interpretation(
         && let Some(object) = effective.as_object_mut()
     {
         object.insert(
+            "semantic_input_context".to_string(),
+            serde_json::json!(
+                crate::search::canonicalize::configured_input_context()
+                    .ok()
+                    .map(crate::search::input_context::InputContext::as_str)
+            ),
+        );
+        object.insert(
             "daemon".to_string(),
             serde_json::json!({
                 "use_existing": semantic_opts.use_daemon,
@@ -104156,6 +104164,11 @@ fn response_schema_search_effective() -> serde_json::Value {
                     "auto_spawn_requested": { "type": "boolean" },
                     "auto_spawn": { "type": "boolean" }
                 }
+            },
+            "semantic_input_context": {
+                "type": ["string", "null"],
+                "enum": ["body", "title-prefix", null],
+                "description": "Selected semantic document input contract; null means an invalid explicit setting. Realized search mode still determines whether semantic retrieval ran."
             },
             "auto_corrections": { "type": "array", "items": { "type": "string" } }
         }

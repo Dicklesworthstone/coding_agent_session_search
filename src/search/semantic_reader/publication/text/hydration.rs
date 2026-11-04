@@ -16,7 +16,10 @@ use std::time::{Duration, Instant};
 
 use crate::franken_sync::Connection;
 use crate::franken_sync::compat::{RowExt, Transaction, TransactionExt};
-use crate::search::canonicalize::{canonicalize_for_embedding, content_hash, embedding_passages};
+use crate::search::canonicalize::{
+    MAX_EMBED_CHARS, canonicalize_for_embedding, content_hash, embedding_passages,
+};
+use crate::search::input_context::{InputContext, TITLE_SCAN_CHARS};
 use crate::search::semantic_manifest::TierKind;
 use crate::search::semantic_reader::publication::SelectedSemanticBatch;
 use crate::search::semantic_reader::{SemanticPassageHit, SemanticSearchBatch};
@@ -43,6 +46,8 @@ pub enum PassageProjection {
     CanonicalPrefixV1,
     /// Current raw-first bounded passages, then per-passage canonicalization.
     RawPassagesV2,
+    /// Raw passages with bounded conversation title context (GH #540).
+    TitlePrefixedPassagesV1,
 }
 
 /// Bounds returned candidates and source/output text retained by this adapter.
@@ -459,6 +464,7 @@ struct SourceMessage {
     message_id: u64,
     conversation_id: i64,
     content: String,
+    title: Option<String>,
     role: String,
     created_at: Option<i64>,
     agent_id: Option<i64>,
@@ -498,9 +504,13 @@ fn read_message(
            + length(CAST(COALESCE(c.source_id, '') AS BLOB))
            + length(CAST(COALESCE(c.origin_host, '') AS BLOB))
            + length(CAST(COALESCE(c.source_path, '') AS BLOB))
+           + length(CAST(COALESCE(substr(c.title, 1, ?2), '') AS BLOB))
          FROM messages m JOIN conversations c ON c.id = m.conversation_id
          WHERE m.id = ?1 LIMIT 2",
-            &[crate::franken_sync::SqliteValue::Integer(id)],
+            &[
+                crate::franken_sync::SqliteValue::Integer(id),
+                crate::franken_sync::SqliteValue::Integer(TITLE_SCAN_CHARS as i64),
+            ],
         )
         .map_err(|_| HydrationError::Database)?;
     work.check()?;
@@ -533,10 +543,14 @@ fn read_message(
     let rows = transaction
         .query_with_params(
             "SELECT m.conversation_id, m.content, m.role, m.created_at,
-                c.agent_id, c.workspace_id, c.source_id, c.origin_host, c.source_path, m.idx
+                c.agent_id, c.workspace_id, c.source_id, c.origin_host, c.source_path, m.idx,
+                substr(c.title, 1, ?2)
          FROM messages m JOIN conversations c ON c.id = m.conversation_id
          WHERE m.id = ?1 LIMIT 2",
-            &[crate::franken_sync::SqliteValue::Integer(id)],
+            &[
+                crate::franken_sync::SqliteValue::Integer(id),
+                crate::franken_sync::SqliteValue::Integer(TITLE_SCAN_CHARS as i64),
+            ],
         )
         .map_err(|_| HydrationError::Database)?;
     work.check()?;
@@ -562,11 +576,15 @@ fn read_message(
     let source_path: String = row
         .get_typed(8)
         .map_err(|_| HydrationError::InvalidSource)?;
+    let title: Option<String> = row
+        .get_typed(10)
+        .map_err(|_| HydrationError::InvalidSource)?;
     let actual_metadata = role
         .len()
         .checked_add(raw_source.as_ref().map_or(0, String::len))
         .and_then(|n| n.checked_add(host.as_ref().map_or(0, String::len)))
         .and_then(|n| n.checked_add(source_path.len()))
+        .and_then(|n| n.checked_add(title.as_ref().map_or(0, String::len)))
         .ok_or(HydrationError::InvalidSource)?;
     if actual_conversation != conversation_id
         || content.len() != bytes
@@ -579,6 +597,7 @@ fn read_message(
         message_id: id as u64,
         conversation_id,
         content,
+        title,
         role,
         source_id,
         source_path,
@@ -639,12 +658,21 @@ fn verify_message(
             canonicalize_for_embedding(&actual.content)
         }
         PassageProjection::CanonicalPrefixV1 => return Err(HydrationError::StaleSource),
-        PassageProjection::RawPassagesV2 => {
+        PassageProjection::RawPassagesV2 | PassageProjection::TitlePrefixedPassagesV1 => {
             let passages = embedding_passages(&actual.content);
             let passage = passages
                 .get(usize::from(expected.chunk_idx))
                 .ok_or(HydrationError::StaleSource)?;
-            canonicalize_for_embedding(passage)
+            let context = if projection == PassageProjection::TitlePrefixedPassagesV1 {
+                InputContext::TitlePrefix
+            } else {
+                InputContext::Body
+            };
+            canonicalize_for_embedding(&context.document(
+                actual.title.as_deref(),
+                passage,
+                MAX_EMBED_CHARS,
+            ))
         }
     };
     if canonical.is_empty() || content_hash(&canonical) != expected_hash {

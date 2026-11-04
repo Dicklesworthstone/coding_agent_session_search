@@ -23,8 +23,9 @@ use crate::indexer::semantic::{
     EmbeddingInput, SemanticIndexer, expected_vector_space_revision, message_id_from_db,
     saturating_u32_from_i64, semantic_doc_id_for_input,
 };
-use crate::search::canonicalize::embedding_passages;
+use crate::search::canonicalize::{MAX_EMBED_CHARS, configured_input_context, embedding_passages};
 use crate::search::fastembed_embedder::FastEmbedder;
+use crate::search::input_context::InputContext;
 use crate::search::semantic_manifest::TierKind;
 use crate::search::vector_index::{VectorIndex, role_code_from_str, vector_index_path};
 use crate::storage::sqlite::FrankenStorage;
@@ -206,7 +207,9 @@ fn saturating_i64_from_usize(raw: usize) -> i64 {
 /// Prepare at most one message's bounded passages, never the whole archive.
 fn canonical_message_inputs(
     message: &crate::storage::sqlite::MessageForEmbedding,
+    title: Option<&str>,
 ) -> anyhow::Result<Vec<(String, EmbeddingInput)>> {
+    let context = configured_input_context()?;
     let Some(message_id) = message_id_from_db(message.message_id) else {
         return Ok(Vec::new());
     };
@@ -220,7 +223,9 @@ fn canonical_message_inputs(
             source_id: message.source_id_hash,
             role: role_code_from_str(&message.role).unwrap_or(0),
             chunk_idx: u8::try_from(ordinal)?,
-            content: passage.to_owned(),
+            content: context
+                .document(title, passage, MAX_EMBED_CHARS)
+                .into_owned(),
         };
         if let Some(doc_id) = semantic_doc_id_for_input(&input) {
             inputs.push((doc_id, input));
@@ -714,6 +719,15 @@ impl EmbeddingWorker {
         let mut skipped_count = 0usize;
         let mut input_count = 0usize;
         let mut completed = 0i64;
+        let context = configured_input_context()?;
+        let prepare_message = |message: &crate::storage::sqlite::MessageForEmbedding| {
+            let title = if context == InputContext::TitlePrefix {
+                messages.title_for_message(message.message_id)?
+            } else {
+                None
+            };
+            canonical_message_inputs(message, title.as_deref())
+        };
 
         let planned = messages.visit(&cancelled, &mut |message| {
             if message_id_from_db(message.message_id).is_none() {
@@ -723,7 +737,7 @@ impl EmbeddingWorker {
                 );
             }
             let mut pending = 0usize;
-            for (doc_id, input) in canonical_message_inputs(message)? {
+            for (doc_id, input) in prepare_message(message)? {
                 if !current_doc_ids.insert(doc_id.clone()) {
                     anyhow::bail!(
                         "daemon embedding input contains duplicate canonical document IDs"
@@ -805,7 +819,7 @@ impl EmbeddingWorker {
             };
             let mut inputs = Vec::with_capacity(EMBED_PROGRESS_CHUNK_SIZE);
             let scanned = messages.visit(&cancelled, &mut |message| {
-                for (doc_id, input) in canonical_message_inputs(message)? {
+                for (doc_id, input) in prepare_message(message)? {
                     if !current_doc_ids.contains(&doc_id) {
                         anyhow::bail!("daemon embedding source changed after identity planning");
                     }

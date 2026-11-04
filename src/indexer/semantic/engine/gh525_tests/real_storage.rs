@@ -307,12 +307,12 @@ fn gh525_unlimited_and_partially_filled_selection_match_the_incumbent_encoder() 
             &old.conversations,
             &mut eager,
             |_| true,
-        );
+        )?;
         let (actual, _) = packet_embedding_inputs_from_materialized_canonical_messages(
             &new.conversations,
             &mut new.grouped_messages,
             |_| true,
-        );
+        )?;
         assert_eq!(signature(actual), signature(expected));
     }
     storage.close()?;

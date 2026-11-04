@@ -42,6 +42,7 @@ pub(crate) mod human_readiness_summary;
 pub(crate) mod incident_categories;
 pub(crate) mod incident_redaction;
 pub(crate) mod inline_repair;
+pub mod input_context;
 pub mod lexical_quarantine;
 pub mod lexical_quarantine_diagnostics;
 pub(crate) mod liveness_fixtures;

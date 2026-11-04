@@ -29,6 +29,49 @@ use std::time::Instant;
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const TERMS: [&str; 5] = ["kiwiword", "limeword", "mangoword", "plumword", "pearword"];
+
+#[test]
+fn gh540_semantic_input_context_is_echoed_without_changing_lexical_results() -> TestResult {
+    let corpus = corpus();
+    let expected = corpus.search(TERMS[0], &[])?;
+    let output = corpus
+        .cmd()
+        .env("CASS_SEMANTIC_INPUT_CONTEXT", "title-prefix")
+        .args([
+            "search",
+            TERMS[0],
+            "--mode",
+            "lexical",
+            "--robot",
+            "--robot-meta",
+            "--no-daemon",
+            "--limit",
+            "1000",
+            "--no-maintenance",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        payload["_meta"]["effective"]["semantic_input_context"],
+        "title-prefix"
+    );
+    assert_eq!(payload["_meta"]["search_mode"], "lexical");
+    let actual = payload["hits"]
+        .as_array()
+        .ok_or("missing hits")?
+        .iter()
+        .map(|hit| {
+            message_id(hit["content"].as_str().unwrap_or_default()).ok_or("missing message ID")
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    assert_eq!(actual, expected);
+    Ok(())
+}
 const SESSIONS: usize = 22;
 /// Sessions from this one on are Claude Code sessions; the rest are Codex.
 const CLAUDE_SESSIONS_FROM: usize = 18;
@@ -73,6 +116,7 @@ impl Corpus {
             .env("CODEX_HOME", self.home.join(".codex"))
             .env("CASS_DATA_DIR", &self.data_dir)
             .env("CASS_AUTO_REFRESH", "0")
+            .env_remove("CASS_SEMANTIC_INPUT_CONTEXT")
             .env("CASS_IGNORE_SOURCES_CONFIG", "1")
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
             .env("CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS", "0")

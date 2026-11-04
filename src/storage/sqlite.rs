@@ -8300,8 +8300,11 @@ fn franken_reconcile_shelley_metadata(
             "UPDATE conversations SET workspace_id = ?1, title = ?2, metadata_json = ?3, metadata_bin = ?4 WHERE id = ?5",
             fparams![workspace_id, conv.title.as_deref(), json.as_deref(), binary.as_deref(), conversation_id],
         )?;
-        if workspace_changed {
-            let generation = format!("workspace:{:032x}", rand::random::<u128>());
+        if workspace_changed || title_changed {
+            // A title can participate in semantic input even when message rowids
+            // and bodies do not change. Invalidate both tiers, including an old
+            // title-context index that is not selected by this ingest process.
+            let generation = format!("conversation-metadata:{:032x}", rand::random::<u128>());
             for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
                 tx.execute_compat(
                     "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
@@ -39868,11 +39871,17 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 assert_eq!(saved.title, conv.title);
                 for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
                     let current = storage.semantic_identity_rebuild_generation(tier).unwrap();
-                    if step < 2 {
+                    if step == 0 {
                         assert!(current.is_none());
-                    } else if step == 2 {
+                    } else if step == 1 || step == 2 {
                         assert!(current.is_some());
-                        if generation.is_none() {
+                        if matches!(tier, SemanticIdentityTier::Fast) {
+                            if generation.is_some() {
+                                assert_ne!(
+                                    current, generation,
+                                    "each metadata edit needs a fresh generation"
+                                );
+                            }
                             generation = current.clone();
                         }
                         assert_eq!(current, generation);

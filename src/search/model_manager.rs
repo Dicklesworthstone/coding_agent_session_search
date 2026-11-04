@@ -341,6 +341,7 @@ fn validate_vector_index_contract(
     expected_embedder_id: &str,
     expected_dimension: usize,
 ) -> Result<(), String> {
+    crate::search::canonicalize::configured_input_context().map_err(|error| error.to_string())?;
     let expected_revision =
         expected_vector_space_revision(expected_embedder_id).ok_or_else(|| {
             format!("no current vector-space revision for embedder {expected_embedder_id}")

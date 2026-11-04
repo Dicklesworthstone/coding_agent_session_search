@@ -21,6 +21,11 @@ const MAX_PAGE_BODY_BYTES: usize = 8 * 1024 * 1024;
 pub(super) trait EmbeddingMessageSource {
     fn total_docs(&self) -> usize;
 
+    /// Title context must come from the same pinned archive as message text.
+    fn title_for_message(&self, _message_id: i64) -> Result<Option<String>> {
+        bail!("title-prefix input context requires a canonical SQLite snapshot")
+    }
+
     /// Returns false on cancellation. A visitor failure is an error, never a
     /// successful short scan. Cancellation is checked before each page and row.
     fn visit(
@@ -161,6 +166,18 @@ impl SqliteEmbeddingSource {
 }
 
 impl EmbeddingMessageSource for SqliteEmbeddingSource {
+    fn title_for_message(&self, message_id: i64) -> Result<Option<String>> {
+        let rows = self.connection.query_with_params(
+            "SELECT substr(c.title, 1, ?2) FROM conversations c JOIN messages m ON m.conversation_id = c.id WHERE m.id = ?1",
+            &[
+                SqliteValue::Integer(message_id),
+                SqliteValue::Integer(i64::try_from(crate::search::input_context::TITLE_SCAN_CHARS)?),
+            ],
+        )?;
+        anyhow::ensure!(rows.len() == 1, "title context lost its canonical message");
+        Ok(rows[0].get_typed(0)?)
+    }
+
     fn total_docs(&self) -> usize {
         self.total_docs
     }
@@ -252,6 +269,29 @@ mod tests {
                 SqliteValue::Text(text.to_string().into()),
             ],
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn gh540_title_reads_share_the_message_snapshot_and_are_bounded() -> Result<()> {
+        let (temp, writer) = fixture()?;
+        writer.execute("ALTER TABLE conversations ADD COLUMN title TEXT")?;
+        insert(&writer, 1, 1, "unchanged body")?;
+        writer.execute_with_params(
+            "UPDATE conversations SET title = ?1 WHERE id = 1",
+            &[SqliteValue::Text("界".repeat(20_000).into())],
+        )?;
+        let source = SqliteEmbeddingSource::open(&temp.path().join("archive.db"))?;
+        writer.execute("UPDATE conversations SET title = 'later title' WHERE id = 1")?;
+        let title = source
+            .title_for_message(1)?
+            .ok_or_else(|| anyhow::anyhow!("snapshot title missing"))?;
+        assert_eq!(
+            title.chars().count(),
+            crate::search::input_context::TITLE_SCAN_CHARS
+        );
+        assert!(title.chars().all(|ch| ch == '界'));
+        assert!(source.title_for_message(999).is_err());
         Ok(())
     }
 

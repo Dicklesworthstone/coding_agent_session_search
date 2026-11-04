@@ -31772,6 +31772,18 @@
                     }
                   }
                 },
+                "semantic_input_context": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "body",
+                    "title-prefix",
+                    null
+                  ],
+                  "description": "Selected semantic document input contract; null means an invalid explicit setting. Realized search mode still determines whether semantic retrieval ran."
+                },
                 "auto_corrections": {
                   "type": "array",
                   "items": {
@@ -32886,6 +32898,18 @@
                       "type": "boolean"
                     }
                   }
+                },
+                "semantic_input_context": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "body",
+                    "title-prefix",
+                    null
+                  ],
+                  "description": "Selected semantic document input contract; null means an invalid explicit setting. Realized search mode still determines whether semantic retrieval ran."
                 },
                 "auto_corrections": {
                   "type": "array",

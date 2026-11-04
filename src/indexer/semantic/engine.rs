@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::franken_sync::{
@@ -27,12 +28,16 @@ use crate::indexer::semantic_progress::{
 };
 use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
 use crate::model::types::{Conversation, Message};
-use crate::search::canonicalize::{canonicalize_for_embedding, content_hash, embedding_passages};
+use crate::search::canonicalize::{
+    MAX_EMBED_CHARS, canonicalize_for_embedding, configured_input_context, content_hash,
+    embedding_passages,
+};
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::{
     FastEmbedder, MINILM_VECTOR_SPACE_REVISION, MULTILINGUAL_MINILM_VECTOR_SPACE_REVISION,
 };
 use crate::search::hash_embedder::HashEmbedder;
+use crate::search::input_context::InputContext;
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION, SemanticPolicy};
 use crate::search::semantic_manifest::{
     ArtifactRecord, BuildCheckpoint, SemanticManifest, SemanticShardManifest, SemanticShardRecord,
@@ -83,10 +88,34 @@ const SEMANTIC_PREP_MEMO_ALGORITHM: &str = "semantic_prepare_window";
 const SEMANTIC_PREP_MEMO_VERSION: &str = "canonicalize_for_embedding:v2:stable-content-hash";
 pub const HASH_VECTOR_SPACE_REVISION: &str = "hash-fnv1a-modular-v1:passages-v2";
 
+// Derive from the exact producer revision so future model/engine upgrades also
+// invalidate title-context artifacts, without a second copied producer pin.
+static MINILM_TITLE_REVISION: LazyLock<String> =
+    LazyLock::new(|| format!("{MINILM_VECTOR_SPACE_REVISION}:title-prefix-v1"));
+static MULTILINGUAL_TITLE_REVISION: LazyLock<String> =
+    LazyLock::new(|| format!("{MULTILINGUAL_MINILM_VECTOR_SPACE_REVISION}:title-prefix-v1"));
+static HASH_TITLE_REVISION: LazyLock<String> =
+    LazyLock::new(|| format!("{HASH_VECTOR_SPACE_REVISION}:title-prefix-v1"));
+
 /// Return the exact vector-space revision that is safe for a current embedder.
 /// ID and dimension alone are insufficient because inference-engine changes
 /// can preserve both while changing vector values.
 pub fn expected_vector_space_revision(embedder_id: &str) -> Option<&'static str> {
+    vector_space_revision_for_context(embedder_id, configured_input_context().ok()?)
+}
+
+fn vector_space_revision_for_context(
+    embedder_id: &str,
+    context: InputContext,
+) -> Option<&'static str> {
+    if context == InputContext::TitlePrefix {
+        return match embedder_id {
+            "minilm-384" => Some(MINILM_TITLE_REVISION.as_str()),
+            "multilingual-minilm-384" => Some(MULTILINGUAL_TITLE_REVISION.as_str()),
+            "fnv1a-384" => Some(HASH_TITLE_REVISION.as_str()),
+            _ => None,
+        };
+    }
     match embedder_id {
         "minilm-384" => Some(MINILM_VECTOR_SPACE_REVISION),
         "multilingual-minilm-384" => Some(MULTILINGUAL_MINILM_VECTOR_SPACE_REVISION),
@@ -1445,7 +1474,9 @@ fn embedding_inputs_from_packet_message(
     agent_id: u32,
     workspace_id: u32,
     source_id_hash: u32,
+    title: Option<&str>,
     message: &crate::model::conversation_packet::ConversationPacketMessage,
+    context: InputContext,
 ) -> Vec<EmbeddingInput> {
     let Some(raw_message_id) = message.message_id else {
         tracing::warn!(
@@ -1475,7 +1506,9 @@ fn embedding_inputs_from_packet_message(
             source_id: source_id_hash,
             role: role_code_from_str(&message.role).unwrap_or(ROLE_USER),
             chunk_idx: ordinal as u8,
-            content: content.to_owned(),
+            content: context
+                .document(title, content, MAX_EMBED_CHARS)
+                .into_owned(),
         })
         .collect()
 }
@@ -1483,11 +1516,12 @@ fn embedding_inputs_from_packet_message(
 fn embedding_inputs_from_conversation_packet(
     row: &CanonicalEmbeddingConversationRow,
     packet: &ConversationPacket,
-) -> Vec<EmbeddingInput> {
+) -> Result<Vec<EmbeddingInput>> {
+    let context = configured_input_context()?;
     let agent_id = saturating_u32_from_i64(row.agent_id);
     let workspace_id = saturating_u32_from_i64(row.workspace_id.unwrap_or(0));
     let source_id_hash = crc32fast::hash(packet.payload.provenance.source_id.as_bytes());
-    packet
+    Ok(packet
         .projections
         .semantic
         .message_indices
@@ -1503,12 +1537,14 @@ fn embedding_inputs_from_conversation_packet(
                         agent_id,
                         workspace_id,
                         source_id_hash,
+                        packet.payload.identity.title.as_deref(),
                         message,
+                        context,
                     )
                 })
                 .unwrap_or_default()
         })
-        .collect()
+        .collect())
 }
 
 fn fetch_canonical_embedding_conversations(
@@ -1612,6 +1648,7 @@ pub(crate) fn semantic_inputs_from_packets(
     packets: &[ConversationPacket],
     contexts: &[SemanticPacketContext],
 ) -> Result<Vec<EmbeddingInput>> {
+    let context_policy = configured_input_context()?;
     if packets.len() != contexts.len() {
         anyhow::bail!(
             "semantic_inputs_from_packets length mismatch: {} packets vs {} contexts",
@@ -1636,7 +1673,9 @@ pub(crate) fn semantic_inputs_from_packets(
                 context.agent_id,
                 context.workspace_id,
                 source_id_hash,
+                packet.payload.identity.title.as_deref(),
                 message,
+                context_policy,
             ));
         }
     }
@@ -1793,7 +1832,7 @@ fn fetch_canonical_embedding_batch_inner_with_caps_and_total(
         &conversations,
         &mut grouped_messages,
         |_| true,
-    );
+    )?;
 
     let conversations_in_batch = u64::try_from(conversations.len()).unwrap_or(u64::MAX);
     let cursor_exhausted = !has_more_from_candidate_limit && !stopped_before_candidate;
@@ -2050,12 +2089,10 @@ where
     let conversations = fetch_canonical_embedding_conversations(storage, conversation_ids)?;
     let mut grouped_messages =
         storage.fetch_messages_for_lexical_rebuild_batch(conversation_ids, None, None)?;
-    Ok(
-        packet_embedding_inputs_from_materialized_canonical_messages(
-            &conversations,
-            &mut grouped_messages,
-            include_message,
-        ),
+    packet_embedding_inputs_from_materialized_canonical_messages(
+        &conversations,
+        &mut grouped_messages,
+        include_message,
     )
 }
 
@@ -2063,7 +2100,7 @@ fn packet_embedding_inputs_from_materialized_canonical_messages<F>(
     conversations: &[CanonicalEmbeddingConversationRow],
     grouped_messages: &mut HashMap<i64, Vec<Message>>,
     mut include_message: F,
-) -> (Vec<EmbeddingInput>, Option<i64>)
+) -> Result<(Vec<EmbeddingInput>, Option<i64>)>
 where
     F: FnMut(&Message) -> bool,
 {
@@ -2092,10 +2129,10 @@ where
         inputs.extend(embedding_inputs_from_conversation_packet(
             conversation,
             &packet,
-        ));
+        )?);
     }
 
-    (inputs, raw_max_message_id)
+    Ok((inputs, raw_max_message_id))
 }
 
 pub(crate) fn packet_embedding_inputs_from_storage_since(
@@ -2510,6 +2547,13 @@ impl SemanticIndexer {
     ) -> Result<Self> {
         use crate::search::external_embedder::{EXTERNAL_EMBEDDER, ExternalEmbedder};
 
+        let context = configured_input_context()?;
+        anyhow::ensure!(
+            context == InputContext::Body
+                || !embedder_type.trim().eq_ignore_ascii_case(EXTERNAL_EMBEDDER),
+            "title-prefix input context currently supports local embedders only"
+        );
+
         if embedder_type.trim().eq_ignore_ascii_case(EXTERNAL_EMBEDDER) {
             let embedder =
                 ExternalEmbedder::from_env_with_cancel(std::sync::Arc::clone(&cancelled))
@@ -2554,6 +2598,10 @@ impl SemanticIndexer {
         config: crate::search::external_embedder::ExternalEmbeddingConfig,
         cancelled: crate::search::external_embedder::CancelCheck,
     ) -> Result<Self> {
+        anyhow::ensure!(
+            configured_input_context()? == InputContext::Body,
+            "title-prefix input context currently supports local embedders only"
+        );
         let embedder = crate::search::external_embedder::ExternalEmbedder::connect(
             config,
             std::sync::Arc::clone(&cancelled),
@@ -3972,6 +4020,26 @@ impl SemanticIndexer {
         }
         let mut snapshot = FsVectorIndex::open_writer(&snapshot_path)
             .map_err(|err| anyhow::anyhow!("open semantic backfill candidate: {err}"))?;
+        // Known input-policy switches require a fresh canonical pass, including
+        // when the candidate belongs to an unfinished checkpoint. Never relabel
+        // old vectors or resume an old-policy cursor into the new representation.
+        if snapshot.embedder_id() == self.embedder_id()
+            && snapshot.dimension() == self.embedder_dimension()
+            && snapshot.embedder_revision() != self.vector_space_revision()?
+            && [InputContext::Body, InputContext::TitlePrefix]
+                .into_iter()
+                .any(|context| {
+                    vector_space_revision_for_context(self.embedder_id(), context)
+                        == Some(snapshot.embedder_revision())
+                })
+        {
+            drop(snapshot);
+            tracing::info!(
+                reason = "semantic_input_context_changed",
+                "rebuilding semantic coverage from the canonical archive"
+            );
+            return self.build_backfill_from_storage(storage, data_dir, manifest, plan, caps, sink);
+        }
         // Historical hash indexes used the generic "1.0" revision. Those
         // vectors cannot be appended to or served as the current space, but
         // an explicit canonical backfill is the supported way to replace
@@ -4626,6 +4694,85 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn gh540_title_context_covers_every_passage_and_preserves_provenance() -> Result<()> {
+        let message = crate::model::conversation_packet::ConversationPacketMessage {
+            message_id: Some(42),
+            idx: 3,
+            role: "assistant".into(),
+            author: None,
+            created_at: Some(1700000000000),
+            content: format!(
+                "{}unique tail evidence",
+                "reviewed body context ".repeat(200)
+            ),
+            extra_json: serde_json::Value::Null,
+            snippets: Vec::new(),
+        };
+        let project = |title, context| {
+            embedding_inputs_from_packet_message(9, 2, 3, 4, title, &message, context)
+        };
+        let body = project(Some("SSH commit signing"), InputContext::Body);
+        let titled = project(Some("SSH commit signing"), InputContext::TitlePrefix);
+        let renamed = project(
+            Some("Postgres password rotation"),
+            InputContext::TitlePrefix,
+        );
+        assert_eq!(
+            body.len(),
+            crate::search::canonicalize::MAX_EMBEDDING_PASSAGES
+        );
+        for ((body, titled), renamed) in body.iter().zip(&titled).zip(&renamed) {
+            assert!(
+                titled
+                    .content
+                    .starts_with("title: SSH commit signing\ntext: ")
+            );
+            assert!(titled.content.ends_with(&body.content));
+            assert_eq!(
+                (
+                    titled.message_id,
+                    titled.agent_id,
+                    titled.workspace_id,
+                    titled.source_id,
+                    titled.role,
+                    titled.created_at_ms,
+                    titled.chunk_idx
+                ),
+                (
+                    42,
+                    2,
+                    3,
+                    4,
+                    crate::search::vector_index::ROLE_ASSISTANT,
+                    1700000000000,
+                    body.chunk_idx
+                )
+            );
+            assert_ne!(
+                semantic_doc_id_for_input(titled),
+                semantic_doc_id_for_input(renamed)
+            );
+        }
+        assert!(
+            titled
+                .last()
+                .is_some_and(|input| input.content.contains("unique tail evidence"))
+        );
+        for embedder in ["fnv1a-384", "minilm-384", "multilingual-minilm-384"] {
+            assert_ne!(
+                vector_space_revision_for_context(embedder, InputContext::Body),
+                vector_space_revision_for_context(embedder, InputContext::TitlePrefix)
+            );
+        }
+        let indexer = SemanticIndexer::new("hash", None)?;
+        assert_ne!(
+            indexer.embed_messages(&titled)?[0].embedding,
+            indexer.embed_messages(&renamed)?[0].embedding
+        );
+        Ok(())
+    }
 
     #[test]
     fn hnsw_maintenance_refuses_an_incompatible_vector_contract() -> Result<()> {

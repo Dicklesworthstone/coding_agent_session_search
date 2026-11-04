@@ -15,6 +15,207 @@ use std::path::PathBuf;
 
 mod util;
 
+/// Real canonical rows and fresh CLI owners; no connector discovery, model
+/// download, network provider, or process-global environment mutation.
+#[test]
+fn gh540_title_context_cli_roundtrip_rebuilds_and_reconciles() -> anyhow::Result<()> {
+    use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use coding_agent_search::search::vector_index::{
+        VectorIndex, parse_semantic_doc_id, vector_index_path,
+    };
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use std::collections::BTreeMap;
+
+    let root = tempfile::tempdir()?;
+    let data = root.path().join("data");
+    fs::create_dir_all(&data)?;
+    let db = data.join("agent_search.db");
+    let mut conversations = ["SSH commit signing", "Postgres password rotation"]
+        .iter()
+        .enumerate()
+        .map(|(i, title)| Conversation {
+            id: None,
+            agent_slug: "shelley".into(),
+            workspace: None,
+            external_id: Some(format!("gh540-{i}")),
+            title: Some((*title).into()),
+            source_path: root.path().join(format!("source-{i}.jsonl")),
+            started_at: Some(1700000000000),
+            ended_at: Some(1700000000000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"source":"shelley","shelley":{}}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1700000000000),
+                content: "Applied the configuration and confirmed it works.".into(),
+                extra_json: Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        })
+        .collect::<Vec<_>>();
+    let (agent_id, conversation_ids) = {
+        let storage = FrankenStorage::open(&db)?;
+        let agent = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "shelley".into(),
+            name: "Shelley".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let mut ids = Vec::new();
+        for conversation in &conversations {
+            ids.push(
+                storage
+                    .insert_conversation_tree(agent, None, conversation)?
+                    .conversation_id,
+            );
+        }
+        (agent, ids)
+    };
+    let backfill = |context: &str, bounded: bool| {
+        cargo_bin_cmd!("cass")
+            .current_dir(root.path())
+            .env("CASS_SEMANTIC_INPUT_CONTEXT", context)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .args([
+                "models",
+                "backfill",
+                "--tier",
+                "fast",
+                "--embedder",
+                "hash",
+                "--max-batches",
+                if bounded { "1" } else { "8" },
+                "--batch-conversations",
+                if bounded { "1" } else { "64" },
+                "--json",
+                "--data-dir",
+            ])
+            .arg(&data)
+            .arg("--db")
+            .arg(&db)
+            .output()
+    };
+    let run = |context: &str| -> anyhow::Result<()> {
+        let output = backfill(context, false)?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    };
+    let vector_snapshot = || -> anyhow::Result<_> {
+        let index = VectorIndex::open_read_only(&vector_index_path(&data, "fnv1a-384"))?;
+        anyhow::ensure!(index.record_count() == 2 && index.wal_record_count() == 0);
+        let mut records = BTreeMap::new();
+        for ordinal in 0..index.record_count() {
+            let id = parse_semantic_doc_id(index.doc_id_at(ordinal)?)
+                .ok_or_else(|| anyhow::anyhow!("invalid canonical identity"))?;
+            let vector = index
+                .vector_at_f32(ordinal)?
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>();
+            records.insert(id.message_id, (id.content_hash, vector));
+        }
+        Ok((index.embedder_revision().to_string(), records))
+    };
+    run("body")?;
+    let body = vector_snapshot()?;
+    let vectors = body
+        .1
+        .values()
+        .map(|(_, vector)| vector)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        vectors[0], vectors[1],
+        "identical bodies must have identical hash-control vectors"
+    );
+    let partial = backfill("title-prefix", true)?;
+    anyhow::ensure!(
+        partial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&partial.stderr)
+    );
+    let manifest = coding_agent_search::search::semantic_manifest::SemanticManifest::load(&data)?
+        .ok_or_else(|| anyhow::anyhow!("partial backfill manifest missing"))?;
+    assert!(
+        manifest.checkpoint.is_some(),
+        "fixture must leave a real interrupted-policy checkpoint"
+    );
+    run("body")?;
+    assert_eq!(
+        vector_snapshot()?,
+        body,
+        "a foreign input-policy cursor must restart from canonical data"
+    );
+    run("title-prefix")?;
+    let prefixed = vector_snapshot()?;
+    assert_ne!(body.0, prefixed.0);
+    assert!(prefixed.0.ends_with(":title-prefix-v1"));
+    assert_eq!(
+        body.1.keys().collect::<Vec<_>>(),
+        prefixed.1.keys().collect::<Vec<_>>()
+    );
+    let vectors = prefixed
+        .1
+        .values()
+        .map(|(_, vector)| vector)
+        .collect::<Vec<_>>();
+    assert_ne!(
+        vectors[0], vectors[1],
+        "titles must distinguish identical bodies"
+    );
+    conversations[0].title = Some("Restore a deleted Git branch".into());
+    {
+        let storage = FrankenStorage::open(&db)?;
+        storage.insert_conversation_tree(agent_id, None, &conversations[0])?;
+        assert_eq!(storage.get_last_embedded_message_id("fnv1a-384")?, None);
+        for id in &conversation_ids {
+            assert_eq!(
+                storage.fetch_messages(*id)?.len(),
+                1,
+                "context must not manufacture messages"
+            );
+        }
+    }
+    run("title-prefix")?;
+    let edited = vector_snapshot()?;
+    let changes = edited
+        .1
+        .iter()
+        .filter(|&(id, value)| prefixed.1.get(id) != Some(value))
+        .count();
+    assert_eq!(
+        changes, 1,
+        "only the renamed conversation's vector should change"
+    );
+    run("body")?;
+    assert_eq!(
+        vector_snapshot()?,
+        body,
+        "switching back must restore body-only inputs"
+    );
+    let path = vector_index_path(&data, "fnv1a-384");
+    let before = fs::read(&path)?;
+    let invalid = backfill("typo", false)?;
+    assert!(!invalid.status.success());
+    assert_eq!(
+        fs::read(&path)?,
+        before,
+        "invalid context must not rewrite the index"
+    );
+    Ok(())
+}
+
 /// Helper to create Codex session with modern envelope format.
 fn make_codex_session(
     root: &std::path::Path,

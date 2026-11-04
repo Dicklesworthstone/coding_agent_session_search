@@ -29,6 +29,17 @@ pub const EMBEDDING_PASSAGE_CHARS: usize = 510;
 /// Bound vector growth independently of the size of a source message.
 pub const MAX_EMBEDDING_PASSAGES: usize = 8;
 
+/// Resolve the document representation independently of model selection.
+/// Invalid explicit settings must not silently build a body-only index.
+pub fn configured_input_context() -> anyhow::Result<super::input_context::InputContext> {
+    use super::input_context::InputContext;
+    match dotenvy::var("CASS_SEMANTIC_INPUT_CONTEXT") {
+        Ok(value) => InputContext::parse(&value).map_err(anyhow::Error::msg),
+        Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => Ok(InputContext::Body),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Select deterministic raw passages before markdown collapse or truncation.
 ///
 /// Short messages retain their exact input and chunk-zero identity. Long
