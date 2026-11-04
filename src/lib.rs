@@ -6431,7 +6431,7 @@ fn detect_command_intent(raw_str: &str) -> String {
         }
         Some("sessions" | "session" | "current") => "discover or list session files",
         Some("robot-docs" | "docs" | "help-robot" | "robotdocs") => "get robot-mode documentation",
-        Some("stats" | "ls" | "list" | "info" | "summary") => "show statistics",
+        Some("stats" | "ls" | "list" | "info" | "summary") => "showing statistics",
         Some("view" | "show" | "get" | "read" | "expand") => "view a specific session",
         Some("capabilities" | "caps" | "cap" | "introspect" | "inspect" | "intro") => {
             "discover tool capabilities"
@@ -6456,7 +6456,7 @@ fn detect_command_intent(raw_str: &str) -> String {
     } else if raw_str.contains("doc") || raw_str.contains("help") || raw_str.contains("robot") {
         "get robot-mode documentation".to_string()
     } else if raw_str.contains("stats") || raw_str.contains("ls") || raw_str.contains("list") {
-        "show statistics".to_string()
+        "showing statistics".to_string()
     } else if raw_str.contains("index")
         || raw_str.contains("rebuild")
         || raw_str.contains("reindex")
@@ -6583,7 +6583,32 @@ fn get_contextual_hints(intent: &str, raw_str: &str) -> Vec<String> {
     }
 
     if hints.is_empty() {
-        hints.push(format!("For {intent}, try: cass --robot-help"));
+        const SUBCOMMANDS_WITH_HELP: &[&str] = &[
+            "index",
+            "search",
+            "sessions",
+            "robot-docs",
+            "stats",
+            "view",
+            "expand",
+            "capabilities",
+            "introspect",
+            "diag",
+            "doctor",
+            "status",
+            "health",
+            "models",
+        ];
+        let subcommand = raw_str
+            .split_whitespace()
+            .find(|token| !token.starts_with('-'))
+            .filter(|token| SUBCOMMANDS_WITH_HELP.contains(token));
+        hints.push(match subcommand {
+            Some(sub) => format!(
+                "Run `cass {sub} --help` for the flags `{sub}` accepts, or `cass robot-docs commands` for every command"
+            ),
+            None => format!("For {intent}, try: cass --robot-help"),
+        });
     }
 
     hints

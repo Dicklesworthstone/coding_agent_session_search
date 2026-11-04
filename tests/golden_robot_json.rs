@@ -1932,6 +1932,30 @@ fn stats_json_missing_db_error_envelope_matches_golden() {
 }
 
 #[test]
+fn parse_error_robot_envelope_matches_golden() {
+    // Bead robot-parse-error-envelope-878z7: an unknown flag in robot mode is
+    // the most common agent mistake. It exits 2 with the same documented
+    // `{"error": {code, kind, message, hint, retryable}}` envelope on stderr
+    // as every other failure, with the parse guidance (detail, examples,
+    // hints, common mistakes, flag syntax) nested inside `error`. Before the
+    // fix the payload had a string `error`, a top-level snake_case kind and
+    // `cass view` examples for `stats`; no golden pinned it.
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let out = cass_cmd(test_home.path())
+        .args(["stats", "--json", "--nonexistent-flag"])
+        .output()
+        .expect("run cass stats --json --nonexistent-flag");
+    assert_eq!(out.status.code(), Some(2), "parse errors exit 2");
+    assert!(out.stdout.is_empty(), "stdout stays data-only");
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim())
+        .expect("parse error envelope is one JSON object on stderr");
+    let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
+    let scrubbed = scrub_robot_json(&canonical, test_home.path());
+    assert_golden("robot/parse_error_envelope.json.golden", &scrubbed);
+}
+
+#[test]
 fn stats_json_happy_path_matches_golden() -> Result<(), Box<dyn Error>> {
     // `coding_agent_session_search-zefv4`: the error envelope has been
     // pinned (stats_missing_db* goldens) but the success envelope had no

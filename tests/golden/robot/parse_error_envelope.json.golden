@@ -1,0 +1,36 @@
+{
+  "error": {
+    "code": 2,
+    "kind": "usage",
+    "message": "unexpected argument '--nonexistent-flag' found",
+    "hint": "Run `cass stats --help` for the flags `stats` accepts, or `cass robot-docs commands` for every command",
+    "retryable": false,
+    "detail": "error: unexpected argument '--nonexistent-flag' found\n\nUsage: cass stats --json\n\nFor more information, try '--help'.\n",
+    "examples": [
+      "cass stats --robot",
+      "cass stats --robot --source local",
+      "cass stats --robot --by-source"
+    ],
+    "hints": [
+      "Run `cass stats --help` for the flags `stats` accepts, or `cass robot-docs commands` for every command"
+    ],
+    "common_mistakes": [
+      {
+        "wrong": "cass stats | jq .",
+        "correct": "cass stats --json | jq ."
+      }
+    ],
+    "flag_syntax": {
+      "correct": [
+        "--limit 5",
+        "--robot",
+        "--json"
+      ],
+      "incorrect": [
+        "--limt 5",
+        "-limit 5",
+        "--Limit"
+      ]
+    }
+  }
+}
