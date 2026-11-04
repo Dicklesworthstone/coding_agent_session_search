@@ -4068,10 +4068,11 @@ fn doctor_check_rejects_mutating_or_rebuild_flags() {
     assert!(!out.status.success(), "doctor check must reject --fix");
     let payload = doctor_error_json(&out.stderr);
     assert_eq!(out.status.code(), Some(2));
-    assert_eq!(payload["status"].as_str(), Some("error"));
-    assert_eq!(payload["kind"].as_str(), Some("argument_parsing"));
+    assert_eq!(test_error_code(&payload), Some(2));
+    assert_eq!(payload["error"]["kind"].as_str(), Some("usage"));
+    assert_eq!(payload["error"]["retryable"].as_bool(), Some(false));
     assert!(
-        payload["error"]
+        payload["error"]["detail"]
             .as_str()
             .is_some_and(|message| message.contains("--check") && message.contains("--fix")),
         "parse error should explain the rejected mutating check flags: {payload:#}"

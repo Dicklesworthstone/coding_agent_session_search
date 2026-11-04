@@ -130,6 +130,9 @@ const NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = DEFAULT_STREAMING_BATCH_LIMIT
 const NON_WATCH_INGEST_CHUNK_SIZE_MAX: usize = 128;
 static ROBOT_TRACE_INGEST_ENABLED: AtomicBool = AtomicBool::new(false);
 static ROBOT_TRACE_INGEST_BATCH_N: AtomicU64 = AtomicU64::new(0);
+/// Set only by `cass index --background` without `--semantic`; see
+/// [`set_background_semantic_delta_enabled`].
+static BACKGROUND_SEMANTIC_DELTA_ENABLED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_SESSION_SOURCE_SKIP_OBSERVED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1929,6 +1932,46 @@ pub fn set_robot_trace_ingest_enabled(enabled: bool) -> bool {
     }
     let _ = crate::storage::sqlite::set_message_lookup_trace_enabled(enabled);
     previous
+}
+
+/// Let a background index run extend an existing semantic index by the
+/// messages it just ingested (bead 962e8, GH #458).
+///
+/// Stale-on-read catch-up, the scheduler's incremental job and the daemon
+/// timer all run `cass index --background` without `--semantic`. Every
+/// ingest moves the archive fingerprint past the published semantic index,
+/// and search then refuses semantic results until someone reruns
+/// `cass index --semantic`, so semantic search was off almost all the time
+/// on an active archive. When enabled, a run applies only the existing
+/// one-shot delta path, and only when that path is eligible: never the bulk
+/// re-embed, never an external embedder, and never a failed lexical run.
+/// Returns the previous value so the caller can restore it.
+pub fn set_background_semantic_delta_enabled(enabled: bool) -> bool {
+    BACKGROUND_SEMANTIC_DELTA_ENABLED.swap(enabled, Ordering::Relaxed)
+}
+
+/// The one-shot delta path's own preconditions (see the `--semantic` branch of
+/// `run_index`): the requested embedder's index exists under the current
+/// contract, no identity rebuild is pending, and the embed watermark trails
+/// the newest message. Anything else would need the bulk pass, which a
+/// background run never starts.
+fn background_semantic_delta_eligible(
+    storage: &FrankenStorage,
+    data_dir: &Path,
+    embedder: &str,
+) -> Result<bool> {
+    if storage.semantic_identity_rebuild_required(semantic_identity_tier_for_requested_embedder(
+        embedder,
+    ))? {
+        return Ok(false);
+    }
+    if !semantic_index_has_current_contract(data_dir, embedder) {
+        return Ok(false);
+    }
+    Ok(matches!(
+        (storage.get_last_embedded_message_id()?, storage.max_message_id()?),
+        (Some(watermark), Some(max_id)) if watermark < max_id
+    ))
 }
 
 #[derive(Debug)]
@@ -19733,6 +19776,65 @@ fn run_index_with_storage_ownership(
                 vector_count,
                 vector_count,
             );
+        }
+    } else if BACKGROUND_SEMANTIC_DELTA_ENABLED.load(Ordering::Relaxed)
+        && !opts.full
+        && !opts.watch
+        && !targeted_semantic_watch_once
+        && opts.embedder != "external"
+    {
+        // Delta-only and non-fatal (see set_background_semantic_delta_enabled):
+        // the bulk pass below `opts.semantic` is deliberately unreachable here.
+        match background_semantic_delta_eligible(&storage, &opts.data_dir, &opts.embedder) {
+            Ok(true) => {
+                if let Err(err) =
+                    index_run_lock.set_phase(initial_lock_mode, "semantic:background-delta")
+                {
+                    tracing::debug!(
+                        error = %err,
+                        "background semantic delta breadcrumb write failed (continuing)"
+                    );
+                }
+                let delta_started_at_ms = semantic_indexing_now_ms();
+                let storage_cell = Mutex::new(storage);
+                let outcome =
+                    incremental_semantic_embed(&opts.embedder, &opts.data_dir, &storage_cell);
+                storage = storage_cell
+                    .into_inner()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match outcome.and_then(|embedded| {
+                    finalize_one_shot_semantic_delta(
+                        &opts.embedder,
+                        &opts.data_dir,
+                        &storage,
+                        delta_started_at_ms,
+                    )
+                    .map(|doc_count| (embedded, doc_count))
+                }) {
+                    Ok((embedded, doc_count)) => tracing::info!(
+                        embedder = %opts.embedder,
+                        embedded,
+                        doc_count,
+                        "background semantic delta kept the semantic index current"
+                    ),
+                    Err(err) => tracing::warn!(
+                        embedder = %opts.embedder,
+                        error = %err,
+                        "background semantic delta failed; lexical indexing is unaffected \
+                         and `cass index --semantic` retries it"
+                    ),
+                }
+            }
+            Ok(false) => tracing::debug!(
+                embedder = %opts.embedder,
+                "background semantic delta not eligible: no current semantic index with a \
+                 trailing embed watermark"
+            ),
+            Err(err) => tracing::warn!(
+                embedder = %opts.embedder,
+                error = %err,
+                "background semantic delta eligibility check failed; skipping it"
+            ),
         }
     }
 

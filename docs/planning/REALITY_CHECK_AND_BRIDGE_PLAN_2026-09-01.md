@@ -15,8 +15,8 @@ the release are fixed on HEAD:
 
 HEAD is no slower in wall time and uses about 6% more peak RSS on this corpus. On
 both binaries, watch takes two to three minutes, not the documented 5 s, to make an
-appended message searchable. On the scheduler's backfill path, one ordinary ingest
-turns semantic search off until the next backfill (GH #458, reproduced on HEAD).
+appended message searchable. With real MiniLM, any ordinary ingest turns semantic
+search off until `cass index --semantic` reruns (GH #458, reproduced on both).
 
 v0.10.0 is still the latest release after 32 days. Main is 838 commits ahead. 14 of
 the 35 open GitHub issues are fixed only on main, and six owner comments promised those fixes "in the next
@@ -88,7 +88,7 @@ No peer bead was claimed or closed.
 | `index --watch`, append to an active session | searchable after ~123 s (189 s on a second run); ignored SIGINT for 5 s, SIGTERM needed | searchable after ~139 s (polls every ~30 s); same SIGINT behaviour | README's 2 s debounce / 5 s maximum wait is not what users get |
 | Real TUI in a pty: launch, type the marker, Esc, Ctrl+C | first launch: query typed at 6 s not drawn within 4.6 s; 3 later launches drew the hit | same (1 miss on first launch, 2 passes) | Search-as-you-type works warm; a cold first launch can drop early keystrokes |
 | Interleaved `index --full` ABAB, fresh data dirs | 31.7 s, 27.5 s; 676, 690 MB | 27.7 s, 27.0 s; 729, 728 MB | Wall time within noise; HEAD +~6% peak RSS. A small corpus, not a scale claim |
-| Real MiniLM, `models install` + `index --semantic`, paraphrase query (lexical: 0 hits), then a one-message ingest | before: semantic/hybrid top-2 correct; **after: semantic exit 15, hybrid lexical 0 hits** | before: correct; **after: unchanged, still semantic** | The README first-run path keeps semantic through ingest only on HEAD: another unreleased fix |
+| Real MiniLM, `models install` + `index --semantic`, paraphrase query (lexical: 0 hits), then a one-message ingest | before: semantic/hybrid top-2 correct; **after: semantic exit 15, hybrid lexical 0 hits** | identical (fresh data dir). An earlier HEAD run that appeared to keep serving reused a data dir, so its "ingest" added no row; corrected | Any ordinary ingest switches semantic search off on both binaries. `cass index --semantic` restores it (about 2 s here) |
 | Real MiniLM, `models install` + `models backfill --tier quality`, same ingest | before: correct; after: semantic exit 15, hybrid lexical **0 hits** | identical | #458 reproduced on both (180 messages); not a regression |
 | Robot parse error (`models install --json`, `stats --json --bogus`, `search foo --robot --bogus-flag`) | exit 2, `{status, error:<string>, kind:"argument_parsing", examples…}`; `models install` / `stats` examples suggest `cass view` | identical | Undocumented second envelope for exit 2 (new bead) |
 | Data dir after the journey | ~405 MB from 8.7 MB of sources: live lexical 155 MB, one retained publish backup 172 MB, DB ~48 MB, raw mirror 13 MB | live lexical 172 MB (+11%) | ~13 KB of lexical per short message, doubled by the default one-generation backup |
@@ -139,7 +139,7 @@ measured rows:
 | # | Promise | 10-27 | 2026-11-03 evidence | Owner |
 |---|---|---|---|---|
 | 10 | Correct Boolean/phrase/wildcard/filter search | WORKING* (basic lexical) | **WORKING on both binaries** (title-free probe, 6/6, `_meta.effective.query_structure` matches the executed grouping). Undocumented semantics: message search also matches the conversation title (first prompt), so `x NOT y` excludes every message of a conversation whose first prompt contains `y` | `2l1b0.26` (document it) |
-| 12 | Default hybrid with explicit degradation | WORKING* | Fail-open is unchanged on both binaries: requested hybrid, realized lexical, explicit reason; `--mode semantic` exits 15. **With real MiniLM on HEAD** (30 sessions / 180 messages; paraphrase query "automobile ignition failure low power", which lexical misses): after `models install` + `index --semantic`, semantic and hybrid rank the car/battery sessions first. On HEAD they **keep doing so after an ordinary one-message ingest**; on v0.10.0 the same ingest switches semantic off (exit 15, hybrid lexical 0 hits). After `models install` + **`models backfill --tier quality`** (the path the nightly scheduler runs), the same one-message ingest makes `--mode semantic` exit 15 ("semantic assets not current") and default hybrid return **0 hits** via lexical. That is GH #458, reproduced on both binaries: for a scheduler user, semantic search is off between nightly backfills | `962e8` (repro + design comments filed), `ds7uy.*` |
+| 12 | Default hybrid with explicit degradation | WORKING* | Fail-open is unchanged on both binaries: requested hybrid, realized lexical, explicit reason; `--mode semantic` exits 15. **With real MiniLM on HEAD** (30 sessions / 180 messages; paraphrase query "automobile ignition failure low power", which lexical misses): after `models install` + `index --semantic`, semantic and hybrid rank the car/battery sessions first. **On both binaries, the same one-message ingest then switches semantic off** (exit 15, hybrid lexical 0 hits), on this path and on the backfill path, until `cass index --semantic` reruns. After `models install` + **`models backfill --tier quality`** (the path the nightly scheduler runs), the same one-message ingest makes `--mode semantic` exit 15 ("semantic assets not current") and default hybrid return **0 hits** via lexical. That is GH #458, reproduced on both binaries. Every plain `cass index` changes the fingerprint (`content-v1:{conversations}:{max conversation id}:{max message id}`), including stale-on-read catch-up and the scheduler's 15-minute job, so on an active machine semantic search is off nearly all the time | `962e8` (repro + design comments filed), `ds7uy.*` |
 | 14 | Progressive quality/fast refinement | PARTIAL | Unchanged and fail-closed: `vector_index.rs:223-228` hard-codes `owner_backed_progressive_reader: false`; hybrid hard-codes `SemanticTierMode::Single` (`query.rs:7682`); `two_tier_search.rs` has no production caller; the TUI's `CASS_TUI_TWO_TIER` path falls through to exact single-tier | `ds7uy.1`–`.5` |
 | 16 | ANN truthful readiness | PARTIAL | `hnsw_ready` is now hard-coded `false` (`asset_state.rs:984-988`, ecfaafe5) and presence is `hnsw_present`; **README.md:323 still says `hnsw_ready` means the sidecar is present.** `append_hnsw_generation` (92b93c04) has only test callers | `wfm4e`, `of9i7`, `2l1b0.26` |
 | 27 | Safe HTML/generic export | PARTIAL (`.84` open) | **Shipped defect, fixed on HEAD.** v0.10.0 HTML (77,534 bytes) and Markdown exports contain both synthetic credentials verbatim, with no `[REDACTED]`. HEAD: neither credential, 5 / 3 `[REDACTED]` markers, the session marker preserved, receipt `{policy: redact-secrets, redaction_applied: true}` | `.84` (blocked on UBS only) |
@@ -240,14 +240,13 @@ shipped fix until blocker 1 or 2 moves.
      refusal.
 
    The same journey passes on HEAD, which also fixes the shipped export leak and the
-   archive-envelope gap, and keeps `index --semantic` vectors serving across an
-   ordinary ingest (v0.10.0 does not). Real MiniLM semantic and hybrid search answer
-   a paraphrase query that lexical misses.
+   archive-envelope gap. Real MiniLM semantic and hybrid search answer a paraphrase
+   query that lexical misses, until the next ingest.
 2. **What does not:**
    - Users run a release whose exports carry credentials verbatim.
-   - On the scheduler's backfill path, one ordinary ingest switches semantic search off
-     until the next backfill (#458, reproduced on HEAD), and progressive refinement is
-     fail-closed.
+   - Any ordinary ingest switches semantic search off until `cass index --semantic`
+     reruns. That includes stale-on-read catch-up and the scheduler's 15-minute job
+     (#458, reproduced on both binaries). Progressive refinement is fail-closed.
    - Robot argument-parsing errors (exit 2) use an undocumented envelope: `error` is a
      string and `kind` is `argument_parsing`, on both binaries.
    - Watch freshness for an active session is 2–3 minutes, not 5 s.
@@ -284,7 +283,7 @@ shipped fix until blocker 1 or 2 moves.
 | 2 | **Restore native build capacity** | `dsr health all` shows a healthy host per target. The before-output (0/3) is retained as the negative pair; floors are not lowered | new bead `release-infra-dsr-capacity`; owner action (no deletion without permission) |
 | 3 | **Ship 0.11.0 from main** | Journey smoke on each dsr target, with the previous release and the candidate in the same invocation; release notes list known reds and beads; all 14 FIXED_UNRELEASED issues and six promise threads get the version | `yrjna`, `.25` (as narrowed by 1); `p3gh0` re-justified or dropped |
 | 4 | **Make shipping routine** | Two consecutive cadence releases at most 16 days apart, each with a journey receipt per target and a zero-new-critical UBS delta | new bead `release-train-ratchet` (blocked by 1 and 2) |
-| 5 | **Keep semantic serving through ingest on the backfill path** | Serve a quality generation by 2P-set coverage instead of exact fingerprint equality. Named probe: `sem_probe_backfill.sh`, where the paraphrase hit must survive a one-message ingest on the backfill path (it fails today). Old semantic-only hit still returned after a 68-message ingest; negatives for forgotten and Codebuff-updated conversations | `962e8` (design comment filed), `ds7uy.*` |
+| 5 | **Keep semantic serving through ingest** | Serve a quality generation by 2P-set coverage instead of exact fingerprint equality. Named probe: `sem_probe_backfill.sh`, where the paraphrase hit must survive a one-message ingest on the backfill path (it fails today). Old semantic-only hit still returned after a 68-message ingest; negatives for forgotten and Codebuff-updated conversations | `962e8` (design comment filed), `ds7uy.*` |
 | 6 | **Seconds, not minutes, for active sessions under watch** | Stable-prefix ingest for append-only JSONL. `watch_appended_jsonl_line_searchable_within_debounce` (<10 s); negatives for a partial trailing line (ingested exactly once), rewritten-in-place sources (still deferred) and truncation (no duplicates) | new bead `watch-stable-prefix-ingest` |
 | 7 | **One error envelope for robot callers** | `parse_error_envelope_matches_documented_shape`: exit 2 parse errors carry `error{code,kind,message,hint,retryable}` with the helpful extras nested. Negative: `models install --json` examples must start with `cass models`. Golden added with a GOLDEN-CHANGE note | new bead `robot-parse-error-envelope` |
 | 8 | **Owner archive back in service on current main** | `health` 0 and `last_indexed_at` < 24 h on the restored host, and a search for today's session hits (negative: before the restore it misses). Peak RSS, wall time and disk growth recorded on `.72`/`.46` | new bead `dogfood-owner-archive` |
@@ -303,9 +302,9 @@ answer.
    incumbent and runs it live in the same invocation as the candidate, which is
    AGENTS.md's vs-incumbent rule applied to releases. That turned item 3 into item 4.
 2. **Round 2: attack where users lose, not where proof is easy.** The largest gap
-   between README promise and runtime is that, for a scheduler user, default hybrid is
-   lexical most of the day: the backfill-published tier is refused after any ingest.
-   This was reproduced with real MiniLM on HEAD. The second is minute-scale watch
+   between README promise and runtime is that default hybrid is lexical nearly all the
+   time on an active archive, because any ingest makes the semantic tier unservable.
+   This was reproduced with real MiniLM on both binaries. The second is minute-scale watch
    latency for the session an agent is in. Both are cheaper to fix than to keep proving: one is a validity
    predicate, the other a stable-prefix watermark on receipts that already exist. That
    added items 5 and 6.

@@ -6330,10 +6330,29 @@ fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[S
     let intent = detect_command_intent(&raw_str);
 
     if is_robot {
+        // The documented robot error envelope: {"error": {code, kind, message,
+        // hint, retryable}}. The parse-specific guidance travels inside it so
+        // a caller branching on `.error.kind` handles exit 2 like every other
+        // failure (bead robot-parse-error-envelope-878z7).
+        let detail = err.to_string();
+        let message = detail
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| line.trim_start_matches("error:").trim().to_string())
+            .filter(|line| !line.is_empty())
+            .unwrap_or_else(|| "could not parse arguments".to_string());
+        let hints = get_contextual_hints(&intent, &raw_str);
+        let hint = hints.first().cloned().unwrap_or_else(|| {
+            "Run `cass --help` or `cass robot-docs commands` for valid syntax.".to_string()
+        });
         let mut err_map = serde_json::Map::new();
-        err_map.insert("status".into(), "error".into());
-        err_map.insert("error".into(), err.to_string().into());
-        err_map.insert("kind".into(), "argument_parsing".into());
+        err_map.insert("code".into(), 2.into());
+        err_map.insert("kind".into(), CliErrorKind::Usage.kind_str().into());
+        err_map.insert("message".into(), message.into());
+        err_map.insert("hint".into(), hint.into());
+        err_map.insert("retryable".into(), false.into());
+        err_map.insert("detail".into(), detail.into());
 
         if raw != normalized && normalized.len() > 1 {
             err_map.insert(
@@ -6346,8 +6365,7 @@ fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[S
         let examples = get_contextual_examples(&intent);
         err_map.insert("examples".into(), serde_json::json!(examples));
 
-        // Context-aware hints
-        let hints = get_contextual_hints(&intent, &raw_str);
+        // Context-aware hints (the first one is also the envelope's `hint`)
         err_map.insert("hints".into(), serde_json::json!(hints));
 
         // Common mistakes for this intent
@@ -6364,7 +6382,8 @@ fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[S
             }),
         );
 
-        return serde_json::to_string_pretty(&err_map).unwrap_or_else(|_| err.to_string());
+        return serde_json::to_string_pretty(&serde_json::json!({ "error": err_map }))
+            .unwrap_or_else(|_| err.to_string());
     }
 
     // Human-readable format
@@ -6395,13 +6414,38 @@ fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[S
 }
 
 /// Detect the likely command intent from the raw argument string.
+///
+/// A recognized subcommand in the first non-flag position decides the intent
+/// outright. The substring heuristics below only guess for misspelled or
+/// missing subcommands: matched against the whole argv they misfired (`models`
+/// contains "ls", so `cass models install --json` was offered `cass view`
+/// examples; any `--robot` flag read as a documentation request).
 fn detect_command_intent(raw_str: &str) -> String {
-    if matches!(
-        raw_str.split_whitespace().next(),
-        Some("index" | "rebuild" | "reindex")
-    ) {
-        "rebuild or manage the search index".to_string()
-    } else if raw_str.contains("search")
+    let intent = match raw_str
+        .split_whitespace()
+        .find(|token| !token.starts_with('-'))
+    {
+        Some("index" | "rebuild" | "reindex" | "idx") => "rebuild or manage the search index",
+        Some("search" | "find" | "query" | "q" | "grep" | "lookup") => {
+            "search for sessions or messages"
+        }
+        Some("sessions" | "session" | "current") => "discover or list session files",
+        Some("robot-docs" | "docs" | "help-robot" | "robotdocs") => "get robot-mode documentation",
+        Some("stats" | "ls" | "list" | "info" | "summary") => "show statistics",
+        Some("view" | "show" | "get" | "read" | "expand") => "view a specific session",
+        Some("capabilities" | "caps" | "cap" | "introspect" | "inspect" | "intro") => {
+            "discover tool capabilities"
+        }
+        Some("diag" | "diagnose" | "debug" | "doctor") => "run diagnostics",
+        Some("status" | "st" | "state") => "check status",
+        Some("health") => "run health check",
+        Some("models") => "manage semantic models",
+        _ => "",
+    };
+    if !intent.is_empty() {
+        return intent.to_string();
+    }
+    if raw_str.contains("search")
         || raw_str.contains("find")
         || raw_str.contains("query")
         || raw_str.contains("grep")
@@ -6412,7 +6456,7 @@ fn detect_command_intent(raw_str: &str) -> String {
     } else if raw_str.contains("doc") || raw_str.contains("help") || raw_str.contains("robot") {
         "get robot-mode documentation".to_string()
     } else if raw_str.contains("stats") || raw_str.contains("ls") || raw_str.contains("list") {
-        "view statistics or list sessions".to_string()
+        "show statistics".to_string()
     } else if raw_str.contains("index")
         || raw_str.contains("rebuild")
         || raw_str.contains("reindex")
@@ -6472,6 +6516,12 @@ fn get_contextual_examples(intent: &str) -> Vec<&'static str> {
             "cass stats --robot",
             "cass stats --robot --source local",
             "cass stats --robot --by-source",
+        ]
+    } else if intent.contains("models") {
+        vec![
+            "cass models status --json",
+            "cass models install --yes",
+            "cass models verify --json",
         ]
     } else if intent.contains("capabilities") {
         vec!["cass capabilities --json", "cass introspect --json"]
@@ -6715,8 +6765,13 @@ mod canonical_top_level_command_tests {
             let args = ["cass", "index", "--semantic", "--approximate", format].map(str::to_string);
             let error = Cli::try_parse_from(&args).expect_err("query-only flag rejected");
             let output = format_friendly_parse_error(error, &args, &args);
-            let payload: serde_json::Value = serde_json::from_str(&output).expect("error JSON");
-            assert_eq!(payload["kind"], "argument_parsing");
+            let envelope: serde_json::Value = serde_json::from_str(&output).expect("error JSON");
+            let payload = &envelope["error"];
+            assert_eq!(payload["code"], 2);
+            assert_eq!(payload["kind"], "usage");
+            assert_eq!(payload["retryable"], false);
+            assert!(payload["message"].as_str().is_some_and(|m| !m.is_empty()));
+            assert!(payload["hint"].as_str().is_some_and(|h| !h.is_empty()));
             let examples = payload["examples"].as_array().expect("examples");
             assert!(!examples.is_empty());
             for example in examples {
@@ -6737,6 +6792,53 @@ mod canonical_top_level_command_tests {
                 let correct = mistake["correct"].as_str().expect("corrected command");
                 assert!(correct.starts_with("cass index "), "{correct}");
                 assert!(Cli::try_parse_from(correct.split_whitespace()).is_ok());
+            }
+        }
+    }
+
+    /// Bead robot-parse-error-envelope-878z7: an unknown flag on a real
+    /// subcommand gets the documented envelope, and its examples come from that
+    /// subcommand. Before the fix `models` matched the "ls" substring and
+    /// `stats` matched "view", so both were offered `cass view` examples, and
+    /// the payload had a string `error` with a top-level snake_case kind.
+    #[test]
+    fn parse_error_examples_follow_the_failing_subcommand() {
+        for (argv, prefix) in [
+            (&["cass", "models", "install", "--json"][..], "cass models "),
+            (
+                &["cass", "stats", "--json", "--nonexistent-flag"][..],
+                "cass stats ",
+            ),
+            (
+                &["cass", "index", "--json", "--no-such-thing"][..],
+                "cass index ",
+            ),
+        ] {
+            let args: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
+            let error = Cli::try_parse_from(&args).expect_err("unknown flag rejected");
+            let output = format_friendly_parse_error(error, &args, &args);
+            let envelope: serde_json::Value = serde_json::from_str(&output).expect("error JSON");
+            assert!(
+                envelope.get("kind").is_none(),
+                "no top-level kind: {output}"
+            );
+            let payload = &envelope["error"];
+            assert!(payload.is_object(), "error must be an object: {output}");
+            assert_eq!(payload["code"], 2);
+            assert_eq!(payload["kind"], "usage");
+            assert_eq!(payload["retryable"], false);
+            let message = payload["message"].as_str().expect("message");
+            assert!(message.contains("unexpected argument"), "{message}");
+            assert!(payload["hint"].as_str().is_some_and(|h| !h.is_empty()));
+            let examples = payload["examples"].as_array().expect("examples");
+            assert!(!examples.is_empty());
+            for example in examples {
+                let example = example.as_str().expect("example command");
+                assert!(example.starts_with(prefix), "{argv:?} offered {example}");
+                assert!(
+                    Cli::try_parse_from(example.split_whitespace()).is_ok(),
+                    "example must parse: {example}"
+                );
             }
         }
     }
@@ -112225,6 +112327,11 @@ fn run_index_with_data(
     let opts_clone = opts.clone();
     let previous_robot_trace_ingest =
         robot_trace_ingest.then(|| indexer::set_robot_trace_ingest_enabled(true));
+    // Background catch-up keeps an existing semantic index current by the
+    // delta it just ingested (bead 962e8); an explicit `--semantic` run keeps
+    // its own full semantic phase.
+    let previous_background_semantic_delta =
+        (background && !semantic).then(|| indexer::set_background_semantic_delta_enabled(true));
     let index_handle = index_worker_thread_builder()
         .spawn(move || indexer::run_cli_index(opts_clone, mirror_source_ids))
         .map_err(|error| CliError {
@@ -112670,6 +112777,9 @@ fn run_index_with_data(
     }
     if let Some(previous) = previous_robot_trace_ingest {
         let _ = indexer::set_robot_trace_ingest_enabled(previous);
+    }
+    if let Some(previous) = previous_background_semantic_delta {
+        let _ = indexer::set_background_semantic_delta_enabled(previous);
     }
     // Persisted neighbors are useful, but a failed source scan is not a
     // complete index invocation. Decide before success progress, completion

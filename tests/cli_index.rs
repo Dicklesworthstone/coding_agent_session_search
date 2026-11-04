@@ -5480,3 +5480,160 @@ fn index_full_variable_width_corpus_passes_stock_sqlite_verification() {
     altered[1_000].push('!');
     assert_eq!(payload_mismatches(&altered, &stored), (1, 1));
 }
+
+/// Bead 962e8 (GH #458): stale-on-read catch-up, the scheduled incremental
+/// job and the daemon timer run `cass index --background` without
+/// `--semantic`, so every ingest left the semantic index behind the archive
+/// and semantic search was refused until someone reran `cass index --semantic`.
+/// A background run now extends an existing semantic index by the delta.
+/// Planted negative: a foreground `cass index` (unchanged behavior) leaves the
+/// new message semantically unsearchable. No-bulk guard: an archive without a
+/// semantic index gets none from a background run.
+#[test]
+fn background_index_keeps_an_existing_semantic_index_current() {
+    use serde_json::{Value, json};
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::write(home.join(".env"), "").unwrap();
+    let project = home.join(".claude/projects/-bg-semantic");
+    fs::create_dir_all(&project).unwrap();
+    let session = project.join("bg-semantic.jsonl");
+    let append = |ordinal: usize, text: &str| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&session)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type": "user", "sessionId": "bg-semantic",
+                "uuid": format!("bg-semantic-{ordinal}"),
+                "timestamp": format!("2025-11-12T18:3{ordinal}:18.697Z"),
+                "cwd": home.to_string_lossy(),
+                "message": {"role": "user", "content": text}
+            })
+        )
+        .unwrap();
+    };
+    let cass = |data_dir: &std::path::Path, args: &[&str]| {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_SEMANTIC_EMBEDDER", "hash")
+            .env("RUST_MIN_STACK", "134217728")
+            .args(args)
+            .arg("--data-dir")
+            .arg(data_dir)
+            .timeout(std::time::Duration::from_secs(180));
+        cmd.output().unwrap()
+    };
+    let index = |data_dir: &std::path::Path, args: &[&str]| {
+        let output = cass(data_dir, args);
+        assert!(
+            output.status.success(),
+            "{args:?} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let semantic_top = |data_dir: &std::path::Path, query: &str| {
+        let output = cass(
+            data_dir,
+            &[
+                "search",
+                query,
+                "--mode",
+                "semantic",
+                "--no-maintenance",
+                "--json",
+                "--limit",
+                "1",
+            ],
+        );
+        if !output.status.success() {
+            return Err(output.status.code());
+        }
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        Ok(payload["hits"][0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
+    };
+
+    let data_dir = home.join("data");
+    append(1, "zzbgalpha first durable note about the parser");
+    index(
+        &data_dir,
+        &[
+            "index",
+            "--full",
+            "--semantic",
+            "--embedder",
+            "hash",
+            "--json",
+        ],
+    );
+    let first = semantic_top(&data_dir, "zzbgalpha").expect("semantic search after --semantic");
+    assert!(first.contains("zzbgalpha"), "top hit: {first}");
+
+    append(2, "zzbgomega appended after the semantic index was built");
+    // Foreground incremental run: unchanged, so the semantic index now lags
+    // the archive and semantic search refuses it.
+    index(&data_dir, &["index", "--embedder", "hash", "--json"]);
+    assert_eq!(
+        semantic_top(&data_dir, "zzbgomega"),
+        Err(Some(15)),
+        "a foreground run must not extend the semantic index"
+    );
+
+    // Background run (what auto-refresh, the scheduler and the daemon spawn):
+    // the lexical scan finds nothing new, but the semantic delta catches up.
+    index(
+        &data_dir,
+        &["index", "--background", "--embedder", "hash", "--json"],
+    );
+    let caught_up =
+        semantic_top(&data_dir, "zzbgomega").expect("semantic search after background run");
+    assert!(caught_up.contains("zzbgomega"), "top hit: {caught_up}");
+    let still = semantic_top(&data_dir, "zzbgalpha").expect("older vectors stay served");
+    assert!(still.contains("zzbgalpha"), "top hit: {still}");
+
+    // No bulk pass: a background run never creates a semantic index.
+    let lexical_only = home.join("lexical-only");
+    index(&lexical_only, &["index", "--full", "--json"]);
+    index(
+        &lexical_only,
+        &["index", "--background", "--embedder", "hash", "--json"],
+    );
+    let vectors = lexical_only.join("vector_index");
+    let fsvi_files = fs::read_dir(&vectors)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "fsvi"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        fsvi_files, 0,
+        "background run must not bulk-embed an archive"
+    );
+}

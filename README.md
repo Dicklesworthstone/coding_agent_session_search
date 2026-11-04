@@ -48,7 +48,7 @@ The Homebrew tap installs prebuilt release tarballs (not bottles) for Linux and 
 ⚠️ **Never run bare `cass` in an agent context** — it launches the interactive TUI. Always use `--robot` or `--json`.
 
 ```bash
-# 1) Check the installed interface once per version (recipe verified on 0.8.0).
+# 1) Check the installed interface once per version (recipe verified on 0.10.0).
 cass --version
 cass search --help
 
@@ -80,7 +80,7 @@ cass sources agents exclude openclaw
 cass sources agents include openclaw
 ```
 
-The retrieval flags above are available in 0.8.0. On older builds, check help;
+The retrieval flags above are available in 0.8.0 and later. On older builds, check help;
 if `--no-maintenance` is absent, report the mismatch instead of dropping the
 read-only constraint. `--timeout` is in milliseconds, while `--max-tokens` limits
 approximate output size. Also set a caller-side deadline (for example, GNU
@@ -320,7 +320,7 @@ The deterministic hash embedder is available only when explicitly selected, such
 **Features**:
 - **Memory-mappable**: large indexes open without copying into RAM
 - **Quantization**: supports `f32` and `f16` storage for smaller on-disk size
-- **Fast search**: exact brute-force vector search by default; HNSW approximate search runs only when `--approximate` is passed and the HNSW sidecar file exists. `hnsw_ready` in `status --json` means only that the sidecar file is present, not that ANN is in use
+- **Fast search**: exact brute-force vector search by default; HNSW approximate search runs only when `--approximate` is passed and the HNSW sidecar file exists. In `status --json`, `hnsw_present` and `hnsw_state` (`present_unverified` when a sidecar file exists) report the sidecar; `hnsw_ready` is currently always `false`, because status does not verify native ANN admission
 
 **Index Location**: `~/.local/share/coding-agent-search/vector_index/index-<embedder>.fsvi`
 
@@ -1518,7 +1518,7 @@ every match.
 | Build | Threshold | `stale lock` with `--limit 10` on a 1,034,219-document index |
 |-------|-----------|---------------------------------------------------------------|
 | v0.9.0 and earlier | 50,000 documents | `total_matches: 11` |
-| Current (unreleased) | 5,000,000 documents | `total_matches: 11915` |
+| v0.10.0 and later | 5,000,000 documents | `total_matches: 11915` |
 
 `--robot-meta` says which kind of number you got:
 
@@ -1770,6 +1770,8 @@ Combine terms with explicit operators for complex queries:
 | `-` | `error -test` | Shorthand for NOT |
 
 **Operator Precedence**: NOT binds tightest, then AND (explicit, `&&`, or implied between words), then OR (`OR`, `||`). Parentheses group, in the TUI and robot mode alike: `a OR b c` means `a OR (b AND c)`, while `(a OR b) c` needs the parentheses. A `(` groups only at the start of a word, so code such as `foo(bar)` stays one term. `NOT NOT x` is `x`. Unbalanced parentheses are recovered rather than rejected. The SQLite fallback lanes, used while no lexical index is available, apply the same grammar.
+
+**Titles count as message text.** Each message is matched together with its conversation's title, which is often the conversation's first prompt. A term that appears only in the title therefore matches every message of that conversation, and `x NOT y` drops every message of a conversation whose title contains `y`. For example, in a conversation titled `fix auth tests`, `error NOT tests` returns none of its messages.
 
 ```bash
 # Complex boolean query
@@ -2388,7 +2390,7 @@ There is no double-line tier. `Ctrl+B` toggles between rounded and square Unicod
 
 ## 🔖 Bookmark System
 
-Bookmarks are a CLI feature: `cass bookmarks add|list|remove|search|export|import --json` manages user-authored annotations on search results (a source path, optional line number, note, and tags). The TUI has no bookmark keybindings today.
+Bookmarks are a CLI feature: `cass bookmarks add|list|remove|search|export|import --json` manages user-authored annotations on search results (a source path, optional line number, note, and tags). In the TUI, `Alt+E` bookmarks the selected hit into the same store.
 
 ```bash
 # Bookmark a search hit (source_path + line_number from search output)
@@ -2599,6 +2601,14 @@ Idle awareness: scheduled work skips a run when the machine is under severe load
 
 The source-scan interval is separate from health's 30-minute stale threshold. It checks completed-scan metadata without walking provider directories on the read path. Five minutes is an eligibility threshold, not a timer or a completion guarantee: a read must occur, and the cooldown, archive lock and failed-run breaker still apply. A completed no-op scan resets the cadence too. For continuous updates, run `cass index --watch`; for indexing while no one searches, install the scheduler. Set `CASS_AUTO_REFRESH_SOURCE_SCAN_SECS=0` to keep stale/partial/pending catch-up while disabling periodic source checks on reads; this does not disable the resident daemon timer.
 
+**Semantic catch-up in background runs.** Search refuses a semantic index that is behind the archive, and every ingest moves the archive ahead. Before, semantic search stayed off after any catch-up until someone reran `cass index --semantic`. Now every `cass index --background` run (stale-on-read catch-up, the scheduler's incremental job, the daemon timer) also embeds the messages ingested since the semantic index's embed watermark, then republishes it. Three limits apply:
+
+- It runs only when that index already exists for the configured embedder and carries a watermark, which `cass index --semantic` sets. It never starts a full semantic build.
+- It never uses the external embedder.
+- A semantic failure is logged and never fails the lexical run.
+
+A quality tier published only by `cass models backfill` has no watermark, so it is not extended this way. Running `cass index --semantic` once gives it one, but that is a full semantic pass over the archive.
+
 After an upgrade, the storage engine repairs and migrates an existing archive once, on its first writable open; that pass copies and rewrites the whole archive. Background runs (stale-on-read catch-up and scheduled jobs) never start it on an archive larger than `CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES` (default 2 GiB): they exit 7 with kind `migration-repair-pending`, touch nothing, and `cass schedule status` names the cause. Run `cass index --full` in the foreground at a quiet time to perform it once; it keeps the original as a `.pre-migration-bak` copy, so plan for that much free space.
 
 For a slow hosted disk, start with `cass schedule install --interval-mins 60` and measure before shortening the interval. On Linux, `cass index --json` reports `indexing_stats.bytes_written`: the process block-write counter increase during indexing, including final checkpointing. It measures physical writes across all indexing layers, not just new transcript bytes or lexical segments; a cache-backed filesystem can report zero. The field is omitted when the counter is unavailable, including on other platforms. Check this alongside `elapsed_ms` on both changed-source and unchanged-source runs.
@@ -2719,7 +2729,7 @@ Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sql
   - Conversation rows are updated as they grow: end time, last message index, token summaries, title and metadata.
   - Deduplication, `forget` and purge delete rows.
 - **Deduplication**: messages are keyed by `UNIQUE(conversation_id, idx)`. New conversations are written with batched plain `INSERT`s, with the unique index as the backstop. Appends to a known conversation use `INSERT OR IGNORE`, so an agent re-writing a file cannot store a message twice. BLAKE3 content hashes are used only in memory, as merge fingerprints.
-- **Versioning**: a `_schema_migrations` table and a strict migration path keep upgrades safe and atomic; see *Database Schema Migrations*. Production creates a fresh database with one combined `full_schema_v13` step and then applies v14–v22, so a new database records versions 13–22. The v1–v12 SQL is compiled only into tests.
+- **Versioning**: a `_schema_migrations` table and a strict migration path keep upgrades safe and atomic; see *Database Schema Migrations*. Production creates a fresh database with one combined `full_schema_v13` step and then applies v14–v23, so a new database records versions 13–23. The v1–v12 SQL is compiled only into tests.
 
 ---
 
@@ -2854,6 +2864,15 @@ Re-index affected files
 
 - **Debounce**: 2 seconds (wait for burst of changes to settle)
 - **Max wait**: 5 seconds (don't wait forever during continuous activity)
+
+The debounce only batches events. A session file that was modified within the
+last `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` seconds (default 120), is
+open for writing, or holds an advisory lock is treated as still being written
+and is deferred, then retried after the window. So a message appended to the
+session an agent is actively working in becomes searchable after roughly two to
+three minutes, not seconds: 123 s, 139 s and 189 s were measured on a synthetic
+Claude Code session. Lowering the window shortens that wait, at the cost of
+parsing files that are still being written.
 
 ### Path Classification
 
@@ -3014,7 +3033,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_ses
 
 Example (Linux x86_64, replace `VERSION` with an explicit release tag):
 ```bash
-VERSION=v0.2.0  # e.g. v0.2.0
+VERSION=v0.10.0  # an explicit release tag from the Releases page
 curl -L -o cass-linux-amd64.tar.gz \
   "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/${VERSION}/cass-linux-amd64.tar.gz"
 curl -L -o SHA256SUMS.txt \
