@@ -109593,7 +109593,7 @@ const INDEX_STALL_HINT_PERSIST: &str = concat!(
     "(default 1800s) and per-message heartbeats normally keep it from even ",
     "reporting. If this stall repeats with no `activity` movement at all, ",
     "capture a stack trace (`sudo gdb -batch -ex 'thread apply all bt' -p ",
-    "$(pgrep -f 'cass index')`) and attach it to issue #373. Memory pressure ",
+    "$(pgrep -f 'cass index')`) and attach it to a new GitHub issue. Memory pressure ",
     "multiplies redaction time on giant conversations; re-running on a ",
     "quieter machine is the fastest operational fix. ",
     "CASS_INDEX_STALL_DETECT_SECS / CASS_INDEX_STALL_ABORT_SECS tune or ",
@@ -111141,6 +111141,12 @@ mod stall_diagnostics_tests {
         assert!(
             !hint.contains("WAL_AUTOCHECKPOINT"),
             "the finalize-WAL decoy guidance must not appear in the persist hint"
+        );
+        // Like the generic hint, the persist hint must send the stack trace
+        // to a new issue, not to a closed one (#382 follow-up).
+        assert!(
+            hint.contains("attach it to a new GitHub issue") && !hint.contains("issue #"),
+            "the persist hint must not route reports to a numbered (closed) issue, got: {hint}"
         );
         assert!(
             watchdog.observe(&progress, 200).is_none(),
