@@ -4719,17 +4719,21 @@ mod tests {
             Some("Postgres password rotation"),
             InputContext::TitlePrefix,
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Test oracle for passage-selection coverage.
         assert_eq!(
             body.len(),
             crate::search::canonicalize::MAX_EMBEDDING_PASSAGES
         );
         for ((body, titled), renamed) in body.iter().zip(&titled).zip(&renamed) {
+            // ubs:ignore[rust.panic.assert-macros] -- Every selected passage must retain its title context.
             assert!(
                 titled
                     .content
                     .starts_with("title: SSH commit signing\ntext: ")
             );
+            // ubs:ignore[rust.panic.assert-macros] -- Test oracle for retained passage text.
             assert!(titled.content.ends_with(&body.content));
+            // ubs:ignore[rust.panic.assert-macros] -- Test oracle for canonical source provenance.
             assert_eq!(
                 (
                     titled.message_id,
@@ -4750,27 +4754,36 @@ mod tests {
                     body.chunk_idx
                 )
             );
+            // ubs:ignore[rust.panic.assert-macros] -- Title changes must invalidate canonical vector identities.
             assert_ne!(
                 semantic_doc_id_for_input(titled),
                 semantic_doc_id_for_input(renamed)
             );
         }
+        // ubs:ignore[rust.panic.assert-macros] -- Test oracle for coverage of evidence near the message tail.
         assert!(
             titled
                 .last()
                 .is_some_and(|input| input.content.contains("unique tail evidence"))
         );
         for embedder in ["fnv1a-384", "minilm-384", "multilingual-minilm-384"] {
+            // ubs:ignore[rust.panic.assert-macros] -- Input policies must occupy different vector namespaces.
             assert_ne!(
                 vector_space_revision_for_context(embedder, InputContext::Body),
                 vector_space_revision_for_context(embedder, InputContext::TitlePrefix)
             );
         }
         let indexer = SemanticIndexer::new("hash", None)?;
-        assert_ne!(
-            indexer.embed_messages(&titled)?[0].embedding,
-            indexer.embed_messages(&renamed)?[0].embedding
-        );
+        let titled_embeddings = indexer.embed_messages(&titled)?;
+        let renamed_embeddings = indexer.embed_messages(&renamed)?;
+        let titled_first = titled_embeddings
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("missing title-context embedding"))?;
+        let renamed_first = renamed_embeddings
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("missing renamed-title embedding"))?;
+        // ubs:ignore[rust.panic.assert-macros] -- The real hash embedder must observe changed title context.
+        assert_ne!(titled_first.embedding, renamed_first.embedding);
         Ok(())
     }
 

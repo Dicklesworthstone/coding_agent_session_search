@@ -33,13 +33,14 @@ const TERMS: [&str; 5] = ["kiwiword", "limeword", "mangoword", "plumword", "pear
 #[test]
 fn gh540_semantic_input_context_is_echoed_without_changing_lexical_results() -> TestResult {
     let corpus = corpus();
-    let expected = corpus.search(TERMS[0], &[])?;
+    let term = TERMS.first().copied().ok_or("missing corpus search term")?;
+    let expected = corpus.search(term, &[])?;
     let output = corpus
         .cmd()
         .env("CASS_SEMANTIC_INPUT_CONTEXT", "title-prefix")
         .args([
             "search",
-            TERMS[0],
+            term,
             "--mode",
             "lexical",
             "--robot",
@@ -50,25 +51,34 @@ fn gh540_semantic_input_context_is_echoed_without_changing_lexical_results() -> 
             "--no-maintenance",
         ])
         .output()?;
+    // ubs:ignore[rust.panic.assert-macros] -- The actual search CLI must succeed for the fixture.
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     let payload: Value = serde_json::from_slice(&output.stdout)?;
+    // ubs:ignore[rust.panic.assert-macros] -- Test oracle for effective input-policy metadata.
     assert_eq!(
         payload["_meta"]["effective"]["semantic_input_context"],
         "title-prefix"
     );
+    // ubs:ignore[rust.panic.assert-macros] -- Semantic input context must not change realized lexical mode.
     assert_eq!(payload["_meta"]["search_mode"], "lexical");
-    let actual = payload["hits"]
-        .as_array()
+    let actual = payload
+        .get("hits")
+        .and_then(Value::as_array)
         .ok_or("missing hits")?
         .iter()
         .map(|hit| {
-            message_id(hit["content"].as_str().unwrap_or_default()).ok_or("missing message ID")
+            let content = hit
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or("missing hit content")?;
+            message_id(content).ok_or("missing message ID")
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
+    // ubs:ignore[rust.panic.assert-macros] -- Test oracle for identical lexical result membership.
     assert_eq!(actual, expected);
     Ok(())
 }

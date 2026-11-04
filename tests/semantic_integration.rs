@@ -135,8 +135,12 @@ fn gh540_title_context_cli_roundtrip_rebuilds_and_reconciles() -> anyhow::Result
         .values()
         .map(|(_, vector)| vector)
         .collect::<Vec<_>>();
+    let [first, second] = vectors.as_slice() else {
+        anyhow::bail!("body fixture must contain exactly two vectors");
+    };
+    // ubs:ignore[rust.panic.assert-macros] -- Test oracle for identical body-only hash-control vectors.
     assert_eq!(
-        vectors[0], vectors[1],
+        first, second,
         "identical bodies must have identical hash-control vectors"
     );
     let partial = backfill("title-prefix", true)?;
@@ -147,11 +151,13 @@ fn gh540_title_context_cli_roundtrip_rebuilds_and_reconciles() -> anyhow::Result
     );
     let manifest = coding_agent_search::search::semantic_manifest::SemanticManifest::load(&data)?
         .ok_or_else(|| anyhow::anyhow!("partial backfill manifest missing"))?;
+    // ubs:ignore[rust.panic.assert-macros] -- The fixture must actually exercise an interrupted checkpoint.
     assert!(
         manifest.checkpoint.is_some(),
         "fixture must leave a real interrupted-policy checkpoint"
     );
     run("body")?;
+    // ubs:ignore[rust.panic.assert-macros] -- Test oracle for rebuilding a foreign-policy checkpoint.
     assert_eq!(
         vector_snapshot()?,
         body,
@@ -159,8 +165,11 @@ fn gh540_title_context_cli_roundtrip_rebuilds_and_reconciles() -> anyhow::Result
     );
     run("title-prefix")?;
     let prefixed = vector_snapshot()?;
+    // ubs:ignore[rust.panic.assert-macros] -- Different input policies must use different vector revisions.
     assert_ne!(body.0, prefixed.0);
+    // ubs:ignore[rust.panic.assert-macros] -- Test oracle for the versioned title-prefix contract.
     assert!(prefixed.0.ends_with(":title-prefix-v1"));
+    // ubs:ignore[rust.panic.assert-macros] -- Input context must preserve canonical message identities.
     assert_eq!(
         body.1.keys().collect::<Vec<_>>(),
         prefixed.1.keys().collect::<Vec<_>>()
@@ -170,16 +179,22 @@ fn gh540_title_context_cli_roundtrip_rebuilds_and_reconciles() -> anyhow::Result
         .values()
         .map(|(_, vector)| vector)
         .collect::<Vec<_>>();
-    assert_ne!(
-        vectors[0], vectors[1],
-        "titles must distinguish identical bodies"
-    );
-    conversations[0].title = Some("Restore a deleted Git branch".into());
+    let [first, second] = vectors.as_slice() else {
+        anyhow::bail!("title-prefix fixture must contain exactly two vectors");
+    };
+    // ubs:ignore[rust.panic.assert-macros] -- Different titles must disambiguate otherwise identical bodies.
+    assert_ne!(first, second, "titles must distinguish identical bodies");
+    let renamed = conversations
+        .first_mut()
+        .ok_or_else(|| anyhow::anyhow!("missing conversation to rename"))?;
+    renamed.title = Some("Restore a deleted Git branch".into());
     {
         let storage = FrankenStorage::open(&db)?;
-        storage.insert_conversation_tree(agent_id, None, &conversations[0])?;
+        storage.insert_conversation_tree(agent_id, None, renamed)?;
+        // ubs:ignore[rust.panic.assert-macros] -- Title edits must invalidate the semantic watermark.
         assert_eq!(storage.get_last_embedded_message_id("fnv1a-384")?, None);
         for id in &conversation_ids {
+            // ubs:ignore[rust.panic.assert-macros] -- Context must never manufacture canonical messages.
             assert_eq!(
                 storage.fetch_messages(*id)?.len(),
                 1,
@@ -194,11 +209,13 @@ fn gh540_title_context_cli_roundtrip_rebuilds_and_reconciles() -> anyhow::Result
         .iter()
         .filter(|&(id, value)| prefixed.1.get(id) != Some(value))
         .count();
+    // ubs:ignore[rust.panic.assert-macros] -- The title-only edit must change exactly one stored vector.
     assert_eq!(
         changes, 1,
         "only the renamed conversation's vector should change"
     );
     run("body")?;
+    // ubs:ignore[rust.panic.assert-macros] -- Switching back must reconstruct the original body-only vectors.
     assert_eq!(
         vector_snapshot()?,
         body,
@@ -207,7 +224,9 @@ fn gh540_title_context_cli_roundtrip_rebuilds_and_reconciles() -> anyhow::Result
     let path = vector_index_path(&data, "fnv1a-384");
     let before = fs::read(&path)?;
     let invalid = backfill("typo", false)?;
+    // ubs:ignore[rust.panic.assert-macros] -- Invalid input-policy settings must fail validation.
     assert!(!invalid.status.success());
+    // ubs:ignore[rust.panic.assert-macros] -- Failed validation must not mutate the vector artifact.
     assert_eq!(
         fs::read(&path)?,
         before,

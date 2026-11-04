@@ -174,8 +174,10 @@ impl EmbeddingMessageSource for SqliteEmbeddingSource {
                 SqliteValue::Integer(i64::try_from(crate::search::input_context::TITLE_SCAN_CHARS)?),
             ],
         )?;
-        anyhow::ensure!(rows.len() == 1, "title context lost its canonical message");
-        Ok(rows[0].get_typed(0)?)
+        let [row] = rows.as_slice() else {
+            bail!("title context lost its canonical message");
+        };
+        Ok(row.get_typed(0)?)
     }
 
     fn total_docs(&self) -> usize {
@@ -286,11 +288,14 @@ mod tests {
         let title = source
             .title_for_message(1)?
             .ok_or_else(|| anyhow::anyhow!("snapshot title missing"))?;
+        // ubs:ignore[rust.panic.assert-macros] -- Test oracle for bounded snapshot reads.
         assert_eq!(
             title.chars().count(),
             crate::search::input_context::TITLE_SCAN_CHARS
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Test oracle for snapshot isolation.
         assert!(title.chars().all(|ch| ch == '界'));
+        // ubs:ignore[rust.panic.assert-macros] -- Missing canonical rows must be rejected.
         assert!(source.title_for_message(999).is_err());
         Ok(())
     }

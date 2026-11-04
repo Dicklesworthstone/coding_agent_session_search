@@ -80,7 +80,9 @@ mod tests {
     fn body_policy_preserves_the_exact_borrowed_input() {
         let body = "**original**\n body 👋";
         let input = InputContext::Body.document(Some("irrelevant title"), body, 2000);
+        // ubs:ignore[rust.panic.assert-macros] -- Test oracle for zero-copy body inputs.
         assert!(matches!(input, Cow::Borrowed(_)));
+        // ubs:ignore[rust.panic.assert-macros] -- Test oracle for unchanged body text.
         assert_eq!(input, body);
     }
 
@@ -90,19 +92,24 @@ mod tests {
         let git = InputContext::TitlePrefix.document(Some("SSH commit signing"), body, 2000);
         let database =
             InputContext::TitlePrefix.document(Some("Postgres password rotation"), body, 2000);
+        // ubs:ignore[rust.panic.assert-macros] -- Different titles must disambiguate identical bodies.
         assert_ne!(git, database);
+        // ubs:ignore[rust.panic.assert-macros] -- Test oracle for retained passage text.
         assert!(git.ends_with(body) && database.ends_with(body));
+        // ubs:ignore[rust.panic.assert-macros] -- Test oracle for the versioned input format.
         assert!(git.starts_with("title: SSH commit signing\ntext: "));
     }
 
     #[test]
     fn absent_blank_or_out_of_budget_titles_preserve_the_body() {
         for title in [None, Some(""), Some("\n\t  "), Some("\0ignored")] {
+            // ubs:ignore[rust.panic.assert-macros] -- Empty titles must preserve the body.
             assert_eq!(
                 InputContext::TitlePrefix.document(title, "body", 2000),
                 "body"
             );
         }
+        // ubs:ignore[rust.panic.assert-macros] -- An unusable context budget must preserve the body.
         assert_eq!(
             InputContext::TitlePrefix.document(Some("title"), "body", 5),
             "body"
@@ -115,11 +122,14 @@ mod tests {
         let input = InputContext::TitlePrefix
             .document(Some(&title), &"界".repeat(3000), 2000)
             .into_owned();
+        // ubs:ignore[rust.panic.assert-macros] -- Test oracle for title normalization.
         assert!(input.starts_with("title: résumé 修復 "));
+        // ubs:ignore[rust.panic.assert-macros] -- Test oracle for the total Unicode character budget.
         assert_eq!(input.chars().count(), 2000);
         let (title, body) = input
             .split_once("\ntext: ")
             .ok_or("missing title/body separator")?;
+        // ubs:ignore[rust.panic.assert-macros] -- Test oracle for the title-specific character budget.
         assert_eq!(
             title
                 .strip_prefix("title: ")
@@ -128,12 +138,14 @@ mod tests {
                 .count(),
             TITLE_CONTEXT_CHARS
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Title context must leave room for the passage.
         assert!(body.chars().count() > 1800);
         Ok(())
     }
 
     #[test]
     fn controls_and_nul_do_not_create_extra_title_fields() {
+        // ubs:ignore[rust.panic.assert-macros] -- Test oracle for control-character and NUL normalization.
         assert_eq!(
             InputContext::TitlePrefix.document(
                 Some("first\nsecond\u{1b} third\0hidden"),
@@ -146,12 +158,15 @@ mod tests {
 
     #[test]
     fn settings_are_explicit_and_invalid_values_are_errors() {
+        // ubs:ignore[rust.panic.assert-macros] -- Test oracle for the default policy spelling.
         assert_eq!(InputContext::parse(" body "), Ok(InputContext::Body));
+        // ubs:ignore[rust.panic.assert-macros] -- Test oracle for the opt-in policy spelling.
         assert_eq!(
             InputContext::parse("title-prefix"),
             Ok(InputContext::TitlePrefix)
         );
         for value in ["", "true", "titles", "title_prefix"] {
+            // ubs:ignore[rust.panic.assert-macros] -- Invalid settings must fail instead of falling back.
             assert!(InputContext::parse(value).is_err());
         }
     }

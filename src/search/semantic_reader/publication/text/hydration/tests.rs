@@ -48,6 +48,7 @@ fn gh540_title_edits_invalidate_title_prefixed_passages_but_not_body_only() {
     let mut expected = identity(&actual.content, 0, PassageProjection::RawPassagesV2);
     let body_only = expected;
     expected.content_hash = Some(content_hash(&canonical));
+    // ubs:ignore[rust.panic.assert-macros] -- Test oracle for title-aware source verification.
     assert_eq!(
         verify_message(
             &expected,
@@ -57,6 +58,7 @@ fn gh540_title_edits_invalidate_title_prefixed_passages_but_not_body_only() {
         Ok(canonical)
     );
     actual.title = Some("Postgres password rotation".into());
+    // ubs:ignore[rust.panic.assert-macros] -- Title-only edits must invalidate prefixed vector provenance.
     assert_eq!(
         verify_message(
             &expected,
@@ -65,6 +67,7 @@ fn gh540_title_edits_invalidate_title_prefixed_passages_but_not_body_only() {
         ),
         Err(HydrationError::StaleSource)
     );
+    // ubs:ignore[rust.panic.assert-macros] -- Body-only provenance must remain valid after title edits.
     assert!(verify_message(&body_only, &actual, PassageProjection::RawPassagesV2).is_ok());
 }
 

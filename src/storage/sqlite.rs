@@ -39877,6 +39877,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                         assert!(current.is_some());
                         if matches!(tier, SemanticIdentityTier::Fast) {
                             if generation.is_some() {
+                                // ubs:ignore[rust.panic.assert-macros] -- Regression oracle for title/workspace invalidation.
                                 assert_ne!(
                                     current, generation,
                                     "each metadata edit needs a fresh generation"
