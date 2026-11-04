@@ -243,7 +243,7 @@ fn empty_semantic_rebuild_resets_watermark_and_indexes_new_lower_ids()
     std::fs::create_dir_all(fixture.codex_home.join("sessions"))?;
     let db_path = fixture.data_dir.join("agent_search.db");
     let storage = FrankenStorage::open(&db_path)?;
-    storage.set_last_embedded_message_id(100_000)?;
+    storage.set_last_embedded_message_id("fnv1a-384", 100_000)?;
     assert_eq!(storage.max_message_id()?, None);
     storage.close()?;
     let indexer = SemanticIndexer::new("hash", None)?;
@@ -297,7 +297,7 @@ fn empty_semantic_rebuild_resets_watermark_and_indexes_new_lower_ids()
     run_index("empty_semantic_reset", true);
     let storage = FrankenStorage::open_readonly(&db_path)?;
     assert_eq!(storage.max_message_id()?, None);
-    assert_eq!(storage.get_last_embedded_message_id()?, Some(0));
+    assert_eq!(storage.get_last_embedded_message_id("fnv1a-384")?, Some(0));
     storage.close()?;
     let empty = VectorIndex::open_read_only(&fsvi_path)?;
     assert_eq!(empty.record_count(), 0);
@@ -323,7 +323,10 @@ fn empty_semantic_rebuild_resets_watermark_and_indexes_new_lower_ids()
         .max_message_id()?
         .ok_or("missing new canonical messages")?;
     assert!((1..100_000).contains(&max_id));
-    assert_eq!(storage.get_last_embedded_message_id()?, Some(max_id));
+    assert_eq!(
+        storage.get_last_embedded_message_id("fnv1a-384")?,
+        Some(max_id)
+    );
     storage.close()?;
     let rebuilt = VectorIndex::open_read_only(&fsvi_path)?;
     assert!(rebuilt.record_count() > 0);
@@ -429,7 +432,7 @@ fn gh470_covered_watermark_rebuilds_old_prefix_and_reuses_current_passages()
         }
         Ok((
             serde_json::to_value(conversations)?,
-            storage.get_last_embedded_message_id()?,
+            storage.get_last_embedded_message_id("fnv1a-384")?,
         ))
     };
     let before = canonical_snapshot()?;

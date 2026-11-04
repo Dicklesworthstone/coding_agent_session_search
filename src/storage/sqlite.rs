@@ -3460,7 +3460,8 @@ fn clear_seeded_runtime_meta(conn: &FrankenConnection) -> Result<()> {
     conn.execute(
         "DELETE FROM meta
          WHERE key LIKE 'historical_bundle_salvaged:%'
-            OR key IN ('last_scan_ts', 'last_indexed_at', 'last_embedded_message_id')",
+            OR key LIKE 'last_embedded_message_id%'
+            OR key IN ('last_scan_ts', 'last_indexed_at')",
     )?;
     Ok(())
 }
@@ -8065,10 +8066,27 @@ fn replay_owns_provider_workspace(
 /// skip forever: the tier is never re-certified, and a reused id would resolve
 /// to the deleted text's vector. Dropping the watermark sends the next semantic
 /// run through the full re-embed, the same invalidation the reconcilers below
-/// apply on identity changes (2l1b0.78).
+/// apply on identity changes (2l1b0.78). Every vector space loses its
+/// watermark: the deleted rows were in all of them.
 fn clear_semantic_embed_watermark_after_deletion(tx: &FrankenTransaction<'_>) -> Result<()> {
-    tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+    tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
     Ok(())
+}
+
+/// Each vector space keeps its own embed watermark, keyed by embedder id
+/// (`last_embedded_message_id:fnv1a-384`, `last_embedded_message_id:minilm-384`).
+/// A single shared key let one embedder's run certify another embedder's older
+/// index: the next delta appended only rows above the foreign watermark and
+/// republished that index as current with a coverage hole (962e8).
+const SEMANTIC_EMBED_WATERMARK_KEY_PREFIX: &str = "last_embedded_message_id:";
+
+/// Drops every per-embedder watermark, and the retired single shared key that
+/// no reader trusts any more.
+const CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL: &str =
+    "DELETE FROM meta WHERE key LIKE 'last_embedded_message_id%'";
+
+fn semantic_embed_watermark_key(embedder_id: &str) -> String {
+    format!("{SEMANTIC_EMBED_WATERMARK_KEY_PREFIX}{embedder_id}")
 }
 
 /// Delete one duplicate conversation and its children inside `tx`. Messages,
@@ -8209,7 +8227,7 @@ fn franken_reconcile_provider_workspace(
                     fparams![tier.meta_key(), generation.as_str()],
                 )?;
             }
-            tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+            tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
         }
     }
     Ok(previous_workspace != workspace_id)
@@ -8290,7 +8308,7 @@ fn franken_reconcile_shelley_metadata(
                     fparams![tier.meta_key(), generation.as_str()],
                 )?;
             }
-            tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+            tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
         }
     }
     Ok(workspace_changed || title_changed)
@@ -10696,7 +10714,7 @@ impl FrankenStorage {
                     fparams![semantic_tier.meta_key(), pending_state.as_str()],
                 )?;
             }
-            tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+            tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
             let now_ms = Self::now_millis();
             let mut normalized_sources = HashMap::new();
             for legacy in &legacy_conversations {
@@ -10806,7 +10824,7 @@ impl FrankenStorage {
                     fparams![semantic_tier.meta_key(), pending_state.as_str()],
                 )?;
             }
-            tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+            tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
             tx.commit()?;
         }
 
@@ -17122,11 +17140,14 @@ impl FrankenStorage {
             .with_context(|| "fetching messages for embedding")
     }
 
-    /// Get the watermark for incremental semantic embedding.
-    pub fn get_last_embedded_message_id(&self) -> Result<Option<i64>> {
+    /// Get the incremental embedding watermark of one vector space: every
+    /// message at or below it is embedded in that embedder's index. Another
+    /// embedder's watermark says nothing about this one's coverage.
+    pub fn get_last_embedded_message_id(&self, embedder_id: &str) -> Result<Option<i64>> {
+        let key = semantic_embed_watermark_key(embedder_id);
         let result: Result<String, _> = self.conn.query_row_map(
-            "SELECT value FROM meta WHERE key = 'last_embedded_message_id'",
-            fparams![],
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![key.as_str()],
             |row| row.get_typed(0),
         );
         match result.optional() {
@@ -17152,11 +17173,12 @@ impl FrankenStorage {
         Ok((max > 0).then_some(max))
     }
 
-    /// Set the watermark for incremental semantic embedding.
-    pub fn set_last_embedded_message_id(&self, id: i64) -> Result<()> {
+    /// Set one vector space's incremental embedding watermark.
+    pub fn set_last_embedded_message_id(&self, embedder_id: &str, id: i64) -> Result<()> {
+        let key = semantic_embed_watermark_key(embedder_id);
         self.conn.execute_compat(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES('last_embedded_message_id', ?1)",
-            fparams![id.to_string()],
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![key.as_str(), id.to_string()],
         )?;
         Ok(())
     }
@@ -18252,7 +18274,7 @@ impl FrankenStorage {
                     fparams![tier.meta_key(), generation.as_str()],
                 )?;
             }
-            tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+            tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
             tx.execute_compat(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
                 fparams![
@@ -25150,8 +25172,41 @@ mod tests {
 
         // The one-shot semantic skip (issue #394) compares this against the
         // embedding watermark; a watermark at max must read back intact.
-        storage.set_last_embedded_message_id(max).unwrap();
-        assert_eq!(storage.get_last_embedded_message_id().unwrap(), Some(max));
+        storage
+            .set_last_embedded_message_id("fnv1a-384", max)
+            .unwrap();
+        assert_eq!(
+            storage.get_last_embedded_message_id("fnv1a-384").unwrap(),
+            Some(max)
+        );
+        // 962e8: the hash space's watermark certifies nothing about another
+        // vector space, which keeps its own (here absent) watermark.
+        assert_eq!(
+            storage.get_last_embedded_message_id("minilm-384").unwrap(),
+            None
+        );
+        storage
+            .set_last_embedded_message_id("minilm-384", max - 1)
+            .unwrap();
+        assert_eq!(
+            storage.get_last_embedded_message_id("fnv1a-384").unwrap(),
+            Some(max)
+        );
+        assert_eq!(
+            storage.get_last_embedded_message_id("minilm-384").unwrap(),
+            Some(max - 1)
+        );
+        // The retired single shared key is never read as anyone's coverage.
+        storage
+            .raw()
+            .execute("INSERT OR REPLACE INTO meta(key, value) VALUES('last_embedded_message_id', '999999')")
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_last_embedded_message_id("all-MiniLM-L6-v2")
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -27654,7 +27709,10 @@ mod tests {
 
         let max_message_id = storage.max_message_id().unwrap().unwrap();
         storage
-            .set_last_embedded_message_id(max_message_id)
+            .set_last_embedded_message_id("fnv1a-384", max_message_id)
+            .unwrap();
+        storage
+            .set_last_embedded_message_id("minilm-384", max_message_id)
             .unwrap();
 
         // Dry-run: detects the pair, mutates nothing.
@@ -27670,7 +27728,7 @@ mod tests {
         assert_eq!(conv_count(&storage), 2, "dry-run must not delete rows");
         assert_eq!(msg_count(&storage), 4, "dry-run must not delete messages");
         assert_eq!(
-            storage.get_last_embedded_message_id().unwrap(),
+            storage.get_last_embedded_message_id("fnv1a-384").unwrap(),
             Some(max_message_id),
             "dry-run must not invalidate semantic assets"
         );
@@ -27684,8 +27742,16 @@ mod tests {
         assert_eq!(applied.messages_affected, 2);
         assert_eq!(conv_count(&storage), 1, "twin row dropped");
         assert_eq!(msg_count(&storage), 2, "twin's messages dropped");
-        // 2l1b0.78: the twin's vectors remain in the semantic artifact.
-        assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
+        // 2l1b0.78: the twin's vectors remain in the semantic artifact, and
+        // in every vector space's artifact, so no watermark may survive.
+        assert_eq!(
+            storage.get_last_embedded_message_id("fnv1a-384").unwrap(),
+            None
+        );
+        assert_eq!(
+            storage.get_last_embedded_message_id("minilm-384").unwrap(),
+            None
+        );
 
         let surviving: String = storage
             .conn
@@ -35425,7 +35491,9 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             .unwrap();
         source.set_last_scan_ts(123).unwrap();
         source.set_last_indexed_at(456).unwrap();
-        source.set_last_embedded_message_id(789).unwrap();
+        source
+            .set_last_embedded_message_id("minilm-384", 789)
+            .unwrap();
         source
             .conn
             .execute_compat(
@@ -35547,7 +35615,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             .unwrap();
         assert_eq!(message_count, 1);
         assert_eq!(seeded.get_last_scan_ts().unwrap(), None);
-        assert_eq!(seeded.get_last_embedded_message_id().unwrap(), None);
+        assert_eq!(
+            seeded.get_last_embedded_message_id("minilm-384").unwrap(),
+            None
+        );
 
         let last_indexed: Option<String> = seeded
             .conn
@@ -38332,7 +38403,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                     .unwrap();
             }
             storage
-                .set_last_embedded_message_id(before[2].id.unwrap())
+                .set_last_embedded_message_id("minilm-384", before[2].id.unwrap())
                 .unwrap();
             gh423_revise(&mut conv);
             let update = gh423_persist(&storage, agent, &conv, route).unwrap();
@@ -38393,7 +38464,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 assert!(storage.semantic_identity_rebuild_required(tier).unwrap());
                 storage.complete_semantic_identity_rebuild(tier).unwrap();
             }
-            assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
+            assert_eq!(
+                storage.get_last_embedded_message_id("minilm-384").unwrap(),
+                None
+            );
             let analytics = gh423_analytics_snapshot(&storage);
             let replay = gh423_persist(&storage, agent, &conv, route).unwrap();
             assert!(replay.inserted_indices.is_empty() && replay.updated_indices.is_empty());
@@ -39859,7 +39933,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
                     .unwrap();
             storage
-                .set_last_embedded_message_id(storage.max_message_id().unwrap().unwrap())
+                .set_last_embedded_message_id(
+                    "fnv1a-384",
+                    storage.max_message_id().unwrap().unwrap(),
+                )
                 .unwrap();
             let mut repair_generation = None;
             conv.workspace = Some(correct.clone());
@@ -39880,7 +39957,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 assert!(!outcome.conversation_inserted);
                 assert!(outcome.inserted_indices.is_empty());
                 assert_eq!(outcome.workspace_changed, expected_change);
-                assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
+                assert_eq!(
+                    storage.get_last_embedded_message_id("fnv1a-384").unwrap(),
+                    None
+                );
                 let generation = storage
                     .semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)
                     .unwrap()
@@ -40918,7 +40998,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         let legacy_message_id = storage
             .max_message_id()?
             .expect("legacy OMP fixture should contain one message");
-        storage.set_last_embedded_message_id(legacy_message_id)?;
+        storage.set_last_embedded_message_id("minilm-384", legacy_message_id)?;
         for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
             assert!(!storage.semantic_identity_rebuild_required(tier)?);
         }
@@ -40932,7 +41012,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             }
         );
         assert_eq!(
-            storage.get_last_embedded_message_id()?,
+            storage.get_last_embedded_message_id("minilm-384")?,
             None,
             "agent/source identity changes must invalidate the rowid-only semantic watermark"
         );
@@ -41130,7 +41210,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         let imported_message_id = storage
             .max_message_id()?
             .expect("historical OMP fixture should contain messages");
-        storage.set_last_embedded_message_id(imported_message_id)?;
+        storage.set_last_embedded_message_id("fnv1a-384", imported_message_id)?;
         assert_eq!(
             storage.reclassify_legacy_omp_conversations()?,
             LegacyOmpReclassificationResult::default(),
@@ -41144,7 +41224,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 analytics_rebuild_required: true,
             }
         );
-        assert_eq!(storage.get_last_embedded_message_id()?, None);
+        assert_eq!(storage.get_last_embedded_message_id("fnv1a-384")?, None);
         assert!(storage.semantic_identity_rebuild_required(SemanticIdentityTier::Fast)?);
         assert!(storage.semantic_identity_rebuild_required(SemanticIdentityTier::Quality)?);
         let conversations = storage.list_conversations(10, 0)?;
@@ -46525,14 +46605,14 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         seed_conversation(&storage, "codex", "keep-target");
         let max_message_id = storage.max_message_id().unwrap().unwrap();
         storage
-            .set_last_embedded_message_id(max_message_id)
+            .set_last_embedded_message_id("minilm-384", max_message_id)
             .unwrap();
 
         // An agent with no archived rows purges nothing and keeps the watermark.
         let noop = storage.purge_agent_archive_data("cursor").unwrap();
         assert_eq!(noop.conversations_deleted, 0);
         assert_eq!(
-            storage.get_last_embedded_message_id().unwrap(),
+            storage.get_last_embedded_message_id("minilm-384").unwrap(),
             Some(max_message_id)
         );
 
@@ -46540,7 +46620,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(purge.conversations_deleted, 1);
         assert_eq!(purge.messages_deleted, 2);
         // 2l1b0.78: the purged messages' vectors remain in the semantic artifact.
-        assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
+        assert_eq!(
+            storage.get_last_embedded_message_id("minilm-384").unwrap(),
+            None
+        );
 
         storage.rebuild_fts().unwrap();
         storage.rebuild_analytics().unwrap();
@@ -46659,7 +46742,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         // A semantic embed watermark that covers the whole corpus.
         let max_message_id = storage.max_message_id().unwrap().unwrap();
         storage
-            .set_last_embedded_message_id(max_message_id)
+            .set_last_embedded_message_id("fnv1a-384", max_message_id)
+            .unwrap();
+        storage
+            .set_last_embedded_message_id("minilm-384", max_message_id)
             .unwrap();
 
         // Dry-run: reports matches, deletes nothing.
@@ -46671,11 +46757,13 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(dry.messages_matched, 2);
         assert_eq!(dry.conversations_deleted, 0);
         assert_eq!(storage.total_conversation_count().unwrap(), 3);
-        assert_eq!(
-            storage.get_last_embedded_message_id().unwrap(),
-            Some(max_message_id),
-            "a dry run must not invalidate semantic assets"
-        );
+        for embedder_id in ["fnv1a-384", "minilm-384"] {
+            assert_eq!(
+                storage.get_last_embedded_message_id(embedder_id).unwrap(),
+                Some(max_message_id),
+                "a dry run must not invalidate semantic assets"
+            );
+        }
         assert!(
             storage.forgotten_source_stamps().unwrap().is_empty(),
             "a dry run must not tombstone anything"
@@ -46692,10 +46780,16 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         // The surviving top-level session's message is intact.
         assert_eq!(storage.total_message_count().unwrap(), 1);
         // 2l1b0.78: the deleted messages' vectors are still in the semantic
-        // artifact, so the watermark that covered them must not survive.
-        assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
+        // artifact, so no vector space's watermark that covered them may
+        // survive.
+        for embedder_id in ["fnv1a-384", "minilm-384"] {
+            assert_eq!(
+                storage.get_last_embedded_message_id(embedder_id).unwrap(),
+                None
+            );
+        }
         storage
-            .set_last_embedded_message_id(max_message_id)
+            .set_last_embedded_message_id("minilm-384", max_message_id)
             .unwrap();
         // 2l1b0.50: each forgotten source is tombstoned with its file stamp
         // (these fixture paths do not exist, so the stamp is empty).
@@ -46735,7 +46829,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(none.conversations_deleted, 0);
         assert_eq!(storage.total_conversation_count().unwrap(), 1);
         assert_eq!(
-            storage.get_last_embedded_message_id().unwrap(),
+            storage.get_last_embedded_message_id("minilm-384").unwrap(),
             Some(max_message_id),
             "a no-op forget must not force a semantic re-embed"
         );

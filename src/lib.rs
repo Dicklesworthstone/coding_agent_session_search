@@ -128113,6 +128113,34 @@ fn run_models_backfill_batch(
             })?;
     }
 
+    // 962e8: a published or verified-unchanged generation holds every
+    // canonical row of the archive this batch read under the maintenance lock
+    // (the build path keeps one fingerprint across batches; reconcile compares
+    // exact document identities), so it certifies its own vector space's embed
+    // watermark. Background `cass index` runs can then keep a backfill-built
+    // tier current with a delta, instead of semantic search staying off until
+    // the next nightly backfill. Write only on change: a write moves the WAL,
+    // which costs the next unchanged run its completed-backfill cache once.
+    if outcome.published && !external {
+        let recorded = storage.max_message_id().and_then(|max_id| {
+            let max_id = max_id.unwrap_or(0);
+            if storage.get_last_embedded_message_id(indexer.embedder_id())? == Some(max_id) {
+                return Ok(false);
+            }
+            storage.set_last_embedded_message_id(indexer.embedder_id(), max_id)?;
+            Ok(true)
+        });
+        // The tier is already published; a missing watermark only means
+        // background runs leave it to the next backfill, so do not fail.
+        if let Err(error) = recorded {
+            tracing::warn!(
+                %error,
+                embedder_id = indexer.embedder_id(),
+                "semantic backfill published but could not record its embed watermark"
+            );
+        }
+    }
+
     let progress_pct = outcome.progress_pct();
     let status = if outcome.unchanged {
         "unchanged"

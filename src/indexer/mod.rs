@@ -1968,10 +1968,22 @@ fn background_semantic_delta_eligible(
     if !semantic_index_has_current_contract(data_dir, embedder) {
         return Ok(false);
     }
-    Ok(matches!(
-        (storage.get_last_embedded_message_id()?, storage.max_message_id()?),
-        (Some(watermark), Some(max_id)) if watermark < max_id
-    ))
+    let Some(watermark) = semantic_embed_watermark(storage, embedder)? else {
+        return Ok(false);
+    };
+    Ok(storage
+        .max_message_id()?
+        .is_some_and(|max_id| watermark < max_id))
+}
+
+/// The requested local embedder's own coverage watermark (962e8). External
+/// providers have no admission-free identity, so they never get the
+/// watermark fast paths and fall back to the bulk pass.
+fn semantic_embed_watermark(storage: &FrankenStorage, embedder: &str) -> Result<Option<i64>> {
+    match semantic_local_embedder_metadata(embedder) {
+        Some((embedder_id, _)) => storage.get_last_embedded_message_id(&embedder_id),
+        None => Ok(None),
+    }
 }
 
 #[derive(Debug)]
@@ -19481,7 +19493,7 @@ fn run_index_with_storage_ownership(
             .join(crate::search::vector_index::VECTOR_INDEX_DIR);
         let has_existing_index =
             semantic_index_has_current_contract(&opts.data_dir, &opts.embedder);
-        let last_embedded = storage.get_last_embedded_message_id()?;
+        let last_embedded = semantic_embed_watermark(&storage, &opts.embedder)?;
         let has_watermark = last_embedded.is_some();
         // #394: a one-shot `index --semantic` used to ignore the watermark
         // entirely and re-embed the whole corpus every run. When the existing
@@ -19746,7 +19758,10 @@ fn run_index_with_storage_ownership(
                 false,
                 "updating semantic indexing watermark",
                 |writer| {
-                    writer.set_last_embedded_message_id(semantic_build.last_message_id.unwrap_or(0))
+                    writer.set_last_embedded_message_id(
+                        semantic_indexer.embedder_id(),
+                        semantic_build.last_message_id.unwrap_or(0),
+                    )
                 },
             )?;
             if semantic_identity_rebuild_required && semantic_manifest_published {
@@ -21900,6 +21915,7 @@ fn run_targeted_semantic_watch_once_publish(
     if let Some(raw_max_message_id) = selection.raw_max_message_id {
         update_incremental_semantic_watermark(
             storage,
+            indexer.embedder_id(),
             raw_max_message_id,
             "updating semantic watch-once watermark",
         )?;
@@ -21940,6 +21956,7 @@ fn run_targeted_semantic_watch_once_publish(
 
 fn update_incremental_semantic_watermark(
     storage: &Mutex<FrankenStorage>,
+    embedder_id: &str,
     raw_max_id: i64,
     context: &str,
 ) -> Result<()> {
@@ -21947,7 +21964,7 @@ fn update_incremental_semantic_watermark(
         .lock()
         .map_err(|e| anyhow::anyhow!("lock storage for watermark write: {e}"))?;
     persist::with_ephemeral_writer(&guard, false, context, |writer| {
-        writer.set_last_embedded_message_id(raw_max_id)
+        writer.set_last_embedded_message_id(embedder_id, raw_max_id)
     })?;
     Ok(())
 }
@@ -21964,13 +21981,20 @@ fn embed_incremental_semantic_inputs(
     // A watch callback may outlive the base generation it started with. Admit
     // the target before loading a model, embedding a delta, or certifying even
     // a filtered-only watermark. Append still validates again to catch races.
-    if !semantic_index_has_current_contract(data_dir, embedder) {
+    let Some((embedder_id, _)) = semantic_local_embedder_metadata(embedder)
+        .filter(|_| semantic_index_has_current_contract(data_dir, embedder))
+    else {
         anyhow::bail!(
             "incremental semantic base is missing or incompatible; rebuild with cass index --semantic before appending"
         );
-    }
+    };
     if embedding_inputs.is_empty() {
-        update_incremental_semantic_watermark(storage, raw_max_id, filtered_watermark_context)?;
+        update_incremental_semantic_watermark(
+            storage,
+            &embedder_id,
+            raw_max_id,
+            filtered_watermark_context,
+        )?;
         return Ok(0);
     }
 
@@ -21978,7 +22002,13 @@ fn embed_incremental_semantic_inputs(
     let embedded = semantic_indexer.embed_messages(&embedding_inputs)?;
     let count = semantic_indexer.append_to_index(embedded, data_dir)?;
 
-    update_incremental_semantic_watermark(storage, raw_max_id, success_watermark_context)?;
+    // Certify only the vector space the rows were appended to.
+    update_incremental_semantic_watermark(
+        storage,
+        semantic_indexer.embedder_id(),
+        raw_max_id,
+        success_watermark_context,
+    )?;
     Ok(count)
 }
 
@@ -22069,12 +22099,18 @@ fn incremental_semantic_embed(
     data_dir: &Path,
     storage: &Mutex<FrankenStorage>,
 ) -> Result<usize> {
-    // 1. Read watermark
-    let watermark = storage
-        .lock()
-        .map_err(|e| anyhow::anyhow!("lock storage for watermark read: {e}"))?
-        .get_last_embedded_message_id()?
-        .unwrap_or(0);
+    // 1. Read this embedder's own watermark. Without one nothing proves which
+    // rows the existing index already holds, and appending from zero would
+    // duplicate them; callers fall back to the bulk pass instead.
+    let watermark = semantic_embed_watermark(
+        &storage
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock storage for watermark read: {e}"))?,
+        embedder,
+    )?
+    .with_context(|| {
+        format!("no semantic embed watermark for {embedder}; the delta needs a covered base")
+    })?;
 
     // 2. Fetch new packet-derived canonical batches since watermark.
     let batch = {
@@ -47303,7 +47339,7 @@ mod tests {
     fn gh481_incremental_semantic_preflight_preserves_watermark_before_model_load() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let storage = Mutex::new(FrankenStorage::open(&temp.path().join("archive.db"))?);
-        update_incremental_semantic_watermark(&storage, 7, "seed test watermark")?;
+        update_incremental_semantic_watermark(&storage, "minilm-384", 7, "seed test watermark")?;
         let index_path = vector_index_path(temp.path(), "minilm-384");
         fs::create_dir_all(index_path.parent().context("vector parent")?)?;
         let mut manifest = SemanticManifest::default();
@@ -47352,7 +47388,10 @@ mod tests {
                     "{error:#}"
                 );
                 assert_eq!(
-                    storage.lock().unwrap().get_last_embedded_message_id()?,
+                    storage
+                        .lock()
+                        .unwrap()
+                        .get_last_embedded_message_id("minilm-384")?,
                     Some(7)
                 );
                 assert!(!temp.path().join("models").exists());
@@ -47403,8 +47442,19 @@ mod tests {
             1
         );
         assert_eq!(
-            storage.lock().unwrap().get_last_embedded_message_id()?,
+            storage
+                .lock()
+                .unwrap()
+                .get_last_embedded_message_id("fnv1a-384")?,
             Some(8)
+        );
+        // 962e8: appending to the hash space certifies nothing for MiniLM.
+        assert_eq!(
+            storage
+                .lock()
+                .unwrap()
+                .get_last_embedded_message_id("minilm-384")?,
+            None
         );
         assert_eq!(
             embed_incremental_semantic_inputs(
@@ -47419,12 +47469,70 @@ mod tests {
             0
         );
         assert_eq!(
-            storage.lock().unwrap().get_last_embedded_message_id()?,
+            storage
+                .lock()
+                .unwrap()
+                .get_last_embedded_message_id("fnv1a-384")?,
             Some(9)
         );
         assert_eq!(
             inspect_semantic_artifact(&index_path)?.live_record_count(),
             1
+        );
+        Ok(())
+    }
+
+    /// 962e8: one shared watermark let a hash-space run certify an older
+    /// MiniLM index, whose next background delta appended only the rows above
+    /// the foreign watermark and republished it as current with a hole.
+    #[test]
+    fn background_semantic_delta_needs_the_requested_embedders_own_watermark() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let storage = FrankenStorage::open(&temp.path().join("archive.db"))?;
+        seed_archive_conversation(&storage, "bg-own-watermark");
+        let max_id = storage.max_message_id()?.context("seeded messages")?;
+        let index_path = vector_index_path(temp.path(), "minilm-384");
+        fs::create_dir_all(index_path.parent().context("vector parent")?)?;
+        FsVectorIndex::create_with_revision(
+            &index_path,
+            "minilm-384",
+            crate::indexer::semantic::expected_vector_space_revision("minilm-384")
+                .context("MiniLM vector space revision")?,
+            384,
+            frankensearch::index::Quantization::F16,
+        )?
+        .finish()?;
+        publish_direct_semantic_artifact(
+            &storage,
+            temp.path(),
+            &index_path,
+            "minilm-384",
+            384,
+            0,
+            1,
+        )?;
+        assert!(semantic_index_has_current_contract(temp.path(), "minilm"));
+
+        assert!(!background_semantic_delta_eligible(
+            &storage,
+            temp.path(),
+            "minilm"
+        )?);
+        storage.set_last_embedded_message_id("fnv1a-384", max_id - 1)?;
+        assert!(
+            !background_semantic_delta_eligible(&storage, temp.path(), "minilm")?,
+            "another vector space's trailing watermark must not admit a MiniLM delta"
+        );
+        storage.set_last_embedded_message_id("minilm-384", max_id - 1)?;
+        assert!(background_semantic_delta_eligible(
+            &storage,
+            temp.path(),
+            "minilm"
+        )?);
+        storage.set_last_embedded_message_id("minilm-384", max_id)?;
+        assert!(
+            !background_semantic_delta_eligible(&storage, temp.path(), "minilm")?,
+            "a covered space has no delta to run"
         );
         Ok(())
     }
@@ -47497,7 +47605,7 @@ mod tests {
             manifest.fast_tier.context("fast tier")?.db_fingerprint,
             lexical_rebuild_content_fingerprint(&guard, 3)?
         );
-        assert_eq!(guard.get_last_embedded_message_id()?, Some(3));
+        assert_eq!(guard.get_last_embedded_message_id("fnv1a-384")?, Some(3));
         Ok(())
     }
 
@@ -47534,7 +47642,10 @@ mod tests {
         assert!(maintenance.pending_paths.contains(&source));
         assert_eq!(maintenance.pending_conversations, 1);
         assert_eq!(
-            storage.lock().unwrap().get_last_embedded_message_id()?,
+            storage
+                .lock()
+                .unwrap()
+                .get_last_embedded_message_id("fnv1a-384")?,
             Some(3)
         );
         fs::rename(&held_index, &index_path)?;

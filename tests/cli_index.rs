@@ -5488,7 +5488,9 @@ fn index_full_variable_width_corpus_passes_stock_sqlite_verification() {
 /// A background run now extends an existing semantic index by the delta.
 /// Planted negative: a foreground `cass index` (unchanged behavior) leaves the
 /// new message semantically unsearchable. No-bulk guard: an archive without a
-/// semantic index gets none from a background run.
+/// semantic index gets none from a background run. The same holds for a tier
+/// published only by `cass models backfill`, which records its own vector
+/// space's watermark and no other.
 #[test]
 fn background_index_keeps_an_existing_semantic_index_current() {
     use serde_json::{Value, json};
@@ -5636,4 +5638,59 @@ fn background_index_keeps_an_existing_semantic_index_current() {
         fsvi_files, 0,
         "background run must not bulk-embed an archive"
     );
+
+    // A tier published only by `cass models backfill` (the nightly scheduler's
+    // path) had no embed watermark, so background runs could not extend it and
+    // every ingest turned semantic search off until the next backfill. The
+    // backfill now records its own vector space's watermark.
+    let backfilled = home.join("backfilled");
+    index(&backfilled, &["index", "--full", "--json"]);
+    index(
+        &backfilled,
+        &[
+            "models",
+            "backfill",
+            "--tier",
+            "fast",
+            "--embedder",
+            "hash",
+            "--json",
+        ],
+    );
+    {
+        use coding_agent_search::storage::sqlite::FrankenStorage;
+        let storage = FrankenStorage::open_readonly(&backfilled.join("agent_search.db")).unwrap();
+        let max_id = storage.max_message_id().unwrap();
+        assert!(max_id.is_some());
+        assert_eq!(
+            storage.get_last_embedded_message_id("fnv1a-384").unwrap(),
+            max_id,
+            "a published backfill certifies its own vector space"
+        );
+        assert_eq!(
+            storage.get_last_embedded_message_id("minilm-384").unwrap(),
+            None,
+            "and no other"
+        );
+        storage.close().unwrap();
+    }
+    let served = semantic_top(&backfilled, "zzbgomega").expect("semantic search after backfill");
+    assert!(served.contains("zzbgomega"), "top hit: {served}");
+
+    append(3, "zzbgdelta appended after the backfill published");
+    index(&backfilled, &["index", "--embedder", "hash", "--json"]);
+    assert_eq!(
+        semantic_top(&backfilled, "zzbgdelta"),
+        Err(Some(15)),
+        "a foreground run must not extend the backfilled tier"
+    );
+    index(
+        &backfilled,
+        &["index", "--background", "--embedder", "hash", "--json"],
+    );
+    let caught_up = semantic_top(&backfilled, "zzbgdelta")
+        .expect("backfilled tier served after background run");
+    assert!(caught_up.contains("zzbgdelta"), "top hit: {caught_up}");
+    let still = semantic_top(&backfilled, "zzbgalpha").expect("backfilled vectors stay served");
+    assert!(still.contains("zzbgalpha"), "top hit: {still}");
 }

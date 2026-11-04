@@ -559,7 +559,7 @@ fn direct_semantic_streaming_build_matches_incumbent_vectors_across_batches() ->
     storage
         .raw()
         .execute("UPDATE messages SET content = '' WHERE id = 515")?;
-    storage.set_last_embedded_message_id(7)?;
+    storage.set_last_embedded_message_id("fnv1a-384", 7)?;
     let indexer = SemanticIndexer::new("hash", None)?;
     let mut inputs =
         engine::packet_embedding_inputs_from_storage_with_progress(&storage, |_, _| {})?;
@@ -592,7 +592,7 @@ fn direct_semantic_streaming_build_matches_incumbent_vectors_across_batches() ->
         stored_semantic_rows(&streaming, &indexer)?,
         stored_semantic_rows(&incumbent, &indexer)?
     );
-    assert_eq!(storage.get_last_embedded_message_id()?, Some(7));
+    assert_eq!(storage.get_last_embedded_message_id("fnv1a-384")?, Some(7));
     assert!(!storage.raw().as_async().in_transaction());
     storage.close()?;
     Ok(())
@@ -604,7 +604,7 @@ fn direct_semantic_streaming_late_replay_error_preserves_published_generation() 
 
     let temp = tempfile::tempdir()?;
     let storage = database(temp.path(), 1, 577)?;
-    storage.set_last_embedded_message_id(11)?;
+    storage.set_last_embedded_message_id("fnv1a-384", 11)?;
     let indexer = SemanticIndexer::new("hash", None)?;
     drop(indexer.build_and_save_index(
         indexer.embed_messages(&[EmbeddingInput::new(
@@ -639,7 +639,7 @@ fn direct_semantic_streaming_late_replay_error_preserves_published_generation() 
     );
     assert!(error.downcast_ref::<FrankenError>().is_some());
     assert_eq!(std::fs::read(&path)?, before);
-    assert_eq!(storage.get_last_embedded_message_id()?, Some(11));
+    assert_eq!(storage.get_last_embedded_message_id("fnv1a-384")?, Some(11));
     assert!(!storage.raw().as_async().in_transaction());
     storage.close()?;
     Ok(())
