@@ -10539,18 +10539,23 @@ fn semantic_vector_matches_current_contract(
             == Some(index.embedder_revision())
 }
 
+/// Resolve the local input contract without loading a model or constructing
+/// an external provider. Admission and delta publication must use the same
+/// metadata even when no inference is needed.
+fn semantic_local_embedder_metadata(requested_embedder: &str) -> Option<(String, usize)> {
+    if requested_embedder == "hash" {
+        return Some(("fnv1a-384".to_string(), 384));
+    }
+    let config = crate::search::fastembed_embedder::FastEmbedder::config_for(requested_embedder)?;
+    Some((config.embedder_id, config.dimension))
+}
+
 /// A watermark proves row coverage only for the requested input contract.
 /// Inspect metadata without initializing or downloading the native model.
 fn semantic_index_has_current_contract(data_dir: &Path, requested_embedder: &str) -> bool {
-    let (embedder_id, dimension) = if requested_embedder == "hash" {
-        ("fnv1a-384".to_string(), 384)
-    } else {
-        let Some(config) =
-            crate::search::fastembed_embedder::FastEmbedder::config_for(requested_embedder)
-        else {
-            return false;
-        };
-        (config.embedder_id, config.dimension)
+    let Some((embedder_id, dimension)) = semantic_local_embedder_metadata(requested_embedder)
+    else {
+        return false;
     };
     let Some(tier) = semantic_tier_for_embedder_id(&embedder_id) else {
         return false;
@@ -21987,33 +21992,57 @@ fn finalize_one_shot_semantic_delta(
     storage: &FrankenStorage,
     build_started_at_ms: i64,
 ) -> Result<u64> {
-    let semantic_indexer = SemanticIndexer::new(embedder, Some(data_dir))?;
-    let index_path =
-        crate::search::vector_index::vector_index_path(data_dir, semantic_indexer.embedder_id());
+    let (embedder_id, embedder_dimension) = semantic_local_embedder_metadata(embedder)
+        .with_context(|| {
+            format!("unknown local semantic embedder for delta finalization: {embedder}")
+        })?;
+    let index_path = vector_index_path(data_dir, &embedder_id);
     let mut index = FsVectorIndex::open(&index_path).map_err(|err| {
         anyhow::anyhow!(
             "open appended one-shot semantic index {}: {err}",
             index_path.display()
         )
     })?;
+    anyhow::ensure!(
+        semantic_vector_matches_current_contract(&index, &embedder_id, embedder_dimension),
+        "appended one-shot semantic index is incompatible with the current vector input contract"
+    );
     if index.wal_record_count() > 0 {
         index
             .compact()
             .map_err(|err| anyhow::anyhow!("compact appended one-shot semantic index: {err}"))?;
     }
+    // GH #539: finalization needs a live count, not the reusable/duplicate ID
+    // sets used by reconciliation. Keep this admitted handle and validate each
+    // live ID without cloning it. Header/layout admission alone cannot detect
+    // an invalid string-table range or UTF-8 ID, including on a no-WAL run.
+    let mut live_record_count = index.wal_record_count();
+    for record_index in 0..index.record_count() {
+        if index.is_deleted(record_index) {
+            continue;
+        }
+        index.doc_id_at(record_index).with_context(|| {
+            format!(
+                "validating live semantic document {record_index} from {}",
+                index_path.display()
+            )
+        })?;
+        live_record_count = live_record_count.saturating_add(1);
+    }
+    let doc_count = u64::try_from(live_record_count).unwrap_or(u64::MAX);
     drop(index);
-    let inventory = inspect_semantic_artifact(&index_path)?;
-    let doc_count = u64::try_from(inventory.live_record_count()).unwrap_or(u64::MAX);
     // The append changed the vector row set, so any HNSW graph built over the
     // previous rows is stale. The loader rejects it independently, but the
     // durable manifest must stop advertising it as ready (same rule as the
     // targeted watch-once publish).
-    if let Some(tier) = semantic_tier_for_embedder_id(semantic_indexer.embedder_id()) {
+    if let Some(tier) = semantic_tier_for_embedder_id(&embedder_id) {
         let mut manifest = SemanticManifest::load_or_default(data_dir)
             .map_err(|err| anyhow::anyhow!("loading semantic manifest for delta publish: {err}"))?;
-        if manifest.hnsw.as_ref().is_some_and(|hnsw| {
-            hnsw.base_tier == tier && hnsw.embedder_id == semantic_indexer.embedder_id()
-        }) {
+        if manifest
+            .hnsw
+            .as_ref()
+            .is_some_and(|hnsw| hnsw.base_tier == tier && hnsw.embedder_id == embedder_id)
+        {
             manifest.hnsw = None;
             manifest
                 .save(data_dir)
@@ -22024,8 +22053,8 @@ fn finalize_one_shot_semantic_delta(
         storage,
         data_dir,
         &index_path,
-        semantic_indexer.embedder_id(),
-        semantic_indexer.embedder_dimension(),
+        &embedder_id,
+        embedder_dimension,
         doc_count,
         build_started_at_ms,
     )?;
@@ -47011,6 +47040,262 @@ mod tests {
             assert!(!semantic_index_has_current_contract(temp.path(), requested));
             assert!(!temp.path().join("models").exists());
         }
+        Ok(())
+    }
+
+    fn gh539_semantic_delta_fixture(data_dir: &Path) -> Result<(FrankenStorage, PathBuf)> {
+        let storage = FrankenStorage::open(&data_dir.join("archive.db"))?;
+        for external_id in ["first", "second", "third"] {
+            seed_archive_conversation(&storage, external_id);
+        }
+        let indexer = SemanticIndexer::new("hash", Some(data_dir))?;
+        let inputs = CanonicalSemanticDocuments::from_storage(&storage)?.into_inputs();
+        let embedded = indexer.embed_messages(&inputs)?;
+        let index = indexer.build_and_save_index(embedded, data_dir)?;
+        let index_path = vector_index_path(data_dir, indexer.embedder_id());
+        let doc_count = u64::try_from(index.record_count())?;
+        assert_eq!(doc_count, 3);
+        drop(index);
+        publish_direct_semantic_artifact(
+            &storage,
+            data_dir,
+            &index_path,
+            indexer.embedder_id(),
+            indexer.embedder_dimension(),
+            doc_count,
+            1,
+        )?;
+        Ok((storage, index_path))
+    }
+
+    #[test]
+    fn gh539_semantic_delta_finalizes_native_metadata_without_models() -> Result<()> {
+        const CHILD: &str = "CASS_TEST_GH539_FINALIZE_NO_MODEL";
+        if !dotenvy::var(CHILD).is_ok_and(|value| value == "1") {
+            // Isolate the override so installed models cannot mask an eager
+            // reload and other tests never observe a process-wide env change.
+            let model_root = tempfile::tempdir()?;
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "indexer::tests::gh539_semantic_delta_finalizes_native_metadata_without_models",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(
+                    "FRANKENSEARCH_MODEL_DIR",
+                    model_root.path().join("absent-model"),
+                )
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "native metadata finalization failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            anyhow::ensure!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "native metadata child did not execute its test"
+            );
+            return Ok(());
+        }
+
+        for (requested, embedder_id) in [
+            ("all-MiniLM-L6-v2", "minilm-384"),
+            ("multilingual", "multilingual-minilm-384"),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let storage = FrankenStorage::open(&temp.path().join("archive.db"))?;
+            let index_path = vector_index_path(temp.path(), embedder_id);
+            fs::create_dir_all(index_path.parent().context("vector parent")?)?;
+            let revision = crate::indexer::semantic::expected_vector_space_revision(embedder_id)
+                .context("registered input contract")?;
+            // Empty native artifacts exercise metadata publication only; no
+            // synthetic vectors stand in for native inference.
+            let write_header = |revision: &str| -> Result<()> {
+                FsVectorIndex::create_with_revision(
+                    &index_path,
+                    embedder_id,
+                    revision,
+                    384,
+                    frankensearch::index::Quantization::F16,
+                )?
+                .finish()?;
+                Ok(())
+            };
+            write_header(revision)?;
+            assert_eq!(
+                finalize_one_shot_semantic_delta(requested, temp.path(), &storage, 1)?,
+                0
+            );
+            let manifest = SemanticManifest::load_or_default(temp.path())?;
+            let artifact = manifest.quality_tier.as_ref().context("quality artifact")?;
+            assert_eq!(artifact.embedder_id, embedder_id);
+            assert_eq!(artifact.dimension, 384);
+            assert_eq!(artifact.doc_count, 0);
+            assert_eq!(artifact.db_fingerprint, "content-v1:0:0:0");
+            assert_eq!(
+                artifact.model_revision,
+                semantic_model_revision_for_embedder_id(embedder_id)
+            );
+            assert!(artifact.ready);
+            assert!(!temp.path().join("models").exists());
+
+            let manifest_before = fs::read(SemanticManifest::path(temp.path()))?;
+            write_header("incompatible-input-contract")?;
+            let error = finalize_one_shot_semantic_delta(requested, temp.path(), &storage, 2)
+                .expect_err("an incompatible artifact cannot be republished");
+            assert!(format!("{error:#}").contains("incompatible"), "{error:#}");
+            assert_eq!(
+                fs::read(SemanticManifest::path(temp.path()))?,
+                manifest_before
+            );
+        }
+        assert!(semantic_local_embedder_metadata("external").is_none());
+        assert!(semantic_local_embedder_metadata("fnv1a-384").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn gh539_semantic_delta_counts_live_rows_without_rewriting_tombstones() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (storage, index_path) = gh539_semantic_delta_fixture(temp.path())?;
+        let mut index = FsVectorIndex::open(&index_path)?;
+        let deleted_id = index.doc_id_at(0)?.to_owned();
+        assert!(index.soft_delete(&deleted_id)?);
+        assert_eq!(index.tombstone_count(), 1);
+        assert_eq!(index.wal_record_count(), 0);
+        drop(index);
+        let before = fs::read(&index_path)?;
+
+        assert_eq!(
+            finalize_one_shot_semantic_delta("hash", temp.path(), &storage, 2)?,
+            2
+        );
+        assert_eq!(fs::read(&index_path)?, before);
+        let manifest = SemanticManifest::load_or_default(temp.path())?;
+        assert_eq!(
+            manifest
+                .fast_tier
+                .as_ref()
+                .context("fast artifact")?
+                .doc_count,
+            2
+        );
+        let index = FsVectorIndex::open_read_only(&index_path)?;
+        assert_eq!(index.record_count(), 3);
+        assert_eq!(index.tombstone_count(), 1);
+        assert_eq!(index.wal_record_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn gh539_semantic_delta_compacts_wal_replacements_and_revokes_hnsw() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (storage, index_path) = gh539_semantic_delta_fixture(temp.path())?;
+        seed_archive_conversation(&storage, "fourth");
+        let (added_id, added_input) = CanonicalSemanticDocuments::from_storage(&storage)?
+            .documents
+            .into_iter()
+            .max_by_key(|(_, input)| input.message_id)
+            .context("appended canonical document")?;
+        let indexer = SemanticIndexer::new("hash", Some(temp.path()))?;
+        let added = indexer.embed_messages(&[added_input])?;
+        assert_eq!(added.len(), 1);
+
+        let before = fs::read(&index_path)?;
+        let mut index = FsVectorIndex::open(&index_path)?;
+        let replaced_id = index.doc_id_at(0)?.to_owned();
+        let replacement_vector: Vec<f32> = index
+            .vector_at_f32(0)?
+            .into_iter()
+            .map(|value| -value)
+            .collect();
+        index.append(&replaced_id, &replacement_vector)?;
+        index.append(&added_id, &added[0].embedding)?;
+        assert_eq!(index.wal_record_count(), 2);
+        drop(index);
+        // A real WAL with the pre-tombstone main image models an interrupted
+        // append. Compaction must keep the WAL replacement and count it once.
+        fs::write(&index_path, before)?;
+        let reader = FsVectorIndex::open_read_only(&index_path)?;
+        assert_eq!(reader.record_count(), 3);
+        assert_eq!(reader.tombstone_count(), 0);
+        assert_eq!(reader.wal_record_count(), 2);
+        drop(reader);
+        let mut manifest = SemanticManifest::load_or_default(temp.path())?;
+        manifest.publish_hnsw(crate::search::semantic_manifest::HnswRecord {
+            base_tier: SemanticTierKind::Fast,
+            embedder_id: "fnv1a-384".to_string(),
+            ef_search: 64,
+            index_path: "vector_index/hnsw-fnv1a-384.chsw".to_string(),
+            size_bytes: 1,
+            built_at_ms: 1,
+            ready: true,
+        });
+        manifest.save(temp.path())?;
+
+        assert_eq!(
+            finalize_one_shot_semantic_delta("hash", temp.path(), &storage, 2)?,
+            4
+        );
+        let manifest = SemanticManifest::load_or_default(temp.path())?;
+        assert!(manifest.hnsw.is_none());
+        assert_eq!(
+            manifest
+                .fast_tier
+                .as_ref()
+                .context("fast artifact")?
+                .doc_count,
+            4
+        );
+        let index = FsVectorIndex::open_read_only(&index_path)?;
+        assert_eq!(index.record_count(), 4);
+        assert_eq!(index.tombstone_count(), 0);
+        assert_eq!(index.wal_record_count(), 0);
+        let replacement_row = (0..index.record_count())
+            .find(|&row| index.doc_id_at(row).is_ok_and(|id| id == replaced_id))
+            .context("retained WAL replacement")?;
+        assert_eq!(index.vector_at_f32(replacement_row)?, replacement_vector);
+        assert!(
+            (0..index.record_count())
+                .any(|row| index.doc_id_at(row).is_ok_and(|id| id == added_id))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gh539_semantic_delta_rejects_invalid_live_id_before_manifest_publish() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (storage, index_path) = gh539_semantic_delta_fixture(temp.path())?;
+        let index = FsVectorIndex::open_read_only(&index_path)?;
+        let doc_id = index.doc_id_at(0)?.to_owned();
+        drop(index);
+        let mut bytes = fs::read(&index_path)?;
+        let positions: Vec<_> = bytes
+            .windows(doc_id.len())
+            .enumerate()
+            .filter_map(|(offset, candidate)| (candidate == doc_id.as_bytes()).then_some(offset))
+            .collect();
+        assert_eq!(positions.len(), 1, "the fixture ID must occur exactly once");
+        // Corrupt only a live string-table byte: header/layout admission still
+        // succeeds, so this specifically guards the retained doc_id_at check.
+        bytes[positions[0]] = 0xff;
+        fs::write(&index_path, &bytes)?;
+        let index = FsVectorIndex::open_read_only(&index_path)?;
+        assert_eq!(index.record_count(), 3);
+        assert!(index.doc_id_at(0).is_err());
+        drop(index);
+        let manifest_before = fs::read(SemanticManifest::path(temp.path()))?;
+
+        let error = finalize_one_shot_semantic_delta("hash", temp.path(), &storage, 2)
+            .expect_err("invalid live document IDs must not certify publication");
+        assert!(format!("{error:#}").contains("invalid UTF-8"), "{error:#}");
+        assert_eq!(
+            fs::read(SemanticManifest::path(temp.path()))?,
+            manifest_before
+        );
+        assert_eq!(fs::read(&index_path)?, bytes);
         Ok(())
     }
 
