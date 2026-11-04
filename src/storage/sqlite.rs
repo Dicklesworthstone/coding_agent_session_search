@@ -47194,20 +47194,30 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         let mut other_agent = local.clone();
         other_agent.agent_slug = "devin".into();
         seed_forget_fixture(&storage, &other_agent)?;
+        assert_eq!(storage.total_conversation_count()?, 4);
+        let retired = ForgetConversationsFilter {
+            workspace_glob: Some("/work/retired"),
+            ..Default::default()
+        };
+        assert_eq!(
+            storage
+                .forget_conversations(&retired, false)?
+                .conversations_deleted,
+            3
+        );
+        // Canonical identity is UNIQUE(source_id, agent_id, external_id), so a
+        // same-session copy in another store file can only exist after the
+        // original row is gone. Its exclusion is then a genuine path sibling of
+        // the first one: same source, agent and external id, different path.
         let mut other_path = local;
         other_path.source_path = directory.path().join("other.db");
         seed_forget_fixture(&storage, &other_path)?;
+        assert_eq!(storage.total_conversation_count()?, 2);
         assert_eq!(
             storage
-                .forget_conversations(
-                    &ForgetConversationsFilter {
-                        workspace_glob: Some("/work/retired"),
-                        ..Default::default()
-                    },
-                    false,
-                )?
+                .forget_conversations(&retired, false)?
                 .conversations_deleted,
-            4
+            1
         );
         for (key, path) in [
             ("source_ingest_v1:shared", source.as_str()),
