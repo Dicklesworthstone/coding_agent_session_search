@@ -49,6 +49,7 @@ fn gh494_refused_rebuild_preserves_and_bootstraps_prior_publication_authority() 
         None,
         LexicalRebuildStartupOptions {
             defer_initial_content_fingerprint: true,
+            force_fresh: true,
         },
         None,
     )
@@ -597,10 +598,25 @@ fn gh494_explicit_live_resume_ignores_unrelated_scratch_generation() {
     let resumed = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
     assert_eq!(resumed.indexed_docs, 4);
     assert_eq!(gh494_query_count(&index_path, "fixture"), 4);
+    // The explicit live lane still owns pending-commit reconciliation above.
+    // Its unverified cursor now forces an off-live restart, retaining the
+    // unrelated scratch bytes as evidence instead of adopting or deleting them.
+    let quarantines: Vec<_> = fs::read_dir(index_path.parent().unwrap())
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".lexical-rebuild-quarantine-")
+        })
+        .collect();
+    assert_eq!(quarantines.len(), 1);
     assert_eq!(
-        fs::read(scratch.join("MANIFEST")).unwrap(),
+        fs::read(quarantines[0].path().join("index").join("MANIFEST")).unwrap(),
         unrelated_manifest
     );
+    assert!(!scratch.exists());
 }
 
 #[test]
@@ -1028,13 +1044,27 @@ fn gh494_completed_marker_cannot_hide_a_live_document_count_mismatch() {
     let mut checkpoint = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
     checkpoint.indexed_docs += 1;
     persist_lexical_rebuild_state(&index_path, &checkpoint).unwrap();
-    let error = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
-        .expect_err("completed marker cannot certify a mismatched publication");
-    assert!(
-        error.to_string().contains("reuse_completed_generation"),
-        "{error:#}"
-    );
-    verify_published_lexical_doc_count(&index_path, 4, "gh494 mismatch kept live").unwrap();
+    let repaired = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
+        .expect("an inconsistent completed marker must trigger verified repair");
+    assert!(repaired.exact_checkpoint_persisted);
+    assert_eq!(repaired.observed_conversations, 2);
+    assert_eq!(repaired.observed_messages, Some(4));
+    assert_eq!(repaired.indexed_docs, 4);
+    verify_published_lexical_doc_count(&index_path, 4, "gh494 mismatch repaired").unwrap();
+    let completed = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+    assert!(completed.completed);
+    assert_eq!(completed.indexed_docs, 4);
+    assert!(has_usable_lexical_publication_receipt(
+        &index_path,
+        &db_path
+    ));
+    let canonical = gh496_documents(&db_path);
+    assert_eq!(canonical.len(), 4);
+    let published = lexical_reconcile::canary::exact::PublishedSnapshot::open(&index_path).unwrap();
+    assert_eq!(published.doc_count(), canonical.len() as u64);
+    for document in &canonical {
+        assert!(published.verify_content(document).unwrap());
+    }
 }
 
 #[test]
