@@ -89615,6 +89615,11 @@ fn run_selftest(output_format: Option<RobotFormat>) -> CliResult<()> {
     }
 }
 
+/// `errors[]` entry on `cass health` for a wedged rebuild. It names no issue
+/// number: reports belong in a new issue, not a closed thread (#382).
+const REBUILD_STALLED_HEALTH_ERROR: &str =
+    "index rebuild stalled — indexing thread is not making forward progress";
+
 /// GH #457: `errors[]` entry for a hollow lexical generation on `cass health`.
 const HOLLOW_INDEX_HEALTH_ERROR: &str = "index hollow — the published lexical generation serves far fewer documents than its completed rebuild checkpoint certified; run 'cass index' to rebuild it from the canonical database";
 
@@ -89854,10 +89859,7 @@ fn run_health(
         errors.push("index stale".to_string());
     }
     if rebuild_stalled {
-        errors.push(
-            "index rebuild stalled — indexing thread is not making forward progress (issue #258)"
-                .to_string(),
-        );
+        errors.push(REBUILD_STALLED_HEALTH_ERROR.to_string());
     } else if rebuild_active {
         errors.push("index rebuild in progress".to_string());
     }
@@ -111588,6 +111590,16 @@ mod stall_diagnostics_tests {
         assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["exit_code"], serde_json::json!(70));
         Ok(())
+    }
+
+    /// #382: `cass health` must not point operators at a closed issue.
+    #[test]
+    fn stalled_rebuild_health_error_names_no_closed_issue() {
+        let error = super::REBUILD_STALLED_HEALTH_ERROR;
+        assert!(
+            error.contains("rebuild stalled") && !error.contains("issue #"),
+            "{error}"
+        );
     }
 
     /// #496: a rebuild held below its memory reserve under a 12 GiB cgroup

@@ -1865,7 +1865,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let status_reason = if stalled {
         let secs = stall_age_ms.unwrap_or(0) / 1000;
         Some(format!(
-            "indexing thread has not posted forward progress for {secs}s while the lock heartbeat keeps refreshing — see issue #258 for diagnostics (run `cass doctor check --json` and capture a stack trace)"
+            "indexing thread has not posted forward progress for {secs}s while the lock heartbeat keeps refreshing — run `cass doctor check --json`, capture a stack trace, and attach both to a new GitHub issue"
         ))
     } else if rebuilding {
         Some("lexical rebuild is in progress".to_string())
@@ -2196,7 +2196,7 @@ pub(crate) fn evaluate_maintenance_coordination_from_snapshot(
         return MaintenanceCoordinationOutcome::Stale {
             job_id,
             reason: format!(
-                "indexing thread has not posted forward progress for {stall_age_ms}ms while the heartbeat keeps refreshing (stall threshold {threshold_ms}ms) — see issue #258"
+                "indexing thread has not posted forward progress for {stall_age_ms}ms while the heartbeat keeps refreshing (stall threshold {threshold_ms}ms)"
             ),
         };
     }
@@ -3737,10 +3737,12 @@ mod tests {
             .status_reason
             .as_deref()
             .expect("stalled state should populate status_reason");
+        // #382: operators are sent to a new issue, not to a closed one.
         assert!(
             reason.contains("forward progress")
-                && (reason.contains("#258") || reason.contains("issue #258")),
-            "status_reason should mention forward progress and reference #258 ({reason})",
+                && reason.contains("attach both to a new GitHub issue")
+                && !reason.contains("issue #"),
+            "status_reason should mention forward progress and ask for a new issue ({reason})",
         );
     }
 
@@ -3942,10 +3944,10 @@ mod tests {
         let outcome = evaluate_maintenance_coordination_from_snapshot(&snapshot, now_ms);
         match outcome {
             MaintenanceCoordinationOutcome::Stale { ref reason, .. } => {
+                // #382: no pointer to a closed issue.
                 assert!(
-                    reason.contains("forward progress")
-                        && (reason.contains("#258") || reason.contains("issue #258")),
-                    "stalled coordination reason should mention forward progress and #258: {reason}",
+                    reason.contains("forward progress") && !reason.contains("issue #"),
+                    "stalled coordination reason should mention forward progress and name no closed issue: {reason}",
                 );
             }
             other => assert!(
