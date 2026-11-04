@@ -2603,11 +2603,11 @@ The source-scan interval is separate from health's 30-minute stale threshold. It
 
 **Semantic catch-up in background runs.** Search refuses a semantic index that is behind the archive, and every ingest moves the archive ahead. Before, semantic search stayed off after any catch-up until someone reran `cass index --semantic`. Now every `cass index --background` run (stale-on-read catch-up, the scheduler's incremental job, the daemon timer) also embeds the messages ingested since the semantic index's embed watermark, then republishes it. Three limits apply:
 
-- It runs only when that index already exists for the configured embedder and carries a watermark, which `cass index --semantic` sets. It never starts a full semantic build.
+- It runs only when that index already exists for the configured embedder and carries that embedder's own watermark. `cass index --semantic` sets it, and so does a `cass models backfill` batch that publishes its tier or finds it unchanged. It never starts a full semantic build.
 - It never uses the external embedder.
 - A semantic failure is logged and never fails the lexical run.
 
-A quality tier published only by `cass models backfill` has no watermark, so it is not extended this way. Running `cass index --semantic` once gives it one, but that is a full semantic pass over the archive.
+Each embedder keeps its own watermark, so a hash-tier run never vouches for an older MiniLM index. Deleting messages (`forget`, purge, dedup) or changing a conversation's identity clears every watermark: the next `cass index --semantic` then re-embeds in full, while the next backfill batch reconciles the tier against the archive and records a new one. Watermarks written by cass versions before per-embedder watermarks are not trusted, so after upgrading, the first `cass index --semantic` is a full pass, or the next backfill batch records the watermark.
 
 After an upgrade, the storage engine repairs and migrates an existing archive once, on its first writable open; that pass copies and rewrites the whole archive. Background runs (stale-on-read catch-up and scheduled jobs) never start it on an archive larger than `CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES` (default 2 GiB): they exit 7 with kind `migration-repair-pending`, touch nothing, and `cass schedule status` names the cause. Run `cass index --full` in the foreground at a quiet time to perform it once; it keeps the original as a `.pre-migration-bak` copy, so plan for that much free space.
 
