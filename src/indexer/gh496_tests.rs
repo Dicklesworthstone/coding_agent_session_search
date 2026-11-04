@@ -292,6 +292,144 @@ fn gh496_append_resume_retains_native_work_and_matches_fresh_search() {
 
 #[test]
 #[serial_test::serial]
+fn gh496_candidate_admission_audits_the_writers_actual_generation() {
+    let fixture = gh496_fixture();
+    let scratch = staged_lexical_rebuild_scratch_path(&fixture.index_path);
+    let live_manifest = fs::read(fixture.index_path.join("MANIFEST")).unwrap();
+    let original = gh496_documents(&fixture.db_path).remove(0);
+    let mut replacement = original.clone();
+    replacement.content = "growthproof unverifiednativeadmission".into();
+    let earlier = lexical_reconcile::canary::exact::PublishedSnapshot::open(&scratch).unwrap();
+    assert!(earlier.verify_content(&original).unwrap());
+    let state = load_lexical_rebuild_state(&fixture.index_path)
+        .unwrap()
+        .unwrap();
+    let mut changed = false;
+    let error = lexical_resume::run_with_observer(
+        &fixture.db_path,
+        &fixture.data_dir,
+        &fixture.index_path,
+        state,
+        None,
+        None,
+        |event| {
+            if event == lexical_resume::Event::BeforeCandidateAdmission {
+                let mut writer = TantivyIndex::open_or_create(&scratch).unwrap();
+                assert_eq!(writer.doc_count().unwrap(), 2);
+                writer
+                    .upsert_prebuilt_documents_slice(std::slice::from_ref(&replacement))
+                    .unwrap();
+                writer.commit().unwrap();
+                assert_eq!(writer.doc_count().unwrap(), 2);
+                changed = true;
+                // A reader captured before writer admission still verifies the
+                // old payload. Reusing it would certify unexamined new bytes.
+                assert!(earlier.verify_content(&original).unwrap());
+                assert!(!earlier.verify_content(&replacement).unwrap());
+            }
+            Ok(())
+        },
+    )
+    .expect_err("the admitted native generation must be audited, even with unchanged counts");
+    assert!(
+        changed,
+        "the independent native writer did not run: {error:#}"
+    );
+    assert!(error.is::<lexical_resume::Incompatible>(), "{error:#}");
+    assert_eq!(
+        fs::read(fixture.index_path.join("MANIFEST")).unwrap(),
+        live_manifest
+    );
+    assert!(
+        !load_lexical_rebuild_state(&fixture.index_path)
+            .unwrap()
+            .unwrap()
+            .completed
+    );
+    drop(earlier);
+    rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();
+    gh496_assert_exact(&fixture, 2);
+    assert!(gh496_search_signature(&fixture.index_path, "unverifiednativeadmission").is_empty());
+}
+
+#[test]
+#[serial_test::serial]
+fn gh496_native_changes_after_writer_release_cannot_inherit_completion_proof() {
+    for boundary in [
+        lexical_resume::Event::CandidateReleased,
+        lexical_resume::Event::BeforePublication,
+    ] {
+        let fixture = gh496_fixture();
+        gh496_append(&fixture);
+        let scratch = staged_lexical_rebuild_scratch_path(&fixture.index_path);
+        let live_manifest = fs::read(fixture.index_path.join("MANIFEST")).unwrap();
+        let mut replacement = gh496_documents(&fixture.db_path).remove(0);
+        replacement.content = "growthproof unverifiednativepublication".into();
+        let state = load_lexical_rebuild_state(&fixture.index_path)
+            .unwrap()
+            .unwrap();
+        let mut verified_fingerprint = None;
+        let error = lexical_resume::run_with_observer(
+            &fixture.db_path,
+            &fixture.data_dir,
+            &fixture.index_path,
+            state,
+            None,
+            None,
+            |event| {
+                if event == boundary {
+                    verified_fingerprint = index_meta_fingerprint(&scratch).unwrap();
+                    let mut writer = TantivyIndex::open_or_create(&scratch).unwrap();
+                    assert_eq!(writer.doc_count().unwrap(), 7);
+                    writer
+                        .upsert_prebuilt_documents_slice(std::slice::from_ref(&replacement))
+                        .unwrap();
+                    writer.commit().unwrap();
+                    assert_eq!(writer.doc_count().unwrap(), 7);
+                }
+                Ok(())
+            },
+        )
+        .expect_err("a later same-count publication must not inherit the completed content proof");
+        assert!(verified_fingerprint.is_some(), "{boundary:?}: {error:#}");
+        assert!(
+            error.is::<lexical_resume::CandidateChanged>(),
+            "{boundary:?}: {error:#}"
+        );
+        assert_eq!(
+            fs::read(fixture.index_path.join("MANIFEST")).unwrap(),
+            live_manifest,
+            "{boundary:?}"
+        );
+        let saved = load_lexical_rebuild_state(&fixture.index_path)
+            .unwrap()
+            .unwrap();
+        assert!(!saved.completed, "{boundary:?}");
+        assert_eq!(
+            saved.committed_meta_fingerprint, verified_fingerprint,
+            "{boundary:?}: keep the proof of the generation that was actually audited"
+        );
+        assert_ne!(
+            index_meta_fingerprint(&scratch).unwrap(),
+            verified_fingerprint,
+            "{boundary:?}: the same-count native rewrite must change generation identity"
+        );
+        assert!(!has_usable_lexical_publication_receipt(
+            &scratch,
+            &fixture.db_path,
+        ));
+        // The unverified candidate remains available. The next complete audit
+        // detects its changed content and the public retry rebuilds safely.
+        rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 3, None).unwrap();
+        gh496_assert_exact(&fixture, 3);
+        assert!(
+            gh496_search_signature(&fixture.index_path, "unverifiednativepublication").is_empty()
+        );
+    }
+}
+
+#[test]
+#[serial_test::serial]
 fn gh496_existing_unbound_staged_checkpoint_is_adopted_only_through_full_audit() {
     let fixture = gh496_fixture();
     let segments = gh496_segments(&staged_lexical_rebuild_scratch_path(&fixture.index_path));

@@ -133,7 +133,9 @@ fn gh496_metadata_epoch_drift_is_revalidated_without_native_writes() {
             match event {
                 lexical_resume::Event::CanonicalMessage { .. } => observed_messages += 1,
                 lexical_resume::Event::CommittedBatch { .. } => committed_batches += 1,
-                lexical_resume::Event::BeforePublication => {}
+                lexical_resume::Event::BeforeCandidateAdmission
+                | lexical_resume::Event::CandidateReleased
+                | lexical_resume::Event::BeforePublication => {}
             }
             Ok(())
         },
@@ -365,7 +367,9 @@ fn gh496_completed_revalidation_refreshes_artifact_pair_after_unindexed_growth()
             match event {
                 lexical_resume::Event::CanonicalMessage { .. } => observed_messages += 1,
                 lexical_resume::Event::CommittedBatch { .. } => committed_batches += 1,
-                lexical_resume::Event::BeforePublication => {}
+                lexical_resume::Event::BeforeCandidateAdmission
+                | lexical_resume::Event::CandidateReleased
+                | lexical_resume::Event::BeforePublication => {}
             }
             Ok(())
         },
@@ -445,7 +449,9 @@ fn gh496_completed_revalidation_repairs_missing_or_corrupt_artifact_pair() {
                         lexical_resume::Event::CommittedBatch { .. } => {
                             panic!("repairing completion metadata must not commit native documents")
                         }
-                        lexical_resume::Event::BeforePublication => {}
+                        lexical_resume::Event::BeforeCandidateAdmission
+                        | lexical_resume::Event::CandidateReleased
+                        | lexical_resume::Event::BeforePublication => {}
                     }
                     Ok(())
                 },
@@ -513,6 +519,8 @@ fn gh496_completed_fast_path_rechecks_source_and_native_generation_before_accept
                     lexical_resume::Event::CommittedBatch { .. } => {
                         panic!("completed admission must not write native documents")
                     }
+                    lexical_resume::Event::BeforeCandidateAdmission
+                    | lexical_resume::Event::CandidateReleased => {}
                     lexical_resume::Event::BeforePublication => {
                         admission_callbacks += 1;
                         if mutation == "source" {

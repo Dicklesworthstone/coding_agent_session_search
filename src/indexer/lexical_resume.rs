@@ -186,6 +186,20 @@ fn candidate_failure(error: anyhow::Error, context: &str) -> anyhow::Error {
 #[error("canonical archive changed during lexical recovery; durable candidate retained for retry")]
 pub(super) struct SourceChanged;
 
+/// A concurrent native publication does not prove the retained candidate is
+/// corrupt. Keep it for another complete audit, without attaching this run's
+/// content proof to a generation that this run never examined.
+#[derive(Debug, thiserror::Error)]
+#[error("native lexical generation changed during recovery; durable candidate retained for retry")]
+pub(super) struct CandidateChanged;
+
+fn verify_candidate_generation(index_path: &Path, fingerprint: &str) -> Result<()> {
+    if super::index_meta_fingerprint(index_path)?.as_deref() != Some(fingerprint) {
+        return Err(CandidateChanged.into());
+    }
+    Ok(())
+}
+
 /// Physical write evidence brackets the source snapshot and publication.
 /// Exclude SHM: ordinary readers legitimately update that coordination file.
 /// Completed checkpoints persist this evidence to refuse reuse after even a
@@ -256,6 +270,7 @@ fn epoch_file_observation(path: &Path) -> Option<Value> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum Event {
+    BeforeCandidateAdmission,
     CanonicalMessage {
         conversation_id: i64,
         message_idx: i64,
@@ -263,6 +278,7 @@ pub(super) enum Event {
     CommittedBatch {
         indexed_docs: usize,
     },
+    CandidateReleased,
     BeforePublication,
 }
 
@@ -1019,8 +1035,31 @@ fn run_inner(
     }
     crate::search::tantivy::validate_searchable_index_contract(&candidate_path)
         .map_err(|error| candidate_failure(error, "staged lexical contract is unreadable"))?;
+    if let Some(progress) = &progress {
+        progress.check_stop()?;
+        progress.tick_activity();
+    }
+    super::bump_index_run_lock_progress_if_present(progress_bump.as_ref());
+    observer(Event::BeforeCandidateAdmission)?;
+    // Quill writer admission precedes its interrupted-publish recovery and GC.
+    // Pin that writer's actual admitted generation, not a lock-free reader that
+    // could describe an older generation by the time this admission completes.
+    // The shared view also avoids hashing/mapping every retained segment twice.
+    let mut index = if let Some(heartbeat) = super::lexical_index_heartbeat(progress.as_ref()) {
+        crate::search::quill_bridge::run_with_liveness_ticks(
+            vec![candidate_path.clone()],
+            heartbeat,
+            || super::open_lexical_index_with_heartbeat(&candidate_path, progress.as_ref()),
+        )?
+    } else {
+        super::open_lexical_index_with_heartbeat(&candidate_path, progress.as_ref())?
+    };
+    if let Some(progress) = &progress {
+        progress.check_stop()?;
+    }
+    index.configure_bulk_load_merge_policy();
     let mut state = super::reconcile_pending_lexical_commit(index_path, state)?;
-    let published = PublishedSnapshot::open(&candidate_path)
+    let published = PublishedSnapshot::from_keeper(index.committed_snapshot()?)
         .map_err(|error| candidate_failure(error, "staged lexical generation is unreadable"))?;
     let original_docs = usize::try_from(published.doc_count())
         .context("lexical recovery candidate document count exceeds usize")?;
@@ -1066,8 +1105,6 @@ fn run_inner(
         conversations: max_conversations,
         page_size,
     } = ReplayLimits::capture();
-    let mut index = super::open_lexical_index_with_heartbeat(&candidate_path, progress.as_ref())?;
-    index.configure_bulk_load_merge_policy();
     state.db = db_state;
     state.committed_offset = 0;
     state.committed_conversation_id = None;
@@ -1180,10 +1217,25 @@ fn run_inner(
             None,
         )
     })?;
+    // This checkpoint fingerprint was captured after our final native commit,
+    // while the writer still held the candidate's exclusive admission. Never
+    // replace it with a later observation after releasing that admission: a
+    // same-count native rewrite would otherwise inherit an unrelated proof.
+    let verified_fingerprint = state
+        .committed_meta_fingerprint
+        .clone()
+        .context("recovered lexical generation has no committed fingerprint")?;
     drop(index);
+    observer(Event::CandidateReleased)?;
     publication.run("validate_recovered_candidate", || {
+        verify_candidate_generation(&candidate_path, &verified_fingerprint)?;
         crate::search::tantivy::validate_searchable_index_contract(&candidate_path)?;
-        super::verify_published_lexical_doc_count(&candidate_path, indexed_docs, "verified_replay")
+        super::verify_published_lexical_doc_count(
+            &candidate_path,
+            indexed_docs,
+            "verified_replay",
+        )?;
+        verify_candidate_generation(&candidate_path, &verified_fingerprint)
     })?;
     epoch.verify(db_path)?;
     let lexical_duration = started.elapsed();
@@ -1212,7 +1264,7 @@ fn run_inner(
     state.committed_conversation_id = last_conversation_id;
     state.indexed_docs = indexed_docs;
     state.completed_source_epoch = Some(epoch.clone());
-    state.mark_completed(super::index_meta_fingerprint(&candidate_path)?);
+    state.mark_completed(Some(verified_fingerprint.clone()));
     publication.run("persist_recovered_receipt", || {
         super::persist_lexical_rebuild_state(&candidate_path, &state)?;
         super::persist_lexical_publication_receipt(&candidate_path, &state)?;
@@ -1227,12 +1279,15 @@ fn run_inner(
     {
         return Err(SourceChanged.into());
     }
+    verify_candidate_generation(&candidate_path, &verified_fingerprint)?;
     publication.run("publish_recovered_generation", || {
         super::publish_staged_lexical_index(&candidate_path, index_path)
     })?;
     publication.run("validate_recovered_publication", || {
+        verify_candidate_generation(index_path, &verified_fingerprint)?;
         crate::search::tantivy::validate_searchable_index_contract(index_path)?;
-        super::verify_published_lexical_doc_count(index_path, indexed_docs, "verified_replay")
+        super::verify_published_lexical_doc_count(index_path, indexed_docs, "verified_replay")?;
+        verify_candidate_generation(index_path, &verified_fingerprint)
     })?;
     super::log_lexical_generation_manifest_published(&manifest, &evidence);
     let ledger = super::build_authoritative_lexical_refresh_ledger(

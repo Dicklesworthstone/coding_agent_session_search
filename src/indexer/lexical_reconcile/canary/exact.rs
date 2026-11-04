@@ -87,7 +87,14 @@ impl PublishedSnapshot {
         // Only committed durable segments are eligible for repair completion.
         let keeper = KeeperSnapshot::open(path, CASS_SEMANTIC_SCHEMA)
             .context("admitting lexical repair verification snapshot")?;
-        let view = SnapshotPublisher::new(Arc::new(keeper), Vec::new())
+        Self::from_keeper(Arc::new(keeper))
+    }
+
+    /// Reuse a writer-admitted immutable generation without reopening its
+    /// segment files. The caller retains the native writer admission while
+    /// auditing this view and extending that same generation.
+    pub(in crate::indexer) fn from_keeper(keeper: Arc<KeeperSnapshot>) -> Result<Self> {
+        let view = SnapshotPublisher::new(keeper, Vec::new())
             .context("binding lexical repair verification snapshot")?
             .load();
         Ok(Self { view })
@@ -213,6 +220,34 @@ mod tests {
             origin_host: None,
             conversation_id: Some(id),
         }
+    }
+
+    #[test]
+    fn writer_admitted_snapshot_reuses_native_view_and_pins_committed_content() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("index");
+        let mut index = TantivyIndex::open_or_create(&path)?;
+        let original = document(42, "meridian original committed content");
+        let replacement = document(42, "meridian replacement committed content");
+        index.add_prebuilt_documents_slice(std::slice::from_ref(&original))?;
+        index.commit()?;
+
+        let admitted = index.committed_snapshot()?;
+        let before = PublishedSnapshot::from_keeper(Arc::clone(&admitted))?;
+        assert!(Arc::ptr_eq(&admitted, &before.view.keeper_snapshot_arc(),));
+        assert_eq!(before.doc_count(), 1);
+        assert!(before.verify_content(&original)?);
+        assert!(!before.verify_content(&replacement)?);
+
+        index.upsert_prebuilt_documents_slice(std::slice::from_ref(&replacement))?;
+        index.commit()?;
+        let after = PublishedSnapshot::from_keeper(index.committed_snapshot()?)?;
+        assert_eq!(after.doc_count(), 1);
+        assert!(after.verify_content(&replacement)?);
+        assert!(!after.verify_content(&original)?);
+        assert!(before.verify_content(&original)?);
+        assert!(!before.verify_content(&replacement)?);
+        Ok(())
     }
 
     #[test]
