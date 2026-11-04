@@ -1643,6 +1643,60 @@ current MANIFEST is read through `MANIFEST.prev`, the generation before the
 newest publish, so the index reports `stale` and `health` reports it as an
 error; `cass index` rebuilds the generation from the canonical archive.
 
+### Recovering an Interrupted Lexical Rebuild
+
+Rerun `cass index --full --rebuild-profile bounded --json` after an interrupted
+rebuild. A saved scratch generation can retain its committed documents when
+new conversations or messages have entered the canonical archive, including
+messages appended to conversations it already processed. Recovery streams the
+canonical archive again to verify those documents and adds only missing
+document identities. Final segment maintenance can still rewrite retained
+segments. Verification progress therefore starts at the first conversation;
+that does not mean the committed index work was discarded.
+
+Every retained document must match the canonical identity and full projected
+content, and every document in the saved generation must be accounted for.
+Edits or deletions affecting retained search documents, a replaced archive,
+incompatible projection settings, and damaged or inconsistent index evidence
+reject reuse. The rejected candidate is retained in a
+`.lexical-rebuild-quarantine-*` directory and a fresh replacement is built
+off-live. Explicit `--force-rebuild` still requests a fresh pass.
+
+Recovery checkpoints bind the archive's stable file identity, lexical schema,
+packet contract, and per-message content cap. Older version-three checkpoints
+that explicitly identify a staged single index can be adopted only through
+the complete content audit; their old conversation cursor never authorizes
+skipping rows. They cannot establish historical file identity before that
+upgrade. Incomplete shared-writer and live-index checkpoints restart off-live,
+including checkpoints that carry an archive binding.
+
+Completed generations are also bound to their native manifest and the observed
+canonical DB/WAL write epoch. If that evidence has changed, an explicit rebuild
+performs a bounded read-only content audit before reusing the live generation.
+This includes harmless bookkeeping writes: equal row counts alone never renew
+rebuild authority. A matching audit retains the index without rewriting its
+documents; a mismatch starts a replacement off-live. Successful verification
+refreshes the paired generation and equivalence evidence before recording
+completion, while leaving the native index unchanged.
+
+Newly indexed batches are committed and checkpointed durably. A further
+interruption preserves those batches too. Readers keep the prior published
+generation until the candidate, its manifest, and its completed receipt are
+ready for the existing atomic swap. A canonical database write detected during
+verification or publication returns an error and retains the generation for a
+verified retry. Any saved completion evidence remains bound to the source
+epoch that was actually audited. CASS's archive writer lease excludes
+cooperating canonical writers; external session files can keep growing, and a
+later indexing scan ingests those files after canonical recovery finishes.
+
+The bounded profile, per-message cap, responsiveness limits, disk headroom
+checks, and bounded merge planner still apply. The audit does not retain an
+archive-sized set of message identities. Its source reads and native content
+checks still cost time, and the existing controls do not guarantee a fixed
+total-process RSS ceiling. See [the recovery design and validation
+record](docs/perf/issue-496-lexical-resume.md) for the test matrix and measured
+scope.
+
 ### Robot Documentation System
 
 For machine-readable documentation, use `cass robot-docs <topic>`:
