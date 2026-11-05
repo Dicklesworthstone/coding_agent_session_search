@@ -39,7 +39,7 @@ Those revisions must be distinguished rather than combined into one green claim.
   Reviewed their commit evidence, all additional README text and the relevant
   production boundaries. This is a delta review, not a claim to have executed
   all new tests or fully audited every new line. The commits explicitly leave
-  full application validation pending. The running repair gate stays frozen
+  full application validation pending. The completed repair gate stayed frozen
   at `c507db8b`; these newer commits cannot inherit its result. Local main was
   not blindly pulled across its staged lexical source edit.
 - Concurrent commit `7535bd42a04d1921ce3bd2ef6ff2cde5244c1c82` subsequently
@@ -50,11 +50,26 @@ Those revisions must be distinguished rather than combined into one green claim.
   additive receipt change; that is not an exact-HEAD runtime receipt. The earlier
   E0624 and clamp failures describe `c507db8b`, not an unfixed latest-source
   blocker. This pass's narrower test-placement alternative stays unmerged.
-- Final direct DSR health refresh (`dsr-cass-health-final.json`,
-  `2026-11-05T00:24:33Z`) again found both actual CASS builders healthy, with
+- The final fetch also found `c72b890f22d2dff5e30c26c0ab00a6999efa769d`,
+  a 42-file semantic-serving implementation. Neither governing file nor README
+  changed. Read its complete 255-line evidence/limits report and inspected
+  publication, conditional completion, retained-owner loading, transactional
+  candidate hydration and client propagation boundaries. Certified native Unix
+  legacy generations now have real production serving integration; the earlier
+  claim that only certificate primitives existed is superseded. Its author
+  reports 26 component cases and two million-record probes, with full application
+  runtime tests still pending and strict UBS red. Those are attributed component
+  receipts, not this assessment's runtime results. The final independent probe
+  remains frozen at `0d91b8f3`; it cannot qualify this subsequent implementation.
+- Final direct DSR health refresh (`dsr-cass-health-completion-refresh.json`,
+  `2026-11-05T02:41:47Z`) again found both actual CASS builders healthy, with
   disk warnings and no errors. No release/build result follows from health.
 - Fresh released-binary run: `/home/ubuntu/.local/bin/cass`, SHA256
   `d221153d8e0a79ae37eb492855d32cd2aadb98e707c74c37445f779a46c626dd`.
+  Downloaded the published Linux amd64 archive again and verified its asset
+  digest `638ea8a8a9023c2e046bf8868392e6191218b89cf006e81af3ca205b546c4681`;
+  hashing its `cass` member in memory exactly matches the installed executable.
+  Receipt: `published-v0100-binary-identity-final.json`, `2026-11-05T02:59:28Z`.
   Same deterministic synthetic corpus as yesterday, recreated in a new private
   home: 456 Claude/Codex conversations, 12,038 messages, including a 3,000-message
   conversation, old timestamps, filters, and synthetic credentials. No owner
@@ -121,13 +136,25 @@ Those revisions must be distinguished rather than combined into one green claim.
   of newly introduced defects. The pinned `hz3` retry refused admission after
   its queue deadline (`EXIT=103`), verifying nothing. No local fallback or
   admission-floor override was used.
-- The corrected four-file gate is running on `hz4`, frozen content SHA256
+- The corrected four-file gate finished on `hz4`, frozen content SHA256
   `2da229a3c7ea058bd9c0f932b45bfdbd9bf46319c7b222284c420d519f536fc2`.
-  Identity, freshness and formatting passed. At this report checkpoint there
-  is no terminal compiler/runtime result or candidate-binary journey. The
-  receipt is `gate-final-hz4-after-error-conversion.console.log`; unfinished
-  stages provide no clearance. No release qualification follows from host
-  health, static review, old results, hashes alone, or an ignored test.
+  Identity, freshness, fmt, all-target clippy and lib-build passed. Selected
+  library tests returned **78 passed, 4 failed, 2 ignored, 9,128 filtered out**
+  in 202.94 s (`STAGE=lib-tests EXIT=101`). The real hash-embedder background
+  CLI regression passed (1 test, 75.78 s), and 69 goldens passed across two
+  binaries. Strict UBS returned exit 1 with the same 1,288 warnings. Transport
+  and `job-complete` returned zero; the gate correctly returned **RED, exit 1**.
+  Receipt: `gate-final-hz4-after-error-conversion.console.log` and
+  `/data/tmp/cass-gate.oLLKR0`, finished `2026-11-05T02:12:35Z`.
+- The selected library executable was hashed through its live process:
+  SHA256 `ead485f4d8c70b350a0f0eb6c7a2df219131cae9c9942a43361745ae869a0942`.
+  The CLI actually executed by that gate's `cli_index` test was retained
+  through `/proc/<pid>/exe`, copied locally and independently hash-checked:
+  SHA256 `9ec87883a4a694bd8d87929e62e85b1a077ff64434fb5f4fd401978e1c25ecbb`.
+  Both receipts record the worker, ancestor process chain, size, inode and
+  frozen source digest. This is the candidate used below, not the release or
+  later `0d91b8f3` source. Its functional debug profile omits symbols, with
+  assertions enabled and dependencies at the repository's opt-level 1.
 
 ### What the fresh released-binary journey established
 
@@ -168,13 +195,95 @@ until cleanup; SIGINT did not stop it within five seconds, then the probe's own
 process exited 143 after SIGTERM. That is a cleanup observation, not the GH515
 forced-cut/WAL acceptance proof or a current-source shutdown verdict.
 
-The GitHub API still reports latest release [v0.10.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.10.0), published
+The final GitHub/package-channel refresh at approximately `2026-11-05T02:41Z`
+still reports latest release [v0.10.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.10.0), published
 `2026-10-02T02:54:21Z`. There are **10 open GitHub issues** in the current read,
 not yesterday's 35. A reduced issue count does not mean those source fixes have
 been released. New #539 and #540 initially had no work-graph record.
 Live package-channel reads show Homebrew and Scoop at `0.10.0`, and [crates.io](https://crates.io/crates/coding-agent-search)
 still at `0.7.0` (last updated 2026-08-25). This checks published manifests and
 registry metadata, not fresh installations on every platform.
+
+### What the source-bound candidate established, and what failed
+
+The captured candidate also completed the same 43-command journey with **60/60
+checked outcomes** on a new private synthetic home. Both planted credentials
+were absent from its HTML and Markdown exports. Stock SQLite 3.46.1 opened the
+resulting archive read-only and returned `PRAGMA quick_check = ok`. This is
+bounded interoperation, not damaged-owner-archive recovery or a corruption
+advisory requalification. Candidate index timing/RSS is retained as an observation;
+the different source, dependency graph and debug profile do not establish a
+performance win over the release.
+
+The separate real-MiniLM candidate run passed **23 checks**. Backfill published
+180 vectors for 30 conversations, repeated backfill embedded zero documents,
+and the no-lexical-match paraphrase retrieved the garage/battery material in
+semantic and hybrid modes. After one ordinary appended message and background
+indexing, canonical and quality-vector counts both became **181**, the quality
+tier remained current, and both queries still refined semantically with no
+fallback. This verifies the narrow background lifecycle fix on real MiniLM,
+beyond the hash integration fixture. It does not establish general relevance,
+foreground catch-up, immutable retained serving or archive-scale cost.
+
+Readiness still described semantic state as `building` with residual backfill
+while quality coverage was current and usable. Progressive readiness remained
+false with `owner_backed_reader_required`; ordinary fully refined hybrid is not
+evidence of the disabled progressive owner. Retain this distinction in `.26`'s
+contract/readiness cleanup.
+
+The library selection was **not green**. Its four failures need separate triage:
+
+| Frozen-cohort test | Observed failure and actual limit |
+|---|---|
+| `gh494_publish_failure_at_eof_is_finalized_on_retry_instead_of_returning_success` | A real directory obstruction refused publication, but the test expected phase `persist_generation_manifest` while recovery reported `persist_recovered_generation`. Later preservation assertions were not reached; do not erase them to make the label green. |
+| `gh496_count_refresh_cannot_complete_or_overwrite_an_incomplete_staged_audit` | The initial fixture premise compared live count `Some(4)` with `db_state.total_messages = 0`; it failed before exercising the intended count-refresh guard. |
+| `gh496_edits_deletions_and_identity_changes_refuse_prefix_reuse` | The public rebuild returned, but full projected content for conversation 1/message 0 was missing or stale for at least one of the ten mutation variants. The log does not identify which variant; it does not prove all ten fail. |
+| `gh496_replaced_archive_at_same_path_is_not_the_checkpoint_archive` | Reopening the replacement database path failed after moving the original DB/WAL/SHM. The intended archive-identity assertions were not reached. |
+
+These are results for `c507db8b` plus the recorded four-file candidate. No
+matched, unmodified C507 control was executed; later main is a distinct cohort.
+
+The final independent gate froze the then-current main snapshot `0d91b8f3`,
+with no candidate source edits, on `hz4`: content SHA256
+`1d99e35633baf8e312c3aa1f61b1648414e16d8290204ff67223238ab7439b39`.
+The first pinned-worker attempt refused source-namespace initialization before
+any stage (`gate-current-0d91-targeted.console.log`, exit 103). The ordinary
+unpinned retry selected `hz4`. Identity, freshness, fmt, all-target clippy and
+lib-build passed. Selected library runtime returned **55 passed, 5 failed,
+1 ignored, 9,194 filtered out** in 126.53 s. All four recovery failures above
+reproduced with the same reached/unreached boundaries. They therefore remain
+unresolved in this newer unmodified snapshot as well as in the prototype; this
+is not a single-variable attribution experiment.
+
+The fifth failure is
+`storage::sqlite::semantic_coverage_tests::gh458_forget_and_reused_ids_keep_durable_invalidation`.
+Forget, watermark clearing and stale-boundary CAS assertions passed, then the
+replacement insert's maximum ID was `Some(3)` rather than the fixture's required
+`Some(1)`. It never established the intended top-rowid-reuse condition, and its
+later reuse-invalidation/high-water assertions did not execute. This is neither
+proof of stale-vector resurrection nor passing reused-ID protection; `962e8`
+retains that missing acceptance. Forty replay-cache cases, eleven canonical
+coverage cases and four packet cases passed. The million-passage inventory
+case was explicitly ignored because it writes/validates more than 128 MiB;
+this run does not repeat its author's separate million-record measurement.
+
+The actual current-cohort library executable was hashed through its live process:
+SHA256 `bd52c2affd69b31275581070ba8edce5724faede6d80069fd2a769fecc48dbf5`,
+423,151,184 bytes. `current-lib-executable-identity.console.log` records the
+worker, ancestors, source digest and file identity. The gate receipt is
+`gate-current-0d91-unpinned.console.log`. Strict pinned UBS completed **exit 1,
+15 files, 96 critical, 27,877 warnings and 10,422 informational findings**, with
+the real Rust AST control passed. This is a blocking whole-file result, not
+96 newly introduced defects; no complete baseline attribution was performed.
+The four-file and fifteen-file scan totals have different scopes and must not
+be added or treated as a defect-growth comparison. No CLI integration or
+goldens were requested in this final cohort,
+and none of these results qualifies the subsequent `c72b890f` serving changes.
+The gate ended **RED, exit 1**, at `2026-11-05T03:12:23Z`, receipt
+`/data/tmp/cass-gate.zqEry5`; transport and `job-complete` were zero. Its warning
+about a missing positive terminal test-count receipt follows the failed library
+selection, not zero executed cases; the actual harness counts above are retained.
+All source candidates remain unmerged.
 
 ### Vision checklist: implementation, proof and remaining ownership
 
@@ -187,7 +296,7 @@ whole-project clearance. Bead suffixes use `coding_agent_session_search-`.
 | # | Testable promise from README/plans | Current code and evidence | Remaining work |
 |---|---|---|---|
 | 1 | Discover and normalize every advertised provider | PARTIAL qualification: real FAD registry/CASS adapters; fresh journey covers Claude/Codex, not all 34 | `cooow`, `.24`, provider acceptance |
-| 2 | Batch/watch/quarantine use the same provider semantics | PARTIAL qualification; [Continue now constructs the CASS adapter](../../src/indexer/mod.rs#L32257) in `ConnectorKind`, correcting the older assessment | `cooow`, GH538 |
+| 2 | Batch/watch/quarantine use the same provider semantics | PARTIAL qualification; [Continue constructs the CASS adapter](https://github.com/Dicklesworthstone/coding_agent_session_search/blob/c507db8bf1797c8b1879ec58d95a2a4b098f5920/src/indexer/mod.rs#L32257) in `ConnectorKind`, correcting the older assessment | `cooow`, GH538 |
 | 3 | Durable pure-Rust canonical SQLite storage | WORKING-R for the fixture; production uses `franken_sync`/FrankenSQLite, `rusqlite` is dev-only; external sqlite3 repairs remain | `.65`, engine/integrity owners |
 | 4 | Stable identity, no duplicates, append/forget correctness | WORKING-R on ordinary files; shared-store/reinclude source and regression repair exist | `fx9fd`, `.24`, shared-store acceptance |
 | 5 | Cheap no-op and small-delta indexing | PARTIAL; durable reuse, lexical-count fixes and journal-guided replay now exist; the separate semantic catch-up path retained an adjacent DISTINCT scan | `.86`, `.86.1`, `3zq55`, `irqgt`, `ayhvu` |
@@ -199,8 +308,8 @@ whole-project clearance. Bead suffixes use `coding_agent_session_search-`.
 | 11 | Missing/corrupt lexical assets heal through atomic publication | PARTIAL; real scratch/atomic swap/quarantine pipeline, verified-replay recovery and passive Current/Unverified/Stale/Incompatible evidence | `h3jnv`, `.46`, `.48`, `lndgg` |
 | 12 | Hybrid defaults to lexical when semantic is unavailable | WORKING-R missing-model fallback; robot metadata names the realized mode and reason | `.11`, `ds7uy.4`, model-backed lifecycle |
 | 13 | Useful native local MiniLM with explicit acquisition | WORKING-R on the real-model paraphrase/backfill fixture; broad relevance, target-platform and current-source qualification remain separate | `jyfuq.2`, `dl6ye`, `bzurv`, `.33` |
-| 14 | Real progressive fast/quality refinement | PARTIAL and deliberately inactive in CLI/TUI; [private owner-backed capability remains false](../../src/search/vector_index.rs#L228), ordinary hybrid is single tier | `ds7uy.1`–`.5`, `jyfuq` |
-| 15 | Semantic generations remain current through ingestion | PARTIAL; background delta/per-embedder watermarks exist; newly landed V24 journal and coverage/CAS foundation do not yet activate retained serving/query validation | `962e8`, `ds7uy.*` |
+| 14 | Real progressive fast/quality refinement | PARTIAL and deliberately inactive in CLI/TUI; the private owner-backed progressive capability remains false even after `c72b890f`; certified single-tier retention is a different contract | `ds7uy.1`–`.5`, `jyfuq` |
+| 15 | Semantic generations remain useful through ingestion | PARTIAL; background lifecycle passed in the frozen candidate; `c72b890f` adds certified immutable Unix legacy serving and transactional candidate validation, but full application runtime qualification remains pending | `962e8`, `ds7uy.*`, issue-458 native gates |
 | 16 | Native ANN covers all authoritative shards/updates | PARTIAL; exact fallback preserves correctness; [12 incremental-HNSW](../../src/indexer/semantic/delegate/hnsw.rs#L279) and [two ANN-WAL tests](../../src/search/query/ann_shards/wal_tests.rs#L178) were ignored, not fixed | `of9i7`, `ds7uy.3.3`, `wfm4e`, `fdvur`, `3rz35` |
 | 17 | Retained daemon/service avoids repeated cold setup | Real authenticated daemon and persistent lexical/semantic service; warm retention differs from one-shot startup cost | `.32`, `o9ixv`, native lifecycle owners |
 | 18 | Bounded robot retrieval and truthful effective inputs | WORKING-R sampled errors/filters/fallback; broad budget/metadata paths exist, scale costs remain | `.11`, `.68`, budget owners |
@@ -254,12 +363,18 @@ must become `10,20,999` after deduplication. The candidate's Rust test adds exac
 old/new VDBE controls, historical/watermark rows, holes, repeats, orphan and empty
 delta behavior; existing packet tests cover canonical content and provenance.
 The requested CLI background regression uses the real hash-embedder pipeline to
-check lifecycle and publication. It is not a MiniLM relevance test; the fresh
-real-MiniLM evidence above belongs to the released executable.
-These observations establish an engine-plan defect and a plausible bounded
-repair. They are not a measured whole-command speedup or a passing CASS test.
+check lifecycle and publication. It is not a MiniLM relevance test; the separate
+real-MiniLM runs above distinguish the released and source-bound executables.
+The subsequent source-bound Rust range-seek regression and all three existing
+packet controls passed; the real hash CLI and MiniLM background fixtures also
+passed. This verifies the bounded repair's mechanism and behavior in the frozen
+candidate. It is not a measured whole-command speedup or a green whole gate.
 The source patch and input hashes are retained beside the gate receipts; `.86.1`
-owns implementation and validation together.
+owns implementation and validation together. `semantic-query-only.patch`
+(SHA256 `2eae2cff00613aad548faabddf0236083b0cef17dce196756aca78ede2b60c70`)
+excludes the superseded test-placement alternative and clamp maintenance. A
+read-only `git apply --check` succeeds on `c72b890f`; patch applicability is not
+runtime qualification of that newer source.
 
 The independent plan check was also repeated against a copy of the full migrated
 CASS synthetic archive, including its actual `messages` unique index and
@@ -326,12 +441,17 @@ or category was exempted. `.46` retains this implementation/validation unit.
 3. **Finish semantic serving as a product lifecycle.** The background delta is a
    real improvement. It is not immutable current-source serving, progressive
    CLI/TUI delivery, native ANN across WAL/shards, or general title-aware search.
-   Foreground indexing still intentionally leaves semantic assets stale unless
-   semantic work or a later background catch-up runs. The latest V24 journal and
-   coverage-certificate foundation and streamed replay are substantial progress,
-   with bounded component receipts recorded by their author. They do not yet
-   relax serving admission or establish a passing full application. Streamed
-   identity inventory and existing ID sets still perform archive-sized work.
+   In the independently executed candidate, foreground indexing still leaves
+   semantic assets stale unless semantic work or later background catch-up runs.
+   Subsequent `c72b890f` now relaxes admission for certified immutable native Unix
+   legacy owners, validates each winning passage and parent in one canonical
+   transaction, and carries partial coverage through clients. This is substantive
+   implementation progress, with attributed component receipts, rather than a
+   passing native application result. Unsupported owners/platforms stay strict,
+   certified legacy ANN falls back to exact vectors, cold admission hashes whole
+   artifacts, and streamed identity inventory and ID sets still perform
+   archive-sized work. The new path needs its own exact-source native gate and
+   large-archive lifecycle/relevance acceptance.
 4. **Make routine work scale with its actual obligation.** #539 reports two
    small-delta commands at 110.2/60.3 s, with estimated archive-sized costs of
    45/35 s. Those are qualified reporter observations, not reproduced timings.
@@ -404,6 +524,15 @@ rule. New validation cites observed GH539 costs or an existing named release gat
 The bridge therefore preserves ambition without pretending that an unfinished
 library API is enabled in the CLI, an ignored test is fixed, a healthy host is a
 tested artifact, or a small fixture proves the large-archive resource contract.
+
+The assessment publishes this report and the scoped tracker updates. The Rust
+proposal stays reviewable in its isolated worktree and core-only patch because
+its acceptance is incomplete. Metadata is committed from a separate clean
+checkout following main, preserving the shared checkout's staged lexical edit
+and concurrent source history. Both owned gates have ended; the final frozen
+QA checkout has no remaining worker processes. The receipt root's
+`final-evidence-manifest-20261105.json` binds the terminal logs, actual executable
+identities, retained patches and independent journey verifiers.
 
 ---
 
