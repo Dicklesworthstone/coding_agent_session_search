@@ -526,7 +526,7 @@ fn path_to_packet_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn normalize_role(role: &str) -> String {
+pub(crate) fn normalize_role(role: &str) -> String {
     match role.trim().to_ascii_lowercase().as_str() {
         "agent" | "assistant" => "assistant".to_string(),
         "user" => "user".to_string(),

@@ -31,6 +31,9 @@ pub(crate) struct SemanticStorageBuildOutcome {
     pub input_passages: usize,
     pub embedded_docs: usize,
     pub last_message_id: Option<i64>,
+    pub coverage: Option<engine::SemanticBuildSnapshot>,
+    pub document_digest: Option<String>,
+    pub canonical_boundary: Option<(crate::storage::sqlite::SemanticArchiveState, i64)>,
 }
 
 const DIRECT_EMBED_MAX_INPUTS: usize = 512;
@@ -153,6 +156,22 @@ impl SemanticIndexer {
             .saturating_mul(4)
             .clamp(1, DIRECT_EMBED_MAX_INPUTS);
         let mut outcome = SemanticStorageBuildOutcome::default();
+        let mut coverage = engine::SemanticBuildSnapshot::capture(storage, self.embedder_id())?;
+        outcome.canonical_boundary = if let Some(snapshot) = &coverage {
+            Some((snapshot.state.clone(), snapshot.max_message_id))
+        } else {
+            storage
+                .semantic_archive_state()?
+                .map(|state| {
+                    storage
+                        .max_message_id()
+                        .map(|maximum| (state, maximum.unwrap_or(0)))
+                })
+                .transpose()?
+        };
+        if let Some(snapshot) = &mut coverage {
+            snapshot.prepare_parents(storage, data_dir)?;
+        }
         let published = self.build_and_save_index_with_producer(
             data_dir,
             |emit| {
@@ -220,6 +239,9 @@ impl SemanticIndexer {
                             &on_progress,
                         )?);
                 self.inner.check_external_cancelled()?;
+                if let Some(snapshot) = &coverage {
+                    snapshot.verify(storage)?;
+                }
                 (on_progress.borrow_mut())(
                     SemanticStorageBuildPhase::VectorPublish,
                     0,
@@ -229,6 +251,19 @@ impl SemanticIndexer {
             },
             |_| {},
         )?;
+        if let Some((_, maximum)) = &outcome.canonical_boundary
+            && let Some(last_selected) = outcome.last_message_id
+        {
+            ensure!(
+                last_selected <= *maximum,
+                "semantic replay crossed its captured message boundary"
+            );
+        }
+        if let Some(snapshot) = &coverage {
+            snapshot.verify(storage)?;
+            outcome.document_digest = Some(engine::semantic_index_document_digest(&published)?);
+        }
+        outcome.coverage = coverage;
         // Close the installed reader before the caller updates manifest or
         // watermark state, including on Windows. No callbacks run after commit.
         drop(published);
@@ -274,6 +309,18 @@ impl SemanticIndexer {
         data_dir: &Path,
     ) -> Result<usize> {
         append::run(self, embedded_messages, data_dir)
+    }
+
+    /// The receipt is computed while the same maintenance lease still owns
+    /// base admission, append, and compaction. A caller cannot certify a tail
+    /// against a different prefix installed by a concurrent publisher.
+    pub(crate) fn append_to_index_with_coverage_receipt(
+        &self,
+        embedded_messages: impl IntoIterator<Item = EmbeddedMessage>,
+        data_dir: &Path,
+        expected_base_sha256: Option<&str>,
+    ) -> Result<(usize, String)> {
+        append::run_with_coverage_receipt(self, embedded_messages, data_dir, expected_base_sha256)
     }
 
     /// Reconcile against the caller's authoritative canonical identity set.

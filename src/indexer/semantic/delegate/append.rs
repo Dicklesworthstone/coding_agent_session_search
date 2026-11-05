@@ -193,6 +193,49 @@ fn run_with_limit(
     max_bytes: usize,
     mut check_cancelled: impl FnMut() -> Result<()>,
 ) -> Result<usize> {
+    run_admitted(
+        indexer,
+        messages,
+        data_dir,
+        max_bytes,
+        &mut check_cancelled,
+        None,
+        false,
+    )
+    .map(|(count, _)| count)
+}
+
+pub(super) fn run_with_coverage_receipt(
+    indexer: &SemanticIndexer,
+    messages: impl IntoIterator<Item = EmbeddedMessage>,
+    data_dir: &Path,
+    expected_base_sha256: Option<&str>,
+) -> Result<(usize, String)> {
+    let (count, receipt) = run_admitted(
+        indexer,
+        messages,
+        data_dir,
+        configured_max_bytes()?,
+        || indexer.inner.check_external_cancelled(),
+        expected_base_sha256,
+        true,
+    )?;
+    Ok((
+        count,
+        receipt.context("semantic append omitted its publication receipt")?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_admitted(
+    indexer: &SemanticIndexer,
+    messages: impl IntoIterator<Item = EmbeddedMessage>,
+    data_dir: &Path,
+    max_bytes: usize,
+    mut check_cancelled: impl FnMut() -> Result<()>,
+    expected_base_sha256: Option<&str>,
+    receipt_required: bool,
+) -> Result<(usize, Option<String>)> {
     check_cancelled()?;
     // The native read-to-write transition below releases its shared source
     // owner. Hold the same outer lease as full rebuilds and backfills across
@@ -206,6 +249,15 @@ fn run_with_limit(
     let source =
         VectorIndex::open_read_only(&path).context("open semantic append source read-only")?;
     check_contract(indexer, &source)?;
+    if let Some(expected) = expected_base_sha256 {
+        let mut file = fs::File::open(&path)?;
+        ensure!(
+            source.wal_record_count() == 0
+                && source.tombstone_count() == 0
+                && crate::search::semantic_coverage::semantic_file_sha256(&mut file)? == expected,
+            "certified semantic base changed before append admission"
+        );
+    }
     ensure!(
         RebuildDestination::capture(&path)? == before
             && ObservedSemanticFile::capture(&wal)? == wal_before,
@@ -228,7 +280,10 @@ fn run_with_limit(
     );
     check_cancelled()?;
     if count == 0 {
-        return Ok(0);
+        let receipt = receipt_required
+            .then(|| engine::semantic_index_document_digest(&source))
+            .transpose()?;
+        return Ok((0, receipt));
     }
     drop(source);
     // The observations hold the main file and WAL open. Compaction below may
@@ -247,7 +302,16 @@ fn run_with_limit(
     indexer.inner.append_to_index(messages, data_dir)?;
     // Preserve the API's input-row count even when repeated identities were
     // reduced to their last values. Never report cancellation after commit.
-    Ok(count)
+    let receipt = if receipt_required {
+        let mut published = VectorIndex::open_writer(&path)?;
+        if published.wal_record_count() > 0 {
+            published.compact()?;
+        }
+        Some(engine::semantic_index_document_digest(&published)?)
+    } else {
+        None
+    };
+    Ok((count, receipt))
 }
 
 fn check_contract(indexer: &SemanticIndexer, source: &VectorIndex) -> Result<()> {

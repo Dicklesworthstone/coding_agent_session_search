@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::indexer::{
-    LEXICAL_REBUILD_PAGE_SIZE_PUBLIC, LexicalRebuildCheckpoint,
-    lexical_rebuild_page_size_is_compatible, lexical_storage_fingerprint_for_db,
-    load_lexical_rebuild_checkpoint,
+    LEXICAL_REBUILD_PAGE_SIZE_PUBLIC, LexicalCheckpointFreshness, LexicalRebuildCheckpoint,
+    completed_lexical_checkpoint_freshness, lexical_rebuild_page_size_is_compatible,
+    lexical_storage_fingerprint_for_db_cached, load_lexical_rebuild_checkpoint,
 };
 use crate::search::ann_index::hnsw_index_path;
 use crate::search::embedder::Embedder;
@@ -630,6 +630,7 @@ pub(crate) struct SemanticTierAssetState {
     pub size_bytes: Option<u64>,
     pub index_path: Option<PathBuf>,
     pub shard_count: Option<u32>,
+    pub coverage: Option<crate::search::vector_index::SemanticCoverageSnapshot>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -831,6 +832,71 @@ pub(crate) fn inspect_semantic_assets(
         SemanticPreference::DefaultModel => probe_semantic_availability(data_dir),
         SemanticPreference::HashFallback => probe_hash_semantic_availability(data_dir),
     };
+    if availability.can_search()
+        && let Some(embedder_id) = semantic_embedder_id(&availability, preference)
+    {
+        let observation = FrankenStorage::open_readonly(db_path)
+            .map_err(|error| error.to_string())
+            .and_then(|storage| {
+                crate::search::model_manager::observe_covered_semantic_artifact(
+                    data_dir,
+                    &storage,
+                    &embedder_id,
+                )
+            });
+        match observation {
+            Ok(Some((record, coverage))) => {
+                let mut state = semantic_state_from_availability(
+                    data_dir,
+                    &availability,
+                    preference,
+                    current_db_fingerprint,
+                );
+                state.status = if coverage.status == "partial" {
+                    "partial"
+                } else {
+                    "ready"
+                };
+                state.availability = if coverage.status == "partial" {
+                    "partial_coverage"
+                } else {
+                    "ready"
+                };
+                state.summary = if coverage.status == "partial" {
+                    "verified semantic generation remains searchable while current messages are reconciled".to_owned()
+                } else {
+                    "verified semantic generation covers the current canonical snapshot".to_owned()
+                };
+                state.available = true;
+                state.can_search = true;
+                state.semantic_only_search_available = true;
+                state.fallback_mode = None;
+                state.hint = (coverage.status == "partial").then(||
+                    "Results exclude changed or removed identities; newer messages become searchable after semantic catch-up.".to_owned());
+                state.vector_index_path = Some(data_dir.join(&record.index_path));
+                state.hnsw_path = None;
+                state.hnsw_present = false;
+                state.hnsw_state = "missing";
+                let tier = match record.tier {
+                    TierKind::Fast => &mut state.fast_tier,
+                    TierKind::Quality => &mut state.quality_tier,
+                };
+                tier.coverage = Some(coverage);
+                tier.index_path = Some(data_dir.join(&record.index_path));
+                state.quality_tier_published |= state.quality_tier.coverage.is_some();
+                return state;
+            }
+            Ok(None) => {}
+            Err(context) => {
+                return semantic_state_from_availability(
+                    data_dir,
+                    &SemanticAvailability::LoadFailed { context },
+                    preference,
+                    current_db_fingerprint,
+                );
+            }
+        }
+    }
     let availability = apply_semantic_identity_invalidation(db_path, availability, preference);
     semantic_state_from_availability(data_dir, &availability, preference, current_db_fingerprint)
 }
@@ -1208,7 +1274,7 @@ fn semantic_tier_queryable(
     availability: &SemanticAvailability,
     tier: &SemanticTierAssetState,
 ) -> bool {
-    if !tier.ready || tier.current_db_matches == Some(false) {
+    if !tier.ready || (tier.current_db_matches == Some(false) && tier.coverage.is_none()) {
         return false;
     }
     let Some(embedder_id) = tier.embedder_id.as_deref() else {
@@ -1275,6 +1341,7 @@ fn semantic_tier_asset_state(
         size_bytes: Some(artifact.size_bytes),
         index_path: None,
         shard_count: Some(1),
+        coverage: None,
     }
 }
 
@@ -1368,6 +1435,7 @@ fn promote_complete_shard_generation_state(
         size_bytes: Some(size_bytes),
         index_path: Some(first_index_path),
         shard_count: u32::try_from(records.len()).ok(),
+        coverage: None,
     };
 }
 
@@ -1444,19 +1512,35 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
     let index_path = crate::search::tantivy::expected_index_dir(data_dir);
     let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
         .with_context(|| format!("loading lexical checkpoint from {}", index_path.display()))?;
-    let current_db_fingerprint = if db_available && compute_lexical_fingerprint {
-        let fingerprint = lexical_storage_fingerprint_for_db(db_path).with_context(|| {
-            format!(
-                "computing lexical storage fingerprint for {}",
-                db_path.display()
+    let completion_freshness = checkpoint.as_ref().filter(|state| state.completed).map(|state| {
+        completed_lexical_checkpoint_freshness(&index_path, db_path, state).unwrap_or_else(|error| {
+            tracing::debug!(%error, "lexical completion freshness could not be passively verified");
+            LexicalCheckpointFreshness::Unverified(
+                "lexical completion evidence is unavailable; content verification is required",
             )
-        })?;
-        crate::indexer::write_archive_fingerprint_cache_best_effort(
-            db_path,
-            &index_path,
-            &fingerprint,
-        );
-        Some(fingerprint)
+        })
+    });
+    let current_db_fingerprint = if db_available
+        && completion_freshness == Some(LexicalCheckpointFreshness::Current)
+    {
+        // The source epoch and native publication were just checked together.
+        // No SQLite open is needed to repeat that completed observation.
+        checkpoint
+            .as_ref()
+            .map(|state| state.storage_fingerprint.clone())
+    } else if db_available && compute_lexical_fingerprint {
+        match lexical_storage_fingerprint_for_db_cached(db_path, &index_path) {
+            Ok(fingerprint) => Some(fingerprint),
+            Err(error) if crate::indexer::lexical_fingerprint_observation_changed(&error) => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "computing lexical storage fingerprint for {}",
+                        db_path.display()
+                    )
+                });
+            }
+        }
     } else if db_available {
         // GH #353: the skip-open surfaces (health watermark lane, count-less
         // status) deliberately never open the archive, but they must still
@@ -1470,7 +1554,7 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         None
     };
 
-    Ok(lexical_state_from_observations(LexicalObservationInput {
+    let mut state = lexical_state_from_observations(LexicalObservationInput {
         index_path: &index_path,
         db_path,
         stale_threshold,
@@ -1480,7 +1564,39 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         checkpoint: checkpoint.as_ref(),
         current_db_fingerprint: current_db_fingerprint.as_deref(),
         live: crate::search::tantivy::searchable_index_live_docs(&index_path),
-    }))
+    });
+    if state.exists && !state.rebuilding {
+        match completion_freshness {
+            Some(LexicalCheckpointFreshness::Unverified(reason)) if !state.stale => {
+                // A metadata write or a WAL checkpoint changes the physical
+                // epoch without proving missing lexical content. Say that the
+                // evidence is unverified; do not turn every read into another
+                // expensive rebuild. Existing age/count/replay-debt signals
+                // still take precedence and schedule ordinary maintenance.
+                state.fresh = false;
+                state.status = "unverified";
+                state.status_reason = Some(reason.to_string());
+            }
+            Some(LexicalCheckpointFreshness::Incompatible(reason)) => {
+                state.fresh = false;
+                state.stale = true;
+                if !state.engine_incompatible && !state.hollow {
+                    state.status = "incompatible";
+                    state.status_reason = Some(reason.to_string());
+                }
+            }
+            Some(LexicalCheckpointFreshness::Stale(reason)) => {
+                state.fresh = false;
+                state.stale = true;
+                if !state.engine_incompatible && !state.hollow && state.status == "ready" {
+                    state.status = "stale";
+                    state.status_reason = Some(reason.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(state)
 }
 
 struct LexicalObservationInput<'a> {
@@ -1749,7 +1865,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let status_reason = if stalled {
         let secs = stall_age_ms.unwrap_or(0) / 1000;
         Some(format!(
-            "indexing thread has not posted forward progress for {secs}s while the lock heartbeat keeps refreshing — see issue #258 for diagnostics (run `cass doctor check --json` and capture a stack trace)"
+            "indexing thread has not posted forward progress for {secs}s while the lock heartbeat keeps refreshing — run `cass doctor check --json`, capture a stack trace, and attach both to a new GitHub issue"
         ))
     } else if rebuilding {
         Some("lexical rebuild is in progress".to_string())
@@ -2080,7 +2196,7 @@ pub(crate) fn evaluate_maintenance_coordination_from_snapshot(
         return MaintenanceCoordinationOutcome::Stale {
             job_id,
             reason: format!(
-                "indexing thread has not posted forward progress for {stall_age_ms}ms while the heartbeat keeps refreshing (stall threshold {threshold_ms}ms) — see issue #258"
+                "indexing thread has not posted forward progress for {stall_age_ms}ms while the heartbeat keeps refreshing (stall threshold {threshold_ms}ms)"
             ),
         };
     }
@@ -3621,10 +3737,12 @@ mod tests {
             .status_reason
             .as_deref()
             .expect("stalled state should populate status_reason");
+        // #382: operators are sent to a new issue, not to a closed one.
         assert!(
             reason.contains("forward progress")
-                && (reason.contains("#258") || reason.contains("issue #258")),
-            "status_reason should mention forward progress and reference #258 ({reason})",
+                && reason.contains("attach both to a new GitHub issue")
+                && !reason.contains("issue #"),
+            "status_reason should mention forward progress and ask for a new issue ({reason})",
         );
     }
 
@@ -3826,10 +3944,10 @@ mod tests {
         let outcome = evaluate_maintenance_coordination_from_snapshot(&snapshot, now_ms);
         match outcome {
             MaintenanceCoordinationOutcome::Stale { ref reason, .. } => {
+                // #382: no pointer to a closed issue.
                 assert!(
-                    reason.contains("forward progress")
-                        && (reason.contains("#258") || reason.contains("issue #258")),
-                    "stalled coordination reason should mention forward progress and #258: {reason}",
+                    reason.contains("forward progress") && !reason.contains("issue #"),
+                    "stalled coordination reason should mention forward progress and name no closed issue: {reason}",
                 );
             }
             other => assert!(
@@ -5174,7 +5292,11 @@ mod tests {
             compute_lexical_fingerprint: true,
         })
         .expect("status inspection");
-        assert_eq!(status_view.status, "ready");
+        assert_eq!(status_view.status, "unverified");
+        assert!(
+            !status_view.fresh,
+            "counts cannot certify a legacy checkpoint"
+        );
         assert!(!status_view.stale);
         assert_eq!(
             status_view.fingerprint.matches_current_db_fingerprint,
@@ -5194,9 +5316,9 @@ mod tests {
             compute_lexical_fingerprint: false,
         })
         .expect("primed skip-open inspection");
-        assert_eq!(primed_health.status, "ready");
+        assert_eq!(primed_health.status, "unverified");
         assert!(!primed_health.stale);
-        assert!(primed_health.fresh);
+        assert!(!primed_health.fresh);
         assert_eq!(
             primed_health.fingerprint.current_db_fingerprint,
             status_view.fingerprint.current_db_fingerprint

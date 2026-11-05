@@ -177,3 +177,53 @@ git diff -- tests/golden/robot/quarantine_retry_shape.json.golden
 ```
 
 Run the same test again without `UPDATE_GOLDENS` after reviewing the shape.
+
+## Continuous semantic coverage schema additions (GH #458)
+
+The November 4, 2026 update to `robot/introspect.json.golden`,
+`robot/introspect_shape.json.golden`, and `robot_docs/schemas.txt.golden` is a
+supplementary schema derivation. It is **not a fresh CLI capture or a successful
+application runtime gate**. The application dependency build was still running
+when these fixtures were prepared.
+
+A small isolated Rust generator used the exact current
+`response_schema_semantic_coverage`, `response_schema_semantic_state`,
+`response_schema_cursor_manifest`, and `response_schema_triage_inspection`
+functions from `src/lib.rs`. It used the unmodified `render_schema_docs` and
+`tests/golden_robot_json.rs::json_value_schema` functions to derive the text
+and shape fixtures. Its registry input was the checked-in introspection golden
+from `aa4f5d45d7ce223d5f3178e8fa1165a4b868a97b`; it did not execute the full
+`build_response_schemas` function. The search metadata source was checked to be
+byte-identical to that baseline after removing precisely the new coverage
+property after `refinement_level`.
+
+Before applying any change, the generator reproduced all three baseline files
+byte-for-byte, including their final newline. A structural comparison of the
+result found exactly 16 added `coverage` or `semantic_coverage` properties and
+no modification or removal of existing values. The schema adds request-local
+coverage to search metadata and cursor metadata, and optional tier coverage to
+the existing semantic status surfaces. The unchanged lexical response fixtures
+do not acquire a coverage field.
+
+The generator used the repository's pinned nightly, one Cargo build job, and
+the exact registry versions and checksums from the application lockfile. Its
+optional `serde_json/preserve_order` feature reproduced the existing JSON
+ordering. The isolated generator's final invocation passed; two preparation
+failures (the omitted crate recursion setting and omitted final-newline
+adapter) were retained in its evidence. These results validate only this
+fixture derivation. They do not validate SQL, semantic serving, or CLI output.
+
+| Derived fixture | SHA-256 |
+| --- | --- |
+| `robot/introspect.json.golden` | `41ee41ef93c7612940827c66037da8c08117e616be75e69694df7d53590e5db7` |
+| `robot/introspect_shape.json.golden` | `f2a3208ee07b67934f176a1c074e04bc73ec749ad7f257ea3d7814da8f8be1f5` |
+| `robot_docs/schemas.txt.golden` | `19d58ad24f25e5416543fb00a427f30d5994414dab21b15268420a698a8103aa` |
+
+The corresponding application checks remain the existing
+`golden_robot_json::introspect_json_matches_golden`,
+`golden_robot_json::introspect_shape_matches_golden`, and
+`golden_robot_docs::robot_docs_schemas_matches_golden` tests. The runtime
+metamorphic schema test now also exercises certified complete and partial
+semantic/hybrid results and JSON, compact, TOON, JSONL, sessions, and human
+coverage output. Those runtime checks must be reported separately from the
+isolated derivation.

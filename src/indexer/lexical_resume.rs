@@ -381,7 +381,9 @@ fn completed_audit_result(
 /// a full audit, whose verified evidence repairs the pair before completion.
 /// Do not let a corrupt artifact turn admission into an unbounded allocation
 /// or a blocking special-file read.
-fn read_completed_artifact<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+pub(super) fn read_completed_artifact<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<Option<T>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

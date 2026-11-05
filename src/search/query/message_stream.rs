@@ -6,7 +6,8 @@
 //! needed. The ordinary first-window fast path remains in the caller.
 
 use super::{
-    FsSearchFilter, FsVectorIndex, SemanticIndexArtifact, VectorSearchResult, parse_semantic_doc_id,
+    FsSearchFilter, FsVectorIndex, SemanticDocId, SemanticIndexArtifact, VectorSearchResult,
+    parse_semantic_doc_id,
 };
 use anyhow::{Result, anyhow, ensure};
 use rayon::prelude::*;
@@ -31,6 +32,7 @@ struct Winner {
     message_id: u64,
     chunk_idx: u8,
     score: f32,
+    identity: Option<SemanticDocId>,
 }
 
 impl PartialEq for Winner {
@@ -140,6 +142,7 @@ fn scan_range(
             message_id: identity.message_id,
             chunk_idx: identity.chunk_idx,
             score,
+            identity: Some(identity),
         })?;
         scored += 1;
     }
@@ -250,6 +253,7 @@ pub(super) fn try_collect_exact_messages(
                 message_id: identity.message_id,
                 chunk_idx: identity.chunk_idx,
                 score,
+                identity: Some(identity),
             })?;
             wal_scored = wal_scored.saturating_add(1);
         }
@@ -261,6 +265,7 @@ pub(super) fn try_collect_exact_messages(
             message_id: hit.message_id,
             chunk_idx: hit.chunk_idx,
             score: hit.score,
+            identity: hit.identity,
         })
         .collect();
     tracing::debug!(

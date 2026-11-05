@@ -6546,6 +6546,68 @@
                     "integer",
                     "null"
                   ]
+                },
+                "coverage": {
+                  "type": "object",
+                  "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "complete",
+                        "partial"
+                      ]
+                    },
+                    "generation": {
+                      "type": "string"
+                    },
+                    "published_at_ms": {
+                      "type": "integer"
+                    },
+                    "published_mutation_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "current_mutation_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "published_max_message_id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "current_max_message_id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "indexed_passages": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "excluded_candidates": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "candidate_window_limited": {
+                      "type": "boolean"
+                    },
+                    "stale_reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "generation",
+                    "published_at_ms",
+                    "published_mutation_seq",
+                    "current_mutation_seq",
+                    "published_max_message_id",
+                    "current_max_message_id",
+                    "indexed_passages",
+                    "excluded_candidates",
+                    "candidate_window_limited"
+                  ],
+                  "additionalProperties": false
                 }
               }
             },
@@ -6605,6 +6667,68 @@
                     "integer",
                     "null"
                   ]
+                },
+                "coverage": {
+                  "type": "object",
+                  "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "complete",
+                        "partial"
+                      ]
+                    },
+                    "generation": {
+                      "type": "string"
+                    },
+                    "published_at_ms": {
+                      "type": "integer"
+                    },
+                    "published_mutation_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "current_mutation_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "published_max_message_id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "current_max_message_id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "indexed_passages": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "excluded_candidates": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "candidate_window_limited": {
+                      "type": "boolean"
+                    },
+                    "stale_reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "generation",
+                    "published_at_ms",
+                    "published_mutation_seq",
+                    "current_mutation_seq",
+                    "published_max_message_id",
+                    "current_max_message_id",
+                    "indexed_passages",
+                    "excluded_candidates",
+                    "candidate_window_limited"
+                  ],
+                  "additionalProperties": false
                 }
               }
             },
@@ -27127,6 +27251,68 @@
                     "integer",
                     "null"
                   ]
+                },
+                "coverage": {
+                  "type": "object",
+                  "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "complete",
+                        "partial"
+                      ]
+                    },
+                    "generation": {
+                      "type": "string"
+                    },
+                    "published_at_ms": {
+                      "type": "integer"
+                    },
+                    "published_mutation_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "current_mutation_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "published_max_message_id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "current_max_message_id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "indexed_passages": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "excluded_candidates": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "candidate_window_limited": {
+                      "type": "boolean"
+                    },
+                    "stale_reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "generation",
+                    "published_at_ms",
+                    "published_mutation_seq",
+                    "current_mutation_seq",
+                    "published_max_message_id",
+                    "current_max_message_id",
+                    "indexed_passages",
+                    "excluded_candidates",
+                    "candidate_window_limited"
+                  ],
+                  "additionalProperties": false
                 }
               }
             },
@@ -27186,6 +27372,68 @@
                     "integer",
                     "null"
                   ]
+                },
+                "coverage": {
+                  "type": "object",
+                  "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "complete",
+                        "partial"
+                      ]
+                    },
+                    "generation": {
+                      "type": "string"
+                    },
+                    "published_at_ms": {
+                      "type": "integer"
+                    },
+                    "published_mutation_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "current_mutation_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "published_max_message_id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "current_max_message_id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "indexed_passages": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "excluded_candidates": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "candidate_window_limited": {
+                      "type": "boolean"
+                    },
+                    "stale_reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "generation",
+                    "published_at_ms",
+                    "published_mutation_seq",
+                    "current_mutation_seq",
+                    "published_max_message_id",
+                    "current_max_message_id",
+                    "indexed_passages",
+                    "excluded_candidates",
+                    "candidate_window_limited"
+                  ],
+                  "additionalProperties": false
                 }
               }
             },
@@ -30541,6 +30789,68 @@
                         "integer",
                         "null"
                       ]
+                    },
+                    "coverage": {
+                      "type": "object",
+                      "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+                      "properties": {
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "complete",
+                            "partial"
+                          ]
+                        },
+                        "generation": {
+                          "type": "string"
+                        },
+                        "published_at_ms": {
+                          "type": "integer"
+                        },
+                        "published_mutation_seq": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "current_mutation_seq": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "published_max_message_id": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "current_max_message_id": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "indexed_passages": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "excluded_candidates": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "candidate_window_limited": {
+                          "type": "boolean"
+                        },
+                        "stale_reason": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "generation",
+                        "published_at_ms",
+                        "published_mutation_seq",
+                        "current_mutation_seq",
+                        "published_max_message_id",
+                        "current_max_message_id",
+                        "indexed_passages",
+                        "excluded_candidates",
+                        "candidate_window_limited"
+                      ],
+                      "additionalProperties": false
                     }
                   }
                 },
@@ -30600,6 +30910,68 @@
                         "integer",
                         "null"
                       ]
+                    },
+                    "coverage": {
+                      "type": "object",
+                      "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+                      "properties": {
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "complete",
+                            "partial"
+                          ]
+                        },
+                        "generation": {
+                          "type": "string"
+                        },
+                        "published_at_ms": {
+                          "type": "integer"
+                        },
+                        "published_mutation_seq": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "current_mutation_seq": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "published_max_message_id": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "current_max_message_id": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "indexed_passages": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "excluded_candidates": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "candidate_window_limited": {
+                          "type": "boolean"
+                        },
+                        "stale_reason": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "generation",
+                        "published_at_ms",
+                        "published_mutation_seq",
+                        "current_mutation_seq",
+                        "published_max_message_id",
+                        "current_max_message_id",
+                        "indexed_passages",
+                        "excluded_candidates",
+                        "candidate_window_limited"
+                      ],
+                      "additionalProperties": false
                     }
                   }
                 },
@@ -32331,6 +32703,68 @@
             "refinement_level": {
               "type": "string"
             },
+            "semantic_coverage": {
+              "type": "object",
+              "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "complete",
+                    "partial"
+                  ]
+                },
+                "generation": {
+                  "type": "string"
+                },
+                "published_at_ms": {
+                  "type": "integer"
+                },
+                "published_mutation_seq": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "current_mutation_seq": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "published_max_message_id": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "current_max_message_id": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "indexed_passages": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "excluded_candidates": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "candidate_window_limited": {
+                  "type": "boolean"
+                },
+                "stale_reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "generation",
+                "published_at_ms",
+                "published_mutation_seq",
+                "current_mutation_seq",
+                "published_max_message_id",
+                "current_max_message_id",
+                "indexed_passages",
+                "excluded_candidates",
+                "candidate_window_limited"
+              ],
+              "additionalProperties": false
+            },
             "semantic_fallback_reason": {
               "type": [
                 "string",
@@ -32712,6 +33146,68 @@
                     },
                     "semantic_refinement": {
                       "type": "boolean"
+                    },
+                    "semantic_coverage": {
+                      "type": "object",
+                      "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+                      "properties": {
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "complete",
+                            "partial"
+                          ]
+                        },
+                        "generation": {
+                          "type": "string"
+                        },
+                        "published_at_ms": {
+                          "type": "integer"
+                        },
+                        "published_mutation_seq": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "current_mutation_seq": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "published_max_message_id": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "current_max_message_id": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "indexed_passages": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "excluded_candidates": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "candidate_window_limited": {
+                          "type": "boolean"
+                        },
+                        "stale_reason": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "generation",
+                        "published_at_ms",
+                        "published_mutation_seq",
+                        "current_mutation_seq",
+                        "published_max_message_id",
+                        "current_max_message_id",
+                        "indexed_passages",
+                        "excluded_candidates",
+                        "candidate_window_limited"
+                      ],
+                      "additionalProperties": false
                     }
                   }
                 }
@@ -33441,6 +33937,68 @@
                             "integer",
                             "null"
                           ]
+                        },
+                        "coverage": {
+                          "type": "object",
+                          "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+                          "properties": {
+                            "status": {
+                              "type": "string",
+                              "enum": [
+                                "complete",
+                                "partial"
+                              ]
+                            },
+                            "generation": {
+                              "type": "string"
+                            },
+                            "published_at_ms": {
+                              "type": "integer"
+                            },
+                            "published_mutation_seq": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "current_mutation_seq": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "published_max_message_id": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "current_max_message_id": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "indexed_passages": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "excluded_candidates": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "candidate_window_limited": {
+                              "type": "boolean"
+                            },
+                            "stale_reason": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "status",
+                            "generation",
+                            "published_at_ms",
+                            "published_mutation_seq",
+                            "current_mutation_seq",
+                            "published_max_message_id",
+                            "current_max_message_id",
+                            "indexed_passages",
+                            "excluded_candidates",
+                            "candidate_window_limited"
+                          ],
+                          "additionalProperties": false
                         }
                       }
                     },
@@ -33500,6 +34058,68 @@
                             "integer",
                             "null"
                           ]
+                        },
+                        "coverage": {
+                          "type": "object",
+                          "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+                          "properties": {
+                            "status": {
+                              "type": "string",
+                              "enum": [
+                                "complete",
+                                "partial"
+                              ]
+                            },
+                            "generation": {
+                              "type": "string"
+                            },
+                            "published_at_ms": {
+                              "type": "integer"
+                            },
+                            "published_mutation_seq": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "current_mutation_seq": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "published_max_message_id": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "current_max_message_id": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "indexed_passages": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "excluded_candidates": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "candidate_window_limited": {
+                              "type": "boolean"
+                            },
+                            "stale_reason": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "status",
+                            "generation",
+                            "published_at_ms",
+                            "published_mutation_seq",
+                            "current_mutation_seq",
+                            "published_max_message_id",
+                            "current_max_message_id",
+                            "indexed_passages",
+                            "excluded_candidates",
+                            "candidate_window_limited"
+                          ],
+                          "additionalProperties": false
                         }
                       }
                     },
@@ -34884,6 +35504,68 @@
                     "integer",
                     "null"
                   ]
+                },
+                "coverage": {
+                  "type": "object",
+                  "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "complete",
+                        "partial"
+                      ]
+                    },
+                    "generation": {
+                      "type": "string"
+                    },
+                    "published_at_ms": {
+                      "type": "integer"
+                    },
+                    "published_mutation_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "current_mutation_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "published_max_message_id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "current_max_message_id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "indexed_passages": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "excluded_candidates": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "candidate_window_limited": {
+                      "type": "boolean"
+                    },
+                    "stale_reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "generation",
+                    "published_at_ms",
+                    "published_mutation_seq",
+                    "current_mutation_seq",
+                    "published_max_message_id",
+                    "current_max_message_id",
+                    "indexed_passages",
+                    "excluded_candidates",
+                    "candidate_window_limited"
+                  ],
+                  "additionalProperties": false
                 }
               }
             },
@@ -34943,6 +35625,68 @@
                     "integer",
                     "null"
                   ]
+                },
+                "coverage": {
+                  "type": "object",
+                  "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "complete",
+                        "partial"
+                      ]
+                    },
+                    "generation": {
+                      "type": "string"
+                    },
+                    "published_at_ms": {
+                      "type": "integer"
+                    },
+                    "published_mutation_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "current_mutation_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "published_max_message_id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "current_max_message_id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "indexed_passages": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "excluded_candidates": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "candidate_window_limited": {
+                      "type": "boolean"
+                    },
+                    "stale_reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "generation",
+                    "published_at_ms",
+                    "published_mutation_seq",
+                    "current_mutation_seq",
+                    "published_max_message_id",
+                    "current_max_message_id",
+                    "indexed_passages",
+                    "excluded_candidates",
+                    "candidate_window_limited"
+                  ],
+                  "additionalProperties": false
                 }
               }
             },
@@ -37043,6 +37787,68 @@
                     "integer",
                     "null"
                   ]
+                },
+                "coverage": {
+                  "type": "object",
+                  "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "complete",
+                        "partial"
+                      ]
+                    },
+                    "generation": {
+                      "type": "string"
+                    },
+                    "published_at_ms": {
+                      "type": "integer"
+                    },
+                    "published_mutation_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "current_mutation_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "published_max_message_id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "current_max_message_id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "indexed_passages": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "excluded_candidates": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "candidate_window_limited": {
+                      "type": "boolean"
+                    },
+                    "stale_reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "generation",
+                    "published_at_ms",
+                    "published_mutation_seq",
+                    "current_mutation_seq",
+                    "published_max_message_id",
+                    "current_max_message_id",
+                    "indexed_passages",
+                    "excluded_candidates",
+                    "candidate_window_limited"
+                  ],
+                  "additionalProperties": false
                 }
               }
             },
@@ -37102,6 +37908,68 @@
                     "integer",
                     "null"
                   ]
+                },
+                "coverage": {
+                  "type": "object",
+                  "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "complete",
+                        "partial"
+                      ]
+                    },
+                    "generation": {
+                      "type": "string"
+                    },
+                    "published_at_ms": {
+                      "type": "integer"
+                    },
+                    "published_mutation_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "current_mutation_seq": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "published_max_message_id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "current_max_message_id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "indexed_passages": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "excluded_candidates": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "candidate_window_limited": {
+                      "type": "boolean"
+                    },
+                    "stale_reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "generation",
+                    "published_at_ms",
+                    "published_mutation_seq",
+                    "current_mutation_seq",
+                    "published_max_message_id",
+                    "current_max_message_id",
+                    "indexed_passages",
+                    "excluded_candidates",
+                    "candidate_window_limited"
+                  ],
+                  "additionalProperties": false
                 }
               }
             },
@@ -39218,6 +40086,68 @@
                         "integer",
                         "null"
                       ]
+                    },
+                    "coverage": {
+                      "type": "object",
+                      "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+                      "properties": {
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "complete",
+                            "partial"
+                          ]
+                        },
+                        "generation": {
+                          "type": "string"
+                        },
+                        "published_at_ms": {
+                          "type": "integer"
+                        },
+                        "published_mutation_seq": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "current_mutation_seq": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "published_max_message_id": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "current_max_message_id": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "indexed_passages": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "excluded_candidates": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "candidate_window_limited": {
+                          "type": "boolean"
+                        },
+                        "stale_reason": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "generation",
+                        "published_at_ms",
+                        "published_mutation_seq",
+                        "current_mutation_seq",
+                        "published_max_message_id",
+                        "current_max_message_id",
+                        "indexed_passages",
+                        "excluded_candidates",
+                        "candidate_window_limited"
+                      ],
+                      "additionalProperties": false
                     }
                   }
                 },
@@ -39277,6 +40207,68 @@
                         "integer",
                         "null"
                       ]
+                    },
+                    "coverage": {
+                      "type": "object",
+                      "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+                      "properties": {
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "complete",
+                            "partial"
+                          ]
+                        },
+                        "generation": {
+                          "type": "string"
+                        },
+                        "published_at_ms": {
+                          "type": "integer"
+                        },
+                        "published_mutation_seq": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "current_mutation_seq": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "published_max_message_id": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "current_max_message_id": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "indexed_passages": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "excluded_candidates": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "candidate_window_limited": {
+                          "type": "boolean"
+                        },
+                        "stale_reason": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "generation",
+                        "published_at_ms",
+                        "published_mutation_seq",
+                        "current_mutation_seq",
+                        "published_max_message_id",
+                        "current_max_message_id",
+                        "indexed_passages",
+                        "excluded_candidates",
+                        "candidate_window_limited"
+                      ],
+                      "additionalProperties": false
                     }
                   }
                 },

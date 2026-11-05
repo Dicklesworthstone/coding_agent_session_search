@@ -92,6 +92,54 @@ fn seeded_source(
 }
 
 #[test]
+fn covered_append_receipt_binds_base_and_compacted_document_order() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let path = vector_index_path(root.path(), indexer.embedder_id());
+    write_rows(&path, &rows(&indexer, 1, 2)?, Quantization::F16)?;
+    let expected =
+        crate::search::semantic_coverage::semantic_file_sha256(&mut fs::File::open(&path)?)?;
+    let (count, receipt) = run_with_coverage_receipt(
+        &indexer,
+        rows(&indexer, 3, 1)?,
+        root.path(),
+        Some(&expected),
+    )?;
+    assert_eq!(count, 1);
+    let index = VectorIndex::open_read_only(&path)?;
+    assert_eq!(index.record_count(), 3);
+    assert_eq!(index.wal_record_count(), 0);
+    assert_eq!(receipt, engine::semantic_index_document_digest(&index)?);
+    drop(index);
+    let current =
+        crate::search::semantic_coverage::semantic_file_sha256(&mut fs::File::open(&path)?)?;
+    let (count, unchanged_receipt) =
+        run_with_coverage_receipt(&indexer, Vec::new(), root.path(), Some(&current))?;
+    assert_eq!(count, 0);
+    assert_eq!(unchanged_receipt, receipt);
+    Ok(())
+}
+
+#[test]
+fn covered_append_rejects_changed_base_before_consuming_or_writing_a_delta() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?;
+    let path = vector_index_path(root.path(), indexer.embedder_id());
+    write_rows(&path, &rows(&indexer, 1, 2)?, Quantization::F16)?;
+    let before = bytes(&path)?;
+    let visited = Cell::new(0usize);
+    let input = rows(&indexer, 3, 1)?
+        .into_iter()
+        .inspect(|_| visited.set(visited.get() + 1));
+    let error =
+        run_with_coverage_receipt(&indexer, input, root.path(), Some(&"f".repeat(64))).unwrap_err();
+    assert!(error.to_string().contains("base changed"));
+    assert_eq!(visited.get(), 0);
+    assert_eq!(bytes(&path)?, before);
+    Ok(())
+}
+
+#[test]
 fn prepared_last_occurrence_order_matches_independent_reverse_dedup() -> Result<()> {
     let indexer = SemanticIndexer::new("hash", None)?;
     let source = rows(&indexer, 1, 31)?;

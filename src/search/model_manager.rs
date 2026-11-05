@@ -9,7 +9,11 @@
 //! It does **not** download models. Missing files are surfaced as availability
 //! states so the UI can guide the user. Downloads are handled by [`model_download`].
 
+mod coverage;
 mod external;
+
+pub use coverage::covered_semantic_record;
+pub(crate) use coverage::observe_covered_semantic_artifact;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -729,6 +733,15 @@ pub(crate) fn probe_semantic_availability_for_embedder(
         return availability;
     }
 
+    match coverage::probe(data_dir, &config.embedder_id, config.dimension) {
+        Ok(true) => {
+            return SemanticAvailability::Ready {
+                embedder_id: config.embedder_id,
+            };
+        }
+        Ok(false) => {}
+        Err(context) => return SemanticAvailability::LoadFailed { context },
+    }
     let index_path = vector_index_path(data_dir, &config.embedder_id);
     match semantic_artifact_candidate_exists(&index_path) {
         Ok(true) => {}
@@ -754,6 +767,11 @@ pub(crate) fn probe_hash_semantic_availability(data_dir: &Path) -> SemanticAvail
         return availability;
     }
     let embedder = HashEmbedder::default();
+    match coverage::probe(data_dir, embedder.id(), embedder.dimension()) {
+        Ok(true) => return SemanticAvailability::HashFallback,
+        Ok(false) => {}
+        Err(context) => return SemanticAvailability::LoadFailed { context },
+    }
     let index_path = vector_index_path(data_dir, embedder.id());
     match semantic_artifact_candidate_exists(&index_path) {
         Ok(false) => SemanticAvailability::IndexMissing { index_path },
@@ -791,6 +809,28 @@ fn load_hash_semantic_context_inner(
         };
     }
     let embedder = HashEmbedder::default();
+    match coverage::load_context(
+        data_dir,
+        db_path,
+        embedder.id(),
+        embedder.dimension(),
+        strict_read_only,
+        || Ok(Arc::new(HashEmbedder::default()) as Arc<dyn Embedder>),
+    ) {
+        Ok(Some(context)) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::HashFallback,
+                context: Some(context),
+            };
+        }
+        Ok(None) => {}
+        Err(context) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed { context },
+                context: None,
+            };
+        }
+    }
     let index_path = vector_index_path(data_dir, embedder.id());
     let monolithic_present = match semantic_artifact_candidate_exists(&index_path) {
         Ok(present) => present,
@@ -977,6 +1017,39 @@ fn load_semantic_context_inner(
         };
     }
 
+    match coverage::load_context(
+        data_dir,
+        db_path,
+        &config.embedder_id,
+        config.dimension,
+        strict_read_only,
+        || {
+            if defer_embedder_load {
+                LazyFastEmbedder::new(data_dir, canonical_name)
+                    .map(|embedder| Arc::new(embedder) as Arc<dyn Embedder>)
+            } else {
+                FastEmbedder::load_by_name(data_dir, canonical_name)
+                    .map(|embedder| Arc::new(embedder) as Arc<dyn Embedder>)
+            }
+            .map_err(|error| format!("model load: {error}"))
+        },
+    ) {
+        Ok(Some(context)) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::Ready {
+                    embedder_id: config.embedder_id,
+                },
+                context: Some(context),
+            };
+        }
+        Ok(None) => {}
+        Err(context) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed { context },
+                context: None,
+            };
+        }
+    }
     let index_path = vector_index_path(data_dir, &config.embedder_id);
     let monolithic_present = match semantic_artifact_candidate_exists(&index_path) {
         Ok(present) => present,

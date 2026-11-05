@@ -23540,13 +23540,15 @@ fn state_meta_json_inner(
                 .unwrap_or(true)
         })
     {
-        assets.lexical.status = "stale";
         assets.lexical.fresh = false;
         assets.lexical.stale = true;
-        assets.lexical.status_reason = Some(
-            "last_scan_ts is newer than last_indexed_at; a prior scan advanced without a completed projection into the searchable index"
-                .to_string(),
-        );
+        if matches!(assets.lexical.status, "ready" | "stale" | "unverified") {
+            assets.lexical.status = "stale";
+            assets.lexical.status_reason = Some(
+                "last_scan_ts is newer than last_indexed_at; a prior scan advanced without a completed projection into the searchable index"
+                    .to_string(),
+            );
+        }
     }
     // A lease heartbeat and a recent timestamp cannot certify publication
     // while source replay remains durable. An unsuccessful requested probe
@@ -23562,7 +23564,7 @@ fn state_meta_json_inner(
         assets.lexical.fresh = false;
         assets.lexical.stale = true;
         // Do not replace stronger missing/corrupt/hollow/rebuilding verdicts.
-        if matches!(assets.lexical.status, "ready" | "stale") {
+        if matches!(assets.lexical.status, "ready" | "stale" | "unverified") {
             assets.lexical.status = "stale";
             assets.lexical.status_reason = Some(
                 if watch_lexical_replay_pending == Some(true) {
@@ -24037,6 +24039,14 @@ fn state_meta_json_inner(
             "db_path": db_path.display().to_string()
         }
     });
+    for (name, tier) in [
+        ("fast_tier", &semantic.fast_tier),
+        ("quality_tier", &semantic.quality_tier),
+    ] {
+        if let Some(coverage) = &tier.coverage {
+            state["semantic"][name]["coverage"] = serde_json::json!(coverage);
+        }
+    }
     // zn1xn: emit the "canonical FTS shadow may be half-rebuilt" signal
     // additively — present only when the last full index run left the shadow
     // unrepaired — so existing status/index JSON is byte-identical otherwise.
@@ -24596,10 +24606,9 @@ fn lexical_readiness_from_state(
     if status == "error" {
         return LexicalReadinessState::CorruptQuarantined;
     }
-    // b4uax (gh#382): a legacy Tantivy generation exists on disk but no
-    // reader can open it. Search is unavailable until the rebuild runs, so it
-    // is the Missing class (repair now), never "stale but searchable".
-    if status == "legacy_engine"
+    // An engine or archive/projection incompatibility requires a rebuild;
+    // a foreign archive's readable generation is not searchable for this DB.
+    if matches!(status, "legacy_engine" | "incompatible")
         || index
             .and_then(|idx| idx.get("engine_incompatible"))
             .and_then(|value| value.as_bool())
@@ -24938,7 +24947,10 @@ fn readiness_recommended_commands(
         return commands;
     }
 
-    if !index_exists || index_empty_with_messages {
+    if !index_exists
+        || index_empty_with_messages
+        || state_index_status(state) == Some("incompatible")
+    {
         commands.push(readiness_command_recommendation(
             ReadinessCommandRecommendation {
                 id: "rebuild-lexical-index",
@@ -24949,7 +24961,7 @@ fn readiness_recommended_commands(
                 ),
                 purpose: "Rebuild the lexical search index from the cass archive.",
                 safety: "writes-derived-index",
-                run_when: "Run when the archive exists but the lexical index is missing or empty.",
+                run_when: "Run when the archive exists but the lexical index is missing, empty, or belongs to an incompatible archive or projection configuration.",
                 success_signal: "success=true, then health/status report index.exists=true",
                 parse_fields: &["success", "indexing_stats", "error"],
                 retry_after_ms: None,
@@ -24970,7 +24982,7 @@ fn readiness_recommended_commands(
         return commands;
     }
 
-    if !index_fresh || pending_sessions > 0 {
+    if (!index_fresh && state_index_status(state) != Some("unverified")) || pending_sessions > 0 {
         commands.push(readiness_command_recommendation(
             ReadinessCommandRecommendation {
                 id: "refresh-lexical-index",
@@ -25220,6 +25232,52 @@ mod readiness_projection_tests {
             lexical_readiness_from_state(&ready, false),
             LexicalReadinessState::Ready
         );
+    }
+
+    #[test]
+    fn gh496_readiness_distinguishes_unverified_and_incompatible_sources() {
+        use crate::search::readiness::LexicalReadinessState;
+        let mut state = json!({
+            "index": { "exists": true, "status": "unverified", "fresh": false, "stale": false },
+            "database": { "exists": true, "opened": true },
+            "pending": { "sessions": 0 },
+            "rebuild": { "active": false }
+        });
+        assert!(super::lexical_readiness_from_state(&state, false).is_searchable());
+        let data_dir = std::path::Path::new("/archive");
+        let db_path = data_dir.join("agent_search.db");
+        let commands = super::readiness_recommended_commands(
+            data_dir,
+            &db_path,
+            &state,
+            "unhealthy",
+            false,
+            false,
+            None,
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|command| command["id"] != "refresh-lexical-index")
+        );
+
+        state["index"]["status"] = json!("incompatible");
+        state["index"]["stale"] = json!(true);
+        assert_eq!(
+            super::lexical_readiness_from_state(&state, false),
+            LexicalReadinessState::Missing
+        );
+        let commands = super::readiness_recommended_commands(
+            data_dir,
+            &db_path,
+            &state,
+            "unhealthy",
+            false,
+            false,
+            None,
+        );
+        assert_eq!(commands[0]["id"], "rebuild-lexical-index");
+        assert!(commands[0]["command"].as_str().unwrap().contains("--full"));
     }
 }
 
@@ -29648,6 +29706,24 @@ fn search_lexical_checkpoint_diagnosis(
             "lexical checkpoint does not carry a completed canonical storage fingerprint",
         )));
     }
+    let completion_freshness = crate::indexer::completed_lexical_checkpoint_freshness(
+        index_path,
+        db_path,
+        &checkpoint,
+    )
+    .unwrap_or_else(|error| {
+        tracing::debug!(%error, "lexical completion freshness could not be passively verified");
+        crate::indexer::LexicalCheckpointFreshness::Unverified(
+            "lexical completion evidence is unavailable; content verification is required",
+        )
+    });
+    match completion_freshness {
+        crate::indexer::LexicalCheckpointFreshness::Current => return Ok(None),
+        crate::indexer::LexicalCheckpointFreshness::Incompatible(reason) => {
+            return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(reason)));
+        }
+        _ => {}
+    }
     // Memoized on the archive's physical identity: the uncached variant opens
     // a synchronous storage handle that replays the whole WAL on a large
     // archive, which cost every default `cass search` ~4 s before the engine
@@ -29656,6 +29732,11 @@ fn search_lexical_checkpoint_diagnosis(
         crate::indexer::lexical_storage_fingerprint_for_db_cached(db_path, index_path);
     let current_storage_fingerprint = match cached_fingerprint {
         Ok(fingerprint) => fingerprint,
+        Err(err) if crate::indexer::lexical_fingerprint_observation_changed(&err) => {
+            return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
+                "canonical archive changed during freshness observation; content verification is deferred",
+            )));
+        }
         Err(err) => {
             // Historical duplicate rows for the derived FTS table can stop
             // the strict reader before it reaches canonical conversations.
@@ -29707,7 +29788,14 @@ fn search_lexical_checkpoint_diagnosis(
         )));
     }
 
-    Ok(None)
+    // A count/ID fingerprint can still match after an in-place content edit.
+    // It must not erase the source/native evidence verdict. Epoch drift alone
+    // is unverified, not proof of missing content: serve the readable index
+    // without an inline audit; ordinary age/count/source cadence still drive
+    // background maintenance.
+    Ok(completion_freshness
+        .reason()
+        .map(SearchLexicalSelfHealDiagnosis::existing_index))
 }
 
 fn search_active_rebuild_wait_duration(timeout_ms: Option<u64>, started_at: Instant) -> Duration {
@@ -30005,7 +30093,21 @@ fn search_lexical_read_only_diagnosis(
     // checkpoint a dirty WAL or repair duplicate schema rows. A strict read is
     // allowed to serve the last published generation and truthfully report its
     // passive metadata; freshness repair belongs to a mutating invocation.
-    Ok(None)
+    let freshness =
+        crate::indexer::completed_lexical_checkpoint_freshness(index_path, db_path, &checkpoint)
+            .unwrap_or(crate::indexer::LexicalCheckpointFreshness::Unverified(
+                "lexical completion evidence is unavailable; content verification is required",
+            ));
+    Ok(match freshness {
+        crate::indexer::LexicalCheckpointFreshness::Current => None,
+        crate::indexer::LexicalCheckpointFreshness::Incompatible(reason) => {
+            Some(SearchLexicalSelfHealDiagnosis::rebuild(reason))
+        }
+        crate::indexer::LexicalCheckpointFreshness::Unverified(reason)
+        | crate::indexer::LexicalCheckpointFreshness::Stale(reason) => {
+            Some(SearchLexicalSelfHealDiagnosis::existing_index(reason))
+        }
+    })
 }
 
 fn inspect_lexical_assets_for_search_read_only(
@@ -30064,7 +30166,7 @@ fn inspect_lexical_assets_for_search_read_only(
         tracing::warn!(
             reason = %diagnosis.reason,
             data_dir = %data_dir.display(),
-            "--no-maintenance is using the readable lexical index without changing its stale checkpoint metadata"
+            "--no-maintenance is using the readable lexical index without changing its checkpoint evidence"
         );
         return Ok((
             SearchLexicalSelfHeal {
@@ -30392,7 +30494,7 @@ fn ensure_lexical_assets_for_search_admitting(
             data_dir = %data_dir.display(),
             db_path = %db_path.display(),
             next_step,
-            "search detected stale lexical checkpoint metadata; using existing readable lexical index and deferring heavyweight repair"
+            "lexical freshness could not be confirmed; using existing readable lexical index and deferring heavyweight repair"
         );
         return Ok((
             SearchLexicalSelfHeal {
@@ -31212,7 +31314,7 @@ mod search_lexical_self_heal_tests {
     }
 
     #[test]
-    fn search_self_heal_refreshes_stale_checkpoint_when_live_index_matches_db() {
+    fn search_self_heal_revalidates_stale_checkpoint_before_certifying_live_index() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
         let db_path = seed_canonical_search_db(data_dir);
@@ -31248,14 +31350,138 @@ mod search_lexical_self_heal_tests {
             false,
             false,
         )
-        .expect("search self-heal should refresh checkpoint");
-        assert_eq!(repair.action, "refreshed-checkpoint");
+        .expect("search self-heal should verify canonical content before restoring proof");
+        assert_eq!(repair.action, "rebuilt-from-canonical-db");
 
         let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
             .expect("load repaired checkpoint")
             .expect("checkpoint present");
         assert_eq!(checkpoint.schema_hash, crate::search::tantivy::SCHEMA_HASH);
         assert!(checkpoint.completed);
+        assert_eq!(
+            crate::indexer::completed_lexical_checkpoint_freshness(
+                &index_path,
+                &db_path,
+                &checkpoint,
+            )
+            .expect("verified completion proof"),
+            crate::indexer::LexicalCheckpointFreshness::Current
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn gh496_repeated_reads_defer_epoch_verification_without_rebuilding() {
+        for mutation in ["metadata", "same-count-content"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let data_dir = temp.path();
+            let db_path = seed_canonical_search_db(data_dir);
+            let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+            ensure_lexical_assets_for_search(
+                data_dir,
+                &db_path,
+                &index_path,
+                None,
+                Instant::now(),
+                false,
+                false,
+            )
+            .expect("build completed generation");
+            let checkpoint_path = index_path.join(".lexical-rebuild-state.json");
+            let checkpoint_bytes = std::fs::read(&checkpoint_path).expect("read checkpoint");
+            let manifest_bytes = std::fs::read(index_path.join("MANIFEST")).expect("read manifest");
+            let storage = FrankenStorage::open(&db_path).expect("open ordinary writer");
+            if mutation == "metadata" {
+                storage
+                    .set_last_indexed_at(FrankenStorage::now_millis())
+                    .unwrap();
+            } else {
+                storage
+                    .raw()
+                    .execute("UPDATE messages SET content = 'samecountfreshnessrewrite'")
+                    .unwrap();
+            }
+            storage.close_without_checkpoint().unwrap();
+
+            for _ in 0..3 {
+                let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
+                    .expect("diagnose bounded freshness")
+                    .expect("an unverified epoch must not be reported as current");
+                assert!(diagnosis.existing_index_search_allowed, "{mutation}");
+                assert!(!diagnosis.checkpoint_refresh_allowed, "{mutation}");
+                assert!(
+                    diagnosis.reason.contains("source epoch"),
+                    "{mutation}: {}",
+                    diagnosis.reason
+                );
+                let repair = ensure_lexical_assets_for_search(
+                    data_dir,
+                    &db_path,
+                    &index_path,
+                    None,
+                    Instant::now(),
+                    false,
+                    false,
+                )
+                .expect("readable publication must not require an inline content audit");
+                assert_eq!(
+                    repair.action, "deferred-repair-searching-existing-index",
+                    "{mutation}"
+                );
+                assert_eq!(repair.indexed_docs, None);
+            }
+            assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_bytes);
+            assert_eq!(
+                std::fs::read(index_path.join("MANIFEST")).unwrap(),
+                manifest_bytes
+            );
+
+            let before_strict_read = data_tree_snapshot(data_dir);
+            let (strict, opened) =
+                inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
+                    .expect("strict read must serve a complete unverified generation");
+            assert_eq!(strict.action, "no-maintenance-searching-existing-index");
+            assert!(opened.is_some());
+            assert_eq!(data_tree_snapshot(data_dir), before_strict_read);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn gh496_search_rejects_a_different_archive_at_the_same_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+            false,
+        )
+        .expect("build original generation");
+        let replacement_path = data_dir.join("replacement.db");
+        seed_search_db_at(
+            &replacement_path,
+            "differentarchivefreshnessneedle",
+            "replacement-conversation",
+        );
+        std::fs::rename(&db_path, data_dir.join("retained-original.db")).unwrap();
+        std::fs::rename(replacement_path, &db_path).unwrap();
+        let before = data_tree_snapshot(data_dir);
+        let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
+            .expect("diagnose replacement")
+            .expect("replacement must require a canonical rebuild");
+        assert!(!diagnosis.existing_index_search_allowed);
+        assert!(!diagnosis.checkpoint_refresh_allowed);
+        assert!(diagnosis.reason.contains("archive identity"));
+        let error = inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
+            .expect_err("strict read must not serve a different archive's documents");
+        assert_eq!(error.kind, "maintenance-required");
+        assert_eq!(data_tree_snapshot(data_dir), before);
     }
 
     #[test]
@@ -32322,8 +32548,8 @@ fn execute_search_operation(
                 }
             })?,
         SearchMode::Semantic => {
-            let (hits, ann_stats) = client
-                .search_semantic_with_tier(
+            let (hits, ann_stats, semantic_coverage) = client
+                .search_semantic_with_tier_and_coverage(
                     &query,
                     filters.clone(),
                     search_limit,
@@ -32370,6 +32596,7 @@ fn execute_search_operation(
                         }
                     }
                 })?;
+            mode_meta.semantic_coverage = semantic_coverage;
             let ann_unavailable_reason = if approximate {
                 client
                     .ann_unavailability_reason()
@@ -32396,7 +32623,7 @@ fn execute_search_operation(
                 total_count: None,
             }
         }
-        SearchMode::Hybrid => match client.search_hybrid(
+        SearchMode::Hybrid => match client.search_hybrid_with_coverage(
             &query,
             &query,
             filters.clone(),
@@ -32406,7 +32633,10 @@ fn execute_search_operation(
             field_mask,
             approximate,
         ) {
-            Ok(result) => result,
+            Ok((result, coverage)) => {
+                mode_meta.semantic_coverage = coverage;
+                result
+            }
             Err(error) => {
                 let message = error.to_string();
                 if hybrid_fail_open
@@ -33708,8 +33938,8 @@ fn run_cli_search(
                 // frankensearch/native backend, so semantic availability is a
                 // runtime question (model/vector assets), not a compile-time one.
                 {
-                    let (hits, ann_stats) = client
-                    .search_semantic_with_tier(
+                    let (hits, ann_stats, semantic_coverage) = client
+                    .search_semantic_with_tier_and_coverage(
                         query,
                         filters.clone(),
                         search_limit,
@@ -33758,6 +33988,7 @@ fn run_cli_search(
                             }
                         }
                     })?;
+                    mode_meta.semantic_coverage = semantic_coverage;
                     let ann_unavailable_reason = if approximate {
                         client.ann_unavailability_reason().map_err(|e| CliError {
                             code: 9,
@@ -33783,7 +34014,7 @@ fn run_cli_search(
                     }
                 }
             }
-            SearchMode::Hybrid => match client.search_hybrid(
+            SearchMode::Hybrid => match client.search_hybrid_with_coverage(
                 query,
                 query,
                 filters.clone(),
@@ -33793,7 +34024,10 @@ fn run_cli_search(
                 field_mask,
                 approximate,
             ) {
-                Ok(result) => result,
+                Ok((result, coverage)) => {
+                    mode_meta.semantic_coverage = coverage;
+                    result
+                }
                 Err(e) => {
                     let err_str = e.to_string();
                     if hybrid_fail_open
@@ -34385,6 +34619,9 @@ fn run_cli_search(
     // Bead v6vuz: captured before the output chain because `warning` and
     // `effective_robot` are conditionally moved into the robot branch below.
     let is_human_search = effective_robot.is_none();
+    let human_semantic_coverage = is_human_search
+        .then(|| mode_meta.semantic_coverage.clone())
+        .flatten();
     let has_readiness_warning = warning.is_some();
     // i6tyy: keep the human copy before `warning` is moved into the robot
     // envelope below.
@@ -34610,6 +34847,20 @@ fn run_cli_search(
     }
     if is_human_search && let Some(reason) = display_result.ann_unavailable_reason {
         eprintln!("{}", ann_fallback_human_warning(reason));
+    }
+    if let Some(coverage) = human_semantic_coverage {
+        eprintln!(
+            "Semantic coverage: {}; published mutation {}, current mutation {}; {} stale candidates excluded{}.",
+            coverage.status,
+            coverage.published_mutation_seq,
+            coverage.current_mutation_seq,
+            coverage.excluded_candidates,
+            if coverage.candidate_window_limited {
+                "; candidate refill limit reached"
+            } else {
+                ""
+            },
+        );
     }
 
     Ok(())
@@ -36893,6 +37144,7 @@ struct SearchModeMeta {
     /// `long_query_term`), or kept its own hits because the retry ran out of
     /// query fuel (`query_fuel_exhausted`, 7hvlg).
     wildcard_fallback_skipped: Option<&'static str>,
+    semantic_coverage: Option<crate::search::vector_index::SemanticCoverageSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37025,6 +37277,7 @@ impl SearchModeMeta {
             semantic_work_completed: true,
             lexical_degrade_reason: None,
             wildcard_fallback_skipped: None,
+            semantic_coverage: None,
         }
     }
 
@@ -37046,6 +37299,7 @@ impl SearchModeMeta {
         self.realized = crate::search::query::SearchMode::Lexical;
         self.fallback_tier = Some("lexical");
         self.fallback_reason = Some(reason.into());
+        self.semantic_coverage = None;
     }
 
     fn fell_back_to_lexical(&self) -> bool {
@@ -37285,7 +37539,13 @@ fn search_cursor_manifest_json(input: SearchCursorManifestInput<'_>) -> serde_js
         .and_then(|freshness| freshness.get("rebuilding"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let continuation_safe = input.next_cursor_present && !input.timed_out && !index_rebuilding;
+    let semantic_partial = input
+        .search_mode_meta
+        .semantic_coverage
+        .as_ref()
+        .is_some_and(|coverage| coverage.status == "partial" || coverage.candidate_window_limited);
+    let continuation_safe =
+        input.next_cursor_present && !input.timed_out && !index_rebuilding && !semantic_partial;
     let continuation_reason = if !input.has_more {
         "result window exhausted; no continuation cursor was emitted"
     } else if !input.next_cursor_present {
@@ -37294,6 +37554,8 @@ fn search_cursor_manifest_json(input: SearchCursorManifestInput<'_>) -> serde_js
         "partial timeout results are best-effort; rerun before continuing for deterministic pagination"
     } else if index_rebuilding {
         "lexical index is rebuilding; cursor is best-effort until the generation is stable"
+    } else if semantic_partial {
+        "semantic coverage is partial; subsequent pages may observe catch-up or canonical changes"
     } else if input.hits_clamped {
         "cursor offset advances by emitted hits after token-budget clamping"
     } else {
@@ -37328,7 +37590,7 @@ fn search_cursor_manifest_json(input: SearchCursorManifestInput<'_>) -> serde_js
         .map(|generation| generation.to_string());
     let reload_ms_total = input.cache_stats.reload_ms_total.min(u128::from(u64::MAX)) as u64;
 
-    serde_json::json!({
+    let mut manifest = serde_json::json!({
         "schema_version": 1,
         "has_more": input.has_more,
         "count_precision": count_precision,
@@ -37386,7 +37648,11 @@ fn search_cursor_manifest_json(input: SearchCursorManifestInput<'_>) -> serde_js
             "fallback_reason": input.search_mode_meta.fallback_reason.clone(),
             "semantic_refinement": input.search_mode_meta.semantic_refinement(),
         },
-    })
+    });
+    if let Some(coverage) = &input.search_mode_meta.semantic_coverage {
+        manifest["semantic_fallback"]["semantic_coverage"] = serde_json::json!(coverage);
+    }
+    manifest
 }
 
 /// Map the realized [`SearchMode`] to the trust [`RealizedMode`] vocabulary.
@@ -37754,6 +38020,13 @@ fn output_robot_results(
     zero_result_diagnosis: Option<&crate::search::zero_result_diagnosis::ZeroResultReport>,
 ) -> CliResult<()> {
     use std::io::{BufWriter, Write};
+    let coverage_on_diagnostics = matches!(format, RobotFormat::Sessions)
+        || (!include_meta && matches!(format, RobotFormat::Jsonl));
+    if coverage_on_diagnostics && let Some(coverage) = &search_mode_meta.semantic_coverage {
+        eprintln!("{}", serde_json::json!({"semantic_coverage": coverage}));
+    }
+    let include_meta =
+        include_meta || (search_mode_meta.semantic_coverage.is_some() && !coverage_on_diagnostics);
 
     if matches!(format, RobotFormat::Sessions) {
         // Output unique session paths only, one per line.
@@ -38367,6 +38640,9 @@ fn output_robot_results(
                     "explanation_cards": explanation_cards_json.clone(),
                     "effective": effective.clone(),
                 });
+                if let Some(coverage) = &search_mode_meta.semantic_coverage {
+                    meta["semantic_coverage"] = serde_json::json!(coverage);
+                }
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
                 {
@@ -38519,6 +38795,9 @@ fn output_robot_results(
                         "effective": effective.clone(),
                     }
                 });
+                if let Some(coverage) = &search_mode_meta.semantic_coverage {
+                    meta["_meta"]["semantic_coverage"] = serde_json::json!(coverage);
+                }
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut outer) = meta
                     && let Some(serde_json::Value::Object(m)) = outer.get_mut("_meta")
@@ -38738,6 +39017,9 @@ fn output_robot_results(
                     "explanation_cards": explanation_cards_json.clone(),
                     "effective": effective.clone(),
                 });
+                if let Some(coverage) = &search_mode_meta.semantic_coverage {
+                    meta["semantic_coverage"] = serde_json::json!(coverage);
+                }
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
                 {
@@ -38922,6 +39204,9 @@ fn output_robot_results(
                     "explanation_cards": explanation_cards_json.clone(),
                     "effective": effective.clone(),
                 });
+                if let Some(coverage) = &search_mode_meta.semantic_coverage {
+                    meta["semantic_coverage"] = serde_json::json!(coverage);
+                }
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
                 {
@@ -89330,6 +89615,11 @@ fn run_selftest(output_format: Option<RobotFormat>) -> CliResult<()> {
     }
 }
 
+/// `errors[]` entry on `cass health` for a wedged rebuild. It names no issue
+/// number: reports belong in a new issue, not a closed thread (#382).
+const REBUILD_STALLED_HEALTH_ERROR: &str =
+    "index rebuild stalled — indexing thread is not making forward progress";
+
 /// GH #457: `errors[]` entry for a hollow lexical generation on `cass health`.
 const HOLLOW_INDEX_HEALTH_ERROR: &str = "index hollow — the published lexical generation serves far fewer documents than its completed rebuild checkpoint certified; run 'cass index' to rebuild it from the canonical database";
 
@@ -89354,6 +89644,10 @@ fn state_index_manifest_corrupt(state: &serde_json::Value) -> bool {
         == Some(
             crate::search::quill_bridge::QuillManifestSource::PreviousAfterCorruptCurrent.as_str(),
         )
+}
+
+fn state_index_status(state: &serde_json::Value) -> Option<&str> {
+    state.get("index")?.get("status")?.as_str()
 }
 
 /// Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy.
@@ -89553,14 +89847,19 @@ fn run_health(
         errors.push(HOLLOW_INDEX_HEALTH_ERROR.to_string());
     } else if state_index_manifest_corrupt(&state) {
         errors.push(CORRUPT_MANIFEST_HEALTH_ERROR.to_string());
+    } else if state_index_status(&state) == Some("incompatible") {
+        errors
+            .push("index archive identity or projection configuration is incompatible".to_string());
+    } else if state_index_status(&state) == Some("unverified") {
+        errors.push(
+            "index source freshness is unverified; the published generation remains searchable"
+                .to_string(),
+        );
     } else if index_exists && !index_fresh && !not_initialized {
         errors.push("index stale".to_string());
     }
     if rebuild_stalled {
-        errors.push(
-            "index rebuild stalled — indexing thread is not making forward progress (issue #258)"
-                .to_string(),
-        );
+        errors.push(REBUILD_STALLED_HEALTH_ERROR.to_string());
     } else if rebuild_active {
         errors.push("index rebuild in progress".to_string());
     }
@@ -101149,7 +101448,8 @@ fn response_schema_semantic_state() -> serde_json::Value {
                     "model_revision": { "type": ["string", "null"] },
                     "completed_at": { "type": ["string", "null"] },
                     "size_bytes": { "type": ["integer", "null"] },
-                    "shard_count": { "type": ["integer", "null"] }
+                    "shard_count": { "type": ["integer", "null"] },
+                    "coverage": response_schema_semantic_coverage()
                 }
             },
             "quality_tier": {
@@ -101164,7 +101464,8 @@ fn response_schema_semantic_state() -> serde_json::Value {
                     "model_revision": { "type": ["string", "null"] },
                     "completed_at": { "type": ["string", "null"] },
                     "size_bytes": { "type": ["integer", "null"] },
-                    "shard_count": { "type": ["integer", "null"] }
+                    "shard_count": { "type": ["integer", "null"] },
+                    "coverage": response_schema_semantic_coverage()
                 }
             },
             "backlog": {
@@ -103934,7 +104235,8 @@ fn response_schema_cursor_manifest() -> serde_json::Value {
                     "realized_search_mode": { "type": "string" },
                     "fallback_tier": { "type": ["string", "null"] },
                     "fallback_reason": { "type": ["string", "null"] },
-                    "semantic_refinement": { "type": "boolean" }
+                    "semantic_refinement": { "type": "boolean" },
+                    "semantic_coverage": response_schema_semantic_coverage()
                 }
             }
         },
@@ -104162,6 +104464,30 @@ fn response_schema_search_effective() -> serde_json::Value {
     })
 }
 
+fn response_schema_semantic_coverage() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+        "properties": {
+            "status": {"type": "string", "enum": ["complete", "partial"]},
+            "generation": {"type": "string"},
+            "published_at_ms": {"type": "integer"},
+            "published_mutation_seq": {"type": "integer", "minimum": 0},
+            "current_mutation_seq": {"type": "integer", "minimum": 0},
+            "published_max_message_id": {"type": "integer", "minimum": 0},
+            "current_max_message_id": {"type": "integer", "minimum": 0},
+            "indexed_passages": {"type": "integer", "minimum": 0},
+            "excluded_candidates": {"type": "integer", "minimum": 0},
+            "candidate_window_limited": {"type": "boolean"},
+            "stale_reason": {"type": "string"}
+        },
+        "required": ["status", "generation", "published_at_ms", "published_mutation_seq",
+            "current_mutation_seq", "published_max_message_id", "current_max_message_id",
+            "indexed_passages", "excluded_candidates", "candidate_window_limited"],
+        "additionalProperties": false
+    })
+}
+
 fn response_schema_search_meta() -> serde_json::Value {
     response_schema_object([
         ("elapsed_ms", serde_json::json!({ "type": "integer" })),
@@ -104191,6 +104517,7 @@ fn response_schema_search_meta() -> serde_json::Value {
         ),
         // Truthful refinement level + typed fallback reason (bead .5.4).
         ("refinement_level", serde_json::json!({ "type": "string" })),
+        ("semantic_coverage", response_schema_semantic_coverage()),
         (
             "semantic_fallback_reason",
             serde_json::json!({ "type": ["string", "null"] }),
@@ -111263,6 +111590,16 @@ mod stall_diagnostics_tests {
         assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["exit_code"], serde_json::json!(70));
         Ok(())
+    }
+
+    /// #382: `cass health` must not point operators at a closed issue.
+    #[test]
+    fn stalled_rebuild_health_error_names_no_closed_issue() {
+        let error = super::REBUILD_STALLED_HEALTH_ERROR;
+        assert!(
+            error.contains("rebuild stalled") && !error.contains("issue #"),
+            "{error}"
+        );
     }
 
     /// #496: a rebuild held below its memory reserve under a 12 GiB cgroup
@@ -127483,6 +127820,7 @@ fn run_models_build_hnsw(
             retryable: true,
         })?;
 
+    let expected_manifest = manifest.clone();
     let tier = match tier_raw {
         Some(raw) => parse_models_backfill_tier(raw)?,
         None if manifest
@@ -127611,7 +127949,7 @@ fn run_models_build_hnsw(
             built_at_ms: chrono::Utc::now().timestamp_millis(),
             ready: true,
         });
-        manifest.save(&data_dir).map_err(|err| CliError {
+        manifest.save_if_unchanged(&data_dir, Some(&expected_manifest)).map_err(|err| CliError {
             code: 5,
             kind: CliErrorKind::Storage.kind_str(),
             message: format!(
@@ -128283,6 +128621,8 @@ fn run_models_backfill_batch(
         })?;
 
     if outcome.published && identity_rebuild_generation.is_some() {
+        let certificate = manifest.coverage.get(indexer.embedder_id()).cloned();
+        let expected_manifest = manifest.clone();
         let published_artifact = match outcome.tier {
             TierKind::Fast => manifest.fast_tier.as_mut(),
             TierKind::Quality => manifest.quality_tier.as_mut(),
@@ -128296,7 +128636,16 @@ fn run_models_backfill_batch(
             ),
             retryable: true,
         })?;
-        if published_artifact.db_fingerprint != backfill_db_fingerprint {
+        let expected_fingerprint = certificate
+            .as_ref()
+            .map_or(backfill_db_fingerprint.as_str(), |proof| {
+                proof.db_fingerprint.as_str()
+            });
+        if published_artifact.db_fingerprint != expected_fingerprint
+            || certificate
+                .as_ref()
+                .is_some_and(|proof| !proof.matches_artifact(published_artifact))
+        {
             return Err(CliError {
                 code: 5,
                 kind: CliErrorKind::SemanticManifest.kind_str(),
@@ -128308,17 +128657,22 @@ fn run_models_backfill_batch(
                 retryable: true,
             });
         }
-        published_artifact.db_fingerprint = canonical_db_fingerprint.clone();
-        manifest.refresh_backlog(outcome.total_conversations, &canonical_db_fingerprint);
-        manifest.save(&data_dir).map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::SemanticManifest.kind_str(),
-            message: format!("Failed to finalize semantic identity manifest: {e}"),
-            hint: Some(
-                "Retry the semantic backfill; stale semantic serving remains fail-closed".into(),
-            ),
-            retryable: true,
-        })?;
+        if certificate.is_none() {
+            published_artifact.db_fingerprint = canonical_db_fingerprint.clone();
+            manifest.refresh_backlog(outcome.total_conversations, &canonical_db_fingerprint);
+            manifest
+                .save_if_unchanged(&data_dir, Some(&expected_manifest))
+                .map_err(|e| CliError {
+                    code: 5,
+                    kind: CliErrorKind::SemanticManifest.kind_str(),
+                    message: format!("Failed to finalize semantic identity manifest: {e}"),
+                    hint: Some(
+                        "Retry the semantic backfill; stale semantic serving remains fail-closed"
+                            .into(),
+                    ),
+                    retryable: true,
+                })?;
+        }
         crate::indexer::semantic::invalidate_identity_stale_semantic_shards(
             &data_dir,
             indexer.embedder_id(),
@@ -128332,18 +128686,28 @@ fn run_models_backfill_batch(
             ),
             retryable: true,
         })?;
-        storage
-            .complete_semantic_identity_rebuild(identity_tier)
-            .map_err(|e| CliError {
-                code: 5,
-                kind: CliErrorKind::Storage.kind_str(),
-                message: format!("Failed to complete semantic identity rebuild: {e}"),
-                hint: Some(
-                    "Retry the semantic backfill; stale semantic serving remains fail-closed"
-                        .into(),
-                ),
-                retryable: true,
-            })?;
+        let completion = if let Some(certificate) = certificate {
+            storage
+                .complete_semantic_identity_rebuild_if_current(
+                    identity_tier,
+                    &crate::storage::sqlite::SemanticArchiveState {
+                        archive_id: certificate.archive_id,
+                        mutation_seq: certificate.mutation_seq,
+                    },
+                )
+                .map(|_| ())
+        } else {
+            storage.complete_semantic_identity_rebuild(identity_tier)
+        };
+        completion.map_err(|e| CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: format!("Failed to complete semantic identity rebuild: {e}"),
+            hint: Some(
+                "Retry the semantic backfill; stale semantic serving remains fail-closed".into(),
+            ),
+            retryable: true,
+        })?;
     }
 
     let progress_pct = outcome.progress_pct();

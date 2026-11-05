@@ -117,6 +117,7 @@ pub(super) fn collect_exact_messages<E>(
                     if hit.score.total_cmp(&best.score).is_gt() {
                         best.score = hit.score;
                         best.chunk_idx = hit.chunk_idx;
+                        best.identity = hit.identity;
                     }
                 })
                 .or_insert(hit);
@@ -164,6 +165,7 @@ mod tests {
             message_id,
             chunk_idx,
             score,
+            identity: None,
         }
     }
 

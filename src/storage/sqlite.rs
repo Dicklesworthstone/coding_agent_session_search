@@ -16,6 +16,7 @@ use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use anyhow::{Context, Result, anyhow, bail};
 use frankensqlite::AsyncConnection as FrankenAsyncConnection;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -1780,6 +1781,147 @@ fn franken_read_message_extra_compat(
     }
 
     serde_json::Value::Null
+}
+
+// Keep the writer and both query connection facades on exactly the same raw
+// projection. Nullable IDs/timestamps must not be coalesced: None and Some(0)
+// can produce the same semantic document ID but describe different parents.
+const SEMANTIC_PARENT_PROJECTION: &str = "SELECT m.id, m.conversation_id, m.idx, c.started_at, m.created_at, \
+     c.source_path, c.external_id, c.title, c.agent_id, a.slug, \
+     c.workspace_id, w.path, c.source_id, c.origin_host, \
+     s.kind, s.host_label, s.machine_id, \
+     CASE WHEN a.slug IN ('codebuff', 'grok_bot') THEN m.extra_json ELSE NULL END, \
+     CASE WHEN a.slug IN ('codebuff', 'grok_bot') THEN m.extra_bin ELSE NULL END, m.role \
+     FROM messages m JOIN conversations c ON c.id = m.conversation_id \
+     LEFT JOIN agents a ON a.id = c.agent_id \
+     LEFT JOIN workspaces w ON w.id = c.workspace_id \
+     LEFT JOIN sources s ON s.id = c.source_id";
+
+fn hash_semantic_parent_field(hash: &mut Sha256, field: Option<&[u8]>) {
+    if let Some(value) = field {
+        hash.update([1]);
+        hash.update((value.len() as u64).to_le_bytes());
+        hash.update(value);
+    } else {
+        hash.update([0]);
+    }
+}
+
+fn semantic_parent_digest_from_row(row: &FrankenRow) -> Result<(i64, [u8; 32])> {
+    let message_id: i64 = row.get_typed(0)?;
+    anyhow::ensure!(message_id > 0, "nonpositive canonical semantic message ID");
+    let mut hash = Sha256::new();
+    hash.update(b"cass-semantic-parent-v1\0");
+    for column in [0, 1, 2, 3, 4, 8, 10] {
+        let value: Option<i64> = row.get_typed(column)?;
+        hash_semantic_parent_field(
+            &mut hash,
+            value.map(i64::to_le_bytes).as_ref().map(|v| v.as_slice()),
+        );
+    }
+    for column in [5, 6, 7, 9, 11, 12, 13, 14, 15, 16, 19] {
+        let value: Option<String> = row.get_typed(column)?;
+        hash_semantic_parent_field(&mut hash, value.as_deref().map(str::as_bytes));
+    }
+    let agent_slug: Option<String> = row.get_typed(9)?;
+    let native_identity = match agent_slug.as_deref() {
+        Some("codebuff") => {
+            let extra = franken_read_message_extra_compat(row, 17, 18);
+            Some(codebuff_native_message_id(&extra)?.to_owned())
+        }
+        Some("grok_bot") => {
+            let extra = franken_read_message_extra_compat(row, 17, 18);
+            Some(grok_bot_native_entry_id(&extra)?.to_owned())
+        }
+        _ => None,
+    };
+    hash_semantic_parent_field(&mut hash, native_identity.as_deref().map(str::as_bytes));
+    Ok((message_id, hash.finalize().into()))
+}
+
+/// Visit canonical parent proofs in message-ID order with bounded metadata
+/// pages. This does not open or finish a transaction; the caller must retain
+/// its committed read snapshot across the entire visit.
+pub fn visit_semantic_parent_identities(
+    connection: &FrankenConnection,
+    mut visit: impl FnMut(i64, [u8; 32]) -> Result<()>,
+) -> Result<()> {
+    const PAGE_SIZE: usize = 1024;
+    let mut after = None;
+    loop {
+        let (sql, parameters) = if let Some(last) = after {
+            (
+                format!(
+                    "{SEMANTIC_PARENT_PROJECTION} WHERE m.id > ?1 ORDER BY m.id LIMIT {PAGE_SIZE}"
+                ),
+                vec![SqliteValue::from(last)],
+            )
+        } else {
+            (
+                format!("{SEMANTIC_PARENT_PROJECTION} ORDER BY m.id LIMIT {PAGE_SIZE}"),
+                Vec::new(),
+            )
+        };
+        let rows = connection.query_with_params(&sql, &parameters)?;
+        let exhausted = rows.len() < PAGE_SIZE;
+        for row in rows {
+            let (message_id, digest) = semantic_parent_digest_from_row(&row)?;
+            anyhow::ensure!(
+                after.is_none_or(|previous| message_id > previous),
+                "semantic parent stream is not ordered"
+            );
+            visit(message_id, digest)?;
+            after = Some(message_id);
+        }
+        if exhausted {
+            return Ok(());
+        }
+    }
+}
+
+fn lookup_semantic_parent_identities_with_query(
+    ids: &[i64],
+    mut query: impl FnMut(&str, &[SqliteValue]) -> Result<Vec<FrankenRow>>,
+) -> Result<HashMap<i64, [u8; 32]>> {
+    let mut identities = HashMap::with_capacity(ids.len());
+    for chunk in ids.chunks(256) {
+        let placeholders = (1..=chunk.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("{SEMANTIC_PARENT_PROJECTION} WHERE m.id IN ({placeholders})");
+        let parameters = chunk
+            .iter()
+            .copied()
+            .map(SqliteValue::from)
+            .collect::<Vec<_>>();
+        for row in query(&sql, &parameters)? {
+            let (message_id, digest) = semantic_parent_digest_from_row(&row)?;
+            identities.insert(message_id, digest);
+        }
+    }
+    Ok(identities)
+}
+
+/// Batch proof lookup on the caller's existing synchronous read transaction.
+pub fn lookup_semantic_parent_identities_in_connection(
+    connection: &FrankenConnection,
+    ids: &[i64],
+) -> Result<HashMap<i64, [u8; 32]>> {
+    lookup_semantic_parent_identities_with_query(ids, |sql, values| {
+        Ok(connection.query_with_params(sql, values)?)
+    })
+}
+
+/// The same proof lookup on search's existing async-connection transaction.
+/// No connection is reopened and no nested transaction is introduced.
+pub fn lookup_semantic_parent_identities_on_async(
+    connection: &FrankenAsyncConnection,
+    ids: &[i64],
+) -> Result<HashMap<i64, [u8; 32]>> {
+    lookup_semantic_parent_identities_with_query(ids, |sql, values| {
+        Ok(connection.query_with_params_sync(sql, values)?)
+    })
 }
 
 // -------------------------------------------------------------------------
@@ -4098,8 +4240,44 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 23;
+pub const CURRENT_SCHEMA_VERSION: i64 = 24;
 pub(crate) const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
+const SEMANTIC_ARCHIVE_STATE_META_KEY: &str = "semantic_archive_state_v1";
+const SEMANTIC_MESSAGE_ID_HIGH_WATER_META_KEY: &str = "semantic_message_id_high_water_v1";
+
+/// Committed canonical authority. Neither row counts nor reused numeric IDs
+/// identify an archive incarnation or describe its destructive mutations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticArchiveState {
+    pub archive_id: String,
+    pub mutation_seq: u64,
+}
+
+impl SemanticArchiveState {
+    pub fn parse(value: &str) -> Result<Self> {
+        let state: Self =
+            serde_json::from_str(value).context("decoding canonical semantic archive state")?;
+        anyhow::ensure!(
+            state.archive_id.len() == 32
+                && state
+                    .archive_id
+                    .bytes()
+                    .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) })
+                && state.mutation_seq <= i64::MAX as u64,
+            "invalid canonical semantic archive identity or mutation sequence"
+        );
+        Ok(state)
+    }
+}
+
+/// Latest changed conversation IDs, including durable deletion tombstones.
+/// A global invalidation makes this insufficient for an incremental replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticConversationChanges {
+    pub state: SemanticArchiveState,
+    pub conversation_ids: Vec<i64>,
+    pub complete: bool,
+}
 const LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v2";
 const PREVIOUS_LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v1";
 const LEGACY_OMP_LEXICAL_PUBLISHED_META_KEY: &str =
@@ -4838,6 +5016,20 @@ CREATE TABLE IF NOT EXISTS forgotten_conversations (
     forgotten_at_ms INTEGER NOT NULL,
     PRIMARY KEY (source_id, agent_slug, source_path, external_id)
 );
+";
+
+const MIGRATION_V24: &str = r"
+-- No foreign key: deletion and numeric-ID reuse must retain their tombstones.
+-- ID zero represents a global/unknown canonical invalidation.
+CREATE TABLE IF NOT EXISTS semantic_conversation_changes (
+    conversation_id INTEGER PRIMARY KEY,
+    mutation_seq INTEGER NOT NULL,
+    invalidation_seq INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_conversation_changes_seq
+ON semantic_conversation_changes(mutation_seq, conversation_id);
+CREATE INDEX IF NOT EXISTS idx_semantic_conversation_invalidations_seq
+ON semantic_conversation_changes(invalidation_seq);
 ";
 
 /// Row from the embedding_jobs table.
@@ -6131,6 +6323,12 @@ impl FrankenStorage {
         // Keep meta.schema_version in sync for backward compatibility.
         self.sync_meta_schema_version(current)?;
 
+        if current >= 24 && semantic_archive_state_in_connection(&self.conn)?.is_none() {
+            let mut tx = self.conn.transaction()?;
+            ensure_semantic_archive_state(&tx)?;
+            tx.commit()?;
+        }
+
         Ok(())
     }
 
@@ -6209,6 +6407,24 @@ impl FrankenStorage {
             );
 
             for batch in current_schema_repair_batches_for_missing_tables(&missing_tables)? {
+                if batch.name == "semantic_coverage" {
+                    // Recreating a lost journal cannot preserve its former
+                    // completeness authority. Reset the incarnation atomically
+                    // with the table so readers never see an empty trusted log.
+                    let mut tx = self.conn.transaction()?;
+                    tx.execute_compat(
+                        "DELETE FROM meta WHERE key = ?1 OR key = ?2",
+                        fparams![
+                            SEMANTIC_ARCHIVE_STATE_META_KEY,
+                            SEMANTIC_MESSAGE_ID_HIGH_WATER_META_KEY
+                        ],
+                    )?;
+                    tx.execute_batch(batch.sql)?;
+                    ensure_semantic_archive_state(&tx)?;
+                    tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
+                    tx.commit()?;
+                    continue;
+                }
                 self.conn
                     .execute_batch(batch.sql)
                     .with_context(|| format!("repairing current-schema batch {}", batch.name))?;
@@ -6528,6 +6744,7 @@ const POST_TAIL_CACHE_MIGRATION_STEPS: &[(i64, &str, &str)] = &[
     (21, "conversation_context_index", MIGRATION_V21),
     (22, "forgotten_sources", MIGRATION_V22),
     (23, "forgotten_conversations", MIGRATION_V23),
+    (24, "semantic_coverage", MIGRATION_V24),
 ];
 
 /// Migration versions that ordinary storage open may apply when their ledger
@@ -7462,6 +7679,11 @@ const CURRENT_SCHEMA_REPAIR_BATCHES: &[SchemaRepairBatch] = &[
         tables: &["forgotten_conversations"],
         sql: MIGRATION_V23,
     },
+    SchemaRepairBatch {
+        name: "semantic_coverage",
+        tables: &["semantic_conversation_changes"],
+        sql: MIGRATION_V24,
+    },
 ];
 
 fn current_schema_repair_batches_for_missing_tables(
@@ -7495,7 +7717,7 @@ fn current_schema_repair_batches_for_missing_tables(
 }
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 23] = [
+const MIGRATION_NAMES: [(i64, &str); 24] = [
     (1, "core_tables"),
     (2, "fts_messages"),
     (3, "fts_messages_rebuild"),
@@ -7519,6 +7741,7 @@ const MIGRATION_NAMES: [(i64, &str); 23] = [
     (21, "conversation_context_index"),
     (22, "forgotten_sources"),
     (23, "forgotten_conversations"),
+    (24, "semantic_coverage"),
 ];
 
 /// Transitions an existing database from `meta` table schema versioning to the
@@ -7664,6 +7887,10 @@ const REQUIRED_CURRENT_SCHEMA_TABLE_PROBES: &[(&str, &str)] = &[
         "forgotten_conversations",
         "SELECT source_id, agent_slug, source_path, external_id FROM forgotten_conversations LIMIT 1;",
     ),
+    (
+        "semantic_conversation_changes",
+        "SELECT conversation_id, mutation_seq, invalidation_seq FROM semantic_conversation_changes LIMIT 1;",
+    ),
 ];
 
 const REQUIRED_CONVERSATION_TOKEN_COLUMNS: &[(&str, &str)] = &[
@@ -7807,10 +8034,15 @@ fn delete_orphan_message_id_chunk_once(conn: &FrankenConnection, ids: &[i64]) ->
             }
         }
     }
-    deleted = deleted.saturating_add(
-        delete_rows_by_i64_chunks(&tx, "DELETE FROM messages WHERE id IN", ids)
-            .context("deleting orphan rows from messages")?,
-    );
+    let messages_deleted = delete_rows_by_i64_chunks(&tx, "DELETE FROM messages WHERE id IN", ids)
+        .context("deleting orphan rows from messages")?;
+    deleted = deleted.saturating_add(messages_deleted);
+    if messages_deleted > 0 {
+        // The parent may already have vanished outside supported writers.
+        // There is no complete conversation delta to recover here.
+        record_semantic_conversation_changes(&tx, &[0], true)?;
+        clear_semantic_embed_watermark_after_deletion(&tx)?;
+    }
     tx.commit()?;
     Ok(deleted)
 }
@@ -8060,6 +8292,163 @@ fn replay_owns_provider_workspace(
         )
 }
 
+fn semantic_archive_state_with_query(
+    mut query: impl FnMut(&str) -> Result<Vec<FrankenRow>>,
+) -> Result<Option<SemanticArchiveState>> {
+    let rows = query("SELECT value FROM meta WHERE key = 'semantic_archive_state_v1'")?;
+    rows.first()
+        .map(|row| SemanticArchiveState::parse(&row.get_typed::<String>(0)?))
+        .transpose()
+}
+
+/// Read-only archive authority for a caller-owned canonical transaction.
+pub fn semantic_archive_state_in_connection(
+    connection: &FrankenConnection,
+) -> Result<Option<SemanticArchiveState>> {
+    semantic_archive_state_with_query(|sql| Ok(connection.query(sql)?))
+}
+
+/// Initialize only from a canonical write transaction. Old schema callers keep
+/// strict serving; reads never synthesize a mutation history.
+fn ensure_semantic_archive_state(
+    tx: &FrankenTransaction<'_>,
+) -> Result<Option<SemanticArchiveState>> {
+    if let Some(state) = semantic_archive_state_with_query(|sql| Ok(tx.query(sql)?))? {
+        return Ok(Some(state));
+    }
+    if tx
+        .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'semantic_conversation_changes'")?
+        .is_empty()
+    {
+        return Ok(None);
+    }
+    let mut identity = [0_u8; 16];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut identity)
+        .map_err(|_| anyhow!("creating canonical semantic archive identity"))?;
+    let state = SemanticArchiveState {
+        archive_id: hex::encode(identity),
+        mutation_seq: 0,
+    };
+    let high_water: i64 = tx.query_row_map(
+        "SELECT COALESCE(MAX(id), 0) FROM messages",
+        fparams![],
+        |row| row.get_typed(0),
+    )?;
+    tx.execute_compat(
+        "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+        fparams![
+            SEMANTIC_ARCHIVE_STATE_META_KEY,
+            serde_json::to_string(&state)?
+        ],
+    )?;
+    tx.execute_compat(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        fparams![
+            SEMANTIC_MESSAGE_ID_HIGH_WATER_META_KEY,
+            high_water.to_string()
+        ],
+    )?;
+    Ok(Some(state))
+}
+
+/// Record supported canonical changes in the same transaction as their rows.
+/// Appends preserve old invalidation boundaries; deletion/reidentity tombstones
+/// survive subsequent reuse of either the conversation or message IDs.
+fn record_semantic_conversation_changes(
+    tx: &FrankenTransaction<'_>,
+    conversation_ids: &[i64],
+    invalidates_existing: bool,
+) -> Result<()> {
+    if conversation_ids.is_empty() {
+        return Ok(());
+    }
+    let Some(mut state) = ensure_semantic_archive_state(tx)? else {
+        return Ok(());
+    };
+    state.mutation_seq = state
+        .mutation_seq
+        .checked_add(1)
+        .filter(|sequence| *sequence <= i64::MAX as u64)
+        .context("canonical semantic mutation sequence exhausted")?;
+    let sequence = i64::try_from(state.mutation_seq)?;
+    for conversation_id in conversation_ids.iter().copied().collect::<BTreeSet<_>>() {
+        anyhow::ensure!(
+            conversation_id >= 0,
+            "negative semantic conversation identity"
+        );
+        let invalidation = if invalidates_existing {
+            sequence
+        } else {
+            tx.query_row_map(
+                "SELECT invalidation_seq FROM semantic_conversation_changes WHERE conversation_id = ?1",
+                fparams![conversation_id],
+                |row| row.get_typed::<i64>(0),
+            ).optional()?.unwrap_or(0)
+        };
+        tx.execute_compat(
+            "INSERT OR REPLACE INTO semantic_conversation_changes(conversation_id, mutation_seq, invalidation_seq) VALUES(?1, ?2, ?3)",
+            fparams![conversation_id, sequence, invalidation],
+        )?;
+    }
+    tx.execute_compat(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        fparams![
+            SEMANTIC_ARCHIVE_STATE_META_KEY,
+            serde_json::to_string(&state)?
+        ],
+    )?;
+    Ok(())
+}
+
+fn record_semantic_message_insertions(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    message_ids: &[i64],
+) -> Result<()> {
+    let Some(minimum) = message_ids.iter().copied().min() else {
+        return Ok(());
+    };
+    let Some(_) = ensure_semantic_archive_state(tx)? else {
+        return Ok(());
+    };
+    let high_water: String = tx.query_row_map(
+        "SELECT value FROM meta WHERE key = ?1",
+        fparams![SEMANTIC_MESSAGE_ID_HIGH_WATER_META_KEY],
+        |row| row.get_typed(0),
+    )?;
+    let high_water: i64 = high_water
+        .parse()
+        .context("invalid semantic message-ID high water")?;
+    let reused = minimum <= high_water;
+    record_semantic_conversation_changes(tx, &[conversation_id], reused)?;
+    if reused {
+        tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
+    }
+    if let Some(maximum) = message_ids.iter().copied().max()
+        && maximum > high_water
+    {
+        tx.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![SEMANTIC_MESSAGE_ID_HIGH_WATER_META_KEY, maximum.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+fn record_semantic_parent_repair(
+    tx: &FrankenTransaction<'_>,
+    affected_query: &str,
+    parameters: &[ParamValue],
+) -> Result<()> {
+    if !tx.query_params(affected_query, parameters)?.is_empty() {
+        // Filling a missing dimension is canonical repair, not an ordinary
+        // append. The old provenance was incomplete, so require reconciliation.
+        record_semantic_conversation_changes(tx, &[0], true)?;
+        tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
+    }
+    Ok(())
+}
+
 /// Canonical rows were deleted (forget, dedup, agent purge). Their vectors
 /// stay in the semantic artifact and SQLite reuses the freed top message ids,
 /// so a watermark that covers them lets `cass index --semantic` take the #394
@@ -8098,6 +8487,7 @@ fn delete_duplicate_conversation_rows(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
 ) -> Result<()> {
+    record_semantic_conversation_changes(tx, &[conversation_id], true)?;
     tx.execute_compat(
         "DELETE FROM conversation_external_lookup WHERE conversation_id = ?1",
         fparams![conversation_id],
@@ -8228,6 +8618,7 @@ fn franken_reconcile_provider_workspace(
                 )?;
             }
             tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
+            record_semantic_conversation_changes(tx, &[conversation_id], true)?;
         }
     }
     Ok(previous_workspace != workspace_id)
@@ -8300,6 +8691,9 @@ fn franken_reconcile_shelley_metadata(
             "UPDATE conversations SET workspace_id = ?1, title = ?2, metadata_json = ?3, metadata_bin = ?4 WHERE id = ?5",
             fparams![workspace_id, conv.title.as_deref(), json.as_deref(), binary.as_deref(), conversation_id],
         )?;
+        if workspace_changed || title_changed {
+            record_semantic_conversation_changes(tx, &[conversation_id], true)?;
+        }
         if workspace_changed {
             let generation = format!("workspace:{:032x}", rand::random::<u128>());
             for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
@@ -8873,6 +9267,11 @@ fn franken_reconcile_codebuff_messages<'a>(
                 fparams![message_id],
             )?;
             franken_insert_snippets(tx, message_id, &revised.snippets)?;
+            record_semantic_conversation_changes(
+                tx,
+                &[existing.context("canonical message lacks conversation")?.0],
+                true,
+            )?;
             revisions.push(CodebuffRevision {
                 conversation_id: existing.context("canonical message lacks conversation")?.0,
                 started_at: reconciled.started_at,
@@ -10745,6 +11144,7 @@ impl FrankenStorage {
                         legacy_agent_id
                     ],
                 )?;
+                record_semantic_conversation_changes(&tx, &[conversation_id], true)?;
                 tx.execute_compat(
                     "UPDATE token_usage
                      SET agent_id = ?1, source_id = ?2
@@ -10825,6 +11225,7 @@ impl FrankenStorage {
                 )?;
             }
             tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
+            record_semantic_conversation_changes(&tx, &[0], true)?;
             tx.commit()?;
         }
 
@@ -11130,6 +11531,12 @@ impl FrankenStorage {
         )?;
 
         let mut tx = self.conn.transaction()?;
+        let deleted_conversation_ids: Vec<i64> = tx.query_map_collect(
+            "SELECT id FROM conversations WHERE agent_id = ?1",
+            fparams![agent_id],
+            |row| row.get_typed(0),
+        )?;
+        record_semantic_conversation_changes(&tx, &deleted_conversation_ids, true)?;
         tx.execute_compat(
             "DELETE FROM conversation_external_lookup
              WHERE conversation_id IN (
@@ -13515,7 +13922,8 @@ impl FrankenStorage {
         // Re-indexing commonly reuses the same normalized source metadata
         // across many conversations. Skip the write entirely when the row is
         // already identical so we avoid needless WAL churn and timestamp bumps.
-        self.conn.execute_compat(
+        let mut tx = self.conn.transaction()?;
+        let changed = tx.execute_compat(
             "INSERT INTO sources(id, kind, host_label, machine_id, platform, config_json, created_at, updated_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET
@@ -13543,6 +13951,20 @@ impl FrankenStorage {
                 now
             ],
         )?;
+        if changed == 0 {
+            tx.rollback()?;
+            return Ok(());
+        }
+        let affected: Vec<i64> = tx.query_map_collect(
+            "SELECT id FROM conversations WHERE source_id = ?1",
+            fparams![source.id.as_str()],
+            |row| row.get_typed(0),
+        )?;
+        record_semantic_conversation_changes(&tx, &affected, true)?;
+        if !affected.is_empty() {
+            tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -14403,11 +14825,22 @@ impl FrankenStorage {
         if id == LOCAL_SOURCE_ID {
             anyhow::bail!("cannot delete the local source");
         }
-        let count = self
-            .conn
-            .execute_compat("DELETE FROM sources WHERE id = ?1", fparams![id])?;
+        let mut tx = self.conn.transaction()?;
+        let affected: Vec<i64> = tx.query_map_collect(
+            "SELECT id FROM conversations WHERE source_id = ?1",
+            fparams![id],
+            |row| row.get_typed(0),
+        )?;
+        let count = tx.execute_compat("DELETE FROM sources WHERE id = ?1", fparams![id])?;
         if count > 0 {
+            record_semantic_conversation_changes(&tx, &affected, true)?;
+            if !affected.is_empty() {
+                tx.execute(CLEAR_SEMANTIC_EMBED_WATERMARKS_SQL)?;
+            }
+            tx.commit()?;
             self.invalidate_conversation_source_cache(id);
+        } else {
+            tx.rollback()?;
         }
         Ok(count > 0)
     }
@@ -17140,9 +17573,82 @@ impl FrankenStorage {
             .with_context(|| "fetching messages for embedding")
     }
 
-    /// Get the incremental embedding watermark of one vector space: every
-    /// message at or below it is embedded in that embedder's index. Another
-    /// embedder's watermark says nothing about this one's coverage.
+    /// Current canonical mutation authority. Reads never create an authority
+    /// for an old or incompletely restored archive.
+    pub fn semantic_archive_state(&self) -> Result<Option<SemanticArchiveState>> {
+        semantic_archive_state_in_connection(&self.conn)
+    }
+
+    /// Changes since a captured boundary, read in one SQL snapshot. A missing
+    /// or foreign authority cannot prove a complete incremental replay.
+    pub fn semantic_conversation_changes_since(
+        &self,
+        previous: &SemanticArchiveState,
+    ) -> Result<Option<SemanticConversationChanges>> {
+        let sequence = i64::try_from(previous.mutation_seq)?;
+        let rows = match self.conn.query_with_params(
+            "SELECT meta.value, changes.conversation_id \
+             FROM meta LEFT JOIN semantic_conversation_changes AS changes \
+             ON changes.mutation_seq > ?1 \
+             WHERE meta.key = 'semantic_archive_state_v1' \
+             ORDER BY changes.conversation_id",
+            &[SqliteValue::from(sequence)],
+        ) {
+            Ok(rows) => rows,
+            Err(error) if error_indicates_missing_table(&error) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(first) = rows.first() else {
+            return Ok(None);
+        };
+        let state = SemanticArchiveState::parse(&first.get_typed::<String>(0)?)?;
+        if state.archive_id != previous.archive_id || state.mutation_seq < previous.mutation_seq {
+            return Ok(None);
+        }
+        let mut conversation_ids = Vec::with_capacity(rows.len());
+        let mut complete = true;
+        for row in rows {
+            if let Some(id) = row.get_typed::<Option<i64>>(1)? {
+                if id == 0 {
+                    complete = false;
+                } else {
+                    anyhow::ensure!(id > 0, "invalid semantic conversation journal identity");
+                    conversation_ids.push(id);
+                }
+            }
+        }
+        Ok(Some(SemanticConversationChanges {
+            state,
+            conversation_ids,
+            complete,
+        }))
+    }
+
+    /// Whether a captured generation lost canonical identity. Missing,
+    /// foreign, or regressed archive authority fails closed.
+    pub fn semantic_invalidations_after(&self, previous: &SemanticArchiveState) -> Result<bool> {
+        let sequence = i64::try_from(previous.mutation_seq)?;
+        let rows = match self.conn.query_with_params(
+            "SELECT value, EXISTS(SELECT 1 FROM semantic_conversation_changes \
+             WHERE invalidation_seq > ?1) FROM meta \
+             WHERE key = 'semantic_archive_state_v1'",
+            &[SqliteValue::from(sequence)],
+        ) {
+            Ok(rows) => rows,
+            Err(error) if error_indicates_missing_table(&error) => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(row) = rows.first() else {
+            return Ok(true);
+        };
+        let state = SemanticArchiveState::parse(&row.get_typed::<String>(0)?)?;
+        Ok(state.archive_id != previous.archive_id
+            || state.mutation_seq < previous.mutation_seq
+            || row.get_typed::<i64>(1)? != 0)
+    }
+
+    /// Read only this embedder's incremental watermark; another vector
+    /// space's watermark provides no authority for its coverage.
     pub fn get_last_embedded_message_id(&self, embedder_id: &str) -> Result<Option<i64>> {
         let key = semantic_embed_watermark_key(embedder_id);
         let result: Result<String, _> = self.conn.query_row_map(
@@ -17181,6 +17687,42 @@ impl FrankenStorage {
             fparams![key.as_str(), id.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Certify only the captured message boundary, atomically with checking
+    /// the archive authority. A raced deletion cannot clear a watermark and
+    /// then have an obsolete publisher restore it. Equal watermarks do not
+    /// cause a needless canonical file write.
+    pub fn set_last_embedded_message_id_if_unchanged(
+        &self,
+        embedder_id: &str,
+        max_id: i64,
+        expected: &SemanticArchiveState,
+    ) -> Result<bool> {
+        anyhow::ensure!(max_id >= 0, "negative semantic embedding watermark");
+        let mut tx = self.conn.transaction()?;
+        if semantic_archive_state_with_query(|sql| Ok(tx.query(sql)?))?.as_ref() != Some(expected) {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        let key = semantic_embed_watermark_key(embedder_id);
+        let current: Option<String> = tx
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![key.as_str()],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        if current.as_deref() == Some(max_id.to_string().as_str()) {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![key.as_str(), max_id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Whether semantic artifacts must be rebuilt because canonical filter
@@ -17235,6 +17777,41 @@ impl FrankenStorage {
             fparams![tier.meta_key()],
         )?;
         Ok(())
+    }
+
+    /// Complete an identity rebuild only if its canonical source boundary
+    /// still owns the marker. A later reidentity cannot be acknowledged by
+    /// an earlier publisher.
+    ///
+    /// Publishers acknowledge only the canonical boundary they captured,
+    /// leaving later identity changes pending for their own generation.
+    pub(crate) fn complete_semantic_identity_rebuild_if_current(
+        &self,
+        tier: SemanticIdentityTier,
+        expected: &SemanticArchiveState,
+    ) -> Result<bool> {
+        let mut tx = self.conn.transaction()?;
+        if semantic_archive_state_with_query(|sql| Ok(tx.query(sql)?))?.as_ref() != Some(expected) {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        let marker: Option<String> = tx
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![tier.meta_key()],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        if marker.as_deref().is_none_or(|value| value == "complete") {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'complete')",
+            fparams![tier.meta_key()],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Get embedding jobs for a database path.
@@ -18504,6 +19081,11 @@ fn ensure_agents_in_tx(
                     now
                 ],
             )?;
+            record_semantic_parent_repair(
+                tx,
+                "SELECT 1 FROM conversations WHERE agent_id = ?1 LIMIT 1",
+                fparams![agent_id],
+            )?;
         }
     }
     Ok(())
@@ -18544,6 +19126,11 @@ fn ensure_workspaces_in_tx(
             tx.execute_compat(
                 "INSERT OR IGNORE INTO workspaces(id, path) VALUES(?1, ?2)",
                 fparams![ws_id, path_str.as_str()],
+            )?;
+            record_semantic_parent_repair(
+                tx,
+                "SELECT 1 FROM conversations WHERE workspace_id = ?1 LIMIT 1",
+                fparams![ws_id],
             )?;
         }
     }
@@ -18591,6 +19178,11 @@ fn ensure_sources_in_tx(
                     now,
                     now
                 ],
+            )?;
+            record_semantic_parent_repair(
+                tx,
+                "SELECT 1 FROM conversations WHERE source_id = ?1 LIMIT 1",
+                fparams![source_id.as_str()],
             )?;
         }
     }
@@ -18964,6 +19556,7 @@ fn franken_promote_pi_family_external_identity_by_source_path(
             "UPDATE conversations SET external_id = ?1 WHERE id = ?2",
             fparams![external_id, existing_id],
         )?;
+        record_semantic_conversation_changes(tx, &[existing_id], true)?;
     }
 
     let existing = ExistingConversationWithTail {
@@ -19391,6 +19984,7 @@ fn franken_insert_conversation(
     ) {
         Ok(_) => {
             let conv_id = franken_last_rowid(tx)?;
+            record_semantic_conversation_changes(tx, &[conv_id], false)?;
             franken_insert_conversation_tail_state(
                 tx,
                 conv_id,
@@ -19604,6 +20198,8 @@ fn franken_append_insert_new_messages<'a>(
             inserted.push((message_id, *msg));
         }
     }
+    let inserted_ids = inserted.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    record_semantic_message_insertions(tx, conversation_id, &inserted_ids)?;
     Ok(inserted)
 }
 
@@ -19649,6 +20245,7 @@ fn franken_batch_insert_new_messages_with_batch_size(
         inserted_ids.extend((0..chunk.len()).map(|offset| first_id + offset as i64));
     }
 
+    record_semantic_message_insertions(tx, conversation_id, &inserted_ids)?;
     Ok(inserted_ids)
 }
 
@@ -19786,6 +20383,7 @@ fn franken_batch_insert_new_messages_with_profile_batch_size(
         profile.rowid_duration += rowid_start.elapsed();
     }
 
+    record_semantic_message_insertions(tx, conversation_id, &inserted_ids)?;
     Ok(inserted_ids)
 }
 
@@ -24818,6 +25416,10 @@ fn agent_kind_str(kind: AgentKind) -> String {
 // =============================================================================
 // Tests (bead yln.4)
 // =============================================================================
+
+#[cfg(test)]
+#[path = "sqlite/semantic_coverage_tests.rs"]
+mod semantic_coverage_tests;
 
 #[cfg(test)]
 mod tests {
@@ -47815,7 +48417,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(applied.legacy_sources_removed, 1);
         assert_eq!(applied.source_observations_removed, 1);
         assert!(storage.source_ingest_ledger_entries()?.is_empty());
-        assert_eq!(storage.schema_version()?, 23);
+        assert_eq!(storage.schema_version()?, CURRENT_SCHEMA_VERSION);
         assert!(storage.forget_derived_rebuild_pending()?);
         Ok(())
     }
@@ -48249,7 +48851,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         reader.close_without_checkpoint()?;
 
         let migrated = FrankenStorage::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 23);
+        assert_eq!(migrated.schema_version()?, CURRENT_SCHEMA_VERSION);
         assert_eq!(migrated.total_conversation_count()?, 1);
         assert_eq!(migrated.total_message_count()?, 1);
         assert_eq!(migrated.forgotten_source_stamps()?.len(), 1);

@@ -1637,7 +1637,7 @@ impl TantivyIndex {
     /// The durable generation protected by this writer's native admission.
     /// Cloning its immutable view avoids a second segment admission and keeps
     /// rebuild recovery's content audit bound to the generation it will extend.
-    pub(crate) fn committed_snapshot(
+    pub fn committed_snapshot(
         &self,
     ) -> Result<std::sync::Arc<frankensearch::quill::KeeperSnapshot>> {
         self.inner.committed_snapshot()

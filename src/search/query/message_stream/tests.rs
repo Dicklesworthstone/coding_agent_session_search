@@ -147,6 +147,7 @@ fn streaming_selection_retains_reentering_messages_and_exact_ties() -> Result<()
             message_id,
             chunk_idx,
             score,
+            identity: None,
         })?;
         assert!(selection.ordered.len() <= 2);
         assert_eq!(selection.ordered.len(), selection.by_message.len());
@@ -180,6 +181,7 @@ fn streaming_selection_matches_full_sort_for_adversarial_orders() -> Result<()> 
                         message_id,
                         chunk_idx,
                         score,
+                        identity: None,
                     },
                     ordinal,
                 ));
@@ -220,7 +222,8 @@ fn streaming_selection_rejects_nonfinite_and_orders_signed_zero() -> Result<()> 
                 .consider(Winner {
                     message_id: 1,
                     chunk_idx: 0,
-                    score
+                    score,
+                    identity: None,
                 })
                 .is_err()
         );
@@ -231,6 +234,7 @@ fn streaming_selection_rejects_nonfinite_and_orders_signed_zero() -> Result<()> 
             message_id,
             chunk_idx: 0,
             score,
+            identity: None,
         })?;
     }
     assert_eq!(

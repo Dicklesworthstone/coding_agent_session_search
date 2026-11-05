@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel as mpsc;
 
+#[path = "query/coverage.rs"]
+mod coverage;
 #[path = "query/retry_budget.rs"]
 mod retry_budget;
 pub use retry_budget::LEXICAL_RETRY_QUERY_FUEL_EXHAUSTED;
@@ -34,7 +36,7 @@ use frankensearch::{
     },
     rrf_fuse as fs_rrf_fuse,
 };
-use frankensqlite::AsyncConnection as SearchSqliteConnection;
+use frankensqlite::AsyncConnection as FrankenSearchSqliteConnection;
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -52,6 +54,39 @@ use crate::franken_sync::compat::OptionalExtension;
 use crate::franken_sync::compat::{ParamValue, RowExt, param_slice_to_values};
 #[cfg(test)]
 use crate::franken_sync::params;
+
+/// The database-file witness belongs to the hydration connection, including
+/// connections opened by lexical search before semantic context is attached.
+/// A missing witness preserves ordinary read compatibility but never admits a
+/// certified semantic query. It must not be filled from a later pathname open.
+#[derive(Debug)]
+struct SearchSqliteConnection {
+    inner: FrankenSearchSqliteConnection,
+    archive_witness: Option<coverage::CanonicalDatabaseWitness>,
+}
+
+impl SearchSqliteConnection {
+    fn verify_canonical_archive(&self) -> Result<()> {
+        self.archive_witness
+            .as_ref()
+            .ok_or_else(|| anyhow!("semantic canonical archive ownership was not verified when the hydration connection opened"))?
+            .verify()
+    }
+}
+
+impl std::ops::Deref for SearchSqliteConnection {
+    type Target = FrankenSearchSqliteConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for SearchSqliteConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
 
 /// Row-mapping conveniences for the dedicated-owner search connection.
 ///
@@ -117,7 +152,12 @@ struct SearchSqliteFixture(Option<SearchSqliteConnection>);
 #[cfg(test)]
 impl SearchSqliteFixture {
     fn in_memory() -> Result<Self, crate::franken_sync::FrankenError> {
-        SearchSqliteConnection::open_sync(":memory:").map(|conn| Self(Some(conn)))
+        FrankenSearchSqliteConnection::open_sync(":memory:").map(|inner| {
+            Self(Some(SearchSqliteConnection {
+                inner,
+                archive_witness: None,
+            }))
+        })
     }
 
     fn into_connection(mut self) -> SearchSqliteConnection {
@@ -648,12 +688,20 @@ fn open_search_hydration_sqlite(
     timeout: Duration,
     strict_read_only: bool,
 ) -> Result<SearchSqliteConnection> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    // Capture around this connection's open, rather than at semantic model
+    // admission: a long-lived client may already have a lexical connection.
+    let archive_opening = coverage::CanonicalDatabaseOpening::capture(&path).ok();
     let conn = if strict_read_only {
         crate::storage::sqlite::open_franken_async_strict_readonly_connection_with_timeout(
-            path, timeout,
+            &path, timeout,
         )?
     } else {
-        crate::storage::sqlite::open_franken_async_readonly_connection_with_timeout(path, timeout)?
+        crate::storage::sqlite::open_franken_async_readonly_connection_with_timeout(&path, timeout)?
     };
     conn.execute_sync("PRAGMA query_only = 1;")
         .with_context(|| "setting search hydration query_only")?;
@@ -663,7 +711,10 @@ fn open_search_hydration_sqlite(
         "PRAGMA cache_size = -{SEARCH_SQLITE_HYDRATION_CACHE_KIB};"
     ))
     .with_context(|| "setting search hydration cache_size")?;
-    Ok(conn)
+    Ok(SearchSqliteConnection {
+        inner: conn,
+        archive_witness: archive_opening.and_then(|opening| opening.finish().ok()),
+    })
 }
 
 /// NFC-normalize a query string before sanitization so that decomposed
@@ -766,11 +817,18 @@ fn semantic_doc_component_id_from_db(raw: Option<i64>) -> u32 {
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash, is_search_noise_text};
 use crate::search::embedder::Embedder;
 use crate::search::vector_index::{
-    ROLE_USER, SemanticAnnUnavailableReason, SemanticDocId, SemanticFilter, SemanticFilterMaps,
-    SemanticIndexArtifact, SemanticProgressiveUnavailableReason, VectorSearchResult,
-    parse_semantic_doc_id, role_code_from_str,
+    ROLE_USER, SemanticAnnUnavailableReason, SemanticCoverageSnapshot, SemanticDocId,
+    SemanticFilter, SemanticFilterMaps, SemanticIndexArtifact,
+    SemanticProgressiveUnavailableReason, VectorSearchResult, parse_semantic_doc_id,
+    role_code_from_str,
 };
 use crate::sources::provenance::SourceFilter;
+
+pub type SemanticSearchWithCoverage = (
+    Vec<SearchHit>,
+    Option<crate::search::ann_index::AnnSearchStats>,
+    Option<SemanticCoverageSnapshot>,
+);
 
 // ============================================================================
 // String Interner for Cache Keys (Opt 2.3)
@@ -2711,6 +2769,19 @@ pub fn rrf_fuse_hits(
     limit: usize,
     offset: usize,
 ) -> Vec<SearchHit> {
+    rrf_fuse_hits_with_coverage(lexical, semantic, query, limit, offset, None)
+}
+
+/// A certified rank may only score the payload authenticated by its semantic
+/// read snapshot. Lexical and semantic phases may observe different snapshots.
+pub fn rrf_fuse_hits_with_coverage(
+    lexical: &[SearchHit],
+    semantic: &[SearchHit],
+    query: &str,
+    limit: usize,
+    offset: usize,
+    coverage: Option<&SemanticCoverageSnapshot>,
+) -> Vec<SearchHit> {
     if limit == 0 {
         return Vec::new();
     }
@@ -2721,12 +2792,13 @@ pub fn rrf_fuse_hits(
 
     let mut lexical_scored = Vec::with_capacity(lexical.len());
     let mut semantic_scored = Vec::with_capacity(semantic.len());
-    let mut hit_by_doc_id: HashMap<String, SearchHit> = HashMap::with_capacity(total_candidates);
+    let mut hit_by_doc_id: HashMap<String, (SearchHit, bool)> =
+        HashMap::with_capacity(total_candidates);
 
     for hit in lexical {
         let doc_id = search_hit_doc_id(hit);
         // Prefer lexical hit details (snippets highlight query terms).
-        hit_by_doc_id.insert(doc_id.clone(), hit.clone());
+        hit_by_doc_id.insert(doc_id.clone(), (hit.clone(), false));
         lexical_scored.push(FsScoredResult {
             doc_id: doc_id.into(),
             score: hit.score,
@@ -2745,7 +2817,13 @@ pub fn rrf_fuse_hits(
         let doc_id = search_hit_doc_id(hit);
         hit_by_doc_id
             .entry(doc_id.clone())
-            .or_insert_with(|| hit.clone());
+            .and_modify(|(payload, certified)| {
+                if coverage.is_some() {
+                    *payload = hit.clone();
+                    *certified = true;
+                }
+            })
+            .or_insert_with(|| (hit.clone(), coverage.is_some()));
         semantic_scored.push(FsVectorHit {
             index: u32::try_from(idx).unwrap_or(u32::MAX),
             score: hit.score,
@@ -2795,6 +2873,7 @@ pub fn rrf_fuse_hits(
     let mut fallback_seen: HashMap<CompatFallbackKey, CompatSlot> =
         HashMap::with_capacity(fused.len());
     let mut unique_hits: Vec<SearchHit> = Vec::with_capacity(fused.len());
+    let mut certified_payloads: Vec<bool> = Vec::with_capacity(fused.len());
 
     let update_slot = |slot: &mut CompatSlot, conversation_id: Option<i64>| {
         if slot.ambiguous {
@@ -2808,7 +2887,7 @@ pub fn rrf_fuse_hits(
     };
 
     for fused_hit in fused {
-        let mut hit = match hit_by_doc_id.remove(fused_hit.doc_id.as_str()) {
+        let (mut hit, certified) = match hit_by_doc_id.remove(fused_hit.doc_id.as_str()) {
             Some(hit) => hit,
             None => continue,
         };
@@ -2885,7 +2964,13 @@ pub fn rrf_fuse_hits(
                 ambiguous: false,
             });
             update_slot(slot, hit.conversation_id);
-            if unique_hits[existing_idx].conversation_id.is_none() && hit.conversation_id.is_some()
+            if certified && !certified_payloads[existing_idx] {
+                hit.score = unique_hits[existing_idx].score;
+                unique_hits[existing_idx] = hit;
+                certified_payloads[existing_idx] = true;
+            } else if !certified_payloads[existing_idx]
+                && unique_hits[existing_idx].conversation_id.is_none()
+                && hit.conversation_id.is_some()
             {
                 unique_hits[existing_idx].conversation_id = hit.conversation_id;
             }
@@ -2896,6 +2981,7 @@ pub fn rrf_fuse_hits(
         hit.score = fused_hit.rrf_score as f32;
         let index = unique_hits.len();
         unique_hits.push(hit);
+        certified_payloads.push(certified);
         exact_seen.insert(exact_key, index);
         match fallback_seen.get_mut(&fallback_key) {
             Some(slot) => update_slot(slot, unique_hits[index].conversation_id),
@@ -5480,12 +5566,14 @@ impl SearchClient {
                 if hit.score > entry.score {
                     entry.score = hit.score;
                     entry.chunk_idx = parsed.chunk_idx;
+                    entry.identity = Some(parsed);
                 }
             })
             .or_insert(VectorSearchResult {
                 message_id: parsed.message_id,
                 chunk_idx: parsed.chunk_idx,
                 score: hit.score,
+                identity: Some(parsed),
             });
     }
 
@@ -5589,6 +5677,7 @@ impl SearchClient {
                                 message_id: parsed.message_id,
                                 chunk_idx: parsed.chunk_idx,
                                 score: hit.score,
+                                identity: Some(parsed),
                             })
                         })
                         .collect::<Result<Vec<_>>>()
@@ -5607,6 +5696,7 @@ impl SearchClient {
                         if hit.score.total_cmp(&best.score).is_gt() {
                             best.score = hit.score;
                             best.chunk_idx = hit.chunk_idx;
+                            best.identity = hit.identity;
                         }
                     })
                     .or_insert(hit);
@@ -6384,12 +6474,14 @@ impl SearchClient {
                     if hit.score > entry.score {
                         entry.score = hit.score;
                         entry.chunk_idx = parsed.chunk_idx;
+                        entry.identity = Some(parsed);
                     }
                 })
                 .or_insert(VectorSearchResult {
                     message_id: parsed.message_id,
                     chunk_idx: parsed.chunk_idx,
                     score: hit.score,
+                    identity: Some(parsed),
                 });
         }
         let mut collapsed: Vec<VectorSearchResult> = best_by_message.into_values().collect();
@@ -6675,6 +6767,7 @@ impl SearchClient {
                 message_id: result.message_id,
                 chunk_idx: result.chunk_idx,
                 score: result.score,
+                identity: result.identity,
             })
             .collect();
         let mut hydrated_by_id: HashMap<u64, SearchHit> = self
@@ -6969,12 +7062,63 @@ impl SearchClient {
         Vec<SearchHit>,
         Option<crate::search::ann_index::AnnSearchStats>,
     )> {
+        self.search_semantic_with_tier_and_coverage(
+            query,
+            filters,
+            limit,
+            offset,
+            field_mask,
+            approximate,
+            tier_mode,
+        )
+        .map(|(hits, stats, _)| (hits, stats))
+    }
+
+    /// Search and return the coverage observed by this request's canonical
+    /// hydration snapshot. The receipt is never read from shared last-query state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_semantic_with_tier_and_coverage(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
+        approximate: bool,
+        tier_mode: SemanticTierMode,
+    ) -> Result<SemanticSearchWithCoverage> {
         let field_mask = effective_field_mask(field_mask);
         let canonical = canonicalize_for_embedding(query);
         if canonical.trim().is_empty() {
-            return Ok((Vec::new(), None));
+            let retained = {
+                let guard = self
+                    .semantic
+                    .lock()
+                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
+                if let Some(state) = guard.as_ref()
+                    && state
+                        .artifacts
+                        .iter()
+                        .any(|artifact| artifact.coverage_certificate().is_some())
+                    && state.artifacts.len() != 1
+                {
+                    bail!("certified semantic serving requires one retained generation");
+                }
+                guard
+                    .as_ref()
+                    .and_then(|state| state.artifacts.first())
+                    .filter(|artifact| artifact.coverage_certificate().is_some())
+                    .cloned()
+            };
+            let coverage = if let Some(artifact) = retained {
+                self.hydrate_semantic_hits_at_generation(&[], field_mask, Some(&artifact))?
+                    .1
+            } else {
+                None
+            };
+            return Ok((Vec::new(), None, coverage));
         }
-        loop {
+        'generation: loop {
             let (
                 embedding,
                 candidate_context,
@@ -7068,51 +7212,30 @@ impl SearchClient {
                 limit
             };
             let target_hits = limit.saturating_add(offset);
-            let initial_fetch_limit = target_hits;
-            let fallback_fetch_limit = target_hits.saturating_mul(3);
-            let finalize_hits =
-                |results: &[VectorSearchResult]| -> Result<(usize, Vec<SearchHit>)> {
-                    let hits = self.hydrate_semantic_hits(results, field_mask)?;
-                    Ok(self.postprocess_hits_page(hits, query, &filters, limit, offset))
-                };
-
-            let (results, retry_state, mut ann_stats) = self.search_semantic_candidates(
-                &candidate_context,
-                &embedding,
-                &filters,
-                SemanticCandidateSearchRequest {
-                    fetch_limit: initial_fetch_limit,
-                    approximate: effective_approximate,
-                    tier_mode: effective_tier_mode,
-                    in_memory_two_tier_index: in_memory_two_tier_index.as_ref(),
-                    ann_index: ann_index.as_ref(),
-                },
-            )?;
-            if !self.semantic_context_matches(&context_token)? {
-                tracing::debug!("semantic context changed during candidate search; retrying");
-                continue;
+            let certified = candidate_context
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.coverage_certificate().is_some());
+            if certified && candidate_context.artifacts.len() != 1 {
+                bail!("certified semantic serving requires one retained generation");
             }
-            let (mut available_hits, mut paged_hits) = finalize_hits(&results)?;
-
-            let needs_retry = initial_fetch_limit < fallback_fetch_limit
-                && ((available_hits < target_hits && retry_state.has_more_candidates)
-                    || retry_state.exact_window_may_omit_competitor);
-
-            if needs_retry {
-                tracing::debug!(
-                    query = canonical,
-                    target_hits,
-                    available_hits,
-                    initial_fetch_limit,
-                    fallback_fetch_limit,
-                    "retrying semantic fetch due to candidate-window shortfall"
-                );
-                let (retry_results, _, retry_ann_stats) = self.search_semantic_candidates(
+            let retained = candidate_context.artifacts.first();
+            let maximum_fetch = if certified {
+                target_hits.saturating_mul(3).max(4096)
+            } else {
+                target_hits.saturating_mul(3)
+            };
+            let mut fetch_limit = target_hits;
+            loop {
+                if let Some(artifact) = retained {
+                    artifact.verify_coverage_file()?;
+                }
+                let (results, retry_state, ann_stats) = self.search_semantic_candidates(
                     &candidate_context,
                     &embedding,
                     &filters,
                     SemanticCandidateSearchRequest {
-                        fetch_limit: fallback_fetch_limit,
+                        fetch_limit,
                         approximate: effective_approximate,
                         tier_mode: effective_tier_mode,
                         in_memory_two_tier_index: in_memory_two_tier_index.as_ref(),
@@ -7120,32 +7243,40 @@ impl SearchClient {
                     },
                 )?;
                 if !self.semantic_context_matches(&context_token)? {
-                    tracing::debug!("semantic context changed during retry fetch; retrying");
+                    tracing::debug!("semantic context changed during candidate search; retrying");
+                    continue 'generation;
+                }
+                let (hydrated, mut coverage) =
+                    self.hydrate_semantic_hits_at_generation(&results, field_mask, retained)?;
+                let hits = hydrated.into_iter().map(|(_, hit)| hit).collect();
+                let (available_hits, paged_hits) =
+                    self.postprocess_hits_page(hits, query, &filters, limit, offset);
+                let needs_more = (available_hits < target_hits && retry_state.has_more_candidates)
+                    || retry_state.exact_window_may_omit_competitor;
+                if needs_more && fetch_limit < maximum_fetch {
+                    fetch_limit = if certified {
+                        fetch_limit
+                            .saturating_mul(2)
+                            .max(fetch_limit.saturating_add(1))
+                            .min(maximum_fetch)
+                    } else {
+                        maximum_fetch
+                    };
                     continue;
                 }
-                (available_hits, paged_hits) = finalize_hits(&retry_results)?;
-                ann_stats = retry_ann_stats;
+                if let Some(coverage) = &mut coverage {
+                    coverage.candidate_window_limited = needs_more;
+                }
+                tracing::trace!(
+                    query = canonical,
+                    target_hits,
+                    available_hits,
+                    returned = paged_hits.len(),
+                    "semantic fetch complete"
+                );
+                return Ok((paged_hits, ann_stats, coverage));
             }
-
-            tracing::trace!(
-                query = canonical,
-                target_hits,
-                available_hits,
-                returned = paged_hits.len(),
-                "semantic fetch complete"
-            );
-
-            return Ok((paged_hits, ann_stats));
         }
-    }
-
-    fn hydrate_semantic_hits(
-        &self,
-        results: &[VectorSearchResult],
-        field_mask: FieldMask,
-    ) -> Result<Vec<SearchHit>> {
-        self.hydrate_semantic_hits_with_ids(results, field_mask)
-            .map(|rows| rows.into_iter().map(|(_, hit)| hit).collect())
     }
 
     /// Project an engine-ranked candidate stream through the production CASS
@@ -7698,15 +7829,69 @@ impl SearchClient {
         approximate: bool,
         semantic_tier_mode: SemanticTierMode,
     ) -> Result<SearchResult> {
+        self.search_hybrid_with_tier_and_coverage(
+            lexical_query,
+            semantic_query,
+            filters,
+            limit,
+            offset,
+            sparse_threshold,
+            field_mask,
+            approximate,
+            semantic_tier_mode,
+        )
+        .map(|(result, _)| result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_hybrid_with_coverage(
+        &self,
+        lexical_query: &str,
+        semantic_query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        sparse_threshold: usize,
+        field_mask: FieldMask,
+        approximate: bool,
+    ) -> Result<(SearchResult, Option<SemanticCoverageSnapshot>)> {
+        self.search_hybrid_with_tier_and_coverage(
+            lexical_query,
+            semantic_query,
+            filters,
+            limit,
+            offset,
+            sparse_threshold,
+            field_mask,
+            approximate,
+            SemanticTierMode::Single,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_hybrid_with_tier_and_coverage(
+        &self,
+        lexical_query: &str,
+        semantic_query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        sparse_threshold: usize,
+        field_mask: FieldMask,
+        approximate: bool,
+        semantic_tier_mode: SemanticTierMode,
+    ) -> Result<(SearchResult, Option<SemanticCoverageSnapshot>)> {
         if semantic_query.trim().is_empty() {
-            return self.search_with_fallback(
-                lexical_query,
-                filters,
-                limit,
-                offset,
-                sparse_threshold,
-                field_mask,
-            );
+            return self
+                .search_with_fallback(
+                    lexical_query,
+                    filters,
+                    limit,
+                    offset,
+                    sparse_threshold,
+                    field_mask,
+                )
+                .map(|result| (result, None));
         }
 
         self.refresh_lexical_generation()?;
@@ -7726,15 +7911,18 @@ impl SearchClient {
         };
         let fetch = limit.saturating_add(offset);
         if fetch == 0 {
-            return Ok(SearchResult {
-                hits: Vec::new(),
-                wildcard_fallback: false,
-                cache_stats: self.cache_stats(),
-                suggestions: Vec::new(),
-                ann_stats: None,
-                ann_unavailable_reason: None,
-                total_count: None,
-            });
+            return Ok((
+                SearchResult {
+                    hits: Vec::new(),
+                    wildcard_fallback: false,
+                    cache_stats: self.cache_stats(),
+                    suggestions: Vec::new(),
+                    ann_stats: None,
+                    ann_unavailable_reason: None,
+                    total_count: None,
+                },
+                None,
+            ));
         }
 
         let budget =
@@ -7774,15 +7962,16 @@ impl SearchClient {
             Err(err) => return Err(err),
         };
         let session_scoped = !filters.session_paths.is_empty();
-        let (semantic_hits, semantic_ann_stats) = self.search_semantic_with_tier(
-            semantic_query,
-            filters,
-            budget.semantic_candidates,
-            0,
-            field_mask,
-            approximate,
-            semantic_tier_mode,
-        )?;
+        let (semantic_hits, semantic_ann_stats, coverage) = self
+            .search_semantic_with_tier_and_coverage(
+                semantic_query,
+                filters,
+                budget.semantic_candidates,
+                0,
+                field_mask,
+                approximate,
+                semantic_tier_mode,
+            )?;
         let semantic_ann_unavailable_reason = if approximate && session_scoped {
             Some(SemanticAnnUnavailableReason::SessionScopeRequiresExact)
         } else if approximate {
@@ -7790,21 +7979,31 @@ impl SearchClient {
         } else {
             None
         };
-        let fused = rrf_fuse_hits(&lexical.hits, &semantic_hits, semantic_query, limit, offset);
+        let fused = rrf_fuse_hits_with_coverage(
+            &lexical.hits,
+            &semantic_hits,
+            semantic_query,
+            limit,
+            offset,
+            coverage.as_ref(),
+        );
         let suggestions = if fused.is_empty() {
             lexical.suggestions.clone()
         } else {
             Vec::new()
         };
-        Ok(SearchResult {
-            hits: fused,
-            wildcard_fallback: lexical.wildcard_fallback,
-            cache_stats: lexical.cache_stats,
-            suggestions,
-            ann_stats: semantic_ann_stats,
-            ann_unavailable_reason: semantic_ann_unavailable_reason,
-            total_count: None,
-        })
+        Ok((
+            SearchResult {
+                hits: fused,
+                wildcard_fallback: lexical.wildcard_fallback,
+                cache_stats: lexical.cache_stats,
+                suggestions,
+                ann_stats: semantic_ann_stats,
+                ann_unavailable_reason: semantic_ann_unavailable_reason,
+                total_count: None,
+            },
+            coverage,
+        ))
     }
 
     /// Generate "did-you-mean" suggestions for zero-hit queries.
@@ -10861,6 +11060,7 @@ mod tests {
             message_id,
             chunk_idx: 0,
             score,
+            identity: None,
         }
     }
 
@@ -16634,11 +16834,13 @@ mod tests {
                     message_id: 1,
                     chunk_idx: 0,
                     score: 0.9,
+                    identity: None,
                 },
                 VectorSearchResult {
                     message_id: 2,
                     chunk_idx: 0,
                     score: 0.8,
+                    identity: None,
                 },
             ],
             FieldMask::new(false, true, true, true),
@@ -17078,6 +17280,7 @@ mod tests {
                 message_id: 1,
                 chunk_idx: 0,
                 score: 0.9,
+                identity: None,
             }],
             FieldMask::new(false, true, true, true),
         )?;
@@ -17153,6 +17356,7 @@ mod tests {
                 message_id: 1,
                 chunk_idx: 0,
                 score: 0.9,
+                identity: None,
             }],
             FieldMask::new(false, true, true, true),
         )?;
@@ -17363,6 +17567,7 @@ mod tests {
                 message_id: 1,
                 chunk_idx: 0,
                 score: 0.9,
+                identity: None,
             }],
             FieldMask::new(false, true, true, true),
         )?;

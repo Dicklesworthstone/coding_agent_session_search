@@ -3,6 +3,412 @@
 
 #[test]
 #[serial_test::serial]
+fn gh496_completed_freshness_tracks_growth_without_laundering_cached_counts() {
+    let fixture = gh496_fixture();
+    rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();
+    let checkpoint = load_lexical_rebuild_checkpoint(&fixture.index_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        completed_lexical_checkpoint_freshness(&fixture.index_path, &fixture.db_path, &checkpoint,)
+            .unwrap(),
+        LexicalCheckpointFreshness::Current
+    );
+    assert!(
+        prime_archive_fingerprint_cache_from_verified_checkpoint(
+            &fixture.db_path,
+            &fixture.index_path,
+            || Ok(()),
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        lexical_storage_fingerprint_for_db_cached_readonly(&fixture.db_path, &fixture.index_path),
+        Some(checkpoint.storage_fingerprint.clone())
+    );
+
+    gh496_append(&fixture);
+    assert!(matches!(
+        completed_lexical_checkpoint_freshness(&fixture.index_path, &fixture.db_path, &checkpoint,)
+            .unwrap(),
+        LexicalCheckpointFreshness::Unverified(_)
+    ));
+    assert!(
+        !prime_archive_fingerprint_cache_from_verified_checkpoint(
+            &fixture.db_path,
+            &fixture.index_path,
+            || Ok(()),
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        lexical_storage_fingerprint_for_db_cached_readonly(&fixture.db_path, &fixture.index_path),
+        None,
+        "an old completion cannot prime counts under the appended archive's epoch"
+    );
+    let current =
+        lexical_storage_fingerprint_for_db_cached(&fixture.db_path, &fixture.index_path).unwrap();
+    assert_ne!(current, checkpoint.storage_fingerprint);
+    assert_eq!(
+        current,
+        lexical_storage_fingerprint_for_db_strict(&fixture.db_path).unwrap()
+    );
+
+    rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 3, None).unwrap();
+    gh496_assert_exact(&fixture, 3);
+    let recovered = load_lexical_rebuild_checkpoint(&fixture.index_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        completed_lexical_checkpoint_freshness(&fixture.index_path, &fixture.db_path, &recovered,)
+            .unwrap(),
+        LexicalCheckpointFreshness::Current
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn gh496_equal_count_edit_stays_unverified_after_count_cache_refresh() {
+    let fixture = gh496_fixture();
+    rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();
+    let checkpoint = load_lexical_rebuild_checkpoint(&fixture.index_path)
+        .unwrap()
+        .unwrap();
+    let manifest = fs::read(fixture.index_path.join("MANIFEST")).unwrap();
+    let storage = FrankenStorage::open(&fixture.db_path).unwrap();
+    storage
+        .raw()
+        .execute("UPDATE messages SET content = 'growthproof readfreshnessrewrite' WHERE idx = 0")
+        .unwrap();
+    storage.close_without_checkpoint().unwrap();
+    assert_eq!(
+        lexical_storage_fingerprint_for_db_cached(&fixture.db_path, &fixture.index_path).unwrap(),
+        checkpoint.storage_fingerprint,
+        "count/max-ID evidence deliberately cannot detect an in-place edit"
+    );
+    for _ in 0..3 {
+        assert!(matches!(
+            completed_lexical_checkpoint_freshness(
+                &fixture.index_path,
+                &fixture.db_path,
+                &checkpoint,
+            )
+            .unwrap(),
+            LexicalCheckpointFreshness::Unverified(_)
+        ));
+        assert!(
+            !prime_archive_fingerprint_cache_from_verified_checkpoint(
+                &fixture.db_path,
+                &fixture.index_path,
+                || Ok(()),
+            )
+            .unwrap()
+        );
+    }
+    assert_eq!(
+        fs::read(fixture.index_path.join("MANIFEST")).unwrap(),
+        manifest
+    );
+    assert!(gh496_search_signature(&fixture.index_path, "readfreshnessrewrite").is_empty());
+}
+
+#[test]
+#[serial_test::serial]
+fn gh496_cache_priming_rejects_a_writer_after_completion_admission() {
+    let fixture = gh496_fixture();
+    rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();
+    let mut writer_ran = false;
+    assert!(
+        !prime_archive_fingerprint_cache_from_verified_checkpoint(
+            &fixture.db_path,
+            &fixture.index_path,
+            || {
+                gh496_append(&fixture);
+                writer_ran = true;
+                Ok(())
+            },
+        )
+        .unwrap()
+    );
+    assert!(
+        writer_ran,
+        "exercise the gap after successful source admission"
+    );
+    assert_eq!(
+        lexical_storage_fingerprint_for_db_cached_readonly(&fixture.db_path, &fixture.index_path),
+        None
+    );
+    assert_eq!(
+        lexical_storage_fingerprint_for_db_cached(&fixture.db_path, &fixture.index_path).unwrap(),
+        lexical_storage_fingerprint_for_db_strict(&fixture.db_path).unwrap()
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn gh496_fingerprint_cache_rejects_a_writer_between_query_and_publication() {
+    let fixture = gh496_fixture();
+    let cache_dir = fixture.data_dir.join("count-cache-race");
+    fs::create_dir(&cache_dir).unwrap();
+    let identity = lexical_storage_physical_identity(&fixture.db_path).unwrap();
+    let mut writer_ran = false;
+    let error = lexical_storage_fingerprint_for_db_disk_cached_with_observer(
+        &fixture.db_path,
+        &identity,
+        &cache_dir,
+        || {
+            gh496_append(&fixture);
+            writer_ran = true;
+            Ok(())
+        },
+    )
+    .expect_err("a completed query must not acquire the following writer's identity");
+    assert!(writer_ran);
+    assert!(lexical_fingerprint_observation_changed(&error), "{error:#}");
+    assert!(!cache_dir.join(ARCHIVE_FINGERPRINT_CACHE_FILE).exists());
+    let current = lexical_storage_fingerprint_for_db_cached(&fixture.db_path, &cache_dir).unwrap();
+    assert_eq!(
+        current,
+        lexical_storage_fingerprint_for_db_strict(&fixture.db_path).unwrap()
+    );
+    assert_eq!(
+        lexical_storage_fingerprint_for_db_cached_readonly(&fixture.db_path, &cache_dir),
+        Some(current)
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn gh496_fingerprint_cache_ignores_legacy_and_oversized_sidecars() {
+    let fixture = gh496_fixture();
+    let identity = lexical_storage_physical_identity(&fixture.db_path).unwrap();
+    let actual = lexical_storage_fingerprint_for_db_strict(&fixture.db_path).unwrap();
+    let cache_path = fixture.index_path.join(ARCHIVE_FINGERPRINT_CACHE_FILE);
+    let legacy = ArchiveFingerprintCache {
+        schema_version: 1,
+        identity: identity.clone(),
+        fingerprint: "content-v1:999:999:999:999".to_string(),
+        computed_at_ms: 0,
+    };
+    fs::write(&cache_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert_eq!(
+        lexical_storage_fingerprint_for_db_cached_readonly(&fixture.db_path, &fixture.index_path),
+        None
+    );
+    assert_eq!(
+        lexical_storage_fingerprint_for_db_disk_cached(
+            &fixture.db_path,
+            &identity,
+            &fixture.index_path,
+        )
+        .unwrap(),
+        actual
+    );
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&cache_path)
+        .unwrap()
+        .set_len(2 * 1024 * 1024)
+        .unwrap();
+    assert_eq!(
+        lexical_storage_fingerprint_for_db_cached_readonly(&fixture.db_path, &fixture.index_path),
+        None,
+        "oversized cache files must be rejected before allocation"
+    );
+    assert_eq!(
+        lexical_storage_fingerprint_for_db_disk_cached(
+            &fixture.db_path,
+            &identity,
+            &fixture.index_path,
+        )
+        .unwrap(),
+        actual
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn gh496_metadata_finalization_reports_unverified_without_forcing_catch_up() {
+    let _scan_cadence = set_env_var("CASS_AUTO_REFRESH_SOURCE_SCAN_SECS", "300");
+    let fixture = gh496_fixture();
+    rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();
+    let manifest = fs::read(fixture.index_path.join("MANIFEST")).unwrap();
+    let checkpoint = fs::read(lexical_rebuild_state_path(&fixture.index_path)).unwrap();
+    let now = FrankenStorage::now_millis();
+    let storage = FrankenStorage::open(&fixture.db_path).unwrap();
+    storage.set_last_indexed_at(now).unwrap();
+    storage.close_without_checkpoint().unwrap();
+
+    for compute_lexical_fingerprint in [true, false, false] {
+        let assets = crate::search::asset_state::inspect_search_assets(
+            crate::search::asset_state::InspectSearchAssetsInput {
+                data_dir: &fixture.data_dir,
+                db_path: &fixture.db_path,
+                stale_threshold: 60,
+                last_indexed_at_ms: Some(now),
+                now_ms: now,
+                maintenance: crate::search::asset_state::SearchMaintenanceSnapshot::default(),
+                semantic_preference: crate::search::asset_state::SemanticPreference::DefaultModel,
+                db_available: true,
+                compute_lexical_fingerprint,
+                inspect_semantic: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(assets.lexical.status, "unverified");
+        assert!(!assets.lexical.fresh);
+        assert!(!assets.lexical.stale);
+        assert_eq!(
+            assets.lexical.fingerprint.matches_current_db_fingerprint,
+            Some(true)
+        );
+        let mut read_freshness = serde_json::json!({
+            "exists": assets.lexical.exists,
+            "fresh": assets.lexical.fresh,
+            "stale": assets.lexical.stale,
+            "rebuilding": assets.lexical.rebuilding,
+            "partial": false,
+            "pending_sessions": assets.lexical.pending_sessions,
+            "last_indexed_at": now,
+        });
+        assert_eq!(background_refresh::catch_up_reason(&read_freshness), None);
+        read_freshness["last_indexed_at"] = serde_json::json!(now - 301_000);
+        assert_eq!(
+            background_refresh::catch_up_reason(&read_freshness),
+            Some("source-scan-overdue")
+        );
+    }
+    assert_eq!(
+        fs::read(fixture.index_path.join("MANIFEST")).unwrap(),
+        manifest
+    );
+    assert_eq!(
+        fs::read(lexical_rebuild_state_path(&fixture.index_path)).unwrap(),
+        checkpoint
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn gh496_same_path_archive_replacement_rejects_completed_and_staged_read_proofs() {
+    let fixture = gh496_fixture();
+    rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();
+    let completed = load_lexical_rebuild_state(&fixture.index_path)
+        .unwrap()
+        .unwrap();
+    gh496_stage_prefix(&fixture.db_path, &fixture.index_path, 1);
+    assert!(has_usable_lexical_publication_receipt(
+        &fixture.index_path,
+        &fixture.db_path
+    ));
+
+    let replacement_path = fixture.data_dir.join("replacement.db");
+    let replacement = FrankenStorage::open(&replacement_path).unwrap();
+    gh496_insert_conversation(&replacement, 9, 2, 32);
+    replacement.close().unwrap();
+    fs::rename(
+        &fixture.db_path,
+        fixture.data_dir.join("retained-original.db"),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            completed_lexical_checkpoint_freshness_for_state(
+                &fixture.index_path,
+                &fixture.db_path,
+                &completed,
+            )
+            .unwrap(),
+            LexicalCheckpointFreshness::Unverified(_)
+        ),
+        "temporary source unavailability is not proof of replacement"
+    );
+    fs::rename(replacement_path, &fixture.db_path).unwrap();
+    assert!(matches!(
+        completed_lexical_checkpoint_freshness_for_state(
+            &fixture.index_path,
+            &fixture.db_path,
+            &completed,
+        )
+        .unwrap(),
+        LexicalCheckpointFreshness::Incompatible(_)
+    ));
+    assert!(!has_usable_lexical_publication_receipt(
+        &fixture.index_path,
+        &fixture.db_path
+    ));
+}
+
+#[test]
+#[serial_test::serial]
+fn gh496_read_freshness_rejects_projection_drift_and_corrupt_current_manifest() {
+    let _cap = set_env_var("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", "8192");
+    let fixture = gh496_fixture();
+    rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();
+    let checkpoint = load_lexical_rebuild_checkpoint(&fixture.index_path)
+        .unwrap()
+        .unwrap();
+    {
+        let _changed_cap = set_env_var("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", "4096");
+        assert!(matches!(
+            completed_lexical_checkpoint_freshness(
+                &fixture.index_path,
+                &fixture.db_path,
+                &checkpoint
+            )
+            .unwrap(),
+            LexicalCheckpointFreshness::Incompatible(_)
+        ));
+        assert!(!has_usable_lexical_publication_receipt(
+            &fixture.index_path,
+            &fixture.db_path
+        ));
+    }
+    fs::copy(
+        fixture.index_path.join("MANIFEST"),
+        fixture.index_path.join("MANIFEST.prev"),
+    )
+    .unwrap();
+    fs::write(
+        fixture.index_path.join("MANIFEST"),
+        b"corrupt-current-manifest",
+    )
+    .unwrap();
+    assert!(matches!(
+        completed_lexical_checkpoint_freshness(&fixture.index_path, &fixture.db_path, &checkpoint)
+            .unwrap(),
+        LexicalCheckpointFreshness::Stale(_)
+    ));
+    assert!(
+        !prime_archive_fingerprint_cache_from_verified_checkpoint(
+            &fixture.db_path,
+            &fixture.index_path,
+            || Ok(()),
+        )
+        .unwrap()
+    );
+    fs::rename(
+        fixture.index_path.join("MANIFEST"),
+        fixture.index_path.join("retained-corrupt-MANIFEST"),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            completed_lexical_checkpoint_freshness(
+                &fixture.index_path,
+                &fixture.db_path,
+                &checkpoint
+            )
+            .unwrap(),
+            LexicalCheckpointFreshness::Stale(_)
+        ),
+        "a previous manifest after a missing current manifest is not current proof"
+    );
+}
+
+#[test]
+#[serial_test::serial]
 fn gh496_legacy_completed_checkpoint_cannot_certify_same_count_content_edit() {
     let fixture = gh496_fixture();
     rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();
