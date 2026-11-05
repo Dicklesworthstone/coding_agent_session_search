@@ -17782,6 +17782,11 @@ impl FrankenStorage {
     /// Complete an identity rebuild only if its canonical source boundary
     /// still owns the marker. A later reidentity cannot be acknowledged by
     /// an earlier publisher.
+    ///
+    /// Production publishers still call the unconditional
+    /// `complete_semantic_identity_rebuild`; wiring them to this check is
+    /// open under #458.
+    #[cfg(test)]
     pub(crate) fn complete_semantic_identity_rebuild_if_current(
         &self,
         tier: SemanticIdentityTier,

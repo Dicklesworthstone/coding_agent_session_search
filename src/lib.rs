@@ -31471,8 +31471,7 @@ mod search_lexical_self_heal_tests {
         assert!(!diagnosis.checkpoint_refresh_allowed);
         assert!(diagnosis.reason.contains("archive identity"));
         let error = inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
-            .err()
-            .expect("strict read must not serve a different archive's documents");
+            .expect_err("strict read must not serve a different archive's documents");
         assert_eq!(error.kind, "maintenance-required");
         assert_eq!(data_tree_snapshot(data_dir), before);
     }
