@@ -142,9 +142,11 @@ fn complete_backfill_seals_owner_and_caches_its_parent_proof() -> Result<()> {
     Ok(())
 }
 
+type Mutation = Box<dyn FnOnce() -> Result<()> + Send>;
+
 struct MutatingHash {
     inner: HashEmbedder,
-    once: Mutex<Option<Box<dyn FnOnce() -> Result<()> + Send>>>,
+    once: Mutex<Option<Mutation>>,
 }
 
 impl Embedder for MutatingHash {

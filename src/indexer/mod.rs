@@ -10300,6 +10300,47 @@ fn prepare_lexical_rebuild_state_for_active_run(
     persist_lexical_rebuild_state(index_path, state)
 }
 
+/// An ingest commit moves the live generation past its last receipt, and a run
+/// killed before its final checkpoint refresh leaves the checkpoint behind too.
+/// Search keeps serving that generation (a stale completed checkpoint is
+/// `existing_index`), so replacing the checkpoint with rebuild progress must not
+/// be what revokes it: above the automatic-repair budget, that turns one
+/// interrupted rebuild into refused searches for as long as the next one takes.
+///
+/// This certifies only what was already being served: the exact bytes now live,
+/// under the prior checkpoint's archive identity. It carries no source proof,
+/// which never transfers between generations, and neither a scratch candidate
+/// nor a generation smaller than the certified one gets a receipt.
+fn lexical_receipt_for_live_generation_ahead_of_checkpoint(
+    index_path: &Path,
+    previous: &LexicalRebuildState,
+) -> Result<Option<LexicalRebuildState>> {
+    let is_scratch = index_path.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .ends_with(LEXICAL_REBUILD_STAGING_SUFFIX)
+    });
+    if is_scratch || !lexical_state_can_certify_publication(previous) {
+        return Ok(None);
+    }
+    let Some(live_docs) = crate::search::tantivy::searchable_index_live_doc_count(index_path)
+    else {
+        return Ok(None);
+    };
+    let live_docs = usize::try_from(live_docs)?;
+    if live_docs < previous.indexed_docs {
+        return Ok(None);
+    }
+    let mut receipt = previous.clone();
+    receipt.committed_meta_fingerprint = index_meta_fingerprint(index_path)?;
+    receipt.indexed_docs = live_docs;
+    // The certified total predates the rows those commits indexed.
+    receipt.db.total_messages = receipt.db.total_messages.max(live_docs);
+    receipt.completed_source_epoch = None;
+    receipt.updated_at_ms = FrankenStorage::now_millis();
+    // Re-reads the fingerprint around the count, so a concurrent swap refuses.
+    Ok(lexical_publication_receipt_matches_live(index_path, &receipt)?.then_some(receipt))
+}
+
 fn persist_lexical_rebuild_state_for_active_run_start(
     index_path: &Path,
     state: &LexicalRebuildState,
@@ -10312,7 +10353,17 @@ fn persist_lexical_rebuild_state_for_active_run_start(
     {
         match lexical_publication_receipt_matches_live(index_path, &previous) {
             Ok(true) => persist_lexical_publication_receipt(index_path, &previous)?,
-            Ok(false) => {}
+            Ok(false) => {
+                match lexical_receipt_for_live_generation_ahead_of_checkpoint(index_path, &previous)
+                {
+                    Ok(Some(receipt)) => persist_lexical_publication_receipt(index_path, &receipt)?,
+                    Ok(None) => {}
+                    Err(error) => tracing::debug!(
+                        error = %format!("{error:#}"),
+                        "live generation cannot be certified; continuing explicit rebuild"
+                    ),
+                }
+            }
             Err(error) => tracing::debug!(
                 error = %format!("{error:#}"),
                 "previous generation cannot be certified; continuing explicit rebuild"
@@ -11166,6 +11217,12 @@ fn expected_live_lexical_doc_count_delta(
     Ok(Some(cached.expected_docs.saturating_add(appended)))
 }
 
+/// Rows past a memoized maximum id. Both run on every memo delta, so each must
+/// seek past the bound rather than walk the table (GH #539; asserted on the
+/// compiled program by `gh539_pure_append_counts_seek_past_the_memo`).
+const CONVERSATIONS_AFTER_ID_COUNT_SQL: &str = "SELECT COUNT(*) FROM conversations WHERE id > ?1";
+const MESSAGES_AFTER_ID_COUNT_SQL: &str = "SELECT COUNT(*) FROM messages WHERE id > ?1";
+
 /// Whether the archive changed from `old` to `current` only by appended rows:
 /// no conversation or message was deleted (both totals grew by exactly the
 /// rows beyond the old maxima) and the content cap is unchanged.
@@ -11184,14 +11241,10 @@ fn expected_lexical_docs_identity_is_pure_append(
     }
     let new_conversations = count_exact(
         storage,
-        "SELECT COUNT(*) FROM conversations WHERE id > ?1",
+        CONVERSATIONS_AFTER_ID_COUNT_SQL,
         old.max_conversation_id,
     )?;
-    let new_messages = count_exact(
-        storage,
-        "SELECT COUNT(*) FROM messages WHERE id > ?1",
-        old.max_message_id,
-    )?;
+    let new_messages = count_exact(storage, MESSAGES_AFTER_ID_COUNT_SQL, old.max_message_id)?;
     Ok(
         old.total_conversations.checked_add(new_conversations) == Some(current.total_conversations)
             && old.total_messages.checked_add(new_messages) == Some(current.total_messages),
@@ -64567,6 +64620,72 @@ c.close()
             )?,
             0,
             "a caught-up watermark has no delta"
+        );
+        Ok(())
+    }
+
+    /// GH #539: the pure-append check runs before every memo delta, so its two
+    /// counts must seek past the memoized maxima. Read the compiled program,
+    /// as the append stream's own test does: fsqlite can label a rowid range
+    /// SCAN in EXPLAIN QUERY PLAN even when codegen seeks.
+    #[test]
+    fn gh539_pure_append_counts_seek_past_the_memo() -> Result<()> {
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("gh539-append-counts.db"))?;
+        seed_lexical_rebuild_fixture(&storage);
+        for (sql, table) in [
+            (CONVERSATIONS_AFTER_ID_COUNT_SQL, "conversations"),
+            (MESSAGES_AFTER_ID_COUNT_SQL, "messages"),
+        ] {
+            let opcodes: Vec<(String, i64, i64)> = storage.raw().query_map_collect(
+                &format!("EXPLAIN {sql}"),
+                &[ParamValue::from(1_i64)],
+                |row| Ok((row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+            )?;
+            let rootpage: i64 = storage.raw().query_row_map(
+                "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                &[ParamValue::from(table)],
+                |row| row.get_typed(0),
+            )?;
+            let cursor = opcodes
+                .iter()
+                .find_map(|(op, p1, p2)| (op == "OpenRead" && *p2 == rootpage).then_some(*p1))
+                .unwrap_or_else(|| panic!("{sql}: the count reads {table}: {opcodes:?}"));
+            assert!(
+                opcodes
+                    .iter()
+                    .any(|(op, p1, _)| op == "SeekGT" && *p1 == cursor),
+                "{sql}: the cursor must seek strictly past the bound: {opcodes:?}"
+            );
+            assert!(
+                !opcodes
+                    .iter()
+                    .any(|(op, p1, _)| matches!(op.as_str(), "Rewind" | "Last") && *p1 == cursor),
+                "{sql}: the count must not walk rows at or below the bound: {opcodes:?}"
+            );
+        }
+
+        let max_conversation_id = max_conversation_id_exact(&storage)?.expect("seed conversations");
+        let max_message_id = storage.max_message_id()?.expect("seed messages");
+        assert_eq!(
+            count_exact(
+                &storage,
+                CONVERSATIONS_AFTER_ID_COUNT_SQL,
+                max_conversation_id
+            )?,
+            0
+        );
+        assert_eq!(
+            count_exact(&storage, MESSAGES_AFTER_ID_COUNT_SQL, max_message_id)?,
+            0
+        );
+        assert_eq!(
+            count_exact(&storage, CONVERSATIONS_AFTER_ID_COUNT_SQL, 0)?,
+            count_total_conversations_exact(&storage)?
+        );
+        assert_eq!(
+            count_exact(&storage, MESSAGES_AFTER_ID_COUNT_SQL, 0)?,
+            count_total_messages_exact(&storage)?
         );
         Ok(())
     }

@@ -11,7 +11,11 @@
 //! A missing owner may be hidden by procfs policy, so even a genuinely departed
 //! owner keeps cached positives deferred until a new filter is captured.
 //! Linux keeps descriptor witnesses so a still-open writer costs only a few
-//! procfs reads.
+//! procfs reads. The census reads each writable descriptor's link without
+//! following it. It follows (stats) a session-named descriptor, and, only
+//! while refreshing a cached positive, other descriptors on local
+//! filesystems; a stat of a file on a network or FUSE mount is answered by
+//! that mount's server or daemon and can block for as long as it is down.
 //! One refresh replaces evidence for every source, amortizing closed writers.
 //! A newly incomplete refresh retains all prior positives for the filter's life.
 //! macOS lsof can silently omit inaccessible processes; its captured positives
@@ -104,6 +108,9 @@ struct WriterCensus {
     visibility_gaps: HashSet<VisibilityGap>,
     visible_processes: HashSet<ProcessIdentity>,
     complete: bool,
+    /// Descriptor targets this census followed to their file's filesystem.
+    #[cfg(test)]
+    followed: Vec<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
@@ -268,6 +275,81 @@ fn read_descriptor_access(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// Whether a descriptor's file is on a network or FUSE filesystem, judged
+/// from procfs alone: the mount ID in the descriptor's fdinfo, looked up in
+/// the owning process's mount table (read once per process into
+/// `mount_types`). A descriptor not proven local counts as remote.
+#[cfg(target_os = "linux")]
+fn descriptor_on_remote_filesystem(
+    process: &Path,
+    info: &Path,
+    mount_types: &mut Option<HashMap<u64, bool>>,
+) -> bool {
+    let Some(mount_id) = std::fs::read_to_string(info).ok().and_then(|contents| {
+        contents
+            .lines()
+            .find_map(|line| line.strip_prefix("mnt_id:"))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    }) else {
+        return true;
+    };
+    mount_types
+        .get_or_insert_with(|| {
+            std::fs::read_to_string(process.join("mountinfo"))
+                .map(|table| parse_mount_remoteness(&table))
+                .unwrap_or_default()
+        })
+        .get(&mount_id)
+        .copied()
+        .unwrap_or(true)
+}
+
+/// Map each mount ID in a `/proc/<pid>/mountinfo` table to whether its
+/// filesystem type is a network or FUSE one. Mount paths escape spaces, so
+/// the first " - " always ends the optional fields.
+#[cfg(target_os = "linux")]
+fn parse_mount_remoteness(table: &str) -> HashMap<u64, bool> {
+    table
+        .lines()
+        .filter_map(|line| {
+            let mount_id = line.split_whitespace().next()?.parse::<u64>().ok()?;
+            let (_, after_separator) = line.split_once(" - ")?;
+            let filesystem_type = after_separator.split_whitespace().next()?;
+            Some((mount_id, filesystem_type_is_remote(filesystem_type)))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn filesystem_type_is_remote(filesystem_type: &str) -> bool {
+    // fuse, fuseblk and every fuse.<subtype> are answered by a userspace
+    // daemon; the rest by a server over the network. fusectl, FUSE's own
+    // control filesystem, is answered by the kernel.
+    filesystem_type.starts_with("fuse.")
+        || matches!(
+            filesystem_type,
+            "fuse"
+                | "fuseblk"
+                | "nfs"
+                | "nfs4"
+                | "cifs"
+                | "smb3"
+                | "smbfs"
+                | "ceph"
+                | "9p"
+                | "afs"
+                | "virtiofs"
+                | "lustre"
+                | "gpfs"
+                | "glusterfs"
+                | "beegfs"
+                | "orangefs"
+                | "pvfs2"
+                | "ncpfs"
+                | "coda"
+        )
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ProcessIdentity {
@@ -366,6 +448,9 @@ fn collect_writers(
             continue;
         };
         let process_id = process_identity(&process.path(), pid).ok();
+        // This process's mount table, read at most once and only if a
+        // descriptor needs it.
+        let mut mount_types = None;
         let descriptors = match std::fs::read_dir(process.path().join("fd")) {
             Ok(descriptors) => descriptors,
             Err(error) => {
@@ -396,6 +481,38 @@ fn collect_writers(
                 }
             }
             let path = descriptor.path();
+            // Read the link before following it. readlink on a procfs
+            // descriptor is answered by the kernel, while a stat that follows
+            // it is answered by the file's own filesystem: a process holding
+            // a file on an unresponsive network or FUSE mount would otherwise
+            // block this census, and the whole index run, in the kernel.
+            let target = match std::fs::read_link(&path) {
+                Ok(target) => target,
+                Err(error) => {
+                    census.observe_error(
+                        error,
+                        process_id,
+                        Some(descriptor.file_name()),
+                        Inspection::Target,
+                    );
+                    continue;
+                }
+            };
+            let session_named = is_session_source(&target);
+            // A known positive can have a writable successor reached through
+            // a hardlink with a non-session suffix, so while positives are
+            // cached a non-session descriptor is followed and matched against
+            // their inodes. Only a local one: a session source on a network
+            // or FUSE mount is still found under its session name, but not
+            // through such a hardlink.
+            if !session_named
+                && (known_writers.is_empty()
+                    || descriptor_on_remote_filesystem(&process.path(), &info, &mut mount_types))
+            {
+                continue;
+            }
+            #[cfg(test)]
+            census.followed.push(target);
             let identity = match file_identity(&path) {
                 Ok(identity) => identity,
                 Err(error) => {
@@ -408,25 +525,8 @@ fn collect_writers(
                     continue;
                 }
             };
-            // A known positive can have a writable successor reached through
-            // a hardlink with a non-session suffix. Keep initial capture's
-            // predicate scope, but match known inodes before filtering names.
-            if !known_writers.contains_key(&identity) {
-                let target = match std::fs::read_link(&path) {
-                    Ok(target) => target,
-                    Err(error) => {
-                        census.observe_error(
-                            error,
-                            process_id,
-                            Some(descriptor.file_name()),
-                            Inspection::Target,
-                        );
-                        continue;
-                    }
-                };
-                if !is_session_source(&target) {
-                    continue;
-                }
+            if !session_named && !known_writers.contains_key(&identity) {
+                continue;
             }
             census
                 .writers

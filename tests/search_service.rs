@@ -9,6 +9,38 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use wait_timeout::ChildExt;
 
+/// Waits for a service child while reading both of its pipes. Reading only after
+/// exit deadlocks once the replies outgrow the pipe buffer: the service blocks on
+/// write and never reaches its EOF handling (8 KiB pipes once the per-user pipe
+/// quota is exhausted, for example).
+fn wait_with_output_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+    what: &str,
+) -> anyhow::Result<std::process::Output> {
+    use std::io::Read;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let out = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stdout.read_to_end(&mut buf).map(|_| buf)
+    });
+    let err = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stderr.read_to_end(&mut buf).map(|_| buf)
+    });
+    let Some(status) = child.wait_timeout(timeout)? else {
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow::bail!("{what}");
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out.join().expect("stdout reader")?,
+        stderr: err.join().expect("stderr reader")?,
+    })
+}
+
 #[test]
 fn cass_serve_dispatches_stdio_without_entering_ordinary_cli_setup() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
@@ -25,12 +57,11 @@ fn cass_serve_dispatches_stdio_without_entering_ordinary_cli_setup() -> anyhow::
     let mut input = child.stdin.take().unwrap();
     input.write_all(b"{\"op\":\"status\",\"id\":1}\n{\"op\":\"shutdown\",\"id\":2}\n")?;
     drop(input);
-    if child.wait_timeout(Duration::from_secs(20))?.is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
-        anyhow::bail!("stdio service did not terminate after shutdown");
-    }
-    let output = child.wait_with_output()?;
+    let output = wait_with_output_timeout(
+        child,
+        Duration::from_secs(20),
+        "stdio service did not terminate after shutdown",
+    )?;
     assert!(
         output.status.success(),
         "{}",
@@ -107,12 +138,11 @@ fn cass_serve_searches_repeatedly_through_the_real_cli() -> anyhow::Result<()> {
     }
     // EOF is also a clean lifecycle boundary; no explicit shutdown required.
     drop(input);
-    if child.wait_timeout(Duration::from_secs(30))?.is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
-        anyhow::bail!("search worker did not terminate after EOF");
-    }
-    let output = child.wait_with_output()?;
+    let output = wait_with_output_timeout(
+        child,
+        Duration::from_secs(30),
+        "search worker did not terminate after EOF",
+    )?;
     assert!(
         output.status.success(),
         "{}",
@@ -164,12 +194,11 @@ fn cass_serve_mcp_dispatches_real_negotiation_without_archive_access() -> anyhow
         writeln!(input, "{request}")?;
     }
     drop(input);
-    if child.wait_timeout(Duration::from_secs(20))?.is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
-        anyhow::bail!("MCP service did not terminate after EOF");
-    }
-    let output = child.wait_with_output()?;
+    let output = wait_with_output_timeout(
+        child,
+        Duration::from_secs(20),
+        "MCP service did not terminate after EOF",
+    )?;
     assert!(
         output.status.success(),
         "{}",
@@ -261,12 +290,11 @@ fn cass_serve_reads_explicit_canonical_archive_without_opening_an_index() -> any
         )?;
         writeln!(input, "{}", json!({"op":"status", "id":2}))?;
         drop(input);
-        if child.wait_timeout(Duration::from_secs(20))?.is_none() {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("canonical service failed to terminate after EOF");
-        }
-        let output = child.wait_with_output()?;
+        let output = wait_with_output_timeout(
+            child,
+            Duration::from_secs(20),
+            "canonical service failed to terminate after EOF",
+        )?;
         assert!(
             output.status.success(),
             "{}",

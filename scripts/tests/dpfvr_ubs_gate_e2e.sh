@@ -41,6 +41,29 @@ if [ "${1:-}" = --batched-only ] || [ "${1:-}" = --formatter-only ] || [ "${1:-}
         check_exit scanner-engine-invalid-json 2 bash "$gate" --verify-ubs-rust-engine /bin/echo
         check_exit scanner-engine-optimized-valid 0 env PYTHONOPTIMIZE=2 bash "$gate" --verify-ubs-rust-engine "$real_ast"
         check_exit scanner-engine-optimized-empty 2 env PYTHONOPTIMIZE=2 bash "$gate" --verify-ubs-rust-engine /bin/true
+
+        # A direct call does not exercise declare -f serialization in the
+        # actual remote batch. Bash can accept a corrupted heredoc as shell
+        # syntax while passing a shell statement into the Python validator.
+        check_exit scanner-engine-printed-batch 0 bash "$gate" \
+            --ubs-files src/storage/sqlite.rs --print-remote-script
+        batch_functions="$proof_dir/scanner-engine-batch-functions.sh"
+        awk '/^test_log_counts \(\)/ { batch=1 } batch && /^echo SOURCE_HEAD=/ { exit } batch { print }' \
+            "$proof_dir/scanner-engine-printed-batch.log" > "$batch_functions"
+        check_exit scanner-engine-batch-shell 0 bash -n "$batch_functions"
+        check_serialized_engine() {
+            local label="$1" expected="$2" engine="$3" optimize="$4"
+            check_exit "$label" "$expected" env PYTHONOPTIMIZE="$optimize" bash -c \
+                'source "$1"; verify_ubs_rust_engine "$2" "$3"' \
+                _ "$batch_functions" "$engine" "$proof_dir"
+        }
+        check_serialized_engine scanner-engine-batch-real 0 "$real_ast" 0
+        check_serialized_engine scanner-engine-batch-missing 2 "$proof_dir/absent-ast-grep" 0
+        check_serialized_engine scanner-engine-batch-empty 2 /bin/true 0
+        check_serialized_engine scanner-engine-batch-error 2 /bin/false 0
+        check_serialized_engine scanner-engine-batch-invalid-json 2 /bin/echo 0
+        check_serialized_engine scanner-engine-batch-optimized-valid 0 "$real_ast" 2
+        check_serialized_engine scanner-engine-batch-optimized-empty 2 /bin/true 2
         echo "Scanner engine gate: PASS=$pass FAIL=$fail fixtures=$proof_dir"
         [ "$fail" -eq 0 ]
         exit $?
