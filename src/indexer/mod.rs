@@ -3416,6 +3416,22 @@ fn try_readonly_canonical_force_rebuild(
         }
     }
 
+    // This canonical-only path returns before ordinary index finalization.
+    // Its optional watermark write can still change the source epoch after
+    // publication, so certify only after that writer has closed as well.
+    let index_path = crate::search::tantivy::expected_index_dir(&opts.data_dir);
+    anyhow::ensure!(
+        lexical_resume::certify_after_index(
+            &opts.db_path,
+            &index_path,
+            true,
+            opts.progress.clone(),
+            Some(Arc::clone(progress_bump)),
+        )?,
+        "force-rebuilt lexical generation could not be certified against the settled archive"
+    );
+    prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
+
     Ok(true)
 }
 
@@ -21246,7 +21262,34 @@ fn run_index_with_storage_ownership(
     if let Some(progress) = opts.progress.as_ref() {
         progress.finalizing.store(true, Ordering::Relaxed);
     }
+    // Writer release can publish a final native manifest. It must precede the
+    // settled-archive audit, just as the final canonical writes/checkpoint do.
+    drop(t_index);
     close_storage_after_index(storage, &opts.db_path, "index run")?;
+    work_phase!("lexical:certify");
+    let allow_final_content_audit = should_defer_incremental_authoritative_lexical_repair(
+        &opts,
+        canonical_storage_rebuilt,
+        initial_canonical_sessions_before_salvage,
+        true,
+        None,
+    )
+    .is_none();
+    if !lexical_resume::certify_after_index(
+        &opts.db_path,
+        &index_path,
+        allow_final_content_audit,
+        opts.progress.clone(),
+        Some(Arc::clone(&progress_bump)),
+    )
+    .context("verifying completed lexical content after final archive checkpoint")?
+    {
+        tracing::warn!(
+            db_path = %opts.db_path.display(),
+            allow_final_content_audit,
+            "lexical source freshness remains unverified after indexing; run 'cass index --full' for authoritative content verification"
+        );
+    }
     prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
     Ok(())
 }

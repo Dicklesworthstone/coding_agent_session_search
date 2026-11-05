@@ -513,6 +513,57 @@ fn gh496_count_refresh_cannot_complete_or_overwrite_an_incomplete_staged_audit()
 
 #[test]
 #[serial_test::serial]
+fn gh496_final_certification_respects_deferred_audit_and_settled_epoch() {
+    let fixture = gh496_fixture();
+    rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();
+    let storage = FrankenStorage::open(&fixture.db_path).unwrap();
+    storage
+        .set_last_indexed_at(FrankenStorage::now_millis())
+        .unwrap();
+    close_storage_after_index(storage, &fixture.db_path, "final certification test").unwrap();
+    let checkpoint_path = lexical_rebuild_state_path(&fixture.index_path);
+    let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+    let native_before = fs::read(fixture.index_path.join("MANIFEST")).unwrap();
+
+    assert!(
+        !lexical_resume::certify_after_index(
+            &fixture.db_path,
+            &fixture.index_path,
+            false,
+            None,
+            None,
+        )
+        .unwrap(),
+        "deferred maintenance must not audit or renew the changed epoch"
+    );
+    assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+    assert!(
+        lexical_resume::certify_after_index(
+            &fixture.db_path,
+            &fixture.index_path,
+            true,
+            None,
+            None,
+        )
+        .unwrap()
+    );
+    let checkpoint = load_lexical_rebuild_checkpoint(&fixture.index_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        completed_lexical_checkpoint_freshness(&fixture.index_path, &fixture.db_path, &checkpoint,)
+            .unwrap(),
+        LexicalCheckpointFreshness::Current
+    );
+    assert_eq!(
+        fs::read(fixture.index_path.join("MANIFEST")).unwrap(),
+        native_before,
+        "certification must not rebuild the published documents"
+    );
+}
+
+#[test]
+#[serial_test::serial]
 fn gh496_metadata_epoch_drift_is_revalidated_without_native_writes() {
     let fixture = gh496_fixture();
     rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();

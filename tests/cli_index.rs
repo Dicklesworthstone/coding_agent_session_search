@@ -1576,6 +1576,194 @@ fn make_codex_session(
     file
 }
 
+/// dnluu: the index command must publish freshness evidence after its final
+/// canonical writes and WAL checkpoint. Search must not be needed to repair
+/// the evidence before the health preflight can accept a successful index.
+#[test]
+fn index_publishes_fresh_lexical_authority_after_full_incremental_noop_and_force_runs() {
+    use coding_agent_search::franken_sync::compat::ConnectionExt;
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::write(home.join(".env"), "").unwrap();
+    let data_dir = home.join("data");
+    let codex_home = home.join(".codex");
+    let command = || {
+        let mut cmd = base_cmd(home);
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CODEX_HOME", &codex_home)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .arg("--data-dir")
+            .arg(&data_dir);
+        cmd
+    };
+
+    make_codex_session(
+        &codex_home,
+        "2026/11/05",
+        "rollout-freshness-initial.jsonl",
+        "freshlexicalinitial",
+    );
+    for stage in ["full", "incremental", "noop", "force"] {
+        if stage == "incremental" {
+            make_codex_session(
+                &codex_home,
+                "2026/11/05",
+                "rollout-freshness-appended.jsonl",
+                "freshlexicalappended",
+            );
+        }
+        let mut index = command();
+        index.args(["index", "--json", "--no-progress-events"]);
+        if stage == "full" {
+            index.arg("--full");
+        } else if stage == "force" {
+            index.arg("--force-rebuild");
+        }
+        let output = index.output().expect("run index journey step");
+        assert!(
+            output.status.success(),
+            "{stage}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["success"], true, "{stage}: {payload}");
+
+        // Read both truth surfaces before any search can self-heal the index.
+        for surface in ["status", "health"] {
+            let output = command()
+                .args([surface, "--json", "--stale-threshold", "3600"])
+                .output()
+                .expect("read index readiness");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{stage} {surface}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let state: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(state["healthy"], true, "{stage} {surface}: {state}");
+            assert_eq!(
+                state["index"]["status"], "ready",
+                "{stage} {surface}: {state}"
+            );
+            assert_eq!(state["index"]["fresh"], true, "{stage} {surface}: {state}");
+        }
+        let keyword = if stage == "full" {
+            "freshlexicalinitial"
+        } else {
+            "freshlexicalappended"
+        };
+        let output = command()
+            .args(["search", keyword, "--robot", "--mode", "lexical"])
+            .output()
+            .expect("search indexed session");
+        assert!(output.status.success(), "{stage}: {output:?}");
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            payload["hits"].as_array().unwrap().len(),
+            2,
+            "{stage}: {payload}"
+        );
+    }
+
+    // Apply the existing large-incremental policy to this small fixture. Its
+    // metadata writes change the epoch, but a routine run with no audit budget
+    // must not scan the corpus or turn counts into a fresh content proof.
+    let checkpoint_path = coding_agent_search::search::tantivy::expected_index_dir(&data_dir)
+        .join(".lexical-rebuild-state.json");
+    let before: serde_json::Value =
+        serde_json::from_slice(&fs::read(&checkpoint_path).unwrap()).unwrap();
+    let output = command()
+        .env(
+            "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+            "0",
+        )
+        .args(["index", "--json", "--no-progress-events"])
+        .output()
+        .expect("run incremental index with deferred content audit");
+    assert!(output.status.success(), "{output:?}");
+    let deferred: serde_json::Value =
+        serde_json::from_slice(&fs::read(&checkpoint_path).unwrap()).unwrap();
+    assert_eq!(
+        deferred["completed_source_epoch"], before["completed_source_epoch"],
+        "a deferred content audit must not renew the source epoch"
+    );
+    let output = command()
+        .args(["health", "--json", "--stale-threshold", "3600"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let state: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(state["index"]["status"], "unverified", "{state}");
+
+    // An explicit full index remains able to certify the same archive even
+    // when automatic incremental auditing is disabled.
+    let output = command()
+        .env(
+            "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+            "0",
+        )
+        .args(["index", "--full", "--json", "--no-progress-events"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let output = command()
+        .args(["health", "--json", "--stale-threshold", "3600"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let state: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(state["index"]["status"], "ready", "{state}");
+    assert_eq!(state["index"]["fresh"], true, "{state}");
+
+    // A same-count canonical edit outside indexing must still invalidate the
+    // published proof. Fixing the successful journey must not certify by counts
+    // alone or stamp a new epoch onto content that Quill has never indexed.
+    let storage = FrankenStorage::open(&data_dir.join("agent_search.db")).unwrap();
+    assert_eq!(storage.total_message_count().unwrap(), 4);
+    let changed = storage
+        .raw()
+        .execute_compat(
+            "UPDATE messages SET content = ?1 WHERE idx = 0",
+            coding_agent_search::franken_sync::params!["changedcanonicalmessage"],
+        )
+        .unwrap();
+    assert_eq!(changed, 2);
+    assert_eq!(storage.total_message_count().unwrap(), 4);
+    storage.close_without_checkpoint().unwrap();
+    for surface in ["status", "health"] {
+        let output = command()
+            .args([surface, "--json", "--stale-threshold", "3600"])
+            .output()
+            .expect("read readiness after canonical edit");
+        assert_eq!(
+            output.status.code(),
+            Some(if surface == "health" { 1 } else { 0 }),
+            "{surface}: {output:?}"
+        );
+        let state: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(state["healthy"], false, "{surface}: {state}");
+        assert_eq!(state["index"]["status"], "unverified", "{surface}: {state}");
+        assert_eq!(state["index"]["fresh"], false, "{surface}: {state}");
+    }
+}
+
 #[test]
 #[serial]
 fn watch_once_indexes_real_aider_session_with_deferred_tantivy_open() {
