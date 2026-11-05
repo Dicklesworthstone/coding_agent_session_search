@@ -64,7 +64,12 @@ fn setup(
     let mut manifest = SemanticManifest::default();
     let outcome = indexer.run_backfill_from_storage(&storage, data, &mut manifest, plan.clone())?;
     assert!(outcome.published);
-    let reader = VectorIndex::open_read_only(&outcome.index_path)?;
+    let artifact = manifest.quality_tier.as_ref().unwrap();
+    let certificate = manifest.coverage.get(indexer.embedder_id()).unwrap();
+    assert!(certificate.matches_artifact(artifact));
+    let live = data.join(&artifact.index_path);
+    assert_ne!(live, vector_index_path(data, indexer.embedder_id()));
+    let reader = VectorIndex::open_read_only(&live)?;
     let ann = indexer.build_hnsw_index(&reader, data, None, None)?;
     manifest.hnsw = Some(HnswRecord {
         base_tier: plan.tier,
@@ -76,7 +81,7 @@ fn setup(
         ready: true,
     });
     manifest.save(data)?;
-    Ok((storage, manifest, plan, outcome.index_path))
+    Ok((storage, manifest, plan, live))
 }
 
 fn cache_path(data: &Path) -> PathBuf {
@@ -136,6 +141,12 @@ fn absent_corrupt_or_stale_cache_preserves_publication_ann_and_existing_and_fres
             );
             let before = snapshot(data)?;
             let ledger = manifest.clone();
+            let parent_path = data.join(&ledger.coverage["fnv1a-384"].parent_path);
+            let served_before = (
+                stamp(&live)?,
+                stamp(&parent_path)?,
+                stamp(&SemanticManifest::path(data))?,
+            );
             let reader = VectorIndex::open_read_only(&live)?;
             let query = HashEmbedder::default().embed_sync("compiler recovery checkpoint")?;
             let hits = reader.search_top_k(&query, 8, None)?;
@@ -154,6 +165,10 @@ fn absent_corrupt_or_stale_cache_preserves_publication_ann_and_existing_and_fres
             assert_eq!(outcome.embedded_docs, 0);
             assert_eq!(outcome.total_conversations, 3);
             assert_eq!(outcome.last_offset, 3);
+            assert_eq!(
+                outcome.index_path, live,
+                "retain the certified serving owner"
+            );
             assert_eq!(manifest, ledger);
             assert!(manifest.hnsw.as_ref().unwrap().ready);
             assert_eq!(
@@ -167,6 +182,22 @@ fn absent_corrupt_or_stale_cache_preserves_publication_ann_and_existing_and_fres
                 Some(plan.db_fingerprint.clone())
             );
             assert_eq!(snapshot(data)?, before, "no publication or graph rewrite");
+            assert_eq!(
+                (
+                    stamp(&live)?,
+                    stamp(&parent_path)?,
+                    stamp(&SemanticManifest::path(data))?,
+                ),
+                served_before,
+                "read-only proof preserves serving identities and timestamps"
+            );
+            let receipt: serde_json::Value = serde_json::from_slice(&fs::read(cache_path(data))?)?;
+            assert_eq!(receipt["version"], 2);
+            assert_eq!(
+                receipt["coverage"],
+                serde_json::to_value(&ledger.coverage["fnv1a-384"])?
+            );
+            assert!(receipt["coverage_files"].is_array());
             assert_eq!(reader.search_top_k(&query, 8, None)?, hits);
             assert_eq!(
                 VectorIndex::open_read_only(&live)?.search_top_k(&query, 8, None)?,

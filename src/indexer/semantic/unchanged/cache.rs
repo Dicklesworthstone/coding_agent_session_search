@@ -1,4 +1,4 @@
-//! Write the existing version-1 completed-build skip receipt from a successful
+//! Write the existing version-2 completed-build skip receipt from a successful
 //! read-only proof. The engine remains the only cache reader. Its admission is
 //! exercised by the tests, so serialization drift cannot silently lose the
 //! constant-time path. This receipt is never serving authority.
@@ -39,13 +39,15 @@ struct FilePairV1<'a> {
 }
 
 #[derive(Serialize)]
-struct CompletedBackfillCacheV1<'a> {
+struct CompletedBackfillCacheV2<'a> {
     version: u32,
     archive: FilePairV1<'a>,
     vectors: FilePairV1<'a>,
     artifact: &'a ArtifactRecord,
     vector_space_revision: &'static str,
     last_offset: i64,
+    coverage: Option<&'a SemanticCoverageCertificate>,
+    coverage_files: Option<(FileStampV1, FileStampV1)>,
 }
 
 pub(super) fn refresh(
@@ -55,10 +57,11 @@ pub(super) fn refresh(
     vectors: &FileStamp,
     artifact: &ArtifactRecord,
     last_offset: i64,
+    coverage: Option<(&SemanticCoverageCertificate, &FileStamp)>,
 ) -> Result<()> {
     let vector_path = vector_path.canonicalize()?;
-    let cache = CompletedBackfillCacheV1 {
-        version: 1,
+    let cache = CompletedBackfillCacheV2 {
+        version: 2,
         archive: FilePairV1 {
             path: &archive.path,
             main: FileStampV1::from_observation(&archive.main)?,
@@ -77,6 +80,15 @@ pub(super) fn refresh(
         vector_space_revision: engine::expected_vector_space_revision(&artifact.embedder_id)
             .context("unknown proved vector-space revision")?,
         last_offset,
+        coverage: coverage.map(|(certificate, _)| certificate),
+        coverage_files: coverage
+            .map(|(_, parents)| {
+                Ok::<_, anyhow::Error>((
+                    FileStampV1::from_observation(vectors)?,
+                    FileStampV1::from_observation(parents)?,
+                ))
+            })
+            .transpose()?,
     };
     // Preserve the exact observations that were proved, not new stamps from
     // after the proof. A concurrent change then invalidates the receipt at
