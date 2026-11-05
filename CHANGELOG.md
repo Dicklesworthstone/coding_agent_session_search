@@ -16,8 +16,9 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 ---
 
 Scope window: this update covers the changes after the 2026-08-31 v0.7.1
-binary release, through the 2026-09-10 v0.8.0 binary release and the
-2026-09-25 v0.9.0 binary release. Earlier version entries retain their existing scope.
+binary release, through the 2026-09-10 v0.8.0, 2026-09-25 v0.9.0,
+2026-10-01 v0.10.0 and 2026-11-05 v0.11.0 binary releases. Earlier version
+entries retain their existing scope.
 Git commits, release metadata, and Beads supply
 the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
@@ -25,21 +26,45 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 | Version | Date | Publication state |
 |---------|------|-------------------|
+| [v0.11.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.11.0) | 2026-11-05 | Linux x86_64/arm64, macOS arm64, Windows x86_64. Search keeps serving while a lexical rebuild runs, `cass timeline` memory fix (#521), credential-redacting exports, `cass index --watch` ingestion repairs (#538), background semantic catch-up (#458), FrankenSQLite 0.4.12 integrity fixes (#516), exclusions and re-inclusion (#537) |
 | [v0.10.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.10.0) | 2026-10-01 | Leaked-page doctor repair, robot search/pack interpretation echoes, `CASS_RAW_MIRROR=0`, OpenCode 2.x and mid-turn Claude Code prompts indexed, giant-conversation slicing, WAL-only watch-once and forget-tombstone fixes |
 | [v0.9.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.9.0) | 2026-09-25 | Published GitHub Release: Linux x86_64/arm64, macOS arm64, Windows x86_64. Sharded native ANN semantic search, bounded-admission daemon, responsive transcript pages, large-archive index and FTS repair fixes |
 | [v0.8.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.8.0) | 2026-09-10 | Published GitHub Release: Linux x86_64/arm64, macOS arm64, Windows x86_64 |
 | [v0.7.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.7.1) | 2026-08-31 | Published GitHub Release and binary baseline for the changes below |
 
-## [Unreleased]
+## [v0.11.0] -- 2026-11-05
+
+Changes after v0.10.0, through main at e5a2e9e1 (2026-11-04), plus three
+commits on top of it: the lexical-rebuild fix ac29a9d3, a test-harness fix,
+and a fix to the active-writer census. Main commits after e5a2e9e1 are not
+in this release.
+
+### Upgrade notes
+
+- The archive schema moves from 22 to 23 (a `forgotten_conversations`
+  table). v0.10.0 still opens and searches an archive this release has
+  migrated.
+- The first `cass index` on this release re-reads every source once: the
+  ingest contract no longer hashes the package version, and
+  franken-agent-detection 0.3.10 changes what several connectors produce.
+- After upgrading, the first `cass index --semantic` is a full pass, or the
+  next `cass models backfill` batch records the new per-embedder watermark.
+- On macOS, run `cass schedule install` again so the scheduled jobs pick up
+  `ProcessType=Interactive` (see Fixed).
+- Robot-mode argument errors now use the standard error envelope (see
+  Changed).
 
 ### Added
 
 - **Discoverable exclusions and explicit session re-inclusion (#537).**
   `cass forget --list` reports durable shared-session exclusions and legacy
   file stamps. `--reinclude` previews an explicit release and requires
-  `--apply` to commit it, followed by `cass index --full` to restore preserved
-  transcripts. Literal source paths, source provenance, provider and external
-  session IDs can select one identity without releasing its siblings. An
+  `--apply` to commit it, followed by a plain `cass index` to restore
+  preserved transcripts; the `--apply` JSON reports
+  `conversations_restored: 0`, `reindex_required` and a `next_command_argv`
+  bound to the same `--db` and `--data-dir`. Literal source paths, source
+  provenance, provider and external session IDs can select one identity
+  without releasing its siblings. An
   identity release that overlaps a path-wide legacy stamp refuses to apply;
   a separately reviewed source-only release can remove both mechanisms.
   Workspace/age filters remain deletion selectors because v23 exclusion
@@ -52,6 +77,8 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   feature flags. Its command schema and `robot/introspect.json.golden` add
   the explicit list/re-inclusion options; `robot_docs/commands.txt.golden`
   documents those modes and the explicit shared-session release policy.
+  The re-inclusion help and robot-docs guidance say `cass index`, not
+  `cass index --full`.
 
 - **Retryable selective-forget recovery and bounded exclusion lookups (#537).**
   Canonical deletion records a durable pending-rebuild marker in the same
@@ -136,7 +163,274 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   `raw_mirror_size` finding recommends `--keep-latest 1` instead of
   `--older-than 90d`.
 
+- **Bookmark the selected result from the TUI.** `Alt+E`, or "Bookmark
+  selected result" in the command palette, saves the selected hit to the
+  store `cass bookmarks list` reads. Pressing it again on the same line
+  reports "Already bookmarked" instead of adding a duplicate.
+- **`cass capabilities` reports whether the binary reuses completed sources
+  (#426).** `source_ingest_reuse` gives `enabled` and, when it is off,
+  `disabled_by`: the first dependency without a registry or git source,
+  which is what turns completed-source reuse off at build time.
+
+- **`cass guide` can repair the lexical index and index configured sources
+  with `--apply`.** In v0.10.0 these steps were reported but never run.
+  `cass guide repair-assets --apply` now rebuilds the lexical index from
+  the selected canonical database once the plan's confirmations are given.
+  It refuses a missing or empty archive before any source discovery,
+  reports `already-ready` when the index is current, and succeeds only when
+  a fresh, complete lexical generation has the same canonical identity and
+  conversation and message counts. `cass guide onboard-source --apply`
+  checks the configured sources first: `type = "local"` sources must have
+  readable paths (resolved as the indexer resolves them, including `~/`),
+  and remote sources get a local dry-sync preview and must already have
+  mirrors staged by `cass sources sync`. After explicit confirmation it
+  runs an incremental index that honors `--db` and `--data-dir`, under the
+  index lock, with a 120-second deadline. The guide registers no source,
+  opens no SSH connection and downloads no model. Missing paths or mirrors,
+  scan errors, deferred work or a busy indexer fail the step, and an
+  incremental index that started may already have changed the archive.
+
+- **Opt-in external embeddings are listed by `cass capabilities --json`
+  and `cass robot-docs env`.** An OpenAI-compatible `/v1/embeddings`
+  service can act as the semantic embedder. Select `external` (for example
+  `cass models backfill --embedder external`, or
+  `CASS_SEMANTIC_EMBEDDER=external`) and set `CASS_EXTERNAL_EMBEDDINGS=1`
+  to consent to sending archive text during backfill and query text during
+  search; a configured URL alone sends nothing. The URL must be HTTPS or
+  loopback HTTP and may not carry credentials, a query or a fragment.
+  `CASS_EXTERNAL_EMBEDDING_MODEL`, `_DIMENSION` and `_REVISION` identify a
+  separate vector space, and `cass serve --semantic-embedder external`
+  needs the same consent. Discovery now lists all ten settings with their
+  defaults and bounds; it never prints configured values (the API key
+  included) and never contacts the endpoint.
+  GOLDEN-CHANGE: `robot/capabilities.json.golden` and
+  `robot_docs/env.txt.golden` add the ten settings and the `external` value
+  of `CASS_SEMANTIC_EMBEDDER`.
+
+- **A read starts a catch-up index when the last source scan is five
+  minutes old, even on a healthy index (#514).** `search`, `pack` and TUI
+  launch request a detached incremental `cass index --background` once the
+  last completed source scan is `CASS_AUTO_REFRESH_SOURCE_SCAN_SECS`
+  seconds old (default 300). This is separate from health's 30-minute
+  stale threshold, and the current read still returns its existing
+  results. `0` disables only this trigger; `CASS_AUTO_REFRESH=0` still
+  disables all read-triggered catch-up, and the spawn cooldown, archive
+  lock and failed-run breaker still apply. `--robot-meta` reports the
+  trigger as `source-scan-overdue`. The variable is now listed by
+  `cass capabilities --json` and `cass robot-docs env`.
+  GOLDEN-CHANGE: `robot/capabilities.json.golden` and
+  `robot_docs/env.txt.golden` add the variable and the updated
+  `CASS_AUTO_REFRESH` description.
+
 ### Fixed
+
+- **Starting a lexical rebuild no longer makes every search fail with
+  `maintenance-required`.** An index run that committed to the live
+  lexical index and was killed before its final checkpoint (for example by
+  a stall abort, exit 70) left the checkpoint behind the index. Search kept
+  serving that index, but the next rebuild replaced the checkpoint with its
+  own progress. On an archive over the automatic-repair budget
+  (`CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES`, 1 GiB by
+  default) every `cass search` then failed with `maintenance-required`
+  until the rebuild published. A rebuild now first certifies the index
+  search was already serving, so search keeps answering from it while the
+  rebuild runs. The
+  output of an interrupted rebuild, a staging candidate and an index with
+  fewer documents than the last certified one are still not served.
+
+- **`cass index --watch` makes new and appended messages searchable while
+  it runs (#538).** On a macOS archive of about 8,640 conversations, a
+  watcher started from a shell did not make new conversations or appended
+  messages searchable during the reporter's observation windows. While one
+  active source kept recovery pending, every retry re-read and republished
+  the whole root's history ahead of the new work. Live watch now gives each
+  source a durable receipt only after its messages are stored and
+  searchable, and skips unchanged sources that already have one. It also:
+  - rescans configured roots after its notifications are registered, so a
+    write made during startup is not missed, and finds files that have old
+    modification times or changed while the watcher was stopped;
+  - re-registers roots that disappear, are replaced or are reached through
+    a symlink, rebuilds recursive watches lost after a notification error
+    or rescan event, and rescans after an FSEvents stream restart;
+  - keeps retrying work whose publication failed, including after the
+    transcript or its whole root has gone, instead of dropping it with the
+    notification that triggered it;
+  - recovers when a periodic reopen of its database handle fails, instead
+    of failing every later event;
+  - scans an event under nested or symlinked roots with the deepest root by
+    resolved path, not by the length of the configured spelling;
+  - on macOS, retries a Devin or Shelley database directory the poller
+    failed to register, and re-checks those databases after each poller
+    rebuild.
+
+  #538 stays open until this is confirmed on the reporter's machine.
+
+- **`cass index --watch` does less work per event on a large archive and
+  raw mirror, and a stall report names what it was waiting on (#538).** On
+  the reporter's archive (8,560 conversations, an 11 GB raw mirror of
+  20,816 files) the watcher exited 70 after about 300 seconds, again and
+  again, while a standalone `cass index` finished in about 3 minutes. A
+  watch event held a whole root's parsed conversations in memory and
+  copied every one into the raw mirror before its first batch was stored,
+  without reporting progress to the stall watchdog. Watch now spills a
+  large backlog to a temporary file, stores bounded batches in order,
+  captures only the batch it is about to store, and reports progress as
+  filesystem work completes. Near its size cap the raw mirror no longer
+  walks every file when its running totals already decide a capture, and
+  an unchanged capture writes nothing. Live watch no longer reads every old
+  message body to refresh its lexical checkpoint, a failed full rescan no
+  longer clears the saved watermarks, and an event that arrives while the
+  previous batch is being stored no longer becomes an archive-wide rescan.
+  A callback that left work unpublished puts its roots back on the retry
+  queue. When a stall does happen, the stall record's
+  `diagnostics.raw_mirror_io` names the filesystem operation in flight,
+  its path and `elapsed_ms`, and those diagnostics run off the watchdog
+  thread, so a blocked path can no longer keep the watchdog from exiting
+  70. The reporter's original stall has not been reproduced.
+
+- **`cass status` and `cass health` no longer call the index ready while
+  watch recovery is pending (#538).** A live watcher and a recent
+  `last_indexed_at` made the lexical index look fresh even when the
+  watcher still owed durable ingestion or publication for a source root.
+  Both now report `pending.lexical_replay`: `true` while such work is
+  recorded, `false` when a check found none, and `null` when it was not
+  checked or the check failed. While work is pending, or the check failed,
+  the lexical index is reported `stale` with a reason, and status warns
+  that new content may not be searchable yet.
+  GOLDEN-CHANGE: health, status, introspect and `robot_docs/schemas.txt`
+  goldens add `pending.lexical_replay`.
+
+- **On macOS, scheduled index jobs are no longer I/O-throttled by launchd
+  (#538).** The LaunchAgents written by `cass schedule install` set
+  `Nice=15` and no `ProcessType`, which launchd treats as `Standard`, and
+  `Standard` still throttles I/O. The #538 reporter's scheduled indexing
+  stalled on filesystem work under it; with `ProcessType=Interactive` the
+  same binary finished in about 30 to 191 seconds. The plists now set
+  `ProcessType=Interactive` and keep `Nice=15` and the load and idle
+  gates. Jobs installed by an earlier version keep their old plist until
+  `cass schedule install` runs again.
+
+- **Background index runs keep an existing semantic index current
+  (#458).** Every ingest moves the archive past the published semantic
+  index, and search refuses a semantic index that is behind. Stale-on-read
+  catch-up, the scheduler's incremental job and the daemon timer all run
+  `cass index --background` without `--semantic`, so on an active archive
+  `--mode semantic` was refused (exit 15) nearly all the time until someone
+  ran `cass index --semantic`. A background run now also embeds the
+  messages added since the index's watermark and republishes it. It does
+  so only when the index exists for the configured embedder and carries
+  that embedder's own watermark (next item). It never starts a full
+  semantic build, never uses the external embedder, and a semantic failure
+  is logged without failing the lexical run. Foreground runs without
+  `--semantic` are unchanged.
+
+- **A semantic index is no longer marked current by another embedder's
+  run.** cass kept one embed watermark for every vector space. After a run
+  with one embedder (the hash tier, say), an incremental
+  `cass index --semantic` with another appended only the messages above
+  that watermark to its own older index and published it as current, so
+  the messages in between were missing from semantic search. Each embedder
+  now keeps its own watermark, an embedder without one gets a full pass
+  instead of an append, and `forget`, purge, dedup and conversation
+  identity repairs clear every watermark. A `cass models backfill` batch
+  that publishes its tier, or finds it unchanged, records that embedder's
+  watermark, so background runs can extend a backfill-built tier.
+  Watermarks from earlier versions are not trusted: after upgrading, the
+  first `cass index --semantic` is a full pass, or the next backfill batch
+  records the watermark.
+
+- **`cass export`, `cass export-html` and TUI exports redact credentials by
+  default.** Ingest redaction protects the archive, but an export of a
+  readable source file, or of an archive indexed with
+  `CASS_INDEX_REDACTION=off`, wrote recognized credentials into its output;
+  v0.10.0's direct HTML and Markdown exports of a session kept a recognized
+  password. Exports now redact messages, tool data, titles, workspace and
+  agent name before rendering, encryption and receipts, report the policy
+  on stderr, and TUI export filenames come from the redacted title and
+  workspace. `--include-secrets` keeps source credentials and marks the
+  output sensitive; it cannot restore a credential already removed from an
+  archived record. HTML export JSON, dry runs and explain plans included,
+  gains `privacy.policy`, `privacy.redaction_applied` and
+  `privacy.sensitive_output`.
+  GOLDEN-CHANGE: capabilities and introspect add `include-secrets` to
+  `export` and `export-html`; `robot/export_html_shape.json.golden` adds
+  the `privacy` object.
+
+- **Text and generic HTML exports include tool results.** With
+  `--include-tools`, `cass export --format text` and `--format html` showed
+  each tool call but dropped Claude's tool-result blocks. They now print
+  each result (under `[Tool Result]` in text, HTML-escaped in HTML) after
+  redaction.
+
+- **The raw mirror's size cap counts captures and prunes made by other
+  cass processes.** Each process cached its measurement of the mirror for
+  at least a minute and updated it only for its own captures and prunes, so
+  while a watcher, an index run or `cass mirror prune` worked on the same
+  mirror, one of them could admit a capture against a total that was no
+  longer true. Every capture, automatic retention pass, prune and
+  manifest-link update now advances a counter in the mirror's
+  `.usage-generation` file, and a process re-measures when it changes. A
+  capture refused by the size cap or the free-space floor no longer
+  creates a staging directory or changes any file in the mirror.
+
+- **The raw mirror no longer copies VS Code workspace state that holds no
+  Copilot chat.** Indexing captured each workspace's `state.vscdb`, and the
+  `workspace.json` beside it, before parsing, so the mirror kept copies of
+  VS Code state for workspaces that never had a Copilot chat. Capture is
+  now skipped when the database has no `interactive.sessions` entry, or
+  only an empty `[]` or `{}`, and the workspace has no `chatSessions`
+  transcript. The check opens the database read-only and does not change
+  it. A store it cannot prove chat-free (a symlink, an unreadable or
+  malformed store, a chat key present only in the WAL) is still captured,
+  and the first chat in a skipped workspace is captured on the next index
+  run.
+
+- **Copilot chats that VS Code has committed only to `state.vscdb-wal`
+  are indexed.** VS Code can commit chat rows to the write-ahead log
+  without changing `state.vscdb`'s modification time, and an incremental
+  `cass index` skipped a database whose primary file looked older than the
+  last scan. It now also reads a database whose `-wal` file changed since
+  then; full scans are unchanged. `cass index --watch-once` given the
+  `state.vscdb-wal` path indexes the `state.vscdb` beside it, instead of
+  treating the WAL as a database, and scans only that workspace.
+
+- **`--verbose` no longer turns on FrankenSQLite statement logging.**
+  Verbose mode, including with `--robot` or `--quiet`, set every log target
+  to `debug`, which also enabled the storage engine's per-statement
+  telemetry. That telemetry turns off the engine's fast write path and
+  could stall `cass index --watch` startup. `--verbose` now logs cass and
+  other dependencies at `debug` while FrankenSQLite targets stay at
+  `warn`.
+
+- **A stall report says when the rebuild was held below its memory
+  reserve (#496).** A full rebuild under `MemoryMax=12G` exited 70 after
+  2 h 37 min. Its stall record's `controller_reason` showed 1,931,636,736
+  bytes available against a 4 GiB reserve, so the rebuild had stayed on its
+  reduced startup budget, but the hint only asked for a stack trace. When
+  the controller is at or below its memory reserve or emergency reserve,
+  the hint now gives both figures and names
+  `CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILD_MEMORY_RESERVE_BYTES` and
+  `CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_MEMORY_RESERVE_BYTES`,
+  which the README now documents. Under a cgroup limit it names the cgroup
+  level and says the figure can be low while the host has memory free. The
+  stall record also reports `rebuild_pipeline.memory_limit_source`, as
+  `cass status --json` does (see Added), and the exit-70 envelope carries the
+  same hint.
+
+- **The persist-phase stall hint no longer sends reports to closed #373
+  (#382).** While a giant-conversation batched persist was running, the
+  stall hint asked for a stack trace on #373, which is closed. It now asks
+  for a new issue, as the generic stall hint does.
+
+- **A path through a symlink and then `..` resolves as the filesystem
+  resolves it.** cass removed `..` from a path before resolving symlinks,
+  so `alias/../archive.db` named the directory holding the symlink, not
+  the parent of its target. A `--db` spelled that way did not match the
+  index run holding that archive's lock, so `cass doctor` did not see the
+  active run, and watch recovery work recorded under one spelling was not
+  found under the other. Symlinks are now resolved first, and a path whose
+  last components do not exist yet keeps the same identity once they are
+  created.
 
 - **`cass swarm status` reads Beads with br 0.7.x (#529).** The live Beads
   reader accepted only br 0.6.x, so with the current br it reported the
@@ -550,18 +844,22 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   `rebuild.expected_docs_scan`, and human `cass status` prints it as a
   "Coverage scan" line, so a timeout-wrapped caller can see it advance.
 
-### Added
-
-- **Bookmark the selected result from the TUI.** `Alt+E`, or "Bookmark
-  selected result" in the command palette, saves the selected hit to the
-  store `cass bookmarks list` reads. Pressing it again on the same line
-  reports "Already bookmarked" instead of adding a duplicate.
-- **`cass capabilities` reports whether the binary reuses completed sources
-  (#426).** `source_ingest_reuse` gives `enabled` and, when it is off,
-  `disabled_by`: the first dependency without a registry or git source,
-  which is what turns completed-source reuse off at build time.
-
 ### Changed
+
+- **Robot-mode argument errors use the standard error envelope.** A flag
+  or argument error with `--json` or `--robot` printed a top-level
+  `status: "error"`, a string `error` and `kind: "argument_parsing"`,
+  unlike every other failure. It now prints
+  `{"error": {"code": 2, "kind": "usage", "message", "hint",
+  "retryable": false, ...}}`, the envelope an invalid `--since` already
+  used, with `detail`, `examples`, `hints`, `common_mistakes` and
+  `flag_syntax` inside `error`. Scripts that read the old top-level fields
+  need updating. Examples now follow the subcommand that failed
+  (`cass models install --json` and `cass stats` used to be offered
+  `cass view` examples), and when that subcommand is known the hint names
+  its `--help`. Errors from `cass archive` commands now include `hint` as
+  well, `null` when there is none.
+  GOLDEN-CHANGE: new `robot/parse_error_envelope.json.golden`.
 
 - **`swarm lint`, `evidence`, `proof-debt` and `failure-patterns` read the
   live repository.** Outside fixtures they reported every provider as
@@ -598,6 +896,88 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   missing `rsync`/`scp`, an interrupted setup and leftover
   `.sources.toml.tmp*` files as `config_validation`. Validation errors make
   it exit 1.
+
+### Performance
+
+- **Small incremental runs do less work that grows with the archive
+  (#539).** Two `cass index --semantic --embedder minilm` runs that added
+  4,908 and 1,631 passages spent an estimated 45 s and 35 s on work
+  proportional to the existing archive. Three of those costs are removed:
+  - counting the appended messages the lexical index must take no longer
+    runs a separate `DISTINCT` query, which FrankenSQLite 0.4.12 evaluates
+    by rewinding the messages table; the rowid-bounded stream the run
+    already reads now counts them;
+  - lexical segment counts come from the writer's verified snapshot
+    instead of a freshly opened reader, and each open verifies every
+    segment;
+  - publishing a semantic delta no longer loads the embedding model again
+    to learn its identity and dimension, and counts live vectors without
+    building sets of every document ID.
+
+  End-to-end timings after these changes have not been measured.
+
+- **A full semantic build embeds in bounded batches.** A full build in
+  `cass index --semantic` collected every passage, and then every
+  embedding, in memory before writing the vector index. It now streams
+  passages from one read snapshot in batches of at most 512 passages or
+  1 MiB of text (a single larger passage is allowed) and writes each
+  embedded batch to an unpublished index that is published only after the
+  whole build validates. The model, vector writer and database still
+  allocate outside that bound. A build that finds nothing to embed now
+  replaces stale vectors with an empty index, and
+  `cass index --full --semantic` no longer skips the build because an old
+  watermark says the archive is covered.
+
+- **A build that differs only in its version number keeps completed-source
+  reuse.** Unchanged sources are skipped only while the binary's ingest
+  contract matches the one that recorded them, and the contract hashed
+  `Cargo.toml` and `Cargo.lock` whole, so bumping the release version made
+  the next `cass index` reparse every source (and invalidated the semantic
+  replay cache, which uses the same contract). The package's own version is
+  now left out; dependency versions, sources, features and code changes
+  still count. The new contract itself invalidates once, so the first index
+  run on this release reparses every source.
+
+### Known open at release
+
+- `indexer::tests::gh515_targeted_watch_once_finishes_admitted_batch_after_stop`
+  is red at this release: a targeted `--watch-once` run that is asked to stop
+  right after admitting its batch stores 2 of the 4 expected messages. The
+  test is new since v0.10.0 (544b7a76) and is tracked on 362yj (#515).
+- Two `daemon_client_integration` tests of SIGTERM during cross-process
+  writer contention are red, as they are at e5a2e9e1
+  (`gh515_sigterm_cancels_contended_migration_before_native_busy_timeout`,
+  `gh515_sigterm_bounds_contended_engine_open_and_recovers_with_resident_daemon`).
+  While another process holds the database writer, FrankenSQLite's
+  busy-retry loop does not observe cancellation, so the signal can wait for
+  the 5-second busy timeout or forced exit (frankensqlite#524, tracked on
+  0m49m). The rest of the lib suite and the gated integration targets pass
+  at the release commit.
+- #538 stays open until the `cass index --watch` repairs above are
+  confirmed on the reporter's machine; the original stall has not been
+  reproduced. #458 stays open: background runs extend an existing semantic
+  index but never build one, so an archive without one still needs a single
+  `cass index --semantic` (or `cass models backfill`).
+- The strict whole-file UBS scan is still red, as at v0.10.0 (5v57k).
+  Compared with v0.10.0 over the 469 source files changed since (pinned
+  runner 5.4.4, static rules), it reports 174 critical findings those files
+  did not have: 171 are in test code (test files, `#[cfg(test)]` modules,
+  `#[test]` functions) or in development scripts and experiments that are
+  not built into `cass`, and 3 flag `==` on values that are not secrets (a
+  socket peer's uid, a content digest, an exclusion-policy signature). The
+  three commits on top of e5a2e9e1 add no critical finding to the files
+  they touch, and no warning outside the tests they add.
+- The Windows binary is cross-built (`cargo xwin`) and was not run on
+  Windows before publication.
+
+### Dependencies
+
+- FrankenSQLite (`fsqlite` family) `=0.4.6` -> `=0.4.12` (#516, #509),
+  frankensearch 0.6.1 -> 0.7.1 (quill 0.3.4 -> 0.4.1, index 0.3.1 -> 0.4.2),
+  franken-agent-detection 0.3.3 -> 0.3.10, `dirs` 7 only (6 dropped from the
+  lockfile); `dunce` and `zstd` become direct dependencies.
+- franken-agent-detection is pinned to a git revision (6b337ba4), not a
+  crates.io release, so this version is not published to crates.io.
 
 ## [v0.10.0] -- 2026-10-01
 
