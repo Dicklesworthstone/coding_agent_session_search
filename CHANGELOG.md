@@ -974,8 +974,10 @@ after e5a2e9e1 are not in this release.
   socket peer's uid, a content digest, an exclusion-policy signature). The
   three commits on top of e5a2e9e1 add no critical finding to the files
   they touch, and no warning outside the tests they add.
-- The Windows binary is cross-built (`cargo xwin`) and was not run on
-  Windows before publication.
+- The Windows binary is cross-built (`cargo xwin`). After tagging, it was
+  run on Windows 11 x64: a targeted index of one session, then status,
+  health and search, all as expected. A full index of a real archive was
+  not run on Windows.
 
 ### Dependencies
 
