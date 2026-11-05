@@ -14,6 +14,11 @@ type HydratedSemanticPage = (HydratedSemanticHits, Option<SemanticCoverageSnapsh
 #[path = "coverage/tests.rs"]
 mod tests;
 
+#[cfg(all(test, unix))]
+pub(super) fn after_hydration_connection_open(path: &Path, attempt: usize) -> Result<()> {
+    tests::after_hydration_connection_open(path, attempt)
+}
+
 /// Identity of the canonical database pathname when its hydration owner was
 /// opened. Query checks compare only identity so ordinary WAL commits and
 /// checkpoints remain valid.

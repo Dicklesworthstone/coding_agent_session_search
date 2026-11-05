@@ -80,6 +80,128 @@ fn refreshed_receipt_uses_the_existing_engine_cache_and_rejects_later_wal_edits(
 }
 
 #[test]
+fn certified_parent_edits_without_vector_identity_changes_are_not_unchanged() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path();
+    let (storage, manifest, plan, _) = setup(data)?;
+    let before_ids: Vec<_> = engine::packet_embedding_inputs_from_storage(&storage)?
+        .iter()
+        .filter_map(engine::semantic_doc_id_for_input)
+        .collect();
+    let archive_state = storage.semantic_archive_state()?;
+    storage.raw().execute(
+        "UPDATE conversations SET source_path = '/other-parent/reused.jsonl' WHERE id = 1",
+    )?;
+    let after_ids: Vec<_> = engine::packet_embedding_inputs_from_storage(&storage)?
+        .iter()
+        .filter_map(engine::semantic_doc_id_for_input)
+        .collect();
+    assert_eq!(
+        before_ids, after_ids,
+        "the vector ID alone misses this edit"
+    );
+    assert_eq!(storage.semantic_archive_state()?, archive_state);
+    fs::write(cache_path(data), b"retained invalid receipt")?;
+    let before = snapshot(data)?;
+    let inner = engine::SemanticIndexer::new("hash", None)?;
+    assert!(
+        prove_unchanged(
+            &inner,
+            &storage,
+            data,
+            &manifest,
+            &plan,
+            &SemanticProgressSink::disabled(),
+            || Ok(())
+        )?
+        .is_none()
+    );
+    assert_eq!(snapshot(data)?, before);
+    assert_eq!(fs::read(cache_path(data))?, b"retained invalid receipt");
+    Ok(())
+}
+
+#[test]
+fn corrupt_certified_parent_or_foreign_archive_cannot_renew_receipt() -> Result<()> {
+    for corrupt_parent in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let data = temp.path();
+        let (storage, mut manifest, plan, _) = setup(data)?;
+        let certificate = manifest.coverage.get_mut("fnv1a-384").unwrap();
+        if corrupt_parent {
+            let parent = data.join(&certificate.parent_path);
+            let modified = fs::metadata(&parent)?.modified()?;
+            let mut bytes = fs::read(&parent)?;
+            *bytes.last_mut().unwrap() ^= 1;
+            fs::write(&parent, bytes)?;
+            File::options()
+                .write(true)
+                .open(&parent)?
+                .set_modified(modified)?;
+        } else {
+            let starts_with_zero = certificate.archive_id.starts_with('0');
+            certificate
+                .archive_id
+                .replace_range(0..1, if starts_with_zero { "1" } else { "0" });
+            assert!(certificate.matches_artifact(manifest.quality_tier.as_ref().unwrap()));
+        }
+        fs::write(cache_path(data), b"retained invalid receipt")?;
+        let before = snapshot(data)?;
+        let inner = engine::SemanticIndexer::new("hash", None)?;
+        assert!(
+            prove_unchanged(
+                &inner,
+                &storage,
+                data,
+                &manifest,
+                &plan,
+                &SemanticProgressSink::disabled(),
+                || Ok(())
+            )?
+            .is_none()
+        );
+        assert_eq!(snapshot(data)?, before);
+        assert_eq!(fs::read(cache_path(data))?, b"retained invalid receipt");
+    }
+    Ok(())
+}
+
+#[test]
+fn replacing_certified_parent_after_replay_fails_final_owner_fence() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path();
+    let (storage, manifest, plan, _) = setup(data)?;
+    let parent = data.join(&manifest.coverage["fnv1a-384"].parent_path);
+    fs::write(cache_path(data), b"retained invalid receipt")?;
+    let ledger = fs::read(SemanticManifest::path(data))?;
+    let inner = engine::SemanticIndexer::new("hash", None)?;
+    let error = prove_unchanged(
+        &inner,
+        &storage,
+        data,
+        &manifest,
+        &plan,
+        &SemanticProgressSink::disabled(),
+        || {
+            let old = fs::read(&parent)?;
+            let modified = fs::metadata(&parent)?.modified()?;
+            fs::rename(&parent, data.join("retained-parent-proof"))?;
+            fs::write(&parent, old)?;
+            File::options()
+                .write(true)
+                .open(&parent)?
+                .set_modified(modified)?;
+            Ok(())
+        },
+    )
+    .expect_err("byte-identical replacement still changes the authenticated parent owner");
+    assert!(format!("{error:#}").contains("changed during unchanged proof"));
+    assert_eq!(fs::read(SemanticManifest::path(data))?, ledger);
+    assert_eq!(fs::read(cache_path(data))?, b"retained invalid receipt");
+    Ok(())
+}
+
+#[test]
 fn failed_receipt_write_does_not_fail_a_no_op_or_damage_serving_files() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let data = temp.path();

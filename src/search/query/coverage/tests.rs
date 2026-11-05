@@ -7,6 +7,57 @@ use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use crate::search::model_manager::load_hash_semantic_context_strict;
 use crate::search::semantic_manifest::{SemanticCurrentPointerV1, SemanticManifest, TierKind};
 use crate::storage::sqlite::FrankenStorage;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+type OpeningInterleave = Box<dyn FnMut(&Path, usize) -> Result<()>>;
+
+thread_local! {
+    static OPENING_INTERLEAVE: RefCell<Option<OpeningInterleave>> = const { RefCell::new(None) };
+}
+
+/// Interleave real filesystem mutations after the dedicated worker has opened
+/// its database and before production verifies the opening seal. The thread-
+/// local scope keeps concurrent tests from injecting races into other clients.
+struct OpeningInterleaveGuard;
+
+impl OpeningInterleaveGuard {
+    fn new(interleave: impl FnMut(&Path, usize) -> Result<()> + 'static) -> Self {
+        OPENING_INTERLEAVE.with_borrow_mut(|current| {
+            assert!(current.is_none(), "opening interleave already installed");
+            *current = Some(Box::new(interleave));
+        });
+        Self
+    }
+}
+
+impl Drop for OpeningInterleaveGuard {
+    fn drop(&mut self) {
+        OPENING_INTERLEAVE.with_borrow_mut(|current| *current = None);
+    }
+}
+
+pub(super) fn after_hydration_connection_open(path: &Path, attempt: usize) -> Result<()> {
+    OPENING_INTERLEAVE.with_borrow_mut(|current| {
+        current
+            .as_mut()
+            .map_or(Ok(()), |interleave| interleave(path, attempt))
+    })
+}
+
+fn create_unrelated_archive_sibling(path: &Path, attempt: usize) -> Result<()> {
+    let parent = path.parent().context("fixture archive parent")?;
+    let before = std::fs::metadata(parent)?;
+    std::fs::write(
+        parent.join(format!("unrelated-opening-{attempt}")),
+        b"unrelated sibling",
+    )?;
+    // Ensure detection even when directory timestamps have coarse resolution.
+    std::fs::File::open(parent)?.set_times(
+        std::fs::FileTimes::new().set_modified(before.modified()? + Duration::from_secs(2)),
+    )?;
+    Ok(())
+}
 
 struct Fixture {
     root: tempfile::TempDir,
@@ -308,27 +359,135 @@ fn certified_semantic_opening_seal_detects_ancestor_rename_restore_through_paren
 }
 
 #[test]
+fn certified_semantic_opening_retries_transient_sibling_churn_before_first_query() -> Result<()> {
+    for strict_read_only in [false, true] {
+        let fixture = Fixture::new(&["retained semantic coverage transient opening race"])?;
+        let mut client = fixture.client()?;
+        client.strict_read_only = strict_read_only;
+        let attempts = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&attempts);
+        let interleave = OpeningInterleaveGuard::new(move |path, attempt| {
+            observed.set(attempt);
+            if attempt == 1 {
+                create_unrelated_archive_sibling(path, attempt)?;
+            }
+            Ok(())
+        });
+
+        let (hits, receipt) = search(&client, 10)?;
+        drop(interleave);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(receipt.status, "complete");
+        assert!(
+            (2..=SEARCH_SQLITE_OPEN_WITNESS_ATTEMPTS).contains(&attempts.get()),
+            "the raced connection must be retried before the first certified query"
+        );
+        assert_eq!(search(&client, 10)?.1.generation, receipt.generation);
+    }
+    Ok(())
+}
+
+#[test]
+fn certified_semantic_opening_zero_budget_never_retries_or_certifies_a_raced_owner() -> Result<()> {
+    let fixture = Fixture::new(&["retained semantic coverage opening timeout"])?;
+    let attempts = Rc::new(Cell::new(0));
+    let observed = Rc::clone(&attempts);
+    let interleave = OpeningInterleaveGuard::new(move |path, attempt| {
+        observed.set(attempt);
+        create_unrelated_archive_sibling(path, attempt)
+    });
+    let mut connection = open_search_hydration_sqlite(
+        &fixture.root.path().join("agent_search.db"),
+        Duration::ZERO,
+        true,
+    )?;
+    drop(interleave);
+    assert_eq!(attempts.get(), 1);
+    let error = connection.verify_canonical_archive().unwrap_err();
+    assert!(error.to_string().contains("opening timeout exhausted"));
+    assert!(error.to_string().contains("ancestor changed"));
+    // Budget exhaustion keeps the already-open lexical reader usable while
+    // refusing to certify it; no fresh witness is attached afterward.
+    let rows = connection.query_sync("SELECT COUNT(*) FROM messages")?;
+    assert_eq!(rows[0].get_typed::<i64>(0)?, 1);
+    connection
+        .close_without_checkpoint_sync()
+        .map_err(|error| anyhow!("closing fixture hydration owner: {error}"))?;
+    Ok(())
+}
+
+#[test]
+fn certified_semantic_opening_retry_hydrates_the_replacement_from_a_new_owner() -> Result<()> {
+    let mut fixture = Fixture::new(&["retained semantic coverage original opening owner"])?;
+    let client = fixture.client()?;
+    let replacement = fixture.copied_database()?;
+    {
+        let storage = FrankenStorage::open(&replacement)?;
+        storage.raw().execute_compat(
+            "UPDATE messages SET content = ?1",
+            params!["replacement body without the original certified identity"],
+        )?;
+        storage.raw().query("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        storage.close_without_checkpoint()?;
+    }
+    let retained = fixture.root.path().join("opening-owner-retained.db");
+    let attempts = Rc::new(Cell::new(0));
+    let observed = Rc::clone(&attempts);
+    let interleave = OpeningInterleaveGuard::new(move |path, attempt| {
+        observed.set(attempt);
+        if attempt == 1 {
+            std::fs::rename(path, &retained)?;
+            std::fs::rename(&replacement, path)?;
+            assert!(!same_file::is_same_file(path, &retained)?);
+        }
+        Ok(())
+    });
+
+    let (hits, receipt) = search(&client, 10)?;
+    drop(interleave);
+    assert!(
+        (2..=SEARCH_SQLITE_OPEN_WITNESS_ATTEMPTS).contains(&attempts.get()),
+        "the connection opened before replacement must be discarded"
+    );
+    // Merely attaching a new pathname witness to the original worker would
+    // expose the original body's certified score and fail this assertion.
+    assert!(hits.is_empty());
+    assert_eq!(receipt.status, "partial");
+    assert_eq!(receipt.stale_reason, Some("candidate_identity_changed"));
+    assert_eq!(receipt.excluded_candidates, 1);
+    assert!(search(&client, 10)?.0.is_empty());
+    Ok(())
+}
+
+#[test]
 fn certified_semantic_retries_with_a_new_owner_after_an_unavailable_opening_seal() -> Result<()> {
     let mut fixture = Fixture::new(&["retained semantic coverage opening recovery"])?;
     let client = fixture.client()?;
-    let path = fixture.root.path().join("agent_search.db");
-    {
-        let mut cached = client.sqlite_guard()?;
-        let connection = cached.as_mut().context("fixture hydration owner")?;
-        let opening = CanonicalDatabaseOpening::capture(&path)?;
-        let parent = path.parent().context("fixture archive parent")?;
-        let before = std::fs::metadata(parent)?;
-        std::fs::File::open(parent)?.set_times(
-            std::fs::FileTimes::new().set_modified(before.modified()? + Duration::from_secs(2)),
-        )?;
-        // Install the actual failed-seal result that an opening race leaves in
-        // the cached owner; the database and its dedicated worker are real.
-        connection.archive_witness = opening.finish().ok();
-        assert!(connection.archive_witness.is_none());
-    }
+    let attempts = Rc::new(Cell::new(0));
+    let observed = Rc::clone(&attempts);
+    let interleave = OpeningInterleaveGuard::new(move |path, attempt| {
+        observed.set(attempt);
+        create_unrelated_archive_sibling(path, attempt)
+    });
+    // Ordinary lexical hydration remains available, but every actual opening
+    // seal races. Exhaustion must retain an uncertified owner and its cause.
+    let lexical = client.browse_by_date(SearchFilters::default(), 10, 0, true, FieldMask::FULL)?;
+    drop(interleave);
+    assert_eq!(lexical.len(), 1);
+    assert_eq!(attempts.get(), SEARCH_SQLITE_OPEN_WITNESS_ATTEMPTS);
+    assert!(
+        client
+            .sqlite_guard()?
+            .as_ref()
+            .context("fixture hydration owner")?
+            .archive_witness
+            .is_err()
+    );
     fixture.insert("recovery-append", "new unembedded recovery passage")?;
     let rejected = search(&client, 10).unwrap_err();
     assert!(rejected.to_string().contains("retry the search"));
+    assert!(rejected.to_string().contains("ancestor changed"));
+    assert!(rejected.to_string().contains("after 3 attempts"));
     assert!(
         client
             .sqlite
@@ -461,7 +620,9 @@ fn certified_semantic_row_id_reuse_never_transfers_a_vector_to_another_conversat
         "retained semantic coverage identical reused message",
     ])?;
     let client = fixture.client()?;
-    let deleted = fixture.storage.fetch_messages(fixture.conversations[1].0)?[0].id;
+    let deleted = fixture.storage.fetch_messages(fixture.conversations[1].0)?[0]
+        .id
+        .context("fixture deleted message id")?;
     fixture.storage.forget_conversations_by_source_glob(
         fixture.conversations[1]
             .1
@@ -474,9 +635,20 @@ fn certified_semantic_row_id_reuse_never_transfers_a_vector_to_another_conversat
         "replacement-parent",
         "retained semantic coverage identical reused message",
     )?;
+    let allocated = fixture.storage.fetch_messages(replacement)?[0]
+        .id
+        .context("fixture replacement message id")?;
+    // Exercise adversarial ID reuse explicitly; ordinary inserts need not reuse
+    // deleted IDs. Keep the replacement's distinct parent and identical body.
+    let updated = fixture.storage.raw().execute_compat(
+        "UPDATE messages SET id = ?1 WHERE id = ?2 AND conversation_id = ?3",
+        params![deleted, allocated, replacement],
+    )?;
+    assert_eq!(updated, 1, "reuse must update the replacement's actual row");
     let replacement_id = fixture.storage.fetch_messages(replacement)?[0].id;
     assert_eq!(
-        replacement_id, deleted,
+        replacement_id,
+        Some(deleted),
         "fixture must exercise numeric ID reuse"
     );
     let (hits, coverage) = search(&client, 10)?;
