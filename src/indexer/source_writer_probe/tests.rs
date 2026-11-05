@@ -272,8 +272,8 @@ mod linux {
             "a session-named writer is followed for its identity"
         );
         // Following this one stats it on its own filesystem. On a hung sshfs
-        // mount that stat never returned, and every index run on the host
-        // stalled in the census.
+        // mount that stat blocked for minutes, and index runs on the host sat
+        // in the census until their stall watchdog fired.
         assert!(!state.census.followed.contains(&fs::canonicalize(&feed)?));
         Ok(())
     }
@@ -286,6 +286,7 @@ mod linux {
                 "36 35 98:0 /mnt1 /mnt/parent rw,noatime master:1 - ext3 /dev/root rw",
                 "40 1 0:45 / /data/ssd rw,relatime shared:30 - zfs pool/ssd rw,xattr",
                 "41 1 0:46 / /tmp rw,nosuid,nodev shared:31 - tmpfs tmpfs rw,size=8g",
+                "42 24 0:47 / /sys/fs/fuse/connections rw,relatime shared:32 - fusectl fusectl rw",
                 "412 30 0:61 / /home/u/bulk rw,relatime shared:220 - fuse.sshfs u@host:/bulk rw",
                 "413 30 0:62 / /mnt/nas rw,relatime shared:221 - fuseblk /dev/sdb1 rw",
                 "414 30 0:63 / /net/home rw,relatime shared:222 - nfs4 server:/home rw,vers=4.2",
@@ -295,13 +296,13 @@ mod linux {
             ]
             .join("\n"),
         );
-        for local in [22, 36, 40, 41] {
+        for local in [22, 36, 40, 41, 42] {
             assert_eq!(mounts.get(&local), Some(&false), "mount {local}");
         }
         for remote in [412, 413, 414, 415] {
             assert_eq!(mounts.get(&remote), Some(&true), "mount {remote}");
         }
-        assert_eq!(mounts.len(), 8);
+        assert_eq!(mounts.len(), 9);
     }
 
     #[test]

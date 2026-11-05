@@ -323,11 +323,14 @@ fn parse_mount_remoteness(table: &str) -> HashMap<u64, bool> {
 #[cfg(target_os = "linux")]
 fn filesystem_type_is_remote(filesystem_type: &str) -> bool {
     // fuse, fuseblk and every fuse.<subtype> are answered by a userspace
-    // daemon; the rest by a server over the network.
-    filesystem_type.starts_with("fuse")
+    // daemon; the rest by a server over the network. fusectl, FUSE's own
+    // control filesystem, is answered by the kernel.
+    filesystem_type.starts_with("fuse.")
         || matches!(
             filesystem_type,
-            "nfs"
+            "fuse"
+                | "fuseblk"
+                | "nfs"
                 | "nfs4"
                 | "cifs"
                 | "smb3"
