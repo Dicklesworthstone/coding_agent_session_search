@@ -57,19 +57,20 @@ use crate::franken_sync::params;
 
 /// The database-file witness belongs to the hydration connection, including
 /// connections opened by lexical search before semantic context is attached.
-/// A missing witness preserves ordinary read compatibility but never admits a
-/// certified semantic query. It must not be filled from a later pathname open.
+/// A failed opening seal preserves ordinary read compatibility but never
+/// admits a certified semantic query. Its error is retained for diagnostics;
+/// a witness must not be filled from a later pathname open.
 #[derive(Debug)]
 struct SearchSqliteConnection {
     inner: FrankenSearchSqliteConnection,
-    archive_witness: Option<coverage::CanonicalDatabaseWitness>,
+    archive_witness: Result<coverage::CanonicalDatabaseWitness>,
 }
 
 impl SearchSqliteConnection {
     fn verify_canonical_archive(&self) -> Result<()> {
         self.archive_witness
             .as_ref()
-            .ok_or_else(|| anyhow!("semantic canonical archive ownership was not verified when the hydration connection opened"))?
+            .map_err(|error| anyhow!("semantic canonical archive ownership was not verified when the hydration connection opened: {error:#}"))?
             .verify()
     }
 }
@@ -155,7 +156,9 @@ impl SearchSqliteFixture {
         FrankenSearchSqliteConnection::open_sync(":memory:").map(|inner| {
             Self(Some(SearchSqliteConnection {
                 inner,
-                archive_witness: None,
+                archive_witness: Err(anyhow!(
+                    "in-memory hydration connection has no canonical archive pathname"
+                )),
             }))
         })
     }
@@ -681,6 +684,7 @@ const SQLITE_FTS5_POST_FILTER_SCAN_LIMIT: usize = 30_000;
 // at most this many raw message rows at once.
 const SQLITE_MESSAGE_SCAN_FALLBACK_PAGE_ROWS: usize = 1_024;
 const SEARCH_SQLITE_HYDRATION_CACHE_KIB: i64 = 4_096;
+const SEARCH_SQLITE_OPEN_WITNESS_ATTEMPTS: usize = 3;
 const SEMANTIC_EXACT_CHUNK_OVERFETCH_MULTIPLIER: usize = 4;
 
 fn open_search_hydration_sqlite(
@@ -688,20 +692,82 @@ fn open_search_hydration_sqlite(
     timeout: Duration,
     strict_read_only: bool,
 ) -> Result<SearchSqliteConnection> {
+    let started = Instant::now();
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()?.join(path)
     };
-    // Capture around this connection's open, rather than at semantic model
-    // admission: a long-lived client may already have a lexical connection.
-    let archive_opening = coverage::CanonicalDatabaseOpening::capture(&path).ok();
-    let conn = if strict_read_only {
-        crate::storage::sqlite::open_franken_async_strict_readonly_connection_with_timeout(
-            &path, timeout,
-        )?
-    } else {
-        crate::storage::sqlite::open_franken_async_readonly_connection_with_timeout(&path, timeout)?
+    let mut attempt = 0;
+    let mut retry_cause: Option<anyhow::Error> = None;
+    let (conn, archive_witness) = loop {
+        // Capture around this connection's open, rather than at semantic model
+        // admission: a long-lived client may already have a lexical connection.
+        let archive_opening = coverage::CanonicalDatabaseOpening::capture(&path);
+        let remaining = timeout.saturating_sub(started.elapsed());
+        // Preserve the storage opener's single initial attempt for a zero
+        // timeout. Subsequent attempts share one budget, including seal reads
+        // and closing/joining the previous worker. If closing used the last
+        // budget, there is no live fallback owner to return.
+        if remaining.is_zero()
+            && let Some(error) = retry_cause.take()
+        {
+            return Err(error.context(format!(
+                "canonical archive opening timeout exhausted after {attempt} attempts"
+            )));
+        }
+        attempt += 1;
+        let mut conn = if strict_read_only {
+            crate::storage::sqlite::open_franken_async_strict_readonly_connection_with_timeout(
+                &path, remaining,
+            )?
+        } else {
+            crate::storage::sqlite::open_franken_async_readonly_connection_with_timeout(
+                &path, remaining,
+            )?
+        };
+        #[cfg(all(test, unix))]
+        coverage::after_hydration_connection_open(&path, attempt)?;
+
+        match archive_opening.and_then(coverage::CanonicalDatabaseOpening::finish) {
+            Ok(witness) => break (conn, Ok(witness)),
+            Err(error)
+                if attempt < SEARCH_SQLITE_OPEN_WITNESS_ATTEMPTS && started.elapsed() < timeout =>
+            {
+                // Ancestor metadata also changes for unrelated sibling files.
+                // Keep that fence against rename-and-restore, but retry a raced
+                // opening with a NEW worker. Re-sealing this connection could
+                // bind a replacement pathname to the previous database owner.
+                conn.close_without_checkpoint_sync()
+                    .map_err(|close_error| {
+                        anyhow!(
+                            "closing uncertified search hydration connection after opening attempt \
+                         {attempt} failed: {close_error}; opening seal: {error:#}"
+                        )
+                    })?;
+                tracing::debug!(
+                    attempt,
+                    error = %format!("{error:#}"),
+                    "canonical archive opening seal failed; reopening hydration owner"
+                );
+                retry_cause = Some(error);
+            }
+            Err(error) => {
+                let reason = if started.elapsed() >= timeout {
+                    "opening timeout exhausted"
+                } else {
+                    "retry limit reached"
+                };
+                let error = error.context(format!(
+                    "canonical archive opening seal failed after {attempt} attempts ({reason})"
+                ));
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "search hydration owner remains unavailable for certified semantic search"
+                );
+                break (conn, Err(error));
+            }
+        }
     };
     conn.execute_sync("PRAGMA query_only = 1;")
         .with_context(|| "setting search hydration query_only")?;
@@ -713,7 +779,7 @@ fn open_search_hydration_sqlite(
     .with_context(|| "setting search hydration cache_size")?;
     Ok(SearchSqliteConnection {
         inner: conn,
-        archive_witness: archive_opening.and_then(|opening| opening.finish().ok()),
+        archive_witness,
     })
 }
 
