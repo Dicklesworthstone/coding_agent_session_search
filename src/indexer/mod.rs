@@ -11217,6 +11217,12 @@ fn expected_live_lexical_doc_count_delta(
     Ok(Some(cached.expected_docs.saturating_add(appended)))
 }
 
+/// Rows past a memoized maximum id. Both run on every memo delta, so each must
+/// seek past the bound rather than walk the table (GH #539; asserted on the
+/// compiled program by `gh539_pure_append_counts_seek_past_the_memo`).
+const CONVERSATIONS_AFTER_ID_COUNT_SQL: &str = "SELECT COUNT(*) FROM conversations WHERE id > ?1";
+const MESSAGES_AFTER_ID_COUNT_SQL: &str = "SELECT COUNT(*) FROM messages WHERE id > ?1";
+
 /// Whether the archive changed from `old` to `current` only by appended rows:
 /// no conversation or message was deleted (both totals grew by exactly the
 /// rows beyond the old maxima) and the content cap is unchanged.
@@ -11235,14 +11241,10 @@ fn expected_lexical_docs_identity_is_pure_append(
     }
     let new_conversations = count_exact(
         storage,
-        "SELECT COUNT(*) FROM conversations WHERE id > ?1",
+        CONVERSATIONS_AFTER_ID_COUNT_SQL,
         old.max_conversation_id,
     )?;
-    let new_messages = count_exact(
-        storage,
-        "SELECT COUNT(*) FROM messages WHERE id > ?1",
-        old.max_message_id,
-    )?;
+    let new_messages = count_exact(storage, MESSAGES_AFTER_ID_COUNT_SQL, old.max_message_id)?;
     Ok(
         old.total_conversations.checked_add(new_conversations) == Some(current.total_conversations)
             && old.total_messages.checked_add(new_messages) == Some(current.total_messages),
@@ -64618,6 +64620,72 @@ c.close()
             )?,
             0,
             "a caught-up watermark has no delta"
+        );
+        Ok(())
+    }
+
+    /// GH #539: the pure-append check runs before every memo delta, so its two
+    /// counts must seek past the memoized maxima. Read the compiled program,
+    /// as the append stream's own test does: fsqlite can label a rowid range
+    /// SCAN in EXPLAIN QUERY PLAN even when codegen seeks.
+    #[test]
+    fn gh539_pure_append_counts_seek_past_the_memo() -> Result<()> {
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("gh539-append-counts.db"))?;
+        seed_lexical_rebuild_fixture(&storage);
+        for (sql, table) in [
+            (CONVERSATIONS_AFTER_ID_COUNT_SQL, "conversations"),
+            (MESSAGES_AFTER_ID_COUNT_SQL, "messages"),
+        ] {
+            let opcodes: Vec<(String, i64, i64)> = storage.raw().query_map_collect(
+                &format!("EXPLAIN {sql}"),
+                &[ParamValue::from(1_i64)],
+                |row| Ok((row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+            )?;
+            let rootpage: i64 = storage.raw().query_row_map(
+                "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                &[ParamValue::from(table)],
+                |row| row.get_typed(0),
+            )?;
+            let cursor = opcodes
+                .iter()
+                .find_map(|(op, p1, p2)| (op == "OpenRead" && *p2 == rootpage).then_some(*p1))
+                .unwrap_or_else(|| panic!("{sql}: the count reads {table}: {opcodes:?}"));
+            assert!(
+                opcodes
+                    .iter()
+                    .any(|(op, p1, _)| op == "SeekGT" && *p1 == cursor),
+                "{sql}: the cursor must seek strictly past the bound: {opcodes:?}"
+            );
+            assert!(
+                !opcodes
+                    .iter()
+                    .any(|(op, p1, _)| matches!(op.as_str(), "Rewind" | "Last") && *p1 == cursor),
+                "{sql}: the count must not walk rows at or below the bound: {opcodes:?}"
+            );
+        }
+
+        let max_conversation_id = max_conversation_id_exact(&storage)?.expect("seed conversations");
+        let max_message_id = storage.max_message_id()?.expect("seed messages");
+        assert_eq!(
+            count_exact(
+                &storage,
+                CONVERSATIONS_AFTER_ID_COUNT_SQL,
+                max_conversation_id
+            )?,
+            0
+        );
+        assert_eq!(
+            count_exact(&storage, MESSAGES_AFTER_ID_COUNT_SQL, max_message_id)?,
+            0
+        );
+        assert_eq!(
+            count_exact(&storage, CONVERSATIONS_AFTER_ID_COUNT_SQL, 0)?,
+            count_total_conversations_exact(&storage)?
+        );
+        assert_eq!(
+            count_exact(&storage, MESSAGES_AFTER_ID_COUNT_SQL, 0)?,
+            count_total_messages_exact(&storage)?
         );
         Ok(())
     }
