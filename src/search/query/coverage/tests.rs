@@ -617,7 +617,7 @@ fn certified_rrf_exact_key_preserves_semantic_payload_despite_lexical_metadata_d
     assert_eq!(search_hit_doc_id(&lexical), search_hit_doc_id(&semantic));
     let fused = rrf_fuse_hits_with_coverage(
         &[lexical.clone()],
-        &[semantic.clone()],
+        std::slice::from_ref(&semantic),
         "retained",
         10,
         0,
@@ -669,7 +669,7 @@ fn certified_rrf_keeps_distinct_canonical_identities_and_content_separate() {
         }
         let fused = rrf_fuse_hits_with_coverage(
             &[lexical],
-            &[semantic.clone()],
+            std::slice::from_ref(&semantic),
             "retained",
             10,
             0,
