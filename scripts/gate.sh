@@ -182,7 +182,9 @@ verify_ubs_rust_engine() {
         echo "gate: ast-grep failed its Rust parser control; refusing a partial scan" >&2
         return 2
     fi
-    if ! python3 - "$probe" "$matches" <<'PY'
+    # A conditional heredoc is corrupted by Bash 5.2's declare -f output.
+    # Keep the validator as a quoted argument so the remote batch preserves it.
+    if ! python3 -c '
 import json
 import sys
 from pathlib import Path
@@ -195,8 +197,7 @@ if Path(matches[0]["file"]).resolve() != probe:
     raise SystemExit("Rust parser control returned another source")
 if not matches[0]["text"].startswith("panic!"):
     raise SystemExit("Rust parser control did not recognize the panic")
-PY
-    then
+' "$probe" "$matches"; then
         echo "gate: ast-grep returned an invalid Rust parser control; refusing a partial scan" >&2
         return 2
     fi
