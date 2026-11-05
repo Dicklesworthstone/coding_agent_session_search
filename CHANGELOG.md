@@ -36,8 +36,9 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 Changes after v0.10.0, through main at e5a2e9e1 (2026-11-04), plus three
 commits on top of it: the lexical-rebuild fix ac29a9d3, a test-harness fix,
-and a fix to the active-writer census. Main commits after e5a2e9e1 are not
-in this release.
+and a fix to the active-writer census. A build-configuration commit drops an
+unused `[env]` entry that dsr's strict release mode refuses. Main commits
+after e5a2e9e1 are not in this release.
 
 ### Upgrade notes
 

@@ -21,10 +21,9 @@ rustflags = ["-Z", "threads=4"]
 # applies only to processes cargo launches from this repo, so the shipped
 # binary is unaffected.
 RUST_MIN_STACK = "134217728"
-
-# Coverage exclusion patterns for cargo-llvm-cov
-# These paths are excluded from coverage reports
-CARGO_LLVM_COV_EXCLUDE = "tests/*,**/test*.rs,benches/*"
+# dsr's strict release builds refuse any other CARGO_*, RUST* or compiler
+# variable in [env] (RUST_TEST_THREADS and CARGO_INCREMENTAL = "0" excepted).
+# Coverage exclusions are the --ignore-filename-regex flags in the cov aliases.
 
 [target.x86_64-unknown-linux-gnu]
 # Linux x86_64: Use LLD for faster linking (available in CI)
