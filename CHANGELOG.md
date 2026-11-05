@@ -974,6 +974,14 @@ after e5a2e9e1 are not in this release.
   socket peer's uid, a content digest, an exclusion-policy signature). The
   three commits on top of e5a2e9e1 add no critical finding to the files
   they touch, and no warning outside the tests they add.
+- `cass index` defers a source that another process still has open for
+  writing, and finds those processes by inspecting their open files. It
+  stats each session-log-named file (`.jsonl`, `.json`, `.claude`) that a
+  process holds open for writing. If that file is on a network or FUSE mount
+  that has stopped answering, the run waits on the mount until it answers or
+  the stall watchdog ends the run. v0.10.0 did not look at other processes'
+  files. Other files on such a mount are not examined: the census fix on top
+  of e5a2e9e1 stopped following them (tracked on 594o2).
 - The Windows binary is cross-built (`cargo xwin`). After tagging, it was
   run on Windows 11 x64: a targeted index of one session, then status,
   health and search, all as expected. A full index of a real archive was
