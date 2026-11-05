@@ -344,6 +344,42 @@ pub(super) fn revalidate_completed(
     ))
 }
 
+/// Certify the generation only after the index run has finished every database
+/// write and its final WAL checkpoint. Even metadata-only writes invalidate a
+/// physical epoch; copying that newer epoch into a count-only checkpoint would
+/// also hide same-count canonical edits. Reuse the complete read-only audit to
+/// bind the settled archive to the actual published documents instead.
+///
+/// The caller must release its lexical writer and close its canonical storage
+/// first. Incomplete rebuilds keep their recovery state and are never promoted
+/// by this finalization step.
+pub(super) fn certify_after_index(
+    db_path: &Path,
+    index_path: &Path,
+    allow_full_audit: bool,
+    progress: Option<Arc<IndexingProgress>>,
+    progress_bump: Option<Arc<AtomicI64>>,
+) -> Result<bool> {
+    let Some(state) = super::load_lexical_rebuild_state(index_path)? else {
+        return Ok(false);
+    };
+    if !state.completed {
+        return Ok(false);
+    }
+    if super::completed_lexical_checkpoint_freshness_for_state(index_path, db_path, &state)?
+        == super::LexicalCheckpointFreshness::Current
+    {
+        return Ok(true);
+    }
+    // Routine indexing on a large archive must retain its existing bounded
+    // maintenance policy. A deferred audit leaves freshness unverified; it
+    // never copies the current epoch onto unexamined content.
+    if !allow_full_audit {
+        return Ok(false);
+    }
+    Ok(revalidate_completed(db_path, index_path, state, progress, progress_bump)?.is_some())
+}
+
 #[cfg(test)]
 pub(super) fn revalidate_completed_with_observer(
     db_path: &Path,
