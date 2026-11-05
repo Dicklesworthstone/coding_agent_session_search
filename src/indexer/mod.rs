@@ -10300,6 +10300,47 @@ fn prepare_lexical_rebuild_state_for_active_run(
     persist_lexical_rebuild_state(index_path, state)
 }
 
+/// An ingest commit moves the live generation past its last receipt, and a run
+/// killed before its final checkpoint refresh leaves the checkpoint behind too.
+/// Search keeps serving that generation (a stale completed checkpoint is
+/// `existing_index`), so replacing the checkpoint with rebuild progress must not
+/// be what revokes it: above the automatic-repair budget, that turns one
+/// interrupted rebuild into refused searches for as long as the next one takes.
+///
+/// This certifies only what was already being served: the exact bytes now live,
+/// under the prior checkpoint's archive identity. It carries no source proof,
+/// which never transfers between generations, and neither a scratch candidate
+/// nor a generation smaller than the certified one gets a receipt.
+fn lexical_receipt_for_live_generation_ahead_of_checkpoint(
+    index_path: &Path,
+    previous: &LexicalRebuildState,
+) -> Result<Option<LexicalRebuildState>> {
+    let is_scratch = index_path.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .ends_with(LEXICAL_REBUILD_STAGING_SUFFIX)
+    });
+    if is_scratch || !lexical_state_can_certify_publication(previous) {
+        return Ok(None);
+    }
+    let Some(live_docs) = crate::search::tantivy::searchable_index_live_doc_count(index_path)
+    else {
+        return Ok(None);
+    };
+    let live_docs = usize::try_from(live_docs)?;
+    if live_docs < previous.indexed_docs {
+        return Ok(None);
+    }
+    let mut receipt = previous.clone();
+    receipt.committed_meta_fingerprint = index_meta_fingerprint(index_path)?;
+    receipt.indexed_docs = live_docs;
+    // The certified total predates the rows those commits indexed.
+    receipt.db.total_messages = receipt.db.total_messages.max(live_docs);
+    receipt.completed_source_epoch = None;
+    receipt.updated_at_ms = FrankenStorage::now_millis();
+    // Re-reads the fingerprint around the count, so a concurrent swap refuses.
+    Ok(lexical_publication_receipt_matches_live(index_path, &receipt)?.then_some(receipt))
+}
+
 fn persist_lexical_rebuild_state_for_active_run_start(
     index_path: &Path,
     state: &LexicalRebuildState,
@@ -10312,7 +10353,17 @@ fn persist_lexical_rebuild_state_for_active_run_start(
     {
         match lexical_publication_receipt_matches_live(index_path, &previous) {
             Ok(true) => persist_lexical_publication_receipt(index_path, &previous)?,
-            Ok(false) => {}
+            Ok(false) => {
+                match lexical_receipt_for_live_generation_ahead_of_checkpoint(index_path, &previous)
+                {
+                    Ok(Some(receipt)) => persist_lexical_publication_receipt(index_path, &receipt)?,
+                    Ok(None) => {}
+                    Err(error) => tracing::debug!(
+                        error = %format!("{error:#}"),
+                        "live generation cannot be certified; continuing explicit rebuild"
+                    ),
+                }
+            }
             Err(error) => tracing::debug!(
                 error = %format!("{error:#}"),
                 "previous generation cannot be certified; continuing explicit rebuild"

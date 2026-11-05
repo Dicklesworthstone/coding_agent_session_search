@@ -1308,3 +1308,206 @@ fn gh523_killed_staged_rebuild_resumes_from_its_last_commit_not_its_heartbeat() 
         index_meta_fingerprint(&scratch).unwrap()
     );
 }
+
+// A real ingest shape: the archive and the live generation both grow, and the
+// run dies before its final checkpoint refresh. Seen as exit 70 stall kills.
+fn gh494_commit_inline_without_checkpoint_refresh(fixture: &Gh496Fixture) {
+    gh496_append(fixture);
+    let documents = gh496_documents(&fixture.db_path);
+    let mut index = TantivyIndex::open_or_create(&fixture.index_path).unwrap();
+    index.upsert_prebuilt_documents_slice(&documents).unwrap();
+    index.commit().unwrap();
+}
+
+fn gh494_start_rebuild(index_path: &Path, db_path: &Path) {
+    let fresh = LexicalRebuildState::new(
+        deferred_lexical_rebuild_db_state(db_path, 3),
+        LEXICAL_REBUILD_PAGE_SIZE,
+    );
+    persist_lexical_rebuild_state_for_active_run_start(index_path, &fresh).unwrap();
+}
+
+fn gh494_completed_fixture() -> (Gh496Fixture, LexicalRebuildState) {
+    let fixture = gh496_fixture();
+    rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();
+    let published = load_lexical_rebuild_state(&fixture.index_path)
+        .unwrap()
+        .unwrap();
+    assert!(published.completed);
+    assert!(published.completed_source_epoch.is_some());
+    (fixture, published)
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_rebuild_start_does_not_revoke_a_live_generation_ahead_of_its_receipt() {
+    let (fixture, published) = gh494_completed_fixture();
+    gh494_commit_inline_without_checkpoint_refresh(&fixture);
+    let live = index_meta_fingerprint(&fixture.index_path).unwrap();
+    assert_ne!(live, published.committed_meta_fingerprint);
+    assert!(!has_usable_lexical_publication_receipt(
+        &fixture.index_path,
+        &fixture.db_path
+    ));
+    let before = crate::search_lexical_self_heal_diagnosis(&fixture.index_path, &fixture.db_path)
+        .unwrap()
+        .expect("the generation is ahead of its checkpoint");
+    assert!(before.existing_index_search_allowed, "{}", before.reason);
+
+    gh494_start_rebuild(&fixture.index_path, &fixture.db_path);
+
+    assert!(
+        !load_lexical_rebuild_state(&fixture.index_path)
+            .unwrap()
+            .unwrap()
+            .completed
+    );
+    let after = crate::search_lexical_self_heal_diagnosis(&fixture.index_path, &fixture.db_path)
+        .unwrap()
+        .expect("the rebuild is incomplete");
+    assert!(
+        after.permits_existing_index_during_active_rebuild(),
+        "{}",
+        after.reason
+    );
+    let receipt: LexicalRebuildState = serde_json::from_slice(
+        &fs::read(fixture.index_path.join(LEXICAL_PUBLISHED_STATE_FILE)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt.committed_meta_fingerprint, live);
+    assert_eq!(
+        Some(u64::try_from(receipt.indexed_docs).unwrap()),
+        crate::search::tantivy::searchable_index_live_doc_count(&fixture.index_path)
+    );
+    assert_eq!(
+        receipt.completed_source_epoch, None,
+        "a new native generation cannot inherit an older source proof"
+    );
+    assert_eq!(receipt.resume_binding, published.resume_binding);
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_refused_rebuild_after_an_unrefreshed_inline_commit_keeps_serving() {
+    #[cfg(windows)]
+    const DISK_FULL: i32 = 112;
+    #[cfg(not(windows))]
+    const DISK_FULL: i32 = libc::ENOSPC;
+    let (fixture, _) = gh494_completed_fixture();
+    gh494_commit_inline_without_checkpoint_refresh(&fixture);
+    let live = index_meta_fingerprint(&fixture.index_path).unwrap();
+    #[cfg(target_os = "linux")]
+    let fault = inject_lexical_publish_rename_failure_once(
+        LexicalPublishRenameSite::LinuxParkPriorLiveToCanonicalSidecar,
+        DISK_FULL,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let fault = inject_lexical_publish_rename_failure_once(
+        LexicalPublishRenameSite::NonLinuxPublishStagedLive,
+        DISK_FULL,
+    );
+    let error = rebuild_tantivy_from_db_with_options(
+        &fixture.db_path,
+        &fixture.data_dir,
+        3,
+        None,
+        LexicalRebuildStartupOptions {
+            defer_initial_content_fingerprint: true,
+            force_fresh: true,
+        },
+        None,
+    )
+    .expect_err("refuse the actual swap");
+    drop(fault);
+    assert!(
+        error.to_string().contains("publish_staged_generation"),
+        "{error:#}"
+    );
+    assert!(
+        !load_lexical_rebuild_state(&fixture.index_path)
+            .unwrap()
+            .unwrap()
+            .completed
+    );
+    assert_eq!(index_meta_fingerprint(&fixture.index_path).unwrap(), live);
+    let diagnosis =
+        crate::search_lexical_self_heal_diagnosis(&fixture.index_path, &fixture.db_path)
+            .unwrap()
+            .expect("the rebuild is incomplete");
+    assert!(
+        diagnosis.permits_existing_index_during_active_rebuild(),
+        "{}",
+        diagnosis.reason
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_rebuild_start_certifies_nothing_search_was_not_already_serving() {
+    // Progress is no proof: an interrupted rebuild stays uncertified on restart.
+    let (fixture, published) = gh494_completed_fixture();
+    gh494_commit_inline_without_checkpoint_refresh(&fixture);
+    let mut interrupted = published.clone();
+    interrupted.completed = false;
+    persist_lexical_rebuild_state(&fixture.index_path, &interrupted).unwrap();
+    gh494_start_rebuild(&fixture.index_path, &fixture.db_path);
+    assert!(!has_usable_lexical_publication_receipt(
+        &fixture.index_path,
+        &fixture.db_path
+    ));
+
+    // A generation smaller than the certified one is not its descendant.
+    let (fixture, mut published) = gh494_completed_fixture();
+    gh494_commit_inline_without_checkpoint_refresh(&fixture);
+    let live_docs = crate::search::tantivy::searchable_index_live_doc_count(&fixture.index_path)
+        .map(|docs| usize::try_from(docs).unwrap())
+        .unwrap();
+    published.indexed_docs = live_docs + 1;
+    published.db.total_messages = live_docs + 1;
+    persist_lexical_rebuild_state(&fixture.index_path, &published).unwrap();
+    gh494_start_rebuild(&fixture.index_path, &fixture.db_path);
+    assert!(!has_usable_lexical_publication_receipt(
+        &fixture.index_path,
+        &fixture.db_path
+    ));
+
+    // A scratch candidate is unverified however its counts look, and the size
+    // check alone must not be what refuses it.
+    let (fixture, mut published) = gh494_completed_fixture();
+    gh496_stage_prefix(&fixture.db_path, &fixture.index_path, 1);
+    let scratch = staged_lexical_rebuild_scratch_path(&fixture.index_path);
+    published.indexed_docs = 1;
+    persist_lexical_rebuild_state(&scratch, &published).unwrap();
+    gh494_start_rebuild(&scratch, &fixture.db_path);
+    assert!(!has_usable_lexical_publication_receipt(
+        &scratch,
+        &fixture.db_path
+    ));
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_rebased_receipt_still_refuses_a_replaced_archive() {
+    let (fixture, _) = gh494_completed_fixture();
+    gh494_commit_inline_without_checkpoint_refresh(&fixture);
+    gh494_start_rebuild(&fixture.index_path, &fixture.db_path);
+    assert!(has_usable_lexical_publication_receipt(
+        &fixture.index_path,
+        &fixture.db_path
+    ));
+
+    let replacement_path = fixture.data_dir.join("replacement.db");
+    let replacement = FrankenStorage::open(&replacement_path).unwrap();
+    gh496_insert_conversation(&replacement, 9, 2, 32);
+    replacement.close().unwrap();
+    fs::rename(
+        &fixture.db_path,
+        fixture.data_dir.join("retained-original.db"),
+    )
+    .unwrap();
+    fs::rename(replacement_path, &fixture.db_path).unwrap();
+    assert!(!has_usable_lexical_publication_receipt(
+        &fixture.index_path,
+        &fixture.db_path
+    ));
+}
