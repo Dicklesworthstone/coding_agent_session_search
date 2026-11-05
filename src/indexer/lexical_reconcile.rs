@@ -32,9 +32,9 @@ use crate::search::asset_state::SearchMaintenanceMode;
 use crate::search::tantivy::{TantivyIndex, expected_index_dir};
 use crate::storage::sqlite::{FrankenStorage, LexicalRebuildConversationRow};
 
-mod canary;
+pub(super) mod canary;
 mod checkpoint;
-mod snapshot;
+pub(super) mod snapshot;
 
 const CHECKPOINT_MAX_BYTES: u64 = 64 * 1024;
 const RECONCILE_BATCH_MAX_CONTENT_BYTES: usize = 64 * 1024 * 1024;

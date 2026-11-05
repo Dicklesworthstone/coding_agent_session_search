@@ -4,6 +4,7 @@ mod checkpoint_deadline;
 pub(crate) mod lexical_generation;
 mod lexical_publish;
 pub mod lexical_reconcile;
+mod lexical_resume;
 pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;
 pub mod quarantine;
@@ -2906,6 +2907,9 @@ fn matching_lexical_rebuild_state_status(
     let Some(state) = load_lexical_rebuild_state(index_path)? else {
         return Ok(MatchingLexicalRebuildStateStatus::default());
     };
+    if state.completed && !lexical_publication_receipt_matches_live(index_path, &state)? {
+        return Ok(MatchingLexicalRebuildStateStatus::default());
+    }
     Ok(matching_lexical_rebuild_state_status_for_loaded_state(
         state, db_state,
     ))
@@ -2918,6 +2922,9 @@ fn matching_lexical_rebuild_state_status_if_present(
     let Some(state) = load_lexical_rebuild_state(index_path)? else {
         return Ok(MatchingLexicalRebuildStateStatus::default());
     };
+    if state.completed && !lexical_publication_receipt_matches_live(index_path, &state)? {
+        return Ok(MatchingLexicalRebuildStateStatus::default());
+    }
     let db_state = load_current_db_state()?;
     Ok(matching_lexical_rebuild_state_status_for_loaded_state(
         state, &db_state,
@@ -2941,6 +2948,11 @@ fn matching_completed_lexical_rebuild_state_status_without_fingerprint(
         .into_owned();
     if state.version != LEXICAL_REBUILD_STATE_VERSION
         || state.schema_hash != crate::search::tantivy::SCHEMA_HASH
+        || state
+            .resume_binding
+            .as_ref()
+            .is_some_and(|binding| !binding.matches(db_path))
+        || !state.completed_source_matches(db_path)
         || state.db.total_conversations != total_conversations
         || !lexical_rebuild_db_paths_match(&state.db.db_path, &normalized_db_path)
         || !lexical_rebuild_page_size_is_compatible(state.page_size)
@@ -2951,13 +2963,15 @@ fn matching_completed_lexical_rebuild_state_status_without_fingerprint(
     let has_completed_checkpoint = state.completed
         && state.pending.is_none()
         && state.effective_execution_mode() == LexicalRebuildExecutionMode::SharedWriter
-        && !state.runtime.is_observed();
+        && !state.runtime.is_observed()
+        && lexical_publication_receipt_matches_live(index_path, &state)?
+        && state.completed_source_matches(db_path);
     Ok(Some(MatchingLexicalRebuildStateStatus {
         has_pending_resume: false,
         has_completed_checkpoint,
         completed_indexed_docs: has_completed_checkpoint.then_some(state.indexed_docs),
         completed_exact_totals: has_completed_checkpoint
-            .then_some((state.db.total_conversations, state.indexed_docs)),
+            .then_some((state.db.total_conversations, state.db.total_messages)),
         completed_storage_fingerprint: has_completed_checkpoint
             .then_some(state.db.storage_fingerprint),
     }))
@@ -2967,7 +2981,13 @@ fn matching_lexical_rebuild_state_status_for_loaded_state(
     state: LexicalRebuildState,
     db_state: &LexicalRebuildDbState,
 ) -> MatchingLexicalRebuildStateStatus {
-    if !state.matches_run(db_state, LEXICAL_REBUILD_PAGE_SIZE) {
+    // GH #496: this is only admission to a verified replay, never permission
+    // to skip the saved cursor. In particular, --full must not erase an
+    // auditable staged generation just because its own prior ingest grew the
+    // archive. The replay checks every retained document before publication.
+    if !state.matches_run(db_state, LEXICAL_REBUILD_PAGE_SIZE)
+        && !lexical_resume::eligible(&state, Path::new(&db_state.db_path))
+    {
         return MatchingLexicalRebuildStateStatus::default();
     }
 
@@ -2981,7 +3001,7 @@ fn matching_lexical_rebuild_state_status_for_loaded_state(
         has_completed_checkpoint,
         completed_indexed_docs: has_completed_checkpoint.then_some(state.indexed_docs),
         completed_exact_totals: has_completed_checkpoint
-            .then_some((state.db.total_conversations, state.indexed_docs)),
+            .then_some((state.db.total_conversations, state.db.total_messages)),
         completed_storage_fingerprint: has_completed_checkpoint
             .then_some(state.db.storage_fingerprint),
     }
@@ -3295,12 +3315,16 @@ fn try_readonly_canonical_force_rebuild(
     ensure_authoritative_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
     before_boundary(ReadonlyRebuildBoundary::Rebuild)?;
     let rebuild_start = Instant::now();
-    let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
+    let rebuild = rebuild_tantivy_from_db_with_options(
         &opts.db_path,
         &opts.data_dir,
         total_conversations,
         opts.progress.clone(),
-        Arc::clone(progress_bump),
+        LexicalRebuildStartupOptions {
+            defer_initial_content_fingerprint: true,
+            force_fresh: true,
+        },
+        Some(Arc::clone(progress_bump)),
     )?;
     if let Some(p) = &opts.progress
         && let Ok(mut stats) = p.stats.lock()
@@ -3328,45 +3352,23 @@ fn try_readonly_canonical_force_rebuild(
     // The rebuild above is read-only and remains useful with an unwritable
     // archive directory. Its optional watermark write needs the same archive
     // lease as every other writer, including when another data dir owns it.
-    match before_boundary(ReadonlyRebuildBoundary::ArchiveWrite)
-        .and_then(|()| FrankenStorage::open_writer(&opts.db_path))
-    {
-        Ok(writer) => {
-            let write_result = writer.set_last_indexed_at(now_ms);
-            match writer.close() {
-                Ok(()) => {
-                    if let Err(err) = write_result {
-                        tracing::warn!(
-                            db_path = %opts.db_path.display(),
-                            now_ms,
-                            error = %format!("{err:#}"),
-                            "force rebuild succeeded but failed to update last_indexed_at; \
-                             status/health may report stale until the next index run"
-                        );
-                    } else {
-                        tracing::info!(
-                            now_ms,
-                            "updated last_indexed_at for status display after force rebuild"
-                        );
-                    }
-                }
-                Err(close_err) => {
-                    tracing::warn!(
-                        db_path = %opts.db_path.display(),
-                        now_ms,
-                        write_ok = write_result.is_ok(),
-                        error = %format!("{close_err:#}"),
-                        "force rebuild metadata writer close failed after last_indexed_at update attempt"
-                    );
-                }
-            }
-        }
+    match before_boundary(ReadonlyRebuildBoundary::ArchiveWrite).and_then(|()| {
+        let writer = FrankenStorage::open_writer(&opts.db_path)?;
+        let write_result = writer.set_last_indexed_at(now_ms);
+        let close_result = writer.close();
+        write_result.context("updating force-rebuild last_indexed_at")?;
+        close_result.context("closing force-rebuild metadata writer")
+    }) {
+        Ok(()) => tracing::info!(
+            now_ms,
+            "updated last_indexed_at for status display after force rebuild"
+        ),
         Err(err) => {
             tracing::warn!(
                 db_path = %opts.db_path.display(),
                 now_ms,
                 error = %format!("{err:#}"),
-                "force rebuild succeeded but could not open writer to update last_indexed_at; \
+                "force rebuild succeeded but could not complete the last_indexed_at update; \
                  status/health may report stale until the next index run"
             );
         }
@@ -3547,6 +3549,7 @@ fn process_index_write_bytes() -> Option<u64> {
 /// generation left every message past a long conversation's first 8 MiB
 /// unindexed; the version change stops it certifying, so it is rebuilt once.
 const LEXICAL_REBUILD_STATE_VERSION: u8 = 3;
+const LEXICAL_REBUILD_STATE_MAX_BYTES: u64 = 1024 * 1024;
 // Size of each SQL page fetched from the conversations table during a lexical
 // rebuild. The page is a primary-key-ordered LIMIT window materialized as
 // lightweight `LexicalRebuildConversationRow` records (~1 KB each — no message
@@ -7049,8 +7052,12 @@ enum LexicalRebuildExecutionMode {
     /// One Quill writer building in the canonical scratch sibling. Its cursor
     /// must never be applied to the prior live generation if scratch is lost.
     StagedSingleIndex,
+    /// A bounded audit reuses only documents verified against canonical rows.
+    /// Its cursor reports progress, but never authorizes skipping that audit.
+    StagedVerifiedReplay,
     /// An explicitly in-place writer. Unrelated scratch debris must not redirect
-    /// pending-commit reconciliation or the next writer away from the live tree.
+    /// pending-commit reconciliation. Its unverified prefix cannot authorize a
+    /// cursor resume; replacement rebuilds run off-live.
     LiveSingleIndex,
     StagedShardBuild,
     /// Canonical workspace metadata is changing; all existing documents need
@@ -7060,13 +7067,20 @@ enum LexicalRebuildExecutionMode {
 
 impl LexicalRebuildExecutionMode {
     fn requires_restart_from_zero_on_resume(self) -> bool {
-        matches!(self, Self::StagedShardBuild | Self::CanonicalMetadataRepair)
+        matches!(
+            self,
+            Self::SharedWriter
+                | Self::LiveSingleIndex
+                | Self::StagedShardBuild
+                | Self::CanonicalMetadataRepair
+        )
     }
 
     fn as_str(self) -> &'static str {
         match self {
             Self::SharedWriter => "shared_writer",
             Self::StagedSingleIndex => "staged_single_index",
+            Self::StagedVerifiedReplay => "staged_verified_replay",
             Self::LiveSingleIndex => "live_single_index",
             Self::StagedShardBuild => "staged_shard_build",
             Self::CanonicalMetadataRepair => "canonical_metadata_repair",
@@ -7096,6 +7110,16 @@ struct LexicalRebuildState {
     /// completed legacy generations look staged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     execution_mode: Option<LexicalRebuildExecutionMode>,
+    /// Stable archive identity and lexical projection settings. Unlike the
+    /// whole-archive fingerprint this survives ordinary append-only ingestion.
+    /// It admits verification of a staged generation, not publication by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_binding: Option<lexical_resume::Binding>,
+    /// Completed guarded generations may take a fast path only while the
+    /// observed canonical DB/WAL epoch is unchanged. Count/ID fingerprints
+    /// alone cannot detect an equal-count content or metadata edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_source_epoch: Option<lexical_resume::ArchiveEpoch>,
     #[serde(default)]
     runtime: LexicalRebuildPipelineRuntimeSnapshot,
 }
@@ -7116,6 +7140,8 @@ impl LexicalRebuildState {
             completed: false,
             updated_at_ms: FrankenStorage::now_millis(),
             execution_mode: Some(LexicalRebuildExecutionMode::SharedWriter),
+            resume_binding: None,
+            completed_source_epoch: None,
             runtime: LexicalRebuildPipelineRuntimeSnapshot::default(),
         }
     }
@@ -7137,8 +7163,27 @@ impl LexicalRebuildState {
         };
         self.version == LEXICAL_REBUILD_STATE_VERSION
             && self.schema_hash == crate::search::tantivy::SCHEMA_HASH
+            && self
+                .resume_binding
+                .as_ref()
+                .is_none_or(|binding| binding.matches(Path::new(&db.db_path)))
+            && self.completed_source_matches(Path::new(&db.db_path))
+            // A partial audit never becomes a trusted prefix cursor, even if
+            // the archive's cheap fingerprint happens to match again.
+            && (self.completed
+                || self.effective_execution_mode()
+                    != LexicalRebuildExecutionMode::StagedVerifiedReplay)
             && db_matches
             && lexical_rebuild_page_size_is_compatible(self.page_size)
+    }
+
+    fn completed_source_matches(&self, db_path: &Path) -> bool {
+        !self.completed
+            || (self.resume_binding.is_some()
+                && self
+                    .completed_source_epoch
+                    .as_ref()
+                    .is_some_and(|epoch| epoch.verify(db_path).is_ok()))
     }
 
     fn record_pending_commit(
@@ -7156,6 +7201,7 @@ impl LexicalRebuildState {
             base_meta_fingerprint,
         });
         self.completed = false;
+        self.completed_source_epoch = None;
         self.updated_at_ms = FrankenStorage::now_millis();
     }
 
@@ -9499,14 +9545,42 @@ fn completed_lexical_checkpoint_conversations(index_path: &Path, db_path: &Path)
 
 fn load_lexical_rebuild_state(index_path: &Path) -> Result<Option<LexicalRebuildState>> {
     let path = lexical_rebuild_state_path(index_path);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
             return Err(err)
-                .with_context(|| format!("reading lexical rebuild state {}", path.display()));
+                .with_context(|| format!("inspecting lexical rebuild state {}", path.display()));
         }
     };
+    // A corrupt checkpoint must not bypass the rebuild's memory budget, or
+    // turn status/resume into a blocking FIFO/device read.
+    if !metadata.is_file() || metadata.len() > LEXICAL_REBUILD_STATE_MAX_BYTES {
+        tracing::warn!(path = %path.display(), "ignoring non-regular or oversized lexical rebuild checkpoint");
+        return Ok(None);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(&path)
+        .with_context(|| format!("opening lexical rebuild state {}", path.display()))?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "lexical rebuild checkpoint changed file type"
+    );
+    let mut bytes = Vec::new();
+    file.take(LEXICAL_REBUILD_STATE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading lexical rebuild state {}", path.display()))?;
+    if bytes.len() as u64 > LEXICAL_REBUILD_STATE_MAX_BYTES {
+        tracing::warn!(path = %path.display(), "ignoring lexical rebuild checkpoint that exceeded its read budget");
+        return Ok(None);
+    }
 
     match serde_json::from_slice::<LexicalRebuildState>(&bytes) {
         Ok(state) => Ok(Some(state)),
@@ -9523,7 +9597,50 @@ fn load_lexical_rebuild_state(index_path: &Path) -> Result<Option<LexicalRebuild
 
 fn persist_lexical_rebuild_state(index_path: &Path, state: &LexicalRebuildState) -> Result<()> {
     let path = lexical_rebuild_state_path(index_path);
-    write_json_pretty_atomically(&path, state)
+    write_json_pretty_atomically(&path, state)?;
+    // The checkpoint is a durability boundary, not just a status heartbeat.
+    // Flush its directory entry after the atomic rename so a power loss cannot
+    // leave a committed generation paired with a lost checkpoint replacement.
+    sync_parent_directory(&path)
+}
+
+/// A failed first publication can remove the checkpoint-only live placeholder
+/// before its rename lands. The certified candidate then owns the only state
+/// file. Recover it as an INCOMPLETE audit, never as permission to publish or
+/// skip source rows. Existing live state (including malformed evidence) wins.
+fn recover_terminal_staged_lexical_checkpoint(index_path: &Path, db_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(lexical_rebuild_state_path(index_path)) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspecting live lexical recovery checkpoint"),
+    }
+    let scratch = staged_lexical_rebuild_scratch_path(index_path);
+    match fs::symlink_metadata(&scratch) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspecting terminal lexical recovery candidate"),
+    }
+    let Some(mut state) = load_lexical_rebuild_state(&scratch)? else {
+        return Ok(());
+    };
+    if !lexical_state_can_certify_publication(&state)
+        || state.resume_binding.is_none()
+        || state.completed_source_epoch.is_none()
+        || !crate::stored_path_identity_matches(&state.db.db_path, db_path)
+    {
+        return Ok(());
+    }
+    state.completed = false;
+    state.completed_source_epoch = None;
+    state.set_execution_mode(LexicalRebuildExecutionMode::StagedVerifiedReplay);
+    persist_lexical_rebuild_state_for_active_run_start(index_path, &state)?;
+    tracing::info!(
+        candidate_path = %scratch.display(),
+        candidate_docs = state.indexed_docs,
+        "recovered terminal scratch-only checkpoint for a complete canonical audit"
+    );
+    Ok(())
 }
 
 // Rebuild progress and publication authority have different lifetimes. A staged
@@ -9618,6 +9735,15 @@ pub(crate) fn has_usable_lexical_publication_receipt(index_path: &Path, db_path:
         );
         let state: LexicalRebuildState = serde_json::from_slice(&bytes)?;
         if !crate::stored_path_identity_matches(&state.db.db_path, db_path) {
+            return Ok(false);
+        }
+        if let Some(saved) = state.resume_binding.as_ref()
+            && let Ok(Some(current)) = lexical_resume::Binding::capture(db_path)
+            && saved != &current
+        {
+            // An incomplete rebuild may still serve its prior publication,
+            // but never after a proven archive replacement at the same path.
+            // Failure to observe an identity is not evidence of replacement.
             return Ok(false);
         }
         lexical_publication_receipt_matches_live(index_path, &state)
@@ -9982,7 +10108,11 @@ fn lexical_rebuild_resume_content_path(
         return Ok(index_path.to_path_buf());
     }
     let scratch = staged_lexical_rebuild_scratch_path(index_path);
-    if state.effective_execution_mode() == LexicalRebuildExecutionMode::StagedSingleIndex {
+    if matches!(
+        state.effective_execution_mode(),
+        LexicalRebuildExecutionMode::StagedSingleIndex
+            | LexicalRebuildExecutionMode::StagedVerifiedReplay
+    ) {
         let metadata = fs::symlink_metadata(&scratch).with_context(|| {
             format!(
                 "checkpoint's staged lexical generation is unavailable: {}",
@@ -10008,7 +10138,11 @@ fn lexical_rebuild_bound_candidate_is_missing(
     state: &LexicalRebuildState,
 ) -> Result<bool> {
     if state.completed
-        || state.effective_execution_mode() != LexicalRebuildExecutionMode::StagedSingleIndex
+        || !matches!(
+            state.effective_execution_mode(),
+            LexicalRebuildExecutionMode::StagedSingleIndex
+                | LexicalRebuildExecutionMode::StagedVerifiedReplay
+        )
     {
         return Ok(false);
     }
@@ -11385,6 +11519,7 @@ pub(crate) struct LexicalRebuildOutcome {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct LexicalRebuildStartupOptions {
     defer_initial_content_fingerprint: bool,
+    force_fresh: bool,
 }
 
 fn should_evaluate_incremental_canonical_lexical_repair(
@@ -13011,23 +13146,141 @@ pub(crate) fn load_lexical_rebuild_checkpoint(
     let Some(state) = load_lexical_rebuild_state(index_path)? else {
         return Ok(None);
     };
+    Ok(Some(lexical_checkpoint_status(&state)))
+}
+
+fn lexical_checkpoint_status(state: &LexicalRebuildState) -> LexicalRebuildCheckpoint {
     let processed_conversations = state.reported_processed_conversations();
     let committed_conversation_id = state.reported_committed_conversation_id();
     let indexed_docs = state.reported_indexed_docs();
 
-    Ok(Some(LexicalRebuildCheckpoint {
-        db_path: state.db.db_path,
+    LexicalRebuildCheckpoint {
+        db_path: state.db.db_path.clone(),
         total_conversations: state.db.total_conversations,
-        storage_fingerprint: state.db.storage_fingerprint,
+        storage_fingerprint: state.db.storage_fingerprint.clone(),
         committed_offset: state.committed_offset,
         committed_conversation_id,
         processed_conversations,
         indexed_docs,
-        schema_hash: state.schema_hash,
+        schema_hash: state.schema_hash.clone(),
         page_size: state.page_size,
+        // Historical status only. Rebuild admission additionally requires the
+        // raw source epoch and native-generation binding, or a full audit.
         completed: state.completed,
         updated_at_ms: state.updated_at_ms,
-    }))
+    }
+}
+
+/// Freshness evidence is separate from the historical progress/status record.
+/// In particular, DB/WAL epoch drift may be an ordinary metadata write; it
+/// requires content verification but does not by itself prove missing data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LexicalCheckpointFreshness {
+    Current,
+    Unverified(&'static str),
+    Stale(&'static str),
+    Incompatible(&'static str),
+}
+
+impl LexicalCheckpointFreshness {
+    pub(crate) fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Current => None,
+            Self::Unverified(reason) | Self::Stale(reason) | Self::Incompatible(reason) => {
+                Some(reason)
+            }
+        }
+    }
+}
+
+/// Inspect only bounded checkpoint metadata, native publication metadata and
+/// filesystem identity. This never opens SQLite, hashes index segments or
+/// renews an epoch. Read callers can serve a complete, readable generation
+/// with `Unverified` evidence without scheduling a full audit on every read.
+pub(crate) fn completed_lexical_checkpoint_freshness(
+    index_path: &Path,
+    db_path: &Path,
+    checkpoint: &LexicalRebuildCheckpoint,
+) -> Result<LexicalCheckpointFreshness> {
+    let Some(state) = load_lexical_rebuild_state(index_path)? else {
+        return Ok(LexicalCheckpointFreshness::Unverified(
+            "lexical completion evidence is missing; content verification is required",
+        ));
+    };
+    if lexical_checkpoint_status(&state) != *checkpoint {
+        return Ok(LexicalCheckpointFreshness::Unverified(
+            "lexical completion evidence changed during observation; verification is deferred",
+        ));
+    }
+    completed_lexical_checkpoint_freshness_for_state(index_path, db_path, &state)
+}
+
+fn completed_lexical_checkpoint_freshness_for_state(
+    index_path: &Path,
+    db_path: &Path,
+    state: &LexicalRebuildState,
+) -> Result<LexicalCheckpointFreshness> {
+    use LexicalCheckpointFreshness::{Current, Incompatible, Stale, Unverified};
+
+    if !state.completed {
+        return Ok(Unverified("lexical rebuild is incomplete"));
+    }
+    let current_binding = match lexical_resume::Binding::capture(db_path) {
+        Ok(Some(current)) => current,
+        Ok(None) | Err(_) => {
+            return Ok(Unverified(
+                "lexical archive identity is unavailable; content verification is deferred",
+            ));
+        }
+    };
+    if !crate::stored_path_identity_matches(&state.db.db_path, db_path) {
+        return Ok(Incompatible(
+            "lexical completion evidence belongs to a different canonical archive",
+        ));
+    }
+    let Some(binding) = state.resume_binding.as_ref() else {
+        return Ok(Unverified(
+            "legacy lexical checkpoint has no source binding; content verification is required",
+        ));
+    };
+    if &current_binding != binding {
+        return Ok(Incompatible(
+            "lexical archive identity or projection configuration changed since verification",
+        ));
+    }
+    if !lexical_state_can_certify_publication(state) {
+        return Ok(Stale(
+            "lexical completion evidence no longer matches the active archive or contract",
+        ));
+    }
+    if crate::search::tantivy::searchable_index_live_docs(index_path).is_some_and(|live| {
+        live.manifest_source != crate::search::quill_bridge::QuillManifestSource::Current
+    }) || !lexical_publication_receipt_matches_live(index_path, state)?
+    {
+        return Ok(Stale(
+            "native lexical generation no longer matches its completed checkpoint",
+        ));
+    }
+    if !state.completed_source_matches(db_path) {
+        return Ok(Unverified(
+            "lexical source epoch changed or is unverified; content verification is required",
+        ));
+    }
+    // An atomic index swap or a count-only checkpoint refresh must not combine
+    // evidence from different generations during this passive observation.
+    if load_lexical_rebuild_state(index_path)?.as_ref() != Some(state)
+        || index_meta_fingerprint(index_path)? != state.committed_meta_fingerprint
+    {
+        return Ok(Unverified(
+            "lexical completion evidence changed during observation; verification is deferred",
+        ));
+    }
+    if !binding.matches(db_path) || !state.completed_source_matches(db_path) {
+        return Ok(Unverified(
+            "lexical source changed during observation; content verification is required",
+        ));
+    }
+    Ok(Current)
 }
 
 pub(crate) fn load_active_lexical_rebuild_pipeline_runtime(
@@ -13057,6 +13310,7 @@ pub(crate) fn lexical_storage_fingerprint_for_db(db_path: &Path) -> Result<Strin
 /// opener. Used by strict read-only search so a dirty WAL or duplicate schema
 /// is surfaced rather than repaired as a side effect of freshness validation.
 pub(crate) fn lexical_storage_fingerprint_for_db_strict(db_path: &Path) -> Result<String> {
+    let source_epoch = lexical_resume::ArchiveEpoch::capture(db_path)?;
     let storage = FrankenStorage::open_strict_readonly(db_path).with_context(|| {
         format!(
             "strictly opening readonly storage to compute lexical fingerprint for {}",
@@ -13071,6 +13325,9 @@ pub(crate) fn lexical_storage_fingerprint_for_db_strict(db_path: &Path) -> Resul
             db_path.display()
         )
     })?;
+    // COUNT and MAX are separate statements. A raw writer between them must
+    // not turn a mixed observation into evidence for either source epoch.
+    source_epoch.verify(db_path)?;
     Ok(fingerprint)
 }
 
@@ -13081,21 +13338,18 @@ pub(crate) fn lexical_storage_fingerprint_for_db_strict(db_path: &Path) -> Resul
 /// never hits on the path that matters most.
 pub(crate) const ARCHIVE_FINGERPRINT_CACHE_FILE: &str = ".archive-fingerprint-cache.json";
 
-const ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION: u32 = 1;
+// v1 could associate an old completed checkpoint with a newer physical
+// identity. Never reuse those entries after tightening the admission rule.
+const ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Physical identity of a canonical archive for fingerprint memoization: the
-/// size and mtime of the main database file and of its WAL sidecar. Any
-/// committed write touches at least one of them (a WAL append changes the WAL
-/// length and mtime; a checkpoint changes the main file), so an unchanged key
-/// means the strict fingerprint computed last time is still the current one.
+/// DB/WAL epoch, including native file identity where the platform exposes it.
+/// An equal-length database replacement with restored mtimes must not inherit
+/// the replaced archive's cached fingerprint. SHM is deliberately excluded:
+/// readers update it without changing canonical content.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 struct ArchivePhysicalIdentity {
-    db_len: u64,
-    db_mtime_secs: u64,
-    db_mtime_nanos: u32,
-    wal_len: u64,
-    wal_mtime_secs: u64,
-    wal_mtime_nanos: u32,
+    source_epoch: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -13107,34 +13361,13 @@ struct ArchiveFingerprintCache {
 }
 
 fn lexical_storage_physical_identity(db_path: &Path) -> Option<ArchivePhysicalIdentity> {
-    fn stamp(path: &Path) -> Option<(u64, u64, u32)> {
-        match fs::metadata(path) {
-            Ok(meta) => {
-                let modified = meta
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())?;
-                Some((meta.len(), modified.as_secs(), modified.subsec_nanos()))
-            }
-            // An absent WAL sidecar is a legitimate, stable state.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some((0, 0, 0)),
-            Err(_) => None,
-        }
-    }
-    let (db_len, db_mtime_secs, db_mtime_nanos) = stamp(db_path)?;
-    if db_len == 0 {
+    if fs::metadata(db_path).ok()?.len() == 0 {
         // No archive (or an empty placeholder): nothing worth memoizing.
         return None;
     }
-    let wal_path = crate::storage::sqlite::database_sidecar_path(db_path, "-wal");
-    let (wal_len, wal_mtime_secs, wal_mtime_nanos) = stamp(&wal_path)?;
+    let source_epoch = lexical_resume::ArchiveEpoch::capture(db_path).ok()?;
     Some(ArchivePhysicalIdentity {
-        db_len,
-        db_mtime_secs,
-        db_mtime_nanos,
-        wal_len,
-        wal_mtime_secs,
-        wal_mtime_nanos,
+        source_epoch: serde_json::to_string(&source_epoch).ok()?,
     })
 }
 
@@ -13172,31 +13405,53 @@ fn write_archive_fingerprint_cache_for_identity(
     }
 }
 
-pub(crate) fn write_archive_fingerprint_cache_best_effort(
-    db_path: &Path,
-    cache_dir: &Path,
-    fingerprint: &str,
-) {
-    let Some(identity) = lexical_storage_physical_identity(db_path) else {
-        return;
-    };
-    write_archive_fingerprint_cache_for_identity(&identity, cache_dir, fingerprint);
-}
-
 pub(crate) fn prime_archive_fingerprint_cache_from_completed_checkpoint(
     db_path: &Path,
     index_path: &Path,
 ) {
-    let Ok(Some(checkpoint)) = load_lexical_rebuild_checkpoint(index_path) else {
-        return;
-    };
-    if checkpoint.completed && crate::stored_path_identity_matches(&checkpoint.db_path, db_path) {
-        write_archive_fingerprint_cache_best_effort(
-            db_path,
-            index_path,
-            &checkpoint.storage_fingerprint,
-        );
+    if let Err(error) =
+        prime_archive_fingerprint_cache_from_verified_checkpoint(db_path, index_path, || Ok(()))
+    {
+        tracing::debug!(%error, "unverified lexical checkpoint did not prime archive fingerprint cache");
     }
+}
+
+fn prime_archive_fingerprint_cache_from_verified_checkpoint(
+    db_path: &Path,
+    index_path: &Path,
+    before_publish: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    let Some(identity) = lexical_storage_physical_identity(db_path) else {
+        return Ok(false);
+    };
+    let Some(state) = load_lexical_rebuild_state(index_path)? else {
+        return Ok(false);
+    };
+    if completed_lexical_checkpoint_freshness_for_state(index_path, db_path, &state)?
+        != LexicalCheckpointFreshness::Current
+    {
+        return Ok(false);
+    }
+    before_publish()?;
+    if lexical_storage_physical_identity(db_path).as_ref() != Some(&identity)
+        || completed_lexical_checkpoint_freshness_for_state(index_path, db_path, &state)?
+            != LexicalCheckpointFreshness::Current
+    {
+        return Ok(false);
+    }
+    // Keep the identity observed BEFORE verification. A writer arriving after
+    // the final check invalidates this key; never recapture its newer identity
+    // and associate it with the completed checkpoint's older fingerprint.
+    write_archive_fingerprint_cache_for_identity(
+        &identity,
+        index_path,
+        &state.db.storage_fingerprint,
+    );
+    Ok(true)
+}
+
+pub(crate) fn lexical_fingerprint_observation_changed(error: &anyhow::Error) -> bool {
+    error.is::<lexical_resume::SourceChanged>()
 }
 
 /// The on-disk layer of [`lexical_storage_fingerprint_for_db_cached`]: serve
@@ -13209,27 +13464,58 @@ fn lexical_storage_fingerprint_for_db_disk_cached(
     identity: &ArchivePhysicalIdentity,
     cache_dir: &Path,
 ) -> Result<String> {
+    lexical_storage_fingerprint_for_db_disk_cached_with_observer(
+        db_path,
+        identity,
+        cache_dir,
+        || Ok(()),
+    )
+}
+
+fn lexical_storage_fingerprint_for_db_disk_cached_with_observer(
+    db_path: &Path,
+    identity: &ArchivePhysicalIdentity,
+    cache_dir: &Path,
+    before_publish: impl FnOnce() -> Result<()>,
+) -> Result<String> {
     let cache_path = cache_dir.join(ARCHIVE_FINGERPRINT_CACHE_FILE);
-    if let Ok(raw) = fs::read(&cache_path)
-        && let Ok(cached) = serde_json::from_slice::<ArchiveFingerprintCache>(&raw)
+    let cached = if let Some(cached) =
+        lexical_resume::read_completed_artifact::<ArchiveFingerprintCache>(&cache_path)
+            .unwrap_or_else(|error| {
+                tracing::debug!(%error, "unreadable optional archive fingerprint cache ignored");
+                None
+            })
         && cached.schema_version == ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION
         && &cached.identity == identity
         && cached.fingerprint.starts_with("content-v1:")
     {
+        Some(cached.fingerprint)
+    } else {
+        None
+    };
+    let cache_hit = cached.is_some();
+    let fingerprint = if let Some(fingerprint) = cached {
         tracing::debug!(
             archive_fingerprint_cache = "hit",
             cache = %cache_path.display(),
             "archive fingerprint served from the identity sidecar"
         );
-        return Ok(cached.fingerprint);
+        fingerprint
+    } else {
+        tracing::debug!(
+            archive_fingerprint_cache = "miss",
+            cache = %cache_path.display(),
+            "archive fingerprint recomputed from the canonical database"
+        );
+        lexical_storage_fingerprint_for_db_strict(db_path)?
+    };
+    before_publish()?;
+    if lexical_storage_physical_identity(db_path).as_ref() != Some(identity) {
+        return Err(lexical_resume::SourceChanged.into());
     }
-    tracing::debug!(
-        archive_fingerprint_cache = "miss",
-        cache = %cache_path.display(),
-        "archive fingerprint recomputed from the canonical database"
-    );
-    let fingerprint = lexical_storage_fingerprint_for_db_strict(db_path)?;
-    write_archive_fingerprint_cache_for_identity(identity, cache_dir, &fingerprint);
+    if !cache_hit {
+        write_archive_fingerprint_cache_for_identity(identity, cache_dir, &fingerprint);
+    }
     Ok(fingerprint)
 }
 
@@ -13243,8 +13529,8 @@ fn lexical_storage_fingerprint_for_db_disk_cached(
 /// (measured: 201 MB of WAL read in 97k calls, 3.5–4 s) before the engine
 /// query even ran, and a one-shot CLI process cannot amortize it in memory.
 /// A search-time freshness check only needs the answer to change when the
-/// archive does, and any committed write moves the database or WAL
-/// size/mtime, so both layers are invalidated exactly when they must be. When
+/// archive does. The source epoch covers database/WAL metadata and native
+/// file identity, so replacement cannot inherit an older cache entry. When
 /// the identity cannot be read the strict path runs uncached.
 pub(crate) fn lexical_storage_fingerprint_for_db_cached(
     db_path: &Path,
@@ -13262,6 +13548,9 @@ pub(crate) fn lexical_storage_fingerprint_for_db_cached(
     );
     let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(fingerprint) = memo.lock().ok().and_then(|guard| guard.get(&key).cloned()) {
+        if lexical_storage_physical_identity(db_path).as_ref() != Some(&identity) {
+            return Err(lexical_resume::SourceChanged.into());
+        }
         return Ok(fingerprint);
     }
     let fingerprint =
@@ -13290,11 +13579,12 @@ pub(crate) fn lexical_storage_fingerprint_for_db_cached_readonly(
 ) -> Option<String> {
     let identity = lexical_storage_physical_identity(db_path)?;
     let cache_path = index_path.join(ARCHIVE_FINGERPRINT_CACHE_FILE);
-    let raw = fs::read(cache_path).ok()?;
-    let cached = serde_json::from_slice::<ArchiveFingerprintCache>(&raw).ok()?;
+    let cached: ArchiveFingerprintCache =
+        lexical_resume::read_completed_artifact(&cache_path).ok()??;
     (cached.schema_version == ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION
         && cached.identity == identity
-        && cached.fingerprint.starts_with("content-v1:"))
+        && cached.fingerprint.starts_with("content-v1:")
+        && lexical_storage_physical_identity(db_path).as_ref() == Some(&identity))
     .then_some(cached.fingerprint)
 }
 
@@ -13318,7 +13608,7 @@ pub(crate) fn lexical_storage_fingerprint_for_storage(storage: &FrankenStorage) 
 /// (different fingerprint), or read error returns `false`, preserving the
 /// existing rebuild behavior.
 fn published_lexical_index_validated_for_current_data(index_path: &Path, db_path: &Path) -> bool {
-    let checkpoint = match load_lexical_rebuild_checkpoint(index_path) {
+    let checkpoint = match load_lexical_rebuild_state(index_path) {
         Ok(Some(checkpoint)) => checkpoint,
         Ok(None) => return false,
         Err(err) => {
@@ -13329,11 +13619,23 @@ fn published_lexical_index_validated_for_current_data(index_path: &Path, db_path
             return false;
         }
     };
-    if !checkpoint.completed || !crate::stored_path_identity_matches(&checkpoint.db_path, db_path) {
+    if !lexical_state_can_certify_publication(&checkpoint)
+        || !checkpoint.completed_source_matches(db_path)
+        || !checkpoint
+            .resume_binding
+            .as_ref()
+            .is_some_and(|binding| binding.matches(db_path))
+        || !crate::stored_path_identity_matches(&checkpoint.db.db_path, db_path)
+        || index_meta_fingerprint(index_path).ok().flatten()
+            != checkpoint.committed_meta_fingerprint
+    {
         return false;
     }
     match lexical_storage_fingerprint_for_db(db_path) {
-        Ok(current_fingerprint) => current_fingerprint == checkpoint.storage_fingerprint,
+        Ok(current_fingerprint) => {
+            current_fingerprint == checkpoint.db.storage_fingerprint
+                && checkpoint.completed_source_matches(db_path)
+        }
         Err(err) => {
             tracing::debug!(
                 error = %format!("{err:#}"),
@@ -13344,7 +13646,8 @@ fn published_lexical_index_validated_for_current_data(index_path: &Path, db_path
     }
 }
 
-/// Whether independent coverage validation certified the completed checkpoint.
+/// Refresh historical checkpoint bookkeeping when live coverage counts agree.
+/// This never creates or renews the source proof required for rebuild reuse.
 fn persist_completed_lexical_rebuild_checkpoint_from_observations(
     storage: &FrankenStorage,
     index_path: &Path,
@@ -13354,6 +13657,15 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
     observed_tantivy_docs: Option<usize>,
     allow_full_expected_doc_scan: bool,
 ) -> Result<bool> {
+    let previous_state = load_lexical_rebuild_state(index_path)?;
+    // A count-only refresh of the prior live generation must never complete
+    // or overwrite the separate durable candidate that is still being audited.
+    if previous_state
+        .as_ref()
+        .is_some_and(LexicalRebuildState::is_incomplete)
+    {
+        return Ok(false);
+    }
     let total_conversations = db_state.total_conversations;
     let observed_tantivy_docs = match observed_tantivy_docs {
         Some(observed_tantivy_docs) => observed_tantivy_docs,
@@ -13406,7 +13718,7 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
 
     let committed_meta_fingerprint = index_meta_fingerprint(index_path)?;
     let db_path_string = db_state.db_path.clone();
-    let mut state = match load_lexical_rebuild_state(index_path)? {
+    let mut state = match previous_state {
         Some(state)
             if state.version == LEXICAL_REBUILD_STATE_VERSION
                 && state.schema_hash == crate::search::tantivy::SCHEMA_HASH
@@ -13414,25 +13726,19 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
         {
             state
         }
-        Some(state) => {
-            tracing::info!(
-                path = %index_path.display(),
-                existing_db_path = %state.db.db_path,
-                existing_completed = state.completed,
-                "replacing stale lexical rebuild checkpoint from the live Tantivy index"
-            );
-            LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
-        }
-        None => {
-            tracing::info!(
-                path = %index_path.display(),
-                total_conversations,
-                total_messages,
-                "bootstrapping missing lexical rebuild checkpoint from the live Tantivy index"
-            );
-            LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
-        }
+        _ => LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE),
     };
+    // Historical counts may be refreshed after ordinary inline ingestion, but
+    // they never transfer source proof to a different native generation. Only
+    // the complete canonical/native audit can create or renew that evidence.
+    if state.committed_meta_fingerprint != committed_meta_fingerprint
+        || state
+            .resume_binding
+            .as_ref()
+            .is_some_and(|binding| !binding.matches(Path::new(&db_path_string)))
+    {
+        state.completed_source_epoch = None;
+    }
     let target_committed_offset = i64::try_from(total_conversations).unwrap_or(i64::MAX);
     if state.db == db_state
         && state.page_size == LEXICAL_REBUILD_PAGE_SIZE
@@ -18212,6 +18518,9 @@ fn run_index_with_storage_ownership(
         && !opts.build_hnsw
         && initial_canonical_sessions_before_salvage > 0;
     preflight_phase!("watch_startup:probe_lexical_checkpoint");
+    if !opts.force_rebuild {
+        recover_terminal_staged_lexical_checkpoint(&index_path, &opts.db_path)?;
+    }
     let mut initial_matching_lexical_checkpoint = MatchingLexicalRebuildStateStatus::default();
     let mut restart_pending_lexical_rebuild_from_zero = false;
     let resume_lexical_rebuild = if opts.force_rebuild || mirror_source_ids.is_some() {
@@ -18303,11 +18612,38 @@ fn run_index_with_storage_ownership(
             canonical_only_full_rebuild,
             &initial_matching_lexical_checkpoint,
         );
-    if opts.full
+    if (opts.full || opts.force_rebuild)
         && !resume_lexical_rebuild
         && !preserve_matching_completed_checkpoint_during_full_scan
+        // Retain even an incompatible guarded candidate until rebuild startup
+        // can quarantine its evidence. --force-rebuild remains an explicit
+        // request for a fresh pass.
+        && (opts.force_rebuild
+            || !load_lexical_rebuild_state(&index_path)?.is_some_and(|state| {
+                state.completed
+                    || (state.is_incomplete()
+                    && (state.resume_binding.is_some()
+                        || matches!(
+                            state.effective_execution_mode(),
+                            LexicalRebuildExecutionMode::StagedSingleIndex
+                                | LexicalRebuildExecutionMode::StagedVerifiedReplay
+                        )))
+            }))
     {
-        clear_lexical_rebuild_state(&index_path)?;
+        if opts.force_rebuild {
+            // An explicit fresh pass must not rediscover a completed scratch
+            // candidate whose live checkpoint was removed by first publication.
+            let fresh = LexicalRebuildState::new(
+                deferred_lexical_rebuild_db_state(
+                    &opts.db_path,
+                    initial_canonical_sessions_before_salvage,
+                ),
+                LEXICAL_REBUILD_PAGE_SIZE,
+            );
+            persist_lexical_rebuild_state_for_active_run_start(&index_path, &fresh)?;
+        } else {
+            clear_lexical_rebuild_state(&index_path)?;
+        }
     } else if preserve_matching_completed_checkpoint_during_full_scan {
         tracing::info!(
             db_path = %opts.db_path.display(),
@@ -19297,7 +19633,18 @@ fn run_index_with_storage_ownership(
                         &initial_matching_lexical_checkpoint,
                         scan_canonical_mutations,
                         post_scan_observed_tantivy_docs,
-                    ) {
+                    ) && matching_completed_lexical_rebuild_state_status_without_fingerprint(
+                        &index_path,
+                        &opts.db_path,
+                        initial_canonical_sessions_before_salvage,
+                    )?
+                    .as_ref()
+                        == Some(&initial_matching_lexical_checkpoint)
+                    {
+                        // The initial proof predates the source scan. Raw
+                        // canonical writers and same-count native replacements
+                        // do not appear in the scan's mutation counters: check
+                        // source epoch and native publication again before skip.
                         tracing::info!(
                             db_path = %opts.db_path.display(),
                             observed_tantivy_docs = post_scan_observed_tantivy_docs,
@@ -23889,6 +24236,7 @@ fn rebuild_tantivy_from_db_deferred_startup_with_options(
         progress,
         LexicalRebuildStartupOptions {
             defer_initial_content_fingerprint: true,
+            force_fresh: false,
         },
         progress_bump,
     )
@@ -25454,12 +25802,12 @@ fn maybe_pause_lexical_publish_for_kill_relaunch(
 /// a concurrent sweep delete a live rebuild out from under itself. Trading a
 /// bounded disk residue for that is a bad trade.
 ///
-/// The residue is bounded without reclaim: on the success path the publish
+/// On the success path the publish
 /// `RENAME_EXCHANGE` consumes this directory (it ends up holding the prior-live
 /// index, which the retained-backup contract then owns), and on the crash path
-/// the next from-zero rebuild clears it before reuse while an interrupted run
-/// resumes into it. Worst case is one stale scratch directory, never a growing
-/// set.
+/// an interrupted run audits it before reuse. A refused candidate is moved to
+/// quarantine before a fresh rebuild starts; quarantines deliberately retain
+/// evidence and consume disk space until the operator reclaims them.
 /// Extra documents routed through the upsert path beyond the measured
 /// authority/checkpoint gap (#440). Upserting a document whose identity is
 /// absent is an ordinary insert, so the margin only costs an identity probe
@@ -27505,6 +27853,108 @@ fn rebuild_tantivy_from_db_once(
     options: LexicalRebuildStartupOptions,
     progress_bump: Option<Arc<AtomicI64>>,
 ) -> Result<LexicalRebuildOutcome> {
+    let index_path = index_dir(data_dir)?;
+    if !options.force_fresh {
+        recover_terminal_staged_lexical_checkpoint(&index_path, db_path)?;
+    }
+    if !options.force_fresh
+        && let Some(state) = load_lexical_rebuild_state(&index_path)?
+        && state.completed
+    {
+        let incompatible = match lexical_resume::revalidate_completed(
+            db_path,
+            &index_path,
+            state,
+            progress.clone(),
+            progress_bump.clone(),
+        ) {
+            Ok(Some(outcome)) => {
+                recover_or_finalize_interrupted_lexical_publish_backup(&index_path)?;
+                return Ok(outcome);
+            }
+            Ok(None) => {
+                "completed generation no longer covers the canonical projection".to_string()
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<lexical_resume::Incompatible>()
+                    .is_some() =>
+            {
+                format!("{error:#}")
+            }
+            Err(error) => return Err(error),
+        };
+        tracing::info!(reason = %incompatible,
+            "completed lexical checkpoint requires an off-live rebuild");
+        let fresh = LexicalRebuildState::new(
+            deferred_lexical_rebuild_db_state(db_path, total_conversations),
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        persist_lexical_rebuild_state_for_active_run_start(&index_path, &fresh)?;
+    }
+    // GH #496: a saved scratch generation is reusable across ordinary archive
+    // growth only after a complete canonical audit. Dispatch before either
+    // startup mode can replace the checkpoint with a zero cursor. A changed
+    // count/fingerprint therefore triggers verification instead of erasure.
+    if !options.force_fresh
+        && let Some(state) = load_lexical_rebuild_state(&index_path)?
+        && state.is_incomplete()
+        && matches!(
+            state.effective_execution_mode(),
+            LexicalRebuildExecutionMode::StagedSingleIndex
+                | LexicalRebuildExecutionMode::StagedVerifiedReplay
+        )
+    {
+        let incompatible = if lexical_resume::checked_eligible(&state, db_path)? {
+            match lexical_resume::run(
+                db_path,
+                data_dir,
+                &index_path,
+                state.clone(),
+                progress.clone(),
+                progress_bump.clone(),
+            ) {
+                Ok(outcome) => return Ok(outcome),
+                Err(error)
+                    if error
+                        .downcast_ref::<lexical_resume::Incompatible>()
+                        .is_some() =>
+                {
+                    format!("{error:#}")
+                }
+                // I/O failures and a moving canonical snapshot are retryable;
+                // they never authorize discarding durable work.
+                Err(error) => return Err(error),
+            }
+        } else {
+            "archive identity, lexical configuration, or checkpoint contract changed".to_string()
+        };
+        let scratch = staged_lexical_rebuild_scratch_path(&index_path);
+        let quarantine = match fs::symlink_metadata(&scratch) {
+            Ok(_) => {
+                let quarantine = lexical_publish::quarantine_incomplete_candidate(&scratch)?;
+                // The audit may have durably committed a new batch before
+                // discovering a changed older document; retain its latest state.
+                let retained = load_lexical_rebuild_state(&index_path)?.unwrap_or(state);
+                persist_lexical_rebuild_state(&quarantine, &retained)?;
+                quarantine
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                retain_missing_lexical_candidate_checkpoint(&index_path, &state)?
+            }
+            Err(error) => return Err(error).context("inspecting guarded lexical resume candidate"),
+        };
+        tracing::warn!(
+            reason = %incompatible,
+            quarantine_path = %quarantine.display(),
+            "guarded lexical resume rejected; retained the candidate and rebuilding off-live"
+        );
+        let fresh = LexicalRebuildState::new(
+            deferred_lexical_rebuild_db_state(db_path, total_conversations),
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        persist_lexical_rebuild_state_for_active_run_start(&index_path, &fresh)?;
+    }
     let prep_profile = std::env::var_os("CASS_PREP_PROFILE").is_some();
     let prep_started = Instant::now();
     let mut prep_step_started = Instant::now();
@@ -27535,6 +27985,7 @@ fn rebuild_tantivy_from_db_once(
         *step_started = Instant::now();
     };
 
+    let rebuild_source_epoch = lexical_resume::ArchiveEpoch::capture(db_path)?;
     let storage = FrankenStorage::open_strict_readonly(db_path).with_context(|| {
         format!(
             "opening database for Tantivy rebuild: {}",
@@ -27544,12 +27995,12 @@ fn rebuild_tantivy_from_db_once(
 
     log_prep_step("open_readonly", &mut prep_step_started);
 
-    let index_path = index_dir(data_dir)?;
     let db_state = if options.defer_initial_content_fingerprint {
         deferred_lexical_rebuild_db_state(db_path, total_conversations)
     } else {
         lexical_rebuild_db_state_with_total_conversations(&storage, db_path, total_conversations)?
     };
+    rebuild_source_epoch.verify(db_path)?;
 
     log_prep_step(
         if options.defer_initial_content_fingerprint {
@@ -27585,7 +28036,7 @@ fn rebuild_tantivy_from_db_once(
                             .execution_mode
                             .map_or("legacy_unspecified", LexicalRebuildExecutionMode::as_str),
                         processed_conversations = state.reported_processed_conversations(),
-                    "discarding non-resumable lexical rebuild checkpoint and restarting from zero"
+                    "unverified legacy or non-resumable lexical prefix requires an off-live rebuild"
                     );
                     LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
                 } else {
@@ -27629,6 +28080,10 @@ fn rebuild_tantivy_from_db_once(
             rebuild_state.processed_conversations,
         )
         .run("reuse_completed_generation", || {
+            anyhow::ensure!(
+                index_meta_fingerprint(&index_path)? == rebuild_state.committed_meta_fingerprint,
+                "completed lexical checkpoint no longer identifies the live native generation"
+            );
             crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
             verify_published_lexical_doc_count(
                 &index_path,
@@ -27645,6 +28100,7 @@ fn rebuild_tantivy_from_db_once(
                 db_path.display()
             )
         })?;
+        rebuild_source_epoch.verify(db_path)?;
         if let Some(p) = &progress {
             p.phase.store(0, Ordering::Relaxed);
             p.is_rebuilding.store(false, Ordering::Relaxed);
@@ -27727,16 +28183,31 @@ fn rebuild_tantivy_from_db_once(
     // rebuild restart from zero — the exact failure #380 reports.
     let scratch_path = staged_lexical_rebuild_scratch_path(&index_path);
     let mut staged_build_path = if restart_from_zero && !will_use_atomic_staged_publish {
-        // Fresh staged build: discard any scratch left by an abandoned run.
-        if let Err(err) = fs::remove_dir_all(&scratch_path)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(err).with_context(|| {
-                format!(
-                    "clearing stale staged rebuild scratch {}",
-                    scratch_path.display()
-                )
-            });
+        // Preserve abandoned or corrupt candidates as evidence before starting
+        // over. In particular, malformed checkpoint JSON is not permission to
+        // delete the only durable work from an interrupted run.
+        match fs::symlink_metadata(&scratch_path) {
+            Ok(_) => {
+                let quarantine = lexical_publish::quarantine_incomplete_candidate(&scratch_path)?;
+                let checkpoint = lexical_rebuild_state_path(&index_path);
+                if fs::symlink_metadata(&checkpoint).is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.len() <= LEXICAL_REBUILD_STATE_MAX_BYTES
+                }) {
+                    let retained_checkpoint = lexical_rebuild_state_path(&quarantine);
+                    fs::copy(&checkpoint, &retained_checkpoint)
+                        .context("retaining abandoned lexical checkpoint evidence")?;
+                    File::open(&retained_checkpoint)?.sync_all()?;
+                    sync_parent_directory(&retained_checkpoint)?;
+                }
+                tracing::info!(
+                    quarantine_path = %quarantine.display(),
+                    "retained abandoned lexical rebuild candidate before fresh replay"
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("inspecting abandoned lexical rebuild candidate");
+            }
         }
         fs::create_dir_all(&scratch_path).with_context(|| {
             format!(
@@ -27762,7 +28233,7 @@ fn rebuild_tantivy_from_db_once(
         // `completed`. Resuming into it would publish the older index back over
         // the newer one and then record that as a completed rebuild. Requiring
         // an incomplete checkpoint keeps that debris out of the publish path;
-        // it is discarded by the next from-zero rebuild's wipe above.
+        // it is retained by the next from-zero rebuild's quarantine above.
         Some(scratch_path.clone())
     } else {
         None
@@ -27857,6 +28328,9 @@ fn rebuild_tantivy_from_db_once(
     } else {
         LexicalRebuildExecutionMode::LiveSingleIndex
     });
+    if restart_from_zero && staged_build_path.is_some() {
+        rebuild_state.resume_binding = lexical_resume::Binding::capture(db_path)?;
+    }
     let resumed_from_checkpoint = rebuild_state.processed_conversations > 0;
     log_prep_step("restart_from_zero_reset", &mut prep_step_started);
     let batch_conversation_limit = lexical_rebuild_batch_fetch_conversation_limit(page_size);
@@ -28739,7 +29213,24 @@ fn rebuild_tantivy_from_db_once(
         indexed_docs,
         processed_conversations,
     );
-    publication.run("commit_candidate", || t_index.commit())?;
+    // GH #496: the final ingest tail needs the same durable pending -> native
+    // commit -> checkpoint boundary as every earlier batch. A bare commit here
+    // stranded unrecorded documents if the process died during the subsequent
+    // fold; exact recovery then had to refuse the whole candidate.
+    publication.run("commit_candidate", || {
+        commit_lexical_rebuild_progress(
+            &index_path,
+            &build_path,
+            &mut rebuild_state,
+            last_processed_conversation_id,
+            processed_conversations,
+            indexed_docs,
+            &latest_pipeline_runtime,
+            &mut t_index,
+            true,
+            perf_profile.as_mut(),
+        )
+    })?;
     if let Some(p) = &progress {
         p.tick_activity();
     }
@@ -28844,6 +29335,9 @@ fn rebuild_tantivy_from_db_once(
     } else {
         observed_messages.max(indexed_docs)
     };
+    publication.run("verify_canonical_generation", || {
+        rebuild_source_epoch.verify(db_path)
+    })?;
     publication.run("close_canonical_reader", || {
         storage.close_without_checkpoint().with_context(|| {
             format!(
@@ -28901,6 +29395,7 @@ fn rebuild_tantivy_from_db_once(
         // not a cached fingerprint taken before the writer was dropped.
         index_meta_fingerprint(&build_path)
     })?;
+    rebuild_state.completed_source_epoch = Some(rebuild_source_epoch.clone());
     rebuild_state.mark_completed(completed_fingerprint);
     publication.run("persist_completed_checkpoint", || {
         persist_lexical_rebuild_state(&build_path, &rebuild_state)
@@ -28918,6 +29413,10 @@ fn rebuild_tantivy_from_db_once(
     // of discarding its ingestion progress or adopting the prior-live scratch.
     if let Some(staged) = staged_build_path.as_ref() {
         publication.run("publish_staged_generation", || {
+            // The candidate receipt describes the captured source generation.
+            // A writer advancing the archive while we build must leave this
+            // candidate resumable, never certify that newer, unprocessed data.
+            rebuild_source_epoch.verify(db_path)?;
             publish_staged_lexical_index(staged, &index_path)
         })?;
     }
@@ -45154,6 +45653,8 @@ pub mod persist {
 mod tests {
     include!("gh473_tests.rs");
     include!("gh494_tests.rs");
+    include!("gh496_tests.rs");
+    include!("gh496_completed_tests.rs");
     use super::*;
     use crate::connectors::{
         Connector, DetectionResult, NormalizedConversation, NormalizedMessage, ScanContext,
@@ -65463,6 +65964,7 @@ c.close()
                 None,
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
+                    force_fresh: false,
                 },
                 None,
             )
@@ -65529,6 +66031,7 @@ c.close()
             None,
             LexicalRebuildStartupOptions {
                 defer_initial_content_fingerprint: true,
+                force_fresh: false,
             },
             None,
         )
@@ -65684,6 +66187,7 @@ c.close()
                 None,
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
+                    force_fresh: false,
                 },
                 None,
             )
@@ -65807,6 +66311,7 @@ c.close()
                 None,
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
+                    force_fresh: false,
                 },
                 None,
             )
@@ -65927,6 +66432,7 @@ c.close()
                 None,
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
+                    force_fresh: false,
                 },
                 None,
             )
@@ -67922,6 +68428,7 @@ c.close()
                 None,
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
+                    force_fresh: false,
                 },
                 None,
             )
@@ -77633,25 +78140,15 @@ c.close()
     }
 
     #[test]
+    #[serial_test::serial]
     fn matching_lexical_rebuild_state_status_recognizes_completed_checkpoint() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        fs::create_dir_all(&data_dir).unwrap();
-        let db_path = data_dir.join("agent_search.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-
-        let db_state = lexical_rebuild_db_state(&storage, &db_path).unwrap();
-        let index_path = index_dir(&data_dir).unwrap();
-        let mut state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
-        state.mark_completed(Some("stable-meta".to_string()));
-        persist_lexical_rebuild_state(&index_path, &state).unwrap();
-
-        let status = matching_lexical_rebuild_state_status(&index_path, &db_state).unwrap();
+        let (_tmp, _data_dir, _db_path, index_path) = gh494_publication_receipt_fixture();
+        let state = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+        let status = matching_lexical_rebuild_state_status(&index_path, &state.db).unwrap();
         assert!(!status.has_pending_resume);
         assert!(status.has_completed_checkpoint);
-        assert_eq!(status.completed_indexed_docs, Some(0));
-        assert_eq!(status.completed_exact_totals, Some((0, 0)));
+        assert_eq!(status.completed_indexed_docs, Some(4));
+        assert_eq!(status.completed_exact_totals, Some((2, 4)));
     }
 
     #[test]
@@ -77677,38 +78174,25 @@ c.close()
     }
 
     #[test]
+    #[serial_test::serial]
     fn completed_checkpoint_can_match_without_content_fingerprint() {
-        let tmp = TempDir::new().unwrap();
-        let db_path = tmp.path().join("agent_search.db");
-        fs::write(&db_path, b"db").unwrap();
-        let index_path = tmp.path().join("index");
-        fs::create_dir_all(&index_path).unwrap();
-
-        let checkpoint_db_state = LexicalRebuildDbState {
-            db_path: db_path.to_string_lossy().into_owned(),
-            total_conversations: 7,
-            total_messages: 0,
-            storage_fingerprint: "content-v1:7:42:42".to_string(),
-        };
-        let mut state = LexicalRebuildState::new(checkpoint_db_state, LEXICAL_REBUILD_PAGE_SIZE);
-        state.indexed_docs = 42;
-        state.mark_completed(Some("meta-fingerprint".to_string()));
-        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+        let (_tmp, _data_dir, db_path, index_path) = gh494_publication_receipt_fixture();
+        let mut state = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
 
         let status = matching_completed_lexical_rebuild_state_status_without_fingerprint(
             &index_path,
             &db_path,
-            7,
+            2,
         )
         .unwrap()
-        .expect("completed checkpoints do not need an exact storage fingerprint");
+        .expect("certified checkpoints do not need another storage fingerprint query");
 
         assert!(status.has_completed_checkpoint);
-        assert_eq!(status.completed_indexed_docs, Some(42));
-        assert_eq!(status.completed_exact_totals, Some((7, 42)));
+        assert_eq!(status.completed_indexed_docs, Some(4));
+        assert_eq!(status.completed_exact_totals, Some((2, 4)));
         assert_eq!(
             status.completed_storage_fingerprint.as_deref(),
-            Some("content-v1:7:42:42")
+            Some(state.db.storage_fingerprint.as_str())
         );
 
         state.execution_mode = None;
@@ -77716,12 +78200,12 @@ c.close()
         let legacy_status = matching_completed_lexical_rebuild_state_status_without_fingerprint(
             &index_path,
             &db_path,
-            7,
+            2,
         )
         .unwrap()
-        .expect("completed legacy checkpoints retain shared-writer semantics");
+        .expect("certified checkpoints with omitted mode retain shared-writer semantics");
         assert!(legacy_status.has_completed_checkpoint);
-        assert_eq!(legacy_status.completed_indexed_docs, Some(42));
+        assert_eq!(legacy_status.completed_indexed_docs, Some(4));
     }
 
     #[test]

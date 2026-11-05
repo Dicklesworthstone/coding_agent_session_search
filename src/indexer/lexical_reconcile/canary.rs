@@ -1,6 +1,6 @@
 //! Verify a precise endpoint message, not whichever conversation ranks first.
 
-pub(super) mod exact;
+pub(in crate::indexer) mod exact;
 
 // Retain the previous ranked verifier only as an independent regression
 // comparator. Production resolves exact identities on one native snapshot.

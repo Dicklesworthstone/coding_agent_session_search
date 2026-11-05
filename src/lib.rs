@@ -23540,13 +23540,15 @@ fn state_meta_json_inner(
                 .unwrap_or(true)
         })
     {
-        assets.lexical.status = "stale";
         assets.lexical.fresh = false;
         assets.lexical.stale = true;
-        assets.lexical.status_reason = Some(
-            "last_scan_ts is newer than last_indexed_at; a prior scan advanced without a completed projection into the searchable index"
-                .to_string(),
-        );
+        if matches!(assets.lexical.status, "ready" | "stale" | "unverified") {
+            assets.lexical.status = "stale";
+            assets.lexical.status_reason = Some(
+                "last_scan_ts is newer than last_indexed_at; a prior scan advanced without a completed projection into the searchable index"
+                    .to_string(),
+            );
+        }
     }
     // A lease heartbeat and a recent timestamp cannot certify publication
     // while source replay remains durable. An unsuccessful requested probe
@@ -23562,7 +23564,7 @@ fn state_meta_json_inner(
         assets.lexical.fresh = false;
         assets.lexical.stale = true;
         // Do not replace stronger missing/corrupt/hollow/rebuilding verdicts.
-        if matches!(assets.lexical.status, "ready" | "stale") {
+        if matches!(assets.lexical.status, "ready" | "stale" | "unverified") {
             assets.lexical.status = "stale";
             assets.lexical.status_reason = Some(
                 if watch_lexical_replay_pending == Some(true) {
@@ -24596,10 +24598,9 @@ fn lexical_readiness_from_state(
     if status == "error" {
         return LexicalReadinessState::CorruptQuarantined;
     }
-    // b4uax (gh#382): a legacy Tantivy generation exists on disk but no
-    // reader can open it. Search is unavailable until the rebuild runs, so it
-    // is the Missing class (repair now), never "stale but searchable".
-    if status == "legacy_engine"
+    // An engine or archive/projection incompatibility requires a rebuild;
+    // a foreign archive's readable generation is not searchable for this DB.
+    if matches!(status, "legacy_engine" | "incompatible")
         || index
             .and_then(|idx| idx.get("engine_incompatible"))
             .and_then(|value| value.as_bool())
@@ -24938,7 +24939,10 @@ fn readiness_recommended_commands(
         return commands;
     }
 
-    if !index_exists || index_empty_with_messages {
+    if !index_exists
+        || index_empty_with_messages
+        || state_index_status(state) == Some("incompatible")
+    {
         commands.push(readiness_command_recommendation(
             ReadinessCommandRecommendation {
                 id: "rebuild-lexical-index",
@@ -24949,7 +24953,7 @@ fn readiness_recommended_commands(
                 ),
                 purpose: "Rebuild the lexical search index from the cass archive.",
                 safety: "writes-derived-index",
-                run_when: "Run when the archive exists but the lexical index is missing or empty.",
+                run_when: "Run when the archive exists but the lexical index is missing, empty, or belongs to an incompatible archive or projection configuration.",
                 success_signal: "success=true, then health/status report index.exists=true",
                 parse_fields: &["success", "indexing_stats", "error"],
                 retry_after_ms: None,
@@ -24970,7 +24974,7 @@ fn readiness_recommended_commands(
         return commands;
     }
 
-    if !index_fresh || pending_sessions > 0 {
+    if (!index_fresh && state_index_status(state) != Some("unverified")) || pending_sessions > 0 {
         commands.push(readiness_command_recommendation(
             ReadinessCommandRecommendation {
                 id: "refresh-lexical-index",
@@ -25220,6 +25224,52 @@ mod readiness_projection_tests {
             lexical_readiness_from_state(&ready, false),
             LexicalReadinessState::Ready
         );
+    }
+
+    #[test]
+    fn gh496_readiness_distinguishes_unverified_and_incompatible_sources() {
+        use crate::search::readiness::LexicalReadinessState;
+        let mut state = json!({
+            "index": { "exists": true, "status": "unverified", "fresh": false, "stale": false },
+            "database": { "exists": true, "opened": true },
+            "pending": { "sessions": 0 },
+            "rebuild": { "active": false }
+        });
+        assert!(super::lexical_readiness_from_state(&state, false).is_searchable());
+        let data_dir = std::path::Path::new("/archive");
+        let db_path = data_dir.join("agent_search.db");
+        let commands = super::readiness_recommended_commands(
+            data_dir,
+            &db_path,
+            &state,
+            "unhealthy",
+            false,
+            false,
+            None,
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|command| command["id"] != "refresh-lexical-index")
+        );
+
+        state["index"]["status"] = json!("incompatible");
+        state["index"]["stale"] = json!(true);
+        assert_eq!(
+            super::lexical_readiness_from_state(&state, false),
+            LexicalReadinessState::Missing
+        );
+        let commands = super::readiness_recommended_commands(
+            data_dir,
+            &db_path,
+            &state,
+            "unhealthy",
+            false,
+            false,
+            None,
+        );
+        assert_eq!(commands[0]["id"], "rebuild-lexical-index");
+        assert!(commands[0]["command"].as_str().unwrap().contains("--full"));
     }
 }
 
@@ -29648,6 +29698,24 @@ fn search_lexical_checkpoint_diagnosis(
             "lexical checkpoint does not carry a completed canonical storage fingerprint",
         )));
     }
+    let completion_freshness = crate::indexer::completed_lexical_checkpoint_freshness(
+        index_path,
+        db_path,
+        &checkpoint,
+    )
+    .unwrap_or_else(|error| {
+        tracing::debug!(%error, "lexical completion freshness could not be passively verified");
+        crate::indexer::LexicalCheckpointFreshness::Unverified(
+            "lexical completion evidence is unavailable; content verification is required",
+        )
+    });
+    match completion_freshness {
+        crate::indexer::LexicalCheckpointFreshness::Current => return Ok(None),
+        crate::indexer::LexicalCheckpointFreshness::Incompatible(reason) => {
+            return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(reason)));
+        }
+        _ => {}
+    }
     // Memoized on the archive's physical identity: the uncached variant opens
     // a synchronous storage handle that replays the whole WAL on a large
     // archive, which cost every default `cass search` ~4 s before the engine
@@ -29656,6 +29724,11 @@ fn search_lexical_checkpoint_diagnosis(
         crate::indexer::lexical_storage_fingerprint_for_db_cached(db_path, index_path);
     let current_storage_fingerprint = match cached_fingerprint {
         Ok(fingerprint) => fingerprint,
+        Err(err) if crate::indexer::lexical_fingerprint_observation_changed(&err) => {
+            return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
+                "canonical archive changed during freshness observation; content verification is deferred",
+            )));
+        }
         Err(err) => {
             // Historical duplicate rows for the derived FTS table can stop
             // the strict reader before it reaches canonical conversations.
@@ -29707,7 +29780,14 @@ fn search_lexical_checkpoint_diagnosis(
         )));
     }
 
-    Ok(None)
+    // A count/ID fingerprint can still match after an in-place content edit.
+    // It must not erase the source/native evidence verdict. Epoch drift alone
+    // is unverified, not proof of missing content: serve the readable index
+    // without an inline audit; ordinary age/count/source cadence still drive
+    // background maintenance.
+    Ok(completion_freshness
+        .reason()
+        .map(SearchLexicalSelfHealDiagnosis::existing_index))
 }
 
 fn search_active_rebuild_wait_duration(timeout_ms: Option<u64>, started_at: Instant) -> Duration {
@@ -30005,7 +30085,21 @@ fn search_lexical_read_only_diagnosis(
     // checkpoint a dirty WAL or repair duplicate schema rows. A strict read is
     // allowed to serve the last published generation and truthfully report its
     // passive metadata; freshness repair belongs to a mutating invocation.
-    Ok(None)
+    let freshness =
+        crate::indexer::completed_lexical_checkpoint_freshness(index_path, db_path, &checkpoint)
+            .unwrap_or(crate::indexer::LexicalCheckpointFreshness::Unverified(
+                "lexical completion evidence is unavailable; content verification is required",
+            ));
+    Ok(match freshness {
+        crate::indexer::LexicalCheckpointFreshness::Current => None,
+        crate::indexer::LexicalCheckpointFreshness::Incompatible(reason) => {
+            Some(SearchLexicalSelfHealDiagnosis::rebuild(reason))
+        }
+        crate::indexer::LexicalCheckpointFreshness::Unverified(reason)
+        | crate::indexer::LexicalCheckpointFreshness::Stale(reason) => {
+            Some(SearchLexicalSelfHealDiagnosis::existing_index(reason))
+        }
+    })
 }
 
 fn inspect_lexical_assets_for_search_read_only(
@@ -30064,7 +30158,7 @@ fn inspect_lexical_assets_for_search_read_only(
         tracing::warn!(
             reason = %diagnosis.reason,
             data_dir = %data_dir.display(),
-            "--no-maintenance is using the readable lexical index without changing its stale checkpoint metadata"
+            "--no-maintenance is using the readable lexical index without changing its checkpoint evidence"
         );
         return Ok((
             SearchLexicalSelfHeal {
@@ -30392,7 +30486,7 @@ fn ensure_lexical_assets_for_search_admitting(
             data_dir = %data_dir.display(),
             db_path = %db_path.display(),
             next_step,
-            "search detected stale lexical checkpoint metadata; using existing readable lexical index and deferring heavyweight repair"
+            "lexical freshness could not be confirmed; using existing readable lexical index and deferring heavyweight repair"
         );
         return Ok((
             SearchLexicalSelfHeal {
@@ -31212,7 +31306,7 @@ mod search_lexical_self_heal_tests {
     }
 
     #[test]
-    fn search_self_heal_refreshes_stale_checkpoint_when_live_index_matches_db() {
+    fn search_self_heal_revalidates_stale_checkpoint_before_certifying_live_index() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
         let db_path = seed_canonical_search_db(data_dir);
@@ -31248,14 +31342,138 @@ mod search_lexical_self_heal_tests {
             false,
             false,
         )
-        .expect("search self-heal should refresh checkpoint");
-        assert_eq!(repair.action, "refreshed-checkpoint");
+        .expect("search self-heal should verify canonical content before restoring proof");
+        assert_eq!(repair.action, "rebuilt-from-canonical-db");
 
         let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
             .expect("load repaired checkpoint")
             .expect("checkpoint present");
         assert_eq!(checkpoint.schema_hash, crate::search::tantivy::SCHEMA_HASH);
         assert!(checkpoint.completed);
+        assert_eq!(
+            crate::indexer::completed_lexical_checkpoint_freshness(
+                &index_path,
+                &db_path,
+                &checkpoint,
+            )
+            .expect("verified completion proof"),
+            crate::indexer::LexicalCheckpointFreshness::Current
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn gh496_repeated_reads_defer_epoch_verification_without_rebuilding() {
+        for mutation in ["metadata", "same-count-content"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let data_dir = temp.path();
+            let db_path = seed_canonical_search_db(data_dir);
+            let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+            ensure_lexical_assets_for_search(
+                data_dir,
+                &db_path,
+                &index_path,
+                None,
+                Instant::now(),
+                false,
+                false,
+            )
+            .expect("build completed generation");
+            let checkpoint_path = index_path.join(".lexical-rebuild-state.json");
+            let checkpoint_bytes = std::fs::read(&checkpoint_path).expect("read checkpoint");
+            let manifest_bytes = std::fs::read(index_path.join("MANIFEST")).expect("read manifest");
+            let storage = FrankenStorage::open(&db_path).expect("open ordinary writer");
+            if mutation == "metadata" {
+                storage
+                    .set_last_indexed_at(FrankenStorage::now_millis())
+                    .unwrap();
+            } else {
+                storage
+                    .raw()
+                    .execute("UPDATE messages SET content = 'samecountfreshnessrewrite'")
+                    .unwrap();
+            }
+            storage.close_without_checkpoint().unwrap();
+
+            for _ in 0..3 {
+                let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
+                    .expect("diagnose bounded freshness")
+                    .expect("an unverified epoch must not be reported as current");
+                assert!(diagnosis.existing_index_search_allowed, "{mutation}");
+                assert!(!diagnosis.checkpoint_refresh_allowed, "{mutation}");
+                assert!(
+                    diagnosis.reason.contains("source epoch"),
+                    "{mutation}: {}",
+                    diagnosis.reason
+                );
+                let repair = ensure_lexical_assets_for_search(
+                    data_dir,
+                    &db_path,
+                    &index_path,
+                    None,
+                    Instant::now(),
+                    false,
+                    false,
+                )
+                .expect("readable publication must not require an inline content audit");
+                assert_eq!(
+                    repair.action, "deferred-repair-searching-existing-index",
+                    "{mutation}"
+                );
+                assert_eq!(repair.indexed_docs, None);
+            }
+            assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_bytes);
+            assert_eq!(
+                std::fs::read(index_path.join("MANIFEST")).unwrap(),
+                manifest_bytes
+            );
+
+            let before_strict_read = data_tree_snapshot(data_dir);
+            let (strict, opened) =
+                inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
+                    .expect("strict read must serve a complete unverified generation");
+            assert_eq!(strict.action, "no-maintenance-searching-existing-index");
+            assert!(opened.is_some());
+            assert_eq!(data_tree_snapshot(data_dir), before_strict_read);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn gh496_search_rejects_a_different_archive_at_the_same_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+            false,
+        )
+        .expect("build original generation");
+        let replacement_path = data_dir.join("replacement.db");
+        seed_search_db_at(
+            &replacement_path,
+            "differentarchivefreshnessneedle",
+            "replacement-conversation",
+        );
+        std::fs::rename(&db_path, data_dir.join("retained-original.db")).unwrap();
+        std::fs::rename(replacement_path, &db_path).unwrap();
+        let before = data_tree_snapshot(data_dir);
+        let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
+            .expect("diagnose replacement")
+            .expect("replacement must require a canonical rebuild");
+        assert!(!diagnosis.existing_index_search_allowed);
+        assert!(!diagnosis.checkpoint_refresh_allowed);
+        assert!(diagnosis.reason.contains("archive identity"));
+        let error = inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
+            .expect_err("strict read must not serve a different archive's documents");
+        assert_eq!(error.kind, "maintenance-required");
+        assert_eq!(data_tree_snapshot(data_dir), before);
     }
 
     #[test]
@@ -89364,6 +89582,10 @@ fn state_index_manifest_corrupt(state: &serde_json::Value) -> bool {
         )
 }
 
+fn state_index_status(state: &serde_json::Value) -> Option<&str> {
+    state.get("index")?.get("status")?.as_str()
+}
+
 /// Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy.
 /// Designed for agent pre-flight checks before complex operations.
 ///
@@ -89561,6 +89783,14 @@ fn run_health(
         errors.push(HOLLOW_INDEX_HEALTH_ERROR.to_string());
     } else if state_index_manifest_corrupt(&state) {
         errors.push(CORRUPT_MANIFEST_HEALTH_ERROR.to_string());
+    } else if state_index_status(&state) == Some("incompatible") {
+        errors
+            .push("index archive identity or projection configuration is incompatible".to_string());
+    } else if state_index_status(&state) == Some("unverified") {
+        errors.push(
+            "index source freshness is unverified; the published generation remains searchable"
+                .to_string(),
+        );
     } else if index_exists && !index_fresh && !not_initialized {
         errors.push("index stale".to_string());
     }

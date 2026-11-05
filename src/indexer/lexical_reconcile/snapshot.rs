@@ -4,13 +4,13 @@ use anyhow::{Context, Result};
 
 use crate::franken_sync::Connection;
 
-pub(super) struct CanonicalSnapshot<'a> {
+pub(in crate::indexer) struct CanonicalSnapshot<'a> {
     connection: &'a Connection,
     active: bool,
 }
 
 impl<'a> CanonicalSnapshot<'a> {
-    pub(super) fn begin(connection: &'a Connection) -> Result<Self> {
+    pub(in crate::indexer) fn begin(connection: &'a Connection) -> Result<Self> {
         connection
             .execute("BEGIN DEFERRED")
             .context("begin canonical lexical reconcile snapshot")?;
@@ -20,7 +20,7 @@ impl<'a> CanonicalSnapshot<'a> {
         })
     }
 
-    pub(super) fn release(mut self) -> Result<()> {
+    pub(in crate::indexer) fn release(mut self) -> Result<()> {
         self.connection
             .execute("ROLLBACK")
             .context("release canonical lexical reconcile snapshot")?;

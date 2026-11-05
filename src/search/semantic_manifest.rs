@@ -199,6 +199,54 @@ pub struct ArtifactRecord {
     pub ready: bool,
 }
 
+/// A complete historical generation that may be served while later canonical
+/// mutations are reconciled. File authentication and candidate validation are
+/// still required; a certificate is not authority for an arbitrary vector file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticCoverageCertificate {
+    pub artifact_path: String,
+    pub artifact_sha256: String,
+    pub parent_path: String,
+    pub parent_sha256: String,
+    pub parent_count: u64,
+    pub archive_id: String,
+    pub mutation_seq: u64,
+    pub max_message_id: i64,
+    pub db_fingerprint: String,
+    pub vector_space_revision: String,
+    pub published_at_ms: i64,
+    pub doc_count: u64,
+}
+
+impl SemanticCoverageCertificate {
+    /// Check the complete ledger binding before granting partial-serving
+    /// authority. Digests use canonical lowercase hex and contained paths.
+    pub fn matches_artifact(&self, artifact: &ArtifactRecord) -> bool {
+        let lower_hex = |value: &str, length: usize| {
+            value.len() == length
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        artifact.ready
+            && lower_hex(&self.archive_id, 32)
+            && lower_hex(&self.artifact_sha256, 64)
+            && lower_hex(&self.parent_sha256, 64)
+            && self.mutation_seq <= i64::MAX as u64
+            && self.max_message_id >= 0
+            && self.published_at_ms >= 0
+            && !self.db_fingerprint.is_empty()
+            && !self.vector_space_revision.trim().is_empty()
+            && self.vector_space_revision.trim() == self.vector_space_revision
+            && self.artifact_path == format!("vector_index/served/{}.fsvi", self.artifact_sha256)
+            && self.parent_path == format!("vector_index/served/{}.parents", self.parent_sha256)
+            && artifact.index_path == self.artifact_path
+            && artifact.db_fingerprint == self.db_fingerprint
+            && artifact.doc_count == self.doc_count
+            && artifact.completed_at_ms == self.published_at_ms
+    }
+}
+
 impl ArtifactRecord {
     /// Convert to the policy-level manifest for invalidation checks.
     pub fn to_policy_manifest(&self) -> PolicyManifest {
@@ -776,6 +824,9 @@ pub struct SemanticManifest {
     pub quality_tier: Option<ArtifactRecord>,
     /// HNSW accelerator index.
     pub hnsw: Option<HnswRecord>,
+    /// Per-embedder historical coverage. Older ledgers have no serving proof.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub coverage: BTreeMap<String, SemanticCoverageCertificate>,
     /// Backlog / progress tracker.
     pub backlog: BacklogLedger,
     /// Active build checkpoint (for resuming interrupted work).
@@ -791,6 +842,7 @@ impl Default for SemanticManifest {
             fast_tier: None,
             quality_tier: None,
             hnsw: None,
+            coverage: BTreeMap::new(),
             backlog: BacklogLedger {
                 total_conversations: 0,
                 fast_tier_processed: 0,
@@ -893,6 +945,47 @@ impl SemanticManifest {
 
     /// Atomically save the manifest to disk (write-to-temp then rename).
     pub fn save(&mut self, data_dir: &Path) -> Result<(), ManifestError> {
+        let _guard = Self::lock_for_save(data_dir)?;
+        self.save_under_lock(data_dir)
+    }
+
+    /// Replace the entire ledger only if it still equals the state admitted by
+    /// this writer. The comparison and durable replacement share one lock, so
+    /// a stale tier or checkpoint publisher cannot erase another publication.
+    pub fn save_if_unchanged(
+        &mut self,
+        data_dir: &Path,
+        expected: Option<&Self>,
+    ) -> Result<(), ManifestError> {
+        let _guard = Self::lock_for_save(data_dir)?;
+        let current = Self::load(data_dir)?;
+        if current.as_ref() != expected {
+            return Err(ManifestError::ConcurrentUpdate {
+                path: Self::path(data_dir),
+            });
+        }
+        self.save_under_lock(data_dir)
+    }
+
+    fn lock_for_save(data_dir: &Path) -> Result<SemanticPublishLock, ManifestError> {
+        let root = data_dir.join("vector_index");
+        fs::create_dir_all(&root).map_err(|error| ManifestError::Io {
+            path: root.clone(),
+            source: error.to_string(),
+        })?;
+        let path = root.join("semantic_manifest.json.lock");
+        let file = open_semantic_publish_lock(&root, &path).map_err(|error| ManifestError::Io {
+            path: path.clone(),
+            source: error.to_string(),
+        })?;
+        file.lock_exclusive().map_err(|error| ManifestError::Io {
+            path,
+            source: error.to_string(),
+        })?;
+        Ok(SemanticPublishLock(file))
+    }
+
+    fn save_under_lock(&mut self, data_dir: &Path) -> Result<(), ManifestError> {
         let path = Self::path(data_dir);
 
         // Ensure parent directory exists.
@@ -1041,6 +1134,14 @@ impl SemanticManifest {
 
     /// Record a completed artifact and clear the matching checkpoint.
     pub fn publish_artifact(&mut self, artifact: ArtifactRecord) {
+        let previous = match artifact.tier {
+            TierKind::Fast => self.fast_tier.as_ref(),
+            TierKind::Quality => self.quality_tier.as_ref(),
+        };
+        if let Some(previous) = previous {
+            self.coverage.remove(&previous.embedder_id);
+        }
+        self.coverage.remove(&artifact.embedder_id);
         // Clear checkpoint if it matches this tier.
         if self
             .checkpoint
@@ -1054,6 +1155,37 @@ impl SemanticManifest {
             TierKind::Fast => self.fast_tier = Some(artifact),
             TierKind::Quality => self.quality_tier = Some(artifact),
         }
+    }
+
+    /// Bind a newly authenticated complete generation without allowing a late
+    /// publisher to regress a newer boundary in the same archive/vector space.
+    pub fn publish_covered_artifact(
+        &mut self,
+        artifact: ArtifactRecord,
+        certificate: SemanticCoverageCertificate,
+    ) -> Result<(), ManifestError> {
+        if !certificate.matches_artifact(&artifact) {
+            return Err(ManifestError::InvalidCoverage {
+                reason: "coverage certificate does not match its artifact".to_owned(),
+            });
+        }
+        if self
+            .coverage
+            .get(&artifact.embedder_id)
+            .is_some_and(|prior| {
+                prior.archive_id == certificate.archive_id
+                    && prior.mutation_seq > certificate.mutation_seq
+            })
+        {
+            return Err(ManifestError::InvalidCoverage {
+                reason: "coverage publication would regress its canonical mutation boundary"
+                    .to_owned(),
+            });
+        }
+        let embedder_id = artifact.embedder_id.clone();
+        self.publish_artifact(artifact);
+        self.coverage.insert(embedder_id, certificate);
+        Ok(())
     }
 
     /// Record a completed HNSW accelerator.
@@ -1094,9 +1226,20 @@ impl SemanticManifest {
         };
 
         match tier {
-            TierKind::Fast => self.fast_tier = Some(record),
-            TierKind::Quality => self.quality_tier = Some(record),
+            TierKind::Fast => {
+                if let Some(previous) = &self.fast_tier {
+                    self.coverage.remove(&previous.embedder_id);
+                }
+                self.fast_tier = Some(record);
+            }
+            TierKind::Quality => {
+                if let Some(previous) = &self.quality_tier {
+                    self.coverage.remove(&previous.embedder_id);
+                }
+                self.quality_tier = Some(record);
+            }
         }
+        self.coverage.remove(embedder_id);
         true
     }
 
@@ -4601,6 +4744,8 @@ pub enum ManifestError {
     Parse { path: PathBuf, source: String },
     Serialize { source: String },
     UnsupportedVersion { found: u32, max_supported: u32 },
+    ConcurrentUpdate { path: PathBuf },
+    InvalidCoverage { reason: String },
 }
 
 impl std::fmt::Display for ManifestError {
@@ -4613,6 +4758,12 @@ impl std::fmt::Display for ManifestError {
                 write!(f, "manifest parse error at {}: {source}", path.display())
             }
             Self::Serialize { source } => write!(f, "manifest serialization error: {source}"),
+            Self::ConcurrentUpdate { path } => write!(
+                f,
+                "semantic manifest changed before publication at {}; reload before retrying",
+                path.display()
+            ),
+            Self::InvalidCoverage { reason } => write!(f, "invalid semantic coverage: {reason}"),
             Self::UnsupportedVersion {
                 found,
                 max_supported,
@@ -4828,6 +4979,226 @@ mod tests {
     use super::*;
     use crate::search::policy::SemanticPolicy;
     use proptest::prelude::*;
+
+    fn gh458_covered_artifact(
+        tier: TierKind,
+        mutation_seq: u64,
+    ) -> (ArtifactRecord, SemanticCoverageCertificate) {
+        let mut artifact = test_artifact(tier, true);
+        let digest = "a".repeat(64);
+        artifact.index_path = format!("vector_index/served/{digest}.fsvi");
+        let certificate = SemanticCoverageCertificate {
+            artifact_path: artifact.index_path.clone(),
+            artifact_sha256: digest,
+            parent_path: format!("vector_index/served/{}.parents", "b".repeat(64)),
+            parent_sha256: "b".repeat(64),
+            parent_count: 1000,
+            archive_id: "c".repeat(32),
+            mutation_seq,
+            max_message_id: 1000,
+            db_fingerprint: artifact.db_fingerprint.clone(),
+            vector_space_revision: "gh458-fixture-v1".to_owned(),
+            published_at_ms: artifact.completed_at_ms,
+            doc_count: artifact.doc_count,
+        };
+        (artifact, certificate)
+    }
+
+    #[test]
+    fn gh458_coverage_round_trip_and_legacy_compatibility() {
+        let directory = tempfile::tempdir().unwrap();
+        let (artifact, certificate) = gh458_covered_artifact(TierKind::Fast, 7);
+        let mut manifest = SemanticManifest::default();
+        manifest
+            .publish_covered_artifact(artifact, certificate)
+            .unwrap();
+        manifest.save_if_unchanged(directory.path(), None).unwrap();
+        assert_eq!(
+            SemanticManifest::load(directory.path()).unwrap(),
+            Some(manifest.clone())
+        );
+        let mut legacy = serde_json::to_value(&manifest).unwrap();
+        legacy.as_object_mut().unwrap().remove("coverage");
+        fs::write(
+            SemanticManifest::path(directory.path()),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let legacy = SemanticManifest::load(directory.path()).unwrap().unwrap();
+        assert!(legacy.coverage.is_empty());
+        assert_eq!(legacy.fast_tier, manifest.fast_tier);
+    }
+
+    #[test]
+    fn gh458_plain_publication_retires_prior_coverage() {
+        let (artifact, certificate) = gh458_covered_artifact(TierKind::Fast, 7);
+        let mut manifest = SemanticManifest::default();
+        manifest
+            .publish_covered_artifact(artifact.clone(), certificate)
+            .unwrap();
+        let mut replacement = artifact;
+        replacement.embedder_id = "replacement-embedder".to_owned();
+        manifest.publish_artifact(replacement);
+        assert!(manifest.coverage.is_empty());
+    }
+
+    #[test]
+    fn gh458_coverage_rejects_malformed_and_mismatched_bindings() {
+        let (artifact, certificate) = gh458_covered_artifact(TierKind::Fast, 7);
+        assert!(certificate.matches_artifact(&artifact));
+        for mutation in 0..10 {
+            let mut invalid = certificate.clone();
+            match mutation {
+                0 => invalid.artifact_path = "../escape.fsvi".to_owned(),
+                1 => invalid.parent_path = "vector_index/served/unbound.parents".to_owned(),
+                2 => invalid.artifact_sha256 = "A".repeat(64),
+                3 => invalid.parent_sha256 = "g".repeat(64),
+                4 => invalid.archive_id = "foreign".to_owned(),
+                5 => invalid.mutation_seq = u64::MAX,
+                6 => invalid.max_message_id = -1,
+                7 => invalid.doc_count += 1,
+                8 => invalid.published_at_ms += 1,
+                9 => invalid.vector_space_revision = " ".to_owned(),
+                _ => unreachable!(),
+            }
+            let mut manifest = SemanticManifest::default();
+            let before = manifest.clone();
+            assert!(
+                manifest
+                    .publish_covered_artifact(artifact.clone(), invalid)
+                    .is_err()
+            );
+            assert_eq!(manifest, before, "failed binding mutated the ledger");
+        }
+    }
+
+    #[test]
+    fn gh458_late_load_publisher_cannot_regress_same_archive_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut current = SemanticManifest::default();
+        let (artifact, certificate) = gh458_covered_artifact(TierKind::Fast, 20);
+        current
+            .publish_covered_artifact(artifact, certificate)
+            .unwrap();
+        current.save_if_unchanged(directory.path(), None).unwrap();
+        // This publisher loaded the winning ledger AFTER doing its old work;
+        // an ordinary CAS alone would admit its stale replacement.
+        let mut late = SemanticManifest::load(directory.path()).unwrap().unwrap();
+        let base = late.clone();
+        let (artifact, certificate) = gh458_covered_artifact(TierKind::Fast, 19);
+        assert!(
+            late.publish_covered_artifact(artifact, certificate)
+                .is_err()
+        );
+        assert_eq!(late, base);
+        assert_eq!(
+            SemanticManifest::load(directory.path()).unwrap(),
+            Some(current)
+        );
+    }
+
+    #[test]
+    fn gh458_coverage_allows_equal_boundary_new_archive_and_deletion() {
+        let (artifact, certificate) = gh458_covered_artifact(TierKind::Fast, 20);
+        let mut manifest = SemanticManifest::default();
+        manifest
+            .publish_covered_artifact(artifact.clone(), certificate.clone())
+            .unwrap();
+        manifest
+            .publish_covered_artifact(artifact.clone(), certificate.clone())
+            .unwrap();
+        let mut after_deletion = certificate.clone();
+        after_deletion.mutation_seq += 1;
+        after_deletion.max_message_id = 1;
+        manifest
+            .publish_covered_artifact(artifact.clone(), after_deletion)
+            .unwrap();
+        let mut new_archive = certificate;
+        new_archive.archive_id = "d".repeat(32);
+        new_archive.mutation_seq = 0;
+        manifest
+            .publish_covered_artifact(artifact, new_archive)
+            .unwrap();
+    }
+
+    #[test]
+    fn gh458_full_ledger_cas_rejects_stale_tier_and_checkpoint_writers() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut initial = SemanticManifest::default();
+        initial.save_if_unchanged(directory.path(), None).unwrap();
+        for kind in 0..3 {
+            let expected = SemanticManifest::load(directory.path()).unwrap().unwrap();
+            let mut stale = expected.clone();
+            let mut winner = expected.clone();
+            let (artifact, certificate) = gh458_covered_artifact(TierKind::Fast, 30 + kind);
+            winner
+                .publish_covered_artifact(artifact, certificate)
+                .unwrap();
+            winner
+                .save_if_unchanged(directory.path(), Some(&expected))
+                .unwrap();
+            if kind == 2 {
+                stale.save_checkpoint(test_checkpoint(TierKind::Quality));
+            } else {
+                let tier = if kind == 0 {
+                    TierKind::Fast
+                } else {
+                    TierKind::Quality
+                };
+                let (artifact, certificate) = gh458_covered_artifact(tier, 40);
+                stale
+                    .publish_covered_artifact(artifact, certificate)
+                    .unwrap();
+            }
+            let bytes = fs::read(SemanticManifest::path(directory.path())).unwrap();
+            assert!(matches!(
+                stale.save_if_unchanged(directory.path(), Some(&expected)),
+                Err(ManifestError::ConcurrentUpdate { .. })
+            ));
+            assert_eq!(
+                fs::read(SemanticManifest::path(directory.path())).unwrap(),
+                bytes
+            );
+            assert_eq!(
+                SemanticManifest::load(directory.path()).unwrap(),
+                Some(winner)
+            );
+        }
+    }
+
+    #[test]
+    fn gh458_simultaneous_first_publication_has_one_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writers = [TierKind::Fast, TierKind::Quality].map(|tier| {
+            let directory = directory.path().to_path_buf();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let (artifact, certificate) = gh458_covered_artifact(tier, 3);
+                let mut manifest = SemanticManifest::default();
+                manifest
+                    .publish_covered_artifact(artifact, certificate)
+                    .unwrap();
+                barrier.wait();
+                let result = manifest.save_if_unchanged(&directory, None);
+                (manifest, result)
+            })
+        });
+        let mut winners = Vec::new();
+        for writer in writers {
+            let (manifest, result) = writer.join().unwrap();
+            match result {
+                Ok(()) => winners.push(manifest),
+                Err(ManifestError::ConcurrentUpdate { .. }) => {}
+                Err(error) => panic!("unexpected publication error: {error}"),
+            }
+        }
+        assert_eq!(winners.len(), 1);
+        assert_eq!(
+            SemanticManifest::load(directory.path()).unwrap(),
+            winners.pop()
+        );
+    }
 
     fn test_policy() -> SemanticPolicy {
         SemanticPolicy::compiled_defaults()

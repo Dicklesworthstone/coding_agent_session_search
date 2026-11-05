@@ -1,4 +1,4 @@
-//! Real-binary proof for the reviewed logical-archive v20, v21 and v22 -> v23
+//! Real-binary proof for the reviewed logical-archive v20, v21, v22 and v23 -> v24
 //! bridges.
 
 use std::collections::BTreeMap;
@@ -14,7 +14,7 @@ use coding_agent_search::model::types::{Agent, AgentKind};
 use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, SqliteStorage};
 use serde_json::Value;
 
-const REVIEWED_TARGET_VERSION: i64 = 23;
+const REVIEWED_TARGET_VERSION: i64 = 24;
 
 fn command(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cass"));
@@ -59,7 +59,8 @@ fn database_files(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 }
 
 /// A canonical database at storage schema `version`, made by undoing on a
-/// current database exactly what each later reviewed step added: v23's session
+/// current database exactly what each later reviewed step added: v24's semantic
+/// journal and authority, v23's session
 /// tombstones, v22's source tombstones, and v21's context index. The v22 fixture
 /// retains an existing source tombstone, which migration must preserve.
 fn make_source(root: &Path, version: i64) -> PathBuf {
@@ -87,6 +88,12 @@ fn make_source(root: &Path, version: i64) -> PathBuf {
             )
             .expect("seed existing source tombstone");
     }
+    if version >= 23 {
+        storage.raw().execute(
+            "INSERT INTO forgotten_conversations(source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+             VALUES('local', 'codex', '/fixture/shared.db', 'retained-session', 78)",
+        ).expect("seed existing session tombstone");
+    }
     drop(storage);
 
     let downgrade = match version {
@@ -108,10 +115,18 @@ fn make_source(root: &Path, version: i64) -> PathBuf {
              DELETE FROM _schema_migrations WHERE version >= 23;
              UPDATE meta SET value = '22' WHERE key = 'schema_version';"
         }
+        23 => {
+            "DELETE FROM _schema_migrations WHERE version >= 24;
+             UPDATE meta SET value = '23' WHERE key = 'schema_version';"
+        }
         other => panic!("no reviewed downgrade for schema {other}"),
     };
     let connection =
         Connection::open(source.to_str().expect("UTF-8 fixture path")).expect("open fixture");
+    connection.execute_batch(
+        "DROP TABLE semantic_conversation_changes;
+         DELETE FROM meta WHERE key IN ('semantic_archive_state_v1', 'semantic_message_id_high_water_v1');",
+    ).expect("remove semantic authority absent before v24");
     connection
         .execute_batch(downgrade)
         .expect("downgrade only what the reviewed steps added");
@@ -134,19 +149,24 @@ fn export_source(home: &Path, source: &Path, backup: &Path, archive_id: &str) ->
 }
 
 #[test]
-fn reviewed_v20_backup_migrates_to_v23_and_retries_read_only() {
-    assert_reviewed_backup_migrates(20, "reviewed_v20_to_v23");
+fn reviewed_v20_backup_migrates_to_v24_and_retries_read_only() {
+    assert_reviewed_backup_migrates(20, "reviewed_v20_to_v24");
 }
 
-/// A v0.9.0 export (schema v21) restores into the current v23 build.
+/// A v0.9.0 export (schema v21) restores into the current v24 build.
 #[test]
-fn reviewed_v21_backup_migrates_to_v23_and_retries_read_only() {
-    assert_reviewed_backup_migrates(21, "reviewed_v21_to_v23");
+fn reviewed_v21_backup_migrates_to_v24_and_retries_read_only() {
+    assert_reviewed_backup_migrates(21, "reviewed_v21_to_v24");
 }
 
 #[test]
 fn reviewed_v22_backup_preserves_tombstones_and_retries_read_only() {
-    assert_reviewed_backup_migrates(22, "reviewed_v22_to_v23");
+    assert_reviewed_backup_migrates(22, "reviewed_v22_to_v24");
+}
+
+#[test]
+fn reviewed_v23_backup_preserves_tombstones_without_fabricating_semantic_authority() {
+    assert_reviewed_backup_migrates(23, "reviewed_v23_to_v24");
 }
 
 fn assert_reviewed_backup_migrates(version: i64, mode: &str) {
@@ -257,7 +277,13 @@ fn assert_reviewed_backup_migrates(version: i64, mode: &str) {
             .expect("session tombstones table exists")
             .get_typed::<i64>(0)
             .expect("count"),
-        0
+        i64::from(version >= 23)
+    );
+    assert!(
+        storage
+            .semantic_archive_state()
+            .expect("read coverage authority")
+            .is_none()
     );
     drop(storage);
 

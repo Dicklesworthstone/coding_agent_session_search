@@ -190,7 +190,19 @@ fn gh540_title_context_cli_roundtrip_rebuilds_and_reconciles() -> anyhow::Result
     renamed.title = Some("Restore a deleted Git branch".into());
     {
         let storage = FrankenStorage::open(&db)?;
-        storage.insert_conversation_tree(agent_id, None, renamed)?;
+        let before_title_edit = storage
+            .semantic_archive_state()?
+            .ok_or_else(|| anyhow::anyhow!("missing canonical mutation authority"))?;
+        let changed = storage.insert_conversation_tree(agent_id, None, renamed)?;
+        let changes = storage
+            .semantic_conversation_changes_since(&before_title_edit)?
+            .ok_or_else(|| anyhow::anyhow!("missing title-edit journal"))?;
+        // ubs:ignore[rust.panic.assert-macros] -- Title-only edits must retain complete journal authority.
+        assert!(changes.complete);
+        // ubs:ignore[rust.panic.assert-macros] -- The merged journal must identify the renamed conversation.
+        assert_eq!(changes.conversation_ids, [changed.conversation_id]);
+        // ubs:ignore[rust.panic.assert-macros] -- Title-only edits must invalidate retained semantic coverage.
+        assert!(storage.semantic_invalidations_after(&before_title_edit)?);
         // ubs:ignore[rust.panic.assert-macros] -- Title edits must invalidate the semantic watermark.
         assert_eq!(storage.get_last_embedded_message_id("fnv1a-384")?, None);
         for id in &conversation_ids {

@@ -4438,6 +4438,17 @@ fn gh439_parked_post_publish_fts_repair_still_aborts_with_the_index_stalled_enve
 /// proves the resume contract, not its scale.
 #[test]
 fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoint() {
+    assert_plain_index_recovers_killed_lexical_commit(false);
+}
+
+/// GH #496: the final ingest tail must enter the durable pending-commit
+/// protocol before segment folding, even when no periodic commit was due.
+#[test]
+fn gh496_plain_index_resumes_a_fresh_tail_killed_between_commit_and_checkpoint() {
+    assert_plain_index_recovers_killed_lexical_commit(true);
+}
+
+fn assert_plain_index_recovers_killed_lexical_commit(final_tail: bool) {
     use std::io::Write;
     use std::process::{Command as StdCommand, Stdio};
 
@@ -4500,10 +4511,18 @@ fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoin
         "fixture must contain canonical messages excluded from lexical search: {initial_checkpoint}"
     );
 
-    // Force-rebuild with one commit per conversation and park after the
-    // second commit, inside the commit-to-checkpoint window.
-    let sentinel = data_dir.join("gh440-kill-sentinel.json");
-    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin!("cass"))
+    // Keep the original middle-batch case at one commit per conversation,
+    // parked after commit two. The tail case disables periodic commits and
+    // parks at the first commit, after every canonical document was ingested.
+    let kill_after_commits = if final_tail { "1" } else { "2" };
+    let commit_conversations = if final_tail { "1000" } else { "1" };
+    let sentinel = data_dir.join(if final_tail {
+        "gh496-tail-kill-sentinel.json"
+    } else {
+        "gh440-kill-sentinel.json"
+    });
+    let mut rebuild = StdCommand::new(assert_cmd::cargo::cargo_bin!("cass"));
+    rebuild
         .current_dir(home)
         .args([
             "index",
@@ -4524,7 +4543,10 @@ fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoin
             "CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMIT_SENTINEL",
             &sentinel,
         )
-        .env("CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMITS", "2")
+        .env(
+            "CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMITS",
+            kill_after_commits,
+        )
         .env(
             "CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMIT_SLEEP_MS",
             "60000",
@@ -4534,15 +4556,34 @@ fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoin
             "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
             "1",
         )
-        .env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "1")
+        .env(
+            "CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS",
+            commit_conversations,
+        )
         .env(
             "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
-            "1",
+            commit_conversations,
         )
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn force-rebuild");
+        .stderr(Stdio::null());
+    if final_tail {
+        // Child-local limits exceed this six-session corpus across every
+        // periodic commit trigger; inherited small benchmark settings must
+        // not turn the final-tail test into another middle-batch test.
+        for name in [
+            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES",
+            "CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES",
+        ] {
+            rebuild.env(name, "1000000");
+        }
+        for name in [
+            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES",
+            "CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES",
+        ] {
+            rebuild.env(name, "16777216");
+        }
+    }
+    let mut child = rebuild.spawn().expect("spawn force-rebuild");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
     let payload: serde_json::Value = loop {
@@ -4556,7 +4597,7 @@ fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoin
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "force-rebuild never reached the second staged commit"
+            "force-rebuild never reached staged commit {kill_after_commits}"
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
@@ -4566,6 +4607,13 @@ fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoin
         committed_docs > checkpoint_docs,
         "the kill window must have the authority ahead of the checkpoint: {payload}"
     );
+    if final_tail {
+        assert_eq!(
+            committed_docs,
+            initial_checkpoint["indexed_docs"].as_u64().unwrap(),
+            "the interrupted tail commit must contain the full native document set: {payload}"
+        );
+    }
     // 7qirz: mid-rebuild, the lock names the rebuild, not the last preflight
     // step (which is what #483/#497 operators saw for a whole 42-minute pass).
     // Windows refuses reads of a byte range another process holds locked

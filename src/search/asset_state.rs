@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::indexer::{
-    LEXICAL_REBUILD_PAGE_SIZE_PUBLIC, LexicalRebuildCheckpoint,
-    lexical_rebuild_page_size_is_compatible, lexical_storage_fingerprint_for_db,
-    load_lexical_rebuild_checkpoint,
+    LEXICAL_REBUILD_PAGE_SIZE_PUBLIC, LexicalCheckpointFreshness, LexicalRebuildCheckpoint,
+    completed_lexical_checkpoint_freshness, lexical_rebuild_page_size_is_compatible,
+    lexical_storage_fingerprint_for_db_cached, load_lexical_rebuild_checkpoint,
 };
 use crate::search::ann_index::hnsw_index_path;
 use crate::search::embedder::Embedder;
@@ -1444,19 +1444,35 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
     let index_path = crate::search::tantivy::expected_index_dir(data_dir);
     let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
         .with_context(|| format!("loading lexical checkpoint from {}", index_path.display()))?;
-    let current_db_fingerprint = if db_available && compute_lexical_fingerprint {
-        let fingerprint = lexical_storage_fingerprint_for_db(db_path).with_context(|| {
-            format!(
-                "computing lexical storage fingerprint for {}",
-                db_path.display()
+    let completion_freshness = checkpoint.as_ref().filter(|state| state.completed).map(|state| {
+        completed_lexical_checkpoint_freshness(&index_path, db_path, state).unwrap_or_else(|error| {
+            tracing::debug!(%error, "lexical completion freshness could not be passively verified");
+            LexicalCheckpointFreshness::Unverified(
+                "lexical completion evidence is unavailable; content verification is required",
             )
-        })?;
-        crate::indexer::write_archive_fingerprint_cache_best_effort(
-            db_path,
-            &index_path,
-            &fingerprint,
-        );
-        Some(fingerprint)
+        })
+    });
+    let current_db_fingerprint = if db_available
+        && completion_freshness == Some(LexicalCheckpointFreshness::Current)
+    {
+        // The source epoch and native publication were just checked together.
+        // No SQLite open is needed to repeat that completed observation.
+        checkpoint
+            .as_ref()
+            .map(|state| state.storage_fingerprint.clone())
+    } else if db_available && compute_lexical_fingerprint {
+        match lexical_storage_fingerprint_for_db_cached(db_path, &index_path) {
+            Ok(fingerprint) => Some(fingerprint),
+            Err(error) if crate::indexer::lexical_fingerprint_observation_changed(&error) => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "computing lexical storage fingerprint for {}",
+                        db_path.display()
+                    )
+                });
+            }
+        }
     } else if db_available {
         // GH #353: the skip-open surfaces (health watermark lane, count-less
         // status) deliberately never open the archive, but they must still
@@ -1470,7 +1486,7 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         None
     };
 
-    Ok(lexical_state_from_observations(LexicalObservationInput {
+    let mut state = lexical_state_from_observations(LexicalObservationInput {
         index_path: &index_path,
         db_path,
         stale_threshold,
@@ -1480,7 +1496,39 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         checkpoint: checkpoint.as_ref(),
         current_db_fingerprint: current_db_fingerprint.as_deref(),
         live: crate::search::tantivy::searchable_index_live_docs(&index_path),
-    }))
+    });
+    if state.exists && !state.rebuilding {
+        match completion_freshness {
+            Some(LexicalCheckpointFreshness::Unverified(reason)) if !state.stale => {
+                // A metadata write or a WAL checkpoint changes the physical
+                // epoch without proving missing lexical content. Say that the
+                // evidence is unverified; do not turn every read into another
+                // expensive rebuild. Existing age/count/replay-debt signals
+                // still take precedence and schedule ordinary maintenance.
+                state.fresh = false;
+                state.status = "unverified";
+                state.status_reason = Some(reason.to_string());
+            }
+            Some(LexicalCheckpointFreshness::Incompatible(reason)) => {
+                state.fresh = false;
+                state.stale = true;
+                if !state.engine_incompatible && !state.hollow {
+                    state.status = "incompatible";
+                    state.status_reason = Some(reason.to_string());
+                }
+            }
+            Some(LexicalCheckpointFreshness::Stale(reason)) => {
+                state.fresh = false;
+                state.stale = true;
+                if !state.engine_incompatible && !state.hollow && state.status == "ready" {
+                    state.status = "stale";
+                    state.status_reason = Some(reason.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(state)
 }
 
 struct LexicalObservationInput<'a> {
@@ -5174,7 +5222,11 @@ mod tests {
             compute_lexical_fingerprint: true,
         })
         .expect("status inspection");
-        assert_eq!(status_view.status, "ready");
+        assert_eq!(status_view.status, "unverified");
+        assert!(
+            !status_view.fresh,
+            "counts cannot certify a legacy checkpoint"
+        );
         assert!(!status_view.stale);
         assert_eq!(
             status_view.fingerprint.matches_current_db_fingerprint,
@@ -5194,9 +5246,9 @@ mod tests {
             compute_lexical_fingerprint: false,
         })
         .expect("primed skip-open inspection");
-        assert_eq!(primed_health.status, "ready");
+        assert_eq!(primed_health.status, "unverified");
         assert!(!primed_health.stale);
-        assert!(primed_health.fresh);
+        assert!(!primed_health.fresh);
         assert_eq!(
             primed_health.fingerprint.current_db_fingerprint,
             status_view.fingerprint.current_db_fingerprint

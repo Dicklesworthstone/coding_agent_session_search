@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use frankensearch::quill::cass::{
-    CassConversationKey, CassDerivedColumns, CassDocument, CassFieldValues, cass_document_identity,
-    field,
+    CassConversationKey, CassDerivedColumns, CassDocument, CassDocumentRef, CassFieldValues,
+    cass_document_identity, field,
 };
 use frankensearch::quill::quiver::NumericValue;
 use frankensearch::quill::{
@@ -28,12 +28,21 @@ use xxhash_rust::xxh3::Xxh3;
 /// contract. Actual-engine parity regressions below guard this boundary.
 /// An incompatible encoder causes verification to refuse, never to fall back
 /// to preview/count-only completion.
+#[cfg(test)]
 fn content_witness(
     identity: &str,
     document: &CassDocument,
     derived: &CassDerivedColumns,
 ) -> Result<u64> {
-    let values = CassFieldValues::build(document.as_ref(), derived);
+    content_witness_ref(identity, document.as_ref(), derived)
+}
+
+fn content_witness_ref(
+    identity: &str,
+    document: CassDocumentRef<'_>,
+    derived: &CassDerivedColumns,
+) -> Result<u64> {
+    let values = CassFieldValues::build(document, derived);
     let mut hasher = Xxh3::new();
     hasher.update(b"frankensearch.quill.idmap-content.schema.v1\0");
     let mut field = |ordinal: u16, bytes: &[u8]| -> Result<()> {
@@ -60,24 +69,38 @@ fn content_witness(
     Ok(hasher.digest())
 }
 
-pub(in crate::indexer::lexical_reconcile) struct PublishedSnapshot {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::indexer) enum ContentMatch {
+    Missing,
+    Matching,
+    Different,
+}
+
+pub(in crate::indexer) struct PublishedSnapshot {
     view: Arc<QuillSearchSnapshot>,
 }
 
 impl PublishedSnapshot {
-    pub(in crate::indexer::lexical_reconcile) fn open(path: &Path) -> Result<Self> {
+    pub(in crate::indexer) fn open(path: &Path) -> Result<Self> {
         // The same native Keeper admission and snapshot composition used by
         // QuillSearchIndex::open_with_schema, without binding a query parser.
         // Only committed durable segments are eligible for repair completion.
         let keeper = KeeperSnapshot::open(path, CASS_SEMANTIC_SCHEMA)
             .context("admitting lexical repair verification snapshot")?;
-        let view = SnapshotPublisher::new(Arc::new(keeper), Vec::new())
+        Self::from_keeper(Arc::new(keeper))
+    }
+
+    /// Reuse a writer-admitted immutable generation without reopening its
+    /// segment files. The caller retains the native writer admission while
+    /// auditing this view and extending that same generation.
+    pub(in crate::indexer) fn from_keeper(keeper: Arc<KeeperSnapshot>) -> Result<Self> {
+        let view = SnapshotPublisher::new(keeper, Vec::new())
             .context("binding lexical repair verification snapshot")?
             .load();
         Ok(Self { view })
     }
 
-    pub(in crate::indexer::lexical_reconcile) fn doc_count(&self) -> u64 {
+    pub(in crate::indexer) fn doc_count(&self) -> u64 {
         self.view.live_doc_count()
     }
 
@@ -90,54 +113,71 @@ impl PublishedSnapshot {
 
     /// Verify the full projected document, not only its stored preview. The
     /// source text remains borrowed from the caller's bounded canonical batch.
-    pub(in crate::indexer::lexical_reconcile) fn verify_content(
-        &self,
-        document: &CassDocument,
-    ) -> Result<bool> {
+    pub(in crate::indexer) fn verify_content(&self, document: &CassDocument) -> Result<bool> {
         self.verify_document(document, true)
     }
 
     fn verify_document(&self, document: &CassDocument, full_content: bool) -> Result<bool> {
+        Ok(self.classify_document(document.as_ref(), full_content)? == ContentMatch::Matching)
+    }
+
+    /// Distinguish an absent identity from a stale payload. Rebuild recovery
+    /// may append the former; it must never silently accept the latter.
+    pub(in crate::indexer) fn classify_content_ref(
+        &self,
+        document: CassDocumentRef<'_>,
+    ) -> Result<ContentMatch> {
+        self.classify_document(document, true)
+    }
+
+    fn classify_document(
+        &self,
+        document: CassDocumentRef<'_>,
+        full_content: bool,
+    ) -> Result<ContentMatch> {
         let identity = cass_document_identity(
-            &document.source_id,
-            CassConversationKey::for_document(document.as_ref()),
+            document.source_id,
+            CassConversationKey::for_document(document),
             document.msg_idx,
         );
         // Native resolution checks the full opaque identity, not just its
         // hash, and excludes tombstoned rows. Never reopen/refresh for columns.
         let Some(resolved) = self.view.keeper_snapshot().resolve_document_id(&identity)? else {
-            return Ok(false);
+            return Ok(ContentMatch::Missing);
         };
         let id = resolved.global_docid;
-        let derived = CassDerivedColumns::derive(document.as_ref());
-        if full_content && content_witness(&identity, document, &derived)? != resolved.content_hash
+        let derived = CassDerivedColumns::derive(document);
+        if full_content
+            && content_witness_ref(&identity, document, &derived)? != resolved.content_hash
         {
-            return Ok(false);
+            return Ok(ContentMatch::Different);
         }
         for (field, expected) in [
-            (field::AGENT, Some(document.agent.as_str())),
-            (field::SOURCE_ID, Some(document.source_id.as_str())),
-            (field::SOURCE_PATH, Some(document.source_path.as_str())),
-            (field::WORKSPACE, document.workspace.as_deref()),
-            (
-                field::WORKSPACE_ORIGINAL,
-                document.workspace_original.as_deref(),
-            ),
-            (field::ORIGIN_KIND, Some(document.origin_kind.as_str())),
-            (field::ORIGIN_HOST, document.origin_host.as_deref()),
-            (field::TITLE, document.title.as_deref()),
+            (field::AGENT, Some(document.agent)),
+            (field::SOURCE_ID, Some(document.source_id)),
+            (field::SOURCE_PATH, Some(document.source_path)),
+            (field::WORKSPACE, document.workspace),
+            (field::WORKSPACE_ORIGINAL, document.workspace_original),
+            (field::ORIGIN_KIND, Some(document.origin_kind)),
+            (field::ORIGIN_HOST, document.origin_host),
+            (field::TITLE, document.title),
             (field::PREVIEW, Some(derived.preview.as_str())),
         ] {
             if self.text(field, id)?.as_deref() != expected {
-                return Ok(false);
+                return Ok(ContentMatch::Different);
             }
         }
-        Ok(self
+        let matches = self
             .number(field::CONVERSATION_ID, id)?
             .map(i64::from_le_bytes)
             == document.conversation_id
             && self.number(field::MSG_IDX, id)?.map(u64::from_le_bytes) == Some(document.msg_idx)
-            && self.number(field::CREATED_AT, id)?.map(i64::from_le_bytes) == document.created_at)
+            && self.number(field::CREATED_AT, id)?.map(i64::from_le_bytes) == document.created_at;
+        Ok(if matches {
+            ContentMatch::Matching
+        } else {
+            ContentMatch::Different
+        })
     }
 
     fn text(&self, field: u16, id: u32) -> Result<Option<String>> {
@@ -183,6 +223,34 @@ mod tests {
     }
 
     #[test]
+    fn writer_admitted_snapshot_reuses_native_view_and_pins_committed_content() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("index");
+        let mut index = TantivyIndex::open_or_create(&path)?;
+        let original = document(42, "meridian original committed content");
+        let replacement = document(42, "meridian replacement committed content");
+        index.add_prebuilt_documents_slice(std::slice::from_ref(&original))?;
+        index.commit()?;
+
+        let admitted = index.committed_snapshot()?;
+        let before = PublishedSnapshot::from_keeper(Arc::clone(&admitted))?;
+        assert!(Arc::ptr_eq(&admitted, &before.view.keeper_snapshot_arc(),));
+        assert_eq!(before.doc_count(), 1);
+        assert!(before.verify_content(&original)?);
+        assert!(!before.verify_content(&replacement)?);
+
+        index.upsert_prebuilt_documents_slice(std::slice::from_ref(&replacement))?;
+        index.commit()?;
+        let after = PublishedSnapshot::from_keeper(index.committed_snapshot()?)?;
+        assert_eq!(after.doc_count(), 1);
+        assert!(after.verify_content(&replacement)?);
+        assert!(!after.verify_content(&original)?);
+        assert!(before.verify_content(&original)?);
+        assert!(!before.verify_content(&replacement)?);
+        Ok(())
+    }
+
+    #[test]
     fn full_content_witness_rejects_same_length_rewrites_beyond_preview() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("index");
@@ -204,6 +272,18 @@ mod tests {
         assert!(!before.verify_content(&expected)?);
         assert!(before.verify_content(&actual)?);
         assert!(!before.verify_content(&document(43, "absent identity"))?);
+        assert_eq!(
+            before.classify_content_ref(expected.as_ref())?,
+            ContentMatch::Different
+        );
+        assert_eq!(
+            before.classify_content_ref(actual.as_ref())?,
+            ContentMatch::Matching
+        );
+        assert_eq!(
+            before.classify_content_ref(document(43, "absent identity").as_ref())?,
+            ContentMatch::Missing
+        );
         index.upsert_prebuilt_documents_slice(std::slice::from_ref(&expected))?;
         index.commit()?;
         let after = PublishedSnapshot::open(&path)?;

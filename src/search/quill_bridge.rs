@@ -30,7 +30,9 @@ use frankensearch::quill::cass::{
     CassMergeStatus,
 };
 use frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA;
-use frankensearch::quill::{QuillConfig, QuillIndex, QuillSearchIndex, SchemaDocument};
+use frankensearch::quill::{
+    KeeperSnapshot, QuillConfig, QuillIndex, QuillSearchIndex, SchemaDocument,
+};
 
 #[path = "quill_bridge/fuel_errors.rs"]
 mod fuel_errors;
@@ -1314,6 +1316,16 @@ impl QuillCassIndex {
                 Ok(self.reader()?.doc_count()?)
             }
         }
+    }
+
+    /// Share the immutable generation admitted by this writer. Recovery must
+    /// verify these exact segments, rather than independently opening a reader
+    /// before the writer acquires its cross-process admission and runs recovery.
+    /// Uncommitted additions are deliberately absent from this Keeper view.
+    pub(crate) fn committed_snapshot(&self) -> Result<Arc<KeeperSnapshot>> {
+        self.index.snapshot().map_err(|error| {
+            anyhow::Error::new(error).context("reading the admitted Quill CASS generation")
+        })
     }
 
     /// Durable directory backing this index.
