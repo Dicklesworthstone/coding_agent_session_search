@@ -18,15 +18,18 @@ use coding_agent_search::search::external_embedder::ExternalEmbeddingConfig;
 use coding_agent_search::search::fastembed_embedder::FastEmbedder;
 use coding_agent_search::search::hash_embedder::HashEmbedder;
 use coding_agent_search::search::model_manager::{
-    load_hash_semantic_context_strict, load_semantic_context_for_embedder_strict,
+    covered_semantic_record, load_hash_semantic_context_strict,
+    load_semantic_context_for_embedder_strict,
 };
 use coding_agent_search::search::query::{
-    FieldMask, SearchClient, SearchClientOptions, SearchFilters, SearchHit, rrf_fuse_hits,
+    FieldMask, SearchClient, SearchClientOptions, SearchFilters, SearchHit, SemanticTierMode,
+    rrf_fuse_hits_with_coverage,
 };
+use coding_agent_search::search::semantic_coverage::semantic_coverage_generation;
 use coding_agent_search::search::semantic_manifest::{
     SemanticCurrentPointerV1, SemanticManifest, SemanticShardManifest,
 };
-use coding_agent_search::search::vector_index::vector_index_path;
+use coding_agent_search::search::vector_index::{SemanticCoverageSnapshot, vector_index_path};
 use coding_agent_search::sources::provenance::SourceFilter;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -217,7 +220,10 @@ fn suffixed(path: &Path, suffix: &str) -> PathBuf {
 }
 
 #[derive(Default)]
-struct AssetGuard(BTreeMap<PathBuf, Option<FileStamp>>);
+struct AssetGuard(
+    BTreeMap<PathBuf, Option<FileStamp>>,
+    Option<(PathBuf, same_file::Handle)>,
+);
 
 impl AssetGuard {
     fn add(&mut self, path: PathBuf) -> Result<()> {
@@ -237,6 +243,21 @@ impl AssetGuard {
 
     fn capture(data_dir: &Path, db: &Path, embedder_id: &str) -> Result<Self> {
         let mut guard = Self::default();
+        if let Some((record, certificate)) =
+            covered_semantic_record(data_dir, embedder_id).map_err(anyhow::Error::msg)?
+        {
+            let metadata = std::fs::symlink_metadata(db)?;
+            ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "certified semantic archive must be a regular file"
+            );
+            guard.1 = Some((db.to_path_buf(), same_file::Handle::from_path(db)?));
+            guard.add(SemanticCurrentPointerV1::path(data_dir))?;
+            guard.vector(data_dir.join(record.index_path))?;
+            guard.add(data_dir.join(certificate.parent_path))?;
+            guard.check()?;
+            return Ok(guard);
+        }
         for path in [
             db.to_path_buf(),
             suffixed(db, "-wal"),
@@ -280,6 +301,11 @@ impl AssetGuard {
     }
 
     fn check(&self) -> Result<()> {
+        if let Some((path, expected)) = &self.1
+            && same_file::Handle::from_path(path).ok().as_ref() != Some(expected)
+        {
+            return Err(Refusal::Changed.into());
+        }
         for (path, expected) in &self.0 {
             if FileStamp::read(path).ok().as_ref() != Some(expected) {
                 return Err(Refusal::Changed.into());
@@ -350,7 +376,11 @@ impl Semantic {
     }
 
     pub(super) fn status(&self) -> Value {
-        json!({
+        let coverage = self
+            .client
+            .as_ref()
+            .and_then(SearchClient::semantic_coverage);
+        let mut status = json!({
             "enabled": self.enabled(), "loaded": self.client.is_some(),
             "embedder": self.config.as_ref().map(|config| config.embedder),
             "embedder_id": self.active_identity,
@@ -371,10 +401,16 @@ impl Semantic {
                 "automatic_retries": false,
             },
             "last_failure": self.last_failure, "change_detection": "file_identity_size_mtime_and_unix_ctime",
-            "snapshot_policy": "retained_assets_with_archive_change_checks", "immutable_generation_certified": false,
+            "snapshot_policy": if coverage.is_some() { "retained_generation_with_transaction_verified_candidates" }
+                else { "retained_assets_with_archive_change_checks" },
+            "immutable_generation_certified": coverage.is_some(),
             "canonical_database_access_enabled": self.enabled(), "maintenance_performed": false,
             "ann_supported": false, "ann_unavailable_reason": NATIVE_ANN_UNAVAILABLE,
-        })
+        });
+        if let Some(coverage) = coverage {
+            status["semantic_coverage_at_admission"] = json!(coverage);
+        }
+        status
     }
 
     /// Passive request admission precedes the shared reader pool. Known-unready
@@ -402,7 +438,32 @@ impl Semantic {
     fn ensure_loaded(&mut self, db: &Path) -> Result<()> {
         self.admit_request(Instant::now())?;
         if self.client.is_some() {
-            return self.check();
+            self.check()?;
+            let generation = self
+                .client
+                .as_ref()
+                .and_then(SearchClient::semantic_coverage)
+                .map(|coverage| coverage.generation);
+            if let (Some(generation), Some(config), Some(embedder_id)) = (
+                generation,
+                self.config.as_ref(),
+                self.active_identity.as_deref(),
+            ) && self.admission_retry.retry_after_ms(Instant::now()) == 0
+                && let Ok(Some((_, certificate))) =
+                    covered_semantic_record(&config.data_dir, embedder_id)
+                && semantic_coverage_generation(&certificate) != generation
+            {
+                // Failed replacement admission keeps the verified old owners.
+                // Their candidates still pass canonical validation per request.
+                match self.load(db) {
+                    Ok(()) => self.admission_retry = AdmissionRetry::default(),
+                    Err(error) => {
+                        self.last_failure = Some(format!("semantic refresh: {error:#}"));
+                        self.admission_retry.failed(Instant::now());
+                    }
+                }
+            }
+            return Ok(());
         }
         let result = self.load(db);
         if result.is_ok() {
@@ -455,6 +516,12 @@ impl Semantic {
                     .is_some_and(Option::is_some),
                 "semantic artifact lacks a pre-admission file witness"
             );
+            if let Some(parent) = artifact.parent_path() {
+                ensure!(
+                    guard.0.get(parent).is_some_and(Option::is_some),
+                    "semantic parent proof lacks a pre-admission file witness"
+                );
+            }
         }
         let client = SearchClient::open_semantic(
             db,
@@ -567,14 +634,15 @@ impl Session {
         let window = (offset + limit + 1)
             .saturating_mul(3)
             .min(protocol::MAX_WINDOW);
-        let semantic = setup.and_then(|()| -> Result<(Vec<SearchHit>, Value)> {
+        type SemanticPage = (Vec<SearchHit>, Value, Option<SemanticCoverageSnapshot>);
+        let semantic = setup.and_then(|()| -> Result<SemanticPage> {
             let client = self
                 .semantic
                 .client
                 .as_ref()
                 .context("semantic reader is not loaded")?;
             self.semantic.queries_attempted = self.semantic.queries_attempted.saturating_add(1);
-            let (hits, stats) = client.search_semantic(
+            let (hits, stats, coverage) = client.search_semantic_with_tier_and_coverage(
                 query,
                 search_filters(filters.clone()),
                 if mode == Mode::Hybrid {
@@ -589,6 +657,7 @@ impl Session {
                 // after that allocation. Exact vector owners are reclaimable;
                 // do not invoke either ANN search or lazy ANN diagnostics.
                 false,
+                SemanticTierMode::Single,
             )?;
             ensure!(
                 stats.is_none(),
@@ -597,14 +666,14 @@ impl Session {
             let metadata = ann_metadata(approximate);
             self.semantic.check()?;
             self.semantic.calls_completed = self.semantic.calls_completed.saturating_add(1);
-            Ok((hits, metadata))
+            Ok((hits, metadata, coverage))
         });
         let mut lexical_fallback = None;
         // Request-local ownership only: keep the already-paid native page until
         // the final semantic witness check, without cloning or caching its hits.
         let mut native_lexical_page = None;
-        let (mut hits, realized, ann, lexical_degrade) = match semantic {
-            Ok((semantic_hits, ann)) if mode == Mode::Hybrid => {
+        let (mut hits, realized, ann, lexical_degrade, coverage) = match semantic {
+            Ok((semantic_hits, ann, coverage)) if mode == Mode::Hybrid => {
                 let lexical_reused = self.client.is_some();
                 let lexical_started = Instant::now();
                 let lexical_setup = self.ensure_loaded();
@@ -651,8 +720,14 @@ impl Session {
                             lexical_hits.len() <= window,
                             "lexical candidate budget exceeded"
                         );
-                        let fused =
-                            rrf_fuse_hits(&lexical_hits, &semantic_hits, query, limit + 1, offset);
+                        let fused = rrf_fuse_hits_with_coverage(
+                            &lexical_hits,
+                            &semantic_hits,
+                            query,
+                            limit + 1,
+                            offset,
+                            coverage.as_ref(),
+                        );
                         // Only the independent pinned Quill page is reusable if
                         // the archive/vector witness later changes. Archive
                         // fallback results have no such snapshot guarantee.
@@ -666,7 +741,7 @@ impl Session {
                                 search_ms: lexical_search_ms,
                             });
                         }
-                        (fused, "hybrid", ann, None)
+                        (fused, "hybrid", ann, None, coverage)
                     }
                     Err(error) => (
                         semantic_hits
@@ -677,10 +752,11 @@ impl Session {
                         "semantic",
                         ann,
                         Some(format!("{error:#}")),
+                        coverage,
                     ),
                 }
             }
-            Ok((hits, ann)) => (hits, "semantic", ann, None),
+            Ok((hits, ann, coverage)) => (hits, "semantic", ann, None, coverage),
             Err(error) => {
                 let reason = format!("{error:#}");
                 // Keep the original failure actionable during backoff rather
@@ -747,7 +823,7 @@ impl Session {
         hits.truncate(limit);
         let hits = super::summarize_hits(hits)?;
         self.queries_completed = self.queries_completed.saturating_add(1);
-        Ok(json!({
+        let mut reply = json!({
             "hits": hits, "count": hits.len(), "limit": limit, "offset": offset,
             "has_more": if has_next { Some(true) } else { None }, "next_offset": next_offset,
             "page_window_exhausted": has_next && next_offset.is_none(), "preview_only": true,
@@ -764,7 +840,11 @@ impl Session {
             "semantic_reused": reused, "semantic_setup_ms": setup_ms, "search_ms": started.elapsed().as_millis(),
             "candidate_window_per_leg": if mode == Mode::Hybrid { window } else { limit + offset + 1 },
             "ann": ann, "snapshot": self.status(),
-        }))
+        });
+        if let Some(coverage) = coverage {
+            reply["semantic_coverage"] = json!(coverage);
+        }
+        Ok(reply)
     }
 }
 

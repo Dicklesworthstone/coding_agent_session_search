@@ -145,6 +145,7 @@ fn scan_range(
             message_id: identity.message_id,
             chunk_idx: identity.chunk_idx,
             score: scorer.score(index, row, embedding)?,
+            identity: Some(identity),
         })?;
         scored += 1;
     }
@@ -239,6 +240,7 @@ pub(super) fn collect(
                 message_id: identity.message_id,
                 chunk_idx: identity.chunk_idx,
                 score: dot_product_f32_f32(vector, embedding)?,
+                identity: Some(identity),
             })?;
             wal_scored = wal_scored.saturating_add(1);
         }
@@ -250,6 +252,7 @@ pub(super) fn collect(
             message_id: hit.message_id,
             chunk_idx: hit.chunk_idx,
             score: hit.score,
+            identity: hit.identity,
         })
         .collect();
     tracing::debug!(

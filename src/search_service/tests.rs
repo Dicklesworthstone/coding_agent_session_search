@@ -3,6 +3,10 @@ use coding_agent_search::search::tantivy::TantivyIndex;
 use frankensearch::quill::cass::CassDocument;
 use std::io::Cursor;
 
+#[cfg(unix)]
+#[path = "semantic_coverage_tests.rs"]
+mod certified_coverage;
+
 fn request(value: Value) -> Request {
     serde_json::from_value(value).unwrap()
 }

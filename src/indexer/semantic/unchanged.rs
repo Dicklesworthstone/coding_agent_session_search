@@ -33,6 +33,14 @@ pub(super) fn try_retain_completed(
     sink: &SemanticProgressSink,
 ) -> Result<Option<SemanticBackfillBatchOutcome>> {
     engine.check_external_cancelled()?;
+    if !crate::search::external_embedder::is_external_identity(engine.embedder_id())
+        && storage.semantic_archive_state()?.is_some()
+        && !manifest.coverage.contains_key(engine.embedder_id())
+    {
+        // Preserve vectors, but perform one canonical reconciliation before
+        // granting retained-generation serving to an older installation.
+        return Ok(None);
+    }
     // Keep the existing constant-time cache-hit path; do not turn every
     // scheduled no-op into a full canonical scan.
     if engine

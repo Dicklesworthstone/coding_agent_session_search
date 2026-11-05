@@ -468,11 +468,188 @@ fn introspect_response_schemas_cover_runtime_json_shapes() -> Result<(), Box<dyn
         response_schemas,
         &mut gaps,
     );
+    #[cfg(unix)]
+    collect_certified_semantic_coverage_gaps(
+        test_home.path(),
+        &demo_data,
+        response_schemas,
+        &mut gaps,
+    )?;
     assert!(
         gaps.is_empty(),
         "runtime payloads are not covered by introspect schemas:\n{}",
         gaps.join("\n")
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn collect_certified_semantic_coverage_gaps(
+    test_home: &Path,
+    demo_data: &Path,
+    response_schemas: &Map<String, Value>,
+    gaps: &mut Vec<String>,
+) -> Result<(), Box<dyn Error>> {
+    use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let run_search = |mode: &str, format: Option<&str>, meta: bool| {
+        let mut command = cass_cmd(test_home);
+        command
+            .args([
+                "search",
+                "matrix",
+                "--mode",
+                mode,
+                "--model",
+                "hash",
+                "--no-daemon",
+                "--no-maintenance",
+                "--limit",
+                "2",
+                "--data-dir",
+            ])
+            .arg(demo_data);
+        if let Some(format) = format {
+            command.args(["--robot-format", format]);
+        }
+        if meta {
+            command.arg("--robot-meta");
+        }
+        let output = command.output().expect("run certified search");
+        assert!(
+            output.status.success(),
+            "certified {mode}/{format:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let initial: Value =
+        serde_json::from_slice(&run_search("semantic", Some("json"), false).stdout)?;
+    let complete = &initial["_meta"]["semantic_coverage"];
+    assert_eq!(complete["status"], "complete");
+    assert_eq!(
+        complete["published_mutation_seq"],
+        complete["current_mutation_seq"]
+    );
+    assert!(
+        initial["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty())
+    );
+    collect_runtime_shape_gaps(
+        "search-certified-complete",
+        "$",
+        &json_value_schema(&initial),
+        &response_schemas["search"],
+        gaps,
+    );
+
+    // Advance the real canonical writer while retaining the published vector
+    // generation and existing lexical index. This is the ordinary ingest gap.
+    let storage = FrankenStorage::open(&demo_data.join("agent_search.db"))?;
+    let agent = storage.ensure_agent(&Agent {
+        id: None,
+        slug: "codex".into(),
+        name: "Codex".into(),
+        version: None,
+        kind: AgentKind::Cli,
+    })?;
+    storage.insert_conversation_tree(
+        agent,
+        None,
+        &Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("coverage-contract-append".into()),
+            title: Some("New matrix conversation".into()),
+            source_path: test_home.join("coverage-contract-append.jsonl"),
+            started_at: None,
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: json!({}),
+            source_id: "local".into(),
+            origin_host: None,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::Agent,
+                author: None,
+                created_at: None,
+                content: "matrix newly ingested coverage contract".into(),
+                extra_json: json!({}),
+                snippets: Vec::new(),
+            }],
+        },
+    )?;
+    drop(storage);
+
+    for mode in ["semantic", "hybrid"] {
+        let payload: Value = serde_json::from_slice(&run_search(mode, Some("json"), false).stdout)?;
+        let receipt = &payload["_meta"]["semantic_coverage"];
+        assert_eq!(receipt["status"], "partial");
+        assert_eq!(receipt["generation"], complete["generation"]);
+        assert!(
+            receipt["current_mutation_seq"].as_u64().unwrap()
+                > receipt["published_mutation_seq"].as_u64().unwrap()
+        );
+        assert_eq!(
+            payload["_meta"]["cursor_manifest"]["continuation_safe"],
+            false
+        );
+        collect_runtime_shape_gaps(
+            &format!("search-certified-partial-{mode}"),
+            "$",
+            &json_value_schema(&payload),
+            &response_schemas["search"],
+            gaps,
+        );
+    }
+
+    for format in ["compact", "toon"] {
+        let output = run_search("semantic", Some(format), false);
+        let payload: Value = if format == "toon" {
+            Value::from(
+                toon::try_decode(std::str::from_utf8(&output.stdout)?, None)
+                    .expect("decode certified TOON output"),
+            )
+        } else {
+            serde_json::from_slice(&output.stdout)?
+        };
+        assert_eq!(
+            payload["_meta"]["semantic_coverage"]["status"], "partial",
+            "{format}"
+        );
+    }
+    let diagnostic_receipt = |output: &std::process::Output| {
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find_map(|value| value.get("semantic_coverage").cloned())
+            .expect("coverage receipt on diagnostic channel")
+    };
+    let jsonl = run_search("semantic", Some("jsonl"), false);
+    let rows = String::from_utf8_lossy(&jsonl.stdout)
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(!rows.is_empty());
+    assert!(rows.iter().all(|row| row.get("_meta").is_none()));
+    assert_eq!(diagnostic_receipt(&jsonl)["status"], "partial");
+    let jsonl_meta = run_search("semantic", Some("jsonl"), true);
+    let header: Value = serde_json::from_str(
+        String::from_utf8_lossy(&jsonl_meta.stdout)
+            .lines()
+            .next()
+            .expect("JSONL metadata header"),
+    )?;
+    assert_eq!(header["_meta"]["semantic_coverage"]["status"], "partial");
+    let sessions = run_search("semantic", Some("sessions"), false);
+    assert!(!sessions.stdout.is_empty());
+    assert_eq!(diagnostic_receipt(&sessions)["status"], "partial");
+    let human = run_search("semantic", None, false);
+    assert!(String::from_utf8_lossy(&human.stderr).contains("Semantic coverage: partial"));
     Ok(())
 }
 

@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "scope": "Exact-source native component validation. These receipts do not establish full application compilation, database-backed selection, query execution, CLI runtime, or an end-to-end speedup.",
+  "unique_regular_tests_passed": 26,
+  "explicit_scale_probes_passed": 2,
+  "timing_caveat": "Single observations on a shared, resource-contended host. Parent probe used warm file cache. No controlled cross-release speedup is claimed.",
+  "toolchain": "rustc 1.100.0-nightly (908501772 2026-08-30)\nbinary: rustc\ncommit-hash: 90850177249efe0321573c569aec5d12b257f8d6\ncommit-date: 2026-08-30\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0\n",
+  "replay_inventory": {
+    "scope": "Actual production persist.rs and exact type/retained_bytes declarations including SemanticArchiveState; no selection/journal query integration, storage implementation, embedding, serving, or full-app typechecking.",
+    "ordinary_tests_passed": 15,
+    "explicit_scale_probes_passed": 1,
+    "production_format_module_sha256": "e85cb9a10850479ecf8bdd3617d9b893ea998722fb242fe1788454cc54a6f385",
+    "source_snapshot_sha256": "67af4d6c956c286c1c65ec0f81fc637bdb1930047d84524e2d0733b1fa5f2700",
+    "source_bytes_unchanged": true,
+    "dependency_count": 32,
+    "all_dependencies_match_main_lock": true,
+    "binary_sha256": "76e7827b6d411b1f87b181740e8fe0ab3cc0de0a82eafb9f20cd6749828d0729",
+    "original_receipt_sha256": "c44144ad13baa88fc39c426b683389eb3486fae533633301cda0a23618e77973",
+    "steps_in_order": [
+      "compile_exact_component",
+      "ordinary_format_tests",
+      "explicit_million_passage_probe"
+    ],
+    "steps": [
+      {
+        "exit_code": 0,
+        "wall_seconds": 77.143467524,
+        "max_rss_kib": 290068,
+        "log_sha256": "8296895faf953d9a3ae433f21c4baeaa307712341e15fe31145e715a32992a60"
+      },
+      {
+        "exit_code": 0,
+        "wall_seconds": 0.502230428,
+        "max_rss_kib": 17512,
+        "log_sha256": "b227224118391054f1ac42b5521241f24dff5cbaac8d07900c0eb5426e11c30e"
+      },
+      {
+        "exit_code": 0,
+        "wall_seconds": 3.886505196,
+        "max_rss_kib": 17512,
+        "log_sha256": "65da14c9fd1380c1fb21a2d1a5de5f451a9f154ccb0dffaac12014df0a6efd9a"
+      }
+    ],
+    "scale_observations": [
+      {
+        "conversations": 1024,
+        "disk_bytes": 161498516,
+        "frame_budget_bytes": 262144,
+        "memory_budget_bytes": 134217728,
+        "memory_cache_retained": false,
+        "passage_documents": 1048576,
+        "peak_retained_frame_bytes": 169008,
+        "read_elapsed_us": 1673337,
+        "scenario": "million_passage_replay_inventory_format",
+        "write_elapsed_us": 2087194
+      }
+    ],
+    "test_in_repository": "indexer::semantic::engine::replay_cache::persist::tests::streamed_inventory_retains_a_million_passages_above_the_old_ceiling",
+    "cargo_profiles": {
+      "dev": {
+        "opt-level": 1,
+        "debug": 0,
+        "incremental": false
+      },
+      "test": {
+        "opt-level": 1,
+        "debug": 0,
+        "incremental": false
+      }
+    }
+  },
+  "manifest_publication": {
+    "scope": "Exact legacy manifest, coverage certificate, advisory-lock and atomic publication source; no database or vector integration.",
+    "tests_passed": 7,
+    "requalification": "Same seven cases rerun after the race-test worker error propagation fix; not seven additional unique tests.",
+    "exit_code": 0,
+    "wall_seconds": 39.35757979200025,
+    "max_child_rss_kib": 302456,
+    "source_bytes_unchanged": true,
+    "sources": {
+      "src/search/semantic_manifest.rs": "7bfbdf3b9a4104962730d2d875df9f1f1b51b0706f6299644f03a46545f1a944",
+      "src/search/policy.rs": "7dc0175c2e0ede3db8512a780f1790bb12102cc9b1dd5ead3bd502373373591c",
+      "src/search/semantic_coverage.rs": "fdef0601e6a50df70e5a7bd80f12c76765b7326447913ee309703103000c376f",
+      "src/search/semantic_coverage/tests.rs": "a63671c8fe24b5f9d90c1dac602a915d22ad4be7811473ade53d1e24ae257cbf"
+    },
+    "requalification_receipt_sha256": "d45c5177bcff80e8be480f4c043cb292f961faa06343dc26eafc7ff52c7f2959",
+    "scratch_warning": "One unused BTreeSet wiring import; no production diagnostics and no claim of full Clippy gate.",
+    "cargo_profiles": {
+      "dev": {
+        "opt-level": 1,
+        "debug": 0,
+        "incremental": false
+      },
+      "test": {
+        "opt-level": 1,
+        "debug": 0,
+        "incremental": false
+      }
+    }
+  },
+  "parent_proof": {
+    "scope": "Exact original legacy manifest publication/CAS+coverage verdicts and parent codec; no DB/vector/application integration.",
+    "ordinary_tests_passed": 4,
+    "explicit_scale_probes_passed": 1,
+    "measurements": {
+      "admission_ms": 104.181809,
+      "file_bytes": 40000056,
+      "lookup_count": 1000,
+      "lookup_ms": 26.446345,
+      "reader_buffer_bytes": 65536,
+      "record_bytes": 40,
+      "records": 1000001
+    },
+    "binary_sha256": "645f3870ef7659149edc17d5668cbfbbb0c242728511c4c85ac3e185b78b6ac4",
+    "source_bytes_unchanged": true,
+    "sources": {
+      "src/search/semantic_manifest.rs": "c54de98e0904f4f1566ec5d46a3b74b3719257cfbc052383e1d96c44fbc71f41",
+      "src/search/policy.rs": "7dc0175c2e0ede3db8512a780f1790bb12102cc9b1dd5ead3bd502373373591c",
+      "src/search/semantic_coverage.rs": "fdef0601e6a50df70e5a7bd80f12c76765b7326447913ee309703103000c376f",
+      "src/search/semantic_coverage/tests.rs": "a63671c8fe24b5f9d90c1dac602a915d22ad4be7811473ade53d1e24ae257cbf"
+    },
+    "original_receipt_sha256": "5059f5dd8f3e825f6619d4fa77e86604094ef27029467d81cb999f3a48e6ac40",
+    "dependency_count": 61,
+    "all_dependencies_match_main_lock": true,
+    "million_invocation_wall_seconds": 0.494422491000023,
+    "million_invocation_max_child_rss_kib": 27552,
+    "rss_scope": "Complete Cargo invocation, not isolated reader allocation.",
+    "test_in_repository": "search::semantic_coverage::tests::semantic_parent_inventory_million_records_is_bounded",
+    "cargo_profiles": {
+      "dev": {
+        "opt-level": 1,
+        "debug": 0,
+        "incremental": false
+      },
+      "test": {
+        "opt-level": 1,
+        "debug": 0,
+        "incremental": false
+      }
+    }
+  }
+}

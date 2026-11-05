@@ -46,8 +46,16 @@ use crate::search::vector_index::{
 };
 use crate::storage::sqlite::FrankenStorage;
 
+mod coverage;
 mod replay_cache;
 
+pub(crate) use coverage::{
+    SemanticBuildSnapshot, semantic_index_document_digest,
+    semantic_index_document_digest_for_canonical_ids,
+};
+
+#[cfg(all(test, unix))]
+mod coverage_tests;
 #[cfg(test)]
 mod gh525_tests;
 #[cfg(test)]
@@ -234,10 +242,11 @@ pub struct SemanticBackfillStoragePlan {
     pub max_conversations: usize,
 }
 
-struct BackfillBatchProgress {
+struct BackfillBatchProgress<'a> {
     prior_checkpoint: Option<BuildCheckpoint>,
     embedded_docs: u64,
     last_message_id: Option<i64>,
+    coverage: Option<(&'a FrankenStorage, SemanticBuildSnapshot)>,
 }
 
 #[derive(Debug, Clone)]
@@ -342,6 +351,36 @@ struct CompletedBackfillCache {
     artifact: ArtifactRecord,
     vector_space_revision: String,
     last_offset: i64,
+    #[serde(default)]
+    coverage: Option<crate::search::semantic_manifest::SemanticCoverageCertificate>,
+    #[serde(default)]
+    coverage_files: Option<(BackfillFileStamp, BackfillFileStamp)>,
+}
+
+fn completed_coverage_file_stamps(
+    data_dir: &Path,
+    certificate: &crate::search::semantic_manifest::SemanticCoverageCertificate,
+) -> Option<(BackfillFileStamp, BackfillFileStamp)> {
+    crate::search::semantic_coverage::open_semantic_proof_file(
+        data_dir,
+        &certificate.artifact_path,
+    )
+    .ok()?;
+    crate::search::semantic_coverage::open_semantic_proof_file(data_dir, &certificate.parent_path)
+        .ok()?;
+    Some((
+        backfill_file_stamp(&data_dir.join(&certificate.artifact_path))??,
+        backfill_file_stamp(&data_dir.join(&certificate.parent_path))??,
+    ))
+}
+
+fn completed_coverage_boundary_matches(
+    storage: &FrankenStorage,
+    certificate: &crate::search::semantic_manifest::SemanticCoverageCertificate,
+) -> Result<bool> {
+    Ok(storage.semantic_archive_state()?.is_some_and(|state| {
+        state.archive_id == certificate.archive_id && state.mutation_seq == certificate.mutation_seq
+    }) && storage.max_message_id()?.unwrap_or(0) == certificate.max_message_id)
 }
 
 /// The cache is a skip hint, so failing to save it only costs the next run a
@@ -3503,6 +3542,28 @@ impl SemanticIndexer {
         last_message_id: Option<i64>,
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
+        self.run_backfill_batch_with_coverage(
+            messages,
+            data_dir,
+            manifest,
+            plan,
+            last_message_id,
+            sink,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_backfill_batch_with_coverage(
+        &self,
+        messages: &[EmbeddingInput],
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: SemanticBackfillBatchPlan,
+        last_message_id: Option<i64>,
+        sink: &SemanticProgressSink,
+        coverage: Option<(&FrankenStorage, SemanticBuildSnapshot)>,
+    ) -> Result<SemanticBackfillBatchOutcome> {
         if plan.db_fingerprint.trim().is_empty() {
             bail!("semantic backfill requires a non-empty DB fingerprint");
         }
@@ -3562,6 +3623,7 @@ impl SemanticIndexer {
                 prior_checkpoint,
                 embedded_docs,
                 last_message_id,
+                coverage,
             },
             sink,
         )
@@ -3573,7 +3635,7 @@ impl SemanticIndexer {
         data_dir: &Path,
         manifest: &mut SemanticManifest,
         plan: SemanticBackfillBatchPlan,
-        progress: BackfillBatchProgress,
+        progress: BackfillBatchProgress<'_>,
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
         // Cancellation is admitted before the staging write, never halfway
@@ -3584,7 +3646,14 @@ impl SemanticIndexer {
             prior_checkpoint,
             embedded_docs,
             last_message_id,
+            coverage,
         } = progress;
+        // Merge against the complete current ledger, then publish with a
+        // lease. A late builder must never erase another embedder's update.
+        let mut expected_manifest = SemanticManifest::load(data_dir)?;
+        if let Some(current) = &expected_manifest {
+            *manifest = current.clone();
+        }
         let manifest_path = SemanticManifest::path(data_dir);
         let staging_path = semantic_staging_index_path(
             data_dir,
@@ -3611,19 +3680,32 @@ impl SemanticIndexer {
         manifest.refresh_backlog(plan.total_conversations, &plan.db_fingerprint);
 
         if complete {
+            anyhow::ensure!(
+                coverage.is_some() || !manifest.coverage.contains_key(self.embedder_id()),
+                "semantic publication cannot replace a certified owner without canonical coverage"
+            );
             let retained_generation = self.retain_published_generation_during_replacement(
                 manifest,
                 plan.tier,
                 &plan.db_fingerprint,
                 &plan.model_revision,
             );
-            let db_fingerprint = plan.db_fingerprint.clone();
+            let db_fingerprint = coverage.as_ref().map_or_else(
+                || plan.db_fingerprint.clone(),
+                |(_, snapshot)| snapshot.db_fingerprint.clone(),
+            );
             if staged_index.wal_record_count() > 0 {
                 staged_index.compact().map_err(|err| {
                     anyhow::anyhow!("compact staged semantic index failed: {err}")
                 })?;
             }
             let staged_doc_ids = validated_semantic_index_ids(&staged_index)?;
+            let expected_documents = if let Some((storage, snapshot)) = &coverage {
+                snapshot.verify(storage)?;
+                Some(semantic_index_document_digest(&staged_index)?)
+            } else {
+                None
+            };
             drop(staged_index);
             if sink.is_active() {
                 sink.emit(
@@ -3641,8 +3723,11 @@ impl SemanticIndexer {
             // Contract-replacement batches keep the old complete generation
             // published while staging. Retire it only at the actual publication
             // boundary, immediately before the fixed destination is replaced.
-            if retained_generation {
+            if retained_generation && !manifest.coverage.contains_key(self.embedder_id()) {
                 self.revoke_backfill_serving(data_dir, manifest)?;
+                // Compare against our own successful revocation, not the
+                // ledger from before it or a newly loaded unrelated writer.
+                expected_manifest = Some(manifest.clone());
             }
             // Keep the WAL parked even if publication fails: a failure may
             // follow the rename (for example directory fsync), so restoring it
@@ -3663,7 +3748,7 @@ impl SemanticIndexer {
                 .unwrap_or(final_path.as_path())
                 .to_string_lossy()
                 .to_string();
-            manifest.publish_artifact(ArtifactRecord {
+            let artifact = ArtifactRecord {
                 tier: plan.tier,
                 embedder_id: self.embedder_id().to_string(),
                 model_revision: plan.model_revision,
@@ -3680,9 +3765,23 @@ impl SemanticIndexer {
                     .map_or_else(now_ms, |checkpoint| checkpoint.saved_at_ms),
                 completed_at_ms: now_ms(),
                 ready: true,
-            });
+            };
+            if let Some((storage, snapshot)) = &coverage {
+                let (artifact, certificate) = snapshot.seal(
+                    data_dir,
+                    &final_path,
+                    artifact,
+                    expected_documents
+                        .as_deref()
+                        .context("missing canonical document receipt")?,
+                )?;
+                snapshot.verify(storage)?;
+                manifest.publish_covered_artifact(artifact, certificate)?;
+            } else {
+                manifest.publish_artifact(artifact);
+            }
             manifest.refresh_backlog(plan.total_conversations, &db_fingerprint);
-            manifest.save(data_dir)?;
+            manifest.save_if_unchanged(data_dir, expected_manifest.as_ref())?;
             if sink.is_active() {
                 sink.emit(
                     SemanticProgressEvent::PublishDone,
@@ -3734,7 +3833,7 @@ impl SemanticIndexer {
                 last_message_id: last_message_id.or(prior_last_message_id),
                 cursor_exhausted: plan.cursor_exhausted,
             });
-            manifest.save(data_dir)?;
+            manifest.save_if_unchanged(data_dir, expected_manifest.as_ref())?;
             if sink.is_active() {
                 sink.emit(
                     SemanticProgressEvent::CheckpointSaveDone,
@@ -3859,6 +3958,11 @@ impl SemanticIndexer {
         }?;
         let path = vector_index_path(data_dir, self.embedder_id());
         let recorded_path = data_dir.join(&artifact.index_path);
+        let certified = manifest
+            .coverage
+            .get(self.embedder_id())
+            .is_some_and(|certificate| certificate.matches_artifact(artifact));
+        let candidate_path = if certified { &recorded_path } else { &path };
         (artifact.tier == plan.tier
             && artifact.embedder_id == self.embedder_id()
             && artifact.model_revision == plan.model_revision
@@ -3866,9 +3970,9 @@ impl SemanticIndexer {
             && artifact.chunking_version == CHUNKING_STRATEGY_VERSION
             && artifact.dimension == self.embedder_dimension()
             && semantic_backfill_identity_matches(&artifact.db_fingerprint, &plan.db_fingerprint)
-            && recorded_path == path
-            && path.is_file())
-        .then_some(path)
+            && (recorded_path == path || certified)
+            && candidate_path.is_file())
+        .then_some(candidate_path.clone())
     }
 
     fn revoke_backfill_serving(
@@ -3879,6 +3983,26 @@ impl SemanticIndexer {
         // Complete shard metadata can override an unready monolithic record.
         // Revoke both authorities before scanning or changing any candidate.
         invalidate_identity_stale_semantic_shards(data_dir, self.embedder_id())?;
+        let expected = SemanticManifest::load(data_dir)?;
+        if let Some(current) = &expected {
+            *manifest = current.clone();
+        }
+        // The certified owner is immutable and each returned candidate is
+        // checked against the query's canonical transaction. Builder changes
+        // therefore do not revoke that last complete generation.
+        if [&manifest.fast_tier, &manifest.quality_tier]
+            .into_iter()
+            .flatten()
+            .any(|artifact| {
+                artifact.embedder_id == self.embedder_id()
+                    && manifest
+                        .coverage
+                        .get(self.embedder_id())
+                        .is_some_and(|certificate| certificate.matches_artifact(artifact))
+            })
+        {
+            return Ok(());
+        }
         for artifact in [&mut manifest.fast_tier, &mut manifest.quality_tier]
             .into_iter()
             .flatten()
@@ -3892,7 +4016,7 @@ impl SemanticIndexer {
         {
             hnsw.ready = false;
         }
-        manifest.save(data_dir)?;
+        manifest.save_if_unchanged(data_dir, expected.as_ref())?;
         Ok(())
     }
 
@@ -3959,7 +4083,22 @@ impl SemanticIndexer {
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
         self.check_external_cancelled()?;
+        let mut coverage = SemanticBuildSnapshot::capture(storage, self.embedder_id())?;
         let (candidate_path, caps) = candidate;
+        if let Some(certificate) = manifest.coverage.get(self.embedder_id())
+            && candidate_path == data_dir.join(&certificate.artifact_path)
+        {
+            let mut file = crate::search::semantic_coverage::open_semantic_proof_file(
+                data_dir,
+                &certificate.artifact_path,
+            )?;
+            if crate::search::semantic_coverage::semantic_file_sha256(&mut file)?
+                != certificate.artifact_sha256
+            {
+                return self
+                    .build_backfill_from_storage(storage, data_dir, manifest, plan, caps, sink);
+            }
+        }
         let snapshot_dir = tempfile::Builder::new()
             .prefix(".backfill-reuse-")
             .tempdir_in(data_dir.join(VECTOR_INDEX_DIR))?;
@@ -4042,6 +4181,9 @@ impl SemanticIndexer {
             existing_ids.intersection(&current_ids).cloned().collect();
         covered_ids.extend(selected_ids);
         let complete = covered_ids == current_ids;
+        if complete && let Some(snapshot) = &mut coverage {
+            snapshot.prepare_parents(storage, data_dir)?;
+        }
         sink.emit(
             SemanticProgressEvent::SelectionDone,
             SemanticProgressFields {
@@ -4089,6 +4231,11 @@ impl SemanticIndexer {
                 prior_checkpoint: None,
                 embedded_docs,
                 last_message_id,
+                coverage: if complete {
+                    coverage.map(|snapshot| (storage, snapshot))
+                } else {
+                    None
+                },
             },
             sink,
         )?;
@@ -4154,6 +4301,14 @@ impl SemanticIndexer {
         manifest: &SemanticManifest,
         plan: &SemanticBackfillStoragePlan,
     ) -> Result<Option<(PathBuf, CompletedBackfillCache)>> {
+        // An old skip hint cannot bootstrap a coverage certificate. Upgrade
+        // once through canonical reconciliation while retaining its vectors.
+        if !crate::search::external_embedder::is_external_identity(self.embedder_id())
+            && storage.semantic_archive_state()?.is_some()
+            && !manifest.coverage.contains_key(self.embedder_id())
+        {
+            return Ok(None);
+        }
         let archive_before = BackfillFilePair::archive(storage);
         let candidate = self.reusable_backfill_candidate(data_dir, manifest, plan);
         let cache_path = data_dir.join(VECTOR_INDEX_DIR).join(format!(
@@ -4174,9 +4329,19 @@ impl SemanticIndexer {
             && let Ok(cache) = serde_json::from_reader::<_, CompletedBackfillCache>(
                 std::io::Read::take(file, 64 * 1024),
             )
-            && cache.version == 1
+            && cache.version == 2
             && cache.archive == *archive
             && cache.artifact == *artifact
+            && cache.coverage.as_ref() == manifest.coverage.get(self.embedder_id())
+            && match &cache.coverage {
+                Some(certificate) => completed_coverage_boundary_matches(storage, certificate)?,
+                None => true,
+            }
+            && cache.coverage.as_ref().is_none_or(|certificate| {
+                certificate.matches_artifact(artifact)
+                    && cache.coverage_files.is_some()
+                    && completed_coverage_file_stamps(data_dir, certificate) == cache.coverage_files
+            })
             && cache.vector_space_revision == self.vector_space_revision()?
             && BackfillFilePair::capture(&path, &fsvi_wal_path_for(&path)).as_ref()
                 == Some(&cache.vectors)
@@ -4198,6 +4363,14 @@ impl SemanticIndexer {
     ) -> Result<SemanticBackfillBatchOutcome> {
         self.check_external_cancelled()?;
         let archive_before = BackfillFilePair::archive(storage);
+        let watermark_boundary = storage
+            .semantic_archive_state()?
+            .map(|state| {
+                storage
+                    .max_message_id()
+                    .map(|maximum| (state, maximum.unwrap_or(0)))
+            })
+            .transpose()?;
         let candidate = self.reusable_backfill_candidate(data_dir, manifest, &plan);
         let cache_path = data_dir.join(VECTOR_INDEX_DIR).join(format!(
             ".completed-backfill-{}-{}.json",
@@ -4211,8 +4384,13 @@ impl SemanticIndexer {
             // cache hit without one is a tier published before per-embedder
             // watermarks. Record it once and rebind the cache to the archive
             // as the write left it, so the next unchanged run still skips.
-            if self.certify_embed_watermark(storage)
+            if self.certify_embed_watermark(storage, watermark_boundary.as_ref())
                 && let Some(archive) = BackfillFilePair::archive(storage)
+                && match &cache.coverage {
+                    Some(certificate) => completed_coverage_boundary_matches(storage, certificate)?,
+                    None => true,
+                }
+                && BackfillFilePair::archive(storage).as_ref() == Some(&archive)
             {
                 cache.archive = archive;
                 persist_completed_backfill_cache(data_dir, &cache_path, &cache);
@@ -4264,27 +4442,36 @@ impl SemanticIndexer {
         // next unchanged run its cache. An archive seen to move during the
         // scan proves no coverage.
         if outcome.published && (archive_stable || archive_before.is_none()) {
-            self.certify_embed_watermark(storage);
+            self.certify_embed_watermark(storage, watermark_boundary.as_ref());
         }
         if outcome.published
             && archive_stable
             && let Some(archive) = BackfillFilePair::archive(storage)
-            && let Some(vectors) = BackfillFilePair::capture(
-                &outcome.index_path,
-                &fsvi_wal_path_for(&outcome.index_path),
-            )
             && let Some(artifact) = match tier {
                 TierKind::Fast => manifest.fast_tier.as_ref(),
                 TierKind::Quality => manifest.quality_tier.as_ref(),
             }
+            && match manifest.coverage.get(self.embedder_id()) {
+                Some(certificate) => completed_coverage_boundary_matches(storage, certificate)?,
+                None => true,
+            }
+            && BackfillFilePair::archive(storage).as_ref() == Some(&archive)
+            && let published_path = data_dir.join(&artifact.index_path)
+            && let Some(vectors) =
+                BackfillFilePair::capture(&published_path, &fsvi_wal_path_for(&published_path))
         {
             let cache = CompletedBackfillCache {
-                version: 1,
+                version: 2,
                 archive,
                 vectors,
                 artifact: artifact.clone(),
                 vector_space_revision: self.vector_space_revision()?.into(),
                 last_offset: outcome.last_offset,
+                coverage: manifest.coverage.get(self.embedder_id()).cloned(),
+                coverage_files: manifest
+                    .coverage
+                    .get(self.embedder_id())
+                    .and_then(|certificate| completed_coverage_file_stamps(data_dir, certificate)),
             };
             persist_completed_backfill_cache(data_dir, &cache_path, &cache);
         }
@@ -4299,18 +4486,35 @@ impl SemanticIndexer {
     /// backfill-built tier with a delta. Writes only on change and returns
     /// whether it wrote. Never fails the batch: the tier is already published,
     /// and a missing watermark only leaves catch-up to the next backfill.
-    fn certify_embed_watermark(&self, storage: &FrankenStorage) -> bool {
+    fn certify_embed_watermark(
+        &self,
+        storage: &FrankenStorage,
+        boundary: Option<&(crate::storage::sqlite::SemanticArchiveState, i64)>,
+    ) -> bool {
         if crate::search::external_embedder::is_external_identity(self.embedder_id()) {
             return false;
         }
-        let recorded = storage.max_message_id().and_then(|max_id| {
-            let max_id = max_id.unwrap_or(0);
+        let Some((state, max_id)) = boundary else {
+            return false;
+        };
+        let recorded = (|| {
+            let max_id = *max_id;
             if storage.get_last_embedded_message_id(self.embedder_id())? == Some(max_id) {
                 return Ok(false);
             }
-            storage.set_last_embedded_message_id(self.embedder_id(), max_id)?;
-            Ok(true)
-        });
+            crate::indexer::persist::with_ephemeral_writer(
+                storage,
+                false,
+                "certifying completed semantic coverage",
+                |writer| {
+                    writer.set_last_embedded_message_id_if_unchanged(
+                        self.embedder_id(),
+                        max_id,
+                        state,
+                    )
+                },
+            )
+        })();
         recorded.unwrap_or_else(|error| {
             tracing::warn!(
                 %error,
@@ -4330,12 +4534,27 @@ impl SemanticIndexer {
         caps: SemanticCheckpointCaps,
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
+        let mut coverage = SemanticBuildSnapshot::capture(storage, self.embedder_id())?;
         // A cursor without its vectors proves no coverage. This includes a
         // crash after moving staging to live but before saving the manifest.
         if manifest.checkpoint.as_ref().is_some_and(|checkpoint| {
             checkpoint.tier == plan.tier && checkpoint.embedder_id == self.embedder_id()
         }) {
-            manifest.checkpoint = None;
+            // A missing staging owner must restart at the beginning. Persist
+            // abandonment before prepare_backfill_serving reloads the ledger;
+            // never resurrect its old cursor or erase a concurrent checkpoint.
+            if let Some(current) = SemanticManifest::load(data_dir)? {
+                anyhow::ensure!(
+                    current.checkpoint == manifest.checkpoint,
+                    "semantic checkpoint changed before missing-staging recovery; retry"
+                );
+                let expected = current.clone();
+                *manifest = current;
+                manifest.checkpoint = None;
+                manifest.save_if_unchanged(data_dir, Some(&expected))?;
+            } else {
+                manifest.checkpoint = None;
+            }
         }
         self.prepare_backfill_serving(data_dir, manifest, &plan)?;
         let prior_checkpoint = manifest.checkpoint.as_ref().filter(|checkpoint| {
@@ -4516,7 +4735,12 @@ impl SemanticIndexer {
             (None, None) => None,
         };
 
-        let outcome = self.run_backfill_batch_with_sink(
+        if batch.cursor_exhausted
+            && let Some(snapshot) = &mut coverage
+        {
+            snapshot.prepare_parents(storage, data_dir)?;
+        }
+        let outcome = self.run_backfill_batch_with_coverage(
             &batch.inputs,
             data_dir,
             manifest,
@@ -4531,6 +4755,11 @@ impl SemanticIndexer {
             },
             next_last_message_id,
             sink,
+            if batch.cursor_exhausted {
+                coverage.map(|snapshot| (storage, snapshot))
+            } else {
+                None
+            },
         );
 
         match &outcome {
@@ -6811,7 +7040,7 @@ mod tests {
     }
 
     #[test]
-    fn gh458_reconcile_revokes_live_and_shard_readiness_until_complete() -> Result<()> {
+    fn gh458_legacy_reconcile_revokes_live_and_shard_readiness_until_complete() -> Result<()> {
         use crate::search::asset_state::{SemanticPreference, semantic_state_from_availability};
         use crate::search::model_manager::SemanticAvailability;
 
@@ -6843,6 +7072,18 @@ mod tests {
             plan.clone(),
         )?;
         assert!(initial.published);
+        // This regression exercises the original strict, uncertified format.
+        // A newly completed native backfill now seals a separate served owner;
+        // explicitly restore the historical mutable-path ledger for this test.
+        let canonical_path = vector_index_path(temp.path(), indexer.embedder_id());
+        let mut legacy = manifest.fast_tier.clone().context("initial artifact")?;
+        legacy.index_path = canonical_path
+            .strip_prefix(temp.path())?
+            .to_string_lossy()
+            .into_owned();
+        manifest.publish_artifact(legacy);
+        manifest.save(temp.path())?;
+        assert!(!manifest.coverage.contains_key(indexer.embedder_id()));
         indexer.build_and_save_index_shards(
             indexer.embed_messages(&packet_embedding_inputs_from_storage(&storage)?)?,
             temp.path(),
@@ -6877,7 +7118,7 @@ mod tests {
         );
         manifest.fast_tier.as_mut().unwrap().ready = true;
         manifest.save(temp.path())?;
-        let live_before = fs::read(&initial.index_path)?;
+        let live_before = fs::read(&canonical_path)?;
         storage.raw().execute(
             "UPDATE messages SET content = 'changed content under existing rowid' WHERE conversation_id <= 3",
         )?;
@@ -6895,7 +7136,7 @@ mod tests {
             )?;
             assert!(!partial.published);
             assert_eq!(partial.embedded_docs, 1);
-            assert_eq!(fs::read(&initial.index_path)?, live_before);
+            assert_eq!(fs::read(&canonical_path)?, live_before);
             let observed = state();
             assert_eq!(observed.fast_tier.current_db_matches, Some(true));
             assert!(!observed.fast_tier.ready);
@@ -7395,11 +7636,17 @@ mod tests {
             writer.finish()?;
         }
         let prior_live = fs::read(&initial.index_path)?;
-        manifest
-            .fast_tier
-            .as_mut()
-            .context("initial artifact")?
-            .chunking_version = 1;
+        let mut legacy = manifest.fast_tier.clone().context("initial artifact")?;
+        legacy.chunking_version = 1;
+        legacy.index_path = initial
+            .index_path
+            .strip_prefix(temp.path())?
+            .to_string_lossy()
+            .into_owned();
+        legacy.doc_count = u64::try_from(legacy_vectors.len())?;
+        legacy.size_bytes = fs::metadata(&initial.index_path)?.len();
+        manifest.publish_artifact(legacy);
+        assert!(!manifest.coverage.contains_key(indexer.embedder_id()));
         manifest.checkpoint = Some(BuildCheckpoint {
             tier: TierKind::Fast,
             embedder_id: indexer.embedder_id().into(),
@@ -7508,6 +7755,18 @@ mod tests {
         }
         legacy.finish()?;
         let prior_bytes = fs::read(&published.index_path)?;
+        // The rewritten builder is an actual legacy generation, not a change
+        // to the independently sealed current generation created above.
+        let mut artifact = manifest.fast_tier.clone().context("initial artifact")?;
+        artifact.index_path = published
+            .index_path
+            .strip_prefix(temp.path())?
+            .to_string_lossy()
+            .into_owned();
+        artifact.size_bytes = u64::try_from(prior_bytes.len())?;
+        manifest.publish_artifact(artifact);
+        manifest.save(temp.path())?;
+        assert!(!manifest.coverage.contains_key(indexer.embedder_id()));
         let first = run(&mut manifest, 1)?;
         assert_eq!(first.embedded_docs, 1);
         assert!(first.checkpoint_saved);

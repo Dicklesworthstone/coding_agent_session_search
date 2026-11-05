@@ -69,6 +69,7 @@ fn complete_search(app: &mut CassApp, hits: Vec<SearchHit>) {
         elapsed_ms: 7,
         suggestions: Vec::new(),
         wildcard_fallback: false,
+        semantic_coverage: None,
         append: false,
     });
     drain_cmd_messages(app, cmd);

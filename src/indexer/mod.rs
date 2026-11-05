@@ -14,6 +14,8 @@ pub mod redact_secrets;
 pub mod refresh_ledger;
 pub(crate) mod responsiveness;
 pub mod semantic;
+#[cfg(all(test, unix))]
+mod semantic_legacy_upgrade_tests;
 pub mod semantic_progress;
 #[cfg(test)]
 mod source_ledger_tests;
@@ -1951,16 +1953,56 @@ pub fn set_background_semantic_delta_enabled(enabled: bool) -> bool {
     BACKGROUND_SEMANTIC_DELTA_ENABLED.swap(enabled, Ordering::Relaxed)
 }
 
-/// The one-shot delta path's own preconditions (see the `--semantic` branch of
-/// `run_index`): the requested embedder's index exists under the current
-/// contract, no identity rebuild is pending, and the embed watermark trails
-/// the newest message. Anything else would need the bulk pass, which a
-/// background run never starts.
+/// Maintain an established local tier through its certified tail, bounded
+/// canonical repair, or owned upgrade checkpoint. A legacy tier without a
+/// checkpoint still needs the current contract and its own trailing watermark.
+/// Background maintenance never bootstraps an absent tier with a bulk embed.
 fn background_semantic_delta_eligible(
     storage: &FrankenStorage,
     data_dir: &Path,
     embedder: &str,
 ) -> Result<bool> {
+    if let Some((embedder_id, dimension)) = semantic_local_embedder_metadata(embedder)
+        && let Some(manifest) = SemanticManifest::load(data_dir)?
+        && manifest.checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint.embedder_id == embedder_id
+                && checkpoint.schema_version == SEMANTIC_SCHEMA_VERSION
+                && checkpoint.chunking_version == CHUNKING_STRATEGY_VERSION
+        })
+        && [&manifest.fast_tier, &manifest.quality_tier]
+            .into_iter()
+            .flatten()
+            .any(|artifact| {
+                artifact.embedder_id == embedder_id
+                    && artifact.dimension == dimension
+                    && artifact.schema_version == SEMANTIC_SCHEMA_VERSION
+                    && artifact.chunking_version == CHUNKING_STRATEGY_VERSION
+                    && artifact.model_revision
+                        == semantic_model_revision_for_embedder_id(&embedder_id)
+            })
+    {
+        // Continue a bounded upgrade of an established tier even while its
+        // legacy record is unready or its watermark has been cleared.
+        return Ok(true);
+    }
+    if semantic_index_has_current_contract(data_dir, embedder)
+        && let Some((embedder_id, _)) = semantic_local_embedder_metadata(embedder)
+        && let Some(manifest) = SemanticManifest::load(data_dir)?
+        && let Some(certificate) = manifest.coverage.get(&embedder_id)
+        && let Some(state) = storage.semantic_archive_state()?
+    {
+        // A deletion or identity repair can clear the numeric watermark.
+        // Certified maintenance still has a safe retained owner and can
+        // reconcile a bounded canonical batch without starting a bulk embed.
+        return Ok(state.archive_id != certificate.archive_id
+            || state.mutation_seq != certificate.mutation_seq
+            || storage.get_last_embedded_message_id(&embedder_id)?
+                != Some(certificate.max_message_id)
+            || manifest
+                .checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint.embedder_id == embedder_id));
+    }
     if storage.semantic_identity_rebuild_required(semantic_identity_tier_for_requested_embedder(
         embedder,
     ))? {
@@ -10725,7 +10767,12 @@ fn semantic_index_has_current_contract(data_dir: &Path, requested_embedder: &str
     let Ok(index_path) = semantic_artifact_index_path(data_dir, artifact) else {
         return false;
     };
-    if index_path != vector_index_path(data_dir, &embedder_id) {
+    if index_path != vector_index_path(data_dir, &embedder_id)
+        && !manifest
+            .coverage
+            .get(&embedder_id)
+            .is_some_and(|certificate| certificate.matches_artifact(artifact))
+    {
         return false;
     }
     FsVectorIndex::open_read_only(&index_path).is_ok_and(|index| {
@@ -10748,6 +10795,7 @@ fn maintain_requested_hnsw(data_dir: &Path, requested_embedder: &str) -> Result<
         );
         return Ok(0);
     };
+    let expected_manifest = manifest.clone();
     anyhow::ensure!(
         semantic_index_has_current_contract(data_dir, requested_embedder),
         "cannot build HNSW: the requested semantic artifact is not published under the current input contract; run 'cass index --semantic --force-rebuild'"
@@ -10797,7 +10845,7 @@ fn maintain_requested_hnsw(data_dir: &Path, requested_embedder: &str) -> Result<
             ready: true,
         });
         manifest
-            .save(data_dir)
+            .save_if_unchanged(data_dir, Some(&expected_manifest))
             .context("recording the natively verified HNSW accelerator in the semantic manifest")?;
     }
     tracing::info!(
@@ -10827,6 +10875,29 @@ fn publish_direct_semantic_artifact(
     embedder_dimension: usize,
     embedded_doc_count: u64,
     build_started_at_ms: i64,
+) -> Result<()> {
+    publish_direct_semantic_artifact_with_coverage(
+        storage,
+        data_dir,
+        index_path,
+        embedder_id,
+        embedder_dimension,
+        embedded_doc_count,
+        build_started_at_ms,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_direct_semantic_artifact_with_coverage(
+    storage: &FrankenStorage,
+    data_dir: &Path,
+    index_path: &Path,
+    embedder_id: &str,
+    embedder_dimension: usize,
+    embedded_doc_count: u64,
+    build_started_at_ms: i64,
+    coverage: Option<(&semantic::SemanticBuildSnapshot, &str)>,
 ) -> Result<()> {
     let Some(tier) = semantic_tier_for_embedder_id(embedder_id) else {
         tracing::debug!(
@@ -10860,11 +10931,12 @@ fn publish_direct_semantic_artifact(
         .into_owned();
     let model_revision = semantic_model_revision_for_embedder_id(embedder_id);
 
-    let mut manifest = SemanticManifest::load_or_default(data_dir).map_err(|err| {
+    let expected_manifest = SemanticManifest::load(data_dir).map_err(|err| {
         anyhow::anyhow!("loading semantic manifest for direct artifact publish: {err}")
     })?;
+    let mut manifest = expected_manifest.clone().unwrap_or_default();
     let now = semantic_indexing_now_ms();
-    manifest.publish_artifact(ArtifactRecord {
+    let artifact = ArtifactRecord {
         tier,
         embedder_id: embedder_id.to_string(),
         model_revision,
@@ -10879,10 +10951,31 @@ fn publish_direct_semantic_artifact(
         started_at_ms: build_started_at_ms,
         completed_at_ms: now,
         ready: true,
-    });
+    };
+    if let Some((snapshot, document_digest)) = coverage {
+        let (artifact, certificate) =
+            snapshot.seal(data_dir, index_path, artifact, document_digest)?;
+        snapshot.verify(storage)?;
+        manifest.publish_covered_artifact(artifact, certificate)?;
+    } else {
+        // A legacy publisher may update its mutable builder, but cannot
+        // replace a certified owner without proving the new generation.
+        anyhow::ensure!(
+            !manifest.coverage.contains_key(embedder_id),
+            "semantic publication requires the captured archive and document receipt"
+        );
+        manifest.publish_artifact(artifact);
+    }
+    if manifest
+        .hnsw
+        .as_ref()
+        .is_some_and(|hnsw| hnsw.embedder_id == embedder_id)
+    {
+        manifest.hnsw = None;
+    }
     manifest.refresh_backlog(total_conversations, &db_fingerprint);
     manifest
-        .save(data_dir)
+        .save_if_unchanged(data_dir, expected_manifest.as_ref())
         .map_err(|err| anyhow::anyhow!("saving semantic manifest after direct publish: {err}"))?;
     tracing::info!(
         embedder = embedder_id,
@@ -19848,9 +19941,25 @@ fn run_index_with_storage_ownership(
         // to embed — skip the bulk pass on one-shot runs too.
         // An explicit full semantic rebuild must not be certified by an old
         // watermark, including when the canonical archive is now empty.
+        let certified_boundary_is_current = SemanticManifest::load(&opts.data_dir)?
+            .and_then(|manifest| {
+                let (embedder_id, _) = semantic_local_embedder_metadata(&opts.embedder)?;
+                manifest.coverage.get(&embedder_id).cloned()
+            })
+            .is_some_and(|certificate| {
+                storage
+                    .semantic_archive_state()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|state| {
+                        state.archive_id == certificate.archive_id
+                            && state.mutation_seq == certificate.mutation_seq
+                    })
+            });
         let watermark_covers_corpus = !opts.full
             && !semantic_identity_rebuild_required
             && has_existing_index
+            && certified_boundary_is_current
             && match (last_embedded, storage.max_message_id()?) {
                 (Some(watermark), Some(max_id)) => watermark >= max_id,
                 (Some(_), None) => true,
@@ -20069,7 +20178,7 @@ fn run_index_with_storage_ownership(
                 0,
                 1,
             );
-            if let Err(err) = publish_direct_semantic_artifact(
+            if let Err(err) = publish_direct_semantic_artifact_with_coverage(
                 &semantic_read_storage,
                 &opts.data_dir,
                 &index_path,
@@ -20077,6 +20186,10 @@ fn run_index_with_storage_ownership(
                 semantic_indexer.embedder_dimension(),
                 u64::try_from(semantic_build.embedded_docs).unwrap_or(u64::MAX),
                 build_started_at_ms,
+                semantic_build
+                    .coverage
+                    .as_ref()
+                    .zip(semantic_build.document_digest.as_deref()),
             ) {
                 tracing::warn!(
                     embedder = semantic_indexer.embedder_id(),
@@ -20105,10 +20218,16 @@ fn run_index_with_storage_ownership(
                 false,
                 "updating semantic indexing watermark",
                 |writer| {
-                    writer.set_last_embedded_message_id(
-                        semantic_indexer.embedder_id(),
-                        semantic_build.last_message_id.unwrap_or(0),
-                    )
+                    if semantic_manifest_published
+                        && let Some((state, maximum)) = &semantic_build.canonical_boundary
+                    {
+                        writer.set_last_embedded_message_id_if_unchanged(
+                            semantic_indexer.embedder_id(),
+                            *maximum,
+                            state,
+                        )?;
+                    }
+                    Ok(())
                 },
             )?;
             if semantic_identity_rebuild_required && semantic_manifest_published {
@@ -20123,7 +20242,18 @@ fn run_index_with_storage_ownership(
                     &storage,
                     false,
                     "completing semantic identity rebuild",
-                    |writer| writer.complete_semantic_identity_rebuild(semantic_identity_tier),
+                    |writer| {
+                        if let Some((state, _)) = &semantic_build.canonical_boundary {
+                            writer
+                                .complete_semantic_identity_rebuild_if_current(
+                                    semantic_identity_tier,
+                                    state,
+                                )
+                                .map(|_| ())
+                        } else {
+                            Ok(())
+                        }
+                    },
                 )?;
             }
             update_semantic_progress(opts.progress.as_ref(), &progress_bump, 1, 1);
@@ -20187,7 +20317,7 @@ fn run_index_with_storage_ownership(
                         embedder = %opts.embedder,
                         embedded,
                         doc_count,
-                        "background semantic delta kept the semantic index current"
+                        "background semantic maintenance advanced available coverage"
                     ),
                     Err(err) => tracing::warn!(
                         embedder = %opts.embedder,
@@ -21673,7 +21803,6 @@ struct TargetedSemanticWatchOnceSelection {
     raw_max_message_id: Option<i64>,
     tier: SemanticTierKind,
     index_path: PathBuf,
-    total_conversations: u64,
     current_db_fingerprint: String,
     manifest_before_db_fingerprint: Option<String>,
     current_doc_ids: Option<HashSet<String>>,
@@ -21862,14 +21991,20 @@ fn validate_semantic_watch_once_artifact(
         );
     }
 
-    let index_path = semantic_artifact_index_path(data_dir, artifact)?;
+    let mut index_path = semantic_artifact_index_path(data_dir, artifact)?;
     let canonical_index_path = vector_index_path(data_dir, indexer.embedder_id());
     if !index_path.eq(&canonical_index_path) {
-        anyhow::bail!(
-            "semantic watch-once cannot append to non-canonical vector path {}; expected {}",
-            index_path.display(),
-            canonical_index_path.display()
+        let covered = SemanticManifest::load(data_dir)?.is_some_and(|manifest| {
+            manifest
+                .coverage
+                .get(indexer.embedder_id())
+                .is_some_and(|certificate| certificate.matches_artifact(artifact))
+        });
+        anyhow::ensure!(
+            covered,
+            "semantic watch-once requires a canonical or certified vector owner"
         );
+        index_path = canonical_index_path;
     }
     let index = FsVectorIndex::open(&index_path).map_err(|err| {
         anyhow::anyhow!(
@@ -21994,16 +22129,16 @@ fn select_targeted_semantic_watch_once_inputs(
 
     if pre_watch_conversations == 0 {
         let canonical_documents = CanonicalSemanticDocuments::from_storage(storage)?;
+        let current_doc_ids = Some(canonical_documents.doc_ids.clone());
         return Ok(TargetedSemanticWatchOnceSelection {
             mode: TargetedSemanticWatchOnceMode::RebuildAll,
             inputs: canonical_documents.into_inputs(),
             raw_max_message_id,
             tier,
             index_path: vector_index_path(data_dir, indexer.embedder_id()),
-            total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
             current_db_fingerprint,
             manifest_before_db_fingerprint,
-            current_doc_ids: None,
+            current_doc_ids,
             reason: "fresh_watch_once_db",
         });
     }
@@ -22031,10 +22166,9 @@ fn select_targeted_semantic_watch_once_inputs(
             raw_max_message_id,
             tier,
             index_path,
-            total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
             current_db_fingerprint,
             manifest_before_db_fingerprint,
-            current_doc_ids: None,
+            current_doc_ids: Some(canonical_documents.doc_ids),
             reason: "semantic_artifact_already_covers_db",
         });
     }
@@ -22076,10 +22210,9 @@ fn select_targeted_semantic_watch_once_inputs(
             raw_max_message_id,
             tier,
             index_path,
-            total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
             current_db_fingerprint,
             manifest_before_db_fingerprint,
-            current_doc_ids: None,
+            current_doc_ids: Some(doc_ids),
             reason: "semantic_artifact_is_append_only_prefix",
         });
     }
@@ -22090,7 +22223,6 @@ fn select_targeted_semantic_watch_once_inputs(
         raw_max_message_id,
         tier,
         index_path,
-        total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
         current_db_fingerprint,
         manifest_before_db_fingerprint,
         current_doc_ids: Some(doc_ids),
@@ -22098,64 +22230,26 @@ fn select_targeted_semantic_watch_once_inputs(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish_semantic_watch_once_artifact(
+    storage: &FrankenStorage,
     data_dir: &Path,
     indexer: &SemanticIndexer,
     selection: &TargetedSemanticWatchOnceSelection,
     doc_count: u64,
     build_started_at_ms: i64,
+    coverage: Option<(&semantic::SemanticBuildSnapshot, &str)>,
 ) -> Result<()> {
-    let size_bytes = fs::metadata(&selection.index_path)
-        .with_context(|| {
-            format!(
-                "stat semantic watch-once index {}",
-                selection.index_path.display()
-            )
-        })?
-        .len();
-    let relative_index_path = selection
-        .index_path
-        .strip_prefix(data_dir)
-        .unwrap_or(selection.index_path.as_path())
-        .to_string_lossy()
-        .to_string();
-    let mut manifest = SemanticManifest::load_or_default(data_dir).map_err(|err| {
-        anyhow::anyhow!("loading semantic manifest for semantic watch-once publish: {err}")
-    })?;
-    if !matches!(
-        selection.mode,
-        TargetedSemanticWatchOnceMode::AlreadyCovered
-    ) && manifest.hnsw.as_ref().is_some_and(|hnsw| {
-        hnsw.base_tier == selection.tier && hnsw.embedder_id == indexer.embedder_id()
-    }) {
-        // Any append/rebuild/reconciliation changes the vector row set or
-        // ordering. The HNSW loader independently rejects that stale graph,
-        // but the durable manifest must stop advertising it as ready too.
-        manifest.hnsw = None;
-    }
-    manifest.publish_artifact(ArtifactRecord {
-        tier: selection.tier,
-        embedder_id: indexer.embedder_id().to_string(),
-        model_revision: semantic_model_revision_for_embedder_id(indexer.embedder_id()),
-        schema_version: SEMANTIC_SCHEMA_VERSION,
-        chunking_version: CHUNKING_STRATEGY_VERSION,
-        dimension: indexer.embedder_dimension(),
+    publish_direct_semantic_artifact_with_coverage(
+        storage,
+        data_dir,
+        &selection.index_path,
+        indexer.embedder_id(),
+        indexer.embedder_dimension(),
         doc_count,
-        conversation_count: selection.total_conversations,
-        db_fingerprint: selection.current_db_fingerprint.clone(),
-        index_path: relative_index_path,
-        size_bytes,
-        started_at_ms: build_started_at_ms,
-        completed_at_ms: semantic_indexing_now_ms(),
-        ready: true,
-    });
-    manifest.refresh_backlog(
-        selection.total_conversations,
-        &selection.current_db_fingerprint,
-    );
-    manifest
-        .save(data_dir)
-        .map_err(|err| anyhow::anyhow!("saving semantic watch-once manifest: {err}"))
+        build_started_at_ms,
+        coverage,
+    )
 }
 
 fn run_targeted_semantic_watch_once_publish(
@@ -22172,16 +22266,38 @@ fn run_targeted_semantic_watch_once_publish(
     }
 
     let indexer = SemanticIndexer::new(embedder, Some(data_dir))?;
-    let selection = {
+    let (selection, coverage, canonical_boundary) = {
         let storage = storage.lock().map_err(|err| {
             anyhow::anyhow!("lock storage for semantic watch-once selection: {err}")
         })?;
-        select_targeted_semantic_watch_once_inputs(
+        let mut coverage =
+            semantic::SemanticBuildSnapshot::capture(&storage, indexer.embedder_id())?;
+        let canonical_boundary = if let Some(snapshot) = &coverage {
+            Some((snapshot.state.clone(), snapshot.max_message_id))
+        } else {
+            storage
+                .semantic_archive_state()?
+                .map(|state| {
+                    storage
+                        .max_message_id()
+                        .map(|maximum| (state, maximum.unwrap_or(0)))
+                })
+                .transpose()?
+        };
+        let selection = select_targeted_semantic_watch_once_inputs(
             &storage,
             data_dir,
             &indexer,
             pre_watch_conversations,
-        )?
+        )?;
+        if let Some(snapshot) = &mut coverage {
+            anyhow::ensure!(
+                selection.raw_max_message_id.unwrap_or(0) == snapshot.max_message_id,
+                "semantic watch-once selection crossed its captured message boundary"
+            );
+            snapshot.prepare_parents(&storage, data_dir)?;
+        }
+        (selection, coverage, canonical_boundary)
     };
     let selected_docs = selection.inputs.len();
     let build_started_at_ms = semantic_indexing_now_ms();
@@ -22252,25 +22368,50 @@ fn run_targeted_semantic_watch_once_publish(
         }
     };
 
-    publish_semantic_watch_once_artifact(
-        data_dir,
-        &indexer,
-        &selection,
-        doc_count,
-        build_started_at_ms,
-    )?;
-    if let Some(raw_max_message_id) = selection.raw_max_message_id {
-        update_incremental_semantic_watermark(
-            storage,
-            indexer.embedder_id(),
-            raw_max_message_id,
-            "updating semantic watch-once watermark",
+    let (doc_count, document_digest) = if coverage.is_some() {
+        let index = FsVectorIndex::open_read_only(&selection.index_path)?;
+        let digest = semantic::semantic_index_document_digest_for_canonical_ids(
+            &index,
+            selection
+                .current_doc_ids
+                .as_ref()
+                .context("semantic watch-once omitted its complete canonical identities")?,
         )?;
-    }
+        (u64::try_from(index.record_count())?, Some(digest))
+    } else {
+        (doc_count, None)
+    };
     {
         let guard = storage
             .lock()
             .map_err(|err| anyhow::anyhow!("lock storage after semantic watch-once: {err}"))?;
+        publish_semantic_watch_once_artifact(
+            &guard,
+            data_dir,
+            &indexer,
+            &selection,
+            doc_count,
+            build_started_at_ms,
+            coverage.as_ref().zip(document_digest.as_deref()),
+        )?;
+        persist::with_ephemeral_writer(
+            &guard,
+            false,
+            "certifying semantic watch-once boundary",
+            |writer| {
+                if let Some((state, maximum)) = &canonical_boundary {
+                    writer
+                        .set_last_embedded_message_id_if_unchanged(
+                            indexer.embedder_id(),
+                            *maximum,
+                            state,
+                        )
+                        .map(|_| ())
+                } else {
+                    Ok(())
+                }
+            },
+        )?;
         let semantic_identity_tier = storage_semantic_identity_tier(selection.tier);
         if guard.semantic_identity_rebuild_required(semantic_identity_tier)? {
             crate::indexer::semantic::invalidate_identity_stale_semantic_shards(
@@ -22284,7 +22425,18 @@ fn run_targeted_semantic_watch_once_publish(
                 &guard,
                 false,
                 "completing semantic identity rebuild after semantic watch-once",
-                |writer| writer.complete_semantic_identity_rebuild(semantic_identity_tier),
+                |writer| {
+                    if let Some((state, _)) = &canonical_boundary {
+                        writer
+                            .complete_semantic_identity_rebuild_if_current(
+                                semantic_identity_tier,
+                                state,
+                            )
+                            .map(|_| ())
+                    } else {
+                        Ok(())
+                    }
+                },
             )?;
         }
     }
@@ -22301,6 +22453,7 @@ fn run_targeted_semantic_watch_once_publish(
     })
 }
 
+#[cfg(test)]
 fn update_incremental_semantic_watermark(
     storage: &Mutex<FrankenStorage>,
     embedder_id: &str,
@@ -22316,6 +22469,7 @@ fn update_incremental_semantic_watermark(
     Ok(())
 }
 
+#[cfg(test)]
 fn embed_incremental_semantic_inputs(
     embedder: &str,
     data_dir: &Path,
@@ -22373,6 +22527,36 @@ fn finalize_one_shot_semantic_delta(
         .with_context(|| {
             format!("unknown local semantic embedder for delta finalization: {embedder}")
         })?;
+    if let Some(manifest) = SemanticManifest::load(data_dir)?
+        && manifest
+            .checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.embedder_id == embedder_id)
+    {
+        tracing::info!(
+            embedder = embedder_id,
+            "semantic catch-up checkpoint saved; published serving authority unchanged"
+        );
+        return Ok([&manifest.fast_tier, &manifest.quality_tier]
+            .into_iter()
+            .flatten()
+            .find(|artifact| artifact.embedder_id == embedder_id)
+            .map_or(0, |artifact| artifact.doc_count));
+    }
+    if let Some(manifest) = SemanticManifest::load(data_dir)?
+        && let Some(certificate) = manifest.coverage.get(&embedder_id)
+        && [&manifest.fast_tier, &manifest.quality_tier]
+            .into_iter()
+            .flatten()
+            .any(|artifact| {
+                artifact.embedder_id == embedder_id && certificate.matches_artifact(artifact)
+            })
+    {
+        // Covered maintenance already published its immutable owner and
+        // conditionally advanced its captured watermark. Do not overwrite
+        // that certificate with a live MAX(id) or the mutable builder path.
+        return Ok(certificate.doc_count);
+    }
     let index_path = vector_index_path(data_dir, &embedder_id);
     let mut index = FsVectorIndex::open(&index_path).map_err(|err| {
         anyhow::anyhow!(
@@ -22408,24 +22592,8 @@ fn finalize_one_shot_semantic_delta(
     }
     let doc_count = u64::try_from(live_record_count).unwrap_or(u64::MAX);
     drop(index);
-    // The append changed the vector row set, so any HNSW graph built over the
-    // previous rows is stale. The loader rejects it independently, but the
-    // durable manifest must stop advertising it as ready (same rule as the
-    // targeted watch-once publish).
-    if let Some(tier) = semantic_tier_for_embedder_id(&embedder_id) {
-        let mut manifest = SemanticManifest::load_or_default(data_dir)
-            .map_err(|err| anyhow::anyhow!("loading semantic manifest for delta publish: {err}"))?;
-        if manifest
-            .hnsw
-            .as_ref()
-            .is_some_and(|hnsw| hnsw.base_tier == tier && hnsw.embedder_id == embedder_id)
-        {
-            manifest.hnsw = None;
-            manifest
-                .save(data_dir)
-                .map_err(|err| anyhow::anyhow!("revoking stale HNSW after delta append: {err}"))?;
-        }
-    }
+    // The publisher retires the stale graph and installs the artifact in
+    // one compare-and-swap of the complete ledger.
     publish_direct_semantic_artifact(
         storage,
         data_dir,
@@ -22438,6 +22606,82 @@ fn finalize_one_shot_semantic_delta(
     Ok(doc_count)
 }
 
+/// Upgrade an established legacy tier, or repair a certified builder after an
+/// interrupted append, a deletion, or a changed prefix. Reuse exact surviving
+/// vectors through bounded backfill and its checkpoint. Certified owners stay
+/// available; an uncertified tier keeps strict admission until verification.
+fn reconcile_existing_semantic_delta(
+    embedder: &str,
+    data_dir: &Path,
+    storage: &Mutex<FrankenStorage>,
+) -> Result<usize> {
+    let indexer = SemanticIndexer::new(embedder, Some(data_dir))?;
+    let guard = storage
+        .lock()
+        .map_err(|error| anyhow::anyhow!("lock bounded semantic reconciliation: {error}"))?;
+    let mut manifest = SemanticManifest::load_or_default(data_dir)?;
+    anyhow::ensure!(
+        [&manifest.fast_tier, &manifest.quality_tier]
+            .into_iter()
+            .flatten()
+            .any(|artifact| {
+                artifact.embedder_id == indexer.embedder_id()
+                    && artifact.dimension == indexer.embedder_dimension()
+                    && artifact.schema_version == SEMANTIC_SCHEMA_VERSION
+                    && artifact.chunking_version == CHUNKING_STRATEGY_VERSION
+            }),
+        "semantic maintenance requires an established compatible tier"
+    );
+    anyhow::ensure!(
+        manifest
+            .checkpoint
+            .as_ref()
+            .is_none_or(|checkpoint| checkpoint.embedder_id == indexer.embedder_id()),
+        "another embedder owns the resumable semantic checkpoint"
+    );
+    let tier = semantic_tier_for_embedder_id(indexer.embedder_id())
+        .context("unknown native semantic tier")?;
+    let count = count_total_conversations_exact(&guard)?;
+    let outcome = indexer.run_capped_backfill_from_storage_with_sink(
+        &guard,
+        data_dir,
+        &mut manifest,
+        semantic::SemanticBackfillStoragePlan {
+            tier,
+            db_fingerprint: lexical_rebuild_content_fingerprint(&guard, count)?,
+            model_revision: semantic_model_revision_for_embedder_id(indexer.embedder_id()),
+            max_conversations: 64,
+        },
+        &crate::indexer::semantic_progress::SemanticProgressSink::disabled(),
+    )?;
+    if outcome.published
+        && let Some(certificate) = manifest.coverage.get(indexer.embedder_id())
+    {
+        let boundary = crate::storage::sqlite::SemanticArchiveState {
+            archive_id: certificate.archive_id.clone(),
+            mutation_seq: certificate.mutation_seq,
+        };
+        persist::with_ephemeral_writer(
+            &guard,
+            false,
+            "certifying reconciled semantic boundary",
+            |writer| {
+                writer.set_last_embedded_message_id_if_unchanged(
+                    indexer.embedder_id(),
+                    certificate.max_message_id,
+                    &boundary,
+                )?;
+                writer.complete_semantic_identity_rebuild_if_current(
+                    storage_semantic_identity_tier(tier),
+                    &boundary,
+                )?;
+                Ok(())
+            },
+        )?;
+    }
+    Ok(usize::try_from(outcome.embedded_docs)?)
+}
+
 /// Perform incremental semantic embedding for messages added since the last
 /// watermark. Loads the ONNX model, embeds the batch, appends to the existing
 /// FSVI index via WAL, and updates the watermark.
@@ -22446,54 +22690,97 @@ fn incremental_semantic_embed(
     data_dir: &Path,
     storage: &Mutex<FrankenStorage>,
 ) -> Result<usize> {
-    // 1. Read this embedder's own watermark. Without one nothing proves which
-    // rows the existing index already holds, and appending from zero would
-    // duplicate them; callers fall back to the bulk pass instead.
-    let watermark = semantic_embed_watermark(
-        &*storage
+    let (embedder_id, dimension) = semantic_local_embedder_metadata(embedder)
+        .context("incremental semantic maintenance requires a native embedder")?;
+    // Capture before selection and retain the existing per-embedder watermark.
+    // The archive journal proves that its skipped prefix contains no edits or
+    // deletions; byte admission binds it to the certified immutable base.
+    let (snapshot, inputs) = {
+        let guard = storage
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock storage for watermark read: {e}"))?,
-        embedder,
-    )?
-    .with_context(|| {
-        format!("no semantic embed watermark for {embedder}; the delta needs a covered base")
-    })?;
-
-    // 2. Fetch new packet-derived canonical batches since watermark.
-    let batch = {
-        let storage = storage
+            .map_err(|error| anyhow::anyhow!("lock semantic delta selection: {error}"))?;
+        let Some(mut snapshot) = semantic::SemanticBuildSnapshot::capture(&guard, &embedder_id)?
+        else {
+            // Unsupported proof platforms keep strict serving, but an
+            // established tier can still make bounded maintenance progress.
+            drop(guard);
+            return reconcile_existing_semantic_delta(embedder, data_dir, storage);
+        };
+        if !snapshot.admit_incremental_base(&guard, data_dir, &embedder_id, dimension)? {
+            drop(guard);
+            return reconcile_existing_semantic_delta(embedder, data_dir, storage);
+        }
+        if snapshot.is_unchanged_base() {
+            return Ok(0);
+        }
+        let watermark = guard
+            .get_last_embedded_message_id(&embedder_id)?
+            .context("certified semantic prefix lost its embedder watermark")?;
+        let batch = packet_embedding_inputs_from_storage_since(&guard, watermark)?;
+        anyhow::ensure!(
+            batch.raw_max_message_id.unwrap_or(watermark) <= snapshot.max_message_id,
+            "semantic delta crossed its captured archive boundary"
+        );
+        tracing::debug!(
+            embedder_id = %embedder_id,
+            since_message_id = watermark,
+            conversations_in_batch = batch.conversations_in_batch,
+            semantic_inputs = batch.inputs.len(),
+            raw_max_message_id = batch.raw_max_message_id,
+            "selected bounded semantic catch-up batch"
+        );
+        let inputs: Vec<_> = batch
+            .inputs
+            .into_iter()
+            .filter(|message| {
+                !is_hard_message_noise(semantic_role_name(message.role), &message.content)
+            })
+            .collect();
+        snapshot.prepare_parents(&guard, data_dir)?;
+        (snapshot, inputs)
+    };
+    let started_at = semantic_indexing_now_ms();
+    let indexer = SemanticIndexer::new(embedder, Some(data_dir))?;
+    let embedded = indexer.embed_messages(&inputs)?;
+    {
+        let guard = storage
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock storage for message fetch: {e}"))?;
-        packet_embedding_inputs_from_storage_since(&storage, watermark)?
-    };
-
-    let Some(raw_max_id) = batch.raw_max_message_id else {
-        return Ok(0);
-    };
-
-    tracing::info!(
-        since_id = watermark,
-        conversations = batch.conversations_in_batch,
-        count = batch.inputs.len(),
-        packet_driven = true,
-        "incremental semantic: fetched canonical packet catch-up batch"
-    );
-
-    let embedding_inputs: Vec<EmbeddingInput> = batch
-        .inputs
-        .into_iter()
-        .filter(|msg| !is_hard_message_noise(semantic_role_name(msg.role), &msg.content))
-        .collect();
-
-    embed_incremental_semantic_inputs(
-        embedder,
+            .map_err(|error| anyhow::anyhow!("verify semantic delta source: {error}"))?;
+        snapshot.verify(&guard)?;
+    }
+    let (embedded_count, document_digest) = indexer.append_to_index_with_coverage_receipt(
+        embedded,
         data_dir,
-        storage,
-        embedding_inputs,
-        raw_max_id,
-        "advancing incremental semantic watermark for filtered batch",
-        "updating incremental semantic watermark",
-    )
+        snapshot.base_artifact_sha256(),
+    )?;
+    let index_path = vector_index_path(data_dir, &embedder_id);
+    let index = FsVectorIndex::open_read_only(&index_path)?;
+    let doc_count = u64::try_from(index.record_count())?;
+    anyhow::ensure!(
+        semantic::semantic_index_document_digest(&index)? == document_digest,
+        "semantic append changed before publication"
+    );
+    drop(index);
+    let guard = storage
+        .lock()
+        .map_err(|error| anyhow::anyhow!("publish semantic delta: {error}"))?;
+    publish_direct_semantic_artifact_with_coverage(
+        &guard,
+        data_dir,
+        &index_path,
+        &embedder_id,
+        dimension,
+        doc_count,
+        started_at,
+        Some((&snapshot, &document_digest)),
+    )?;
+    persist::with_ephemeral_writer(
+        &guard,
+        false,
+        "certifying semantic delta boundary",
+        |writer| snapshot.certify_watermark(writer, &embedder_id).map(|_| ()),
+    )?;
+    Ok(embedded_count)
 }
 
 /// Open frankensqlite storage for indexing without replacing canonical data.

@@ -6,7 +6,8 @@
 //! Canonical follow-up requires an explicit --db
 //! and exact source/conversation/message coordinates; it never opens raw files.
 //! Separate opt-in semantic retrieval retains local models and vector assets.
-//! No lane starts writers, automatic refresh, downloads, or detached children.
+//! No lane starts writers, downloads, or detached children. Certified semantic
+//! requests can adopt a newly published retained generation between requests.
 //! Request deadlines terminate the worker, including stalled native calls.
 //! Sampled resident-memory limits terminate an over-budget worker; they are
 //! not kernel allocation limits or a peak-RSS guarantee between samples.

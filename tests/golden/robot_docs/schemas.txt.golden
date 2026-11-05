@@ -693,6 +693,7 @@ schemas: (auto-generated from contract)
       - fast_tier: object
         - completed_at: ?
         - conversation_count: ?
+        - coverage: object
         - current_db_matches: ?
         - doc_count: ?
         - embedder_id: ?
@@ -714,6 +715,7 @@ schemas: (auto-generated from contract)
       - quality_tier: object
         - completed_at: ?
         - conversation_count: ?
+        - coverage: object
         - current_db_matches: ?
         - doc_count: ?
         - embedder_id: ?
@@ -2575,6 +2577,7 @@ schemas: (auto-generated from contract)
       - fast_tier: object
         - completed_at: ?
         - conversation_count: ?
+        - coverage: object
         - current_db_matches: ?
         - doc_count: ?
         - embedder_id: ?
@@ -2596,6 +2599,7 @@ schemas: (auto-generated from contract)
       - quality_tier: object
         - completed_at: ?
         - conversation_count: ?
+        - coverage: object
         - current_db_matches: ?
         - doc_count: ?
         - embedder_id: ?
@@ -3349,6 +3353,18 @@ schemas: (auto-generated from contract)
         - quarantine_status: string
         - quarantined_conversations: integer
       - search_mode: ?
+      - semantic_coverage: object
+        - candidate_window_limited: boolean
+        - current_max_message_id: integer
+        - current_mutation_seq: integer
+        - excluded_candidates: integer
+        - generation: string
+        - indexed_passages: integer
+        - published_at_ms: integer
+        - published_max_message_id: integer
+        - published_mutation_seq: integer
+        - stale_reason: string
+        - status: string
       - semantic_fallback_reason: ?
       - semantic_refinement: ?
       - state: object
@@ -3709,6 +3725,7 @@ schemas: (auto-generated from contract)
       - fast_tier: object
         - completed_at: ?
         - conversation_count: ?
+        - coverage: object
         - current_db_matches: ?
         - doc_count: ?
         - embedder_id: ?
@@ -3730,6 +3747,7 @@ schemas: (auto-generated from contract)
       - quality_tier: object
         - completed_at: ?
         - conversation_count: ?
+        - coverage: object
         - current_db_matches: ?
         - doc_count: ?
         - embedder_id: ?
@@ -4115,6 +4133,7 @@ schemas: (auto-generated from contract)
       - fast_tier: object
         - completed_at: ?
         - conversation_count: ?
+        - coverage: object
         - current_db_matches: ?
         - doc_count: ?
         - embedder_id: ?
@@ -4136,6 +4155,7 @@ schemas: (auto-generated from contract)
       - quality_tier: object
         - completed_at: ?
         - conversation_count: ?
+        - coverage: object
         - current_db_matches: ?
         - doc_count: ?
         - embedder_id: ?

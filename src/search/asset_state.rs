@@ -630,6 +630,7 @@ pub(crate) struct SemanticTierAssetState {
     pub size_bytes: Option<u64>,
     pub index_path: Option<PathBuf>,
     pub shard_count: Option<u32>,
+    pub coverage: Option<crate::search::vector_index::SemanticCoverageSnapshot>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -831,6 +832,71 @@ pub(crate) fn inspect_semantic_assets(
         SemanticPreference::DefaultModel => probe_semantic_availability(data_dir),
         SemanticPreference::HashFallback => probe_hash_semantic_availability(data_dir),
     };
+    if availability.can_search()
+        && let Some(embedder_id) = semantic_embedder_id(&availability, preference)
+    {
+        let observation = FrankenStorage::open_readonly(db_path)
+            .map_err(|error| error.to_string())
+            .and_then(|storage| {
+                crate::search::model_manager::observe_covered_semantic_artifact(
+                    data_dir,
+                    &storage,
+                    &embedder_id,
+                )
+            });
+        match observation {
+            Ok(Some((record, coverage))) => {
+                let mut state = semantic_state_from_availability(
+                    data_dir,
+                    &availability,
+                    preference,
+                    current_db_fingerprint,
+                );
+                state.status = if coverage.status == "partial" {
+                    "partial"
+                } else {
+                    "ready"
+                };
+                state.availability = if coverage.status == "partial" {
+                    "partial_coverage"
+                } else {
+                    "ready"
+                };
+                state.summary = if coverage.status == "partial" {
+                    "verified semantic generation remains searchable while current messages are reconciled".to_owned()
+                } else {
+                    "verified semantic generation covers the current canonical snapshot".to_owned()
+                };
+                state.available = true;
+                state.can_search = true;
+                state.semantic_only_search_available = true;
+                state.fallback_mode = None;
+                state.hint = (coverage.status == "partial").then(||
+                    "Results exclude changed or removed identities; newer messages become searchable after semantic catch-up.".to_owned());
+                state.vector_index_path = Some(data_dir.join(&record.index_path));
+                state.hnsw_path = None;
+                state.hnsw_present = false;
+                state.hnsw_state = "missing";
+                let tier = match record.tier {
+                    TierKind::Fast => &mut state.fast_tier,
+                    TierKind::Quality => &mut state.quality_tier,
+                };
+                tier.coverage = Some(coverage);
+                tier.index_path = Some(data_dir.join(&record.index_path));
+                state.quality_tier_published |= state.quality_tier.coverage.is_some();
+                return state;
+            }
+            Ok(None) => {}
+            Err(context) => {
+                return semantic_state_from_availability(
+                    data_dir,
+                    &SemanticAvailability::LoadFailed { context },
+                    preference,
+                    current_db_fingerprint,
+                );
+            }
+        }
+    }
     let availability = apply_semantic_identity_invalidation(db_path, availability, preference);
     semantic_state_from_availability(data_dir, &availability, preference, current_db_fingerprint)
 }
@@ -1208,7 +1274,7 @@ fn semantic_tier_queryable(
     availability: &SemanticAvailability,
     tier: &SemanticTierAssetState,
 ) -> bool {
-    if !tier.ready || tier.current_db_matches == Some(false) {
+    if !tier.ready || (tier.current_db_matches == Some(false) && tier.coverage.is_none()) {
         return false;
     }
     let Some(embedder_id) = tier.embedder_id.as_deref() else {
@@ -1275,6 +1341,7 @@ fn semantic_tier_asset_state(
         size_bytes: Some(artifact.size_bytes),
         index_path: None,
         shard_count: Some(1),
+        coverage: None,
     }
 }
 
@@ -1368,6 +1435,7 @@ fn promote_complete_shard_generation_state(
         size_bytes: Some(size_bytes),
         index_path: Some(first_index_path),
         shard_count: u32::try_from(records.len()).ok(),
+        coverage: None,
     };
 }
 

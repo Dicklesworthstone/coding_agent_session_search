@@ -24039,6 +24039,14 @@ fn state_meta_json_inner(
             "db_path": db_path.display().to_string()
         }
     });
+    for (name, tier) in [
+        ("fast_tier", &semantic.fast_tier),
+        ("quality_tier", &semantic.quality_tier),
+    ] {
+        if let Some(coverage) = &tier.coverage {
+            state["semantic"][name]["coverage"] = serde_json::json!(coverage);
+        }
+    }
     // zn1xn: emit the "canonical FTS shadow may be half-rebuilt" signal
     // additively — present only when the last full index run left the shadow
     // unrepaired — so existing status/index JSON is byte-identical otherwise.
@@ -32540,8 +32548,8 @@ fn execute_search_operation(
                 }
             })?,
         SearchMode::Semantic => {
-            let (hits, ann_stats) = client
-                .search_semantic_with_tier(
+            let (hits, ann_stats, semantic_coverage) = client
+                .search_semantic_with_tier_and_coverage(
                     &query,
                     filters.clone(),
                     search_limit,
@@ -32588,6 +32596,7 @@ fn execute_search_operation(
                         }
                     }
                 })?;
+            mode_meta.semantic_coverage = semantic_coverage;
             let ann_unavailable_reason = if approximate {
                 client
                     .ann_unavailability_reason()
@@ -32614,7 +32623,7 @@ fn execute_search_operation(
                 total_count: None,
             }
         }
-        SearchMode::Hybrid => match client.search_hybrid(
+        SearchMode::Hybrid => match client.search_hybrid_with_coverage(
             &query,
             &query,
             filters.clone(),
@@ -32624,7 +32633,10 @@ fn execute_search_operation(
             field_mask,
             approximate,
         ) {
-            Ok(result) => result,
+            Ok((result, coverage)) => {
+                mode_meta.semantic_coverage = coverage;
+                result
+            }
             Err(error) => {
                 let message = error.to_string();
                 if hybrid_fail_open
@@ -33926,8 +33938,8 @@ fn run_cli_search(
                 // frankensearch/native backend, so semantic availability is a
                 // runtime question (model/vector assets), not a compile-time one.
                 {
-                    let (hits, ann_stats) = client
-                    .search_semantic_with_tier(
+                    let (hits, ann_stats, semantic_coverage) = client
+                    .search_semantic_with_tier_and_coverage(
                         query,
                         filters.clone(),
                         search_limit,
@@ -33976,6 +33988,7 @@ fn run_cli_search(
                             }
                         }
                     })?;
+                    mode_meta.semantic_coverage = semantic_coverage;
                     let ann_unavailable_reason = if approximate {
                         client.ann_unavailability_reason().map_err(|e| CliError {
                             code: 9,
@@ -34001,7 +34014,7 @@ fn run_cli_search(
                     }
                 }
             }
-            SearchMode::Hybrid => match client.search_hybrid(
+            SearchMode::Hybrid => match client.search_hybrid_with_coverage(
                 query,
                 query,
                 filters.clone(),
@@ -34011,7 +34024,10 @@ fn run_cli_search(
                 field_mask,
                 approximate,
             ) {
-                Ok(result) => result,
+                Ok((result, coverage)) => {
+                    mode_meta.semantic_coverage = coverage;
+                    result
+                }
                 Err(e) => {
                     let err_str = e.to_string();
                     if hybrid_fail_open
@@ -34603,6 +34619,9 @@ fn run_cli_search(
     // Bead v6vuz: captured before the output chain because `warning` and
     // `effective_robot` are conditionally moved into the robot branch below.
     let is_human_search = effective_robot.is_none();
+    let human_semantic_coverage = is_human_search
+        .then(|| mode_meta.semantic_coverage.clone())
+        .flatten();
     let has_readiness_warning = warning.is_some();
     // i6tyy: keep the human copy before `warning` is moved into the robot
     // envelope below.
@@ -34828,6 +34847,20 @@ fn run_cli_search(
     }
     if is_human_search && let Some(reason) = display_result.ann_unavailable_reason {
         eprintln!("{}", ann_fallback_human_warning(reason));
+    }
+    if let Some(coverage) = human_semantic_coverage {
+        eprintln!(
+            "Semantic coverage: {}; published mutation {}, current mutation {}; {} stale candidates excluded{}.",
+            coverage.status,
+            coverage.published_mutation_seq,
+            coverage.current_mutation_seq,
+            coverage.excluded_candidates,
+            if coverage.candidate_window_limited {
+                "; candidate refill limit reached"
+            } else {
+                ""
+            },
+        );
     }
 
     Ok(())
@@ -37111,6 +37144,7 @@ struct SearchModeMeta {
     /// `long_query_term`), or kept its own hits because the retry ran out of
     /// query fuel (`query_fuel_exhausted`, 7hvlg).
     wildcard_fallback_skipped: Option<&'static str>,
+    semantic_coverage: Option<crate::search::vector_index::SemanticCoverageSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37243,6 +37277,7 @@ impl SearchModeMeta {
             semantic_work_completed: true,
             lexical_degrade_reason: None,
             wildcard_fallback_skipped: None,
+            semantic_coverage: None,
         }
     }
 
@@ -37264,6 +37299,7 @@ impl SearchModeMeta {
         self.realized = crate::search::query::SearchMode::Lexical;
         self.fallback_tier = Some("lexical");
         self.fallback_reason = Some(reason.into());
+        self.semantic_coverage = None;
     }
 
     fn fell_back_to_lexical(&self) -> bool {
@@ -37503,7 +37539,13 @@ fn search_cursor_manifest_json(input: SearchCursorManifestInput<'_>) -> serde_js
         .and_then(|freshness| freshness.get("rebuilding"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let continuation_safe = input.next_cursor_present && !input.timed_out && !index_rebuilding;
+    let semantic_partial = input
+        .search_mode_meta
+        .semantic_coverage
+        .as_ref()
+        .is_some_and(|coverage| coverage.status == "partial" || coverage.candidate_window_limited);
+    let continuation_safe =
+        input.next_cursor_present && !input.timed_out && !index_rebuilding && !semantic_partial;
     let continuation_reason = if !input.has_more {
         "result window exhausted; no continuation cursor was emitted"
     } else if !input.next_cursor_present {
@@ -37512,6 +37554,8 @@ fn search_cursor_manifest_json(input: SearchCursorManifestInput<'_>) -> serde_js
         "partial timeout results are best-effort; rerun before continuing for deterministic pagination"
     } else if index_rebuilding {
         "lexical index is rebuilding; cursor is best-effort until the generation is stable"
+    } else if semantic_partial {
+        "semantic coverage is partial; subsequent pages may observe catch-up or canonical changes"
     } else if input.hits_clamped {
         "cursor offset advances by emitted hits after token-budget clamping"
     } else {
@@ -37546,7 +37590,7 @@ fn search_cursor_manifest_json(input: SearchCursorManifestInput<'_>) -> serde_js
         .map(|generation| generation.to_string());
     let reload_ms_total = input.cache_stats.reload_ms_total.min(u128::from(u64::MAX)) as u64;
 
-    serde_json::json!({
+    let mut manifest = serde_json::json!({
         "schema_version": 1,
         "has_more": input.has_more,
         "count_precision": count_precision,
@@ -37604,7 +37648,11 @@ fn search_cursor_manifest_json(input: SearchCursorManifestInput<'_>) -> serde_js
             "fallback_reason": input.search_mode_meta.fallback_reason.clone(),
             "semantic_refinement": input.search_mode_meta.semantic_refinement(),
         },
-    })
+    });
+    if let Some(coverage) = &input.search_mode_meta.semantic_coverage {
+        manifest["semantic_fallback"]["semantic_coverage"] = serde_json::json!(coverage);
+    }
+    manifest
 }
 
 /// Map the realized [`SearchMode`] to the trust [`RealizedMode`] vocabulary.
@@ -37972,6 +38020,13 @@ fn output_robot_results(
     zero_result_diagnosis: Option<&crate::search::zero_result_diagnosis::ZeroResultReport>,
 ) -> CliResult<()> {
     use std::io::{BufWriter, Write};
+    let coverage_on_diagnostics = matches!(format, RobotFormat::Sessions)
+        || (!include_meta && matches!(format, RobotFormat::Jsonl));
+    if coverage_on_diagnostics && let Some(coverage) = &search_mode_meta.semantic_coverage {
+        eprintln!("{}", serde_json::json!({"semantic_coverage": coverage}));
+    }
+    let include_meta =
+        include_meta || (search_mode_meta.semantic_coverage.is_some() && !coverage_on_diagnostics);
 
     if matches!(format, RobotFormat::Sessions) {
         // Output unique session paths only, one per line.
@@ -38585,6 +38640,9 @@ fn output_robot_results(
                     "explanation_cards": explanation_cards_json.clone(),
                     "effective": effective.clone(),
                 });
+                if let Some(coverage) = &search_mode_meta.semantic_coverage {
+                    meta["semantic_coverage"] = serde_json::json!(coverage);
+                }
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
                 {
@@ -38737,6 +38795,9 @@ fn output_robot_results(
                         "effective": effective.clone(),
                     }
                 });
+                if let Some(coverage) = &search_mode_meta.semantic_coverage {
+                    meta["_meta"]["semantic_coverage"] = serde_json::json!(coverage);
+                }
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut outer) = meta
                     && let Some(serde_json::Value::Object(m)) = outer.get_mut("_meta")
@@ -38956,6 +39017,9 @@ fn output_robot_results(
                     "explanation_cards": explanation_cards_json.clone(),
                     "effective": effective.clone(),
                 });
+                if let Some(coverage) = &search_mode_meta.semantic_coverage {
+                    meta["semantic_coverage"] = serde_json::json!(coverage);
+                }
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
                 {
@@ -39140,6 +39204,9 @@ fn output_robot_results(
                     "explanation_cards": explanation_cards_json.clone(),
                     "effective": effective.clone(),
                 });
+                if let Some(coverage) = &search_mode_meta.semantic_coverage {
+                    meta["semantic_coverage"] = serde_json::json!(coverage);
+                }
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
                 {
@@ -101379,7 +101446,8 @@ fn response_schema_semantic_state() -> serde_json::Value {
                     "model_revision": { "type": ["string", "null"] },
                     "completed_at": { "type": ["string", "null"] },
                     "size_bytes": { "type": ["integer", "null"] },
-                    "shard_count": { "type": ["integer", "null"] }
+                    "shard_count": { "type": ["integer", "null"] },
+                    "coverage": response_schema_semantic_coverage()
                 }
             },
             "quality_tier": {
@@ -101394,7 +101462,8 @@ fn response_schema_semantic_state() -> serde_json::Value {
                     "model_revision": { "type": ["string", "null"] },
                     "completed_at": { "type": ["string", "null"] },
                     "size_bytes": { "type": ["integer", "null"] },
-                    "shard_count": { "type": ["integer", "null"] }
+                    "shard_count": { "type": ["integer", "null"] },
+                    "coverage": response_schema_semantic_coverage()
                 }
             },
             "backlog": {
@@ -104164,7 +104233,8 @@ fn response_schema_cursor_manifest() -> serde_json::Value {
                     "realized_search_mode": { "type": "string" },
                     "fallback_tier": { "type": ["string", "null"] },
                     "fallback_reason": { "type": ["string", "null"] },
-                    "semantic_refinement": { "type": "boolean" }
+                    "semantic_refinement": { "type": "boolean" },
+                    "semantic_coverage": response_schema_semantic_coverage()
                 }
             }
         },
@@ -104392,6 +104462,30 @@ fn response_schema_search_effective() -> serde_json::Value {
     })
 }
 
+fn response_schema_semantic_coverage() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Coverage of the retained semantic generation in this request's canonical read snapshot. A partial generation remains searchable; changed or missing identities are excluded. Passage counts and message-ID bounds are not percentages or exact message counts.",
+        "properties": {
+            "status": {"type": "string", "enum": ["complete", "partial"]},
+            "generation": {"type": "string"},
+            "published_at_ms": {"type": "integer"},
+            "published_mutation_seq": {"type": "integer", "minimum": 0},
+            "current_mutation_seq": {"type": "integer", "minimum": 0},
+            "published_max_message_id": {"type": "integer", "minimum": 0},
+            "current_max_message_id": {"type": "integer", "minimum": 0},
+            "indexed_passages": {"type": "integer", "minimum": 0},
+            "excluded_candidates": {"type": "integer", "minimum": 0},
+            "candidate_window_limited": {"type": "boolean"},
+            "stale_reason": {"type": "string"}
+        },
+        "required": ["status", "generation", "published_at_ms", "published_mutation_seq",
+            "current_mutation_seq", "published_max_message_id", "current_max_message_id",
+            "indexed_passages", "excluded_candidates", "candidate_window_limited"],
+        "additionalProperties": false
+    })
+}
+
 fn response_schema_search_meta() -> serde_json::Value {
     response_schema_object([
         ("elapsed_ms", serde_json::json!({ "type": "integer" })),
@@ -104421,6 +104515,7 @@ fn response_schema_search_meta() -> serde_json::Value {
         ),
         // Truthful refinement level + typed fallback reason (bead .5.4).
         ("refinement_level", serde_json::json!({ "type": "string" })),
+        ("semantic_coverage", response_schema_semantic_coverage()),
         (
             "semantic_fallback_reason",
             serde_json::json!({ "type": ["string", "null"] }),
@@ -127713,6 +127808,7 @@ fn run_models_build_hnsw(
             retryable: true,
         })?;
 
+    let expected_manifest = manifest.clone();
     let tier = match tier_raw {
         Some(raw) => parse_models_backfill_tier(raw)?,
         None if manifest
@@ -127841,7 +127937,7 @@ fn run_models_build_hnsw(
             built_at_ms: chrono::Utc::now().timestamp_millis(),
             ready: true,
         });
-        manifest.save(&data_dir).map_err(|err| CliError {
+        manifest.save_if_unchanged(&data_dir, Some(&expected_manifest)).map_err(|err| CliError {
             code: 5,
             kind: CliErrorKind::Storage.kind_str(),
             message: format!(
@@ -128513,6 +128609,8 @@ fn run_models_backfill_batch(
         })?;
 
     if outcome.published && identity_rebuild_generation.is_some() {
+        let certificate = manifest.coverage.get(indexer.embedder_id()).cloned();
+        let expected_manifest = manifest.clone();
         let published_artifact = match outcome.tier {
             TierKind::Fast => manifest.fast_tier.as_mut(),
             TierKind::Quality => manifest.quality_tier.as_mut(),
@@ -128526,7 +128624,16 @@ fn run_models_backfill_batch(
             ),
             retryable: true,
         })?;
-        if published_artifact.db_fingerprint != backfill_db_fingerprint {
+        let expected_fingerprint = certificate
+            .as_ref()
+            .map_or(backfill_db_fingerprint.as_str(), |proof| {
+                proof.db_fingerprint.as_str()
+            });
+        if published_artifact.db_fingerprint != expected_fingerprint
+            || certificate
+                .as_ref()
+                .is_some_and(|proof| !proof.matches_artifact(published_artifact))
+        {
             return Err(CliError {
                 code: 5,
                 kind: CliErrorKind::SemanticManifest.kind_str(),
@@ -128538,17 +128645,22 @@ fn run_models_backfill_batch(
                 retryable: true,
             });
         }
-        published_artifact.db_fingerprint = canonical_db_fingerprint.clone();
-        manifest.refresh_backlog(outcome.total_conversations, &canonical_db_fingerprint);
-        manifest.save(&data_dir).map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::SemanticManifest.kind_str(),
-            message: format!("Failed to finalize semantic identity manifest: {e}"),
-            hint: Some(
-                "Retry the semantic backfill; stale semantic serving remains fail-closed".into(),
-            ),
-            retryable: true,
-        })?;
+        if certificate.is_none() {
+            published_artifact.db_fingerprint = canonical_db_fingerprint.clone();
+            manifest.refresh_backlog(outcome.total_conversations, &canonical_db_fingerprint);
+            manifest
+                .save_if_unchanged(&data_dir, Some(&expected_manifest))
+                .map_err(|e| CliError {
+                    code: 5,
+                    kind: CliErrorKind::SemanticManifest.kind_str(),
+                    message: format!("Failed to finalize semantic identity manifest: {e}"),
+                    hint: Some(
+                        "Retry the semantic backfill; stale semantic serving remains fail-closed"
+                            .into(),
+                    ),
+                    retryable: true,
+                })?;
+        }
         crate::indexer::semantic::invalidate_identity_stale_semantic_shards(
             &data_dir,
             indexer.embedder_id(),
@@ -128562,18 +128674,28 @@ fn run_models_backfill_batch(
             ),
             retryable: true,
         })?;
-        storage
-            .complete_semantic_identity_rebuild(identity_tier)
-            .map_err(|e| CliError {
-                code: 5,
-                kind: CliErrorKind::Storage.kind_str(),
-                message: format!("Failed to complete semantic identity rebuild: {e}"),
-                hint: Some(
-                    "Retry the semantic backfill; stale semantic serving remains fail-closed"
-                        .into(),
-                ),
-                retryable: true,
-            })?;
+        let completion = if let Some(certificate) = certificate {
+            storage
+                .complete_semantic_identity_rebuild_if_current(
+                    identity_tier,
+                    &crate::storage::sqlite::SemanticArchiveState {
+                        archive_id: certificate.archive_id,
+                        mutation_seq: certificate.mutation_seq,
+                    },
+                )
+                .map(|_| ())
+        } else {
+            storage.complete_semantic_identity_rebuild(identity_tier)
+        };
+        completion.map_err(|e| CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: format!("Failed to complete semantic identity rebuild: {e}"),
+            hint: Some(
+                "Retry the semantic backfill; stale semantic serving remains fail-closed".into(),
+            ),
+            retryable: true,
+        })?;
     }
 
     let progress_pct = outcome.progress_pct();

@@ -5167,37 +5167,38 @@ mod tests {
     }
 
     #[test]
-    fn gh458_simultaneous_first_publication_has_one_winner() {
-        let directory = tempfile::tempdir().unwrap();
+    fn gh458_simultaneous_first_publication_has_one_winner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let writers = [TierKind::Fast, TierKind::Quality].map(|tier| {
             let directory = directory.path().to_path_buf();
             let barrier = barrier.clone();
-            std::thread::spawn(move || {
+            std::thread::spawn(move || -> Result<Option<SemanticManifest>, ManifestError> {
                 let (artifact, certificate) = gh458_covered_artifact(tier, 3);
                 let mut manifest = SemanticManifest::default();
-                manifest
-                    .publish_covered_artifact(artifact, certificate)
-                    .unwrap();
+                let prepared = manifest.publish_covered_artifact(artifact, certificate);
                 barrier.wait();
-                let result = manifest.save_if_unchanged(&directory, None);
-                (manifest, result)
+                prepared?;
+                match manifest.save_if_unchanged(&directory, None) {
+                    Ok(()) => Ok(Some(manifest)),
+                    Err(ManifestError::ConcurrentUpdate { .. }) => Ok(None),
+                    Err(error) => Err(error),
+                }
             })
         });
+        let results = writers.map(|writer| writer.join());
         let mut winners = Vec::new();
-        for writer in writers {
-            let (manifest, result) = writer.join().unwrap();
-            match result {
-                Ok(()) => winners.push(manifest),
-                Err(ManifestError::ConcurrentUpdate { .. }) => {}
-                Err(error) => panic!("unexpected publication error: {error}"),
+        for result in results {
+            if let Some(manifest) =
+                result.map_err(|_| std::io::Error::other("semantic publisher thread failed"))??
+            {
+                winners.push(manifest);
             }
         }
         assert_eq!(winners.len(), 1);
-        assert_eq!(
-            SemanticManifest::load(directory.path()).unwrap(),
-            winners.pop()
-        );
+        assert_eq!(SemanticManifest::load(directory.path())?, winners.pop());
+        Ok(())
     }
 
     fn test_policy() -> SemanticPolicy {

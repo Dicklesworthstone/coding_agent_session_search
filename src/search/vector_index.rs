@@ -6,6 +6,7 @@
 //! This module keeps cass-specific helpers (paths, role codes) in one place.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,6 +18,10 @@ use half::f16;
 pub use frankensearch::index::{Quantization, SearchParams, VectorIndex, VectorIndexWriter};
 
 use crate::search::query::SearchFilters;
+use crate::search::semantic_coverage::{
+    SemanticParentReader, ensure_same_file_metadata, semantic_coverage_generation,
+};
+use crate::search::semantic_manifest::SemanticCoverageCertificate;
 use crate::sources::provenance::{LOCAL_SOURCE_ID, SourceFilter, SourceKind};
 use crate::storage::sqlite::FrankenStorage;
 
@@ -170,6 +175,59 @@ pub struct SemanticIndexArtifact {
     ann_path: Option<PathBuf>,
     ann_unavailable_reason: Option<SemanticAnnUnavailableReason>,
     owner_backed_progressive_reader: bool,
+    coverage: Option<Arc<CertifiedSemanticArtifact>>,
+}
+
+/// Coverage observed in the same canonical snapshot as this query's hydrated
+/// hits. Passage counts and row-ID bounds are not a coverage percentage.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SemanticCoverageSnapshot {
+    pub status: &'static str,
+    pub generation: String,
+    pub published_at_ms: i64,
+    pub published_mutation_seq: u64,
+    pub current_mutation_seq: u64,
+    pub published_max_message_id: i64,
+    pub current_max_message_id: i64,
+    pub indexed_passages: u64,
+    pub excluded_candidates: usize,
+    pub candidate_window_limited: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<&'static str>,
+}
+
+impl SemanticCoverageSnapshot {
+    pub(crate) fn at_snapshot(
+        certificate: &SemanticCoverageCertificate,
+        current_mutation_seq: u64,
+        current_max_message_id: i64,
+    ) -> Self {
+        let current = certificate.mutation_seq == current_mutation_seq
+            && certificate.max_message_id == current_max_message_id;
+        Self {
+            status: if current { "complete" } else { "partial" },
+            generation: semantic_coverage_generation(certificate),
+            published_at_ms: certificate.published_at_ms,
+            published_mutation_seq: certificate.mutation_seq,
+            current_mutation_seq,
+            published_max_message_id: certificate.max_message_id,
+            current_max_message_id,
+            indexed_passages: certificate.doc_count,
+            excluded_candidates: 0,
+            candidate_window_limited: false,
+            stale_reason: (!current).then_some("archive_changed_since_publication"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CertifiedSemanticArtifact {
+    certificate: SemanticCoverageCertificate,
+    snapshot: SemanticCoverageSnapshot,
+    parents: Arc<SemanticParentReader>,
+    vector_file: File,
+    vector_metadata: Metadata,
+    current_pointer: PathBuf,
 }
 
 impl SemanticIndexArtifact {
@@ -226,7 +284,56 @@ impl SemanticIndexArtifact {
             // fail-closed until an owner-accepting constructor can set this
             // capability true.
             owner_backed_progressive_reader: false,
+            coverage: None,
         })
+    }
+
+    pub(crate) fn with_coverage(
+        mut self,
+        certificate: SemanticCoverageCertificate,
+        snapshot: SemanticCoverageSnapshot,
+        parents: SemanticParentReader,
+        vector_file: File,
+        vector_metadata: Metadata,
+        current_pointer: PathBuf,
+    ) -> Self {
+        self.coverage = Some(Arc::new(CertifiedSemanticArtifact {
+            certificate,
+            snapshot,
+            parents: Arc::new(parents),
+            vector_file,
+            vector_metadata,
+            current_pointer,
+        }));
+        self
+    }
+
+    pub fn coverage_certificate(&self) -> Option<&SemanticCoverageCertificate> {
+        self.coverage.as_ref().map(|proof| &proof.certificate)
+    }
+
+    pub fn coverage_snapshot(&self) -> Option<&SemanticCoverageSnapshot> {
+        self.coverage.as_ref().map(|proof| &proof.snapshot)
+    }
+
+    pub fn coverage_parents(&self) -> Option<&SemanticParentReader> {
+        self.coverage.as_ref().map(|proof| proof.parents.as_ref())
+    }
+
+    pub fn parent_path(&self) -> Option<&Path> {
+        self.coverage_parents().map(SemanticParentReader::path)
+    }
+
+    pub(crate) fn verify_coverage_file(&self) -> Result<()> {
+        if let Some(proof) = &self.coverage {
+            ensure_same_file_metadata(&proof.vector_metadata, &proof.vector_file.metadata()?)?;
+            match std::fs::symlink_metadata(&proof.current_pointer) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => anyhow::bail!("owner_backed_reader_required"),
+                Err(error) => return Err(error).context("semantic_pointer_probe_failed"),
+            }
+        }
+        Ok(())
     }
 
     /// Opened FSVI reader.
@@ -613,6 +720,9 @@ pub struct VectorSearchResult {
     pub message_id: u64,
     pub chunk_idx: u8,
     pub score: f32,
+    /// Exact identity of the winning vector, retained through message collapse.
+    /// Legacy synthetic candidates may omit it; certified serving may not.
+    pub identity: Option<SemanticDocId>,
 }
 
 impl frankensearch::core::filter::SearchFilter for SemanticFilter {

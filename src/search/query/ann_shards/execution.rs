@@ -120,6 +120,7 @@ impl SemanticAnnShardSet {
                                             {
                                                 best.score = hit.score;
                                                 best.chunk_idx = hit.chunk_idx;
+                                                best.identity = hit.identity;
                                             }
                                         })
                                         .or_insert(hit);
@@ -331,12 +332,14 @@ impl SemanticAnnShardSet {
                         if score.total_cmp(&best.score).is_gt() {
                             best.score = score;
                             best.chunk_idx = parsed.chunk_idx;
+                            best.identity = Some(parsed);
                         }
                     })
                     .or_insert(VectorSearchResult {
                         message_id: parsed.message_id,
                         chunk_idx: parsed.chunk_idx,
                         score,
+                        identity: Some(parsed),
                     });
             }
             records += count;
@@ -503,6 +506,7 @@ impl SemanticAnnShardSet {
                             if hit.score.total_cmp(&best.score).is_gt() {
                                 best.score = hit.score;
                                 best.chunk_idx = hit.chunk_idx;
+                                best.identity = hit.identity;
                             }
                         })
                         .or_insert_with(|| hit.clone());
