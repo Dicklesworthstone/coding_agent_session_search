@@ -256,6 +256,97 @@ mod linux {
         })
     }
 
+    #[test]
+    fn initial_capture_never_follows_a_non_session_descriptor() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let source = fixture.source("followed")?;
+        let feed = fixture.root.join("feed.tsv.gz");
+        fs::write(&feed, b"not a session source")?;
+        let _held_source = writer(&source)?;
+        let _held_feed = writer(&feed)?;
+        let probe = SourceWriterProbe::capture(session_source);
+        let state = probe.state.lock().unwrap();
+        assert!(state.census.writers.contains_key(&file_identity(&source)?));
+        assert!(
+            state.census.followed.contains(&fs::canonicalize(&source)?),
+            "a session-named writer is followed for its identity"
+        );
+        // Following this one stats it on its own filesystem. On a hung sshfs
+        // mount that stat never returned, and every index run on the host
+        // stalled in the census.
+        assert!(!state.census.followed.contains(&fs::canonicalize(&feed)?));
+        Ok(())
+    }
+
+    #[test]
+    fn mount_table_marks_network_and_fuse_mounts_remote() {
+        let mounts = parse_mount_remoteness(
+            &[
+                "22 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw",
+                "36 35 98:0 /mnt1 /mnt/parent rw,noatime master:1 - ext3 /dev/root rw",
+                "40 1 0:45 / /data/ssd rw,relatime shared:30 - zfs pool/ssd rw,xattr",
+                "41 1 0:46 / /tmp rw,nosuid,nodev shared:31 - tmpfs tmpfs rw,size=8g",
+                "412 30 0:61 / /home/u/bulk rw,relatime shared:220 - fuse.sshfs u@host:/bulk rw",
+                "413 30 0:62 / /mnt/nas rw,relatime shared:221 - fuseblk /dev/sdb1 rw",
+                "414 30 0:63 / /net/home rw,relatime shared:222 - nfs4 server:/home rw,vers=4.2",
+                // An escaped space in a mount path never forms the separator.
+                "415 30 0:64 / /mnt/a\\040-\\040b rw,relatime - cifs //server/share rw",
+                "not a mount line",
+            ]
+            .join("\n"),
+        );
+        for local in [22, 36, 40, 41] {
+            assert_eq!(mounts.get(&local), Some(&false), "mount {local}");
+        }
+        for remote in [412, 413, 414, 415] {
+            assert_eq!(mounts.get(&remote), Some(&true), "mount {remote}");
+        }
+        assert_eq!(mounts.len(), 8);
+    }
+
+    #[test]
+    fn a_descriptor_not_proven_local_counts_as_remote() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        fs::write(
+            fixture.root.join("mountinfo"),
+            [
+                "36 35 98:0 / /data rw,noatime - ext4 /dev/sda1 rw",
+                "412 30 0:61 / /bulk rw,relatime - fuse.sshfs u@host:/bulk rw",
+            ]
+            .join("\n"),
+        )?;
+        let fdinfo = |name: &str, contents: &str| -> io::Result<PathBuf> {
+            let path = fixture.root.join(name);
+            fs::write(&path, contents)?;
+            Ok(path)
+        };
+        let local = fdinfo("local", "pos:\t0\nflags:\t02100001\nmnt_id:\t36\nino:\t7\n")?;
+        let sshfs = fdinfo("sshfs", "pos:\t0\nflags:\t02100001\nmnt_id:\t412\n")?;
+        let unlisted = fdinfo("unlisted", "pos:\t0\nflags:\t02100001\nmnt_id:\t999\n")?;
+        let unnamed = fdinfo("no-mount-id", "pos:\t0\nflags:\t02100001\n")?;
+        let mut mount_types = None;
+        assert!(!descriptor_on_remote_filesystem(
+            &fixture.root,
+            &local,
+            &mut mount_types
+        ));
+        for descriptor in [&sshfs, &unlisted, &unnamed] {
+            assert!(
+                descriptor_on_remote_filesystem(&fixture.root, descriptor, &mut mount_types),
+                "{}",
+                descriptor.display()
+            );
+        }
+        // Without a readable mount table no descriptor is proven local.
+        let mut unreadable = None;
+        assert!(descriptor_on_remote_filesystem(
+            &fixture.root.join("no-such-process"),
+            &local,
+            &mut unreadable
+        ));
+        Ok(())
+    }
+
     struct ChildGuard(Child);
 
     impl Drop for ChildGuard {
