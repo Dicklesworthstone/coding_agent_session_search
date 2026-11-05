@@ -728,13 +728,11 @@ impl ReplayLimits {
                 .min(settings.pipeline_max_message_bytes_in_flight / 2)
                 .min(settings.startup_commit_every_message_bytes)
                 .min(settings.steady_commit_every_message_bytes)
-                .min(MAX_BATCH_BYTES)
-                .max(1),
+                .clamp(1, MAX_BATCH_BYTES),
             messages: settings
                 .startup_commit_every_messages
                 .min(settings.steady_commit_every_messages)
-                .min(MAX_BATCH_MESSAGES)
-                .max(1),
+                .clamp(1, MAX_BATCH_MESSAGES),
             conversations: settings
                 .startup_commit_every_conversations
                 .min(settings.steady_commit_every_conversations)
@@ -936,7 +934,9 @@ impl Replay<'_> {
                 }
                 ContentMatch::Missing => missing.push(document),
                 ContentMatch::Different => {
+                    // A mismatch exits before another document is read.
                     return Err(incompatible(format!(
+                        // ubs:ignore[rust.perf.string-alloc-in-loop] -- one error allocation.
                         "canonical projection changed for conversation {} message {}",
                         document.conversation_id.unwrap_or_default(),
                         document.msg_idx,
