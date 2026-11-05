@@ -1278,3 +1278,243 @@ fn gh523_killed_staged_rebuild_resumes_from_its_last_commit_not_its_heartbeat() 
         index_meta_fingerprint(&scratch).unwrap()
     );
 }
+
+fn gh494_canonical_documents(
+    storage: &FrankenStorage,
+) -> Vec<frankensearch::quill::cass::CassDocument> {
+    let (agents, workspaces) = storage.build_lexical_rebuild_lookups().unwrap();
+    let mut documents = Vec::new();
+    let mut after = 0;
+    loop {
+        let rows = storage
+            .list_conversations_for_lexical_rebuild_after_id(64, after, &agents, &workspaces)
+            .unwrap();
+        if rows.is_empty() {
+            return documents;
+        }
+        for row in rows {
+            let id = row.id.unwrap();
+            let messages = storage.fetch_messages_for_lexical_rebuild(id).unwrap();
+            let (provenance, _) =
+                lexical_rebuild_packet_provenance_from_canonical(&row, &HashMap::new());
+            let packet =
+                lexical_rebuild_contract_from_canonical_messages(&row, &provenance, messages);
+            documents.extend(TantivyIndex::build_packet_documents(&packet, Some(id)));
+            after = id;
+        }
+    }
+}
+
+// A real ingest shape: the archive and the live generation both grow, and the
+// run dies before its final checkpoint refresh. Seen as exit 70 stall kills.
+fn gh494_commit_inline_without_checkpoint_refresh(db_path: &Path, index_path: &Path) {
+    let storage = FrankenStorage::open(db_path).unwrap();
+    let agent_id = storage
+        .ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })
+        .unwrap();
+    let workspace_id = storage
+        .ensure_workspace(Path::new("/tmp/workspace"), None)
+        .unwrap();
+    let base_ts = 1_700_000_002_000_i64;
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(workspace_id),
+            &Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: Some(PathBuf::from("/tmp/workspace")),
+                external_id: Some("lexical-fixture-3".to_string()),
+                title: Some("Lexical rebuild fixture".into()),
+                source_path: PathBuf::from("/tmp/lexical-fixture-3.jsonl"),
+                started_at: Some(base_ts),
+                ended_at: Some(base_ts + 100),
+                approx_tokens: Some(64),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(base_ts + 10),
+                    content: "lexical-fixture-3-first".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            },
+        )
+        .unwrap();
+    let documents = gh494_canonical_documents(&storage);
+    drop(storage);
+    let mut index = TantivyIndex::open_or_create(index_path).unwrap();
+    index.upsert_prebuilt_documents_slice(&documents).unwrap();
+    index.commit().unwrap();
+}
+
+fn gh494_start_rebuild(index_path: &Path, db_path: &Path) {
+    let fresh = LexicalRebuildState::new(
+        deferred_lexical_rebuild_db_state(db_path, 3),
+        LEXICAL_REBUILD_PAGE_SIZE,
+    );
+    persist_lexical_rebuild_state_for_active_run_start(index_path, &fresh).unwrap();
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_rebuild_start_does_not_revoke_a_live_generation_ahead_of_its_receipt() {
+    let (tmp, _data_dir, db_path, index_path) = gh494_publication_receipt_fixture();
+    let published = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+    assert!(published.completed);
+    gh494_commit_inline_without_checkpoint_refresh(&db_path, &index_path);
+    let live = index_meta_fingerprint(&index_path).unwrap();
+    assert_ne!(live, published.committed_meta_fingerprint);
+    assert!(!has_usable_lexical_publication_receipt(
+        &index_path,
+        &db_path
+    ));
+    let before = crate::search_lexical_self_heal_diagnosis(&index_path, &db_path)
+        .unwrap()
+        .expect("the generation is ahead of its checkpoint");
+    assert!(before.existing_index_search_allowed, "{}", before.reason);
+
+    gh494_start_rebuild(&index_path, &db_path);
+
+    assert!(
+        !load_lexical_rebuild_state(&index_path)
+            .unwrap()
+            .unwrap()
+            .completed
+    );
+    let after = crate::search_lexical_self_heal_diagnosis(&index_path, &db_path)
+        .unwrap()
+        .expect("the rebuild is incomplete");
+    assert!(
+        after.permits_existing_index_during_active_rebuild(),
+        "{}",
+        after.reason
+    );
+    let receipt: LexicalRebuildState =
+        serde_json::from_slice(&fs::read(index_path.join(LEXICAL_PUBLISHED_STATE_FILE)).unwrap())
+            .unwrap();
+    assert_eq!(receipt.committed_meta_fingerprint, live);
+    assert_eq!(
+        Some(u64::try_from(receipt.indexed_docs).unwrap()),
+        crate::search::tantivy::searchable_index_live_doc_count(&index_path)
+    );
+    assert!(!has_usable_lexical_publication_receipt(
+        &index_path,
+        &tmp.path().join("other.db")
+    ));
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_refused_rebuild_after_an_unrefreshed_inline_commit_keeps_serving() {
+    #[cfg(windows)]
+    const DISK_FULL: i32 = 112;
+    #[cfg(not(windows))]
+    const DISK_FULL: i32 = libc::ENOSPC;
+    let (_tmp, data_dir, db_path, index_path) = gh494_publication_receipt_fixture();
+    gh494_commit_inline_without_checkpoint_refresh(&db_path, &index_path);
+    let live = index_meta_fingerprint(&index_path).unwrap();
+    #[cfg(target_os = "linux")]
+    let fault = inject_lexical_publish_rename_failure_once(
+        LexicalPublishRenameSite::LinuxParkPriorLiveToCanonicalSidecar,
+        DISK_FULL,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let fault = inject_lexical_publish_rename_failure_once(
+        LexicalPublishRenameSite::NonLinuxPublishStagedLive,
+        DISK_FULL,
+    );
+    let error = rebuild_tantivy_from_db_with_options(
+        &db_path,
+        &data_dir,
+        3,
+        None,
+        LexicalRebuildStartupOptions {
+            defer_initial_content_fingerprint: true,
+        },
+        None,
+    )
+    .expect_err("refuse the actual swap");
+    drop(fault);
+    assert!(
+        error.to_string().contains("publish_staged_generation"),
+        "{error:#}"
+    );
+    assert!(
+        !load_lexical_rebuild_state(&index_path)
+            .unwrap()
+            .unwrap()
+            .completed
+    );
+    assert_eq!(index_meta_fingerprint(&index_path).unwrap(), live);
+    let diagnosis = crate::search_lexical_self_heal_diagnosis(&index_path, &db_path)
+        .unwrap()
+        .expect("the rebuild is incomplete");
+    assert!(
+        diagnosis.permits_existing_index_during_active_rebuild(),
+        "{}",
+        diagnosis.reason
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn gh494_rebuild_start_certifies_nothing_search_was_not_already_serving() {
+    // Progress is no proof: an interrupted rebuild stays uncertified on restart.
+    let (_tmp, _data_dir, db_path, index_path) = gh494_publication_receipt_fixture();
+    let mut interrupted = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+    gh494_commit_inline_without_checkpoint_refresh(&db_path, &index_path);
+    interrupted.completed = false;
+    persist_lexical_rebuild_state(&index_path, &interrupted).unwrap();
+    gh494_start_rebuild(&index_path, &db_path);
+    assert!(!has_usable_lexical_publication_receipt(
+        &index_path,
+        &db_path
+    ));
+
+    // A generation smaller than the certified one is not its descendant.
+    let (_tmp, _data_dir, db_path, index_path) = gh494_publication_receipt_fixture();
+    let mut published = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+    gh494_commit_inline_without_checkpoint_refresh(&db_path, &index_path);
+    let live_docs = crate::search::tantivy::searchable_index_live_doc_count(&index_path)
+        .map(|docs| usize::try_from(docs).unwrap())
+        .unwrap();
+    published.indexed_docs = live_docs + 1;
+    published.db.total_messages = live_docs + 1;
+    persist_lexical_rebuild_state(&index_path, &published).unwrap();
+    gh494_start_rebuild(&index_path, &db_path);
+    assert!(!has_usable_lexical_publication_receipt(
+        &index_path,
+        &db_path
+    ));
+
+    // A scratch candidate is unverified however its counts look, and the size
+    // check alone must not be what refuses it.
+    let (_tmp, _data_dir, db_path, index_path) = gh494_publication_receipt_fixture();
+    let mut published = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+    let scratch = staged_lexical_rebuild_scratch_path(&index_path);
+    let storage = FrankenStorage::open_strict_readonly(&db_path).unwrap();
+    let documents = gh494_canonical_documents(&storage);
+    drop(storage);
+    let mut writer = TantivyIndex::open_or_create(&scratch).unwrap();
+    writer
+        .add_prebuilt_documents_slice(&documents[..1])
+        .unwrap();
+    writer.commit().unwrap();
+    drop(writer);
+    published.indexed_docs = 1;
+    persist_lexical_rebuild_state(&scratch, &published).unwrap();
+    gh494_start_rebuild(&scratch, &db_path);
+    assert!(!has_usable_lexical_publication_receipt(&scratch, &db_path));
+}
