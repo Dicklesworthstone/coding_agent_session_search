@@ -280,7 +280,7 @@ mod linux {
 
     #[test]
     fn mount_table_marks_network_and_fuse_mounts_remote() {
-        let mounts = parse_mount_remoteness(
+        let mounts = parse_mount_identities(
             &[
                 "22 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw",
                 "36 35 98:0 /mnt1 /mnt/parent rw,noatime master:1 - ext3 /dev/root rw",
@@ -297,10 +297,18 @@ mod linux {
             .join("\n"),
         );
         for local in [22, 36, 40, 41, 42] {
-            assert_eq!(mounts.get(&local), Some(&false), "mount {local}");
+            assert_eq!(
+                mounts.get(&local).map(|mount| mount.remote),
+                Some(false),
+                "mount {local}"
+            );
         }
         for remote in [412, 413, 414, 415] {
-            assert_eq!(mounts.get(&remote), Some(&true), "mount {remote}");
+            assert_eq!(
+                mounts.get(&remote).map(|mount| mount.remote),
+                Some(true),
+                "mount {remote}"
+            );
         }
         assert_eq!(mounts.len(), 9);
     }
@@ -325,26 +333,198 @@ mod linux {
         let sshfs = fdinfo("sshfs", "pos:\t0\nflags:\t02100001\nmnt_id:\t412\n")?;
         let unlisted = fdinfo("unlisted", "pos:\t0\nflags:\t02100001\nmnt_id:\t999\n")?;
         let unnamed = fdinfo("no-mount-id", "pos:\t0\nflags:\t02100001\n")?;
-        let mut mount_types = None;
-        assert!(!descriptor_on_remote_filesystem(
-            &fixture.root,
-            &local,
-            &mut mount_types
-        ));
+        let mut mounts = None;
+        assert!(
+            descriptor_mount(&fixture.root, &read_descriptor_info(&local)?, &mut mounts)
+                .is_some_and(|mount| !mount.remote)
+        );
         for descriptor in [&sshfs, &unlisted, &unnamed] {
             assert!(
-                descriptor_on_remote_filesystem(&fixture.root, descriptor, &mut mount_types),
+                descriptor_mount(
+                    &fixture.root,
+                    &read_descriptor_info(descriptor)?,
+                    &mut mounts
+                )
+                .is_none_or(|mount| mount.remote),
                 "{}",
                 descriptor.display()
             );
         }
         // Without a readable mount table no descriptor is proven local.
         let mut unreadable = None;
-        assert!(descriptor_on_remote_filesystem(
-            &fixture.root.join("no-such-process"),
-            &local,
-            &mut unreadable
-        ));
+        assert!(
+            descriptor_mount(
+                &fixture.root.join("no-such-process"),
+                &read_descriptor_info(&local)?,
+                &mut unreadable
+            )
+            .is_none()
+        );
+        Ok(())
+    }
+
+    /// A real directory tree with procfs field syntax and a dangling fd link.
+    /// Following that link cannot supply an identity; only the procfs fields
+    /// can. No live network mount or privileged mount operation is needed.
+    fn remote_process(fixture: &Fixture, filesystem: &str) -> io::Result<PathBuf> {
+        use std::os::unix::fs::symlink;
+
+        let process = fixture.root.join("424242");
+        fs::create_dir_all(process.join("fd"))?;
+        fs::create_dir_all(process.join("fdinfo"))?;
+        fs::write(
+            process.join("stat"),
+            format!("424242 (session writer) S {} 42\n", ["0"; 18].join(" ")),
+        )?;
+        fs::write(
+            process.join("mountinfo"),
+            format!("412 30 0:61 / /bulk rw,relatime - {filesystem} remote rw\n"),
+        )?;
+        fs::write(
+            process.join("fdinfo/7"),
+            "pos:\t0\nflags:\t02100001\nmnt_id:\t412\nino:\t987654321\n",
+        )?;
+        symlink(
+            fixture.root.join("unavailable-session.jsonl"),
+            process.join("fd/7"),
+        )?;
+        Ok(process)
+    }
+
+    #[test]
+    fn remote_session_writers_are_captured_and_rechecked_without_following_targets()
+    -> io::Result<()> {
+        for filesystem in ["fuse.sshfs", "nfs4", "cifs"] {
+            let fixture = Fixture::new()?;
+            let process = remote_process(&fixture, filesystem)?;
+            let census = collect_writers_in(&fixture.root, session_source, &HashMap::new());
+            let identity = (61, 987_654_321);
+            assert!(census.complete);
+            assert!(census.visibility_gaps.is_empty());
+            assert!(census.followed.is_empty());
+            assert_eq!(census.writers.len(), 1);
+            let witness = &census.writers[&identity][0];
+            assert_eq!(witness.observe(identity), DescriptorState::Open);
+            assert_eq!(witness.observe((61, 987_654_322)), DescriptorState::Closed);
+            assert_eq!(
+                fs::metadata(process.join("fd/7")).unwrap_err().kind(),
+                io::ErrorKind::NotFound,
+                "the unresolvable target cannot have supplied this identity"
+            );
+
+            // Reuse of the descriptor as a reader revokes writer evidence
+            // without following the target, too.
+            fs::write(
+                process.join("fdinfo/7"),
+                "pos:\t0\nflags:\t02100000\nmnt_id:\t412\nino:\t987654321\n",
+            )?;
+            assert_eq!(witness.observe(identity), DescriptorState::Closed);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_remote_identity_never_stats_or_revokes_a_prior_positive() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let process = remote_process(&fixture, "fuse.sshfs")?;
+        let identity = (61, 987_654_321);
+        let census = collect_writers_in(&fixture.root, session_source, &HashMap::new());
+        let witness = &census.writers[&identity][0];
+        for contents in [
+            // Linux before 5.14 has no inode field. Never revive the hang
+            // by falling back to target metadata on those kernels.
+            "flags:\t02100001\nmnt_id:\t412\n",
+            "flags:\t02100001\nmnt_id:\t412\nino:\tinvalid\n",
+            "flags:\t02100001\nmnt_id:\t999\nino:\t987654321\n",
+            "flags:\t02100001\nino:\t987654321\n",
+        ] {
+            fs::write(process.join("fdinfo/7"), contents)?;
+            assert_eq!(witness.observe(identity), DescriptorState::Uncertain);
+            let fresh = collect_writers_in(&fixture.root, session_source, &census.writers);
+            assert!(fresh.followed.is_empty());
+            assert_eq!(fresh.visibility_gaps.len(), 1);
+            assert!(
+                fresh
+                    .visibility_gaps
+                    .iter()
+                    .all(|gap| gap.inspection == Inspection::Identity)
+            );
+        }
+        let mut state = ProbeState {
+            census,
+            ..ProbeState::default()
+        };
+        let fresh = collect_writers_in(&fixture.root, session_source, &state.census.writers);
+        state.apply_refresh(fresh);
+        assert!(state.refresh_blocked);
+        assert!(state.census.writers.contains_key(&identity));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_mount_devices_do_not_authorize_target_metadata() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let process = remote_process(&fixture, "fuse.sshfs")?;
+        let info = read_descriptor_info(&process.join("fdinfo/7"))?;
+        for device in ["no-device", "0:invalid", "4294967296:61", "0:4294967296"] {
+            fs::write(
+                process.join("mountinfo"),
+                format!("412 30 {device} / /bulk rw - ext4 source rw\n"),
+            )?;
+            let mount = descriptor_mount(&process, &info, &mut None);
+            assert!(mount.is_none());
+            assert_eq!(
+                descriptor_identity(&process.join("fd/7"), &info, mount)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData,
+                "an unknown mount cannot be treated as local"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn local_mounts_retain_metadata_identity_without_procfs_inode() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let source = fixture.source("legacy-kernel")?;
+        let info = DescriptorInfo {
+            writable: true,
+            mount_id: Some(36),
+            inode: None,
+        };
+        assert_eq!(
+            descriptor_identity(
+                &source,
+                &info,
+                Some(MountIdentity {
+                    device: 0,
+                    remote: false,
+                })
+            )?,
+            file_identity(&source)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mount_device_encoding_agrees_with_live_procfs_file_identity() -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        // Procfs has a uniform device/inode namespace; unlike overlayfs it
+        // does not substitute a lower filesystem's identity in stat results.
+        let file = File::open("/proc/self/stat")?;
+        let descriptor = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let info = read_descriptor_info(&PathBuf::from(format!(
+            "/proc/self/fdinfo/{}",
+            file.as_raw_fd()
+        )))?;
+        let mount = descriptor_mount(Path::new("/proc/self"), &info, &mut None)
+            .expect("an open procfs file must have a visible mount");
+        assert_eq!(mount.device, file_identity(&descriptor)?.0);
+        // High minors need their upper bits moved past the major field.
+        assert_eq!(linux_device_id(8, 257), 0x10_0801);
+        assert_eq!(linux_device_id(0x1234, 0x56789abc), 0x1567_89a2_34bc);
         Ok(())
     }
 

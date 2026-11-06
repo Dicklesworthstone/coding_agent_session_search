@@ -12,10 +12,11 @@
 //! owner keeps cached positives deferred until a new filter is captured.
 //! Linux keeps descriptor witnesses so a still-open writer costs only a few
 //! procfs reads. The census reads each writable descriptor's link without
-//! following it. It follows (stats) a session-named descriptor, and, only
-//! while refreshing a cached positive, other descriptors on local
-//! filesystems; a stat of a file on a network or FUSE mount is answered by
-//! that mount's server or daemon and can block for as long as it is down.
+//! following it. Network and FUSE file identities come from fdinfo and
+//! mountinfo, without contacting the mount's server or userspace daemon.
+//! Missing procfs identity fields leave an inspection gap, never a fallback
+//! stat on a potentially hung mount. Only proven local descriptors are
+//! followed, including non-session hardlinks while refreshing a positive.
 //! One refresh replaces evidence for every source, amortizing closed writers.
 //! A newly incomplete refresh retains all prior positives for the filter's life.
 //! macOS lsof can silently omit inaccessible processes; its captured positives
@@ -224,17 +225,24 @@ impl DescriptorWitness {
             Self::Proc {
                 descriptor, info, ..
             } => {
-                match file_identity(descriptor) {
-                    Ok(observed) if observed == identity => {}
+                let observed = match read_descriptor_info(info) {
+                    Ok(observed) if observed.writable => observed,
                     Ok(_) => return DescriptorState::Closed,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         return DescriptorState::Closed;
                     }
                     Err(_) => return DescriptorState::Uncertain,
-                }
-                match read_descriptor_access(info) {
-                    Ok(true) => DescriptorState::Open,
-                    Ok(false) => DescriptorState::Closed,
+                };
+                let Some(process_path) = info.parent().and_then(Path::parent) else {
+                    return DescriptorState::Uncertain;
+                };
+                // A descriptor number may have been reused or its owner may
+                // have changed mount namespaces since capture. Re-read procfs
+                // authority instead of following a formerly local descriptor.
+                let mount = descriptor_mount(process_path, &observed, &mut None);
+                match descriptor_identity(descriptor, &observed, mount) {
+                    Ok(current) if current == identity => DescriptorState::Open,
+                    Ok(_) => DescriptorState::Closed,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         DescriptorState::Closed
                     }
@@ -253,7 +261,15 @@ fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
 }
 
 #[cfg(target_os = "linux")]
-fn read_descriptor_access(path: &Path) -> std::io::Result<bool> {
+#[derive(Debug, Clone, Copy)]
+struct DescriptorInfo {
+    writable: bool,
+    mount_id: Option<u64>,
+    inode: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+fn read_descriptor_info(path: &Path) -> std::io::Result<DescriptorInfo> {
     let contents = std::fs::read_to_string(path)?;
     let flags = contents
         .lines()
@@ -265,57 +281,112 @@ fn read_descriptor_access(path: &Path) -> std::io::Result<bool> {
                 "unreadable procfs access flags",
             )
         })?;
-    match flags & 0o3 {
-        0 => Ok(false),
-        1 | 2 => Ok(true),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "unknown procfs access mode",
-        )),
-    }
-}
-
-/// Whether a descriptor's file is on a network or FUSE filesystem, judged
-/// from procfs alone: the mount ID in the descriptor's fdinfo, looked up in
-/// the owning process's mount table (read once per process into
-/// `mount_types`). A descriptor not proven local counts as remote.
-#[cfg(target_os = "linux")]
-fn descriptor_on_remote_filesystem(
-    process: &Path,
-    info: &Path,
-    mount_types: &mut Option<HashMap<u64, bool>>,
-) -> bool {
-    let Some(mount_id) = std::fs::read_to_string(info).ok().and_then(|contents| {
+    let writable = match flags & 0o3 {
+        0 => false,
+        1 | 2 => true,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unknown procfs access mode",
+            ));
+        }
+    };
+    let decimal_field = |prefix: &str| {
         contents
             .lines()
-            .find_map(|line| line.strip_prefix("mnt_id:"))
+            .find_map(|line| line.strip_prefix(prefix))
             .and_then(|value| value.trim().parse::<u64>().ok())
-    }) else {
-        return true;
     };
-    mount_types
+    Ok(DescriptorInfo {
+        writable,
+        mount_id: decimal_field("mnt_id:"),
+        inode: decimal_field("ino:"),
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MountIdentity {
+    device: u64,
+    remote: bool,
+}
+
+/// Resolve the descriptor's mount in its owner's namespace, using procfs
+/// alone. A missing or malformed record never establishes local access.
+#[cfg(target_os = "linux")]
+fn descriptor_mount(
+    process: &Path,
+    info: &DescriptorInfo,
+    mounts: &mut Option<HashMap<u64, MountIdentity>>,
+) -> Option<MountIdentity> {
+    let mount_id = info.mount_id?;
+    mounts
         .get_or_insert_with(|| {
             std::fs::read_to_string(process.join("mountinfo"))
-                .map(|table| parse_mount_remoteness(&table))
+                .map(|table| parse_mount_identities(&table))
                 .unwrap_or_default()
         })
         .get(&mount_id)
         .copied()
-        .unwrap_or(true)
 }
 
-/// Map each mount ID in a `/proc/<pid>/mountinfo` table to whether its
-/// filesystem type is a network or FUSE one. Mount paths escape spaces, so
-/// the first " - " always ends the optional fields.
+/// Only local mounts permit metadata I/O. Since Linux 5.14, regular-file
+/// fdinfo supplies `ino`; mountinfo supplies the major/minor of `st_dev`.
+/// Older kernels or an opaque namespace cannot supply a remote identity,
+/// so preserve the gap instead of potentially blocking the whole index run.
 #[cfg(target_os = "linux")]
-fn parse_mount_remoteness(table: &str) -> HashMap<u64, bool> {
+fn descriptor_identity(
+    descriptor: &Path,
+    info: &DescriptorInfo,
+    mount: Option<MountIdentity>,
+) -> std::io::Result<FileIdentity> {
+    match mount {
+        Some(mount) if !mount.remote => file_identity(descriptor),
+        Some(mount) => info
+            .inode
+            .map(|inode| (mount.device, inode))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "remote session descriptor has no procfs inode",
+                )
+            }),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "session descriptor mount identity is unverified",
+        )),
+    }
+}
+
+/// Linux's userspace dev_t encoding, also used by makedev(3). Mountinfo
+/// prints decimal major/minor components, rather than this packed value.
+#[cfg(target_os = "linux")]
+fn linux_device_id(major: u32, minor: u32) -> u64 {
+    let major = u64::from(major);
+    let minor = u64::from(minor);
+    (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
+}
+
+/// Map mount IDs to their device and filesystem type. Mount paths escape
+/// spaces, so the first " - " always ends the optional fields.
+#[cfg(target_os = "linux")]
+fn parse_mount_identities(table: &str) -> HashMap<u64, MountIdentity> {
     table
         .lines()
         .filter_map(|line| {
-            let mount_id = line.split_whitespace().next()?.parse::<u64>().ok()?;
-            let (_, after_separator) = line.split_once(" - ")?;
+            let (before_separator, after_separator) = line.split_once(" - ")?;
+            let mut fields = before_separator.split_whitespace();
+            let mount_id = fields.next()?.parse::<u64>().ok()?;
+            let (major, minor) = fields.nth(1)?.split_once(':')?;
+            let device = linux_device_id(major.parse().ok()?, minor.parse().ok()?);
             let filesystem_type = after_separator.split_whitespace().next()?;
-            Some((mount_id, filesystem_type_is_remote(filesystem_type)))
+            Some((
+                mount_id,
+                MountIdentity {
+                    device,
+                    remote: filesystem_type_is_remote(filesystem_type),
+                },
+            ))
         })
         .collect()
 }
@@ -424,11 +495,20 @@ fn collect_writers(
     is_session_source: SourcePredicate,
     known_writers: &HashMap<FileIdentity, Vec<DescriptorWitness>>,
 ) -> WriterCensus {
+    collect_writers_in(Path::new("/proc"), is_session_source, known_writers)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_writers_in(
+    proc_root: &Path,
+    is_session_source: SourcePredicate,
+    known_writers: &HashMap<FileIdentity, Vec<DescriptorWitness>>,
+) -> WriterCensus {
     let mut census = WriterCensus {
         complete: true,
         ..WriterCensus::default()
     };
-    let processes = match std::fs::read_dir("/proc") {
+    let processes = match std::fs::read_dir(proc_root) {
         Ok(processes) => processes,
         Err(_) => return WriterCensus::default(),
     };
@@ -450,7 +530,7 @@ fn collect_writers(
         let process_id = process_identity(&process.path(), pid).ok();
         // This process's mount table, read at most once and only if a
         // descriptor needs it.
-        let mut mount_types = None;
+        let mut mounts = None;
         let descriptors = match std::fs::read_dir(process.path().join("fd")) {
             Ok(descriptors) => descriptors,
             Err(error) => {
@@ -467,9 +547,9 @@ fn collect_writers(
                 }
             };
             let info = process.path().join("fdinfo").join(descriptor.file_name());
-            match read_descriptor_access(&info) {
-                Ok(true) => {}
-                Ok(false) => continue,
+            let observed = match read_descriptor_info(&info) {
+                Ok(observed) if observed.writable => observed,
+                Ok(_) => continue,
                 Err(error) => {
                     census.observe_error(
                         error,
@@ -479,7 +559,7 @@ fn collect_writers(
                     );
                     continue;
                 }
-            }
+            };
             let path = descriptor.path();
             // Read the link before following it. readlink on a procfs
             // descriptor is answered by the kernel, while a stat that follows
@@ -499,21 +579,24 @@ fn collect_writers(
                 }
             };
             let session_named = is_session_source(&target);
+            if !session_named && known_writers.is_empty() {
+                continue;
+            }
+            let mount = descriptor_mount(&process.path(), &observed, &mut mounts);
             // A known positive can have a writable successor reached through
             // a hardlink with a non-session suffix, so while positives are
             // cached a non-session descriptor is followed and matched against
             // their inodes. Only a local one: a session source on a network
             // or FUSE mount is still found under its session name, but not
             // through such a hardlink.
-            if !session_named
-                && (known_writers.is_empty()
-                    || descriptor_on_remote_filesystem(&process.path(), &info, &mut mount_types))
-            {
+            if !session_named && mount.is_none_or(|mount| mount.remote) {
                 continue;
             }
             #[cfg(test)]
-            census.followed.push(target);
-            let identity = match file_identity(&path) {
+            if mount.is_some_and(|mount| !mount.remote) {
+                census.followed.push(target);
+            }
+            let identity = match descriptor_identity(&path, &observed, mount) {
                 Ok(identity) => identity,
                 Err(error) => {
                     census.observe_error(
