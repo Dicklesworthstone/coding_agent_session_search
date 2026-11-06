@@ -127285,7 +127285,7 @@ fn run_models_install(
 
     // Install from local directory (for air-gapped environments)
     if let Some(source_path) = from_file {
-        use crate::search::model_download::compute_sha256;
+        use crate::search::model_download::DownloadError;
 
         if !source_path.is_dir() {
             return Err(CliError {
@@ -127308,7 +127308,9 @@ fn run_models_install(
             source_path.display()
         );
 
-        // Verify all required files exist and match checksums
+        // Preserve the actionable missing-file envelope before staging. The
+        // shared installer verifies the bytes it actually copies, rather than
+        // trusting a checksum computed before the source could change.
         for mfile in &manifest.files {
             let local_name = mfile.local_name();
             let src = source_path.join(local_name);
@@ -127333,74 +127335,43 @@ fn run_models_install(
                     retryable: false,
                 });
             }
+        }
 
-            // Verify SHA256
-            println!("  Verifying {}...", local_name);
-            let actual_hash = compute_sha256(&src).map_err(|e| CliError {
-                code: 22,
-                kind: CliErrorKind::Io.kind_str(),
-                message: format!("Failed to hash {}: {}", local_name, e),
-                hint: None,
-                retryable: false,
-            })?;
-            if actual_hash != mfile.sha256 {
-                return Err(CliError {
+        let downloader = ModelDownloader::new(model_dir.clone());
+        downloader
+            .install_from_directory(&manifest, source_path, None)
+            .map_err(|error| match error {
+                DownloadError::VerificationFailed {
+                    file,
+                    expected,
+                    actual,
+                } => CliError {
                     code: 21,
                     kind: CliErrorKind::Model.kind_str(),
                     message: format!(
                         "SHA256 mismatch for '{}': expected {}, got {}",
-                        local_name, mfile.sha256, actual_hash
+                        file, expected, actual
                     ),
                     hint: Some(
-                        "The file may be corrupted or from a different model version".into(),
+                        "The copied file may be corrupted or from a different model version; the previous installation was preserved".into(),
                     ),
                     retryable: false,
-                });
-            }
-        }
-
-        // All verified -- copy to model directory
-        std::fs::create_dir_all(&model_dir).map_err(|e| CliError {
-            code: 22,
-            kind: CliErrorKind::Io.kind_str(),
-            message: format!("Failed to create model directory: {}", e),
-            hint: None,
-            retryable: false,
-        })?;
-
-        for mfile in &manifest.files {
-            let local_name = mfile.local_name();
-            let src = source_path.join(local_name);
-            let dst = model_dir.join(local_name);
-            std::fs::copy(&src, &dst).map_err(|e| CliError {
-                code: 22,
-                kind: CliErrorKind::Io.kind_str(),
-                message: format!("Failed to copy {}: {}", local_name, e),
-                hint: None,
-                retryable: false,
+                },
+                DownloadError::InstallInProgress { .. } => CliError {
+                    code: 21,
+                    kind: CliErrorKind::Model.kind_str(),
+                    message: error.to_string(),
+                    hint: Some("Retry after the other model installation finishes".into()),
+                    retryable: true,
+                },
+                error => CliError {
+                    code: 22,
+                    kind: CliErrorKind::Io.kind_str(),
+                    message: format!("Failed to stage and install local model: {error}"),
+                    hint: Some("Check the local bundle and available disk space, then retry".into()),
+                    retryable: false,
+                },
             })?;
-        }
-
-        // Write verified marker. The hardened marker records the install
-        // source provenance (`from-file`), the local source path, and the
-        // model fingerprint so an air-gapped install is auditable and
-        // distinguishable from a network download (bead
-        // cass-fleet-resilience-20260608-uojcg.5.5). Byte-compatible with the
-        // legacy reader: `revision=` stays first and unknown lines are ignored.
-        let marker_path = model_dir.join(crate::search::model_acquisition::VERIFIED_MARKER_NAME);
-        let content = crate::search::model_acquisition::VerifiedMarker::for_from_file(
-            &manifest,
-            source_path,
-            chrono::Utc::now().to_rfc3339(),
-        )
-        .render();
-        std::fs::write(&marker_path, content).map_err(|e| CliError {
-            code: 22,
-            kind: CliErrorKind::Io.kind_str(),
-            message: format!("Failed to write verified marker: {}", e),
-            hint: None,
-            retryable: false,
-        })?;
 
         println!();
         println!(
@@ -127408,6 +127379,9 @@ fn run_models_install(
             "✓".green()
         );
         println!("  Location: {}", model_dir.display());
+        println!(
+            "Model files are verified. Semantic search also requires a working embedder and a completed backfill."
+        );
         return Ok(());
     }
 

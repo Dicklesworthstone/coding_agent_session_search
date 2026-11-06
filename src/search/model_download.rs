@@ -1002,14 +1002,20 @@ pub enum DownloadError {
     /// Mirror URL failed validation.
     #[error("invalid mirror URL '{url}': {reason}")]
     InvalidMirrorUrl { url: String, reason: String },
+    /// Another process owns the model's acquisition/publication lease.
+    #[error(
+        "another model installation is in progress (lock: {lock_path}); retry after it finishes"
+    )]
+    InstallInProgress { lock_path: PathBuf },
 }
 
 impl DownloadError {
     fn is_retryable(&self) -> bool {
         match self {
-            DownloadError::NetworkError(_) | DownloadError::IoError(_) | DownloadError::Timeout => {
-                true
-            }
+            DownloadError::NetworkError(_)
+            | DownloadError::IoError(_)
+            | DownloadError::Timeout
+            | DownloadError::InstallInProgress { .. } => true,
             DownloadError::HttpError { status, .. } => {
                 *status == 408 || *status == 429 || (500..=599).contains(status)
             }
@@ -1027,6 +1033,17 @@ impl DownloadError {
 
 const MODEL_HTTP_BODY_SIZE_FLOOR_BYTES: u64 = 500 * 1024 * 1024;
 const MODEL_HTTP_BODY_SIZE_MARGIN_BYTES: u64 = 32 * 1024 * 1024;
+const MODEL_ACQUISITION_RECORD: &str = ".acquisition.json";
+
+/// Keep the stable lock file in place: unlinking it would let a new installer
+/// lock a different inode while another process still owns the original lease.
+struct ModelInstallLease(File);
+
+impl Drop for ModelInstallLease {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
 
 /// Flatten an error and its `source()` chain into one message.
 ///
@@ -1106,7 +1123,7 @@ fn model_http_max_body_size(expected_size: u64) -> usize {
 pub struct ModelDownloader {
     /// Target directory for model files.
     target_dir: PathBuf,
-    /// Temporary download directory.
+    /// Uniquely owned staging directory on the target filesystem.
     temp_dir: PathBuf,
     /// Cancellation flag.
     cancelled: Arc<AtomicBool>,
@@ -1121,18 +1138,7 @@ pub struct ModelDownloader {
 impl ModelDownloader {
     /// Create a new model downloader.
     pub fn new(target_dir: PathBuf) -> Self {
-        // Use parent + modified filename to avoid with_extension() replacing dots in dir names
-        // e.g., "model.v2" should become "model.v2.downloading", not "model.downloading"
-        let temp_dir = if let Some(parent) = target_dir.parent() {
-            let dir_name = target_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("model");
-            parent.join(format!("{}.downloading", dir_name))
-        } else {
-            // Fallback for root paths (unlikely)
-            target_dir.with_extension("downloading")
-        };
+        let temp_dir = unique_model_sidecar_path(&target_dir, "downloading", "model");
         Self {
             target_dir,
             temp_dir,
@@ -1189,28 +1195,15 @@ impl ModelDownloader {
         mirror_base_url: Option<&str>,
         on_progress: Option<ProgressCallback>,
     ) -> Result<(), DownloadError> {
-        // Validate manifest is production-ready before downloading
-        // This prevents downloading models with placeholder checksums that can't be verified
-        if !manifest.is_production_ready() {
-            let unverified_files: Vec<String> = manifest
-                .files
-                .iter()
-                .filter(|f| f.sha256 == PLACEHOLDER_CHECKSUM)
-                .map(|f| f.name.clone())
-                .collect();
-            return Err(DownloadError::ManifestNotVerified {
-                model_id: manifest.id.clone(),
-                unverified_files,
-                revision_unpinned: !manifest.has_pinned_revision(),
-            });
-        }
-
-        // Reset cancellation flag
+        self.validate_install_manifest(manifest)?;
+        let mirror_base_url = mirror_base_url.map(normalize_mirror_base_url).transpose()?;
+        let mirror_base_url = mirror_base_url.as_deref();
+        let _lease = self.acquire_install_lease()?;
         self.cancelled.store(false, Ordering::SeqCst);
-
-        // Prepare the temp directory for a safe resume. Keep partials for the
-        // current manifest, but remove stale or unsafe entries from older runs.
-        self.prepare_temp_dir(manifest)?;
+        let source = mirror_base_url
+            .map(|url| format!("mirror:{url}"))
+            .unwrap_or_else(|| "registry".to_string());
+        self.prepare_acquisition(manifest, &source, true)?;
 
         let grand_total = manifest.total_size();
         let total_files = manifest.files.len();
@@ -1240,6 +1233,7 @@ impl ModelDownloader {
                 if attempt > 0 {
                     let delay = Duration::from_secs(5 * (1 << (attempt - 1)));
                     std::thread::sleep(delay);
+                    self.fail_if_cancelled()?;
                 }
 
                 match self.download_file(
@@ -1274,27 +1268,233 @@ impl ModelDownloader {
                 return Err(err);
             }
 
-            // Verify SHA256
-            self.fail_if_cancelled()?;
-
-            let actual_hash = compute_sha256(&file_path)?;
-            if actual_hash != file.sha256 {
-                let err = DownloadError::VerificationFailed {
-                    file: file.name.clone(),
-                    expected: file.sha256.clone(),
-                    actual: actual_hash,
-                };
-                self.cleanup_temp_for_error(&err);
-                return Err(err);
-            }
+            self.verify_staged_file(file)?;
         }
 
-        // Atomic install: rename temp -> target
-        self.atomic_install()?;
-
-        // Write verified marker
+        // The marker belongs to the same staged generation as the verified
+        // bytes. A marker write failure must never replace the live model.
         self.write_verified_marker(manifest, mirror_base_url)?;
+        self.fail_if_cancelled()?;
+        self.atomic_install()
+    }
 
+    /// Install an explicitly supplied local bundle through the same staged,
+    /// serialized publication path as downloads. Verification reads the copied
+    /// bytes, so changes to the source cannot invalidate a pre-copy checksum.
+    pub fn install_from_directory(
+        &self,
+        manifest: &ModelManifest,
+        source_dir: &Path,
+        on_progress: Option<ProgressCallback>,
+    ) -> Result<(), DownloadError> {
+        self.validate_install_manifest(manifest)?;
+        let _lease = self.acquire_install_lease()?;
+        self.cancelled.store(false, Ordering::SeqCst);
+        self.prepare_acquisition(
+            manifest,
+            &format!("from-file:{}", source_dir.display()),
+            false,
+        )?;
+
+        let mut total_bytes = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        for (idx, file) in manifest.files.iter().enumerate() {
+            self.fail_if_cancelled()?;
+            let source_path = source_dir.join(file.local_name());
+            let source = File::open(&source_path)?;
+            if !source.metadata()?.is_file() {
+                return Err(std::io::Error::other(format!(
+                    "model source is not a regular file: {}",
+                    source_path.display()
+                ))
+                .into());
+            }
+            // A concurrently growing source cannot make an offline install
+            // copy forever. One excess byte is enough for the pinned digest
+            // to reject an oversized or changing artifact.
+            let mut source = source.take(file.size.saturating_add(1));
+            let mut staged = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(self.temp_dir.join(file.local_name()))?;
+            let mut file_bytes = 0_u64;
+            loop {
+                self.fail_if_cancelled()?;
+                let read = source.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                staged.write_all(&buffer[..read])?;
+                file_bytes = file_bytes.saturating_add(read as u64);
+                total_bytes = total_bytes.saturating_add(read as u64);
+                if let Some(callback) = on_progress.as_ref() {
+                    callback(DownloadProgress {
+                        current_file: file.local_name().to_string(),
+                        file_index: idx + 1,
+                        total_files: manifest.files.len(),
+                        file_bytes,
+                        file_total: file.size,
+                        total_bytes,
+                        grand_total: manifest.total_size(),
+                        progress_pct: if manifest.total_size() == 0 {
+                            0
+                        } else {
+                            ((total_bytes as f64 / manifest.total_size() as f64) * 100.0).min(100.0)
+                                as u8
+                        },
+                    });
+                }
+            }
+            staged.sync_all()?;
+            drop(staged);
+            self.verify_staged_file(file)?;
+        }
+
+        let marker = crate::search::model_acquisition::VerifiedMarker::for_from_file(
+            manifest,
+            source_dir,
+            chrono::Utc::now().to_rfc3339(),
+        )
+        .render();
+        self.write_staged_marker(&marker)?;
+        self.fail_if_cancelled()?;
+        self.atomic_install()
+    }
+
+    fn validate_install_manifest(&self, manifest: &ModelManifest) -> Result<(), DownloadError> {
+        if !manifest.is_production_ready() {
+            let unverified_files: Vec<String> = manifest
+                .files
+                .iter()
+                .filter(|f| f.sha256 == PLACEHOLDER_CHECKSUM)
+                .map(|f| f.name.clone())
+                .collect();
+            return Err(DownloadError::ManifestNotVerified {
+                model_id: manifest.id.clone(),
+                unverified_files,
+                revision_unpinned: !manifest.has_pinned_revision(),
+            });
+        }
+        if manifest.files.is_empty() {
+            return Err(std::io::Error::other("model manifest contains no artifacts").into());
+        }
+
+        let mut names = HashSet::new();
+        for file in &manifest.files {
+            let name = file.local_name();
+            if name.is_empty()
+                || matches!(name, "." | ".." | ".verified" | MODEL_ACQUISITION_RECORD)
+                || name.contains(['/', '\\', ':'])
+                || !names.insert(name)
+            {
+                return Err(std::io::Error::other(format!(
+                    "unsafe or duplicate model artifact filename: {}",
+                    file.name
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    fn acquire_install_lease(&self) -> Result<ModelInstallLease, DownloadError> {
+        if let Some(parent) = self.target_dir.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        ensure_replaceable_model_dir(&self.target_dir)?;
+        let lock_path = model_install_lock_path(&self.target_dir);
+        match fs::symlink_metadata(&lock_path) {
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::other(format!(
+                    "model install lock is not a regular file: {}",
+                    lock_path.display()
+                ))
+                .into());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let file = options.open(&lock_path)?;
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(ModelInstallLease(file)),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+            {
+                Err(DownloadError::InstallInProgress { lock_path })
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn prepare_acquisition(
+        &self,
+        manifest: &ModelManifest,
+        source: &str,
+        allow_resume: bool,
+    ) -> Result<(), DownloadError> {
+        let receipt = serde_json::json!({
+            "version": 1,
+            "model": manifest.id,
+            "revision": manifest.revision,
+            "manifest_digest": crate::search::model_acquisition::ModelFingerprint::from_manifest(manifest).content_digest,
+            "source": source,
+        })
+        .to_string();
+        if fs::symlink_metadata(&self.temp_dir).is_ok() {
+            ensure_model_download_temp_dir(&self.temp_dir)?;
+            let same_acquisition = allow_resume
+                && fs::read_to_string(self.temp_dir.join(MODEL_ACQUISITION_RECORD))
+                    .is_ok_and(|previous| previous == receipt);
+            if !same_acquisition {
+                // Preserve an earlier attempt when this downloader is reused
+                // for another source or manifest; never blend its partials.
+                fs::rename(
+                    &self.temp_dir,
+                    unique_model_sidecar_path(&self.target_dir, "downloading", "model"),
+                )?;
+            }
+        }
+        if !self.temp_dir.exists() && allow_resume {
+            for candidate in model_download_staging_dirs(&self.target_dir) {
+                if fs::read_to_string(candidate.join(MODEL_ACQUISITION_RECORD))
+                    .is_ok_and(|previous| previous == receipt)
+                {
+                    // The lease makes this an exclusive transfer of ownership
+                    // to a fresh name, including across process restarts.
+                    fs::rename(candidate, &self.temp_dir)?;
+                    break;
+                }
+            }
+        }
+        self.prepare_temp_dir(manifest)?;
+        let mut file = File::create(self.temp_dir.join(MODEL_ACQUISITION_RECORD))?;
+        file.write_all(receipt.as_bytes())?;
+        file.sync_all()?;
+        sync_parent_directory(&self.temp_dir.join(MODEL_ACQUISITION_RECORD))?;
+        Ok(())
+    }
+
+    fn verify_staged_file(&self, file: &ModelFile) -> Result<(), DownloadError> {
+        self.fail_if_cancelled()?;
+        let actual_hash = compute_sha256(&self.temp_dir.join(file.local_name()))?;
+        if actual_hash != file.sha256 {
+            let error = DownloadError::VerificationFailed {
+                file: file.local_name().to_string(),
+                expected: file.sha256.clone(),
+                actual: actual_hash,
+            };
+            self.cleanup_temp_for_error(&error);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1496,17 +1696,32 @@ impl ModelDownloader {
 
     /// Atomically install downloaded files.
     ///
-    /// Uses a backup-rename-cleanup pattern to minimize the window where no model exists:
+    /// Uses a backup-rename pattern to minimize the window where no model exists:
     /// 1. Move existing target to backup (if present)
     /// 2. Rename temp to target
-    /// 3. Remove backup on success, or restore on failure
+    /// 3. Retain the prior generation for recovery, or restore it on failure
+    ///
+    /// The portable two-rename replacement is not an atomic directory exchange.
+    /// A process/power failure between renames leaves the prior complete model
+    /// at the unique backup path; it must never be deleted as staging cleanup.
     fn atomic_install(&self) -> Result<(), DownloadError> {
         let backup_dir = unique_model_backup_dir(&self.target_dir);
         sync_tree(&self.temp_dir)?;
+        self.fail_if_cancelled()?;
 
         // Move existing target to backup (preserves it until new install succeeds)
         let had_existing = if ensure_replaceable_model_dir(&self.target_dir)? {
             fs::rename(&self.target_dir, &backup_dir)?;
+            if let Err(error) = sync_parent_directory(&backup_dir) {
+                let rollback = fs::rename(&backup_dir, &self.target_dir)
+                    .map_err(DownloadError::from)
+                    .and_then(|()| sync_parent_directory(&self.target_dir));
+                return Err(std::io::Error::other(format!(
+                    "could not sync prior model backup {}: {error}; rollback: {rollback:?}",
+                    backup_dir.display()
+                ))
+                .into());
+            }
             true
         } else {
             false
@@ -1515,11 +1730,19 @@ impl ModelDownloader {
         // Rename temp to target
         match fs::rename(&self.temp_dir, &self.target_dir) {
             Ok(()) => {
-                sync_parent_directory(&self.target_dir)?;
-                // Success: remove backup
+                if let Err(error) = sync_parent_directory(&self.target_dir) {
+                    return Err(std::io::Error::other(format!(
+                        "installed model at {} but could not sync its parent: {error}; prior model retained at {}",
+                        self.target_dir.display(),
+                        backup_dir.display()
+                    ))
+                    .into());
+                }
                 if had_existing {
-                    let _ = fs::remove_dir_all(&backup_dir);
-                    sync_parent_directory(&self.target_dir)?;
+                    tracing::info!(
+                        backup = %backup_dir.display(),
+                        "retained prior model generation for recovery"
+                    );
                 }
             }
             Err(e) => {
@@ -1537,9 +1760,10 @@ impl ModelDownloader {
                         }
                         Err(restore_err) => {
                             return Err(std::io::Error::other(format!(
-                                "failed installing {} from {}: {e}; restore error: {restore_err}; temp model retained at {}",
+                                "failed installing {} from {}: {e}; restore error: {restore_err}; prior model retained at {}; staged model retained at {}",
                                 self.target_dir.display(),
                                 self.temp_dir.display(),
+                                backup_dir.display(),
                                 self.temp_dir.display()
                             ))
                             .into());
@@ -1553,22 +1777,41 @@ impl ModelDownloader {
         Ok(())
     }
 
-    /// Write .verified marker file.
+    /// Write the network provenance marker into the staged generation.
     fn write_verified_marker(
         &self,
         manifest: &ModelManifest,
         mirror_base_url: Option<&str>,
     ) -> Result<(), DownloadError> {
-        let marker_path = self.target_dir.join(".verified");
         let source = mirror_base_url
             .map(|url| format!("mirror:{url}"))
             .unwrap_or_else(|| "registry".to_string());
         let content = format!(
-            "revision={}\nverified_at={}\nsource={}\n",
+            "revision={}\nverified_at={}\nsource={}\nfingerprint={}\n",
             manifest.revision,
             chrono::Utc::now().to_rfc3339(),
-            source
+            source,
+            crate::search::model_acquisition::ModelFingerprint::from_manifest(manifest)
+                .marker_token()
         );
+        self.write_staged_marker(&content)
+    }
+
+    fn write_staged_marker(&self, content: &str) -> Result<(), DownloadError> {
+        self.fail_if_cancelled()?;
+        let marker_path = self.temp_dir.join(".verified");
+        match fs::symlink_metadata(&marker_path) {
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::other(format!(
+                    "staged model verification marker is not a regular file: {}",
+                    marker_path.display()
+                ))
+                .into());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let temp_path = unique_model_sidecar_path(&marker_path, "tmp", ".verified");
         let mut file = File::create(&temp_path)?;
         file.write_all(content.as_bytes())?;
@@ -1706,9 +1949,10 @@ fn classify_model_cache_state(
     // install as not-installed — even after `install --from-file` succeeded and
     // verified all files (#370). A valid install outranks leftover staging
     // debris; the marker/checksum logic below decides the concrete ready state.
-    let staging_dir = model_download_temp_dir(model_dir);
     let install_looks_complete = missing_files.is_empty() && model_dir.join(".verified").is_file();
-    if staging_dir.is_dir() && !install_looks_complete {
+    if !install_looks_complete
+        && let Some(staging_dir) = model_download_staging_dirs(model_dir).into_iter().next()
+    {
         return ModelCacheState::Acquiring {
             bytes_present: directory_size_bytes(&staging_dir),
             staging_dir,
@@ -1965,6 +2209,48 @@ fn model_download_temp_dir(target_dir: &Path) -> PathBuf {
     } else {
         target_dir.with_extension("downloading")
     }
+}
+
+fn model_install_lock_path(target_dir: &Path) -> PathBuf {
+    let name = target_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model");
+    target_dir.with_file_name(format!(".{name}.install.lock"))
+}
+
+/// Recognize legacy resumable directories and uniquely owned new attempts.
+/// Never follow symlinks while discovering staging or count recovery backups as
+/// active acquisition. A complete installed model continues to outrank debris.
+fn model_download_staging_dirs(target_dir: &Path) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    let legacy = model_download_temp_dir(target_dir);
+    if model_dir_is_real_directory(&legacy).unwrap_or(false) {
+        directories.push(legacy);
+    }
+    let parent = target_dir.parent().unwrap_or_else(|| Path::new("."));
+    let name = target_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model");
+    let prefix = format!(".{name}.downloading.");
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_str().is_some_and(|name| {
+                name.strip_prefix(&prefix).is_some_and(|suffix| {
+                    !suffix.is_empty()
+                        && suffix
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+                })
+            }) && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            {
+                directories.push(entry.path());
+            }
+        }
+    }
+    directories.sort();
+    directories
 }
 
 /// Resolve a manifest file on disk.
@@ -3045,20 +3331,271 @@ mod tests {
     }
 
     #[test]
-    fn test_write_verified_marker_overwrites_existing_marker() {
+    fn test_write_verified_marker_changes_only_staged_generation() {
         let tmp = tempfile::tempdir().unwrap();
         let target_dir = tmp.path().join("model");
         fs::create_dir_all(&target_dir).unwrap();
         fs::write(target_dir.join(".verified"), "revision=old\n").unwrap();
 
         let downloader = ModelDownloader::new(target_dir.clone());
+        fs::create_dir_all(&downloader.temp_dir).unwrap();
+        fs::write(downloader.temp_dir.join(".verified"), "revision=partial\n").unwrap();
         let manifest = ModelManifest::minilm_v2();
         downloader.write_verified_marker(&manifest, None).unwrap();
 
-        let marker = fs::read_to_string(target_dir.join(".verified")).unwrap();
+        let marker = fs::read_to_string(downloader.temp_dir.join(".verified")).unwrap();
         assert!(marker.contains(&format!("revision={}", manifest.revision)));
         assert!(marker.contains("verified_at="));
         assert!(marker.contains("source=registry"));
+        assert!(marker.contains("fingerprint="));
+        assert_eq!(
+            fs::read_to_string(target_dir.join(".verified")).unwrap(),
+            "revision=old\n"
+        );
+    }
+
+    fn offline_install_fixture(root: &Path) -> (ModelDownloader, PathBuf, ModelManifest) {
+        let target = root.join("model");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("model.safetensors"), b"previous-weights").unwrap();
+        fs::write(target.join(".verified"), "revision=previous\n").unwrap();
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let files = [
+            ("model.safetensors", b"next-weights".as_slice()),
+            ("tokenizer.json", b"next-tokenizer".as_slice()),
+        ];
+        for (name, bytes) in files {
+            fs::write(source.join(name), bytes).unwrap();
+        }
+        let manifest = build_test_manifest("test/local-model", "next-revision", &files);
+        (ModelDownloader::new(target), source, manifest)
+    }
+
+    fn assert_prior_install_unchanged(downloader: &ModelDownloader) {
+        assert_eq!(
+            fs::read(downloader.target_dir.join("model.safetensors")).unwrap(),
+            b"previous-weights"
+        );
+        assert_eq!(
+            fs::read_to_string(downloader.target_dir.join(".verified")).unwrap(),
+            "revision=previous\n"
+        );
+        assert!(!downloader.target_dir.join("tokenizer.json").exists());
+    }
+
+    #[test]
+    fn test_offline_install_publishes_verified_generation_and_retains_previous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (downloader, source, manifest) = offline_install_fixture(tmp.path());
+
+        downloader
+            .install_from_directory(&manifest, &source, None)
+            .unwrap();
+
+        for file in &manifest.files {
+            assert_eq!(
+                compute_sha256(&downloader.target_dir.join(file.local_name())).unwrap(),
+                file.sha256
+            );
+        }
+        let marker = fs::read_to_string(downloader.target_dir.join(".verified")).unwrap();
+        assert!(marker.contains("revision=next-revision\n"));
+        assert!(marker.contains("source=from-file\n"));
+        assert!(marker.contains(&format!("source_path={}\n", source.display())));
+        assert!(marker.contains("fingerprint="));
+        assert!(!downloader.temp_dir.exists());
+        let backups: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".model.bak.")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            fs::read(backups[0].path().join("model.safetensors")).unwrap(),
+            b"previous-weights"
+        );
+        assert_eq!(
+            fs::read_to_string(backups[0].path().join(".verified")).unwrap(),
+            "revision=previous\n"
+        );
+    }
+
+    #[test]
+    fn test_offline_install_bad_later_file_preserves_entire_previous_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (downloader, source, manifest) = offline_install_fixture(tmp.path());
+        fs::write(source.join("tokenizer.json"), b"corrupt-tokenizer").unwrap();
+
+        let error = downloader
+            .install_from_directory(&manifest, &source, None)
+            .unwrap_err();
+
+        assert!(matches!(error, DownloadError::VerificationFailed { .. }));
+        assert_prior_install_unchanged(&downloader);
+        assert!(!downloader.temp_dir.exists());
+    }
+
+    #[test]
+    fn test_offline_install_missing_later_file_preserves_entire_previous_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (downloader, source, mut manifest) = offline_install_fixture(tmp.path());
+        manifest.files[1].name = "missing-tokenizer.json".to_string();
+
+        let error = downloader
+            .install_from_directory(&manifest, &source, None)
+            .unwrap_err();
+
+        assert!(matches!(error, DownloadError::IoError(_)));
+        assert_prior_install_unchanged(&downloader);
+        assert!(!downloader.temp_dir.join(".verified").exists());
+    }
+
+    #[test]
+    fn test_offline_install_verifies_copied_bytes_after_source_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (downloader, source, manifest) = offline_install_fixture(tmp.path());
+        let mutable_source = source.clone();
+
+        downloader
+            .install_from_directory(
+                &manifest,
+                &source,
+                Some(Arc::new(move |progress| {
+                    if progress.file_index == 1 {
+                        // Change the source after its bytes were copied but
+                        // before the installer's integrity check.
+                        fs::write(mutable_source.join("model.safetensors"), b"changed-data")
+                            .unwrap();
+                    }
+                })),
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::read(downloader.target_dir.join("model.safetensors")).unwrap(),
+            b"next-weights"
+        );
+        assert_eq!(
+            fs::read(source.join("model.safetensors")).unwrap(),
+            b"changed-data"
+        );
+    }
+
+    #[test]
+    fn test_offline_install_marker_failure_preserves_previous_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (downloader, source, manifest) = offline_install_fixture(tmp.path());
+        let blocked_marker = downloader.temp_dir.join(".verified");
+
+        let error = downloader
+            .install_from_directory(
+                &manifest,
+                &source,
+                Some(Arc::new(move |_| {
+                    fs::create_dir_all(&blocked_marker).unwrap();
+                })),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, DownloadError::IoError(_)));
+        assert_prior_install_unchanged(&downloader);
+        assert!(downloader.temp_dir.join("model.safetensors").is_file());
+    }
+
+    #[test]
+    fn test_offline_install_cancellation_preserves_previous_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (downloader, source, manifest) = offline_install_fixture(tmp.path());
+        let cancellation = downloader.cancellation_handle();
+
+        let error = downloader
+            .install_from_directory(
+                &manifest,
+                &source,
+                Some(Arc::new(move |_| {
+                    cancellation.store(true, Ordering::SeqCst);
+                })),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, DownloadError::Cancelled));
+        assert_prior_install_unchanged(&downloader);
+        assert!(!downloader.temp_dir.join(".verified").exists());
+    }
+
+    #[test]
+    fn test_offline_and_network_installs_share_exclusive_model_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (owner, source, manifest) = offline_install_fixture(tmp.path());
+        let contender = ModelDownloader::new(owner.target_dir.clone());
+        assert_ne!(owner.temp_dir, contender.temp_dir);
+        let lease = owner.acquire_install_lease().unwrap();
+
+        assert!(matches!(
+            contender.install_from_directory(&manifest, &source, None),
+            Err(DownloadError::InstallInProgress { .. })
+        ));
+        assert!(matches!(
+            contender.download(&manifest, None),
+            Err(DownloadError::InstallInProgress { .. })
+        ));
+        assert!(!contender.temp_dir.exists());
+        assert_prior_install_unchanged(&owner);
+
+        drop(lease);
+        contender
+            .install_from_directory(&manifest, &source, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_acquisition_resume_does_not_mix_model_or_source_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (first, _, manifest) = offline_install_fixture(tmp.path());
+        first
+            .prepare_acquisition(&manifest, "registry", true)
+            .unwrap();
+        fs::write(first.temp_dir.join("model.safetensors"), b"partial").unwrap();
+        let other = ModelDownloader::new(first.target_dir.clone());
+
+        other
+            .prepare_acquisition(&manifest, "mirror:https://different.example", true)
+            .unwrap();
+
+        assert!(first.temp_dir.join("model.safetensors").exists());
+        assert!(!other.temp_dir.join("model.safetensors").exists());
+        let resumed = ModelDownloader::new(first.target_dir.clone());
+        resumed
+            .prepare_acquisition(&manifest, "registry", true)
+            .unwrap();
+        assert!(!first.temp_dir.exists());
+        assert_eq!(
+            fs::read(resumed.temp_dir.join("model.safetensors")).unwrap(),
+            b"partial"
+        );
+    }
+
+    #[test]
+    fn test_offline_install_rejects_unsafe_or_duplicate_artifact_names_before_staging() {
+        for invalid_name in ["..", ".verified", "C:\\outside", "tokenizer.json"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (downloader, source, mut manifest) = offline_install_fixture(tmp.path());
+            manifest.files[0].name = invalid_name.to_string();
+
+            assert!(
+                downloader
+                    .install_from_directory(&manifest, &source, None)
+                    .is_err()
+            );
+            assert_prior_install_unchanged(&downloader);
+            assert!(!downloader.temp_dir.exists());
+        }
     }
 
     #[test]
@@ -3591,15 +4128,18 @@ mod tests {
             "cancelled run should preserve a partial download for resume; got {partial_size} bytes"
         );
 
-        downloader
+        let resumed = ModelDownloader::new(downloader.target_dir.clone());
+        assert_ne!(resumed.temp_dir, downloader.temp_dir);
+        resumed
             .download_with_mirror(&manifest, Some(&mirror_base), None)
             .unwrap();
 
         assert_eq!(
-            fs::read(downloader.target_dir.join("model.onnx")).unwrap(),
+            fs::read(resumed.target_dir.join("model.onnx")).unwrap(),
             large_payload,
-            "rerun after cancellation should finish the mirrored download and install the exact payload"
+            "new installer after cancellation should adopt the partial and install the exact payload"
         );
+        assert!(!downloader.temp_dir.exists());
         let requests = server.requests();
         assert!(
             requests
