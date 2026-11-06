@@ -266,6 +266,36 @@ mod tests {
     }
 
     #[test]
+    fn invalid_model_configuration_is_a_non_retryable_admission_error() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = temp.path().join("absent.db");
+        let index = temp.path().join("absent-index");
+        let (_worker, handle) = EmbeddingWorker::new();
+        for (fast, quality) in [
+            ("unsupported-model", "minilm"),
+            ("minilm", "MINILM-384"),
+            ("hash", "hash"),
+        ] {
+            let mut job = config(
+                db.to_string_lossy().into_owned(),
+                index.to_string_lossy().into_owned(),
+            );
+            job.fast_model = Some(fast.into());
+            job.quality_model = Some(quality.into());
+            assert!(matches!(
+                submit(job, "invalid-model", Some(&handle)),
+                Response::Error(error)
+                    if error.code == ErrorCode::InvalidInput
+                        && !error.retryable
+                        && error.retry_after_ms.is_none()
+            ));
+        }
+        assert!(!db.exists());
+        assert!(!index.exists());
+        Ok(())
+    }
+
+    #[test]
     fn refused_cancellation_is_an_error_not_a_successful_zero_count() {
         let (_worker, handle) = EmbeddingWorker::new();
         for index in 0..32 {

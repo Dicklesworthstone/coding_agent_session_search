@@ -5,6 +5,7 @@
 
 mod embedding_source;
 mod existing_index;
+mod model_selection;
 mod work_queue;
 
 use std::collections::{HashMap, HashSet};
@@ -17,6 +18,7 @@ use tracing::{debug, error, info, warn};
 
 use self::embedding_source::{EmbeddingMessageSource, SqliteEmbeddingSource};
 use self::existing_index::ExistingIndexState;
+use self::model_selection::{cancel_persisted_jobs, canonical_model};
 use self::work_queue::{JobControl, Receiver, Sender};
 use crate::franken_sync::CancellationHandle;
 use crate::indexer::semantic::{
@@ -58,6 +60,17 @@ pub struct EmbeddingJobConfig {
     pub two_tier: bool,
     pub fast_model: Option<String>,
     pub quality_model: Option<String>,
+}
+
+/// The requested tier and the actual backend are independent. In particular,
+/// choosing a native fast model must not select the hash backend implicitly.
+/// This is job execution order, not a published progressive-search topology;
+/// the worker still writes separate artifacts keyed by each exact model ID.
+#[derive(Debug, PartialEq, Eq)]
+struct EmbeddingPass {
+    model: String,
+    use_semantic: bool,
+    tier: TierKind,
 }
 
 impl EmbeddingJobConfig {
@@ -176,18 +189,18 @@ fn resolve_embedder_kind(
     model_name: &str,
     use_semantic: bool,
 ) -> anyhow::Result<WorkerEmbedderKind> {
-    if !use_semantic
-        || model_name.eq_ignore_ascii_case(HASH_EMBEDDER_MODEL)
-        || model_name.eq_ignore_ascii_case("fnv1a-384")
-    {
-        return Ok(WorkerEmbedderKind::Hash);
-    }
-
-    let normalized_name = FastEmbedder::canonical_name(model_name).ok_or_else(|| {
+    let normalized_name = canonical_model(model_name).ok_or_else(|| {
         anyhow::anyhow!(
             "unsupported semantic model '{model_name}' for daemon embedding worker; the pure-Rust native backend supports minilm and the explicit multilingual-minilm profile"
         )
     })?;
+    if normalized_name == HASH_EMBEDDER_MODEL {
+        return Ok(WorkerEmbedderKind::Hash);
+    }
+    anyhow::ensure!(
+        use_semantic,
+        "native embedding model requires its native backend; refusing hash substitution"
+    );
 
     let config = FastEmbedder::config_for(normalized_name).ok_or_else(|| {
         anyhow::anyhow!("missing FastEmbedder config for registered model '{normalized_name}'")
@@ -462,7 +475,7 @@ impl EmbeddingWorker {
         };
         // Durable terminal status is cleanup. Its write must not inherit the
         // cancelled operation context that just drained preparation.
-        storage.cancel_embedding_jobs(db_path, model_id)?;
+        cancel_persisted_jobs(storage.raw(), db_path, model_id)?;
         maintenance.mark_progress();
         Ok(WorkerOperationOutcome::Completed)
     }
@@ -475,14 +488,14 @@ impl EmbeddingWorker {
         }
         let db_path = Path::new(&config.db_path);
         let index_path = Path::new(&config.index_path);
-        let passes = self.build_passes(config);
-        let Some((first_model, _)) = passes
+        let passes = self.build_passes(config)?;
+        let Some(first_pass) = passes
             .iter()
-            .find(|(model, _)| !self.pass_was_cancelled(model))
+            .find(|pass| !self.pass_was_cancelled(&pass.model))
         else {
             return Ok(WorkerOperationOutcome::Completed);
         };
-        self.set_running_pass(&config.db_path, first_model)?;
+        self.set_running_pass(&config.db_path, &first_pass.model)?;
         let _running_reset = RunningPassReset(&self.running_pass);
         if self.is_stopping() || self.all_passes_cancelled() {
             return Ok(WorkerOperationOutcome::Completed);
@@ -526,7 +539,8 @@ impl EmbeddingWorker {
             "Found messages to embed"
         );
 
-        for (model_name, use_semantic) in &passes {
+        for pass in &passes {
+            let model_name = &pass.model;
             if self.is_stopping() {
                 return Ok(WorkerOperationOutcome::Completed);
             }
@@ -549,7 +563,7 @@ impl EmbeddingWorker {
                 Ok(job_id) => job_id,
                 Err(error) if self.is_cancelled() => {
                     debug!(model = model_name, %error, "Embedding pass start cancelled after storage drained");
-                    storage.cancel_embedding_jobs(&config.db_path, Some(model_name))?;
+                    cancel_persisted_jobs(storage.raw(), &config.db_path, Some(model_name))?;
                     maintenance.mark_progress();
                     continue;
                 }
@@ -565,10 +579,11 @@ impl EmbeddingWorker {
                         &storage,
                         &messages,
                         model_name,
-                        *use_semantic,
+                        pass.use_semantic,
                         job_id,
                         index_path,
                         db_path,
+                        pass.tier,
                         &mut |_| maintenance.mark_progress(),
                     )
                 })()
@@ -588,7 +603,7 @@ impl EmbeddingWorker {
                     info!(model = model_name, "Embedding pass completed");
                 }
                 Ok(EmbeddingPassOutcome::Cancelled) => {
-                    storage.cancel_embedding_jobs(&config.db_path, Some(model_name))?;
+                    cancel_persisted_jobs(storage.raw(), &config.db_path, Some(model_name))?;
                     info!(model = model_name, "Embedding pass cancelled");
                     // A different tier remains eligible unless the whole job
                     // was cancelled or shutdown was requested.
@@ -634,25 +649,32 @@ impl EmbeddingWorker {
     }
 
     /// Determine the embedding passes to run based on config.
-    fn build_passes(&self, config: &EmbeddingJobConfig) -> Vec<(String, bool)> {
-        let mut passes = Vec::new();
-
+    fn build_passes(&self, config: &EmbeddingJobConfig) -> anyhow::Result<Vec<EmbeddingPass>> {
+        // Defence in depth for internal callers as well as mailbox admission.
+        // An old/invalid selector must fail before opening an archive or index.
+        let config = config
+            .clone()
+            .normalize_models()
+            .map_err(anyhow::Error::msg)?;
+        let pass = |model: String, tier| EmbeddingPass {
+            use_semantic: model != HASH_EMBEDDER_MODEL,
+            model,
+            tier,
+        };
         if config.two_tier {
-            // Fast hash pass
-            let fast = config.fast_pass_model();
-            passes.push((fast, false));
-
-            // Quality semantic pass
-            let quality = config.quality_pass_model();
-            passes.push((quality, true));
+            Ok(vec![
+                pass(config.fast_pass_model(), TierKind::Fast),
+                pass(config.quality_pass_model(), TierKind::Quality),
+            ])
         } else {
-            // Single pass with best available
             let model = config.single_pass_model();
-            let is_semantic = model != HASH_EMBEDDER_MODEL;
-            passes.push((model, is_semantic));
+            let tier = if model == HASH_EMBEDDER_MODEL {
+                TierKind::Fast
+            } else {
+                TierKind::Quality
+            };
+            Ok(vec![pass(model, tier)])
         }
-
-        passes
     }
 
     /// Keep the existing reconciliation regressions on the production path.
@@ -676,6 +698,11 @@ impl EmbeddingWorker {
             job_id,
             index_path,
             db_path,
+            if use_semantic {
+                TierKind::Quality
+            } else {
+                TierKind::Fast
+            },
             &mut |_| {},
         )
     }
@@ -697,6 +724,7 @@ impl EmbeddingWorker {
         job_id: i64,
         index_path: &Path,
         db_path: &Path,
+        tier: TierKind,
         on_progress: &mut dyn FnMut(i64),
     ) -> anyhow::Result<EmbeddingPassOutcome> {
         let cancelled = || self.is_cancelled();
@@ -840,10 +868,6 @@ impl EmbeddingWorker {
         // stale identities disappear and unchanged vectors retain exact bits.
         let save_path = vector_index_path(index_path, indexer.embedder_id());
         if existing_state.path_exists {
-            let tier = match &embedder_kind {
-                WorkerEmbedderKind::Hash => TierKind::Fast,
-                WorkerEmbedderKind::FastEmbed { .. } => TierKind::Quality,
-            };
             let db_fingerprint = crate::indexer::lexical_storage_fingerprint_for_db(db_path)?;
             if cancelled() {
                 return Ok(EmbeddingPassOutcome::Cancelled);
@@ -965,32 +989,83 @@ mod tests {
     fn test_build_passes_single() {
         let (_worker, _handle) = EmbeddingWorker::new();
         let config = build_pass_config(false, None, Some("minilm"));
-        let passes = _worker.build_passes(&config);
+        let passes = _worker.build_passes(&config).unwrap();
         assert_eq!(passes.len(), 1);
-        assert_eq!(passes[0].0, "minilm");
-        assert!(passes[0].1); // semantic
+        assert_eq!(passes[0].model, "minilm");
+        assert!(passes[0].use_semantic);
+        assert_eq!(passes[0].tier, TierKind::Quality);
     }
 
     #[test]
     fn test_build_passes_two_tier() {
         let (_worker, _handle) = EmbeddingWorker::new();
         let config = build_pass_config(true, Some("hash"), Some("minilm"));
-        let passes = _worker.build_passes(&config);
+        let passes = _worker.build_passes(&config).unwrap();
         assert_eq!(passes.len(), 2);
-        assert_eq!(passes[0].0, "hash");
-        assert!(!passes[0].1); // not semantic
-        assert_eq!(passes[1].0, "minilm");
-        assert!(passes[1].1); // semantic
+        assert_eq!(passes[0].model, "hash");
+        assert!(!passes[0].use_semantic);
+        assert_eq!(passes[0].tier, TierKind::Fast);
+        assert_eq!(passes[1].model, "minilm");
+        assert!(passes[1].use_semantic);
+        assert_eq!(passes[1].tier, TierKind::Quality);
     }
 
     #[test]
     fn test_build_passes_defaults() {
         let (_worker, _handle) = EmbeddingWorker::new();
         let config = build_pass_config(false, None, None);
-        let passes = _worker.build_passes(&config);
+        let passes = _worker.build_passes(&config).unwrap();
         assert_eq!(passes.len(), 1);
-        assert_eq!(passes[0].0, "hash");
-        assert!(!passes[0].1); // hash is not semantic
+        assert_eq!(passes[0].model, "hash");
+        assert!(!passes[0].use_semantic);
+        assert_eq!(passes[0].tier, TierKind::Fast);
+    }
+
+    #[test]
+    fn native_fast_pass_keeps_its_requested_backend_and_distinct_quality_identity() {
+        let (worker, _) = EmbeddingWorker::new();
+        for (fast, quality, fast_id, quality_id) in [
+            (
+                "MINILM-384",
+                "multilingual",
+                "minilm-384",
+                "multilingual-minilm-384",
+            ),
+            (
+                "Multilingual-MiniLM",
+                "fastembed",
+                "multilingual-minilm-384",
+                "minilm-384",
+            ),
+        ] {
+            let passes = worker
+                .build_passes(&build_pass_config(true, Some(fast), Some(quality)))
+                .unwrap();
+            assert_eq!(passes.len(), 2);
+            assert_eq!(passes[0].tier, TierKind::Fast);
+            assert_eq!(passes[1].tier, TierKind::Quality);
+            for (pass, expected) in passes.iter().zip([fast_id, quality_id]) {
+                assert!(pass.use_semantic);
+                let kind = resolve_embedder_kind(&pass.model, pass.use_semantic).unwrap();
+                assert!(matches!(
+                    kind,
+                    WorkerEmbedderKind::FastEmbed { embedder_id, .. } if embedder_id == expected
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_and_ambiguous_models_fail_before_internal_execution() {
+        let (worker, _) = EmbeddingWorker::new();
+        for config in [
+            build_pass_config(true, Some("unknown-model"), Some("minilm")),
+            build_pass_config(true, Some("minilm-384"), Some("FASTEMBED")),
+            build_pass_config(true, Some("minilm"), Some("FNV1A-384")),
+            build_pass_config(false, None, Some("legacy-unavailable-model")),
+        ] {
+            assert!(worker.build_passes(&config).is_err());
+        }
     }
 
     #[test]
@@ -1309,6 +1384,7 @@ mod tests {
             job_id,
             &index_path,
             &db_path,
+            TierKind::Fast,
             &mut |count| completed.push(count),
         )?;
         assert_eq!(result, EmbeddingPassOutcome::Completed);
@@ -1351,19 +1427,10 @@ mod tests {
         );
     }
 
-    /// `coding_agent_session_search-am69y`: pin the override-by-flag
-    /// short-circuit at the top of `resolve_embedder_kind`. The
-    /// `test_resolve_embedder_kind_hash_aliases` companion above
-    /// exercises ("hash", false), but "hash" matches BOTH the
-    /// `!use_semantic` branch AND the `eq_ignore_ascii_case("hash")`
-    /// branch — so a regression that broke only the `!use_semantic`
-    /// short-circuit would still be rescued by the name match and
-    /// silently pass. This test pins the flag-only contract by
-    /// passing semantic model names with `use_semantic=false`: every
-    /// any configured name MUST resolve to `Hash` purely
-    /// because the flag is false, regardless of name.
+    /// A legacy or inconsistent pass cannot relabel hash vectors as a native
+    /// model. Only an explicit hash selector may choose the hash backend.
     #[test]
-    fn test_resolve_embedder_kind_use_semantic_false_short_circuits_regardless_of_name() {
+    fn test_resolve_embedder_kind_refuses_implicit_hash_substitution() {
         for semantic_name in [
             "minilm",
             "minilm-384",
@@ -1372,12 +1439,9 @@ mod tests {
             "legacy-unavailable-model",
             "MINILM",
         ] {
-            assert_eq!(
-                resolve_embedder_kind(semantic_name, false).unwrap(),
-                WorkerEmbedderKind::Hash,
-                "use_semantic=false MUST short-circuit to Hash regardless of model_name; \
-                 regression on name {semantic_name:?} indicates the !use_semantic branch \
-                 was bypassed"
+            assert!(
+                resolve_embedder_kind(semantic_name, false).is_err(),
+                "native or unknown selector {semantic_name:?} must never produce hash vectors"
             );
         }
     }
@@ -1547,6 +1611,7 @@ mod tests {
                 job_id,
                 &index_path,
                 &db_path,
+                TierKind::Fast,
                 &mut |_| {},
             )?,
             EmbeddingPassOutcome::Cancelled
@@ -1610,6 +1675,73 @@ mod tests {
             assert_eq!(jobs[0].status, "completed");
             assert_eq!(jobs[0].total_docs, 0);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn native_job_aliases_survive_queue_cancellation_and_worker_restart() -> anyhow::Result<()> {
+        // An empty real archive exercises queue ownership, canonical job rows
+        // and durable cleanup without downloading or pretending to run a model.
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("archive.db");
+        let index_path = temp.path().join("index");
+        let db = db_path.to_string_lossy().into_owned();
+        let storage = FrankenStorage::open(&db_path)?;
+        let legacy = storage.upsert_embedding_job(&db, " \tMINILM-384\n", 0)?;
+        storage.start_embedding_job(legacy)?;
+        storage.upsert_embedding_job(&db, "FNV1A-384", 0)?;
+        storage.upsert_embedding_job(&db, "legacy-unavailable-model", 0)?;
+        let mut config = EmbeddingJobConfig {
+            db_path: db.clone(),
+            index_path: index_path.to_string_lossy().into_owned(),
+            two_tier: true,
+            fast_model: Some("FASTEMBED".into()),
+            quality_model: Some("paraphrase-multilingual-minilm-l12-v2".into()),
+        };
+        let (worker, handle) = EmbeddingWorker::new();
+        handle.submit(config.clone()).map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            handle
+                .cancel_with_count(db.clone(), Some("all-MiniLM-L6-v2".into()))
+                .map_err(anyhow::Error::msg)?,
+            1
+        );
+        drop(handle);
+        worker.run();
+        let jobs = storage.get_embedding_jobs(&db)?;
+        assert_eq!(jobs.len(), 4);
+        assert_eq!(jobs[0].model_id, "multilingual-minilm");
+        assert_eq!(jobs[0].status, "completed");
+        assert_eq!(jobs[3].model_id, " \tMINILM-384\n");
+        assert_eq!(jobs[3].status, "cancelled");
+
+        let (worker, handle) = EmbeddingWorker::new();
+        // No in-memory owner survives restart, but aliases still clean up the
+        // exact historical rows. Unsupported labels remain cleanup-only.
+        assert_eq!(
+            handle
+                .cancel_with_count(db.clone(), Some("hash".into()))
+                .map_err(anyhow::Error::msg)?,
+            0
+        );
+        handle
+            .cancel(db.clone(), Some("LEGACY-UNAVAILABLE-MODEL".into()))
+            .map_err(anyhow::Error::msg)?;
+        config.two_tier = false;
+        config.fast_model = None;
+        config.quality_model = Some("MINILM-384".into());
+        handle.submit(config).map_err(anyhow::Error::msg)?;
+        drop(handle);
+        worker.run();
+        let jobs = storage.get_embedding_jobs(&db)?;
+        assert_eq!(jobs.len(), 5);
+        assert_eq!(jobs[0].model_id, "minilm");
+        assert_eq!(jobs[0].status, "completed");
+        assert_eq!(jobs[2].model_id, "legacy-unavailable-model");
+        assert_eq!(jobs[2].status, "cancelled");
+        assert_eq!(jobs[3].model_id, "FNV1A-384");
+        assert_eq!(jobs[3].status, "cancelled");
+        assert!(!vector_index_path(&index_path, "fnv1a-384").exists());
         Ok(())
     }
 }

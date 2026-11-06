@@ -11,23 +11,13 @@ use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use super::{EmbeddingJobConfig, EmbeddingWorkerHandle, FastEmbedder, WorkerMessage};
+use super::model_selection::cancellation_key as model_key;
+use super::{EmbeddingJobConfig, EmbeddingWorkerHandle, WorkerMessage};
 use crate::franken_sync::CancellationHandle;
 
 const MAX_PENDING_JOBS: usize = 32;
 const MAX_PENDING_CANCELLATIONS: usize = 32;
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
-
-fn model_key(model: &str) -> String {
-    let model = model.trim();
-    if model.eq_ignore_ascii_case("hash") || model.eq_ignore_ascii_case("fnv1a-384") {
-        "hash".to_string()
-    } else {
-        FastEmbedder::canonical_name(model)
-            .map(str::to_string)
-            .unwrap_or_else(|| model.to_ascii_lowercase())
-    }
-}
 
 struct Cancellation {
     db_path: String,
@@ -277,6 +267,7 @@ impl Sender {
                 if config.db_path.trim().is_empty() || config.index_path.trim().is_empty() {
                     return Err("embedding job requires database and index paths".to_string());
                 }
+                let config = config.normalize_models()?;
                 let duplicate = state.pending.iter().any(|pending| {
                     same_config(&pending.config, &config) && !pending.control.any_cancelled()
                 });
@@ -300,9 +291,17 @@ impl Sender {
                 if db_path.trim().is_empty() {
                     return Err("embedding cancellation requires a database path".to_string());
                 }
+                if model_id
+                    .as_ref()
+                    .is_some_and(|model| model.trim().is_empty())
+                {
+                    return Err(
+                        "embedding cancellation requires a non-empty model selector".to_string()
+                    );
+                }
                 let scope = CancelScope {
                     db_path,
-                    model: model_id,
+                    model: model_id.as_deref().map(model_key),
                     retry_at: None,
                 };
                 let duplicate = state
@@ -597,6 +596,114 @@ mod tests {
         let (last, permit) = receiver.recv().unwrap();
         assert!(matches!(last, WorkerMessage::Submit(config) if config.db_path == job(0).db_path));
         drop(permit);
+    }
+
+    #[test]
+    fn equivalent_model_aliases_and_defaults_share_one_pending_job() {
+        let (sender, receiver) = channel();
+        let mut defaults = job(1);
+        defaults.fast_model = None;
+        defaults.quality_model = None;
+        sender.send(WorkerMessage::Submit(defaults)).unwrap();
+        let mut aliases = job(1);
+        aliases.fast_model = Some(" FNV1A-384 ".into());
+        aliases.quality_model = Some("ALL-MINILM-L6-V2".into());
+        sender.send(WorkerMessage::Submit(aliases)).unwrap();
+        assert_eq!(sender.state.lock().unwrap().pending.len(), 1);
+        let (message, permit) = receiver.recv().unwrap();
+        assert!(matches!(
+            message,
+            WorkerMessage::Submit(config)
+                if config.fast_model.as_deref() == Some("hash")
+                    && config.quality_model.as_deref() == Some("minilm")
+        ));
+        let control = permit.as_ref().unwrap().control();
+        cancel(&sender, 1, Some("minilm-384"));
+        assert!(control.is_cancelled("fastembed"));
+        assert!(!control.is_cancelled("hash"));
+        assert!(matches!(
+            receiver.recv().unwrap().0,
+            WorkerMessage::Cancel { model_id: Some(model), .. } if model == "minilm"
+        ));
+        drop(permit);
+
+        let mut single = job(2);
+        single.two_tier = false;
+        single.fast_model = Some("multilingual".into());
+        single.quality_model = None;
+        sender.send(WorkerMessage::Submit(single.clone())).unwrap();
+        single.fast_model = Some("hash".into());
+        single.quality_model = Some("MULTILINGUAL-MINILM-384".into());
+        sender.send(WorkerMessage::Submit(single)).unwrap();
+        assert_eq!(sender.state.lock().unwrap().pending.len(), 1);
+        let (message, permit) = receiver.recv().unwrap();
+        assert!(matches!(
+            message,
+            WorkerMessage::Submit(config)
+                if config.fast_model.is_none()
+                    && config.quality_model.as_deref() == Some("multilingual-minilm")
+        ));
+        drop(permit);
+    }
+
+    #[test]
+    fn native_fast_and_quality_cancellation_have_separate_owners() {
+        let (sender, receiver) = channel();
+        let mut config = job(1);
+        config.fast_model = Some("fastembed".into());
+        config.quality_model = Some("paraphrase-multilingual-minilm-l12-v2".into());
+        sender.send(WorkerMessage::Submit(config)).unwrap();
+        let (_, permit) = receiver.recv().unwrap();
+        let control = permit.as_ref().unwrap().control();
+        assert_eq!(
+            sender
+                .send_counted(WorkerMessage::Cancel {
+                    db_path: job(1).db_path,
+                    model_id: Some("MINILM-384".into()),
+                })
+                .unwrap(),
+            1
+        );
+        assert!(control.is_cancelled("minilm"));
+        assert!(!control.is_cancelled("multilingual"));
+        assert!(!control.all_cancelled());
+        assert_eq!(
+            sender
+                .send_counted(WorkerMessage::Cancel {
+                    db_path: job(1).db_path,
+                    model_id: Some("MULTILINGUAL-MINILM-384".into()),
+                })
+                .unwrap(),
+            1
+        );
+        assert!(control.all_cancelled());
+        drop(permit);
+    }
+
+    #[test]
+    fn invalid_model_requests_never_consume_queue_capacity() {
+        let (sender, _receiver) = channel();
+        for (fast, quality) in [
+            ("typo", "minilm"),
+            ("hash", ""),
+            ("minilm", "fastembed"),
+            ("hash", "fnv1a-384"),
+        ] {
+            let mut config = job(1);
+            config.fast_model = Some(fast.into());
+            config.quality_model = Some(quality.into());
+            assert!(sender.send(WorkerMessage::Submit(config)).is_err());
+            assert!(sender.state.lock().unwrap().pending.is_empty());
+        }
+        assert!(
+            sender
+                .send(WorkerMessage::Cancel {
+                    db_path: job(1).db_path,
+                    model_id: Some(" \t ".into()),
+                })
+                .is_err()
+        );
+        assert!(sender.state.lock().unwrap().cancellations.is_empty());
     }
 
     #[test]
