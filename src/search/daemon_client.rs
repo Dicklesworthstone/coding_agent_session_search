@@ -13,13 +13,14 @@ pub use frankensearch::{
 };
 use frankensearch::{ModelCategory, ModelTier, SearchError, SearchResult, SyncEmbed};
 
-/// Local fallback whose advertised identity is pinned by the authenticated
-/// daemon connection and whose actual native model identity is checked before
+/// Local fallback whose complete declared identity must match the authenticated
+/// daemon before composition, and whose actual producer is checked again before
 /// any locally produced vector is returned.
 ///
 /// This preserves lazy model loading: `DaemonFallbackEmbedder::new_verified`
-/// can compare the pinned identity without forcing the several-hundred-MiB
-/// native model into the short-lived client. If daemon inference later fails,
+/// can compare the local frozen identity without forcing the several-hundred-MiB
+/// native model into the short-lived client. The daemon cannot supply the local
+/// producer's expected identity. If daemon inference later fails,
 /// the first local call loads the model, verifies its exact identity, and only
 /// then releases the result.
 pub struct IdentityCheckedLocalEmbedder {
@@ -41,6 +42,11 @@ impl IdentityCheckedLocalEmbedder {
             }
         })?;
         if inner.dimension() != expected_dimension {
+            return Err(Self::identity_mismatch());
+        }
+        let declared = inner.identity().map_err(|_| Self::identity_mismatch())?;
+        declared.validate().map_err(|_| Self::identity_mismatch())?;
+        if declared != &expected {
             return Err(Self::identity_mismatch());
         }
         Ok(Self {
@@ -424,18 +430,151 @@ mod tests {
     }
 
     #[test]
-    fn fallback_still_rejects_same_dimension_producer_mismatch() {
+    fn fallback_rejects_same_dimension_producer_mismatch_before_composition() {
         let mut inner = response(vec![1.0, 0.0, 0.0, 0.0], Vec::new());
         Arc::get_mut(&mut inner)
             .unwrap()
             .identity
             .producer
             .implementation_revision = "different-producer".into();
-        let fallback = checked(inner);
         assert!(matches!(
-            fallback.embed_sync("query"),
+            IdentityCheckedLocalEmbedder::new(inner, identity()),
             Err(SearchError::UnverifiableRemoteSpace { .. })
         ));
+    }
+
+    #[test]
+    fn real_hash_identity_is_admitted_only_for_the_same_producer() -> SearchResult<()> {
+        let local: Arc<dyn SyncEmbed> =
+            Arc::new(crate::search::hash_embedder::HashEmbedder::new(384));
+        let expected = local.identity()?.clone();
+        let checked = IdentityCheckedLocalEmbedder::new(Arc::clone(&local), expected.clone())?;
+        assert_eq!(checked.identity()?, &expected);
+        assert_eq!(
+            checked.embed_sync("real hash producer admission")?,
+            local.embed_sync("real hash producer admission")?
+        );
+        // CASS's input contract differs from the upstream hash producer even
+        // when both expose the same width. Neither ID nor width is authority.
+        let upstream =
+            frankensearch::HashEmbedder::new(384, frankensearch::HashAlgorithm::FnvModular);
+        let other = frankensearch::Embedder::identity(&upstream)?.clone();
+        assert_eq!(expected.space.dimension, other.space.dimension);
+        assert_ne!(expected, other);
+        assert!(matches!(
+            IdentityCheckedLocalEmbedder::new(local, other),
+            Err(SearchError::UnverifiableRemoteSpace { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn native_daemon_composition_checks_both_frozen_profiles_before_inference() -> SearchResult<()>
+    {
+        use crate::search::fastembed_embedder::{FastEmbedder, LazyFastEmbedder};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        for (selected, other) in [
+            ("minilm", "multilingual-minilm"),
+            ("multilingual-minilm", "minilm"),
+        ] {
+            let local: Arc<dyn SyncEmbed> = Arc::new(LazyFastEmbedder::new(temp.path(), selected)?);
+            let expected = FastEmbedder::declared_identity_for(selected)?;
+            let wrong_space = FastEmbedder::declared_identity_for(other)?;
+            assert_eq!(expected.space.dimension, wrong_space.space.dimension);
+            assert!(matches!(
+                IdentityCheckedLocalEmbedder::new(Arc::clone(&local), wrong_space),
+                Err(SearchError::UnverifiableRemoteSpace { .. })
+            ));
+            // Admission succeeds with no model files. Only a later fallback
+            // inference would initialize and verify the real installation.
+            let checked = IdentityCheckedLocalEmbedder::new(local, expected.clone())?;
+            assert_eq!(checked.identity()?, &expected);
+        }
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("untouched directory")
+                .count(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_daemon_composition_rejects_same_model_with_a_different_numeric_producer()
+    -> SearchResult<()> {
+        use crate::search::fastembed_embedder::{FastEmbedder, LazyFastEmbedder};
+        use frankensearch::embed::model_manifest::ModelArtifactManifestV1;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let local: Arc<dyn SyncEmbed> = Arc::new(LazyFastEmbedder::new(temp.path(), "minilm")?);
+        let expected = FastEmbedder::declared_identity_for("minilm")?;
+        let f32_producer = ModelArtifactManifestV1::minilm_native_frankentorch_f32()?
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
+        assert_eq!(
+            expected.space.logical_model_id,
+            f32_producer.space.logical_model_id
+        );
+        assert_eq!(expected.space.dimension, f32_producer.space.dimension);
+        assert_ne!(expected.producer, f32_producer.producer);
+        assert!(matches!(
+            IdentityCheckedLocalEmbedder::new(local, f32_producer),
+            Err(SearchError::UnverifiableRemoteSpace { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_rechecks_producer_identity_after_inference() -> SearchResult<()> {
+        struct DriftingProducer {
+            before: EmbeddingIdentityBundleV1,
+            after: EmbeddingIdentityBundleV1,
+            calls: AtomicUsize,
+        }
+        impl SyncEmbed for DriftingProducer {
+            fn embed_sync(&self, _: &str) -> SearchResult<Vec<f32>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![1.0, 0.0, 0.0, 0.0])
+            }
+
+            fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+                Ok(if self.calls.load(Ordering::SeqCst) == 0 {
+                    &self.before
+                } else {
+                    &self.after
+                })
+            }
+
+            fn dimension(&self) -> usize {
+                4
+            }
+            fn id(&self) -> &str {
+                "synthetic-drifting-producer"
+            }
+            fn is_semantic(&self) -> bool {
+                true
+            }
+            fn category(&self) -> ModelCategory {
+                ModelCategory::TransformerEmbedder
+            }
+        }
+        let before = identity();
+        let mut after = before.clone();
+        after.producer.implementation_revision = "changed-after-admission".into();
+        after.validate()?;
+        let local = Arc::new(DriftingProducer {
+            before: before.clone(),
+            after,
+            calls: AtomicUsize::new(0),
+        });
+        let checked = IdentityCheckedLocalEmbedder::new(local.clone(), before)?;
+        assert_eq!(local.calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            checked.embed_sync("private query"),
+            Err(SearchError::UnverifiableRemoteSpace { .. })
+        ));
+        assert_eq!(local.calls.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
     #[test]

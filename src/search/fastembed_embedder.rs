@@ -26,6 +26,8 @@ use std::sync::OnceLock;
 
 use super::embedder::{Embedder, EmbedderError, EmbedderResult};
 use frankensearch::core::EmbeddingIdentityBundleV1;
+use frankensearch::core::generation::QuantizationFormat;
+use frankensearch::embed::model_manifest::ModelArtifactManifestV1;
 use frankensearch::{ModelCategory, ModelTier, NativeEmbedder, NativeEmbeddingModel};
 
 /// Pooling strategy for the embedder configuration. The native embedder always
@@ -115,6 +117,7 @@ pub struct LazyFastEmbedder {
     data_dir: PathBuf,
     canonical_name: String,
     config: OnnxEmbedderConfig,
+    expected_identity: EmbeddingIdentityBundleV1,
     inner: OnceLock<Result<FastEmbedder, String>>,
 }
 
@@ -133,18 +136,25 @@ impl LazyFastEmbedder {
                 format!("no config for embedder: {embedder_name}"),
             )
         })?;
+        let expected_identity = FastEmbedder::declared_identity_for(canonical_name)?;
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             canonical_name: canonical_name.to_string(),
             config,
+            expected_identity,
             inner: OnceLock::new(),
         })
     }
 
     fn loaded(&self) -> EmbedderResult<&FastEmbedder> {
         match self.inner.get_or_init(|| {
-            FastEmbedder::load_by_name(&self.data_dir, &self.canonical_name)
-                .map_err(|err| err.to_string())
+            let loaded = FastEmbedder::load_by_name(&self.data_dir, &self.canonical_name)
+                .map_err(|err| err.to_string())?;
+            let actual = loaded.identity().map_err(|err| err.to_string())?;
+            if actual != &self.expected_identity {
+                return Err("loaded native producer differs from its declared identity".into());
+            }
+            Ok(loaded)
         }) {
             Ok(embedder) => Ok(embedder),
             Err(reason) => Err(FastEmbedder::unavailable_error(
@@ -169,7 +179,9 @@ impl Embedder for LazyFastEmbedder {
     }
 
     fn identity(&self) -> EmbedderResult<&EmbeddingIdentityBundleV1> {
-        self.loaded()?.identity()
+        // This is the frozen expected contract, not proof that local files are
+        // installed. loaded() verifies the executing producer before inference.
+        Ok(&self.expected_identity)
     }
 
     fn id(&self) -> &str {
@@ -263,6 +275,28 @@ impl FastEmbedder {
             | "paraphrase-multilingual-minilm-l12-v2" => Some("multilingual-minilm"),
             _ => None,
         }
+    }
+
+    /// Complete expected identity for one pinned native profile, without
+    /// reading model files or loading weights. NativeEmbedder uses these same
+    /// manifests and storage contract after verifying its actual installation.
+    /// Callers must still verify the loaded identity before releasing vectors.
+    pub(crate) fn declared_identity_for(
+        embedder_name: &str,
+    ) -> EmbedderResult<EmbeddingIdentityBundleV1> {
+        let manifest = match Self::canonical_name(embedder_name) {
+            Some("minilm") => ModelArtifactManifestV1::minilm_native_frankentorch()?,
+            Some("multilingual-minilm") => {
+                ModelArtifactManifestV1::multilingual_minilm_native_frankentorch()?
+            }
+            _ => {
+                return Err(Self::unavailable_error(
+                    embedder_name,
+                    "unknown native embedding profile",
+                ));
+            }
+        };
+        manifest.declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
     }
 
     /// Get config for a specific embedder by name.
@@ -537,6 +571,10 @@ mod tests {
         assert_eq!(embedder.id(), "minilm-384");
         assert_eq!(embedder.dimension(), 384);
         assert_eq!(embedder.model_name(), "all-minilm-l6-v2");
+        assert_eq!(
+            embedder.identity().expect("declared identity"),
+            &FastEmbedder::declared_identity_for("minilm").expect("registered profile")
+        );
         assert!(
             embedder.inner.get().is_none(),
             "construction must not load the local model"
@@ -602,5 +640,39 @@ mod tests {
             MINILM_VECTOR_SPACE_REVISION,
             MULTILINGUAL_MINILM_VECTOR_SPACE_REVISION
         );
+    }
+
+    #[test]
+    fn lazy_native_identity_is_the_exact_pinned_manifest_without_local_artifacts()
+    -> EmbedderResult<()> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let baseline = ModelArtifactManifestV1::minilm_native_frankentorch()?
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
+        let multilingual = ModelArtifactManifestV1::multilingual_minilm_native_frankentorch()?
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
+        assert_eq!(baseline.space.dimension, multilingual.space.dimension);
+        assert_ne!(baseline, multilingual);
+        for (name, expected) in [
+            ("minilm", &baseline),
+            ("MINILM-384", &baseline),
+            ("fastembed", &baseline),
+            ("multilingual", &multilingual),
+            ("multilingual-minilm-384", &multilingual),
+        ] {
+            let lazy = LazyFastEmbedder::new(temp.path(), name)?;
+            assert_eq!(lazy.identity()?, expected);
+            assert!(
+                lazy.inner.get().is_none(),
+                "identity inspection must stay lazy"
+            );
+        }
+        assert!(FastEmbedder::declared_identity_for("unknown-model").is_err());
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("empty model directory")
+                .count(),
+            0
+        );
+        Ok(())
     }
 }

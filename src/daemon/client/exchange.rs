@@ -346,6 +346,9 @@ fn validate_inference_response(
         DaemonError::Failed("daemon inference response has invalid identity, count, dimensions or non-finite values".into())
     };
     match (request, response) {
+        (Request::ConnectionIdentity, Response::ConnectionIdentity(connection)) => {
+            client.validate_attested_identity(connection)?;
+        }
         (Request::Embed { texts, dims, .. }, Response::Embed(output)) => {
             if output.model.is_empty() || output.model.len() > 256 {
                 return Err(invalid());
@@ -385,6 +388,7 @@ fn validate_inference_response(
             Request::EmbedAttested { challenge, .. } | Request::RerankAttested { challenge, .. },
             Response::AttestedEmbedding(output),
         ) => {
+            client.validate_attested_identity(&output.attestation.connection)?;
             output
                 .attestation
                 .validate_against(challenge, &output.attestation.connection, &output.vectors)
@@ -394,6 +398,7 @@ fn validate_inference_response(
             Request::HandshakeAttested { challenge } | Request::HealthAttested { challenge },
             Response::Attestation(output),
         ) => {
+            client.validate_attested_identity(&output.connection)?;
             output
                 .validate_against(challenge, &output.connection, &[])
                 .map_err(|_| DaemonError::UnverifiableRemoteSpace)?;

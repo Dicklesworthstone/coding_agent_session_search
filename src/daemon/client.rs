@@ -170,6 +170,27 @@ impl UdsDaemonClient {
         Ok(())
     }
 
+    /// Bind an authenticated producer to the caller's selected native profile.
+    /// A same-width daemon for another profile is still the wrong producer.
+    /// An absent selector retains the explicit candidate-and-verifier API.
+    fn validate_attested_identity(
+        &self,
+        connection: &DaemonConnectionIdentityV1,
+    ) -> Result<(), DaemonError> {
+        connection.validate()?;
+        if let Some(expected) = self.config.expected_embedder_id.as_deref() {
+            let declared =
+                crate::search::fastembed_embedder::FastEmbedder::declared_identity_for(expected)
+                    .map_err(|_| DaemonError::UnverifiableRemoteSpace)?;
+            if connection.embedding_identity != declared
+                || connection.model_category != frankensearch::ModelCategory::TransformerEmbedder
+            {
+                return Err(DaemonError::UnverifiableRemoteSpace);
+            }
+        }
+        Ok(())
+    }
+
     /// Check daemon health. The exchange updates its cache while it still
     /// owns the connection, so a late caller cannot recache an invalid stream.
     pub fn health(&self) -> Result<HealthStatus, DaemonError> {
@@ -192,9 +213,7 @@ impl UdsDaemonClient {
             Response::ConnectionIdentity(identity) => identity,
             other => return Err(unexpected_response(other)),
         };
-        identity
-            .validate()
-            .map_err(|_| DaemonError::UnverifiableRemoteSpace)?;
+        self.validate_attested_identity(&identity)?;
         if identity.endpoint_fingerprint
             != daemon_socket_endpoint_fingerprint(&self.config.socket_path)
             || identity.protocol_revision != DAEMON_ATTESTATION_PROTOCOL_REVISION
@@ -1102,6 +1121,180 @@ mod tests {
         assert!(matches!(error, DaemonError::InvalidInput(_)));
         assert!(error.to_string().contains("expected minilm-384"));
         assert!(error.to_string().contains("received hash-384"));
+    }
+
+    #[test]
+    fn selected_native_attestation_channel_checks_complete_profile_on_the_wire() -> TestResult {
+        use crate::search::fastembed_embedder::FastEmbedder;
+
+        // These are real registered identity contracts over real sockets. No
+        // model inference or claim of native output quality is made here.
+        for (selected, served, accepted) in [
+            ("minilm-384", "minilm", true),
+            ("multilingual-minilm-384", "multilingual-minilm", true),
+            ("minilm-384", "multilingual-minilm", false),
+            ("multilingual-minilm-384", "minilm", false),
+        ] {
+            let data = tempfile::tempdir()?;
+            let socket = data.path().join("identity.sock");
+            let (authority, generation) =
+                crate::daemon::initialize_daemon_attestation_authority(data.path())?;
+            let connection = DaemonConnectionIdentityV1 {
+                schema_version: DAEMON_CONNECTION_IDENTITY_SCHEMA_V1,
+                endpoint_fingerprint: daemon_socket_endpoint_fingerprint(&socket),
+                executable_fingerprint: "22".repeat(32),
+                protocol_revision: DAEMON_ATTESTATION_PROTOCOL_REVISION.to_owned(),
+                key_id: authority.key_id().to_owned(),
+                generation,
+                embedding_identity: FastEmbedder::declared_identity_for(served)?,
+                model_category: ModelCategory::TransformerEmbedder,
+            };
+            connection.validate()?;
+            let expected = connection.clone();
+            let (stream, mut peer) = UnixStream::pair()?;
+            let client = UdsDaemonClient::new(DaemonClientConfig {
+                socket_path: socket,
+                auto_spawn: false,
+                expected_embedder_id: Some(selected.to_owned()),
+                ..Default::default()
+            });
+            *client.connection.lock() = Some(stream);
+            client.available.store(true, Ordering::SeqCst);
+            let server = std::thread::spawn(move || -> std::io::Result<()> {
+                let mut prefix = [0; 4];
+                peer.read_exact(&mut prefix)?;
+                let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+                peer.read_exact(&mut body)?;
+                let request = decode_message::<Request>(&body).map_err(std::io::Error::other)?;
+                assert!(matches!(request.payload, Request::ConnectionIdentity));
+                let response = FramedMessage::new(
+                    request.request_id,
+                    Response::ConnectionIdentity(connection),
+                );
+                peer.write_all(&encode_message(&response).map_err(std::io::Error::other)?)
+            });
+            let result = client.attestation_channel(data.path());
+            server
+                .join()
+                .map_err(|_| test_error("identity responder panicked"))??;
+            if accepted {
+                assert_eq!(result?.0, expected);
+            } else {
+                assert!(matches!(result, Err(DaemonError::UnverifiableRemoteSpace)));
+                assert!(client.connection.lock().is_none());
+                assert!(!client.available.load(Ordering::SeqCst));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn selected_native_attestation_rejects_same_model_with_a_different_numeric_producer()
+    -> TestResult {
+        use crate::search::fastembed_embedder::FastEmbedder;
+        use frankensearch::core::generation::QuantizationFormat;
+        use frankensearch::embed::model_manifest::ModelArtifactManifestV1;
+
+        let expected = FastEmbedder::declared_identity_for("minilm")?;
+        let f32 = ModelArtifactManifestV1::minilm_native_frankentorch_f32()?
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")?;
+        assert_eq!(expected.space.logical_model_id, f32.space.logical_model_id);
+        assert_eq!(expected.space.dimension, f32.space.dimension);
+        let client = UdsDaemonClient::new(DaemonClientConfig {
+            expected_embedder_id: Some("minilm-384".into()),
+            ..Default::default()
+        });
+        let mut connection = DaemonConnectionIdentityV1 {
+            schema_version: DAEMON_CONNECTION_IDENTITY_SCHEMA_V1,
+            endpoint_fingerprint: "11".repeat(32),
+            executable_fingerprint: "22".repeat(32),
+            protocol_revision: DAEMON_ATTESTATION_PROTOCOL_REVISION.to_owned(),
+            key_id: "native-profile-test".into(),
+            generation: 1,
+            embedding_identity: f32,
+            model_category: ModelCategory::TransformerEmbedder,
+        };
+        connection.validate()?;
+        assert!(matches!(
+            client.validate_attested_identity(&connection),
+            Err(DaemonError::UnverifiableRemoteSpace)
+        ));
+        connection.embedding_identity = expected;
+        client.validate_attested_identity(&connection)?;
+        let unsupported = UdsDaemonClient::new(DaemonClientConfig {
+            expected_embedder_id: Some("unregistered-profile".into()),
+            ..Default::default()
+        });
+        assert!(matches!(
+            unsupported.validate_attested_identity(&connection),
+            Err(DaemonError::UnverifiableRemoteSpace)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn validly_signed_wrong_profile_control_response_invalidates_selected_connection() -> TestResult
+    {
+        let data = tempfile::tempdir()?;
+        let (authority, generation) =
+            crate::daemon::initialize_daemon_attestation_authority(data.path())?;
+        let connection = DaemonConnectionIdentityV1 {
+            schema_version: DAEMON_CONNECTION_IDENTITY_SCHEMA_V1,
+            endpoint_fingerprint: "11".repeat(32),
+            executable_fingerprint: "22".repeat(32),
+            protocol_revision: DAEMON_ATTESTATION_PROTOCOL_REVISION.to_owned(),
+            key_id: authority.key_id().to_owned(),
+            generation,
+            embedding_identity:
+                crate::search::fastembed_embedder::FastEmbedder::declared_identity_for(
+                    "multilingual-minilm",
+                )?,
+            model_category: ModelCategory::TransformerEmbedder,
+        };
+        let challenge = DaemonChallengeV1::for_inputs(
+            "33".repeat(32),
+            DaemonOperationV1::Handshake,
+            &[],
+            &connection,
+        )?;
+        let (stream, mut peer) = UnixStream::pair()?;
+        peer.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let client = UdsDaemonClient::new(DaemonClientConfig {
+            auto_spawn: false,
+            expected_embedder_id: Some("minilm-384".into()),
+            ..Default::default()
+        });
+        *client.connection.lock() = Some(stream);
+        client.available.store(true, Ordering::SeqCst);
+        let server = std::thread::spawn(move || -> std::io::Result<()> {
+            let mut prefix = [0; 4];
+            peer.read_exact(&mut prefix)?;
+            let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+            peer.read_exact(&mut body)?;
+            let request = decode_message::<Request>(&body).map_err(std::io::Error::other)?;
+            let Request::HandshakeAttested { challenge } = request.payload else {
+                return Err(std::io::Error::other("expected attested handshake"));
+            };
+            let mut proof = DaemonEmbeddingAttestationV1::unsigned(challenge, connection, &[])
+                .map_err(std::io::Error::other)?;
+            proof
+                .sign_hmac_sha256(authority.secret())
+                .map_err(std::io::Error::other)?;
+            let response = FramedMessage::new(request.request_id, Response::Attestation(proof));
+            peer.write_all(&encode_message(&response).map_err(std::io::Error::other)?)?;
+            assert_eq!(peer.read(&mut [0])?, 0, "refused connection must close");
+            Ok(())
+        });
+        assert!(matches!(
+            client.handshake_attested(&challenge),
+            Err(DaemonError::UnverifiableRemoteSpace)
+        ));
+        server
+            .join()
+            .map_err(|_| test_error("signed responder panicked"))??;
+        assert!(client.connection.lock().is_none());
+        assert!(!client.available.load(Ordering::SeqCst));
+        Ok(())
     }
 
     #[test]
