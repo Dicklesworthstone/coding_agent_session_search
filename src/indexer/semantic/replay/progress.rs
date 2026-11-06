@@ -10,13 +10,13 @@ use crate::franken_sync::{Connection, FrankenError, SqliteValue, compat::RowExt}
 use crate::storage::sqlite::FrankenStorage;
 use anyhow::{Context, Result, ensure};
 
-struct ReadSnapshot<'a> {
+pub(super) struct ReadSnapshot<'a> {
     connection: &'a Connection,
     owned: bool,
 }
 
 impl<'a> ReadSnapshot<'a> {
-    fn begin(connection: &'a Connection) -> Result<Self> {
+    pub(super) fn begin(connection: &'a Connection) -> Result<Self> {
         let owned = !connection.as_async().in_transaction();
         if owned {
             connection
@@ -26,7 +26,7 @@ impl<'a> ReadSnapshot<'a> {
         Ok(Self { connection, owned })
     }
 
-    fn release(mut self) -> Result<()> {
+    pub(super) fn release(mut self) -> Result<()> {
         if self.owned {
             self.connection
                 .execute("ROLLBACK")

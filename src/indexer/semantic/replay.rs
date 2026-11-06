@@ -9,8 +9,8 @@
 
 use super::engine;
 use crate::franken_sync::{
-    SqliteValue,
-    compat::{ConnectionExt, ParamValue, RowExt},
+    Connection, SqliteValue,
+    compat::{ConnectionExt, OptionalExtension, ParamValue, RowExt},
 };
 use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
 use crate::model::types::{Conversation, Message};
@@ -19,6 +19,7 @@ use crate::search::tantivy::{
 };
 use crate::storage::sqlite::FrankenStorage;
 use anyhow::{Context, Result, ensure};
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::path::PathBuf;
 
 mod pages;
@@ -35,10 +36,16 @@ pub(crate) use selected::{
 
 const PARENT_PAGE_SIZE: usize = 64;
 
-struct Envelope {
-    conversation: Conversation,
-    context: engine::SemanticPacketContext,
-    provenance: ConversationPacketProvenance,
+const ENVELOPE_SQL: &str = "SELECT id, agent_id, workspace_id, external_id, title, source_path,
+            started_at, ended_at, source_id, origin_host
+     FROM conversations WHERE id = ?1";
+const ENVELOPE_AGENT_SQL: &str = "SELECT slug FROM agents WHERE id = ?1";
+const ENVELOPE_WORKSPACE_SQL: &str = "SELECT path FROM workspaces WHERE id = ?1";
+
+pub(super) struct Envelope {
+    pub(super) conversation: Conversation,
+    pub(super) context: engine::SemanticPacketContext,
+    pub(super) provenance: ConversationPacketProvenance,
 }
 
 impl Envelope {
@@ -54,66 +61,108 @@ impl Envelope {
     }
 }
 
-fn envelopes(storage: &FrankenStorage, ids: &[i64]) -> Result<Vec<Envelope>> {
-    let placeholders = (1..=ids.len())
-        .map(|n| format!("?{n}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT c.id, COALESCE(a.slug, 'unknown'), COALESCE(c.agent_id, 0),
-                c.workspace_id, w.path, c.external_id, c.title, c.source_path,
-                c.started_at, c.ended_at, c.source_id, c.origin_host
-         FROM conversations c
-         LEFT JOIN agents a ON a.id = c.agent_id
-         LEFT JOIN workspaces w ON w.id = c.workspace_id
-         WHERE c.id IN ({placeholders}) ORDER BY c.id ASC"
+fn cached_envelope_text(
+    connection: &Connection,
+    sql: &str,
+    id: Option<i64>,
+    cache: &mut BTreeMap<i64, Option<String>>,
+) -> Result<Option<String>> {
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    match cache.entry(id) {
+        Entry::Occupied(entry) => Ok(entry.get().clone()),
+        Entry::Vacant(entry) => {
+            let value = connection
+                .query_row_map(sql, &[ParamValue::from(id)], |row| row.get_typed(0))
+                .optional()?
+                .flatten();
+            Ok(entry.insert(value).clone())
+        }
+    }
+}
+
+pub(super) fn envelopes(storage: &FrankenStorage, ids: &[i64]) -> Result<Vec<Envelope>> {
+    ensure!(
+        ids.windows(2).all(|pair| pair[0] < pair[1]),
+        "canonical parents changed while loading semantic replay envelopes"
     );
-    let params = ids
-        .iter()
-        .copied()
-        .map(ParamValue::from)
-        .collect::<Vec<_>>();
-    let rows = storage
-        .raw()
-        .query_map_collect(&sql, &params, |row| {
-            let conversation_id: i64 = row.get_typed(0)?;
-            let agent_id: i64 = row.get_typed(2)?;
-            let workspace_id: Option<i64> = row.get_typed(3)?;
-            let workspace: Option<String> = row.get_typed(4)?;
-            let source_id: Option<String> = row.get_typed(10)?;
-            let origin_host: Option<String> = row.get_typed(11)?;
-            let source_id =
-                normalized_index_source_id(source_id.as_deref(), None, origin_host.as_deref());
-            let provenance = ConversationPacketProvenance {
-                origin_kind: normalized_index_origin_kind(&source_id, None),
-                origin_host: normalized_index_origin_host(origin_host.as_deref()),
-                source_id,
-            };
-            Ok(Envelope {
-                context: engine::SemanticPacketContext {
-                    conversation_id,
-                    agent_id: engine::saturating_u32_from_i64(agent_id),
-                    workspace_id: engine::saturating_u32_from_i64(workspace_id.unwrap_or(0)),
-                },
-                conversation: Conversation {
-                    id: Some(conversation_id),
-                    agent_slug: row.get_typed(1)?,
-                    workspace: workspace.map(PathBuf::from),
-                    external_id: row.get_typed(5)?,
-                    title: row.get_typed(6)?,
-                    source_path: PathBuf::from(row.get_typed::<String>(7)?),
-                    started_at: row.get_typed(8)?,
-                    ended_at: row.get_typed(9)?,
-                    approx_tokens: None,
-                    metadata_json: serde_json::Value::Null,
-                    messages: Vec::new(),
-                    source_id: provenance.source_id.clone(),
-                    origin_host: provenance.origin_host.clone(),
-                },
-                provenance,
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // FrankenSQLite's generic two-LEFT-JOIN evaluator materializes every parent
+    // before applying the ID filter. Point reads keep hydration scoped to this
+    // admitted page, including when old parents have very large metadata.
+    // The former single SELECT also observed one metadata snapshot: retain that
+    // guarantee across parent/dimension reads without releasing a caller's lease.
+    let snapshot = progress::ReadSnapshot::begin(storage.raw())?;
+    let mut agents = BTreeMap::new();
+    let mut workspaces = BTreeMap::new();
+    let mut rows = Vec::with_capacity(ids.len());
+    for &id in ids {
+        let (mut envelope, agent_id, workspace_id) = storage
+            .raw()
+            .query_row_map(ENVELOPE_SQL, &[ParamValue::from(id)], |row| {
+                let conversation_id: i64 = row.get_typed(0)?;
+                let agent_id: Option<i64> = row.get_typed(1)?;
+                let workspace_id: Option<i64> = row.get_typed(2)?;
+                let source_id: Option<String> = row.get_typed(8)?;
+                let origin_host: Option<String> = row.get_typed(9)?;
+                let source_id =
+                    normalized_index_source_id(source_id.as_deref(), None, origin_host.as_deref());
+                let provenance = ConversationPacketProvenance {
+                    origin_kind: normalized_index_origin_kind(&source_id, None),
+                    origin_host: normalized_index_origin_host(origin_host.as_deref()),
+                    source_id,
+                };
+                Ok((
+                    Envelope {
+                        context: engine::SemanticPacketContext {
+                            conversation_id,
+                            agent_id: engine::saturating_u32_from_i64(agent_id.unwrap_or(0)),
+                            workspace_id: engine::saturating_u32_from_i64(
+                                workspace_id.unwrap_or(0),
+                            ),
+                        },
+                        conversation: Conversation {
+                            id: Some(conversation_id),
+                            agent_slug: String::new(),
+                            workspace: None,
+                            external_id: row.get_typed(3)?,
+                            title: row.get_typed(4)?,
+                            source_path: PathBuf::from(row.get_typed::<String>(5)?),
+                            started_at: row.get_typed(6)?,
+                            ended_at: row.get_typed(7)?,
+                            approx_tokens: None,
+                            metadata_json: serde_json::Value::Null,
+                            messages: Vec::new(),
+                            source_id: provenance.source_id.clone(),
+                            origin_host: provenance.origin_host.clone(),
+                        },
+                        provenance,
+                    },
+                    agent_id,
+                    workspace_id,
+                ))
             })
-        })
-        .context("read canonical semantic replay envelopes")?;
+            .optional()
+            .context("read canonical semantic replay envelope")?
+            .context("canonical parents changed while loading semantic replay envelopes")?;
+        envelope.conversation.agent_slug =
+            cached_envelope_text(storage.raw(), ENVELOPE_AGENT_SQL, agent_id, &mut agents)
+                .context("read canonical semantic replay agent")?
+                .unwrap_or_else(|| "unknown".into());
+        envelope.conversation.workspace = cached_envelope_text(
+            storage.raw(),
+            ENVELOPE_WORKSPACE_SQL,
+            workspace_id,
+            &mut workspaces,
+        )
+        .context("read canonical semantic replay workspace")?
+        .map(PathBuf::from);
+        rows.push(envelope);
+    }
     ensure!(
         rows.len() == ids.len()
             && rows
@@ -122,6 +171,7 @@ fn envelopes(storage: &FrankenStorage, ids: &[i64]) -> Result<Vec<Envelope>> {
                 .all(|(row, id)| row.context.conversation_id == *id),
         "canonical parents changed while loading semantic replay envelopes"
     );
+    snapshot.release()?;
     Ok(rows)
 }
 

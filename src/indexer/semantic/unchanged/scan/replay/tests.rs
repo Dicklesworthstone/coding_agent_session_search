@@ -2,11 +2,12 @@
 //! Loader instrumentation observes actual body reads, never substitutes a DB.
 
 use super::*;
+use crate::franken_sync::compat::{ConnectionExt, ParamValue};
 use crate::indexer::semantic_progress::SemanticProgressSink;
-use crate::model::types::{Agent, AgentKind, MessageRole};
+use crate::model::types::{Agent, AgentKind, Conversation, MessageRole};
 use std::cell::Cell;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn storage(data: &Path, count: usize) -> Result<FrankenStorage> {
     let storage = FrankenStorage::open(&data.join("agent_search.db"))?;
@@ -115,6 +116,36 @@ fn lazy_replay_matches_existing_packet_replay_across_pages_and_passages() -> Res
 #[derive(Debug, thiserror::Error)]
 #[error("consumer deliberately stopped canonical replay")]
 struct Stop;
+
+#[test]
+fn envelope_snapshot_is_released_before_unchanged_proof_consumers_run() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let storage = storage(temp.path(), 2)?;
+    for borrowed in [false, true] {
+        if borrowed {
+            storage.raw().execute("BEGIN DEFERRED")?;
+        }
+        let mut delivered = 0;
+        let error = visit(
+            &storage,
+            |_| {
+                delivered += 1;
+                assert_eq!(storage.raw().as_async().in_transaction(), borrowed);
+                Err(Stop.into())
+            },
+            || Ok(()),
+        )
+        .expect_err("consumer cancellation must survive envelope snapshot cleanup");
+        assert!(error.is::<Stop>());
+        assert_eq!(delivered, 1);
+        assert_eq!(storage.raw().as_async().in_transaction(), borrowed);
+        if borrowed {
+            storage.raw().execute("ROLLBACK")?;
+        }
+    }
+    storage.close()?;
+    Ok(())
+}
 
 #[test]
 fn first_delta_stops_before_loading_other_bodies_in_the_same_page() -> Result<()> {

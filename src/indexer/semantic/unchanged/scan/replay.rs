@@ -5,97 +5,14 @@
 //! One message and engine scratch can still be large; this is not an RSS ceiling.
 
 use super::{Coverage, engine};
-use crate::franken_sync::{
-    SqliteValue,
-    compat::{ConnectionExt, ParamValue, RowExt},
-};
-use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
-use crate::model::types::{Conversation, Message};
-use crate::search::tantivy::{
-    normalized_index_origin_host, normalized_index_origin_kind, normalized_index_source_id,
-};
+use crate::franken_sync::{SqliteValue, compat::RowExt};
+use crate::indexer::semantic::replay::envelopes;
+use crate::model::conversation_packet::ConversationPacket;
+use crate::model::types::Message;
 use crate::storage::sqlite::FrankenStorage;
 use anyhow::{Context, Result, ensure};
-use std::path::PathBuf;
 
 const PAGE_SIZE: usize = 64;
-
-struct Envelope {
-    conversation: Conversation,
-    context: engine::SemanticPacketContext,
-    provenance: ConversationPacketProvenance,
-}
-
-fn envelopes(storage: &FrankenStorage, ids: &[i64]) -> Result<Vec<Envelope>> {
-    let placeholders = (1..=ids.len())
-        .map(|n| format!("?{n}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT c.id, COALESCE(a.slug, 'unknown'), COALESCE(c.agent_id, 0),
-                c.workspace_id, w.path, c.external_id, c.title, c.source_path,
-                c.started_at, c.ended_at, c.source_id, c.origin_host
-         FROM conversations c
-         LEFT JOIN agents a ON a.id = c.agent_id
-         LEFT JOIN workspaces w ON w.id = c.workspace_id
-         WHERE c.id IN ({placeholders}) ORDER BY c.id ASC"
-    );
-    let params = ids
-        .iter()
-        .copied()
-        .map(ParamValue::from)
-        .collect::<Vec<_>>();
-    let rows = storage
-        .raw()
-        .query_map_collect(&sql, &params, |row| {
-            let conversation_id: i64 = row.get_typed(0)?;
-            let agent_id: i64 = row.get_typed(2)?;
-            let workspace_id: Option<i64> = row.get_typed(3)?;
-            let workspace: Option<String> = row.get_typed(4)?;
-            let source_id: Option<String> = row.get_typed(10)?;
-            let origin_host: Option<String> = row.get_typed(11)?;
-            let source_id =
-                normalized_index_source_id(source_id.as_deref(), None, origin_host.as_deref());
-            let provenance = ConversationPacketProvenance {
-                origin_kind: normalized_index_origin_kind(&source_id, None),
-                origin_host: normalized_index_origin_host(origin_host.as_deref()),
-                source_id,
-            };
-            Ok(Envelope {
-                context: engine::SemanticPacketContext {
-                    conversation_id,
-                    agent_id: engine::saturating_u32_from_i64(agent_id),
-                    workspace_id: engine::saturating_u32_from_i64(workspace_id.unwrap_or(0)),
-                },
-                conversation: Conversation {
-                    id: Some(conversation_id),
-                    agent_slug: row.get_typed(1)?,
-                    workspace: workspace.map(PathBuf::from),
-                    external_id: row.get_typed(5)?,
-                    title: row.get_typed(6)?,
-                    source_path: PathBuf::from(row.get_typed::<String>(7)?),
-                    started_at: row.get_typed(8)?,
-                    ended_at: row.get_typed(9)?,
-                    approx_tokens: None,
-                    metadata_json: serde_json::Value::Null,
-                    messages: Vec::new(),
-                    source_id: provenance.source_id.clone(),
-                    origin_host: provenance.origin_host.clone(),
-                },
-                provenance,
-            })
-        })
-        .context("read unchanged-proof canonical envelopes")?;
-    ensure!(
-        rows.len() == ids.len()
-            && rows
-                .iter()
-                .zip(ids)
-                .all(|(row, id)| row.context.conversation_id == *id),
-        "canonical parents changed while loading unchanged-proof envelopes"
-    );
-    Ok(rows)
-}
 
 #[cfg(test)]
 fn messages(storage: &FrankenStorage, id: i64) -> Result<Vec<Message>> {

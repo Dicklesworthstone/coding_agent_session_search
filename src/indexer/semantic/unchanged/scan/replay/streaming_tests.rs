@@ -1,6 +1,6 @@
 //! Whole-packet equivalence and production replay through real canonical storage.
 use super::*;
-use crate::model::types::{Agent, AgentKind, MessageRole};
+use crate::model::types::{Agent, AgentKind, Conversation, MessageRole};
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::io;

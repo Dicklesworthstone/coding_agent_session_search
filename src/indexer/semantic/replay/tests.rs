@@ -62,6 +62,222 @@ fn signature(inputs: Vec<engine::EmbeddingInput>) -> Vec<(Option<String>, String
 struct Stop;
 
 #[test]
+fn envelope_hydration_seeks_only_admitted_parents_and_dimensions() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let storage = database(temp.path(), PARENT_PAGE_SIZE + 1, 0)?;
+    let selected = (PARENT_PAGE_SIZE + 1) as i64;
+    // Unselected historical parents can contain wide metadata and values that
+    // cannot be decoded as an envelope. They must not enter this admitted page.
+    storage.raw().execute_compat(
+        "UPDATE conversations SET source_path = X'00', metadata_json = ?1 WHERE id = 1",
+        &[ParamValue::from("old unrelated metadata ".repeat(8192))],
+    )?;
+    let rows = envelopes(&storage, &[selected])?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].context.conversation_id, selected);
+    assert_eq!(rows[0].conversation.agent_slug, "codex");
+    assert!(!storage.raw().as_async().in_transaction());
+
+    // Inspect the actual production queries against populated canonical tables.
+    // A result-only check would also accept the old join's eager full-table scan.
+    for (sql, table, id) in [
+        (ENVELOPE_SQL, "conversations", selected),
+        (ENVELOPE_AGENT_SQL, "agents", 1),
+        (ENVELOPE_WORKSPACE_SQL, "workspaces", 1),
+    ] {
+        let root: i64 = storage.raw().query_row_map(
+            "SELECT rootpage FROM sqlite_master WHERE name = ?1",
+            &[ParamValue::from(table)],
+            |row| row.get_typed(0),
+        )?;
+        let plan: Vec<(String, i64, i64)> = storage.raw().query_map_collect(
+            &format!("EXPLAIN {sql}"),
+            &[ParamValue::from(id)],
+            |row| Ok((row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+        )?;
+        let cursor = plan
+            .iter()
+            .find_map(|(op, p1, p2)| (op == "OpenRead" && *p2 == root).then_some(*p1))
+            .expect("envelope query must open its canonical table");
+        assert!(
+            plan.iter()
+                .any(|(op, p1, _)| op == "SeekRowid" && *p1 == cursor),
+            "{table} hydration must seek its admitted rowid: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|(op, p1, _)| {
+                *p1 == cursor && matches!(op.as_str(), "Rewind" | "Last" | "Next" | "Prev")
+            }),
+            "{table} hydration must not scan unrelated records: {plan:?}"
+        );
+    }
+
+    // The malformed row still fails if it is actually admitted, and the owned
+    // metadata snapshot must unwind before another query uses the connection.
+    assert!(envelopes(&storage, &[1]).is_err());
+    assert!(!storage.raw().as_async().in_transaction());
+    assert_eq!(envelopes(&storage, &[selected])?.len(), 1);
+    storage.close()?;
+    Ok(())
+}
+
+#[test]
+fn envelope_hydration_matches_left_join_nulls_and_provenance() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("legacy-envelopes.db");
+    let connection = Connection::open(path.to_string_lossy().into_owned())?;
+    // Historical/salvaged archives can retain nullable dimensions even though
+    // the current fresh schema is stricter. Keep real NULL and missing-row cases
+    // distinct, including an agent with ID zero that a NULL must not resolve to.
+    for sql in [
+        "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT)",
+        "CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT)",
+        "CREATE TABLE conversations (
+            id INTEGER PRIMARY KEY, agent_id INTEGER, workspace_id INTEGER,
+            external_id TEXT, title TEXT, source_path TEXT, started_at INTEGER,
+            ended_at INTEGER, source_id TEXT, origin_host TEXT)",
+        "INSERT INTO agents(id, slug) VALUES (0, 'zero-agent'), (1, 'codex'), (2, NULL), (3, '')",
+        "INSERT INTO workspaces(id, path) VALUES (0, '/zero'), (1, '/workspace'), (2, NULL), (3, '')",
+        "INSERT INTO conversations VALUES
+            (-5, NULL, NULL, NULL, NULL, '/null.jsonl', NULL, NULL, NULL, NULL),
+            (0, 0, 0, 'zero', 'zero title', '/zero.jsonl', -1, 0, '', ' RemoteHost '),
+            (1, 1, 1, 'remote', 'remote title', '/remote.jsonl', 1, 2, 'remote-laptop', 'FixtureHost'),
+            (2, 2, 2, 'null-dimensions', NULL, '/null-dimensions.jsonl', NULL, 2, 'local', ' '),
+            (3, 999, 999, 'missing', 'missing title', '/missing.jsonl', 3, NULL, ' ', 'MissingHost'),
+            (4, 1, NULL, 'local', NULL, '/local.jsonl', 4, 5, 'local', NULL),
+            (5, NULL, 0, 'null-agent', NULL, '/null-agent.jsonl', 5, 6, 'remote-box', 'OtherHost'),
+            (6, 3, 3, 'empty-dimensions', NULL, '/empty-dimensions.jsonl', 6, 7, 'local', ''),
+            (9223372036854775807, 1, 1, 'maximum', NULL, '/maximum.jsonl', NULL, NULL, 'remote-laptop', NULL)",
+    ] {
+        connection.execute(sql)?;
+    }
+    connection.close()?;
+    let storage = FrankenStorage::open_readonly(&path)?;
+    let ids = [-5, 0, 1, 2, 3, 4, 5, 6, i64::MAX];
+    let actual = envelopes(&storage, &ids)?;
+    let old_sql = "SELECT c.id, COALESCE(a.slug, 'unknown'), COALESCE(c.agent_id, 0),
+                          c.workspace_id, w.path, c.external_id, c.title, c.source_path,
+                          c.started_at, c.ended_at, c.source_id, c.origin_host
+                   FROM conversations c
+                   LEFT JOIN agents a ON a.id = c.agent_id
+                   LEFT JOIN workspaces w ON w.id = c.workspace_id
+                   WHERE c.id IN (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ORDER BY c.id ASC";
+    let expected = storage.raw().query_map_collect(
+        old_sql,
+        &ids.into_iter().map(ParamValue::from).collect::<Vec<_>>(),
+        |row| {
+            Ok((
+                row.get_typed::<i64>(0)?,
+                row.get_typed::<String>(1)?,
+                row.get_typed::<i64>(2)?,
+                row.get_typed::<Option<i64>>(3)?,
+                row.get_typed::<Option<String>>(4)?,
+                row.get_typed::<Option<String>>(5)?,
+                row.get_typed::<Option<String>>(6)?,
+                row.get_typed::<String>(7)?,
+                row.get_typed::<Option<i64>>(8)?,
+                row.get_typed::<Option<i64>>(9)?,
+                row.get_typed::<Option<String>>(10)?,
+                row.get_typed::<Option<String>>(11)?,
+            ))
+        },
+    )?;
+    assert_eq!(actual.len(), expected.len());
+    for (envelope, old) in actual.iter().zip(expected) {
+        let (
+            id,
+            agent_slug,
+            agent_id,
+            workspace_id,
+            workspace,
+            external_id,
+            title,
+            source_path,
+            started_at,
+            ended_at,
+            source_id,
+            origin_host,
+        ) = old;
+        let source_id =
+            normalized_index_source_id(source_id.as_deref(), None, origin_host.as_deref());
+        let provenance = ConversationPacketProvenance {
+            origin_kind: normalized_index_origin_kind(&source_id, None),
+            origin_host: normalized_index_origin_host(origin_host.as_deref()),
+            source_id,
+        };
+        let conversation = Conversation {
+            id: Some(id),
+            agent_slug,
+            workspace: workspace.map(PathBuf::from),
+            external_id,
+            title,
+            source_path: source_path.into(),
+            started_at,
+            ended_at,
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: Vec::new(),
+            source_id: provenance.source_id.clone(),
+            origin_host: provenance.origin_host.clone(),
+        };
+        assert_eq!(
+            serde_json::to_value(&envelope.conversation)?,
+            serde_json::to_value(&conversation)?,
+            "parent {id} must preserve the old LEFT JOIN envelope"
+        );
+        assert_eq!(envelope.provenance, provenance);
+        assert_eq!(envelope.context.conversation_id, id);
+        assert_eq!(
+            envelope.context.agent_id,
+            engine::saturating_u32_from_i64(agent_id)
+        );
+        assert_eq!(
+            envelope.context.workspace_id,
+            engine::saturating_u32_from_i64(workspace_id.unwrap_or(0))
+        );
+    }
+    assert_eq!(actual[0].conversation.agent_slug, "unknown");
+    assert_eq!(actual[1].conversation.agent_slug, "zero-agent");
+    assert_eq!(actual[3].conversation.agent_slug, "unknown");
+    assert_eq!(actual[4].conversation.agent_slug, "unknown");
+    assert_eq!(actual[6].conversation.agent_slug, "unknown");
+    assert_eq!(actual[7].conversation.agent_slug, "");
+    assert_eq!(actual[7].conversation.workspace, Some(PathBuf::new()));
+    assert!(!storage.raw().as_async().in_transaction());
+    storage.close()?;
+    Ok(())
+}
+
+#[test]
+fn envelope_hydration_refuses_missing_or_unordered_parents_without_ending_caller_snapshot()
+-> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let storage = database(temp.path(), 2, 0)?;
+    assert!(envelopes(&storage, &[])?.is_empty());
+    for ids in [&[2, 1][..], &[1, 1], &[1, 999]] {
+        let error = envelopes(&storage, ids)
+            .err()
+            .context("invalid parent selection must fail")?;
+        assert!(
+            error
+                .to_string()
+                .contains("canonical parents changed while loading semantic replay envelopes")
+        );
+        assert!(!storage.raw().as_async().in_transaction());
+    }
+    storage.raw().execute("BEGIN DEFERRED")?;
+    assert_eq!(envelopes(&storage, &[1, 2])?.len(), 2);
+    assert!(storage.raw().as_async().in_transaction());
+    assert!(envelopes(&storage, &[1, 999]).is_err());
+    assert!(storage.raw().as_async().in_transaction());
+    storage.raw().execute("ROLLBACK")?;
+    assert_eq!(envelopes(&storage, &[1, 2])?.len(), 2);
+    assert!(!storage.raw().as_async().in_transaction());
+    storage.close()?;
+    Ok(())
+}
+
+#[test]
 fn facade_replay_matches_incumbent_across_parent_and_message_pages() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let storage = database(temp.path(), PARENT_PAGE_SIZE + 1, 3)?;
