@@ -39,6 +39,27 @@ pub(crate) struct SemanticStorageBuildOutcome {
 const DIRECT_EMBED_MAX_INPUTS: usize = 512;
 const DIRECT_EMBED_MAX_INPUT_BYTES: usize = 1024 * 1024;
 
+/// Keep ordinary catch-up below the atomic append preparation ceiling before
+/// collecting text or running inference. The extra allowance covers document
+/// keys/entries and vector capacity slack; native append still checks actual
+/// retained capacities. A zero input allowance is valid: blank deltas can
+/// advance, while nonempty deltas take resumable reconciliation.
+pub(crate) fn semantic_delta_selection_limits(
+    dimension: usize,
+) -> Result<super::replay::SemanticDeltaSelectionLimits> {
+    let append_max_bytes = append::configured_max_bytes()?;
+    let per_input_bytes = dimension
+        .checked_mul(std::mem::size_of::<f32>())
+        .and_then(|bytes| bytes.checked_add(1024))
+        .context("semantic delta preparation allowance overflow")?;
+    let max_inputs = 32_768.min(append_max_bytes / per_input_bytes);
+    Ok(super::replay::SemanticDeltaSelectionLimits {
+        max_messages: max_inputs.saturating_mul(2).clamp(512, 65_536),
+        max_inputs,
+        max_content_bytes: append_max_bytes.min(32 * 1024 * 1024),
+    })
+}
+
 impl SemanticIndexer {
     pub fn batch_size(&self) -> usize {
         self.inner.batch_size()

@@ -102,8 +102,8 @@ use crate::storage::sqlite::{
     seed_canonical_from_best_historical_bundle,
 };
 use semantic::{
-    EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage_since,
-    semantic_doc_id_for_input, visit_packet_embedding_inputs_from_storage,
+    EmbeddingInput, SemanticIndexer, semantic_doc_id_for_input,
+    visit_packet_embedding_inputs_from_storage,
 };
 
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
@@ -22778,9 +22778,9 @@ fn reconcile_existing_semantic_delta(
     Ok(usize::try_from(outcome.embedded_docs)?)
 }
 
-/// Perform incremental semantic embedding for messages added since the last
-/// watermark. Loads the ONNX model, embeds the batch, appends to the existing
-/// FSVI index via WAL, and updates the watermark.
+/// Maintain an established semantic tier. Small certified deltas use one
+/// atomic append; larger tails and interrupted candidates use source-bound
+/// resumable reconciliation. Only complete publication advances the watermark.
 fn incremental_semantic_embed(
     embedder: &str,
     data_dir: &Path,
@@ -22795,6 +22795,18 @@ fn incremental_semantic_embed(
         let guard = storage
             .lock()
             .map_err(|error| anyhow::anyhow!("lock semantic delta selection: {error}"))?;
+        if SemanticManifest::load(data_dir)?.is_some_and(|manifest| {
+            manifest
+                .checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint.embedder_id == embedder_id)
+        }) {
+            // A large tail already owns an unpublished candidate. Resume that
+            // source-bound checkpoint before trying the same oversized append
+            // again, even though the prior serving certificate is still valid.
+            drop(guard);
+            return reconcile_existing_semantic_delta(embedder, data_dir, storage);
+        }
         let Some(mut snapshot) = semantic::SemanticBuildSnapshot::capture(&guard, &embedder_id)?
         else {
             // Unsupported proof platforms keep strict serving, but an
@@ -22812,7 +22824,22 @@ fn incremental_semantic_embed(
         let watermark = guard
             .get_last_embedded_message_id(&embedder_id)?
             .context("certified semantic prefix lost its embedder watermark")?;
-        let batch = packet_embedding_inputs_from_storage_since(&guard, watermark)?;
+        let selection_limits = semantic::semantic_delta_selection_limits(dimension)?;
+        let semantic::SemanticDeltaSelection::Complete(batch) =
+            semantic::packet_embedding_inputs_from_storage_since_bounded(
+                &guard,
+                watermark,
+                selection_limits,
+            )?
+        else {
+            tracing::info!(
+                embedder_id = %embedder_id,
+                since_message_id = watermark,
+                "semantic delta exceeds fast append selection bounds; continuing through resumable reconciliation"
+            );
+            drop(guard);
+            return reconcile_existing_semantic_delta(embedder, data_dir, storage);
+        };
         anyhow::ensure!(
             batch.raw_max_message_id.unwrap_or(watermark) <= snapshot.max_message_id,
             "semantic delta crossed its captured archive boundary"

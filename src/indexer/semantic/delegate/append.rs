@@ -35,7 +35,7 @@ fn budget_error(limit: usize) -> anyhow::Error {
     .into()
 }
 
-fn configured_max_bytes() -> Result<usize> {
+pub(super) fn configured_max_bytes() -> Result<usize> {
     match dotenvy::var(MAX_BYTES_ENV) {
         Ok(value) => {
             let bytes = value.parse::<usize>().ok().filter(|bytes| *bytes > 0);

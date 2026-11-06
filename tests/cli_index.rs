@@ -5930,3 +5930,173 @@ fn background_index_keeps_an_existing_semantic_index_current() {
     let still = semantic_top(&backfilled, "zzbgalpha").expect("backfilled vectors stay served");
     assert!(still.contains("zzbgalpha"), "top hit: {still}");
 }
+
+#[test]
+#[cfg(unix)]
+fn background_semantic_backlog_resumes_under_append_budget() {
+    use coding_agent_search::search::semantic_manifest::SemanticManifest;
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use serde_json::{Value, json};
+
+    const EMBEDDER_ID: &str = "fnv1a-384";
+    const TOTAL: usize = 67;
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::write(home.join(".env"), "").unwrap();
+    let project = home.join(".claude/projects/-semantic-backlog");
+    fs::create_dir_all(&project).unwrap();
+    let data_dir = home.join("data");
+    let content = |ordinal: usize| {
+        format!(
+            "backlogrecord{ordinal} preserves the complete parser investigation and its durable implementation notes"
+        )
+    };
+    let add_session = |ordinal: usize| {
+        let session = format!("semantic-backlog-{ordinal:03}");
+        let record = json!({
+            "type": "user", "sessionId": session,
+            "uuid": format!("backlog-message-{ordinal}"),
+            "timestamp": "2025-11-12T18:30:18.697Z",
+            "cwd": home.to_string_lossy(),
+            "message": {"role": "user", "content": content(ordinal)}
+        });
+        fs::write(
+            project.join(format!("{session}.jsonl")),
+            format!("{record}\n"),
+        )
+        .unwrap();
+    };
+    let cass = |args: &[&str], append_budget: Option<&str>| {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_SEMANTIC_EMBEDDER", "hash")
+            .env("RUST_MIN_STACK", "134217728")
+            .args(args)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .timeout(std::time::Duration::from_secs(180));
+        if let Some(budget) = append_budget {
+            cmd.env("CASS_SEMANTIC_APPEND_MAX_BYTES", budget);
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let background = ["index", "--background", "--embedder", "hash", "--json"];
+
+    add_session(0);
+    cass(
+        &[
+            "index",
+            "--full",
+            "--semantic",
+            "--embedder",
+            "hash",
+            "--json",
+        ],
+        None,
+    );
+    // First establish a certified generation. Otherwise an uncertified legacy
+    // tier already takes reconciliation and would not expose the append bug.
+    add_session(1);
+    cass(&background, None);
+    let prior = SemanticManifest::load(&data_dir).unwrap().unwrap();
+    let certificate = &prior.coverage[EMBEDDER_ID];
+    assert_eq!(certificate.doc_count, 2);
+    assert!(prior.checkpoint.is_none());
+    let artifact_path = data_dir.join(&certificate.artifact_path);
+    let parent_path = data_dir.join(&certificate.parent_path);
+    let artifact_bytes = fs::read(&artifact_path).unwrap();
+    let parent_bytes = fs::read(&parent_path).unwrap();
+
+    for ordinal in 2..TOTAL {
+        add_session(ordinal);
+    }
+    // A complete atomic append cannot fit this budget. Maintenance must admit
+    // the tail before inference and checkpoint a bounded reconciliation pass.
+    cass(&background, Some("4096"));
+    let partial = SemanticManifest::load(&data_dir).unwrap().unwrap();
+    let checkpoint = partial.checkpoint.as_ref().expect("durable backlog cursor");
+    assert_eq!(checkpoint.embedder_id, EMBEDDER_ID);
+    assert!(checkpoint.docs_embedded > certificate.doc_count);
+    assert!(checkpoint.docs_embedded < TOTAL as u64);
+    assert!(!checkpoint.cursor_exhausted);
+    assert_eq!(partial.fast_tier, prior.fast_tier);
+    assert_eq!(partial.coverage.get(EMBEDDER_ID), Some(certificate));
+    assert_eq!(fs::read(&artifact_path).unwrap(), artifact_bytes);
+    assert_eq!(fs::read(&parent_path).unwrap(), parent_bytes);
+    {
+        let storage = FrankenStorage::open_readonly(&data_dir.join("agent_search.db")).unwrap();
+        assert_eq!(storage.total_conversation_count().unwrap(), TOTAL);
+        assert_eq!(storage.total_message_count().unwrap(), TOTAL);
+        assert_eq!(
+            storage.get_last_embedded_message_id(EMBEDDER_ID).unwrap(),
+            Some(certificate.max_message_id),
+            "a partial candidate must not acknowledge the unembedded tail"
+        );
+        storage.close().unwrap();
+    }
+
+    // This fresh process must resume the saved cursor despite the old serving
+    // certificate still being valid and the append budget remaining too small.
+    cass(&background, Some("4096"));
+    let completed = SemanticManifest::load(&data_dir).unwrap().unwrap();
+    assert!(completed.checkpoint.is_none(), "backlog did not finish");
+    let complete_certificate = &completed.coverage[EMBEDDER_ID];
+    let artifact = completed.fast_tier.as_ref().unwrap();
+    assert!(artifact.ready);
+    assert!(complete_certificate.matches_artifact(artifact));
+    assert_eq!(artifact.doc_count, TOTAL as u64);
+    assert_eq!(complete_certificate.parent_count, TOTAL as u64);
+    {
+        let storage = FrankenStorage::open_readonly(&data_dir.join("agent_search.db")).unwrap();
+        let max_id = storage.max_message_id().unwrap();
+        assert_eq!(Some(complete_certificate.max_message_id), max_id);
+        assert_eq!(
+            storage.get_last_embedded_message_id(EMBEDDER_ID).unwrap(),
+            max_id
+        );
+        assert_eq!(storage.total_message_count().unwrap(), TOTAL);
+        storage.close().unwrap();
+    }
+    // Real hash inference is a deterministic lifecycle control; these checks
+    // cover old/new retrieval without making a native-model quality claim.
+    for ordinal in [0, TOTAL - 1] {
+        let query = content(ordinal);
+        let output = cass(
+            &[
+                "search",
+                &query,
+                "--mode",
+                "semantic",
+                "--no-maintenance",
+                "--json",
+                "--limit",
+                "1",
+            ],
+            None,
+        );
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["hits"][0]["content"].as_str(), Some(query.as_str()));
+    }
+}

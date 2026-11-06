@@ -18,18 +18,20 @@ pub use artifacts::{
     BackfillManifestChanged, apply_backfill_artifact_plan, plan_backfill_artifacts,
     reclaim_backfill_artifacts,
 };
-pub(crate) use delegate::SemanticStorageBuildPhase;
+pub(crate) use delegate::{SemanticStorageBuildPhase, semantic_delta_selection_limits};
 pub use engine::*;
 pub use titles::{
     TitleMaintenanceOutcome, maintain_title_index, prepare_title_scope_index,
     title_maintenance_needed,
 };
 // Explicitly select bounded message replay over the engine glob export.
-#[cfg(test)]
-pub(crate) use replay::packet_embedding_inputs_from_storage_with_progress;
 pub(crate) use replay::{
-    packet_embedding_inputs_from_storage_for_message_ids,
-    packet_embedding_inputs_from_storage_since, visit_packet_embedding_inputs_from_storage,
+    SemanticDeltaSelection, packet_embedding_inputs_from_storage_for_message_ids,
+    packet_embedding_inputs_from_storage_since_bounded, visit_packet_embedding_inputs_from_storage,
+};
+#[cfg(test)]
+pub(crate) use replay::{
+    packet_embedding_inputs_from_storage_since, packet_embedding_inputs_from_storage_with_progress,
 };
 
 use std::path::{Path, PathBuf};

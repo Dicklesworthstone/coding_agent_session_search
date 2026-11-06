@@ -2141,9 +2141,11 @@ where
 // conversation ordering plan rewinds the messages table even with an id bound,
 // making a small semantic catch-up walk historical messages. Deduplicate while
 // streaming the tail so both the scan and retained IDs follow the actual delta.
+#[cfg(test)]
 const SEMANTIC_CATCH_UP_CONVERSATION_IDS_SQL: &str =
     "SELECT conversation_id FROM messages WHERE id > ?1 ORDER BY id ASC";
 
+#[cfg(test)]
 fn semantic_catch_up_conversation_ids(
     storage: &FrankenStorage,
     since_message_id: i64,
@@ -2167,6 +2169,7 @@ fn semantic_catch_up_conversation_ids(
     Ok(conversation_ids.into_iter().collect())
 }
 
+#[cfg(test)]
 pub(crate) fn packet_embedding_inputs_from_storage_since(
     storage: &FrankenStorage,
     since_message_id: i64,

@@ -2,8 +2,9 @@
 //!
 //! Selection retains only integer coordinates. SQL bind lists and envelope
 //! pages are bounded; body reads are primary-key lookups of accepted messages.
-//! The returned inputs and selected coordinates still scale with the requested
-//! delta, and one message stays whole. This is not a process memory ceiling.
+//! Atomic catch-up bounds selected coordinates and projected text before
+//! inference; explicit refresh callers still own their requested output size.
+//! One message stays whole. This is not a process memory ceiling.
 //! Callers retain canonical snapshot/maintenance and publication authority.
 
 use super::{PARENT_PAGE_SIZE, engine, envelopes, pages};
@@ -20,6 +21,22 @@ struct MessageKey {
 }
 
 type Selection = BTreeMap<i64, Vec<MessageKey>>;
+type ProjectedSelection = (Vec<engine::EmbeddingInput>, Option<i64>);
+
+/// The fast append path must finish selection before it loads an embedder.
+/// Crossing any bound delegates the complete source boundary to resumable
+/// reconciliation; the partial selection never acknowledges a watermark.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SemanticDeltaSelectionLimits {
+    pub max_messages: usize,
+    pub max_inputs: usize,
+    pub max_content_bytes: usize,
+}
+
+pub(crate) enum SemanticDeltaSelection {
+    Complete(engine::CanonicalIncrementalEmbeddingBatch),
+    Reconcile,
+}
 
 const BODY_SQL: &str = "SELECT id, idx, role, author, created_at, content
     FROM messages WHERE id = ?1 AND conversation_id = ?2 AND idx = ?3";
@@ -29,7 +46,7 @@ const HIGH_WATER_SQL: &str = "SELECT id FROM messages
 const SINCE_SQL: &str = "SELECT id, conversation_id, idx FROM messages
     WHERE id > ?1 AND id <= ?2 ORDER BY id LIMIT ?3";
 
-fn select_since(connection: &Connection, since_message_id: i64) -> Result<Selection> {
+fn capture_high_water(connection: &Connection, since_message_id: i64) -> Result<Option<i64>> {
     let mut high_water = None;
     connection
         .query_with_params_for_each(
@@ -46,40 +63,69 @@ fn select_since(connection: &Connection, since_message_id: i64) -> Result<Select
             },
         )
         .context("capture canonical semantic catch-up high water")?;
-    let Some(high_water) = high_water else {
+    Ok(high_water)
+}
+
+#[cfg(test)]
+fn select_since(connection: &Connection, since_message_id: i64) -> Result<Selection> {
+    let Some(high_water) = capture_high_water(connection, since_message_id)? else {
         return Ok(Selection::new());
     };
     select_since_through(connection, since_message_id, high_water)
 }
 
+#[cfg(test)]
 fn select_since_through(
     connection: &Connection,
     since_message_id: i64,
     high_water: i64,
 ) -> Result<Selection> {
+    select_since_through_with_limit(connection, since_message_id, high_water, None)?
+        .context("unlimited semantic catch-up selection unexpectedly reached a limit")
+}
+
+fn select_since_through_with_limit(
+    connection: &Connection,
+    since_message_id: i64,
+    high_water: i64,
+    max_messages: Option<usize>,
+) -> Result<Option<Selection>> {
     ensure!(
         high_water > since_message_id,
         "invalid semantic catch-up range"
     );
     let mut selected = Selection::new();
     let mut cursor = since_message_id;
+    let mut selected_count = 0usize;
     while cursor < high_water {
         let mut count = 0;
+        let mut limit_reached = false;
+        let page_limit = max_messages.map_or(pages::MAX_ROWS, |maximum| {
+            pages::MAX_ROWS.min(maximum.saturating_sub(selected_count).saturating_add(1))
+        });
         connection
             .query_with_params_for_each(
                 SINCE_SQL,
                 &[
                     SqliteValue::from(cursor),
                     SqliteValue::from(high_water),
-                    SqliteValue::from(pages::MAX_ROWS as i64),
+                    SqliteValue::from(page_limit as i64),
                 ],
                 |row| {
                     let id: i64 = row.get_typed(0)?;
-                    if count >= pages::MAX_ROWS || id <= cursor || id > high_water {
+                    if count >= page_limit || id <= cursor || id > high_water {
                         return Err(FrankenError::Internal(
                             "semantic catch-up identity page did not advance within its range"
                                 .into(),
                         ));
+                    }
+                    cursor = id;
+                    count += 1;
+                    if max_messages.is_some_and(|maximum| selected_count >= maximum) {
+                        // The lookahead proves overflow without retaining or
+                        // decoding another parent's coordinates or body.
+                        limit_reached = true;
+                        return Ok(());
                     }
                     let parent: i64 = row.get_typed(1)?;
                     let idx: i64 = row.get_typed(2)?;
@@ -87,12 +133,14 @@ fn select_since_through(
                         .entry(parent)
                         .or_default()
                         .push(MessageKey { id, idx });
-                    cursor = id;
-                    count += 1;
+                    selected_count = selected_count.saturating_add(1);
                     Ok(())
                 },
             )
             .context("page canonical semantic catch-up identities")?;
+        if limit_reached {
+            return Ok(None);
+        }
         // The captured endpoint must be observed. A disappearing endpoint
         // cannot turn an incomplete scan into an acknowledged catch-up batch.
         ensure!(
@@ -100,7 +148,7 @@ fn select_since_through(
             "canonical semantic catch-up endpoint disappeared"
         );
     }
-    Ok(selected)
+    Ok(Some(selected))
 }
 
 fn selected_sql(count: usize) -> String {
@@ -175,9 +223,20 @@ fn load_message(connection: &Connection, parent: i64, key: MessageKey) -> Result
 fn project_selection(
     storage: &FrankenStorage,
     selected: Selection,
+    load: impl FnMut(i64, MessageKey) -> Result<Message>,
+) -> Result<ProjectedSelection> {
+    project_selection_with_limits(storage, selected, None, load)?
+        .context("unlimited semantic catch-up projection unexpectedly reached a limit")
+}
+
+fn project_selection_with_limits(
+    storage: &FrankenStorage,
+    selected: Selection,
+    limits: Option<SemanticDeltaSelectionLimits>,
     mut load: impl FnMut(i64, MessageKey) -> Result<Message>,
-) -> Result<(Vec<engine::EmbeddingInput>, Option<i64>)> {
+) -> Result<Option<ProjectedSelection>> {
     let mut inputs = Vec::new();
+    let mut content_bytes = 0usize;
     let mut raw_max_message_id: Option<i64> = None;
     let mut selected = selected.into_iter();
     loop {
@@ -198,12 +257,70 @@ fn project_selection(
                     message.id == Some(key.id) && message.idx == key.idx,
                     "canonical message identity changed during selected semantic replay"
                 );
+                if limits.is_some_and(|limits| message.content.len() > limits.max_content_bytes) {
+                    // One source message must stay whole, but do not expand an
+                    // oversized body into another complete packet/passages Vec.
+                    return Ok(None);
+                }
                 raw_max_message_id = Some(raw_max_message_id.map_or(key.id, |id| id.max(key.id)));
-                inputs.extend(envelope.project(message)?);
+                let projected = envelope.project(message)?;
+                let projected_bytes = projected.iter().fold(0usize, |bytes, input| {
+                    bytes.saturating_add(input.content.capacity())
+                });
+                let next_bytes = content_bytes.saturating_add(projected_bytes);
+                if limits.is_some_and(|limits| {
+                    inputs.len().saturating_add(projected.len()) > limits.max_inputs
+                        || next_bytes > limits.max_content_bytes
+                }) {
+                    return Ok(None);
+                }
+                content_bytes = next_bytes;
+                inputs.extend(projected);
             }
         }
     }
-    Ok((inputs, raw_max_message_id))
+    Ok(Some((inputs, raw_max_message_id)))
+}
+
+/// Admit only a complete small delta for atomic append. Unlike the legacy
+/// comparison API, this resource boundary cannot be disabled by the replay
+/// compatibility environment switch. Large tails use the existing durable
+/// backfill checkpoint instead of allocating/embedding them before refusal.
+pub(crate) fn packet_embedding_inputs_from_storage_since_bounded(
+    storage: &FrankenStorage,
+    since_message_id: i64,
+    limits: SemanticDeltaSelectionLimits,
+) -> Result<SemanticDeltaSelection> {
+    let selected = match capture_high_water(storage.raw(), since_message_id)? {
+        Some(high_water) => {
+            let Some(selected) = select_since_through_with_limit(
+                storage.raw(),
+                since_message_id,
+                high_water,
+                Some(limits.max_messages),
+            )?
+            else {
+                return Ok(SemanticDeltaSelection::Reconcile);
+            };
+            selected
+        }
+        None => Selection::new(),
+    };
+    let conversations_in_batch = u64::try_from(selected.len()).unwrap_or(u64::MAX);
+    let Some((inputs, raw_max_message_id)) =
+        project_selection_with_limits(storage, selected, Some(limits), |parent, key| {
+            load_message(storage.raw(), parent, key)
+        })?
+    else {
+        return Ok(SemanticDeltaSelection::Reconcile);
+    };
+    Ok(SemanticDeltaSelection::Complete(
+        engine::CanonicalIncrementalEmbeddingBatch {
+            inputs,
+            conversations_in_batch,
+            raw_max_message_id,
+        },
+    ))
 }
 
 /// Preserve the intersection of explicit parent/message scopes and canonical
@@ -237,6 +354,7 @@ pub(crate) fn packet_embedding_inputs_from_storage_for_message_ids(
 /// snapshot lease: callers still serialize or snapshot canonical mutations.
 /// Raw progress includes blank/non-embeddable messages, while emitted inputs
 /// keep the existing canonical parent/(idx,id)/passage order.
+#[cfg(test)]
 pub(crate) fn packet_embedding_inputs_from_storage_since(
     storage: &FrankenStorage,
     since_message_id: i64,
@@ -259,6 +377,8 @@ pub(crate) fn packet_embedding_inputs_from_storage_since(
     })
 }
 
+#[cfg(test)]
+mod bounded_tests;
 #[cfg(test)]
 mod since_tests;
 #[cfg(test)]

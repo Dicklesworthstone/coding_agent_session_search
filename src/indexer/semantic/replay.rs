@@ -29,9 +29,12 @@ mod selected;
 #[cfg(test)]
 pub(crate) use progress::packet_embedding_inputs_from_storage_with_progress;
 pub(super) use progress::visit_packet_embedding_inputs_from_storage_with_progress;
+#[cfg(test)]
+pub(crate) use selected::packet_embedding_inputs_from_storage_since;
 pub(crate) use selected::{
+    SemanticDeltaSelection, SemanticDeltaSelectionLimits,
     packet_embedding_inputs_from_storage_for_message_ids,
-    packet_embedding_inputs_from_storage_since,
+    packet_embedding_inputs_from_storage_since_bounded,
 };
 
 const PARENT_PAGE_SIZE: usize = 64;
