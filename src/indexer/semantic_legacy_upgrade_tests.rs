@@ -348,3 +348,127 @@ fn gh458_background_resumes_unready_legacy_checkpoint_without_a_watermark() -> R
     }
     Ok(())
 }
+
+#[test]
+#[serial_test::serial]
+fn gh540_title_edit_then_body_append_refreshes_parent_proof_and_reuses_vectors() -> Result<()> {
+    let mut fixture = LegacyTier::new()?;
+    let mut shelley = Conversation {
+        id: None,
+        agent_slug: "shelley".into(),
+        workspace: None,
+        external_id: Some("title-edit-before-body-append".into()),
+        title: Some("Conversation title before edit".into()),
+        source_path: fixture.data_dir().join("shelley-source.db"),
+        started_at: Some(2000),
+        ended_at: None,
+        approx_tokens: None,
+        metadata_json: serde_json::json!({
+            "source": "shelley",
+            "shelley": {"archived": false}
+        }),
+        messages: vec![Message {
+            id: None,
+            idx: 0,
+            role: MessageRole::User,
+            author: None,
+            created_at: Some(2000),
+            content: "Preserve this original body vector when the conversation title changes."
+                .into(),
+            extra_json: serde_json::Value::Null,
+            snippets: Vec::new(),
+        }],
+        source_id: LOCAL_SOURCE_ID.to_owned(),
+        origin_host: None,
+    };
+    let (shelley_agent, shelley_conversation) = {
+        let storage = fixture.archive()?;
+        let agent = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "shelley".into(),
+            name: "Shelley".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let inserted = storage.insert_conversation_tree(agent, None, &shelley)?;
+        (agent, inserted.conversation_id)
+    };
+
+    // Establish a real certified base before editing a parent. The legacy
+    // vector is reused and only the newly inserted Shelley body is embedded.
+    assert_eq!(
+        incremental_semantic_embed(REQUESTED_EMBEDDER, fixture.data_dir(), &fixture.storage)?,
+        1
+    );
+    let original = fixture.assert_complete_generation(2)?;
+    let certificate = &original.coverage[EMBEDDER_ID];
+    let boundary = crate::storage::sqlite::SemanticArchiveState {
+        archive_id: certificate.archive_id.clone(),
+        mutation_seq: certificate.mutation_seq,
+    };
+    let retained = read_vectors(
+        &fixture.data_dir().join(
+            &original
+                .fast_tier
+                .as_ref()
+                .context("original tier")?
+                .index_path,
+        ),
+    )?;
+
+    shelley.title = Some("Conversation title after edit".into());
+    shelley.messages.clear();
+    {
+        let storage = fixture.archive()?;
+        let inserted = storage.insert_conversation_tree(shelley_agent, None, &shelley)?;
+        assert_eq!(inserted.conversation_id, shelley_conversation);
+        assert_eq!(storage.fetch_messages(shelley_conversation)?.len(), 1);
+        assert_eq!(
+            storage
+                .list_conversations(10, 0)?
+                .into_iter()
+                .find(|conversation| conversation.id == Some(shelley_conversation))
+                .and_then(|conversation| conversation.title),
+            shelley.title
+        );
+        assert_eq!(
+            storage.get_last_embedded_message_id(EMBEDDER_ID)?,
+            Some(certificate.max_message_id),
+            "a title edit must retain the body embedding watermark"
+        );
+        assert!(
+            storage.semantic_invalidations_after(&boundary)?,
+            "the canonical parent proof includes the title and must be refreshed"
+        );
+        let mut snapshot = semantic::SemanticBuildSnapshot::capture(&storage, EMBEDDER_ID)?
+            .context("Unix canonical coverage snapshot")?;
+        assert!(
+            !snapshot.admit_incremental_base(&storage, fixture.data_dir(), EMBEDDER_ID, 384)?,
+            "the old parent prefix must not be admitted after a title edit"
+        );
+    }
+
+    // Do not reconcile the title edit first: append a new body and take the
+    // actual maintenance entry point with the changed parent still pending.
+    fixture.append_conversation()?;
+    assert_eq!(
+        incremental_semantic_embed(REQUESTED_EMBEDDER, fixture.data_dir(), &fixture.storage)?,
+        1,
+        "refreshing title provenance must only embed the newly appended body"
+    );
+    let complete = fixture.assert_complete_generation(3)?;
+    assert!(complete.coverage[EMBEDDER_ID].mutation_seq > certificate.mutation_seq);
+    let vectors = read_vectors(
+        &fixture.data_dir().join(
+            &complete
+                .fast_tier
+                .as_ref()
+                .context("completed tier")?
+                .index_path,
+        ),
+    )?;
+    for (identity, vector) in retained {
+        assert_eq!(vectors.get(&identity), Some(&vector));
+    }
+    Ok(())
+}

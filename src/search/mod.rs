@@ -75,6 +75,7 @@ pub(crate) mod storage_integrity;
 pub(crate) mod storage_salvage;
 pub mod tantivy;
 pub mod title_fusion;
+pub mod title_index;
 pub mod trust_correlation;
 pub mod trust_scoring;
 pub mod two_tier_search;

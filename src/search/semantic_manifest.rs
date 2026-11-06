@@ -4852,7 +4852,7 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> std::io::Resul
 }
 
 #[cfg(not(windows))]
-fn persist_named_temp(
+pub(crate) fn persist_named_temp(
     temp: tempfile::NamedTempFile,
     final_path: &Path,
     replace_existing: bool,
@@ -4866,7 +4866,7 @@ fn persist_named_temp(
 }
 
 #[cfg(windows)]
-fn persist_named_temp(
+pub(crate) fn persist_named_temp(
     temp: tempfile::NamedTempFile,
     final_path: &Path,
     replace_existing: bool,
@@ -4965,7 +4965,7 @@ fn sync_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };

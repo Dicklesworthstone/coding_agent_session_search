@@ -8,7 +8,7 @@ use crate::franken_sync::{
     SqliteValue,
     compat::{ConnectionExt, ParamValue, RowExt},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use frankensearch::index::{
     HNSW_DEFAULT_EF_CONSTRUCTION as FS_HNSW_DEFAULT_EF_CONSTRUCTION,
     HNSW_DEFAULT_M as FS_HNSW_DEFAULT_M, HnswConfig as FsHnswConfig, HnswIndex as FsHnswIndex,
@@ -2638,6 +2638,41 @@ impl SemanticIndexer {
 
     pub fn embedder_dimension(&self) -> usize {
         self.embedder.dimension()
+    }
+
+    /// Embed the separately versioned, already bounded title representation.
+    /// Titles never enter message passage splitting or acquire message IDs.
+    pub(crate) fn embed_title_texts(&self, titles: &[&str]) -> Result<Vec<Vec<f32>>> {
+        use crate::search::title_index::{TITLE_MAX_INPUT_CHARS, title_model_revision};
+
+        ensure!(
+            title_model_revision(self.embedder_id()).is_some(),
+            "independent title indexing requires a native or hash embedder"
+        );
+        let mut vectors = Vec::with_capacity(titles.len());
+        for batch in titles.chunks(self.batch_size) {
+            self.check_external_cancelled()?;
+            ensure!(
+                batch.iter().all(|text| !text.is_empty()
+                    && text.chars().take(TITLE_MAX_INPUT_CHARS + 1).count()
+                        <= TITLE_MAX_INPUT_CHARS),
+                "title embedding input violates the bounded representation"
+            );
+            let embedded = self.embedder.embed_batch_sync(batch)?;
+            ensure!(
+                embedded.len() == batch.len(),
+                "title embedding count mismatch"
+            );
+            for vector in &embedded {
+                ensure!(
+                    vector.len() == self.embedder_dimension()
+                        && vector.iter().all(|value| value.is_finite()),
+                    "invalid title embedding dimension or values"
+                );
+            }
+            vectors.extend(embedded);
+        }
+        Ok(vectors)
     }
 
     fn vector_space_revision(&self) -> Result<&'static str> {

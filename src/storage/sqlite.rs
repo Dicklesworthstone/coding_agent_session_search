@@ -8692,6 +8692,10 @@ fn franken_reconcile_shelley_metadata(
             fparams![workspace_id, conv.title.as_deref(), json.as_deref(), binary.as_deref(), conversation_id],
         )?;
         if workspace_changed || title_changed {
+            // Canonical parent proofs include the displayed title. Refresh
+            // their authority on a title edit while the independent title
+            // channel re-embeds only changed title text. Body reconciliation
+            // can reuse unchanged message vectors.
             record_semantic_conversation_changes(tx, &[conversation_id], true)?;
         }
         if workspace_changed {
@@ -40437,6 +40441,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             conv.metadata_json = serde_json::json!({"source":"shelley","shelley":{"archived":true,"tags":["reviewed"]}});
             let mut generation = None;
             for step in 0..5 {
+                let boundary = storage.semantic_archive_state().unwrap().unwrap();
                 if step == 1 {
                     conv.title = Some("new title".into());
                 }
@@ -40468,6 +40473,26 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 assert_eq!(saved.metadata_json["cass"]["retained"], true);
                 assert_eq!(saved.metadata_json["shelley"]["archived"], true);
                 assert_eq!(saved.title, conv.title);
+                let changes = storage
+                    .semantic_conversation_changes_since(&boundary)
+                    .unwrap()
+                    .unwrap();
+                // ubs:ignore[rust.panic.assert-macros] -- Metadata edits must remain incrementally discoverable.
+                assert!(changes.complete);
+                // ubs:ignore[rust.panic.assert-macros] -- Only searchable metadata changes advance the title maintenance cursor.
+                assert_eq!(
+                    changes.conversation_ids,
+                    if step == 1 || step == 2 {
+                        vec![original.conversation_id]
+                    } else {
+                        Vec::new()
+                    }
+                );
+                // ubs:ignore[rust.panic.assert-macros] -- Both changes revoke stale parent proofs; title edits still reuse unchanged body embeddings.
+                assert_eq!(
+                    storage.semantic_invalidations_after(&boundary).unwrap(),
+                    step == 1 || step == 2
+                );
                 for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
                     let current = storage.semantic_identity_rebuild_generation(tier).unwrap();
                     if step < 2 {

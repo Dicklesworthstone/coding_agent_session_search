@@ -9,6 +9,7 @@ mod artifacts;
 mod delegate;
 mod engine;
 mod replay;
+mod titles;
 #[cfg(unix)]
 mod unchanged;
 
@@ -19,6 +20,10 @@ pub use artifacts::{
 };
 pub(crate) use delegate::SemanticStorageBuildPhase;
 pub use engine::*;
+pub use titles::{
+    TitleMaintenanceOutcome, maintain_title_index, prepare_title_scope_index,
+    title_maintenance_needed,
+};
 // Explicitly select bounded message replay over the engine glob export.
 #[cfg(test)]
 pub(crate) use replay::packet_embedding_inputs_from_storage_with_progress;
