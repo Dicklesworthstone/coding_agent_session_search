@@ -240,13 +240,23 @@ impl DescriptorWitness {
                 // have changed mount namespaces since capture. Re-read procfs
                 // authority instead of following a formerly local descriptor.
                 let mount = descriptor_mount(process_path, &observed, &mut None);
-                match descriptor_identity(descriptor, &observed, mount) {
-                    Ok(current) if current == identity => DescriptorState::Open,
-                    Ok(_) => DescriptorState::Closed,
+                let current = match descriptor_identity(descriptor, &observed, mount) {
+                    Ok(current) => current,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        DescriptorState::Closed
+                        return DescriptorState::Closed;
                     }
-                    Err(_) => DescriptorState::Uncertain,
+                    Err(_) => return DescriptorState::Uncertain,
+                };
+                // Never combine an old writer's access flags with a reused
+                // descriptor's identity. Changed evidence cannot clear a
+                // cached positive until a complete census finds its successor.
+                if read_descriptor_info(info).ok() != Some(observed) {
+                    return DescriptorState::Uncertain;
+                }
+                if current == identity {
+                    DescriptorState::Open
+                } else {
+                    DescriptorState::Closed
                 }
             }
         }
@@ -261,7 +271,7 @@ fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DescriptorInfo {
     writable: bool,
     mount_id: Option<u64>,
@@ -609,6 +619,23 @@ fn collect_writers_in(
                 }
             };
             if !session_named && !known_writers.contains_key(&identity) {
+                continue;
+            }
+            let unchanged = match read_descriptor_info(&info) {
+                Ok(after) if after == observed => Ok(()),
+                Ok(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "descriptor changed during writer census",
+                )),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = unchanged {
+                census.observe_error(
+                    error,
+                    process_id,
+                    Some(descriptor.file_name()),
+                    Inspection::Identity,
+                );
                 continue;
             }
             census

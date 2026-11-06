@@ -508,6 +508,56 @@ mod linux {
     }
 
     #[test]
+    fn census_rejects_access_or_identity_changes_during_inspection() -> io::Result<()> {
+        fn change_fdinfo_after_admission(path: &Path) -> bool {
+            if !session_source(path) {
+                return false;
+            }
+            let root = path.parent().unwrap();
+            fs::write(
+                root.join("424242/fdinfo/7"),
+                fs::read(root.join("next-fdinfo")).unwrap(),
+            )
+            .unwrap();
+            true
+        }
+
+        for replacement in [
+            "flags:\t02100000\nmnt_id:\t412\nino:\t987654321\n",
+            "flags:\t02100001\nmnt_id:\t412\nino:\t987654322\n",
+        ] {
+            let fixture = Fixture::new()?;
+            remote_process(&fixture, "nfs4")?;
+            let original = collect_writers_in(&fixture.root, session_source, &HashMap::new());
+            let identity = (61, 987_654_321);
+            assert!(original.writers.contains_key(&identity));
+            fs::write(fixture.root.join("next-fdinfo"), replacement)?;
+            // The admission predicate is reached after the first real fdinfo
+            // read. Mutating the fixture here deterministically recreates a
+            // close/reopen race between access and identity observations.
+            let fresh = collect_writers_in(
+                &fixture.root,
+                change_fdinfo_after_admission,
+                &original.writers,
+            );
+            assert!(fresh.writers.is_empty());
+            assert!(fresh.followed.is_empty());
+            assert!(fresh.visibility_gaps.iter().any(|gap| {
+                gap.inspection == Inspection::Identity
+                    && gap.error_kind == io::ErrorKind::WouldBlock
+            }));
+            let mut state = ProbeState {
+                census: original,
+                ..ProbeState::default()
+            };
+            state.apply_refresh(fresh);
+            assert!(state.refresh_blocked);
+            assert!(state.census.writers.contains_key(&identity));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn mount_device_encoding_agrees_with_live_procfs_file_identity() -> io::Result<()> {
         use std::os::fd::AsRawFd;
 
