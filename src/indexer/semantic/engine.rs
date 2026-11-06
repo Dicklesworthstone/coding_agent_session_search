@@ -2137,25 +2137,41 @@ where
     (inputs, raw_max_message_id)
 }
 
-pub(crate) fn packet_embedding_inputs_from_storage_since(
+// Keep discovery in message primary-key order. FrankenSQLite's DISTINCT +
+// conversation ordering plan rewinds the messages table even with an id bound,
+// making a small semantic catch-up walk historical messages. Deduplicate while
+// streaming the tail so both the scan and retained IDs follow the actual delta.
+const SEMANTIC_CATCH_UP_CONVERSATION_IDS_SQL: &str =
+    "SELECT conversation_id FROM messages WHERE id > ?1 ORDER BY id ASC";
+
+fn semantic_catch_up_conversation_ids(
     storage: &FrankenStorage,
     since_message_id: i64,
-) -> Result<CanonicalIncrementalEmbeddingBatch> {
-    let conversation_ids: Vec<i64> = storage
+) -> Result<Vec<i64>> {
+    let mut conversation_ids = BTreeSet::new();
+    storage
         .raw()
-        .query_map_collect(
-            "SELECT DISTINCT m.conversation_id
-             FROM messages m
-             WHERE m.id > ?1
-             ORDER BY m.conversation_id ASC",
-            &[ParamValue::from(since_message_id)],
-            |row| row.get_typed(0),
+        .query_with_params_for_each(
+            SEMANTIC_CATCH_UP_CONVERSATION_IDS_SQL,
+            &[SqliteValue::Integer(since_message_id)],
+            |row| {
+                conversation_ids.insert(row.get_typed::<i64>(0)?);
+                Ok(())
+            },
         )
         .with_context(|| {
             format!(
                 "fetching canonical semantic catch-up conversation ids after message {since_message_id}"
             )
         })?;
+    Ok(conversation_ids.into_iter().collect())
+}
+
+pub(crate) fn packet_embedding_inputs_from_storage_since(
+    storage: &FrankenStorage,
+    since_message_id: i64,
+) -> Result<CanonicalIncrementalEmbeddingBatch> {
+    let conversation_ids = semantic_catch_up_conversation_ids(storage, since_message_id)?;
 
     if conversation_ids.is_empty() {
         return Ok(CanonicalIncrementalEmbeddingBatch {
@@ -8762,6 +8778,164 @@ mod tests {
                 .all(|input| input.content.contains("cap-first"))
         );
         assert_eq!(batch.total_conversations, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_catch_up_conversation_discovery_seeks_after_watermark() -> Result<()> {
+        let temp = tempdir()?;
+        let storage = FrankenStorage::open(&temp.path().join("semantic-catch-up.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.raw().execute("PRAGMA foreign_keys = OFF")?;
+        storage.raw().execute(&format!(
+            "INSERT INTO conversations(id, agent_id, source_id, external_id, source_path)
+             VALUES (10, {agent_id}, 'local', 'delta-first', '/tmp/delta-first.jsonl'),
+                    (20, {agent_id}, 'local', 'delta-second', '/tmp/delta-second.jsonl'),
+                    (30, {agent_id}, 'local', 'history-only', '/tmp/history-only.jsonl')"
+        ))?;
+        storage.raw().execute(
+            "INSERT INTO messages(id, conversation_id, idx, role, content) VALUES
+             (1, 30, 0, 'user', 'historical conversation'),
+             (1000, 10, 0, 'user', 'at the watermark'),
+             (1001, 20, 0, 'user', 'first appended prompt'),
+             (1003, 10, 1, 'assistant', 'appended assistant answer'),
+             (1004, 20, 1, 'tool', 'appended tool evidence'),
+             (1005, 20, 2, 'system', ''),
+             (1007, 999, 0, 'user', 'orphan must not become semantic evidence')",
+        )?;
+
+        let watermark = 1000_i64;
+        let previous_sql = "SELECT DISTINCT m.conversation_id FROM messages m
+                            WHERE m.id > ?1 ORDER BY m.conversation_id ASC";
+        let previous_ids: Vec<i64> = storage.raw().query_map_collect(
+            previous_sql,
+            &[ParamValue::from(watermark)],
+            |row| row.get_typed(0),
+        )?;
+        let selected = semantic_catch_up_conversation_ids(&storage, watermark)?;
+        assert_eq!(selected, vec![10, 20, 999]);
+        assert_eq!(
+            selected, previous_ids,
+            "discovery preserves ordered unique IDs"
+        );
+
+        let explain = |sql: &str| -> Result<Vec<(String, i64, i64)>> {
+            Ok(storage.raw().query_map_collect(
+                &format!("EXPLAIN {sql}"),
+                &[ParamValue::from(watermark)],
+                |row| Ok((row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+            )?)
+        };
+        let rootpage: i64 = storage.raw().query_row_map(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'messages'",
+            &[],
+            |row| row.get_typed(0),
+        )?;
+        let message_cursor = |opcodes: &[(String, i64, i64)]| {
+            opcodes
+                .iter()
+                .find_map(|(op, p1, p2)| (op == "OpenRead" && *p2 == rootpage).then_some(*p1))
+                .expect("discovery must open the canonical messages table")
+        };
+        let previous_plan = explain(previous_sql)?;
+        let previous_cursor = message_cursor(&previous_plan);
+        assert!(
+            previous_plan
+                .iter()
+                .any(|(op, p1, _)| op == "Rewind" && *p1 == previous_cursor),
+            "negative control must demonstrate the old historical scan: {previous_plan:?}"
+        );
+
+        let plan = explain(SEMANTIC_CATCH_UP_CONVERSATION_IDS_SQL)?;
+        let cursor = message_cursor(&plan);
+        assert!(
+            plan.iter()
+                .any(|(op, p1, _)| op == "SeekGT" && *p1 == cursor),
+            "discovery must seek strictly past the watermark: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|(op, p1, _)| matches!(op.as_str(), "Rewind" | "Last") && *p1 == cursor),
+            "discovery must not traverse historical messages: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|(op, _, _)| matches!(
+                op.as_str(),
+                "SorterOpen" | "OpenEphemeral" | "OpenAutoindex"
+            )),
+            "discovery must not materialize a SQL sort or DISTINCT table: {plan:?}"
+        );
+
+        let batch = packet_embedding_inputs_from_storage_since(&storage, watermark)?;
+        // Discovery counts touched IDs as before; hydration excludes the orphan
+        // and semantic projection excludes empty content, but retains its cursor.
+        assert_eq!(batch.conversations_in_batch, 3);
+        assert_eq!(batch.raw_max_message_id, Some(1005));
+        assert_eq!(
+            batch
+                .inputs
+                .iter()
+                .map(|input| (input.message_id, input.chunk_idx))
+                .collect::<Vec<_>>(),
+            vec![(1003, 0), (1001, 0), (1004, 0)]
+        );
+        assert_eq!(
+            batch
+                .inputs
+                .iter()
+                .map(|input| (input.content.as_str(), input.role))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "appended assistant answer",
+                    role_code_from_str("assistant").unwrap()
+                ),
+                ("first appended prompt", role_code_from_str("user").unwrap()),
+                (
+                    "appended tool evidence",
+                    role_code_from_str("tool").unwrap()
+                ),
+            ]
+        );
+        assert!(
+            batch
+                .inputs
+                .iter()
+                .all(|input| input.agent_id == saturating_u32_from_i64(agent_id)
+                    && input.source_id == crc32fast::hash(b"local"))
+        );
+        let empty = packet_embedding_inputs_from_storage_since(&storage, 1007)?;
+        assert!(empty.inputs.is_empty());
+        assert_eq!(empty.conversations_in_batch, 0);
+        assert_eq!(empty.raw_max_message_id, None);
+
+        storage.raw().execute_with_params(
+            "INSERT INTO messages(id, conversation_id, idx, role, content)
+             VALUES (?1, 20, 3, 'user', 'last representable message')",
+            &[SqliteValue::Integer(i64::MAX)],
+        )?;
+        assert_eq!(
+            semantic_catch_up_conversation_ids(&storage, i64::MAX - 1)?,
+            vec![20]
+        );
+        assert!(semantic_catch_up_conversation_ids(&storage, i64::MAX)?.is_empty());
+        let last = packet_embedding_inputs_from_storage_since(&storage, i64::MAX - 1)?;
+        assert_eq!(last.conversations_in_batch, 1);
+        assert_eq!(last.raw_max_message_id, Some(i64::MAX));
+        assert_eq!(last.inputs.len(), 1);
+        assert_eq!(last.inputs[0].message_id, i64::MAX as u64);
+        assert_eq!(last.inputs[0].content, "last representable message");
+        let past_last = packet_embedding_inputs_from_storage_since(&storage, i64::MAX)?;
+        assert!(past_last.inputs.is_empty());
+        assert_eq!(past_last.conversations_in_batch, 0);
+        assert_eq!(past_last.raw_max_message_id, None);
         Ok(())
     }
 
