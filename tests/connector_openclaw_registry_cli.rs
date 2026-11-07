@@ -23,8 +23,9 @@ mod registry_and_cli {
     use coding_agent_search::storage::sqlite::FrankenStorage;
     use serde::Deserialize;
     use serde_json::{Value, json};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -473,7 +474,11 @@ mod registry_and_cli {
     }
 
     fn watch_once(home: &Path, data: &Path, paths: &[&Path]) {
-        let mut index = assert_cmd::Command::from_std(command(home, data));
+        watch_once_command(command(home, data), paths);
+    }
+
+    fn watch_once_command(index_command: Command, paths: &[&Path]) {
+        let mut index = assert_cmd::Command::from_std(index_command);
         index.args(["index", "--watch-once"]);
         for path in paths {
             index.arg(path);
@@ -483,6 +488,251 @@ mod registry_and_cli {
             .timeout(Duration::from_secs(120))
             .assert()
             .success();
+    }
+
+    fn raw_manifest_ids(data: &Path) -> Result<BTreeMap<PathBuf, BTreeSet<String>>> {
+        #[derive(Deserialize)]
+        struct Manifest {
+            manifest_id: String,
+            provider: String,
+            source_id: String,
+            original_path: PathBuf,
+        }
+        let directory = data.join("raw-mirror/v1/manifests");
+        let mut ids: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+        for entry in fs::read_dir(&directory)
+            .with_context(|| format!("read raw manifests in {}", directory.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            ensure!(
+                entry.file_type()?.is_file()
+                    && path.extension().is_some_and(|extension| extension == "json"),
+                "unexpected raw manifest entry: {}",
+                path.display()
+            );
+            let manifest: Manifest = serde_json::from_slice(&fs::read(&path)?)
+                .with_context(|| format!("parse raw manifest {}", path.display()))?;
+            ensure!(
+                path.file_stem()
+                    .is_some_and(|stem| stem == manifest.manifest_id.as_str()),
+                "manifest filename must match its full ID: {}",
+                path.display()
+            );
+            assert_eq!(manifest.provider, "openclaw");
+            assert_eq!(manifest.source_id, "local");
+            ensure!(
+                ids.entry(manifest.original_path)
+                    .or_default()
+                    .insert(manifest.manifest_id),
+                "duplicate raw manifest ID"
+            );
+        }
+        Ok(ids)
+    }
+
+    #[test]
+    fn watch_once_jsonl_isolates_sibling_canonical_search_and_raw_history() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        // The default agent uses "openclaw" for both preparse and postparse
+        // capture, so each content revision has exactly one manifest ID.
+        let sessions = home.path().join(".openclaw/agents/openclaw/sessions");
+        fs::create_dir_all(&sessions)?;
+        let selected = sessions.join("selected-a.jsonl");
+        let sibling = sessions.join("sibling-b.jsonl");
+        for (path, id, needle) in [
+            (&selected, "selected-a", "jsonlselectedseedneedle"),
+            (&sibling, "sibling-b", "jsonlsiblingseedneedle"),
+        ] {
+            fs::write(
+                path,
+                format!(
+                    "{}\n{}\n",
+                    json!({"type": "session", "id": id, "cwd": "/work/jsonl-isolation", "timestamp": AT}),
+                    json!({
+                        "type": "message", "timestamp": AT + 1_000,
+                        "message": {
+                            "role": "user",
+                            "content": format!("Historical OpenClaw JSONL transcript\n{needle}")
+                        }
+                    }),
+                ),
+            )?;
+        }
+        let selected_path = dunce::canonicalize(&selected)?;
+        let sibling_path = dunce::canonicalize(&sibling)?;
+        let selected_before = bundle(&selected)?;
+        let sibling_before = bundle(&sibling)?;
+        let sources = connector().discover_source_files(&context(home.path(), &selected))?;
+        assert_eq!(sources.len(), 1, "direct discovery must select only A");
+        assert_eq!(dunce::canonicalize(&sources[0].source_path)?, selected_path);
+        assert_eq!(sources[0].role, DiscoveredSourceRole::PrimarySessionLog);
+        assert_eq!(bundle(&selected)?, selected_before);
+        assert_eq!(bundle(&sibling)?, sibling_before);
+
+        let data = home.path().join("cass-data");
+        let refresh = |paths: &[&Path]| {
+            let mut index_command = command(home.path(), &data);
+            // Tiny fixture capture must not be paused by the production
+            // 2 GiB raw-mirror reserve on a space-constrained test runner.
+            index_command.env("CASS_RAW_MIRROR_MIN_FREE_BYTES", "0");
+            watch_once_command(index_command, paths);
+        };
+        refresh(&[selected.as_path()]);
+        let selected_rows = canonical_messages(&data, &selected)?;
+        assert_eq!(selected_rows.len(), 1);
+        assert_eq!(selected_rows[0].created_at, Some(AT + 1_000));
+        let selected_hit = native_search_message(
+            home.path(),
+            &data,
+            &selected,
+            "jsonlselectedseedneedle",
+            &selected_rows[0],
+        )?;
+        assert!(canonical_messages(&data, &sibling)?.is_empty());
+        assert!(search_hits(home.path(), &data, "jsonlsiblingseedneedle")?.is_empty());
+        let selected_manifests = raw_manifest_ids(&data)?;
+        assert_eq!(selected_manifests.len(), 1, "only A may be captured");
+        let selected_ids = selected_manifests
+            .get(&selected_path)
+            .context("selected transcript manifest")?;
+        assert_eq!(selected_ids.len(), 1);
+        assert_eq!(bundle(&selected)?, selected_before);
+        assert_eq!(bundle(&sibling)?, sibling_before);
+
+        refresh(&[selected.as_path()]);
+        assert_eq!(canonical_messages(&data, &selected)?, selected_rows);
+        assert_eq!(
+            single_search_message(home.path(), &data, "jsonlselectedseedneedle")?,
+            selected_hit
+        );
+        assert!(canonical_messages(&data, &sibling)?.is_empty());
+        assert!(search_hits(home.path(), &data, "jsonlsiblingseedneedle")?.is_empty());
+        assert_eq!(raw_manifest_ids(&data)?, selected_manifests);
+        assert_eq!(bundle(&selected)?, selected_before);
+        assert_eq!(bundle(&sibling)?, sibling_before);
+
+        // A directory selection intentionally admits its sibling transcripts.
+        refresh(&[sessions.as_path()]);
+        let sibling_rows = canonical_messages(&data, &sibling)?;
+        assert_eq!(sibling_rows.len(), 1);
+        assert_eq!(sibling_rows[0].created_at, Some(AT + 1_000));
+        let sibling_hit = native_search_message(
+            home.path(),
+            &data,
+            &sibling,
+            "jsonlsiblingseedneedle",
+            &sibling_rows[0],
+        )?;
+        assert_ne!(selected_hit.conversation_id, sibling_hit.conversation_id);
+        assert_eq!(canonical_messages(&data, &selected)?, selected_rows);
+        assert_eq!(
+            single_search_message(home.path(), &data, "jsonlselectedseedneedle")?,
+            selected_hit
+        );
+        let both_manifests = raw_manifest_ids(&data)?;
+        assert_eq!(both_manifests.len(), 2);
+        assert_eq!(both_manifests.get(&selected_path), Some(selected_ids));
+        let sibling_ids = both_manifests
+            .get(&sibling_path)
+            .context("sibling transcript manifest")?;
+        assert_eq!(sibling_ids.len(), 1);
+        assert_eq!(bundle(&selected)?, selected_before);
+        assert_eq!(bundle(&sibling)?, sibling_before);
+
+        let mut writer = fs::OpenOptions::new().append(true).open(&sibling)?;
+        writeln!(
+            writer,
+            "{}",
+            json!({
+                "type": "message", "timestamp": AT + 2_000,
+                "message": {"role": "assistant", "content": "jsonlsiblingappendneedle"}
+            })
+        )?;
+        writer.flush()?;
+        writer.sync_all()?;
+        drop(writer);
+        let sibling_after_append = bundle(&sibling)?;
+        assert_ne!(sibling_after_append, sibling_before);
+
+        // Re-reading A must neither ingest nor capture B's newly appended
+        // content, and must retain B's already searchable historical identity.
+        refresh(&[selected.as_path()]);
+        assert_eq!(canonical_messages(&data, &selected)?, selected_rows);
+        assert_eq!(canonical_messages(&data, &sibling)?, sibling_rows);
+        assert_eq!(
+            single_search_message(home.path(), &data, "jsonlselectedseedneedle")?,
+            selected_hit
+        );
+        assert_eq!(
+            single_search_message(home.path(), &data, "jsonlsiblingseedneedle")?,
+            sibling_hit
+        );
+        assert!(search_hits(home.path(), &data, "jsonlsiblingappendneedle")?.is_empty());
+        assert_eq!(raw_manifest_ids(&data)?, both_manifests);
+        assert_eq!(bundle(&selected)?, selected_before);
+        assert_eq!(bundle(&sibling)?, sibling_after_append);
+
+        refresh(&[sibling.as_path()]);
+        let appended_rows = canonical_append(
+            &data,
+            &sibling,
+            &sibling_rows,
+            sibling_hit.conversation_id,
+            "jsonlsiblingappendneedle",
+            AT + 2_000,
+        )?;
+        let appended_hit = native_search_message(
+            home.path(),
+            &data,
+            &sibling,
+            "jsonlsiblingappendneedle",
+            appended_rows.last().context("appended JSONL message")?,
+        )?;
+        let appended_manifests = raw_manifest_ids(&data)?;
+        assert_eq!(appended_manifests.len(), 2);
+        assert_eq!(appended_manifests.get(&selected_path), Some(selected_ids));
+        let revised_sibling_ids = appended_manifests
+            .get(&sibling_path)
+            .context("appended sibling manifest history")?;
+        assert!(sibling_ids.is_subset(revised_sibling_ids));
+        assert_eq!(revised_sibling_ids.len(), sibling_ids.len() + 1);
+        assert_eq!(canonical_messages(&data, &selected)?, selected_rows);
+        assert_eq!(
+            single_search_message(home.path(), &data, "jsonlselectedseedneedle")?,
+            selected_hit
+        );
+        assert_eq!(
+            single_search_message(home.path(), &data, "jsonlsiblingseedneedle")?,
+            sibling_hit
+        );
+        assert_eq!(bundle(&selected)?, selected_before);
+        assert_eq!(bundle(&sibling)?, sibling_after_append);
+
+        for paths in [
+            vec![sibling.as_path()],
+            vec![selected.as_path(), sibling.as_path()],
+        ] {
+            refresh(&paths);
+            assert_eq!(canonical_messages(&data, &selected)?, selected_rows);
+            assert_eq!(canonical_messages(&data, &sibling)?, appended_rows);
+            assert_eq!(
+                single_search_message(home.path(), &data, "jsonlselectedseedneedle")?,
+                selected_hit
+            );
+            assert_eq!(
+                single_search_message(home.path(), &data, "jsonlsiblingseedneedle")?,
+                sibling_hit
+            );
+            assert_eq!(
+                single_search_message(home.path(), &data, "jsonlsiblingappendneedle")?,
+                appended_hit
+            );
+            assert_eq!(raw_manifest_ids(&data)?, appended_manifests);
+            assert_eq!(bundle(&selected)?, selected_before);
+            assert_eq!(bundle(&sibling)?, sibling_after_append);
+        }
+        Ok(())
     }
 
     /// GH #502/#543: targeted watch-once must see a commit that lands only in
