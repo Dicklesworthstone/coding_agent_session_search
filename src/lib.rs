@@ -128984,10 +128984,7 @@ fn archive_agent_slug_for_exclusion(agent: &str) -> String {
 }
 
 fn archive_data_dir_for_agents_command(cli: &Cli) -> PathBuf {
-    cli.db
-        .as_ref()
-        .and_then(|db_path| db_path.parent().map(Path::to_path_buf))
-        .unwrap_or_else(default_data_dir)
+    resolve_data_dir(&None, cli.db.as_ref())
 }
 
 /// What `sources agents exclude` did with rows already archived for the agent.
@@ -129001,17 +128998,55 @@ enum ExcludedAgentPurge {
     ArchiveUnavailable { db_path: PathBuf, error: String },
 }
 
-fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<ExcludedAgentPurge> {
+fn acquire_agent_exclusion_mutation_lock(
+    data_dir: &Path,
+    db_path: &Path,
+) -> CliResult<crate::indexer::SearchMaintenanceMutationGuard> {
+    crate::indexer::acquire_search_maintenance_mutation_lock(
+        data_dir,
+        db_path,
+        crate::search::asset_state::SearchMaintenanceJobKind::LexicalRefresh,
+    )
+    .map_err(|error| {
+        let rendered = format!("{error:#}");
+        if error_chain_indicates_active_cass_index(&rendered) {
+            let mut error = active_index_run_details(data_dir, db_path)
+                .map(|details| details.to_cli_error())
+                .unwrap_or_else(|| index_storage_contention_cli_error(&rendered));
+            error.hint = Some(
+                "The exclusion command left configuration and archive data unchanged. Stop the active index/watch or maintenance process, then retry the exclusion."
+                    .to_string(),
+            );
+            return error;
+        }
+        CliError {
+            code: 5,
+            kind: CliErrorKind::ArchivePurge.kind_str(),
+            message: format!("Failed to acquire agent exclusion maintenance lock: {rendered}"),
+            hint: Some(format!(
+                "The exclusion was not saved. Check permissions under {} and beside {}, then retry.",
+                data_dir.display(),
+                db_path.display()
+            )),
+            retryable: true,
+        }
+    })
+}
+
+fn purge_excluded_agent_archive_data(
+    agent: &str,
+    db_path: &Path,
+    data_dir: &Path,
+    mutation_guard: &crate::indexer::SearchMaintenanceMutationGuard,
+) -> CliResult<ExcludedAgentPurge> {
     use crate::storage::sqlite::FrankenStorage;
 
-    let db_path = cli.db.clone().unwrap_or_else(default_db_path);
     if !db_path.is_file() {
-        return Ok(ExcludedAgentPurge::NoArchive(db_path));
+        return Ok(ExcludedAgentPurge::NoArchive(db_path.to_path_buf()));
     }
 
-    let data_dir = archive_data_dir_for_agents_command(cli);
     let archive_agent_slug = archive_agent_slug_for_exclusion(agent);
-    let storage = match FrankenStorage::open(&db_path) {
+    let storage = match FrankenStorage::open(db_path) {
         Ok(storage) => storage,
         Err(err) => {
             tracing::warn!(
@@ -129020,7 +129055,7 @@ fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<Exclud
                 "skipping excluded-agent archive purge because the local archive could not be opened"
             );
             return Ok(ExcludedAgentPurge::ArchiveUnavailable {
-                db_path,
+                db_path: db_path.to_path_buf(),
                 error: format!("{err:#}"),
             });
         }
@@ -129035,6 +129070,7 @@ fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<Exclud
             hint: Some("The exclusion was still saved; run 'cass index --full' after fixing the archive if needed".into()),
             retryable: false,
         })?;
+    mutation_guard.mark_progress();
     if purge.conversations_deleted == 0 {
         return Ok(ExcludedAgentPurge::Purged(purge));
     }
@@ -129046,6 +129082,7 @@ fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<Exclud
         hint: Some("Run 'cass index --full' to refresh derived search data".into()),
         retryable: false,
     })?;
+    mutation_guard.mark_progress();
     storage.rebuild_analytics().map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::ArchiveAnalyticsRebuild.kind_str(),
@@ -129055,6 +129092,7 @@ fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<Exclud
         hint: Some("Run 'cass index --full' to refresh derived analytics data".into()),
         retryable: false,
     })?;
+    mutation_guard.mark_progress();
     storage.rebuild_daily_stats().map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::ArchiveDailyStatsRebuild.kind_str(),
@@ -129062,6 +129100,7 @@ fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<Exclud
         hint: Some("Run 'cass index --full' to refresh derived daily stats".into()),
         retryable: false,
     })?;
+    mutation_guard.mark_progress();
     storage.rebuild_token_daily_stats().map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::ArchiveTokenDailyStatsRebuild.kind_str(),
@@ -129071,6 +129110,7 @@ fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<Exclud
         hint: Some("Run 'cass index --full' to refresh token analytics".into()),
         retryable: false,
     })?;
+    mutation_guard.mark_progress();
     let remaining_conversations = storage.total_conversation_count().map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::ArchiveCount.kind_str(),
@@ -129082,16 +129122,22 @@ fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<Exclud
     })?;
     drop(storage);
 
-    crate::indexer::rebuild_tantivy_from_db(&db_path, &data_dir, remaining_conversations, None)
-        .map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::LexicalRebuild.kind_str(),
-            message: format!(
-                "Purged '{archive_agent_slug}' but failed to rebuild the lexical search index: {e}"
-            ),
-            hint: Some("Run 'cass index --full' to refresh lexical search data".into()),
-            retryable: false,
-        })?;
+    crate::indexer::rebuild_tantivy_from_db_with_progress_bump(
+        db_path,
+        data_dir,
+        remaining_conversations,
+        None,
+        mutation_guard.progress_atomic(),
+    )
+    .map_err(|e| CliError {
+        code: 5,
+        kind: CliErrorKind::LexicalRebuild.kind_str(),
+        message: format!(
+            "Purged '{archive_agent_slug}' but failed to rebuild the lexical search index: {e}"
+        ),
+        hint: Some("Run 'cass index --full' to refresh lexical search data".into()),
+        retryable: false,
+    })?;
 
     Ok(ExcludedAgentPurge::Purged(purge))
 }
@@ -129140,6 +129186,31 @@ fn run_agents_list(output_format: Option<RobotFormat>) -> CliResult<()> {
 fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliResult<()> {
     use crate::sources::config::SourcesConfig;
 
+    let apply_exclusion = |config: &mut SourcesConfig| {
+        config
+            .exclude_agent_from_indexing(agent)
+            .map_err(|e| CliError {
+                code: 11,
+                kind: CliErrorKind::Config.kind_str(),
+                message: format!("Failed to update excluded agents: {e}"),
+                hint: Some("Provide a connector slug such as 'openclaw'; qualified names such as 'openclaw/alice' are not connector-wide exclusions".into()),
+                retryable: false,
+            })
+    };
+    // Validate before admission creates any lock files. Load the configuration
+    // used for the actual update only after admission, so another completed
+    // exclusion cannot be overwritten by a pre-lock snapshot.
+    apply_exclusion(&mut SourcesConfig::default())?;
+    let db_path = cli.db.clone().unwrap_or_else(default_db_path);
+    let data_dir = archive_data_dir_for_agents_command(cli);
+    // An already-running indexer/watch keeps its selected connectors. Saving
+    // new configuration cannot revoke that writer's in-flight batches. Own
+    // both the data-dir and archive leases before saving a purging exclusion,
+    // and retain them through the canonical deletion and lexical publication.
+    // Config-only exclusions deliberately apply to future indexing runs.
+    let mutation_guard = (!keep_indexed_data)
+        .then(|| acquire_agent_exclusion_mutation_lock(&data_dir, &db_path))
+        .transpose()?;
     let mut config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
         kind: CliErrorKind::Config.kind_str(),
@@ -129148,15 +129219,7 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
         retryable: false,
     })?;
 
-    let changed = config
-        .exclude_agent_from_indexing(agent)
-        .map_err(|e| CliError {
-            code: 11,
-            kind: CliErrorKind::Config.kind_str(),
-            message: format!("Failed to update excluded agents: {e}"),
-            hint: Some("Provide a connector slug such as 'openclaw'; qualified names such as 'openclaw/alice' are not connector-wide exclusions".into()),
-            retryable: false,
-        })?;
+    let changed = apply_exclusion(&mut config)?;
 
     config.save().map_err(|e| CliError {
         code: 11,
@@ -129166,11 +129229,10 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
         retryable: false,
     })?;
 
-    let purge = if keep_indexed_data {
-        None
-    } else {
-        Some(purge_excluded_agent_archive_data(agent, cli)?)
-    };
+    let purge = mutation_guard
+        .as_ref()
+        .map(|guard| purge_excluded_agent_archive_data(agent, &db_path, &data_dir, guard))
+        .transpose()?;
 
     let agent_slug = agent.trim().to_ascii_lowercase();
     if changed {
@@ -129180,7 +129242,10 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
         println!("'{agent_slug}' was already excluded from indexing.");
     }
     match purge {
-        None => println!("Existing indexed archive data was left untouched."),
+        None => {
+            println!("Existing indexed archive data was left untouched.");
+            println!("Restart any active index/watch process to apply the updated exclusions.");
+        }
         Some(ExcludedAgentPurge::Purged(purge)) if purge.conversations_deleted > 0 => {
             println!(
                 "Purged {} conversations and {} messages already archived for that agent.",

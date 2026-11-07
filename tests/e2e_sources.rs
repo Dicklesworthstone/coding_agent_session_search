@@ -231,7 +231,20 @@ fn isolated_agent_exclusion_command(
     config: &Path,
     data: &Path,
 ) -> assert_cmd::Command {
-    let mut command = tracker.cass_assert_command();
+    let mut command = assert_cmd::Command::from_std(isolated_agent_exclusion_std_command(
+        tracker, home, config, data,
+    ));
+    command.timeout(std::time::Duration::from_secs(90));
+    command
+}
+
+fn isolated_agent_exclusion_std_command(
+    tracker: &PhaseTracker,
+    home: &Path,
+    config: &Path,
+    data: &Path,
+) -> std::process::Command {
+    let mut command = tracker.cass_std_command();
     command
         .env_clear()
         .env("HOME", home)
@@ -246,18 +259,21 @@ fn isolated_agent_exclusion_command(
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("RUST_MIN_STACK", "134217728")
         .env("RAYON_NUM_THREADS", "2")
-        .current_dir(home)
-        .timeout(std::time::Duration::from_secs(90));
+        .current_dir(home);
     if let Ok(system_root) = dotenvy::var("SystemRoot") {
         command.env("SystemRoot", system_root);
     }
-    tracker.command_environment().apply_to_assert(&mut command);
+    tracker.command_environment().apply_to_std(&mut command);
     command
 }
 
 fn agent_exclusion_archive_rows(data: &Path) -> Vec<(i64, String, String, i64, i64, String)> {
+    agent_exclusion_archive_rows_at(&data.join("agent_search.db"))
+}
+
+fn agent_exclusion_archive_rows_at(db_path: &Path) -> Vec<(i64, String, String, i64, i64, String)> {
     use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
-    let storage = FrankenStorage::open_readonly(&data.join("agent_search.db")).unwrap();
+    let storage = FrankenStorage::open_readonly(db_path).unwrap();
     let rows = storage
         .raw()
         .query_map_collect(
@@ -1281,6 +1297,493 @@ fn sources_agents_exclude_rejects_qualified_names_before_config_or_archive_mutat
     assert_eq!(listed["disabled_agents"], serde_json::json!(["codex"]));
     assert_eq!(archive_bundle(), before_archive);
     tracker.complete();
+}
+
+/// Default exclusions must join canonical writer admission before changing
+/// configuration or deleting searchable history.
+mod agent_exclusion_writer_admission {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
+
+    const SELECTED: &str = "exclusionwriterprotectedneedle";
+    const RETAINED: &str = "exclusionwriterretainedneedle";
+
+    #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+    struct Hit {
+        conversation_id: i64,
+        line_number: usize,
+        source_id: String,
+        source_path: PathBuf,
+        agent: String,
+        created_at: Option<i64>,
+        content: String,
+    }
+
+    fn snapshot(paths: &[PathBuf]) -> Vec<Option<(Vec<u8>, SystemTime)>> {
+        paths
+            .iter()
+            .map(|path| match fs::metadata(path) {
+                Ok(metadata) => Some((
+                    fs::read(path).expect("snapshot file bytes"),
+                    metadata.modified().expect("snapshot file mtime"),
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("snapshot {}: {error}", path.display()),
+            })
+            .collect()
+    }
+
+    struct Fixture {
+        _root: tempfile::TempDir,
+        tracker: PhaseTracker,
+        home: PathBuf,
+        config: PathBuf,
+        data: PathBuf,
+        db: PathBuf,
+        db_override: Option<PathBuf>,
+        providers: Vec<PathBuf>,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            Self::new_with_db(name, None)
+        }
+
+        fn new_with_db(name: &str, db_name: Option<&str>) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let canonical_root = dunce::canonicalize(root.path()).unwrap();
+            let home = canonical_root.join("home");
+            let config = canonical_root.join("config");
+            let data = canonical_root.join("data");
+            let db_override = db_name.map(PathBuf::from);
+            let db = db_override
+                .as_ref()
+                .map(|path| home.join(path))
+                .unwrap_or_else(|| data.join("agent_search.db"));
+            fs::create_dir_all(&home).unwrap();
+            create_sources_config(&config, "disabled_agents = []\n");
+            let selected = home.join(".openclaw/agents/alice/sessions/history.jsonl");
+            fs::create_dir_all(selected.parent().unwrap()).unwrap();
+            let session = serde_json::json!({
+                "type": "session", "id": "writer-admission-history",
+                "cwd": "/synthetic/history", "timestamp": 1_780_000_000_000_i64
+            });
+            let message = serde_json::json!({
+                "type": "message", "timestamp": 1_780_000_001_000_i64,
+                "message": {"role": "user", "content": format!("Historical neutral title\n{SELECTED}")}
+            });
+            fs::write(&selected, format!("{session}\n{message}\n")).unwrap();
+            util::seed_codex_session(
+                &home.join(".codex"),
+                "rollout-writer-control.jsonl",
+                RETAINED,
+                false,
+            );
+            let retained = home.join(".codex/sessions/2026/04/23/rollout-writer-control.jsonl");
+            let fixture = Self {
+                _root: root,
+                tracker: tracker_for(name),
+                home,
+                config,
+                data,
+                db,
+                db_override,
+                providers: vec![selected, retained],
+            };
+            fixture.success(
+                fixture
+                    .command()
+                    .args(["index", "--watch-once"])
+                    .args(&fixture.providers)
+                    .args(["--json", "--no-progress-events"]),
+            );
+            assert_eq!(fixture.rows().len(), 2);
+            assert_eq!(fixture.hits(SELECTED).len(), 1);
+            assert_eq!(fixture.hits(RETAINED).len(), 1);
+            fixture
+        }
+
+        fn command(&self) -> assert_cmd::Command {
+            let mut command =
+                isolated_agent_exclusion_command(&self.tracker, &self.home, &self.config, &self.data);
+            if let Some(db) = &self.db_override {
+                command.arg("--db").arg(db);
+            }
+            command
+        }
+
+        fn rows(&self) -> Vec<(i64, String, String, i64, i64, String)> {
+            agent_exclusion_archive_rows_at(&self.db)
+        }
+
+        fn run(&self, command: &mut assert_cmd::Command) -> std::process::Output {
+            let before = snapshot(&self.providers);
+            let output = command.output().expect("run isolated exclusion CLI");
+            assert_eq!(snapshot(&self.providers), before, "provider bundle changed");
+            output
+        }
+
+        fn success(&self, command: &mut assert_cmd::Command) -> std::process::Output {
+            let output = self.run(command);
+            assert!(
+                output.status.success(),
+                "status={} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        }
+
+        fn hits(&self, needle: &str) -> Vec<Hit> {
+            let output = self.success(self.command().args([
+                "search",
+                needle,
+                "--mode",
+                "lexical",
+                "--json",
+                "--no-maintenance",
+                "--limit",
+                "10",
+            ]));
+            let response: Value = serde_json::from_slice(&output.stdout).expect("valid search JSON");
+            assert_ne!(response["budget"]["timed_out"], Value::Bool(true));
+            serde_json::from_value(Value::Array(
+                response
+                    .get("hits")
+                    .and_then(Value::as_array)
+                    .expect("search hits array")
+                    .clone(),
+            ))
+            .expect("complete search provenance")
+        }
+
+        fn archive_bundle(&self) -> Vec<Option<(Vec<u8>, SystemTime)>> {
+            snapshot(&["", "-wal", "-shm"].map(|suffix| {
+                let mut path = self.db.as_os_str().to_owned();
+                path.push(suffix);
+                PathBuf::from(path)
+            }))
+        }
+
+        fn config_snapshot(&self) -> Vec<Option<(Vec<u8>, SystemTime)>> {
+            snapshot(&[self.config.join("cass/sources.toml")])
+        }
+
+        fn assert_busy(&self, command: &mut assert_cmd::Command) {
+            let before_config = self.config_snapshot();
+            let output = self.run(
+                command
+                    .env("CASS_OUTPUT_FORMAT", "json")
+                    .timeout(Duration::from_secs(15)),
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(7),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let error: Value =
+                serde_json::from_slice(&output.stderr).expect("typed busy error JSON");
+            assert_eq!(error["error"]["code"], 7);
+            assert_eq!(error["error"]["kind"], "index-busy");
+            assert_eq!(error["error"]["retryable"], true);
+            assert!(
+                error["error"]["hint"]
+                    .as_str()
+                    .unwrap()
+                    .contains("left configuration and archive data unchanged")
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "a refused exclusion must not report success"
+            );
+            assert_eq!(self.config_snapshot(), before_config);
+        }
+
+        fn append_selected(&self, needle: &str) {
+            let mut writer = fs::OpenOptions::new()
+                .append(true)
+                .open(&self.providers[0])
+                .unwrap();
+            writeln!(
+                writer,
+                "{}",
+                serde_json::json!({
+                    "type": "message", "timestamp": chrono::Utc::now().timestamp_millis(),
+                    "message": {"role": "assistant", "content": needle}
+                })
+            )
+            .unwrap();
+            writer.flush().unwrap();
+            writer.sync_all().unwrap();
+            drop(writer);
+        }
+
+        fn purge_and_assert_no_reimport(&self, expected_messages: usize, retained: &[Hit]) {
+            let kept_rows = self.rows()
+                .into_iter()
+                .filter(|row| row.1 == "codex")
+                .collect::<Vec<_>>();
+            assert_eq!(kept_rows.len(), 1);
+            let output =
+                self.success(self.command().args(["sources", "agents", "exclude", "openclaw"]));
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains(&format!("Purged 1 conversations and {expected_messages} messages"))
+            );
+            assert_eq!(self.rows(), kept_rows);
+            assert!(self.hits(SELECTED).is_empty());
+            assert_eq!(self.hits(RETAINED), retained);
+            let appended = "exclusionwriterafterpurgeneedle";
+            self.append_selected(appended);
+            self.success(
+                self.command()
+                    .args(["index", "--watch-once"])
+                    .args(&self.providers)
+                    .args(["--json", "--no-progress-events"]),
+            );
+            assert_eq!(self.rows(), kept_rows);
+            assert!(self.hits(SELECTED).is_empty());
+            assert!(self.hits(appended).is_empty());
+            assert_eq!(self.hits(RETAINED), retained);
+        }
+    }
+
+    #[test]
+    fn sources_agents_exclude_refuses_both_writer_leases_before_saving_or_opening_archive() {
+        for archive_lease in [false, true] {
+            let fixture = Fixture::new(&format!("agent_exclusion_writer_lease_{archive_lease}"));
+            let rows = fixture.rows();
+            let selected = fixture.hits(SELECTED);
+            let retained = fixture.hits(RETAINED);
+            let db = fixture.db.clone();
+            let lock_path = if archive_lease {
+                let mut path = dunce::canonicalize(&db).unwrap().into_os_string();
+                path.push(".cass-index-run.lock");
+                PathBuf::from(path)
+            } else {
+                fixture.data.join("index-run.lock")
+            };
+            let owner = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            owner
+                .try_lock()
+                .expect("hold the same advisory lease as an index writer");
+            let contender = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            assert!(matches!(
+                contender.try_lock(),
+                Err(fs::TryLockError::WouldBlock)
+            ));
+
+            let mut command = fixture.command();
+            // The canonical lease also protects a --db alias whose derived-data
+            // directory has no active index-run.lock of its own.
+            #[cfg(unix)]
+            if archive_lease {
+                let alias_dir = fixture.home.join("archive-alias");
+                fs::create_dir_all(&alias_dir).unwrap();
+                let alias = alias_dir.join("archive.db");
+                std::os::unix::fs::symlink(&db, &alias).unwrap();
+                command.arg("--db").arg(alias);
+            }
+            let before_archive = fixture.archive_bundle();
+            fixture.assert_busy(command.args(["sources", "agents", "exclude", "openclaw"]));
+            assert_eq!(
+                fixture.archive_bundle(),
+                before_archive,
+                "busy admission must not open or checkpoint the archive"
+            );
+            assert!(matches!(
+                contender.try_lock(),
+                Err(fs::TryLockError::WouldBlock)
+            ));
+            assert_eq!(fixture.rows(), rows);
+            assert_eq!(fixture.hits(SELECTED), selected);
+            assert_eq!(fixture.hits(RETAINED), retained);
+
+            let before_archive = fixture.archive_bundle();
+            let kept = fixture.success(fixture.command().args([
+                "sources",
+                "agents",
+                "exclude",
+                "openclaw",
+                "--keep-indexed-data",
+            ]));
+            assert!(
+                String::from_utf8_lossy(&kept.stdout)
+                    .contains("Restart any active index/watch process")
+            );
+            assert_eq!(fixture.archive_bundle(), before_archive);
+            fixture.assert_busy(
+                fixture
+                    .command()
+                    .args(["sources", "agents", "exclude", "openclaw"]),
+            );
+            owner.unlock().unwrap();
+            assert!(
+                contender.try_lock().is_ok(),
+                "owner release must admit a new writer"
+            );
+            contender.unlock().unwrap();
+            fixture.purge_and_assert_no_reimport(1, &retained);
+            fixture.tracker.complete();
+        }
+    }
+
+    #[test]
+    fn sources_agents_exclude_with_bare_relative_db_uses_the_index_data_directory() {
+        let fixture = Fixture::new_with_db(
+            "agent_exclusion_bare_relative_db",
+            Some("archive.db"),
+        );
+        assert_eq!(fixture.db, fixture.home.join("archive.db"));
+        assert!(fixture.db.is_file());
+        assert!(!fixture.data.join("agent_search.db").exists());
+        assert!(
+            coding_agent_search::search::tantivy::expected_index_dir(&fixture.data).is_dir(),
+            "the real index command must publish into CASS_DATA_DIR"
+        );
+        let assert_no_stray_assets = || {
+            for name in ["index", "raw-mirror", "index-run.lock", "index-run.lock.meta"] {
+                assert!(
+                    !fixture.home.join(name).exists(),
+                    "a bare --db filename must not redirect search assets into the current directory: {name}"
+                );
+            }
+        };
+        assert_no_stray_assets();
+        let retained = fixture.hits(RETAINED);
+
+        // The selected database is in HOME, but the index command's derived
+        // assets and data-dir lease remain in CASS_DATA_DIR.
+        let owner = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(fixture.data.join("index-run.lock"))
+            .unwrap();
+        owner.try_lock().unwrap();
+        let before_archive = fixture.archive_bundle();
+        fixture.assert_busy(
+            fixture
+                .command()
+                .args(["sources", "agents", "exclude", "openclaw"]),
+        );
+        assert_eq!(fixture.archive_bundle(), before_archive);
+        assert_no_stray_assets();
+        owner.unlock().unwrap();
+
+        fixture.purge_and_assert_no_reimport(1, &retained);
+        assert_eq!(fixture.rows().len(), 1);
+        assert_no_stray_assets();
+        fixture.tracker.complete();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sources_agents_exclude_refuses_running_watch_then_purges_after_it_stops() {
+        use std::time::Instant;
+
+        struct WatchChild(std::process::Child);
+        impl Drop for WatchChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let fixture = Fixture::new("agent_exclusion_running_watch");
+        let retained = fixture.hits(RETAINED);
+        let before_providers = snapshot(&fixture.providers);
+        let log_path = fixture.home.join("watch.stderr.log");
+        let mut command = isolated_agent_exclusion_std_command(
+            &fixture.tracker,
+            &fixture.home,
+            &fixture.config,
+            &fixture.data,
+        );
+        let mut watcher = WatchChild(
+            command
+                .arg("--verbose")
+                .args([
+                    "index",
+                    "--watch",
+                    "--watch-interval",
+                    "1",
+                    "--json",
+                    "--no-progress-events",
+                ])
+                .env("RUST_LOG", "info")
+                .env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "8")
+                .stdout(fs::File::create(fixture.home.join("watch.stdout.jsonl")).unwrap())
+                .stderr(fs::File::create(&log_path).unwrap())
+                .spawn()
+                .expect("start real watch process"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let logs = fs::read_to_string(&log_path).unwrap();
+            assert!(
+                watcher.0.try_wait().unwrap().is_none(),
+                "watch exited: {logs}"
+            );
+            if logs.contains("watch mode: minimum interval between scan cycles") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "watch did not become ready: {logs}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        fixture.assert_busy(
+            fixture
+                .command()
+                .args(["sources", "agents", "exclude", "openclaw"]),
+        );
+        assert_eq!(fixture.hits(SELECTED).len(), 1);
+        assert_eq!(fixture.hits(RETAINED), retained);
+        assert_eq!(snapshot(&fixture.providers), before_providers);
+
+        // Refusal leaves the active writer's configuration intact. Prove that
+        // this is a functioning watcher, not merely a stale lock/ready log.
+        let appended = "exclusionwriterliveappendneedle";
+        fixture.append_selected(appended);
+        let after_append = snapshot(&fixture.providers);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let logs = fs::read_to_string(&log_path).unwrap();
+            assert!(
+                watcher.0.try_wait().unwrap().is_none(),
+                "watch exited: {logs}"
+            );
+            if fixture.hits(appended).len() == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "watch did not ingest the positive control: {logs}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(fixture.rows().len(), 3);
+        assert_eq!(snapshot(&fixture.providers), after_append);
+        drop(watcher);
+        fixture.purge_and_assert_no_reimport(2, &retained);
+        assert!(fixture.hits(appended).is_empty());
+        fixture.tracker.complete();
+    }
 }
 
 /// Bead dndyv: an archive that exists but cannot be opened, and a path with

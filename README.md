@@ -854,9 +854,11 @@ cass sources agents exclude openclaw
 cass sources agents include openclaw
 ```
 
-`cass` stores this preference in `sources.toml` (`~/.config/cass/sources.toml` on Linux, `~/Library/Application Support/cass/sources.toml` on macOS), so future scans, syncs, and watch-mode updates remember it automatically.
+`cass` stores this preference in `sources.toml` (`~/.config/cass/sources.toml` on Linux, `~/Library/Application Support/cass/sources.toml` on macOS). New scans, syncs, and watcher processes read the saved exclusion.
 
 By default, `cass sources agents exclude <agent>` also removes already archived local data for that agent and rebuilds the lexical index so the exclusion frees space instead of only blocking future imports.
+
+A purging exclusion requires exclusive access to the selected archive and search data. If an indexer, watcher, or maintenance operation already holds that access, the command exits with code 7 and leaves configuration and archive data unchanged. Stop the active process, then retry the exclusion. Once admitted, the command retains exclusive access through deletion and publication of the rebuilt lexical index.
 
 Exclusions apply to a whole connector. Excluding `openclaw` also removes archived conversations for named agents such as `openclaw/alice` and `openclaw/bob`. Qualified names such as `openclaw/alice` are rejected by `exclude`; they are never silently widened to the whole connector. Use `cass forget --agent openclaw/alice` to preview removing only that named agent's archived conversations, then add `--apply` to confirm the deletion.
 
@@ -865,6 +867,8 @@ If you want to block future indexing but keep the data already archived:
 ```bash
 cass sources agents exclude openclaw --keep-indexed-data
 ```
+
+This option saves only the configuration change and can run while indexing is active. Restart any running watcher for the new exclusion to take effect; its current selection of connectors remains active until it exits.
 
 #### Sync Engine Internals
 

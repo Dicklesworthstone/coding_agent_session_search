@@ -24471,7 +24471,7 @@ pub(crate) fn rebuild_tantivy_from_db(
     )
 }
 
-fn rebuild_tantivy_from_db_with_progress_bump(
+pub(crate) fn rebuild_tantivy_from_db_with_progress_bump(
     db_path: &Path,
     data_dir: &Path,
     total_conversations: usize,
