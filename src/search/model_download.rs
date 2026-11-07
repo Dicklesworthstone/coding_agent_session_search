@@ -1301,7 +1301,23 @@ impl ModelDownloader {
         for (idx, file) in manifest.files.iter().enumerate() {
             self.fail_if_cancelled()?;
             let source_path = source_dir.join(file.local_name());
-            let source = File::open(&source_path)?;
+            if !fs::metadata(&source_path)?.is_file() {
+                return Err(std::io::Error::other(format!(
+                    "model source is not a regular file: {}",
+                    source_path.display()
+                ))
+                .into());
+            }
+            let mut options = fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Keep regular-file symlinks usable for local snapshots, but
+                // never wait for a pipe writer if the source changes on open.
+                options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+            }
+            let source = options.open(&source_path)?;
             if !source.metadata()?.is_file() {
                 return Err(std::io::Error::other(format!(
                     "model source is not a regular file: {}",
@@ -1452,8 +1468,10 @@ impl ModelDownloader {
         if fs::symlink_metadata(&self.temp_dir).is_ok() {
             ensure_model_download_temp_dir(&self.temp_dir)?;
             let same_acquisition = allow_resume
-                && fs::read_to_string(self.temp_dir.join(MODEL_ACQUISITION_RECORD))
-                    .is_ok_and(|previous| previous == receipt);
+                && acquisition_record_matches(
+                    &self.temp_dir.join(MODEL_ACQUISITION_RECORD),
+                    &receipt,
+                );
             if !same_acquisition {
                 // Preserve an earlier attempt when this downloader is reused
                 // for another source or manifest; never blend its partials.
@@ -1465,9 +1483,8 @@ impl ModelDownloader {
         }
         if !self.temp_dir.exists() && allow_resume {
             for candidate in model_download_staging_dirs(&self.target_dir) {
-                if fs::read_to_string(candidate.join(MODEL_ACQUISITION_RECORD))
-                    .is_ok_and(|previous| previous == receipt)
-                {
+                self.fail_if_cancelled()?;
+                if acquisition_record_matches(&candidate.join(MODEL_ACQUISITION_RECORD), &receipt) {
                     // The lease makes this an exclusive transfer of ownership
                     // to a fresh name, including across process restarts.
                     fs::rename(candidate, &self.temp_dir)?;
@@ -2199,6 +2216,39 @@ fn ensure_real_model_directory_metadata(
     Ok(())
 }
 
+/// An acquisition record is a small, exact identity match, never model data.
+/// Bound reads by the expected record even if a file grows after inspection.
+fn acquisition_record_matches(path: &Path, expected: &str) -> bool {
+    let expected_len = expected.len() as u64;
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() != expected_len {
+        return false;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let Ok(file) = options.open(path) else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() != expected_len {
+        return false;
+    }
+    let mut content = Vec::with_capacity(expected.len());
+    file.take(expected_len.saturating_add(1))
+        .read_to_end(&mut content)
+        .is_ok()
+        && content == expected.as_bytes()
+}
+
 fn model_download_temp_dir(target_dir: &Path) -> PathBuf {
     if let Some(parent) = target_dir.parent() {
         let dir_name = target_dir
@@ -2432,6 +2482,13 @@ fn sync_tree(_path: &Path) -> Result<(), DownloadError> {
 fn sync_parent_directory(path: &Path) -> Result<(), DownloadError> {
     let Some(parent) = path.parent() else {
         return Ok(());
+    };
+    // A bare relative name has an empty parent, which denotes the current
+    // directory to Path but is not a valid filename for File::open.
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
     };
     File::open(parent)?.sync_all()?;
     Ok(())
@@ -3579,6 +3636,229 @@ mod tests {
             fs::read(resumed.temp_dir.join("model.safetensors")).unwrap(),
             b"partial"
         );
+    }
+
+    #[test]
+    fn test_offline_install_supports_bare_relative_destination() {
+        const CHILD_ROOT: &str = "CASS_TEST_MODEL_RELATIVE_INSTALL_CHILD_ROOT";
+        let Some(root) = std::env::var_os(CHILD_ROOT) else {
+            let tmp = tempfile::tempdir().unwrap();
+            let full_name = concat!(
+                module_path!(),
+                "::test_offline_install_supports_bare_relative_destination"
+            );
+            let (_, test_name) = full_name.split_once("::").unwrap();
+            assert_cmd::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD_ROOT, tmp.path())
+                .current_dir(tmp.path())
+                .timeout(Duration::from_secs(10))
+                .assert()
+                .success()
+                .stdout(predicates::str::contains("1 passed; 0 failed"));
+            return;
+        };
+        let root = PathBuf::from(root);
+        let (prior, source, manifest) = offline_install_fixture(&root);
+        let relative = ModelDownloader::new(PathBuf::from("model"));
+        let mut invalid = manifest.clone();
+        invalid.files[1].sha256 = "0".repeat(64);
+        assert!(matches!(
+            relative.install_from_directory(&invalid, &source, None),
+            Err(DownloadError::VerificationFailed { .. })
+        ));
+        assert_prior_install_unchanged(&prior);
+
+        relative
+            .install_from_directory(&manifest, &source, None)
+            .unwrap();
+        for file in &manifest.files {
+            assert_eq!(
+                compute_sha256(&prior.target_dir.join(file.local_name())).unwrap(),
+                file.sha256
+            );
+        }
+        let marker = fs::read_to_string(prior.target_dir.join(".verified")).unwrap();
+        assert!(marker.contains("revision=next-revision\n"));
+        assert!(marker.contains("source=from-file\n"));
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".model.bak."))
+                .count(),
+            1,
+            "only the successful install may replace the prior generation"
+        );
+    }
+
+    #[test]
+    fn test_acquisition_receipt_requires_exact_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = tmp.path().join(MODEL_ACQUISITION_RECORD);
+        let expected = r#"{"version":1,"source":"registry"}"#;
+
+        assert!(!acquisition_record_matches(&record, expected));
+        fs::write(&record, expected).unwrap();
+        assert!(acquisition_record_matches(&record, expected));
+        fs::write(&record, expected.replace("registry", "modified")).unwrap();
+        assert!(!acquisition_record_matches(&record, expected));
+        fs::write(&record, format!("{expected}\n")).unwrap();
+        assert!(!acquisition_record_matches(&record, expected));
+        let file = File::create(&record).unwrap();
+        file.set_len(512 * 1024 * 1024).unwrap();
+        drop(file);
+        assert!(!acquisition_record_matches(&record, expected));
+        fs::write(&record, expected).unwrap();
+        assert!(acquisition_record_matches(&record, expected));
+        assert_eq!(fs::read(&record).unwrap(), expected.as_bytes());
+        assert!(!acquisition_record_matches(tmp.path(), expected));
+    }
+
+    #[test]
+    fn test_acquisition_resume_preserves_malformed_candidates_without_adopting_them() {
+        for malformed in ["different-same-size", "trailing-byte", "oversized"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (first, _, manifest) = offline_install_fixture(tmp.path());
+            first
+                .prepare_acquisition(&manifest, "registry", true)
+                .unwrap();
+            let record = first.temp_dir.join(MODEL_ACQUISITION_RECORD);
+            let mut contents = fs::read(&record).unwrap();
+            match malformed {
+                "different-same-size" => contents[0] = b'!',
+                "trailing-byte" => contents.push(b'\n'),
+                "oversized" => {}
+                _ => unreachable!(),
+            }
+            fs::write(&record, &contents).unwrap();
+            if malformed == "oversized" {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&record)
+                    .unwrap()
+                    .set_len(512 * 1024 * 1024)
+                    .unwrap();
+            }
+            let record_len = fs::metadata(&record).unwrap().len();
+            fs::write(first.temp_dir.join("model.safetensors"), b"partial").unwrap();
+            let next = ModelDownloader::new(first.target_dir.clone());
+
+            next.prepare_acquisition(&manifest, "registry", true)
+                .unwrap();
+
+            assert_eq!(
+                fs::read(first.temp_dir.join("model.safetensors")).unwrap(),
+                b"partial"
+            );
+            assert_eq!(fs::metadata(&record).unwrap().len(), record_len);
+            assert!(!next.temp_dir.join("model.safetensors").exists());
+            assert_prior_install_unchanged(&next);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_acquisition_ignores_symlink_receipts_but_accepts_regular_source_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (downloader, source, manifest) = offline_install_fixture(tmp.path());
+        downloader
+            .prepare_acquisition(&manifest, "registry", true)
+            .unwrap();
+        let receipt_path = downloader.temp_dir.join(MODEL_ACQUISITION_RECORD);
+        let original_receipt = fs::read(&receipt_path).unwrap();
+        let external_receipt = tmp.path().join("external-receipt.json");
+        fs::rename(&receipt_path, &external_receipt).unwrap();
+        symlink(&external_receipt, &receipt_path).unwrap();
+        fs::write(downloader.temp_dir.join("model.safetensors"), b"partial").unwrap();
+
+        let next = ModelDownloader::new(downloader.target_dir.clone());
+        next.prepare_acquisition(&manifest, "registry", true)
+            .unwrap();
+        assert!(downloader.temp_dir.join("model.safetensors").exists());
+        assert!(!next.temp_dir.join("model.safetensors").exists());
+        assert_eq!(fs::read(&external_receipt).unwrap(), original_receipt);
+        assert_prior_install_unchanged(&downloader);
+
+        let actual_weights = tmp.path().join("actual-weights");
+        let source_weights = source.join("model.safetensors");
+        fs::rename(&source_weights, &actual_weights).unwrap();
+        symlink(&actual_weights, &source_weights).unwrap();
+        next.install_from_directory(&manifest, &source, None)
+            .unwrap();
+        for file in &manifest.files {
+            assert_eq!(
+                compute_sha256(&next.target_dir.join(file.local_name())).unwrap(),
+                file.sha256
+            );
+        }
+        assert_eq!(fs::read(&actual_weights).unwrap(), b"next-weights");
+        assert_eq!(fs::read(&external_receipt).unwrap(), original_receipt);
+        assert!(downloader.temp_dir.join("model.safetensors").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_model_acquisition_fifo_inputs_do_not_block() {
+        // Isolate the actual calls in a subprocess so a blocking regression
+        // fails this test without wedging the entire library harness.
+        const CHILD_ROOT: &str = "CASS_TEST_MODEL_ACQUISITION_FIFO_CHILD_ROOT";
+        let Some(root) = std::env::var_os(CHILD_ROOT) else {
+            let tmp = tempfile::tempdir().unwrap();
+            let full_name = concat!(
+                module_path!(),
+                "::test_model_acquisition_fifo_inputs_do_not_block"
+            );
+            // libtest names omit the crate component from module_path!().
+            let (_, test_name) = full_name.split_once("::").unwrap();
+            assert_cmd::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD_ROOT, tmp.path())
+                .timeout(Duration::from_secs(5))
+                .assert()
+                .success()
+                .stdout(predicates::str::contains("1 passed; 0 failed"));
+            return;
+        };
+        let root = PathBuf::from(root);
+        let (downloader, source, mut manifest) = offline_install_fixture(&root);
+        manifest.files[0].name = "pipe.safetensors".to_string();
+        let pipe = source.join("pipe.safetensors");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&pipe)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let error = downloader
+            .install_from_directory(&manifest, &source, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+        assert_prior_install_unchanged(&downloader);
+
+        let staging = ModelDownloader::new(downloader.target_dir.clone());
+        fs::create_dir_all(&staging.temp_dir).unwrap();
+        let record = staging.temp_dir.join(MODEL_ACQUISITION_RECORD);
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&record)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(staging.temp_dir.join("model.safetensors"), b"partial").unwrap();
+        let next = ModelDownloader::new(downloader.target_dir.clone());
+        next.prepare_acquisition(&manifest, "registry", true)
+            .unwrap();
+        assert!(staging.temp_dir.join("model.safetensors").exists());
+        assert!(!next.temp_dir.join("model.safetensors").exists());
+        assert_prior_install_unchanged(&downloader);
     }
 
     #[test]
