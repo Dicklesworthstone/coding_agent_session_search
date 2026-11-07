@@ -1371,3 +1371,241 @@ fn gh496_benchmark_worker() {
         })
     );
 }
+
+/// Pooled retained-document classification must return the sequential result
+/// in document order, and the pooled audit must refuse at the same document.
+#[test]
+#[serial_test::serial]
+fn gh496_pooled_classification_keeps_sequential_order_and_refusal() {
+    use lexical_reconcile::canary::exact::{ContentMatch, PublishedSnapshot};
+    let fixture = gh496_fixture();
+    let pool = || ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+    // The stage holds conversation 1 only, so conversation 2 is Missing and
+    // each edited copy of a staged document is Different.
+    let stage =
+        PublishedSnapshot::open(&staged_lexical_rebuild_scratch_path(&fixture.index_path)).unwrap();
+    let mut documents = Vec::new();
+    for document in gh496_documents(&fixture.db_path) {
+        let mut edited = document.clone();
+        edited.content.push_str(" edited");
+        documents.push(document);
+        documents.push(edited);
+    }
+    let refs: Vec<_> = documents.iter().map(|document| document.as_ref()).collect();
+    let sequential: Vec<ContentMatch> = refs
+        .iter()
+        .map(|document| stage.classify_content_ref(*document).unwrap())
+        .collect();
+    for kind in [
+        ContentMatch::Matching,
+        ContentMatch::Missing,
+        ContentMatch::Different,
+    ] {
+        assert!(
+            sequential.contains(&kind),
+            "{kind:?} absent: {sequential:?}"
+        );
+    }
+    let pooled: Vec<ContentMatch> = lexical_resume::classify_batch(&stage, &pool(), &refs)
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(pooled, sequential);
+
+    let live = || PublishedSnapshot::open(&fixture.index_path).unwrap();
+    let audit = |pool: Option<ThreadPool>| {
+        lexical_resume::audit_with_classify_pool(
+            &fixture.db_path,
+            &fixture.index_path,
+            live(),
+            pool,
+        )
+    };
+    let retained = audit(None).unwrap();
+    assert_eq!(retained, (4, 4, 4));
+    assert_eq!(audit(Some(pool())).unwrap(), retained);
+    // One two-message batch: a matching document then an edited one, and then
+    // both edited. Each path must refuse at the same, first-differing message.
+    let refusal = |pool: Option<ThreadPool>| {
+        let error = audit(pool).expect_err("edited retained messages must refuse");
+        assert!(error.is::<lexical_resume::Incompatible>(), "{error:#}");
+        format!("{error:#}")
+    };
+    for (edited_idx, first_refused) in [
+        (1, "conversation 1 message 1"),
+        (0, "conversation 1 message 0"),
+    ] {
+        let storage = FrankenStorage::open(&fixture.db_path).unwrap();
+        storage
+            .raw()
+            .execute(&format!(
+                "UPDATE messages SET content = 'growthproof replacementbody' WHERE conversation_id = 1 AND idx = {edited_idx}"
+            ))
+            .unwrap();
+        drop(storage);
+        let sequential = refusal(None);
+        assert!(sequential.contains(first_refused), "{sequential}");
+        assert_eq!(refusal(Some(pool())), sequential);
+    }
+}
+
+fn gh496_audit_ms_summary(samples: &[f64]) -> serde_json::Value {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    serde_json::json!({
+        "p50": sorted[sorted.len() / 2],
+        "min": sorted[0],
+        "max": sorted[sorted.len() - 1],
+        "samples": samples,
+    })
+}
+
+/// Same-invocation A/B of the retained-document audit that a resumed staged
+/// rebuild runs before it indexes anything new: one canonical archive and one
+/// pinned candidate generation, audited through the production scan by the
+/// sequential incumbent (no pool) and by pooled classification, alternating
+/// which arm runs first each round after an unrecorded warm-up round.
+/// Classification alone is timed too, so the stream/packet share is visible.
+/// CASS_GH496_AUDIT_LAYOUTS lists `conversations x messages x conversations
+/// per segment` layouts, e.g. `512x128x1,512x128x64`.
+#[test]
+#[ignore = "retained-document audit A/B; run explicitly with --ignored --nocapture"]
+#[serial_test::serial]
+fn gh496_benchmark_retained_audit_sequential_against_pooled() {
+    let layouts =
+        dotenvy::var("CASS_GH496_AUDIT_LAYOUTS").unwrap_or_else(|_| "512x128x1".to_string());
+    let body_bytes = gh496_benchmark_size("CASS_GH496_AUDIT_BODY_BYTES", 1024);
+    let rounds = gh496_benchmark_size("CASS_GH496_AUDIT_ROUNDS", 5).max(1);
+    for layout in layouts.split(',') {
+        let sizes: Vec<usize> = layout
+            .split('x')
+            .map(|size| size.trim().parse().unwrap())
+            .collect();
+        assert_eq!(sizes.len(), 3, "layout {layout} is not CxMxP");
+        gh496_benchmark_retained_audit_layout(
+            sizes[0].max(2),
+            sizes[1].max(2),
+            sizes[2].max(1),
+            body_bytes,
+            rounds,
+        );
+    }
+}
+
+fn gh496_benchmark_retained_audit_layout(
+    conversations: usize,
+    messages: usize,
+    per_segment: usize,
+    body_bytes: usize,
+    rounds: usize,
+) {
+    use frankensearch::quill::{CASS_SEMANTIC_SCHEMA, KeeperSnapshot};
+    use lexical_reconcile::canary::exact::{ContentMatch, PublishedSnapshot};
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("audit.db");
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    ensure_fts_schema(&storage);
+    for sequence in 0..conversations {
+        gh496_insert_conversation(&storage, sequence, messages, body_bytes);
+    }
+    drop(storage);
+    let documents = gh496_documents(&db_path);
+    assert_eq!(documents.len(), conversations * messages);
+    let index_path = tmp.path().join("candidate");
+    let mut writer = TantivyIndex::open_or_create(&index_path).unwrap();
+    writer.configure_bulk_load_merge_policy();
+    for (position, conversation) in documents.chunks(messages).enumerate() {
+        writer.add_prebuilt_documents_slice(conversation).unwrap();
+        if (position + 1) % per_segment == 0 || position + 1 == conversations {
+            writer.commit().unwrap();
+        }
+    }
+    drop(writer);
+    let segments = fs::read_dir(&index_path)
+        .unwrap()
+        .filter(|entry| {
+            let name = entry.as_ref().unwrap().file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("seg-") && name.ends_with(".fslx")
+        })
+        .count();
+    let keeper = Arc::new(KeeperSnapshot::open(&index_path, CASS_SEMANTIC_SCHEMA).unwrap());
+    let snapshot = || PublishedSnapshot::from_keeper(Arc::clone(&keeper)).unwrap();
+    let pooled = || build_lexical_rebuild_worker_pool().unwrap();
+    let pool_threads = pooled().map_or(1, |pool| pool.current_num_threads());
+    assert!(
+        pool_threads > 1,
+        "the A/B needs a multi-thread rebuild pool"
+    );
+    let refs: Vec<_> = documents.iter().map(|document| document.as_ref()).collect();
+    let mut audit_ms = [Vec::new(), Vec::new()];
+    let mut classify_ms = [Vec::new(), Vec::new()];
+    let mut audit_outcome = None;
+    for round in 0..=rounds {
+        let arms = if round % 2 == 0 { [0, 1] } else { [1, 0] };
+        for arm in arms {
+            let (published, pool) = (snapshot(), if arm == 0 { None } else { pooled() });
+            let started = Instant::now();
+            let outcome =
+                lexical_resume::audit_with_classify_pool(&db_path, &index_path, published, pool)
+                    .unwrap();
+            let audit_elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(*audit_outcome.get_or_insert(outcome), outcome);
+            let (published, pool) = (snapshot(), pooled().unwrap());
+            let started = Instant::now();
+            let classes: Vec<ContentMatch> = if arm == 0 {
+                refs.chunks(messages)
+                    .flat_map(|batch| {
+                        batch
+                            .iter()
+                            .map(|document| published.classify_content_ref(*document).unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            } else {
+                refs.chunks(messages)
+                    .flat_map(|batch| {
+                        lexical_resume::classify_batch(&published, &pool, batch)
+                            .into_iter()
+                            .map(Result::unwrap)
+                    })
+                    .collect()
+            };
+            let classify_elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(classes.len(), documents.len());
+            assert!(classes.iter().all(|class| *class == ContentMatch::Matching));
+            if round > 0 {
+                audit_ms[arm].push(audit_elapsed);
+                classify_ms[arm].push(classify_elapsed);
+            }
+        }
+    }
+    let outcome = audit_outcome.unwrap();
+    assert_eq!(outcome, (documents.len(), documents.len(), documents.len()));
+    let p50 = |samples: &[f64]| gh496_audit_ms_summary(samples)["p50"].as_f64().unwrap();
+    eprintln!(
+        "GH496_AUDIT_AB {}",
+        serde_json::json!({
+            "conversations": conversations,
+            "messages_per_conversation": messages,
+            "conversations_per_segment": per_segment,
+            "body_bytes": body_bytes,
+            "docs": documents.len(),
+            "segments": segments,
+            "rounds": rounds,
+            "pool_threads": pool_threads,
+            "audit_outcome_retained_expected_observed": [outcome.0, outcome.1, outcome.2],
+            "audit_ms": {
+                "sequential": gh496_audit_ms_summary(&audit_ms[0]),
+                "pooled": gh496_audit_ms_summary(&audit_ms[1]),
+            },
+            "audit_ratio_p50": p50(&audit_ms[1]) / p50(&audit_ms[0]),
+            "classify_ms": {
+                "sequential": gh496_audit_ms_summary(&classify_ms[0]),
+                "pooled": gh496_audit_ms_summary(&classify_ms[1]),
+            },
+            "classify_share_of_sequential_audit_p50": p50(&classify_ms[0]) / p50(&audit_ms[0]),
+            "comparison": "one process, one canonical archive, one pinned candidate; arms alternate order per round",
+        })
+    );
+}

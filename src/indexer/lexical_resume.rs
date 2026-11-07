@@ -19,6 +19,8 @@ use std::time::Instant;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, ensure};
+use frankensearch::quill::cass::CassDocumentRef;
+use rayon::{ThreadPool, prelude::*};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -632,6 +634,7 @@ fn revalidate_completed_inner(
         progress_bump,
         observer,
         runtime: LexicalRebuildPipelineRuntimeSnapshot::default(),
+        classify_pool: classification_pool(),
     };
     replay.scan(&storage, limits.page_size)?;
     let indexed_docs = replay.verify_coverage(total_conversations, total_messages)?;
@@ -746,6 +749,35 @@ struct Replay<'a> {
     progress_bump: Option<Arc<AtomicI64>>,
     observer: &'a mut dyn FnMut(Event) -> Result<()>,
     runtime: LexicalRebuildPipelineRuntimeSnapshot,
+    /// None classifies retained documents on the calling thread.
+    classify_pool: Option<ThreadPool>,
+}
+
+/// Retained-document classification only reads the pinned immutable
+/// snapshot, so the audit may spread it over the rebuild worker pool. A pool
+/// that cannot be built leaves the sequential audit in place; it is never a
+/// new reason to refuse or retry recovery.
+fn classification_pool() -> Option<ThreadPool> {
+    super::build_lexical_rebuild_worker_pool().unwrap_or_else(|error| {
+        tracing::debug!(error = %format!("{error:#}"),
+            "lexical recovery classifies retained documents sequentially");
+        None
+    })
+}
+
+/// Classify one bounded batch on `pool`. The result keeps document order;
+/// the caller applies it exactly as it applies sequential outcomes.
+pub(super) fn classify_batch(
+    published: &PublishedSnapshot,
+    pool: &ThreadPool,
+    documents: &[CassDocumentRef<'_>],
+) -> Vec<Result<ContentMatch>> {
+    pool.install(|| {
+        documents
+            .par_iter()
+            .map(|document| published.classify_content_ref(*document))
+            .collect()
+    })
 }
 
 struct ReplayLimits {
@@ -957,11 +989,19 @@ impl Replay<'_> {
             .expected_docs
             .checked_add(documents.len())
             .context("lexical recovery expected document count overflow")?;
+        let mut pooled = match &self.classify_pool {
+            Some(pool) if documents.len() > 1 => {
+                Some(classify_batch(&self.published, pool, &documents).into_iter())
+            }
+            _ => None,
+        };
         let mut missing = Vec::new();
         for document in documents {
-            match self
-                .published
-                .classify_content_ref(document)
+            let outcome = pooled
+                .as_mut()
+                .and_then(Iterator::next)
+                .unwrap_or_else(|| self.published.classify_content_ref(document));
+            match outcome
                 .map_err(|error| candidate_failure(error, "reading candidate content witness"))?
             {
                 ContentMatch::Matching => {
@@ -972,7 +1012,7 @@ impl Replay<'_> {
                 }
                 ContentMatch::Missing => missing.push(document),
                 ContentMatch::Different => {
-                    // A mismatch exits before another document is read.
+                    // A mismatch exits before another outcome is applied.
                     return Err(incompatible(format!(
                         // ubs:ignore[rust.perf.string-alloc-in-loop] -- one error allocation.
                         "canonical projection changed for conversation {} message {}",
@@ -1200,6 +1240,7 @@ fn run_inner(
             controller_reason: "bounded_single_reader_recovery".to_string(),
             ..LexicalRebuildPipelineRuntimeSnapshot::default()
         },
+        classify_pool: classification_pool(),
     };
     replay.scan(&storage, page_size)?;
     let indexed_docs = replay.verify_coverage(total_conversations, total_messages)?;
@@ -1367,4 +1408,62 @@ fn run_inner(
         exact_checkpoint_persisted: true,
         equivalence: Some(evidence),
     })
+}
+
+/// The production read-only audit (`scan` -> `consume`) of `published`
+/// against the canonical archive, with an explicit classification pool, so a
+/// test can run the sequential path (`None`) and the pooled path on the same
+/// pinned snapshot. Returns (retained, expected, observed messages).
+#[cfg(test)]
+pub(super) fn audit_with_classify_pool(
+    db_path: &Path,
+    index_path: &Path,
+    published: PublishedSnapshot,
+    classify_pool: Option<ThreadPool>,
+) -> Result<(usize, usize, usize)> {
+    let storage = FrankenStorage::open_strict_readonly(db_path)?;
+    let snapshot = CanonicalSnapshot::begin(storage.raw())?;
+    let state = LexicalRebuildState::new(
+        super::lexical_rebuild_db_state(&storage, db_path)?,
+        super::LEXICAL_REBUILD_PAGE_SIZE,
+    );
+    let limits = ReplayLimits::capture();
+    let original_docs = usize::try_from(published.doc_count())?;
+    let mut observer = |_: Event| Ok(());
+    let mut replay = Replay {
+        live: index_path,
+        candidate: index_path,
+        state,
+        index: None,
+        published,
+        original_docs,
+        retained_docs: 0,
+        inserted_docs: 0,
+        pending_docs: 0,
+        pending_bytes: 0,
+        pending_conversations: 0,
+        pending_last_conversation_id: None,
+        commit_max_messages: limits.messages,
+        commit_max_bytes: limits.bytes,
+        commit_max_conversations: limits.conversations,
+        expected_docs: 0,
+        observed_messages: 0,
+        processed_conversations: 0,
+        last_conversation_id: None,
+        equivalence: LexicalRebuildEquivalenceAccumulator::new(),
+        progress: None,
+        progress_bump: None,
+        observer: &mut observer,
+        runtime: LexicalRebuildPipelineRuntimeSnapshot::default(),
+        classify_pool,
+    };
+    let scanned = replay.scan(&storage, limits.page_size);
+    snapshot.release()?;
+    storage.close_without_checkpoint()?;
+    scanned?;
+    Ok((
+        replay.retained_docs,
+        replay.expected_docs,
+        replay.observed_messages,
+    ))
 }
