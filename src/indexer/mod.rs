@@ -11821,8 +11821,32 @@ fn can_skip_absent_explicit_watch_once_index_run(opts: &IndexOptions) -> bool {
         storage.schema_version(),
         Ok(crate::storage::sqlite::CURRENT_SCHEMA_VERSION)
     );
+    // A provider can checkpoint and remove a selected WAL before this run.
+    // Ordinary missing transcript hooks stay cheap, but a surviving native
+    // OpenClaw database must be reconciled when an enabled root owns it.
+    let claimed_openclaw_database = db_schema_current
+        && opts.watch_once_paths.as_ref().is_some_and(|paths| {
+            if !paths
+                .iter()
+                .any(|path| openclaw_database_for_sidecar(path).is_some())
+            {
+                return false;
+            }
+            // This is a read-only preflight; do not sync source config into
+            // the archive just to establish ownership of the absent path.
+            let additional_scan_roots = build_scan_roots(Some(&storage), &opts.data_dir)
+                .into_iter()
+                .filter(|root| {
+                    !(root.origin.source_id == LOCAL_SOURCE_ID && root.path == opts.data_dir)
+                })
+                .collect();
+            let roots = build_watch_roots(additional_scan_roots);
+            classify_paths(paths.clone(), &roots, true)
+                .iter()
+                .any(|(kind, _, _, _)| *kind == ConnectorKind::OpenClaw)
+        });
     let _ = storage.close();
-    if !db_schema_current {
+    if !db_schema_current || claimed_openclaw_database {
         return false;
     }
 
@@ -33566,6 +33590,25 @@ fn is_database_watch_path(kind: ConnectorKind, path: &Path) -> bool {
     kind == ConnectorKind::Shelley
         || (kind == ConnectorKind::Devin
             && path.extension().is_some_and(|extension| extension == "db"))
+        || (kind == ConnectorKind::OpenClaw
+            && path
+                .file_name()
+                .is_some_and(|name| name == "openclaw-agent.sqlite"))
+}
+
+/// Return only the native OpenClaw sidecar's surviving owner. This identifies
+/// a source-family candidate, not a connector claim: classification still
+/// requires an enabled OpenClaw root covering the database.
+fn openclaw_database_for_sidecar(path: &Path) -> Option<PathBuf> {
+    if !path.file_name().is_some_and(|name| {
+        name == "openclaw-agent.sqlite-wal" || name == "openclaw-agent.sqlite-shm"
+    }) {
+        return None;
+    }
+    let database = path.with_file_name("openclaw-agent.sqlite");
+    database
+        .is_file()
+        .then(|| dunce::canonicalize(&database).unwrap_or(database))
 }
 
 /// Shelley and Devin take an explicit file root as their database and fail the
@@ -33584,8 +33627,8 @@ fn explicit_watch_once_file_may_be_database(kind: ConnectorKind, path: &Path) ->
 
 /// FSEvents (macOS) reports a write through a file descriptor that stays open
 /// only when that descriptor closes, and SQLite keeps a provider's `-wal` open
-/// for the life of its connection, so a running Devin or Shelley's WAL-only
-/// commits never arrive as events there (s1nqh). Poll each database root's
+/// for the life of its connection, so a running provider's WAL-only commits
+/// never arrive as events there (s1nqh). Poll each database root's
 /// directory at the watch interval as well, queueing only the database and its
 /// sidecars. The native watcher stays authoritative: a poll error is logged,
 /// never escalated to a full-root rescan.
@@ -37502,6 +37545,11 @@ fn explicit_watch_once_scan_path(
     requested: &Path,
     canonical: &Path,
 ) -> PathBuf {
+    if kind == ConnectorKind::OpenClaw
+        && let Some(database) = openclaw_database_for_sidecar(canonical)
+    {
+        return database;
+    }
     // Copilot's native reader recognizes state.vscdb, not its WAL. Keep the
     // targeted scan on that one database; scanning the parent would also
     // admit unrelated workspaces. Its connector checks the WAL's freshness.
@@ -37636,7 +37684,23 @@ fn classify_paths(
                 .then(|| explicit_watch_once_connector_hint(p))
                 .flatten()
         });
-        if let Ok(meta) = std::fs::metadata(p)
+        let openclaw_database = openclaw_database_for_sidecar(p);
+        let mut metadata_from_database = false;
+        let metadata = std::fs::metadata(p).or_else(|error| {
+            if prefer_explicit_paths
+                && error.kind() == std::io::ErrorKind::NotFound
+                && let Some(database) = &openclaw_database
+            {
+                // A checkpoint can remove WAL/SHM after the caller selected
+                // it. Only OpenClaw may use this owner's metadata below; a
+                // missing path must not revive another provider's scan/hint.
+                metadata_from_database = true;
+                std::fs::metadata(database)
+            } else {
+                Err(error)
+            }
+        });
+        if let Ok(meta) = metadata
             && let Ok(time) = meta.modified()
             && let Ok(dur) = time.duration_since(std::time::UNIX_EPOCH)
         {
@@ -37653,6 +37717,9 @@ fn classify_paths(
                 .zip(&match_root_paths)
                 .zip(&alternate_root_paths)
             {
+                if metadata_from_database && *kind != ConnectorKind::OpenClaw {
+                    continue;
+                }
                 if let Some(hinted_kind) = hinted_kind
                     && *kind != hinted_kind
                 {
@@ -37664,10 +37731,15 @@ fn classify_paths(
                 {
                     continue;
                 }
+                let source_path = if *kind == ConnectorKind::OpenClaw {
+                    openclaw_database.as_ref().unwrap_or(p)
+                } else {
+                    p
+                };
                 let under = |candidate: &PathBuf| {
-                    p.starts_with(candidate)
+                    source_path.starts_with(candidate)
                         || (is_database_watch_root(*kind, root)
-                            && database_sidecar_paths(candidate).contains(p))
+                            && database_sidecar_paths(candidate).contains(source_path))
                 };
                 if under(match_root_path) || alternate_root_path.as_ref().is_some_and(under) {
                     // Aliases can make a physical descendant's configured
@@ -37727,6 +37799,7 @@ fn classify_paths(
                 };
             }
             if prefer_explicit_paths
+                && !metadata_from_database
                 && !matched_root
                 && let Some(hinted_kind) = hinted_kind
             {
@@ -64189,6 +64262,66 @@ c.close()
     }
 
     #[test]
+    #[serial]
+    fn absent_openclaw_sidecars_with_a_claimed_owner_cannot_skip_index_setup() {
+        let _sources_guard = ignore_sources_config();
+        let tmp = TempDir::new().unwrap();
+        let state = tmp.path().join("openclaw-state");
+        let database = state.join("agents/main/agent/openclaw-agent.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"SQLite format 3\0").unwrap();
+        let _state_guard = set_env_var("OPENCLAW_STATE_DIR", state.to_string_lossy());
+        let data_dir = tmp.path().join("data");
+        let mut opts = watch_once_skip_test_options(data_dir.clone(), None);
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        ensure_fts_schema(&storage);
+        storage.close().unwrap();
+        let _index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+
+        for sidecar in database_sidecar_paths(&database) {
+            assert!(
+                !sidecar.exists(),
+                "model the provider's completed checkpoint"
+            );
+            opts.watch_once_paths = Some(vec![sidecar]);
+            assert!(should_skip_absent_explicit_watch_once_paths(&opts));
+            assert!(
+                !can_skip_absent_explicit_watch_once_index_run(&opts),
+                "an absent sidecar still selects its claimed surviving database"
+            );
+        }
+
+        let unclaimed_database = tmp.path().join("unclaimed/openclaw-agent.sqlite");
+        fs::create_dir_all(unclaimed_database.parent().unwrap()).unwrap();
+        fs::write(&unclaimed_database, b"SQLite format 3\0").unwrap();
+        for absent in [
+            database.parent().unwrap().join("future-session.jsonl"),
+            database_sidecar_paths(&unclaimed_database)[0].clone(),
+        ] {
+            opts.watch_once_paths = Some(vec![absent]);
+            assert!(
+                can_skip_absent_explicit_watch_once_index_run(&opts),
+                "missing transcripts and unclaimed database lookalikes remain no-ops"
+            );
+        }
+
+        let config_home = tmp.path().join("config");
+        fs::create_dir_all(config_home.join("cass")).unwrap();
+        fs::write(
+            config_home.join("cass/sources.toml"),
+            "disabled_agents = [\"openclaw\"]\n",
+        )
+        .unwrap();
+        let _config_guard = set_env_var("XDG_CONFIG_HOME", config_home.to_string_lossy());
+        let _respect_config = unset_env_var("CASS_IGNORE_SOURCES_CONFIG");
+        opts.watch_once_paths = Some(vec![database_sidecar_paths(&database)[0].clone()]);
+        assert!(
+            can_skip_absent_explicit_watch_once_index_run(&opts),
+            "a disabled connector must not claim the absent sidecar"
+        );
+    }
+
+    #[test]
     fn watch_once_authoritative_repair_skips_broad_followup_scan() {
         assert!(
             should_skip_broad_scan_after_watch_once_authoritative_repair(true, false, false, true)
@@ -69459,6 +69592,215 @@ c.close()
                     classify_paths(vec![neighbor.clone()], &roots, explicit).is_empty(),
                     "unrelated neighbor must not trigger Devin: {name}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn classify_openclaw_database_sidecars_preserves_root_and_rejects_neighbors() {
+        let tmp = TempDir::new().unwrap();
+        let database = tmp.path().join("openclaw-agent.sqlite");
+        fs::write(&database, b"SQLite format 3\0").unwrap();
+        let root = ScanRoot::remote(
+            database.clone(),
+            Origin::remote_with_host("openclaw-source", "openclaw-host"),
+            Some(Platform::Linux),
+        );
+        let roots = vec![(ConnectorKind::OpenClaw, root.clone())];
+        for event in std::iter::once(database.clone()).chain(database_sidecar_paths(&database)) {
+            fs::write(&event, b"provider event").unwrap();
+            for explicit in [false, true] {
+                let classified = classify_paths(vec![event.clone()], &roots, explicit);
+                assert_eq!(classified.len(), 1, "{}", event.display());
+                assert_eq!(classified[0].0, ConnectorKind::OpenClaw);
+                assert_eq!(
+                    classified[0].1.path,
+                    if explicit {
+                        dunce::canonicalize(&database).unwrap()
+                    } else {
+                        database.clone()
+                    }
+                );
+                assert_eq!(classified[0].1.origin, root.origin);
+                assert_eq!(classified[0].1.platform, root.platform);
+            }
+        }
+        for name in [
+            "other.sqlite-wal",
+            "openclaw-agent.sqlite-wal-extra",
+            "openclaw-agent.sqlite2-wal",
+            "session.jsonl",
+        ] {
+            let neighbor = tmp.path().join(name);
+            fs::write(&neighbor, b"unrelated event").unwrap();
+            for explicit in [false, true] {
+                assert!(classify_paths(vec![neighbor.clone()], &roots, explicit).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn classify_openclaw_sidecars_under_broad_roots_select_one_database_per_origin() {
+        let tmp = TempDir::new().unwrap();
+        let agents = tmp.path().join("agents");
+        let database = agents.join("selected/agent/openclaw-agent.sqlite");
+        let sibling = agents.join("sibling/agent/openclaw-agent.sqlite");
+        for path in [&database, &sibling] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"SQLite format 3\0").unwrap();
+        }
+        let [wal, shm] = database_sidecar_paths(&database);
+        for path in [&wal, &shm] {
+            fs::write(path, b"provider sidecar").unwrap();
+        }
+        let roots: Vec<_> = ["source-a", "source-b"]
+            .into_iter()
+            .map(|source| {
+                (
+                    ConnectorKind::OpenClaw,
+                    ScanRoot::remote(
+                        agents.clone(),
+                        Origin::remote(source),
+                        Some(Platform::Macos),
+                    ),
+                )
+            })
+            .collect();
+
+        for selected in [
+            vec![wal.clone()],
+            vec![shm.clone()],
+            vec![database.clone(), wal.clone(), shm],
+        ] {
+            let classified = classify_paths(selected, &roots, true);
+            assert_eq!(classified.len(), 2, "deduplicate within each source origin");
+            for (_, root, min_ts, max_ts) in &classified {
+                assert_eq!(root.path, dunce::canonicalize(&database).unwrap());
+                assert_eq!(root.platform, Some(Platform::Macos));
+                assert!(min_ts.is_some() && max_ts.is_some());
+            }
+            let sources: BTreeSet<_> = classified
+                .iter()
+                .map(|(_, root, _, _)| root.origin.source_id.as_str())
+                .collect();
+            assert_eq!(sources, BTreeSet::from(["source-a", "source-b"]));
+        }
+
+        let live = classify_paths(vec![wal.clone()], &roots, false);
+        assert_eq!(live.len(), 2);
+        for (_, root, _, _) in live {
+            assert_eq!(
+                root.path, agents,
+                "live events retain their configured root"
+            );
+        }
+        let other = classify_paths(
+            vec![wal.clone()],
+            &[(ConnectorKind::Claude, roots[0].1.clone())],
+            true,
+        );
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].1.path, dunce::canonicalize(&wal).unwrap());
+        assert!(classify_paths(vec![wal], &[], true).is_empty());
+    }
+
+    #[test]
+    fn classify_absent_openclaw_sidecars_only_recover_the_claimed_owner() {
+        let tmp = TempDir::new().unwrap();
+        let agents = tmp.path().join("agents");
+        let database = agents.join("selected/agent/openclaw-agent.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"SQLite format 3\0").unwrap();
+        let owner = dunce::canonicalize(&database).unwrap();
+        for root_path in [&agents, &database] {
+            let root = ScanRoot::remote(
+                root_path.clone(),
+                Origin::remote("selected-source"),
+                Some(Platform::Linux),
+            );
+            let roots = vec![
+                (ConnectorKind::OpenClaw, root.clone()),
+                (ConnectorKind::Claude, ScanRoot::local(agents.clone())),
+            ];
+            for sidecar in database_sidecar_paths(&database) {
+                assert!(!sidecar.exists());
+                let classified = classify_paths(vec![sidecar.clone()], &roots, true);
+                assert_eq!(classified.len(), 1);
+                assert_eq!(classified[0].0, ConnectorKind::OpenClaw);
+                assert_eq!(classified[0].1.path, owner);
+                assert_eq!(classified[0].1.origin, root.origin);
+                assert_eq!(classified[0].1.platform, root.platform);
+                assert!(classify_paths(vec![sidecar.clone()], &roots[1..], true).is_empty());
+                assert!(classify_paths(vec![sidecar], &[], true).is_empty());
+            }
+            assert!(
+                classify_paths(vec![agents.join("future-session.jsonl")], &roots, true).is_empty()
+            );
+        }
+
+        // An absent path with another provider's hint cannot borrow the
+        // database's metadata to activate that provider's fallback claim.
+        let hinted = tmp.path().join(".codex/sessions/openclaw-agent.sqlite");
+        fs::create_dir_all(hinted.parent().unwrap()).unwrap();
+        fs::write(&hinted, b"SQLite format 3\0").unwrap();
+        let roots = vec![(
+            ConnectorKind::Codex,
+            ScanRoot::local(tmp.path().to_path_buf()),
+        )];
+        for sidecar in database_sidecar_paths(&hinted) {
+            assert!(classify_paths(vec![sidecar.clone()], &roots, true).is_empty());
+            assert!(classify_paths(vec![sidecar], &[], true).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_openclaw_sidecar_aliases_coalesce_before_and_after_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let agents = tmp.path().join("agents");
+        let database = agents.join("selected/agent/openclaw-agent.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"SQLite format 3\0").unwrap();
+        let alias = tmp.path().join("agents-alias");
+        std::os::unix::fs::symlink(&agents, &alias).unwrap();
+        let aliased_database = alias.join("selected/agent/openclaw-agent.sqlite");
+        let [wal, shm] = database_sidecar_paths(&database);
+        for path in [&wal, &shm] {
+            fs::write(path, b"provider sidecar").unwrap();
+        }
+        let selected = [wal.clone(), shm.clone()]
+            .into_iter()
+            .chain(database_sidecar_paths(&aliased_database))
+            .chain([database.clone(), aliased_database.clone()])
+            .collect::<Vec<_>>();
+        for checkpointed in [false, true] {
+            if checkpointed {
+                // Model the provider's completed checkpoint, not a live race.
+                fs::remove_file(&wal).unwrap();
+                fs::remove_file(&shm).unwrap();
+            }
+            for root_path in [&alias, &aliased_database] {
+                let root = ScanRoot::remote(
+                    root_path.clone(),
+                    Origin::remote_with_host("alias-source", "alias-host"),
+                    Some(Platform::Linux),
+                );
+                let roots = [(ConnectorKind::OpenClaw, root.clone())];
+                for paths in selected
+                    .iter()
+                    .cloned()
+                    .map(|path| vec![path])
+                    .chain(std::iter::once(selected.clone()))
+                {
+                    let classified = classify_paths(paths, &roots, true);
+                    assert_eq!(classified.len(), 1, "checkpointed={checkpointed}");
+                    assert_eq!(
+                        classified[0].1.path,
+                        dunce::canonicalize(&database).unwrap()
+                    );
+                    assert_eq!(classified[0].1.origin, root.origin);
+                    assert_eq!(classified[0].1.platform, root.platform);
+                }
             }
         }
     }

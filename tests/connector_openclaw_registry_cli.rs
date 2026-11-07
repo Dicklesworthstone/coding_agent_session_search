@@ -486,8 +486,8 @@ mod registry_and_cli {
     }
 
     /// GH #502/#543: targeted watch-once must see a commit that lands only in
-    /// the WAL while the provider's writer stays open, whether the database
-    /// alone or the database plus its WAL is named. An intervening successful
+    /// the WAL while the provider's writer stays open, whether the database,
+    /// its WAL alone, or both are named. An intervening successful
     /// index of another source must not certify this source as already read.
     #[test]
     fn watch_once_reads_wal_only_commits_while_the_writer_stays_open() -> Result<()> {
@@ -532,6 +532,13 @@ mod registry_and_cli {
                 9,
                 "crosssourcesidecarneedle",
                 vec![database.as_path(), wal.as_path()],
+                true,
+            ),
+            (10, "walonlyselectionneedle", vec![wal.as_path()], false),
+            (
+                11,
+                "crosssourcewalonlyselectionneedle",
+                vec![wal.as_path()],
                 true,
             ),
         ] {
@@ -627,6 +634,104 @@ mod registry_and_cli {
         assert!(canonical_messages(&data, &unselected)?.is_empty());
         assert_eq!(bundle(&unselected)?, unselected_before);
         writer.close_without_checkpoint()?;
+        Ok(())
+    }
+
+    #[test]
+    fn watch_once_reads_checkpointed_history_from_a_vanished_wal_path() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let database = fixture(
+            home.path(),
+            "openclaw",
+            "checkpoint",
+            "beforecheckpointneedle",
+        )?;
+        let wal = sidecar(&database, "-wal");
+        let data = home.path().join("cass-data");
+        let writer = Connection::open(database.to_string_lossy().as_ref())?;
+        writer.execute("PRAGMA wal_autocheckpoint = 0")?;
+        watch_once(home.path(), &data, &[database.as_path()]);
+        let previous = canonical_messages(&data, &database)?;
+        assert_eq!(previous.len(), 2);
+        let seeded = native_search_message(
+            home.path(),
+            &data,
+            &database,
+            "beforecheckpointneedle",
+            &previous[0],
+        )?;
+        let main_before = bundle(&database)?.swap_remove(0);
+        append(
+            &writer,
+            "checkpoint",
+            6,
+            json!({"type": "message", "message": {"role": "user", "content": "checkpointedappendneedle"}}),
+        )?;
+        assert_eq!(bundle(&database)?.swap_remove(0), main_before);
+        assert!(search_hits(home.path(), &data, "checkpointedappendneedle")?.is_empty());
+
+        // A provider can checkpoint and remove its WAL after a hook records
+        // the path. Reconstruct that durable state without a scheduling race.
+        let checkpoint = writer.query("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let result = checkpoint.first().context("provider checkpoint result")?;
+        assert_eq!(
+            [
+                result.get_typed::<i64>(0)?,
+                result.get_typed::<i64>(1)?,
+                result.get_typed::<i64>(2)?,
+            ],
+            [0, 0, 0],
+            "provider checkpoint must finish and drain every WAL frame"
+        );
+        writer.close_without_checkpoint()?;
+        if wal.try_exists()? {
+            ensure!(
+                matches!(fs::metadata(&wal)?.len(), 0 | 32),
+                "only a fully drained WAL may leave the provider path"
+            );
+            // FrankenSQLite may retain an empty WAL after close. Preserve it
+            // as fixture evidence while making the recorded event path absent.
+            fs::rename(&wal, sidecar(&database, "-wal.checkpointed-fixture"))?;
+        }
+        assert!(!wal.try_exists()?);
+        let source_after_checkpoint = bundle(&database)?;
+        assert_ne!(source_after_checkpoint[0], main_before);
+        assert_eq!(canonical_messages(&data, &database)?, previous);
+
+        watch_once(home.path(), &data, &[wal.as_path()]);
+        let rows = canonical_append(
+            &data,
+            &database,
+            &previous,
+            seeded.conversation_id,
+            "checkpointedappendneedle",
+            AT + 6_000,
+        )?;
+        let appended = native_search_message(
+            home.path(),
+            &data,
+            &database,
+            "checkpointedappendneedle",
+            rows.last().context("checkpointed canonical message")?,
+        )?;
+        assert_eq!(
+            single_search_message(home.path(), &data, "beforecheckpointneedle")?,
+            seeded
+        );
+        assert_eq!(bundle(&database)?, source_after_checkpoint);
+        for paths in [vec![wal.as_path()], vec![database.as_path(), wal.as_path()]] {
+            watch_once(home.path(), &data, &paths);
+            assert_eq!(canonical_messages(&data, &database)?, rows);
+            assert_eq!(
+                single_search_message(home.path(), &data, "checkpointedappendneedle")?,
+                appended
+            );
+            assert_eq!(
+                single_search_message(home.path(), &data, "beforecheckpointneedle")?,
+                seeded
+            );
+            assert_eq!(bundle(&database)?, source_after_checkpoint);
+        }
         Ok(())
     }
 
