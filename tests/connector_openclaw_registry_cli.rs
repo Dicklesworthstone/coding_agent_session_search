@@ -507,7 +507,9 @@ mod registry_and_cli {
             let path = entry.path();
             ensure!(
                 entry.file_type()?.is_file()
-                    && path.extension().is_some_and(|extension| extension == "json"),
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension == "json"),
                 "unexpected raw manifest entry: {}",
                 path.display()
             );

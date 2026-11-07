@@ -862,3 +862,325 @@ fn cli_status_and_health_warn_about_watch_nomem_deferrals() -> anyhow::Result<()
     );
     Ok(())
 }
+
+#[test]
+fn cli_retry_resolves_archive_providers_without_clearing_mismatched_identities() -> anyhow::Result<()> {
+    #[derive(Debug, PartialEq, Eq)]
+    struct RetriedMessage {
+        conversation_id: i64,
+        external_id: String,
+        source_path: std::path::PathBuf,
+        message_id: i64,
+        idx: i64,
+        content: String,
+        created_at: Option<i64>,
+    }
+
+    for (registry_name, archived_provider, mismatched_provider, relative_path) in [
+        (
+            "claude",
+            "claude_code",
+            "claude",
+            ".claude/projects/-work-retry/selected.jsonl",
+        ),
+        (
+            "openclaw",
+            "openclaw/alice",
+            "openclaw/bob",
+            ".openclaw/agents/alice/sessions/selected.jsonl",
+        ),
+    ] {
+        let dir = tempdir()?;
+        let data_dir = dir.path().join("data");
+        let source_path = dir.path().join(relative_path);
+        let sibling_path = source_path.with_file_name("sibling.jsonl");
+        fs::create_dir_all(source_path.parent().context("source parent")?)?;
+        let events = if registry_name == "claude" {
+            vec![
+                serde_json::json!({
+                    "type": "user", "sessionId": "canonical-retry", "uuid": "retry-user",
+                    "cwd": "/work/retry", "timestamp": "2026-07-22T05:00:01.000Z",
+                    "message": {"role": "user", "content": "Recovery session\ncanonicalretryneedle"}
+                }),
+                serde_json::json!({
+                    "type": "assistant", "sessionId": "canonical-retry", "uuid": "retry-answer",
+                    "parentUuid": "retry-user", "timestamp": "2026-07-22T05:00:02.000Z",
+                    "message": {"role": "assistant", "content": "canonicalretryanswer"}
+                }),
+            ]
+        } else {
+            vec![
+                serde_json::json!({
+                    "type": "session", "id": "canonical-retry", "cwd": "/work/retry",
+                    "timestamp": "2026-07-22T05:00:00.000Z"
+                }),
+                serde_json::json!({
+                    "type": "message", "timestamp": "2026-07-22T05:00:01.000Z",
+                    "message": {"role": "user", "content": "Recovery session\ncanonicalretryneedle"}
+                }),
+                serde_json::json!({
+                    "type": "message", "timestamp": "2026-07-22T05:00:02.000Z",
+                    "message": {"role": "assistant", "content": "canonicalretryanswer"}
+                }),
+            ]
+        };
+        let source_text = events
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect::<String>();
+        fs::write(&source_path, &source_text)?;
+        fs::write(
+            &sibling_path,
+            source_text
+                .replace("canonical-retry", "unselected-retry")
+                .replace("canonicalretryneedle", "unselectedretryneedle")
+                .replace("canonicalretryanswer", "unselectedretryanswer"),
+        )?;
+
+        // A populated lexical generation makes every subsequent zero-hit
+        // assertion distinguish absence from a missing or unusable index.
+        let seed_path = dir.path().join(".codex/sessions/rollout-retry-baseline.jsonl");
+        fs::create_dir_all(seed_path.parent().context("seed parent")?)?;
+        fs::write(
+            &seed_path,
+            concat!(
+                "{\"timestamp\":\"2026-07-22T04:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"retry-baseline\",\"cwd\":\"/work/retry\"}}\n",
+                "{\"timestamp\":\"2026-07-22T04:00:01.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"retrybaselineneedle\"}]}}\n",
+            ),
+        )?;
+        let provider_before = [&source_path, &sibling_path, &seed_path]
+            .into_iter()
+            .map(|path| {
+                Ok((
+                    path.clone(),
+                    fs::read(path)?,
+                    fs::metadata(path)?.modified()?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let data_dir_arg = data_dir.to_str().context("UTF-8 data dir")?;
+        let run = |label: &str, args: &[&str]| -> anyhow::Result<serde_json::Value> {
+            let mut command = Command::new(cargo_bin("cass"));
+            command
+                .args(args)
+                .args(["--data-dir", data_dir_arg])
+                .current_dir(dir.path())
+                .env_clear()
+                .env("HOME", dir.path())
+                .env("USERPROFILE", dir.path())
+                .env("PATH", "")
+                .env("XDG_DATA_HOME", dir.path().join("xdg-data"))
+                .env("XDG_CONFIG_HOME", dir.path().join("xdg-config"))
+                .env("XDG_CACHE_HOME", dir.path().join("xdg-cache"))
+                .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+                .env("CASS_AUTO_REFRESH", "0")
+                .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+                .env("RUST_MIN_STACK", "134217728")
+                .env("NO_COLOR", "1");
+            if let Ok(system_root) = dotenvy::var("SystemRoot") {
+                command.env("SystemRoot", system_root);
+            }
+            let output =
+                spawn_with_timeout_or_diag(command, label, Some(&data_dir), COMMAND_TIMEOUT);
+            ensure!(
+                output.status.success(),
+                "{registry_name} {label}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice(&output.stdout).with_context(|| format!("{label} JSON"))
+        };
+        run(
+            "retry-populated-baseline",
+            &[
+                "index",
+                "--watch-once",
+                seed_path.to_str().context("UTF-8 seed path")?,
+                "--json",
+                "--no-progress-events",
+            ],
+        )?;
+        let search = |needle: &str| {
+            run(
+                "retry-search",
+                &[
+                    "search",
+                    needle,
+                    "--mode",
+                    "lexical",
+                    "--json",
+                    "--no-maintenance",
+                    "--limit",
+                    "10",
+                ],
+            )
+        };
+        ensure!(
+            search("retrybaselineneedle")?["hits"]
+                .as_array()
+                .context("baseline hits")?
+                .len()
+                == 1,
+            "the baseline must be searchable before recovery"
+        );
+
+        let (_, factory) = coding_agent_search::connectors::get_connector_factories()
+            .into_iter()
+            .find(|(name, _)| *name == registry_name)
+            .context("registered fixture connector")?;
+        let source_root = ScanRoot::local(source_path.clone());
+        let context = ScanContext::with_roots(
+            source_path.clone(),
+            vec![source_root],
+            None,
+        );
+        let conversations = factory().scan(&context)?;
+        ensure!(conversations.len() == 1, "retry discovery must select one source");
+        let conversation = conversations.first().context("fixture conversation")?;
+        ensure!(conversation.agent_slug == archived_provider);
+        ensure!(conversation.messages.len() == 2);
+        let workspace = conversation
+            .workspace
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        let identity = |provider: &str| {
+            format!(
+                "{}|{}|{}|{}|{}|{}|{}",
+                provider,
+                conversation.source_path.display(),
+                workspace,
+                conversation.external_id.as_deref().unwrap_or(""),
+                conversation.started_at.unwrap_or_default(),
+                conversation.ended_at.unwrap_or_default(),
+                conversation.messages.len()
+            )
+        };
+        let schema_version = u32::try_from(CURRENT_SCHEMA_VERSION)?;
+        let correct_id = identity(archived_provider);
+        let mismatched_id = identity(mismatched_provider);
+        let correct_key = format!("{correct_id}::v{schema_version}");
+        let mismatched_key = format!("{mismatched_id}::v{schema_version}");
+        let mut state = QuarantineState::default();
+        let mut poison = String::new();
+        for provider in [archived_provider, mismatched_provider] {
+            let conversation_id = identity(provider);
+            state.entries.insert(
+                format!("{conversation_id}::v{schema_version}"),
+                legacy_oom(1)?,
+            );
+            poison.push_str(&format!(
+                "{}\n",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "schema_version_at_quarantine": schema_version,
+                    "cass_version_at_quarantine": "0.0.1-old",
+                    "reason": "index-ingest-out-of-memory",
+                    "agent_slug": provider,
+                    "external_id": conversation.external_id.as_deref(),
+                    "source_path": conversation.source_path,
+                    "workspace": conversation.workspace.as_ref().map(|path| path.display().to_string()),
+                    "started_at": conversation.started_at,
+                    "ended_at": conversation.ended_at,
+                    "message_count": conversation.messages.len(),
+                })
+            ));
+        }
+        state.save(&data_dir)?;
+        let poison_path = data_dir.join("quarantine/index_ingest_poison.jsonl");
+        fs::create_dir_all(poison_path.parent().context("quarantine parent")?)?;
+        fs::write(&poison_path, &poison)?;
+        let state_path = QuarantineState::path(&data_dir);
+        let state_before = fs::read(&state_path)?;
+        let dry = run("retry-canonical-dry", &["quarantine", "retry", "--json"])?;
+        ensure!(dry["planned_attempts"] == 2);
+        ensure!(fs::read(&state_path)? == state_before);
+        ensure!(fs::read_to_string(&poison_path)? == poison);
+
+        let applied = run(
+            "retry-canonical-apply",
+            &["quarantine", "retry", "--apply", "--json"],
+        )?;
+        ensure!(applied["cleared"] == 1, "{applied}");
+        ensure!(applied["remaining_quarantined"] == 1, "{applied}");
+        let remaining = QuarantineState::load(&data_dir);
+        ensure!(!remaining.entries.contains_key(&correct_key));
+        ensure!(remaining.entries.contains_key(&mismatched_key));
+        let poison_after = fs::read_to_string(&poison_path)?
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        ensure!(poison_after.len() == 1);
+        ensure!(poison_after[0]["conversation_id"] == mismatched_id);
+        ensure!(poison_after[0]["agent_slug"] == mismatched_provider);
+
+        let read_rows = || -> anyhow::Result<Vec<RetriedMessage>> {
+            let storage = FrankenStorage::open_readonly(&data_dir.join("agent_search.db"))?;
+            let rows = storage.raw().query_map_collect(
+                "SELECT c.id, c.external_id, c.source_path, m.id, m.idx, m.content, m.created_at
+                 FROM conversations c JOIN agents a ON a.id = c.agent_id
+                 JOIN messages m ON m.conversation_id = c.id
+                 WHERE a.slug = ?1 ORDER BY m.id",
+                &[coding_agent_search::franken_sync::compat::ParamValue::from(archived_provider)],
+                |row| {
+                    Ok(RetriedMessage {
+                        conversation_id: row.get_typed(0)?,
+                        external_id: row.get_typed(1)?,
+                        source_path: std::path::PathBuf::from(row.get_typed::<String>(2)?),
+                        message_id: row.get_typed(3)?,
+                        idx: row.get_typed(4)?,
+                        content: row.get_typed(5)?,
+                        created_at: row.get_typed(6)?,
+                    })
+                },
+            )?;
+            storage.close_without_checkpoint()?;
+            Ok(rows)
+        };
+        let rows = read_rows()?;
+        ensure!(rows.len() == 2);
+        for (row, expected) in rows.iter().zip(&conversation.messages) {
+            ensure!(row.external_id == conversation.external_id.as_deref().context("external ID")?);
+            ensure!(dunce::canonicalize(&row.source_path)? == dunce::canonicalize(&source_path)?);
+            ensure!(row.idx == expected.idx);
+            ensure!(row.content == expected.content);
+            ensure!(row.created_at == expected.created_at);
+            ensure!(row.conversation_id == rows[0].conversation_id);
+        }
+        let found = search("canonicalretryneedle")?;
+        let hits = found["hits"].as_array().context("recovered hits")?;
+        ensure!(hits.len() == 1);
+        ensure!(hits[0]["agent"] == archived_provider);
+        ensure!(hits[0]["conversation_id"] == rows[0].conversation_id);
+        ensure!(
+            search("unselectedretryneedle")?["hits"]
+                .as_array()
+                .context("sibling hits")?
+                .is_empty()
+        );
+        ensure!(
+            search("retrybaselineneedle")?["hits"]
+                .as_array()
+                .context("retained baseline hits")?
+                .len()
+                == 1
+        );
+
+        let repeated = run(
+            "retry-canonical-repeat",
+            &["quarantine", "retry", "--apply", "--json"],
+        )?;
+        ensure!(repeated["cleared"] == 0);
+        ensure!(repeated["remaining_quarantined"] == 1);
+        ensure!(read_rows()? == rows, "repeat must preserve canonical identities");
+        for (path, bytes, modified) in provider_before {
+            ensure!(fs::read(&path)? == bytes, "provider bytes changed: {}", path.display());
+            ensure!(
+                fs::metadata(&path)?.modified()? == modified,
+                "provider mtime changed: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}

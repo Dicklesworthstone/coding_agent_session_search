@@ -38,7 +38,7 @@ class HarnessTests(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp(prefix="cass-harness-proof-")) / "repo with spaces 🔑"
         for directory in ("scripts", "tests", "src/connectors/codex"):
             (self.root / directory).mkdir(parents=True, exist_ok=True)
-        dependencies = ["anyhow", "blake3", "chrono", "dirs", "dotenvy", "serde_json", "tempfile", "thiserror", "tracing"]
+        dependencies = ["anyhow", "blake3", "chrono", "dirs", "dotenvy", "serde_json", "tempfile", "thiserror", "tracing", "walkdir"]
         manifest = '[package]\nname="fixture"\nversion="0.0.0"\n[dependencies]\n'
         manifest += ''.join(f'{name}="1"\n' for name in dependencies)
         manifest += f'{FAD}={{version="=0.3.10",git="{GIT}",rev="{REV}",features=["connectors","cursor","codex-zstd"]}}\n'

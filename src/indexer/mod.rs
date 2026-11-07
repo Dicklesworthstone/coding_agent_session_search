@@ -32127,7 +32127,7 @@ fn targeted_quarantine_retry_inner(
             source.source_path.display()
         );
     }
-    let kind = ConnectorKind::from_slug(&source.provider).with_context(|| {
+    let kind = ConnectorKind::from_archive_slug(&source.provider).with_context(|| {
         format!(
             "quarantine retry does not recognize connector provider {}",
             source.provider
@@ -32766,6 +32766,26 @@ impl ConnectorKind {
             "continue" => Some(Self::Continue),
             _ => None,
         }
+    }
+
+    /// Resolve an archived conversation's provider to its registered reader.
+    /// The caller must still compare the complete archive slug and source
+    /// identity: choosing the OpenClaw reader must not admit another agent.
+    fn from_archive_slug(slug: &str) -> Option<Self> {
+        let provider = if slug
+            .strip_prefix("openclaw/")
+            .is_some_and(|agent| !agent.is_empty())
+        {
+            "openclaw"
+        } else {
+            slug
+        };
+        crate::connectors::get_connector_registrations()
+            .into_iter()
+            .find(|registration| {
+                registration.name == provider || registration.source_slug == provider
+            })
+            .and_then(|registration| Self::from_slug(registration.name))
     }
 
     fn slug(self) -> &'static str {
@@ -59005,6 +59025,41 @@ mod tests {
             "failed operator commands must preserve malformed checkpoint bytes"
         );
         Ok(())
+    }
+
+    #[test]
+    fn quarantine_retry_resolves_archive_provider_names_without_changing_registry_names() {
+        for registration in crate::connectors::get_connector_registrations() {
+            let expected = ConnectorKind::from_slug(registration.name);
+            assert!(expected.is_some(), "{}", registration.name);
+            assert_eq!(
+                ConnectorKind::from_archive_slug(registration.source_slug),
+                expected,
+                "{}",
+                registration.source_slug
+            );
+        }
+        assert_eq!(
+            ConnectorKind::from_archive_slug("claude_code"),
+            Some(ConnectorKind::Claude)
+        );
+        for slug in ["openclaw/alice", "openclaw/研究-agent", "openclaw/agent-name"] {
+            assert_eq!(
+                ConnectorKind::from_archive_slug(slug),
+                Some(ConnectorKind::OpenClaw)
+            );
+            assert!(ConnectorKind::from_slug(slug).is_none());
+        }
+        for slug in [
+            "",
+            "unknown",
+            "openclaw/",
+            "openclaw-other/alice",
+            "other/openclaw/alice",
+        ] {
+            assert!(ConnectorKind::from_archive_slug(slug).is_none(), "{slug}");
+        }
+        assert!(ConnectorKind::from_slug("claude_code").is_none());
     }
 
     /// xaztn: dry-run classifies without mutation; apply reparses exactly the
