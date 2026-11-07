@@ -1034,6 +1034,9 @@ impl DownloadError {
 const MODEL_HTTP_BODY_SIZE_FLOOR_BYTES: u64 = 500 * 1024 * 1024;
 const MODEL_HTTP_BODY_SIZE_MARGIN_BYTES: u64 = 32 * 1024 * 1024;
 const MODEL_ACQUISITION_RECORD: &str = ".acquisition.json";
+// Lifecycle markers contain text metadata, never model payloads. Leave room
+// for extended-length Unicode source paths in from-file provenance.
+const MODEL_MARKER_MAX_BYTES: u64 = 256 * 1024;
 
 /// Keep the stable lock file in place: unlinking it would let a new installer
 /// lock a different inode while another process still owns the original lease.
@@ -1574,8 +1577,9 @@ impl ModelDownloader {
             existing_size = 0;
         }
 
-        // If already complete, skip download
-        if existing_size == expected_size {
+        // A missing zero-byte artifact still needs to be downloaded and
+        // materialized. Only an actual complete file can skip the request.
+        if existing_size == expected_size && path.is_file() {
             bytes_downloaded.fetch_add(expected_size, Ordering::SeqCst);
             return Ok(());
         }
@@ -1860,6 +1864,55 @@ impl ModelDownloader {
     }
 }
 
+/// Read lifecycle metadata without opening a pipe or allocating for an
+/// arbitrarily large file. Regular-file symlinks remain usable.
+pub(crate) fn read_model_marker(path: &Path) -> Result<String, DownloadError> {
+    if !fs::metadata(path)?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("model marker is not a regular file: {}", path.display()),
+        )
+        .into());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("model marker is not a regular file: {}", path.display()),
+        )
+        .into());
+    }
+    let oversized = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "model marker exceeds {MODEL_MARKER_MAX_BYTES} bytes: {}",
+                path.display()
+            ),
+        )
+    };
+    if metadata.len() > MODEL_MARKER_MAX_BYTES {
+        return Err(oversized().into());
+    }
+    // The extra byte detects a file growing after inspection while keeping
+    // the actual read bounded, regardless of its reported size.
+    let mut reader = file.take(MODEL_MARKER_MAX_BYTES + 1);
+    let mut content = String::new();
+    reader.read_to_string(&mut content)?;
+    if reader.limit() == 0 {
+        return Err(oversized().into());
+    }
+    Ok(content)
+}
+
 /// Compute SHA256 hash of a file.
 pub fn compute_sha256(path: &Path) -> Result<String, DownloadError> {
     let file = File::open(path)?;
@@ -1948,7 +2001,7 @@ fn classify_model_cache_state(
 
     let quarantine_marker = model_dir.join(".quarantined");
     if quarantine_marker.is_file() {
-        let reason = fs::read_to_string(&quarantine_marker)
+        let reason = read_model_marker(&quarantine_marker)
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -2036,7 +2089,7 @@ fn classify_model_cache_state(
         };
     }
 
-    let marker = match fs::read_to_string(&verified_marker) {
+    let marker = match read_model_marker(&verified_marker) {
         Ok(marker) => marker,
         Err(err) => {
             return ModelCacheState::QuarantinedCorrupt {
@@ -2108,7 +2161,7 @@ pub fn check_version_mismatch(model_dir: &Path, manifest: &ModelManifest) -> Opt
     }
 
     // Read installed revision
-    let content = fs::read_to_string(&verified_marker).ok()?;
+    let content = read_model_marker(&verified_marker).ok()?;
     let installed_revision = content
         .lines()
         .find(|l| l.starts_with("revision="))
@@ -2662,11 +2715,8 @@ mod tests {
             .and_then(|line| line.split_whitespace().nth(1))
             .unwrap_or("/");
         let path = target
-            .split_once('?')
-            .map(|(path, _)| path)
-            .unwrap_or(target)
-            .split_once('#')
-            .map(|(path, _)| path)
+            .split(['?', '#'])
+            .next()
             .unwrap_or(target)
             .to_string();
         let range_start = lines.find_map(parse_range_start_header);
@@ -2691,7 +2741,7 @@ mod tests {
         let start = range_start.unwrap_or(0) as usize;
         let mut status = "200 OK";
         let mut content_range = None;
-        let body = if start >= route.body.len() {
+        let body = if range_start.is_some() && start >= route.body.len() {
             status = "416 Range Not Satisfiable";
             &[][..]
         } else if start > 0 {
@@ -3241,6 +3291,99 @@ mod tests {
             report.state,
             ModelCacheState::QuarantinedCorrupt { reason, .. } if reason == "bad checksum"
         ));
+    }
+
+    #[test]
+    fn test_model_marker_read_limit_and_invalid_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join(".verified");
+        let source_path = format!(r"\\?\C:\{}", vec!["界".repeat(200); 140].join("\\"));
+        assert!(source_path.encode_utf16().count() < 32_767);
+        let manifest = build_test_manifest("repo/model", "rev1", &[("model.onnx", b"model")]);
+        let long_provenance = crate::search::model_acquisition::VerifiedMarker::for_from_file(
+            &manifest,
+            Path::new(&source_path),
+            "2026-06-15T00:00:00Z".into(),
+        )
+        .render();
+        assert!(long_provenance.len() > 64 * 1024);
+        fs::write(&marker, &long_provenance).unwrap();
+        assert_eq!(read_model_marker(&marker).unwrap(), long_provenance);
+
+        let content = "x".repeat(256 * 1024);
+        fs::write(&marker, &content).unwrap();
+        assert_eq!(read_model_marker(&marker).unwrap(), content);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&marker)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        assert!(matches!(
+            read_model_marker(&marker),
+            Err(DownloadError::IoError(error))
+                if error.kind() == std::io::ErrorKind::InvalidData
+                    && error.to_string().contains("exceeds 262144 bytes")
+        ));
+        assert_eq!(fs::metadata(&marker).unwrap().len(), 262_145);
+
+        fs::write(&marker, [0xff]).unwrap();
+        assert!(matches!(
+            read_model_marker(&marker),
+            Err(DownloadError::IoError(error))
+                if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert!(read_model_marker(&tmp.path().join("missing")).is_err());
+        assert!(matches!(
+            read_model_marker(tmp.path()),
+            Err(DownloadError::IoError(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn classify_cache_bounds_verified_and_quarantine_markers() {
+        for name in [".verified", ".quarantined"] {
+            let tmp = tempfile::tempdir().unwrap();
+            fs::write(tmp.path().join("model.onnx"), b"model").unwrap();
+            fs::write(
+                tmp.path().join(".verified"),
+                "revision=rev1\nsource=registry\n",
+            )
+            .unwrap();
+            let manifest = build_test_manifest("repo/model", "rev1", &[("model.onnx", b"model")]);
+            let policy = ModelAcquisitionPolicy::default();
+            assert!(classify_model_cache(tmp.path(), &manifest, &policy).is_usable());
+
+            let marker = tmp.path().join(name);
+            File::create(&marker)
+                .unwrap()
+                .set_len(64 * 1024 * 1024)
+                .unwrap();
+            let full = classify_model_cache(tmp.path(), &manifest, &policy);
+            let metadata = classify_model_cache_metadata(tmp.path(), &manifest, &policy);
+            assert_eq!(full.state_code(), "quarantined_corrupt");
+            assert_eq!(metadata.state_code(), "quarantined_corrupt");
+            assert!(!full.is_usable());
+            assert!(!metadata.is_usable());
+            assert_eq!(fs::metadata(&marker).unwrap().len(), 64 * 1024 * 1024);
+            assert_eq!(fs::read(tmp.path().join("model.onnx")).unwrap(), b"model");
+            if name == ".verified" {
+                assert!(check_version_mismatch(tmp.path(), &manifest).is_none());
+                assert!(matches!(
+                    full.state,
+                    ModelCacheState::QuarantinedCorrupt { reason, .. }
+                        if reason.contains("exceeds 262144 bytes")
+                ));
+            } else {
+                assert!(matches!(
+                    full.state,
+                    ModelCacheState::QuarantinedCorrupt { reason, .. }
+                        if reason == "model cache quarantined after integrity failure"
+                ));
+            }
+        }
     }
 
     #[test]
@@ -4217,6 +4360,126 @@ mod tests {
             !downloader.temp_dir.exists(),
             "verification failures should discard the temp directory to avoid reusing corrupt data"
         );
+    }
+
+    #[test]
+    fn test_empty_mirror_artifact_is_downloaded_unless_a_complete_file_exists() {
+        for preexisting in [false, true] {
+            let manifest = build_test_manifest(
+                "mirror/empty-model",
+                "empty-revision",
+                &[("empty.bin", b"")],
+            );
+            let server = start_mirror_fixture_server(vec![(
+                mirror_route_path("/cache", &manifest, &manifest.files[0]),
+                MirrorRoute {
+                    body: Vec::new(),
+                    content_type: "application/octet-stream",
+                    chunk_size: 64,
+                    chunk_delay: Duration::ZERO,
+                },
+            )]);
+            let tmp = tempfile::tempdir().unwrap();
+            let downloader = ModelDownloader::new(tmp.path().join("model"));
+            let mirror_base = format!("{}/cache", server.base_url);
+            if preexisting {
+                downloader
+                    .prepare_acquisition(&manifest, &format!("mirror:{mirror_base}"), true)
+                    .unwrap();
+                fs::write(downloader.temp_dir.join("empty.bin"), b"").unwrap();
+            }
+
+            downloader
+                .download_with_mirror(&manifest, Some(&mirror_base), None)
+                .unwrap();
+
+            let installed = downloader.target_dir.join("empty.bin");
+            assert!(installed.is_file());
+            assert_eq!(fs::metadata(&installed).unwrap().len(), 0);
+            assert_eq!(
+                compute_sha256(&installed).unwrap(),
+                manifest.files[0].sha256
+            );
+            let marker = fs::read_to_string(downloader.target_dir.join(".verified")).unwrap();
+            assert!(marker.contains("revision=empty-revision\n"));
+            assert!(marker.contains(&format!("source=mirror:{mirror_base}\n")));
+            let requests = server.requests();
+            assert_eq!(requests.len(), if preexisting { 0 } else { 1 });
+            assert!(requests.iter().all(|request| request.range_start.is_none()));
+        }
+    }
+
+    #[test]
+    fn test_empty_mirror_artifact_rejects_unexpected_payload_without_replacing_model() {
+        let manifest = build_test_manifest(
+            "mirror/empty-model",
+            "empty-revision",
+            &[("empty.bin", b"")],
+        );
+        let server = start_mirror_fixture_server(vec![(
+            mirror_route_path("/cache", &manifest, &manifest.files[0]),
+            MirrorRoute {
+                body: b"unexpected payload".to_vec(),
+                content_type: "application/octet-stream",
+                chunk_size: 64,
+                chunk_delay: Duration::ZERO,
+            },
+        )]);
+        let tmp = tempfile::tempdir().unwrap();
+        let (downloader, _, _) = offline_install_fixture(tmp.path());
+        let mirror_base = format!("{}/cache", server.base_url);
+
+        assert!(matches!(
+            downloader.download_with_mirror(&manifest, Some(&mirror_base), None),
+            Err(DownloadError::VerificationFailed { .. })
+        ));
+
+        assert_prior_install_unchanged(&downloader);
+        assert!(!downloader.target_dir.join("empty.bin").exists());
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn test_empty_mirror_route_accepts_plain_get_and_rejects_unsatisfiable_range() {
+        let server = start_mirror_fixture_server(vec![(
+            "/empty".to_string(),
+            MirrorRoute {
+                body: Vec::new(),
+                content_type: "application/octet-stream",
+                chunk_size: 64,
+                chunk_delay: Duration::ZERO,
+            },
+        )]);
+        crate::ensure_rustls_crypto_provider();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("{}/empty", server.base_url);
+        let ordinary = client.get(&url).send().unwrap();
+        assert_eq!(ordinary.status().as_u16(), 200);
+        assert!(ordinary.bytes().unwrap().is_empty());
+        let ranged = client.get(&url).header("Range", "bytes=0-").send().unwrap();
+        assert_eq!(ranged.status().as_u16(), 416);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].range_start, None);
+        assert_eq!(requests[1].range_start, Some(0));
+
+        let queried = client.get(format!("{url}?download=1")).send().unwrap();
+        assert_eq!(queried.status().as_u16(), 200);
+        assert!(queried.bytes().unwrap().is_empty());
+        let missing = client
+            .get(format!("{}/missing?download=1", server.base_url))
+            .send()
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
+        assert_eq!(missing.text().unwrap(), "not found");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[2].path, "/empty");
+        assert_eq!(requests[2].range_start, None);
+        assert_eq!(requests[3].path, "/missing");
     }
 
     #[test]

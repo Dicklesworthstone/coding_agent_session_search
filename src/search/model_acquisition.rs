@@ -48,7 +48,9 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::search::model_download::{ModelManifest, compute_sha256, model_file_path};
+use crate::search::model_download::{
+    ModelManifest, compute_sha256, model_file_path, read_model_marker,
+};
 use crate::search::semantic_readiness::FallbackMode;
 
 /// The on-disk name of the post-install verification marker. Kept identical to
@@ -782,7 +784,7 @@ pub(crate) fn probe_on_disk(
     let files_present = present == manifest.files.len() && !manifest.files.is_empty();
     let partial_present = present > 0 && !files_present;
 
-    let source = std::fs::read_to_string(model_dir.join(VERIFIED_MARKER_NAME))
+    let source = read_model_marker(&model_dir.join(VERIFIED_MARKER_NAME))
         .ok()
         .and_then(|c| VerifiedMarker::parse(&c))
         .map(|m| m.source)
@@ -1348,6 +1350,61 @@ mod tests {
         assert_eq!(signals.source, ModelSource::FromFile);
         assert_eq!(signals.state(), ModelAcquisitionState::Ready);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_fifo_marker_does_not_block() {
+        const CHILD_ROOT: &str = "CASS_TEST_MODEL_MARKER_FIFO_CHILD_ROOT";
+        let Some(root) = std::env::var_os(CHILD_ROOT) else {
+            let tmp = tempfile::tempdir().unwrap();
+            let full_name = concat!(module_path!(), "::probe_fifo_marker_does_not_block");
+            let (_, test_name) = full_name.split_once("::").unwrap();
+            assert_cmd::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD_ROOT, tmp.path())
+                .timeout(std::time::Duration::from_secs(5))
+                .assert()
+                .success()
+                .stdout(predicates::str::contains("1 passed; 0 failed"));
+            return;
+        };
+        let dir = std::path::PathBuf::from(root);
+        let manifest = synthetic_manifest(&[("model.onnx", "weights"), ("tokenizer.json", "v")]);
+        write(&dir, "model.onnx", "weights");
+        write(&dir, "tokenizer.json", "v");
+        let content = VerifiedMarker::for_from_file(
+            &manifest,
+            Path::new("/srv/airgap"),
+            "2026-06-15T00:00:00Z".into(),
+        )
+        .render();
+        write(&dir, VERIFIED_MARKER_NAME, &content);
+        let regular = probe_on_disk(&dir, &manifest, RuntimeLoadability::NotProbed, policy(None));
+        assert!(regular.files_present && regular.checksum_ok);
+        assert_eq!(regular.source, ModelSource::FromFile);
+
+        let marker = dir.join(VERIFIED_MARKER_NAME);
+        let saved = dir.join("saved-verified-marker");
+        std::fs::rename(&marker, &saved).unwrap();
+        std::os::unix::fs::symlink(&saved, &marker).unwrap();
+        let linked = probe_on_disk(&dir, &manifest, RuntimeLoadability::NotProbed, policy(None));
+        assert!(linked.files_present && linked.checksum_ok);
+        assert_eq!(linked.source, ModelSource::FromFile);
+        std::fs::rename(&marker, dir.join("marker-symlink")).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&marker)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let refused = probe_on_disk(&dir, &manifest, RuntimeLoadability::NotProbed, policy(None));
+        assert!(refused.files_present && refused.checksum_ok);
+        assert_eq!(refused.source, ModelSource::Preseeded);
+        assert!(read_model_marker(&marker).is_err());
+        assert_eq!(std::fs::read_to_string(saved).unwrap(), content);
+        assert_eq!(std::fs::read(dir.join("model.onnx")).unwrap(), b"weights");
     }
 
     #[test]
