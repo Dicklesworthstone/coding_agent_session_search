@@ -17780,6 +17780,7 @@ pub(crate) fn mirrored_root_owners(root: &ScanRoot) -> Option<&'static [&'static
         .find_map(|component| match component {
             ".claude" => Some(&["claude"][..]),
             ".codex" => Some(&["codex"][..]),
+            ".openclaw" => Some(&["openclaw"][..]),
             ".pi" => Some(&["pi_agent", "pi_durable"][..]),
             ".prime" => Some(&["prime_agent"][..]),
             ".omp" | "omp" => Some(&["omp"][..]),
@@ -33785,6 +33786,148 @@ struct WatchRootRefresh {
     database_roots: BTreeSet<PathBuf>,
 }
 
+#[derive(Default)]
+struct WatchDatabaseDiscovery {
+    paths: BTreeSet<PathBuf>,
+    incomplete: bool,
+}
+
+impl WatchDatabaseDiscovery {
+    fn record_error(&mut self, path: &Path, error: &std::io::Error) {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ) {
+            return;
+        }
+        self.incomplete = true;
+        tracing::warn!(path = %path.display(), %error, "OpenClaw database discovery incomplete; retrying source registration");
+    }
+
+    fn observe_file(
+        &mut self,
+        path: PathBuf,
+        progress: Option<&Arc<IndexingProgress>>,
+    ) -> Result<()> {
+        if let Some(progress) = progress {
+            progress.check_stop()?;
+        }
+        let observed = fs::metadata(&path);
+        if let Some(progress) = progress {
+            progress.tick_activity();
+            progress.check_stop()?;
+        }
+        match observed {
+            Ok(metadata) if metadata.is_file() => {
+                self.paths.insert(path);
+            }
+            Ok(_) => {}
+            Err(error) => self.record_error(&path, &error),
+        }
+        Ok(())
+    }
+}
+
+/// Expand only the native database layouts admitted by OpenClaw's connector.
+/// Inspect fixed candidate paths and immediate agent entries; session logs and
+/// database contents are never traversed here. Repeating this metadata census
+/// at the existing registration cooldown enrolls stores created after startup.
+fn discover_openclaw_watch_databases(
+    root: &ScanRoot,
+    progress: Option<&Arc<IndexingProgress>>,
+) -> Result<WatchDatabaseDiscovery> {
+    const DATABASE_NAME: &str = "openclaw-agent.sqlite";
+    let path = &root.path;
+    let mut discovered = WatchDatabaseDiscovery::default();
+    if let Some(progress) = progress {
+        progress.check_stop()?;
+    }
+    let metadata = fs::metadata(path);
+    if let Some(progress) = progress {
+        progress.tick_activity();
+        progress.check_stop()?;
+    }
+    match metadata {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(metadata)
+            if metadata.is_file() && is_database_watch_path(ConnectorKind::OpenClaw, path) =>
+        {
+            discovered.paths.insert(path.to_path_buf());
+            return Ok(discovered);
+        }
+        Ok(_) => return Ok(discovered),
+        Err(error) => {
+            discovered.record_error(path, &error);
+            return Ok(discovered);
+        }
+    }
+
+    let agents_roots = if let Some(agents) = root.mirrored_store(&[".openclaw", "agents"]) {
+        // A transport container's opaque name is not its provider identity.
+        // Match the connector's resolved store exactly, including contents
+        // copies, without admitting unrelated siblings in the container.
+        BTreeSet::from([agents])
+    } else {
+        // An explicitly configured root may be one agent or its agent/ directory.
+        discovered.observe_file(path.join("agent").join(DATABASE_NAME), progress)?;
+        discovered.observe_file(path.join(DATABASE_NAME), progress)?;
+        let mut agents_roots = BTreeSet::from([path.join(".openclaw").join("agents")]);
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some(".openclaw") => {
+                agents_roots.insert(path.join("agents"));
+            }
+            Some("agents") => {
+                agents_roots.insert(path.to_path_buf());
+            }
+            _ => {}
+        }
+        agents_roots
+    };
+    for agents in agents_roots {
+        if let Some(progress) = progress {
+            progress.check_stop()?;
+        }
+        let entries = fs::read_dir(&agents);
+        if let Some(progress) = progress {
+            progress.tick_activity();
+            progress.check_stop()?;
+        }
+        let entries = match entries {
+            Ok(entries) => entries,
+            Err(error) => {
+                discovered.record_error(&agents, &error);
+                continue;
+            }
+        };
+        for entry in entries {
+            if let Some(progress) = progress {
+                progress.tick_activity();
+                progress.check_stop()?;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    discovered.record_error(&agents, &error);
+                    continue;
+                }
+            };
+            // FAD intentionally does not follow symlinked agent directories.
+            // Keep poll coverage inside that same provider discovery boundary.
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => {
+                    discovered.observe_file(
+                        entry.path().join("agent").join(DATABASE_NAME),
+                        progress,
+                    )?;
+                }
+                Ok(_) => {}
+                Err(error) => discovered.record_error(&entry.path(), &error),
+            }
+        }
+    }
+    Ok(discovered)
+}
+
 /// Native backends can share one watch descriptor between aliases and nested
 /// recursive registrations. Removing either registration then removes the
 /// other's coverage too. Canonical targets must have disjoint recursive
@@ -33813,17 +33956,56 @@ fn coalesce_native_watch_targets(
 
 /// Native watches follow filesystem objects, not a permanently live pathname.
 /// A failed initial registration or a replaced root needs another registration
-/// and a census after it. Inspect only distinct roots, never their descendants;
-/// unchanged healthy registrations do not request a scan.
+/// and a census after it. OpenClaw directory roots also admit their shallow
+/// native database layout so WAL polling covers broad overrides and mirrors.
+/// Unchanged healthy registrations do not request a scan.
 fn refresh_watch_root_registrations<W: Watcher>(
     watcher: &mut W,
     roots: &[(ConnectorKind, ScanRoot)],
     registered: &mut BTreeMap<PathBuf, WatchRootRegistration>,
     progress: Option<&Arc<IndexingProgress>>,
 ) -> Result<WatchRootRefresh> {
+    // Derived roots are registration evidence only. The callback still uses
+    // the caller's original roots, preserving source provenance and scan scope.
+    let mut registration_roots = roots.to_vec();
+    let mut database_discoveries = BTreeMap::new();
+    let mut database_paths: HashSet<PathBuf> = roots
+        .iter()
+        .filter(|(kind, _)| *kind == ConnectorKind::OpenClaw)
+        .map(|(_, root)| root.path.clone())
+        .collect();
+    let mut discovery_retries = BTreeSet::new();
+    for (kind, root) in roots {
+        if *kind != ConnectorKind::OpenClaw {
+            continue;
+        }
+        let discovery_key = (
+            root.path.clone(),
+            root.origin.is_remote(),
+            root.mirrored_source_path.clone(),
+        );
+        let discovered = match database_discoveries.entry(discovery_key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(discover_openclaw_watch_databases(root, progress)?)
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+        };
+        if discovered.incomplete {
+            discovery_retries.insert(root.path.clone());
+        }
+        for database in &discovered.paths {
+            if database_paths.insert(database.clone()) {
+                registration_roots.push((*kind, root.with_path(database.clone())));
+            }
+        }
+    }
+    let roots = registration_roots.as_slice();
     let mut observations = BTreeMap::new();
     let mut source_bindings = BTreeMap::new();
-    let mut refreshed = WatchRootRefresh::default();
+    let mut refreshed = WatchRootRefresh {
+        reconcile: discovery_retries,
+        ..WatchRootRefresh::default()
+    };
     for (_, root) in roots {
         if let std::collections::btree_map::Entry::Vacant(entry) =
             observations.entry(root.path.clone())
@@ -34127,7 +34309,8 @@ where
     let mut pending_rescan = !pending.extend(
         deferred_sources
             .into_iter()
-            .chain(roots.iter().map(|(_, root)| root.path.clone())),
+            .chain(roots.iter().map(|(_, root)| root.path.clone()))
+            .chain(initial_roots.reconcile),
     );
     let mut first_event = (pending_rescan || !pending.paths.is_empty()).then(Instant::now);
     let mut last_stale_check = Instant::now();
@@ -34899,6 +35082,344 @@ mod watch_registration_tests {
                 .reconcile
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn openclaw_database_poll_discovery_preserves_layout_scope_and_provenance() {
+        let temp = TempDir::new().unwrap();
+        let mirror = temp.path().join("opaque-mirror");
+        let agents = mirror.join(".openclaw/agents");
+        let alice = agents.join("alice");
+        let bob = agents.join("bob");
+        let first = alice.join("agent/openclaw-agent.sqlite");
+        let second = bob.join("agent/openclaw-agent.sqlite");
+        let sessions = alice.join("sessions");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(&first, b"SQLite format 3\0").unwrap();
+        fs::write(&second, b"SQLite format 3\0").unwrap();
+        let jsonl = sessions.join("selected.jsonl");
+        fs::write(&jsonl, "{}\n").unwrap();
+        fs::write(alice.join("agent/unrelated.sqlite"), b"unrelated database").unwrap();
+        let outside = temp.path().join("outside-agent");
+        fs::create_dir_all(outside.join("agent")).unwrap();
+        fs::write(
+            outside.join("agent/openclaw-agent.sqlite"),
+            b"outside the selected provider tree",
+        )
+        .unwrap();
+        symlink(&outside, agents.join("linked-agent")).unwrap();
+
+        for root in [mirror.clone(), mirror.join(".openclaw"), agents.clone()] {
+            let found = discover_openclaw_watch_databases(&ScanRoot::local(root.clone()), None).unwrap();
+            assert_eq!(
+                found.paths,
+                BTreeSet::from([first.clone(), second.clone()]),
+                "discover only admitted native stores under {}",
+                root.display()
+            );
+            assert!(!found.incomplete);
+        }
+        for root in [alice.clone(), alice.join("agent"), first.clone()] {
+            let found = discover_openclaw_watch_databases(&ScanRoot::local(root.clone()), None).unwrap();
+            assert_eq!(found.paths, BTreeSet::from([first.clone()]));
+            assert!(!found.incomplete);
+        }
+        for root in [sessions, jsonl, temp.path().join("not-present")] {
+            let found = discover_openclaw_watch_databases(&ScanRoot::local(root.clone()), None).unwrap();
+            assert!(found.paths.is_empty(), "narrow log roots must stay narrow");
+            assert!(!found.incomplete);
+        }
+
+        let root = ScanRoot::remote(
+            mirror.clone(),
+            Origin::remote_with_host("remote-openclaw", "synthetic.invalid"),
+            Some(Platform::Linux),
+        )
+        .with_mirrored_source_path("~/.openclaw");
+        let roots = vec![(ConnectorKind::OpenClaw, root.clone())];
+        let mut watcher = recommended_watcher(|_| {}).unwrap();
+        let mut registered = BTreeMap::new();
+        let selected =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert_eq!(
+            selected.database_roots,
+            BTreeSet::from([first.clone(), second.clone()])
+        );
+        assert_eq!(registered.len(), 1, "one recursive native watch covers the mirror");
+        assert!(
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None)
+                .unwrap()
+                .reconcile
+                .is_empty(),
+            "unchanged discovery must not manufacture scans"
+        );
+
+        let wal = database_sidecar_paths(&first)[0].clone();
+        fs::write(&wal, b"provider WAL event").unwrap();
+        let classified = classify_paths(vec![wal], &roots, false);
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::OpenClaw);
+        assert_eq!(classified[0].1.path, root.path);
+        assert_eq!(classified[0].1.origin, root.origin);
+        assert_eq!(classified[0].1.platform, root.platform);
+        assert_eq!(classified[0].1.mirrored_source_path, root.mirrored_source_path);
+
+        let no_openclaw = vec![(ConnectorKind::Codex, ScanRoot::local(mirror))];
+        assert!(
+            refresh_watch_root_registrations(
+                &mut watcher,
+                &no_openclaw,
+                &mut registered,
+                None,
+            )
+            .unwrap()
+            .database_roots
+            .is_empty(),
+            "a disabled or unselected connector has no database poll coverage"
+        );
+        let progress = Arc::new(IndexingProgress::default());
+        progress.request_stop();
+        assert!(
+            discover_openclaw_watch_databases(&ScanRoot::local(agents), Some(&progress)).is_err(),
+            "cancellation must not become an ordinary discovery retry"
+        );
+    }
+
+    #[test]
+    fn openclaw_mirror_poll_discovery_resolves_only_the_selected_provider_store() {
+        let temp = TempDir::new().unwrap();
+        for (index, (source, suffix)) in [
+            ("~/.openclaw", ".openclaw/agents"),
+            ("~/.openclaw/agents", "agents"),
+            ("~/.openclaw/", "agents"),
+            ("~/.openclaw/agents/", ""),
+            (r"C:\Users\fixture\.openclaw\agents", "agents"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let container = temp.path().join(format!("opaque-{index}"));
+            let agents = container.join(suffix);
+            let database = agents.join("selected/agent/openclaw-agent.sqlite");
+            fs::create_dir_all(database.parent().unwrap()).unwrap();
+            fs::write(&database, b"selected native database").unwrap();
+            // Structural fallback would admit this file. Once provenance
+            // resolves an agents store, transport siblings must stay outside it.
+            let unrelated = container.join("openclaw-agent.sqlite");
+            fs::write(&unrelated, b"outside the selected agents store").unwrap();
+            let root = ScanRoot::remote(
+                container,
+                Origin::remote_with_host("mirror", "synthetic.invalid"),
+                Some(Platform::Linux),
+            )
+            .with_mirrored_source_path(source);
+            let found = discover_openclaw_watch_databases(&root, None).unwrap();
+            assert_eq!(found.paths, BTreeSet::from([database.clone()]), "{source}");
+            assert!(!found.incomplete);
+            let roots = vec![(ConnectorKind::OpenClaw, root.clone())];
+            let mut watcher = recommended_watcher(|_| {}).unwrap();
+            let mut registered = BTreeMap::new();
+            let selected =
+                refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None)
+                    .unwrap();
+            assert_eq!(selected.database_roots, BTreeSet::from([database.clone()]));
+            assert_eq!(registered.len(), 1);
+            let wal = database_sidecar_paths(&database)[0].clone();
+            fs::write(&wal, b"selected provider event").unwrap();
+            let classified = classify_paths(vec![wal], &roots, false);
+            assert_eq!(classified.len(), 1);
+            assert_eq!(classified[0].1.path, root.path);
+            assert_eq!(classified[0].1.origin, root.origin);
+            assert_eq!(classified[0].1.mirrored_source_path, root.mirrored_source_path);
+            assert_eq!(fs::read(&unrelated).unwrap(), b"outside the selected agents store");
+        }
+
+        // Agent-subtree contents copies already have a valid fixed-path
+        // native layout. OpenClaw does not opt into generic subtree expansion;
+        // a partial source must not be mistaken for a parent of all agents.
+        for (index, (source, database_relative)) in [
+            ("~/.openclaw/agents/alice/", "agent/openclaw-agent.sqlite"),
+            ("~/.openclaw/agents/alice/agent/", "openclaw-agent.sqlite"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let container = temp.path().join(format!("partial-opaque-{index}"));
+            let database = container.join(database_relative);
+            fs::create_dir_all(database.parent().unwrap()).unwrap();
+            fs::write(&database, b"selected partial native store").unwrap();
+            let sibling = container.join("unrelated/agent/openclaw-agent.sqlite");
+            fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+            fs::write(&sibling, b"unselected sibling store").unwrap();
+            let root = ScanRoot::remote(
+                container,
+                Origin::remote_with_host("partial", "synthetic.invalid"),
+                None,
+            )
+            .with_mirrored_source_path(source);
+            assert!(root.mirrored_store(&[".openclaw", "agents"]).is_none());
+            let found = discover_openclaw_watch_databases(&root, None).unwrap();
+            assert_eq!(found.paths, BTreeSet::from([database]), "{source}");
+            assert!(!found.incomplete);
+            assert_eq!(fs::read(&sibling).unwrap(), b"unselected sibling store");
+        }
+
+        // Cache entries must include the identity used by mirror resolution.
+        // Local/unannotated roots sharing this physical container do not resolve
+        // the store; neither may hide the later annotated remote root.
+        let container = temp.path().join("shared-opaque");
+        let database = container.join("agents/selected/agent/openclaw-agent.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"selected native database").unwrap();
+        let remote = ScanRoot::remote(
+            container.clone(),
+            Origin::remote_with_host("annotated", "synthetic.invalid"),
+            None,
+        )
+        .with_mirrored_source_path("~/.openclaw/agents");
+        let local =
+            ScanRoot::local(container.clone()).with_mirrored_source_path("~/.openclaw/agents");
+        let unannotated = ScanRoot::remote(
+            container.clone(),
+            Origin::remote_with_host("unannotated", "synthetic.invalid"),
+            None,
+        );
+        for root in [&local, &unannotated] {
+            assert!(
+                discover_openclaw_watch_databases(root, None)
+                    .unwrap()
+                    .paths
+                    .is_empty()
+            );
+        }
+        let roots = vec![
+            (ConnectorKind::OpenClaw, local),
+            (ConnectorKind::OpenClaw, unannotated),
+            (ConnectorKind::OpenClaw, remote),
+        ];
+        let mut watcher = recommended_watcher(|_| {}).unwrap();
+        let mut registered = BTreeMap::new();
+        let selected =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert_eq!(selected.database_roots, BTreeSet::from([database]));
+
+        for source in [
+            "~/agents",
+            "~/.codex/agents",
+            "~/.openclaw-backup/agents",
+            "~/.openclaw/agents/../agents",
+            "~/.openclaw/agents/./",
+            "~/.openclaw/agents/\n",
+        ] {
+            let root = ScanRoot::remote(
+                container.clone(),
+                Origin::remote_with_host("rejected", "synthetic.invalid"),
+                None,
+            )
+            .with_mirrored_source_path(source);
+            let found = discover_openclaw_watch_databases(&root, None).unwrap();
+            assert!(found.paths.is_empty(), "{source:?}");
+            assert!(!found.incomplete);
+        }
+
+        let linked_container = temp.path().join("linked-opaque");
+        fs::create_dir(&linked_container).unwrap();
+        symlink(container.join("agents"), linked_container.join("agents")).unwrap();
+        let linked = ScanRoot::remote(
+            linked_container,
+            Origin::remote_with_host("linked", "synthetic.invalid"),
+            None,
+        )
+        .with_mirrored_source_path("~/.openclaw/agents");
+        assert!(
+            discover_openclaw_watch_databases(&linked, None)
+                .unwrap()
+                .paths
+                .is_empty(),
+            "an inferred mirror path must not follow a symlink"
+        );
+    }
+
+    #[test]
+    fn openclaw_broad_root_enrolls_new_and_replaced_databases_for_polling() {
+        let temp = TempDir::new().unwrap();
+        let agents = temp.path().join("agents");
+        fs::create_dir(&agents).unwrap();
+        let roots = vec![(ConnectorKind::OpenClaw, ScanRoot::local(agents.clone()))];
+        // Discard native events: only the database poller below feeds its mailbox.
+        let mut watcher = recommended_watcher(|_| {}).unwrap();
+        let mut registered = BTreeMap::new();
+        let initial =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert!(initial.database_roots.is_empty());
+        assert_eq!(registered.len(), 1);
+
+        let database = agents.join("arriving/agent/openclaw-agent.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"first native database").unwrap();
+        let arriving =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert_eq!(arriving.database_roots, BTreeSet::from([database.clone()]));
+        assert_eq!(arriving.reconcile, BTreeSet::from([database.clone()]));
+        assert_eq!(
+            registered.len(),
+            1,
+            "new stores use the existing recursive native registration"
+        );
+
+        let preserved = database.with_file_name("preserved-openclaw-agent.sqlite");
+        fs::rename(&database, &preserved).unwrap();
+        fs::write(&database, b"replacement native database").unwrap();
+        let replaced =
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None).unwrap();
+        assert_eq!(replaced.database_roots, BTreeSet::from([database.clone()]));
+        assert_eq!(replaced.reconcile, BTreeSet::from([database.clone()]));
+        assert!(
+            refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None)
+                .unwrap()
+                .reconcile
+                .is_empty()
+        );
+        assert_eq!(fs::read(&preserved).unwrap(), b"first native database");
+
+        let backlog = Arc::new(WatchNotificationMailbox::default());
+        let rescan = Arc::new(AtomicBool::new(false));
+        let (wake, notifications) = bounded(1);
+        let (poller, retry) = database_root_poller(
+            &replaced.database_roots,
+            Duration::from_millis(50),
+            Arc::clone(&backlog),
+            Arc::clone(&rescan),
+            wake,
+        );
+        let _poller = poller.expect("discovered database must enroll in polling");
+        assert!(!retry);
+        let unrelated = database.parent().unwrap().join("unrelated.jsonl");
+        fs::write(&unrelated, b"not a native database event").unwrap();
+        let wal = database_sidecar_paths(&database)[0].clone();
+        let mut provider = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal)
+            .unwrap();
+        provider
+            .write_all(b"commit through a descriptor that stays open")
+            .unwrap();
+        provider.sync_all().unwrap();
+        let mut pending = WatchEventBacklog::default();
+        let mut pending_rescan = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pending.paths.contains(&wal) {
+            notifications
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            collect_watch_notifications(&backlog, &rescan, &mut pending, &mut pending_rescan);
+        }
+        assert!(!pending_rescan, "database polling must remain source scoped");
+        assert!(!pending.paths.contains(&unrelated));
+        assert!(!rescan.load(Ordering::Acquire));
     }
 
     #[test]
@@ -76172,9 +76693,14 @@ c.close()
             )
             .with_mirrored_source_path(path)
         };
-        let cases: [(&str, &[&str]); 13] = [
+        let cases: [(&str, &[&str]); 18] = [
             ("~/.claude/projects", &["claude"]),
             ("~/.codex/sessions", &["codex"]),
+            ("~/.openclaw", &["openclaw"]),
+            ("~/.openclaw/agents", &["openclaw"]),
+            ("~/.openclaw/agents/alice/sessions", &["openclaw"]),
+            ("/home/u/.openclaw/agents/alice/agent", &["openclaw"]),
+            (r"C:\Users\u\.openclaw\agents", &["openclaw"]),
             ("~/.pi/agent/sessions", &["pi_agent", "pi_durable"]),
             ("~/.prime/agent/sessions", &["prime_agent"]),
             ("~/.omp/agent/sessions", &["omp"]),
@@ -76200,6 +76726,7 @@ c.close()
                 "factory",
                 "gemini",
                 "cline",
+                "openclaw",
             ] {
                 assert_eq!(
                     mirrored_root_may_hold(connector, &root),
@@ -76225,6 +76752,8 @@ c.close()
         // root keep every connector.
         for root in [
             remote("/backups/claude-sessions"),
+            remote("~/.openclaw-backup/agents"),
+            remote("~/agents"),
             remote("~"),
             ScanRoot::remote(
                 PathBuf::from("/cass/remotes/laptop/mirror"),

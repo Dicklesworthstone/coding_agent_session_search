@@ -864,7 +864,8 @@ fn cli_status_and_health_warn_about_watch_nomem_deferrals() -> anyhow::Result<()
 }
 
 #[test]
-fn cli_retry_resolves_archive_providers_without_clearing_mismatched_identities() -> anyhow::Result<()> {
+fn cli_retry_resolves_archive_providers_without_clearing_mismatched_identities()
+-> anyhow::Result<()> {
     #[derive(Debug, PartialEq, Eq)]
     struct RetriedMessage {
         conversation_id: i64,
@@ -939,7 +940,9 @@ fn cli_retry_resolves_archive_providers_without_clearing_mismatched_identities()
 
         // A populated lexical generation makes every subsequent zero-hit
         // assertion distinguish absence from a missing or unusable index.
-        let seed_path = dir.path().join(".codex/sessions/rollout-retry-baseline.jsonl");
+        let seed_path = dir
+            .path()
+            .join(".codex/sessions/rollout-retry-baseline.jsonl");
         fs::create_dir_all(seed_path.parent().context("seed parent")?)?;
         fs::write(
             &seed_path,
@@ -1029,13 +1032,12 @@ fn cli_retry_resolves_archive_providers_without_clearing_mismatched_identities()
             .find(|(name, _)| *name == registry_name)
             .context("registered fixture connector")?;
         let source_root = ScanRoot::local(source_path.clone());
-        let context = ScanContext::with_roots(
-            source_path.clone(),
-            vec![source_root],
-            None,
-        );
+        let context = ScanContext::with_roots(source_path.clone(), vec![source_root], None);
         let conversations = factory().scan(&context)?;
-        ensure!(conversations.len() == 1, "retry discovery must select one source");
+        ensure!(
+            conversations.len() == 1,
+            "retry discovery must select one source"
+        );
         let conversation = conversations.first().context("fixture conversation")?;
         ensure!(conversation.agent_slug == archived_provider);
         ensure!(conversation.messages.len() == 2);
@@ -1114,9 +1116,10 @@ fn cli_retry_resolves_archive_providers_without_clearing_mismatched_identities()
         ensure!(poison_after[0]["conversation_id"] == mismatched_id);
         ensure!(poison_after[0]["agent_slug"] == mismatched_provider);
 
-        let read_rows = || -> anyhow::Result<Vec<RetriedMessage>> {
-            let storage = FrankenStorage::open_readonly(&data_dir.join("agent_search.db"))?;
-            let rows = storage.raw().query_map_collect(
+        let read_rows =
+            || -> anyhow::Result<Vec<RetriedMessage>> {
+                let storage = FrankenStorage::open_readonly(&data_dir.join("agent_search.db"))?;
+                let rows = storage.raw().query_map_collect(
                 "SELECT c.id, c.external_id, c.source_path, m.id, m.idx, m.content, m.created_at
                  FROM conversations c JOIN agents a ON a.id = c.agent_id
                  JOIN messages m ON m.conversation_id = c.id
@@ -1134,9 +1137,9 @@ fn cli_retry_resolves_archive_providers_without_clearing_mismatched_identities()
                     })
                 },
             )?;
-            storage.close_without_checkpoint()?;
-            Ok(rows)
-        };
+                storage.close_without_checkpoint()?;
+                Ok(rows)
+            };
         let rows = read_rows()?;
         ensure!(rows.len() == 2);
         for (row, expected) in rows.iter().zip(&conversation.messages) {
@@ -1172,9 +1175,16 @@ fn cli_retry_resolves_archive_providers_without_clearing_mismatched_identities()
         )?;
         ensure!(repeated["cleared"] == 0);
         ensure!(repeated["remaining_quarantined"] == 1);
-        ensure!(read_rows()? == rows, "repeat must preserve canonical identities");
+        ensure!(
+            read_rows()? == rows,
+            "repeat must preserve canonical identities"
+        );
         for (path, bytes, modified) in provider_before {
-            ensure!(fs::read(&path)? == bytes, "provider bytes changed: {}", path.display());
+            ensure!(
+                fs::read(&path)? == bytes,
+                "provider bytes changed: {}",
+                path.display()
+            );
             ensure!(
                 fs::metadata(&path)?.modified()? == modified,
                 "provider mtime changed: {}",

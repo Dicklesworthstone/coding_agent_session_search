@@ -383,13 +383,24 @@ mod registry_and_cli {
     }
 
     fn canonical_messages(data: &Path, source: &Path) -> Result<Vec<CanonicalMessage>> {
+        canonical_messages_for_source(data, "local", source)
+    }
+
+    fn canonical_messages_for_source(
+        data: &Path,
+        source_id: &str,
+        source: &Path,
+    ) -> Result<Vec<CanonicalMessage>> {
         let storage = FrankenStorage::open_readonly(&data.join("agent_search.db"))?;
         let source = dunce::canonicalize(source)?;
         let rows = storage.raw().query_map_collect(
             "SELECT c.id, m.id, m.idx, m.created_at, m.content
              FROM conversations c JOIN messages m ON m.conversation_id = c.id
-             WHERE c.source_id = 'local' AND c.source_path = ?1 ORDER BY m.id",
-            &[ParamValue::from(source.to_string_lossy().as_ref())],
+             WHERE c.source_id = ?1 AND c.source_path = ?2 ORDER BY m.id",
+            &[
+                ParamValue::from(source_id),
+                ParamValue::from(source.to_string_lossy().as_ref()),
+            ],
             |row| {
                 Ok(CanonicalMessage {
                     conversation_id: row.get_typed(0)?,
@@ -1121,6 +1132,210 @@ mod registry_and_cli {
             assert_eq!(canonical_messages(&data, &database)?, rows);
             assert_eq!(bundle(&database)?, source_after_append);
         }
+        writer.close_without_checkpoint()?;
+        Ok(())
+    }
+
+    #[test]
+    fn mirrored_openclaw_reingest_preserves_source_scope_streaming() -> Result<()> {
+        assert_mirrored_openclaw_reingest("1")
+    }
+
+    #[test]
+    fn mirrored_openclaw_reingest_preserves_source_scope_batch() -> Result<()> {
+        assert_mirrored_openclaw_reingest("0")
+    }
+
+    fn assert_mirrored_openclaw_reingest(streaming: &str) -> Result<()> {
+        use coding_agent_search::sources::sync::path_to_safe_dirname;
+
+        const SEED: &str = "openclawmirrornativeneedle";
+        const APPEND: &str = "openclawmirrorwalappendneedle";
+        const LEGACY: &str = "openclawmirrorlegacyonlyneedle";
+        const SECOND: &str = "openclawmirrorindependentneedle";
+        const OBSOLETE: &str = "openclawmirrorobsoletecopyneedle";
+        const LOCAL: &str = "openclawmirrorunselectedlocalneedle";
+
+        let temp = tempfile::tempdir()?;
+        let home = dunce::canonicalize(temp.path())?;
+        let data = home.join("cass-data");
+        let local = fixture(&home, "openclaw", "unselected-local", LOCAL)?;
+        let staged = home.join("staged-provider");
+        fixture(&staged, "alice", "shared", SEED)?;
+        let first = data
+            .join("remotes/alpha/mirror")
+            .join(path_to_safe_dirname("~/.openclaw/agents"));
+        fs::create_dir_all(&first)?;
+        fs::rename(staged.join(".openclaw/agents"), first.join("agents"))?;
+        let database = first.join("agents/alice/agent/openclaw-agent.sqlite");
+        let first_sessions = first.join("agents/alice/sessions");
+        let second = data
+            .join("remotes/beta/mirror")
+            .join(path_to_safe_dirname("~/.openclaw/agents/"));
+        let second_sessions = second.join("alice/sessions");
+        fs::create_dir_all(&first_sessions)?;
+        fs::create_dir_all(&second_sessions)?;
+        let duplicate = first_sessions.join("shared.jsonl");
+        let unmatched = first_sessions.join("legacy-only.jsonl");
+        let independent = second_sessions.join("shared.jsonl");
+        for (path, needle) in [
+            (&duplicate, OBSOLETE),
+            (&unmatched, LEGACY),
+            (&independent, SECOND),
+        ] {
+            let session = json!({
+                "type": "session", "timestamp": AT,
+                "cwd": "/work/remote-history"
+            });
+            let message = json!({
+                "type": "message", "timestamp": AT + 1_000,
+                "message": {"role": "user", "content": format!("Remote historical transcript\n{needle}")}
+            });
+            fs::write(path, format!("{session}\n{message}\n"))?;
+        }
+        let config = home.join(".config/cass/sources.toml");
+        fs::create_dir_all(config.parent().context("config parent")?)?;
+        fs::write(
+            config,
+            r#"
+[[sources]]
+name = "alpha"
+type = "ssh"
+host = "operator@alpha.invalid"
+paths = ["~/.openclaw/agents"]
+sync_schedule = "manual"
+[[sources]]
+name = "beta"
+type = "ssh"
+host = "operator@beta.invalid"
+paths = ["~/.openclaw/agents/"]
+sync_schedule = "manual"
+"#,
+        )?;
+        let writer = Connection::open(database.to_string_lossy().as_ref())?;
+        writer.execute("PRAGMA wal_autocheckpoint = 0")?;
+        let provider_snapshot = || -> Result<_> {
+            let logs: Result<Vec<_>> = [&duplicate, &unmatched, &independent]
+                .into_iter()
+                .map(|path| Ok((fs::read(path)?, fs::metadata(path)?.modified()?)))
+                .collect();
+            Ok((bundle(&database)?, bundle(&local)?, logs?))
+        };
+        let reingest = |sources: &[&str]| -> Result<()> {
+            let before = provider_snapshot()?;
+            let mut cmd = command(&home, &data);
+            cmd.env_remove("CASS_IGNORE_SOURCES_CONFIG")
+                .env("CASS_STREAMING_INDEX", streaming)
+                .env("CASS_RAW_MIRROR_MIN_FREE_BYTES", "0")
+                .args(["sources", "reingest", "--from-mirror", "--json"]);
+            for source in sources {
+                cmd.arg("--source").arg(source);
+            }
+            let output = assert_cmd::Command::from_std(cmd)
+                .timeout(Duration::from_secs(120))
+                .output()?;
+            ensure!(output.status.success(), "mirror reingest failed: {output:?}");
+            let result: Value = serde_json::from_slice(&output.stdout)?;
+            assert_eq!(result["status"], "complete");
+            assert_eq!(result["indexing"]["success"], true);
+            assert_eq!(provider_snapshot()?, before, "indexing mutated provider history");
+            Ok(())
+        };
+        let assert_hit = |needle: &str,
+                          source_id: &str,
+                          path: &Path,
+                          row: &CanonicalMessage|
+         -> Result<SearchMessage> {
+            let hit = single_search_message(&home, &data, needle)?;
+            assert_eq!(hit.agent, "openclaw/alice");
+            assert_eq!(hit.source_id, source_id);
+            assert_eq!(hit.source_path, dunce::canonicalize(path)?);
+            assert_eq!(hit.conversation_id, row.conversation_id);
+            assert_eq!(hit.line_number, usize::try_from(row.idx)? + 1);
+            assert_eq!(hit.created_at, row.created_at);
+            assert_eq!(hit.content, row.content);
+            Ok(hit)
+        };
+
+        reingest(&["alpha"])?;
+        let first_rows = canonical_messages_for_source(&data, "alpha", &database)?;
+        let legacy_rows = canonical_messages_for_source(&data, "alpha", &unmatched)?;
+        assert_eq!(first_rows.len(), 2);
+        assert_eq!(legacy_rows.len(), 1);
+        let seeded = assert_hit(SEED, "alpha", &database, &first_rows[0])?;
+        let legacy = assert_hit(LEGACY, "alpha", &unmatched, &legacy_rows[0])?;
+        assert!(search_hits(&home, &data, SECOND)?.is_empty());
+        assert!(search_hits(&home, &data, LOCAL)?.is_empty());
+        assert!(search_hits(&home, &data, OBSOLETE)?.is_empty());
+
+        // Commit to alpha, index beta, then explicitly refresh alpha. Beta's
+        // archive freshness cannot certify that alpha's WAL was consumed.
+        let before_append = bundle(&database)?;
+        append(
+            &writer,
+            "shared",
+            6,
+            json!({"type": "message", "message": {"role": "assistant", "content": APPEND}}),
+        )?;
+        let committed = bundle(&database)?;
+        assert_eq!(committed[0], before_append[0], "append must remain WAL-only");
+        assert_ne!(committed[1], before_append[1]);
+        reingest(&["beta"])?;
+        assert!(search_hits(&home, &data, APPEND)?.is_empty());
+        assert_eq!(canonical_messages_for_source(&data, "alpha", &database)?, first_rows);
+        let second_rows = canonical_messages_for_source(&data, "beta", &independent)?;
+        assert_eq!(second_rows.len(), 1);
+        let independent_hit = assert_hit(SECOND, "beta", &independent, &second_rows[0])?;
+        assert_ne!(seeded.conversation_id, independent_hit.conversation_id);
+        reingest(&["alpha"])?;
+        let updated = canonical_messages_for_source(&data, "alpha", &database)?;
+        assert_eq!(updated.len(), 3);
+        assert_eq!(&updated[..first_rows.len()], first_rows);
+        let appended = updated.last().context("committed mirror append")?;
+        assert_eq!(appended.conversation_id, seeded.conversation_id);
+        assert_eq!(appended.idx, 2);
+        assert_eq!(appended.created_at, Some(AT + 6_000));
+        let appended_hit = assert_hit(APPEND, "alpha", &database, appended)?;
+        let preserved = provider_snapshot()?;
+        for sources in [&["alpha"][..], &["beta"][..], &["alpha", "beta"][..]] {
+            reingest(sources)?;
+            assert_eq!(canonical_messages_for_source(&data, "alpha", &database)?, updated);
+            assert_eq!(canonical_messages_for_source(&data, "alpha", &unmatched)?, legacy_rows);
+            assert_eq!(canonical_messages_for_source(&data, "beta", &independent)?, second_rows);
+            assert_eq!(single_search_message(&home, &data, SEED)?, seeded);
+            assert_eq!(single_search_message(&home, &data, APPEND)?, appended_hit);
+            assert_eq!(single_search_message(&home, &data, LEGACY)?, legacy);
+            assert_eq!(single_search_message(&home, &data, SECOND)?, independent_hit);
+            assert!(search_hits(&home, &data, OBSOLETE)?.is_empty());
+            assert!(search_hits(&home, &data, LOCAL)?.is_empty());
+            assert_eq!(provider_snapshot()?, preserved);
+        }
+        let storage = FrankenStorage::open_readonly(&data.join("agent_search.db"))?;
+        let identities: Vec<(String, String, String, String)> = storage.raw().query_map_collect(
+            "SELECT c.source_id, a.slug, c.external_id, c.source_path
+             FROM conversations c JOIN agents a ON a.id = c.agent_id ORDER BY c.id",
+            &[],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+        )?;
+        storage.close_without_checkpoint()?;
+        assert_eq!(identities.len(), 3, "no unselected or misattributed conversations");
+        let expected: BTreeSet<_> = [
+            ("alpha", "alice/shared", &database),
+            ("alpha", "alice/legacy-only", &unmatched),
+            ("beta", "alice/shared", &independent),
+        ]
+        .into_iter()
+        .map(|(source, id, path)| {
+            (
+                source.to_string(),
+                "openclaw/alice".to_string(),
+                id.to_string(),
+                path.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+        assert_eq!(identities.into_iter().collect::<BTreeSet<_>>(), expected);
+        assert_eq!(bundle(&database)?, committed);
         writer.close_without_checkpoint()?;
         Ok(())
     }

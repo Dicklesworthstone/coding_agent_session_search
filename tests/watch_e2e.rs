@@ -258,6 +258,8 @@ mod deferred_watch_sources {
         const APPEND: &str = "openclawwatchhistoricalappendclock";
         const WAL_APPEND: &str = "openclawwatchwalhistoryclock";
         const FRESH: &str = "Fresh title\nopenclawwatchfreshclock";
+        const LATE_SEED: &str = "Late title\nopenclawwatchlateagentseed";
+        const LATE_APPEND: &str = "openclawwatchlateagentwal";
 
         fn insert(writer: &Connection, session: &str, seq: i64, at: i64, content: &str) {
             let event = serde_json::json!({
@@ -321,6 +323,29 @@ mod deferred_watch_sources {
                 .expect("read canonical message identities")
         }
 
+        fn wait_for_database_polling(child: &mut WatchChild, log: &Path, database: &Path) {
+            let expected = format!(
+                "polling {} for database commits",
+                database.parent().unwrap().display()
+            );
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let logs = fs::read_to_string(log).expect("read database poll enrollment");
+                assert!(
+                    child.0.try_wait().expect("watch status during enrollment").is_none(),
+                    "watcher exited before database poll enrollment: {logs}"
+                );
+                if logs.contains(&expected) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "database never enrolled in polling: {expected}: {logs}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
         let home = TempDir::new().expect("isolated OpenClaw watch home");
         let canonical_home = fs::canonicalize(home.path()).expect("canonical fixture home");
         let data = canonical_home.as_path().join("cass-data");
@@ -357,6 +382,9 @@ mod deferred_watch_sources {
         }
         let (mut child, log) =
             start_watch_with_env(canonical_home.as_path(), &data, true, &environment);
+        // Linux native events can hide missing broad-root polling. Require the
+        // actual fallback enrollment on every platform before committing.
+        wait_for_database_polling(&mut child, &log, &database);
         let before_commit = provider_bundle(&database);
         let fresh_at = i64::try_from(
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis(),
@@ -426,6 +454,76 @@ mod deferred_watch_sources {
         wait_for_hit(&mut child, canonical_home.as_path(), &data, &log, WAL_APPEND);
         assert_eq!(provider_bundle(&database), wal_committed);
 
+        let late_provider = if state_override {
+            // Install a complete new agent store under the already-watched
+            // broad root. Preparing it outside that root avoids exposing a
+            // half-created schema to an unrelated native notification.
+            let staged_agent = canonical_home.join("late-agent-staging");
+            let staged_database = staged_agent.join("agent/openclaw-agent.sqlite");
+            fs::create_dir_all(staged_database.parent().unwrap()).unwrap();
+            let late_seed_writer =
+                Connection::open(staged_database.to_string_lossy().into_owned()).unwrap();
+            late_seed_writer.execute("PRAGMA journal_mode = DELETE").unwrap();
+            late_seed_writer
+                .execute(
+                    "CREATE TABLE transcript_events (session_id TEXT NOT NULL, seq INTEGER NOT NULL, \
+                     event_json TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, seq))",
+                )
+                .unwrap();
+            insert(&late_seed_writer, "historical", 1, OLD - 60_000, LATE_SEED);
+            // Persist WAL mode before any watcher can contend with the change.
+            late_seed_writer.execute("PRAGMA journal_mode = WAL").unwrap();
+            late_seed_writer.close().unwrap();
+            let late_agent = state_dir.join("agents/late");
+            fs::rename(&staged_agent, &late_agent).unwrap();
+            let late_database = late_agent.join("agent/openclaw-agent.sqlite");
+            let late_writer =
+                Connection::open(late_database.to_string_lossy().into_owned()).unwrap();
+            late_writer.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+            let late_seeded = provider_bundle(&late_database);
+
+            wait_for_database_polling(&mut child, &log, &late_database);
+            wait_for_hit(
+                &mut child,
+                canonical_home.as_path(),
+                &data,
+                &log,
+                "openclawwatchlateagentseed",
+            );
+            assert_eq!(provider_bundle(&late_database), late_seeded);
+            fs::File::options()
+                .write(true)
+                .open(&late_database)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_millis(database_at))
+                .unwrap();
+            let late_before = provider_bundle(&late_database);
+            insert(&late_writer, "historical", 2, OLD - 59_000, LATE_APPEND);
+            let late_committed = provider_bundle(&late_database);
+            assert_eq!(late_committed[0], late_before[0], "late commit must remain WAL-only");
+            assert_ne!(late_committed[1], late_before[1]);
+            assert!(late_committed[1].as_ref().unwrap().0.len() > 32);
+            wait_for_hit(
+                &mut child,
+                canonical_home.as_path(),
+                &data,
+                &log,
+                LATE_APPEND,
+            );
+            assert_eq!(provider_bundle(&late_database), late_committed);
+            for needle in ["openclawwatchlateagentseed", LATE_APPEND] {
+                assert_eq!(
+                    content_hit_count(&search(canonical_home.as_path(), &data, needle), needle),
+                    1,
+                    "newly discovered agent history must remain searchable: {needle}"
+                );
+            }
+            Some((late_writer, late_database, late_committed))
+        } else {
+            None
+        };
+        assert_eq!(provider_bundle(&database), wal_committed);
+
         for needle in [
             "openclawwatchseedclock",
             "openclawwatcholdhistoryclock",
@@ -443,15 +541,27 @@ mod deferred_watch_sources {
         child.0.wait().expect("reap watcher");
 
         let after = canonical_rows(&data);
-        assert_eq!(after.len(), 5, "no hidden or duplicate canonical messages");
+        assert_eq!(
+            after.len(),
+            if state_override { 7 } else { 5 },
+            "no hidden or duplicate canonical messages"
+        );
         assert!(initial.iter().all(|row| after.contains(row)));
         assert_eq!(
             after.iter().map(|row| row.0).collect::<std::collections::BTreeSet<_>>().len(),
-            3
+            if state_override { 4 } else { 3 }
         );
         let canonical_source = fs::canonicalize(&database).unwrap();
+        let canonical_late_source = late_provider
+            .as_ref()
+            .map(|(_, database, _)| fs::canonicalize(database).unwrap());
         assert!(after.iter().all(|row| {
-            fs::canonicalize(&row.2).unwrap() == canonical_source
+            let source = fs::canonicalize(&row.2).unwrap();
+            if row.1 == "late/historical" {
+                canonical_late_source.as_ref() == Some(&source)
+            } else {
+                source == canonical_source
+            }
         }));
         let historical: Vec<_> = after
             .iter()
@@ -462,6 +572,17 @@ mod deferred_watch_sources {
             historical,
             [(0, SEED, OLD + 1_000), (1, APPEND, OLD + 2_000), (2, WAL_APPEND, OLD + 3_000)]
         );
+        if state_override {
+            let late_history: Vec<_> = after
+                .iter()
+                .filter(|row| row.1 == "late/historical")
+                .map(|row| (row.4, row.5.as_str(), row.6))
+                .collect();
+            assert_eq!(
+                late_history,
+                [(0, LATE_SEED, OLD - 60_000), (1, LATE_APPEND, OLD - 59_000)]
+            );
+        }
         let watch_state = fs::read(data.join("watch_state.json")).unwrap();
         for _ in 0..2 {
             assert_cmd::Command::from_std(cass(canonical_home.as_path(), &data))
@@ -475,8 +596,14 @@ mod deferred_watch_sources {
             assert_eq!(canonical_rows(&data), after, "unchanged refresh is idempotent");
             assert_eq!(fs::read(data.join("watch_state.json")).unwrap(), watch_state);
             assert_eq!(provider_bundle(&database), wal_committed);
+            if let Some((_, late_database, late_snapshot)) = &late_provider {
+                assert_eq!(provider_bundle(late_database), *late_snapshot);
+            }
         }
         writer.close_without_checkpoint().unwrap();
+        if let Some((late_writer, _, _)) = late_provider {
+            late_writer.close_without_checkpoint().unwrap();
+        }
     }
 
     #[cfg(unix)]
@@ -485,9 +612,9 @@ mod deferred_watch_sources {
         assert_openclaw_watch_preserves_historical_activity(false);
     }
 
-    // The state override supplies a broad agents root. Linux inotify observes
-    // its WAL writes; this case does not claim macOS broad-root poll coverage.
-    #[cfg(target_os = "linux")]
+    // The state override supplies a broad agents root; both its initial store
+    // and a later-created agent must enroll in held-open WAL polling.
+    #[cfg(unix)]
     #[test]
     fn watch_openclaw_state_override_preserves_historical_activity() {
         assert_openclaw_watch_preserves_historical_activity(true);

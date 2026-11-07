@@ -13,7 +13,7 @@ use coding_agent_search::connectors::{
 };
 use coding_agent_search::franken_sync::Connection;
 use coding_agent_search::franken_sync::compat::{ConnectionExt, ParamValue};
-use franken_agent_detection::{DiscoveredSourceRole, NormalizedConversation};
+use franken_agent_detection::{DiscoveredSourceRole, NormalizedConversation, Origin, Platform};
 use serde_json::{Value, json};
 
 const OLD: i64 = 1_780_000_000_000;
@@ -163,7 +163,13 @@ fn incremental_native_scan_uses_source_freshness_without_activity_filtering() ->
     let temp = tempfile::tempdir()?;
     let (path, conn) = database(temp.path(), "main")?;
     seed(&conn, "fresh", "old prefix remains")?;
-    event(&conn, "historical", 0, OLD, message("user", "historical session"))?;
+    event(
+        &conn,
+        "historical",
+        0,
+        OLD,
+        message("user", "historical session"),
+    )?;
     conn.close()?;
 
     let sessions = temp.path().join(".openclaw/agents/main/sessions");
@@ -194,7 +200,10 @@ fn incremental_native_scan_uses_source_freshness_without_activity_filtering() ->
         let ids = by_id(&conversations);
         assert_eq!(ids.len(), 2, "changed stores retain historical sessions");
         assert_eq!(ids["main/fresh"]["messages"].as_array().unwrap().len(), 2);
-        assert_eq!(ids["main/fresh"]["messages"][0]["content"], "old prefix remains");
+        assert_eq!(
+            ids["main/fresh"]["messages"][0]["content"],
+            "old prefix remains"
+        );
         assert_eq!(
             ids["main/historical"]["messages"][0]["content"],
             "historical session"
@@ -204,9 +213,16 @@ fn incremental_native_scan_uses_source_freshness_without_activity_filtering() ->
                 && conversation.metadata["last_event_at"].as_i64().unwrap() < cutoff
         }));
         if let Some(previous) = &previous {
-            assert_eq!(&ids, previous, "broad and database roots retain one identity");
+            assert_eq!(
+                &ids, previous,
+                "broad and database roots retain one identity"
+            );
         }
-        assert_eq!(by_id(&connector.scan(&ctx)?), ids, "repeat is deterministic");
+        assert_eq!(
+            by_id(&connector.scan(&ctx)?),
+            ids,
+            "repeat is deterministic"
+        );
         previous = Some(ids);
         assert_eq!((snapshot(&path)?, snapshot(&legacy)?), before);
     }
@@ -408,6 +424,173 @@ fn committed_wal_transcripts_are_read_without_checkpointing_the_source() -> Resu
         "committed WAL question"
     );
     assert_eq!((snapshot(&path)?, snapshot(&wal)?), before);
+    Ok(())
+}
+
+
+#[test]
+fn opaque_mirrors_preserve_wal_history_and_physical_migration_scope() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let staged = temp.path().join("staged");
+    let (_, conn) = database(&staged, "alice")?;
+    seed(&conn, "shared", "native mirror history")?;
+    conn.close()?;
+
+    // Both actual transport shapes have opaque container names. One retains
+    // the configured basename; the other contains an agents directory's contents.
+    let first = temp.path().join("opaque-retained");
+    fs::create_dir(&first)?;
+    fs::rename(staged.join(".openclaw/agents"), first.join("agents"))?;
+    let native = first.join("agents/alice/agent/openclaw-agent.sqlite");
+    let first_sessions = first.join("agents/alice/sessions");
+    let second = temp.path().join("opaque-contents");
+    let second_sessions = second.join("alice/sessions");
+    fs::create_dir_all(&first_sessions)?;
+    fs::create_dir_all(&second_sessions)?;
+    let duplicate = first_sessions.join("shared.jsonl");
+    let unmatched = first_sessions.join("legacy-only.jsonl");
+    let independent = second_sessions.join("shared.jsonl");
+    for (path, content) in [
+        (&duplicate, "obsolete migration copy"),
+        (&unmatched, "unmatched first-mirror history"),
+        (&independent, "independent second-mirror history"),
+    ] {
+        fs::write(path, format!("{}\n", message("user", content)))?;
+    }
+
+    let writer = Connection::open(native.to_string_lossy().into_owned())?;
+    writer.execute("PRAGMA journal_mode = WAL")?;
+    writer.execute("PRAGMA wal_autocheckpoint = 0")?;
+    event(
+        &writer,
+        "shared",
+        3,
+        OLD + 10_000,
+        message("assistant", "historical committed mirror append"),
+    )?;
+    let wal = PathBuf::from(format!("{}-wal", native.display()));
+    assert!(fs::metadata(&wal)?.len() > 32);
+    let cutoff = NEW + 10_000;
+    fs::File::options()
+        .write(true)
+        .open(&native)?
+        .set_modified(UNIX_EPOCH + Duration::from_millis(OLD as u64))?;
+    for path in [&wal, &duplicate, &unmatched, &independent] {
+        fs::File::options()
+            .write(true)
+            .open(path)?
+            .set_modified(UNIX_EPOCH + Duration::from_millis((cutoff + 10_000) as u64))?;
+    }
+    let roots = vec![
+        ScanRoot::remote(
+            first.clone(),
+            Origin::remote_with_host("first", "first.invalid"),
+            Some(Platform::Linux),
+        )
+        .with_mirrored_source_path("~/.openclaw/agents"),
+        ScanRoot::remote(
+            second.clone(),
+            Origin::remote_with_host("second", "second.invalid"),
+            Some(Platform::Linux),
+        )
+        .with_mirrored_source_path("~/.openclaw/agents/"),
+    ];
+    let provider_snapshot = || -> Result<Vec<Option<(Vec<u8>, std::time::SystemTime)>>> {
+        let mut paths = ["", "-wal", "-shm"]
+            .map(|suffix| {
+                let mut path = native.as_os_str().to_os_string();
+                path.push(suffix);
+                PathBuf::from(path)
+            })
+            .to_vec();
+        paths.extend([duplicate.clone(), unmatched.clone(), independent.clone()]);
+        paths
+            .iter()
+            .map(|path| match fs::metadata(path) {
+                Ok(_) => snapshot(path).map(Some),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.into()),
+            })
+            .collect()
+    };
+    let before = provider_snapshot()?;
+    let by_source = |conversations: Vec<NormalizedConversation>| {
+        let mut result = BTreeMap::new();
+        for conversation in conversations {
+            let key = (
+                conversation.source_path.clone(),
+                conversation.external_id.clone().expect("stable session id"),
+            );
+            assert!(
+                result
+                    .insert(key, serde_json::to_value(conversation).unwrap())
+                    .is_none(),
+                "one source/session must not be emitted twice"
+            );
+        }
+        result
+    };
+    let connector = OpenClawConnector::new();
+    let mut previous = None;
+    for since in [None, Some(cutoff)] {
+        let mut repeated_roots = roots.clone();
+        repeated_roots.extend(roots.clone());
+        let ctx = ScanContext::with_roots(
+            temp.path().join("cass"),
+            repeated_roots,
+            since,
+        );
+        let sources = connector.discover_source_files(&ctx)?;
+        assert_eq!(sources.len(), 5, "database, WAL, and three legacy files");
+        for source in &sources {
+            let root = if source.source_path.starts_with(&first) {
+                &roots[0]
+            } else {
+                assert!(source.source_path.starts_with(&second));
+                &roots[1]
+            };
+            assert_eq!(source.provider_slug, "openclaw");
+            assert_eq!(source.origin, root.origin);
+            assert_eq!(source.platform, root.platform);
+            assert!(source.required_for_reconstruction);
+        }
+        assert!(sources.iter().any(|source| {
+            source.source_path == wal && source.role == DiscoveredSourceRole::MetadataSidecar
+        }));
+        let conversations = by_source(connector.scan(&ctx)?);
+        assert_eq!(conversations.len(), 3);
+        assert!(!conversations.contains_key(&(duplicate.clone(), "alice/shared".to_string())));
+        let native_history = &conversations[&(native.clone(), "alice/shared".to_string())];
+        assert_eq!(native_history["agent_slug"], "openclaw/alice");
+        assert_eq!(native_history["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(native_history["messages"][0]["content"], "native mirror history");
+        assert_eq!(
+            native_history["messages"][2]["content"],
+            "historical committed mirror append"
+        );
+        assert!(native_history["metadata"]["last_event_at"].as_i64().unwrap() < cutoff);
+        assert_eq!(
+            conversations[&(unmatched.clone(), "alice/legacy-only".to_string())]["messages"][0]["content"],
+            "unmatched first-mirror history"
+        );
+        assert_eq!(
+            conversations[&(independent.clone(), "alice/shared".to_string())]["messages"][0]["content"],
+            "independent second-mirror history"
+        );
+        if let Some(previous) = &previous {
+            assert_eq!(&conversations, previous, "full and WAL-only scans must agree");
+        }
+        let mut streamed = Vec::new();
+        connector.scan_with_callback(&ctx, &mut |conversation| {
+            streamed.push(conversation);
+            Ok(())
+        })?;
+        assert_eq!(by_source(streamed), conversations);
+        assert_eq!(by_source(connector.scan(&ctx)?), conversations);
+        previous = Some(conversations);
+        assert_eq!(provider_snapshot()?, before);
+    }
+    writer.close_without_checkpoint()?;
     Ok(())
 }
 

@@ -190,11 +190,12 @@ const CONTRACTS: &[DependencyContract] = &[
         // entries for the Claude, Pi and Codex readers (cass 0f1k0).
         // 0.3.10 exposes SQLite connector runtime shutdown before Windows
         // process teardown (cass#519) and preserves the full read-error chain.
-        // GH#520 needs the post-0.3.10 mirror-root metadata API. The narrow
-        // OpenClaw backport also preserves explicit JSONL file scope (#350/#543).
-        // Keep the source contract exact until a registry release carries both.
+        // GH#520 needs the post-0.3.10 mirror-root metadata API. Narrow
+        // OpenClaw backports preserve explicit-file scope (#350/#543),
+        // historical sessions, opaque mirrors, and physical-store deduplication.
+        // Keep the source contract exact until a registry release carries them.
         expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "3a2d7b3e2d89d2abb946b417f7a060f136e829e1",
+        expected_rev: "0ea083ea4c470a6b7e7607cdeff335cb14690cdc",
         expected_version: "0.3.10",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.
