@@ -11867,13 +11867,12 @@ fn current_searchable_index_summary_available(index_path: &Path) -> bool {
         )
 }
 
-fn should_skip_unchanged_explicit_watch_once_paths(
+fn should_skip_unclaimed_explicit_watch_once_paths(
     opts: &IndexOptions,
-    storage: &FrankenStorage,
     roots: &[(ConnectorKind, ScanRoot)],
-) -> Result<bool> {
+) -> bool {
     if opts.watch || opts.full || opts.force_rebuild || opts.semantic || opts.build_hnsw {
-        return Ok(false);
+        return false;
     }
 
     let Some(paths) = opts
@@ -11881,7 +11880,7 @@ fn should_skip_unchanged_explicit_watch_once_paths(
         .as_ref()
         .filter(|paths| !paths.is_empty())
     else {
-        return Ok(false);
+        return false;
     };
 
     let triggers = classify_paths(paths.clone(), roots, true);
@@ -11889,25 +11888,23 @@ fn should_skip_unchanged_explicit_watch_once_paths(
         // The run ends here without reindexing, so this is the only place
         // that can say why nothing was indexed.
         warn_unclaimed_explicit_watch_once_paths(paths, roots);
-        return Ok(true);
+        return true;
     }
 
-    for (kind, root, _, _) in triggers {
-        if !explicit_watch_once_root_unchanged_after_last_index(storage, kind, &root)? {
-            return Ok(false);
-        }
-    }
-
-    Ok(true)
+    // An archive-wide completion timestamp is not evidence that a selected
+    // source was read. A sibling can advance it after this source changes,
+    // and a write can land between a source snapshot and batch completion.
+    // Claimed explicit paths must reach idempotent ingestion (GH #543).
+    false
 }
 
-fn can_skip_unchanged_explicit_watch_once_index_run(
+fn can_skip_unclaimed_explicit_watch_once_index_run(
     opts: &IndexOptions,
     storage: &FrankenStorage,
     index_path: &Path,
     lexical_rebuild_required: bool,
     analytics_rebuild_required: bool,
-) -> Result<bool> {
+) -> bool {
     if lexical_rebuild_required
         || analytics_rebuild_required
         || opts.watch
@@ -11916,24 +11913,24 @@ fn can_skip_unchanged_explicit_watch_once_index_run(
         || opts.semantic
         || opts.build_hnsw
     {
-        return Ok(false);
+        return false;
     }
     if opts
         .watch_once_paths
         .as_ref()
         .is_none_or(|paths| paths.is_empty())
     {
-        return Ok(false);
+        return false;
     }
 
     let additional_scan_roots =
         additional_scan_roots_for_scan_or_watch(storage, &opts.data_dir, false);
     let watch_roots = build_watch_roots(additional_scan_roots);
-    if !should_skip_unchanged_explicit_watch_once_paths(opts, storage, &watch_roots)? {
-        return Ok(false);
+    if !should_skip_unclaimed_explicit_watch_once_paths(opts, &watch_roots) {
+        return false;
     }
 
-    Ok(current_searchable_index_summary_available(index_path))
+    current_searchable_index_summary_available(index_path)
 }
 
 fn should_skip_broad_scan_after_watch_once_authoritative_repair(
@@ -18564,13 +18561,13 @@ fn run_index_with_storage_ownership(
     }
     complete_preflight_phase!();
 
-    if can_skip_unchanged_explicit_watch_once_index_run(
+    if can_skip_unclaimed_explicit_watch_once_index_run(
         &opts,
         &storage,
         &index_path,
         legacy_omp_upgrade.lexical_rebuild_required,
         legacy_omp_upgrade.analytics_rebuild_required,
-    )? {
+    ) {
         let now_ms = FrankenStorage::now_millis();
         persist_final_index_run_metadata(&storage, &opts.db_path, false, now_ms, now_ms)?;
         record_lexical_population_strategy_if_unset(
@@ -18587,7 +18584,7 @@ fn run_index_with_storage_ownership(
         tracing::info!(
             db_path = %opts.db_path.display(),
             path_count,
-            "skipping unchanged explicit watch-once index run before startup maintenance"
+            "skipping unclaimed explicit watch-once index run before startup maintenance"
         );
         close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run")?;
         prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
@@ -20848,7 +20845,7 @@ fn run_index_with_storage_ownership(
         if targeted_watch_once_only_run
             && t_index.is_none()
             && watch_once_mode
-            && should_skip_unchanged_explicit_watch_once_paths(&opts, &storage, &watch_roots)?
+            && should_skip_unclaimed_explicit_watch_once_paths(&opts, &watch_roots)
         {
             let path_count = opts
                 .watch_once_paths
@@ -20863,7 +20860,7 @@ fn run_index_with_storage_ownership(
             tracing::info!(
                 db_path = %opts.db_path.display(),
                 path_count,
-                "skipping unchanged explicit watch-once paths before opening Tantivy"
+                "skipping unclaimed explicit watch-once paths before opening Tantivy"
             );
             close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run")?;
             prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
@@ -35268,25 +35265,9 @@ fn reindex_paths_with_semantic_delta(
         };
         let replay_canonical = pending_lexical_debt.iter().any(|debt| !debt.discovery_only);
         let source_scoped = conn.supports_source_boundaries();
-        // Semantic watch-once must reconcile and attest an unchanged source,
-        // even when the caller no longer captures callback-local deltas.
-        if explicit_watch_once && !force_full && !opts.semantic && semantic_delta.is_none() {
-            let unchanged = {
-                let storage = storage
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
-                explicit_watch_once_root_unchanged_after_last_index(&storage, kind, &root)?
-            };
-            if unchanged {
-                tracing::info!(
-                    ?kind,
-                    scan_root = %root.path.display(),
-                    "skipping unchanged explicit watch-once root already covered by last_indexed_at"
-                );
-                continue;
-            }
-        }
-
+        // Explicit selections reconcile the source even when it predates the
+        // archive's last completed run. Only source-specific read evidence can
+        // establish freshness; last_indexed_at may belong to another source.
         let since_ts = if force_full || explicit_watch_once || replay_canonical {
             None
         } else {
@@ -36058,74 +36039,6 @@ fn reindex_paths_with_semantic_delta(
         Some(error) => Err(ConnectorScanFailure(error).into()),
         None => Ok(outcome),
     }
-}
-
-fn explicit_watch_once_root_unchanged_after_last_index(
-    storage: &FrankenStorage,
-    kind: ConnectorKind,
-    root: &ScanRoot,
-) -> Result<bool> {
-    if !watch_lexical_replay_debt_for_root(storage, kind, root)?.is_empty() {
-        return Ok(false);
-    }
-    let metadata = match fs::metadata(&root.path) {
-        Ok(metadata) if metadata.is_file() => metadata,
-        _ => return Ok(false),
-    };
-    let Some(modified_at_ms) = metadata
-        .modified()
-        .ok()
-        .and_then(system_time_to_epoch_millis)
-    else {
-        return Ok(false);
-    };
-    let Some(last_indexed_at) = storage.get_last_indexed_at()? else {
-        return Ok(false);
-    };
-    if modified_at_ms > last_indexed_at {
-        return Ok(false);
-    }
-    // A database-backed source commits into its -wal (or rollback -journal)
-    // without touching the main file, so the main file's mtime alone cannot
-    // prove the source unchanged (GH #502). -shm is excluded: readers rewrite
-    // it, and it holds no committed data.
-    for suffix in ["-wal", "-journal"] {
-        let sidecar = database_path_with_suffix(&root.path, suffix);
-        let sidecar_modified_at_ms = match fs::metadata(&sidecar) {
-            Ok(metadata) => metadata
-                .modified()
-                .ok()
-                .and_then(system_time_to_epoch_millis),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Ok(false),
-        };
-        match sidecar_modified_at_ms {
-            Some(sidecar_modified_at_ms) if sidecar_modified_at_ms <= last_indexed_at => {}
-            _ => return Ok(false),
-        }
-    }
-
-    let source_path = root.path.to_string_lossy();
-    let matches: Vec<i64> = storage
-        .raw()
-        .query_map_collect(
-            "SELECT id
-             FROM conversations
-             WHERE source_id = ?1 AND source_path = ?2
-             LIMIT 1",
-            &[
-                ParamValue::from(root.origin.source_id.as_str()),
-                ParamValue::from(source_path.as_ref()),
-            ],
-            |row| row.get_typed(0),
-        )
-        .with_context(|| {
-            format!(
-                "checking indexed source path freshness for {}",
-                root.path.display()
-            )
-        })?;
-    Ok(!matches.is_empty())
 }
 
 const WATCH_LEXICAL_REPLAY_DEBT_PREFIX: &str = "watch_lexical_replay_v1:";
@@ -73985,13 +73898,8 @@ c.close()
         let mut file_selection = opts.clone();
         file_selection.watch_once_paths = Some(vec![amp_file.clone()]);
         assert!(
-            !should_skip_unchanged_explicit_watch_once_paths(
-                &file_selection,
-                &storage.lock().unwrap(),
-                &roots,
-            )
-            .unwrap(),
-            "the outer unchanged-file fast path must preserve Amp's debt"
+            !should_skip_unclaimed_explicit_watch_once_paths(&file_selection, &roots),
+            "the outer watch-once fast path must preserve Amp's debt"
         );
         for _ in 0..2 {
             // Both packets are unchanged. Only Amp's durable debt permits
@@ -75061,11 +74969,10 @@ c.close()
         }
     }
 
-    /// GH #502: a SQLite source's committed WAL (or rollback journal) change is
-    /// a source change even when the main database file is untouched, while a
-    /// reader-rewritten -shm is not.
+    /// GH #543: neither source nor sidecar mtimes relative to an archive-wide
+    /// watermark prove that this database's committed data has been read.
     #[test]
-    fn explicit_watch_once_freshness_counts_committed_sqlite_sidecars() {
+    fn explicit_watch_once_admits_database_regardless_of_archive_watermark() {
         let tmp = TempDir::new().unwrap();
         let storage = FrankenStorage::open(&tmp.path().join("cass.db")).unwrap();
         let agent_id = storage
@@ -75095,7 +75002,9 @@ c.close()
             .unwrap();
         let indexed_at = FrankenStorage::now_millis();
         storage.set_last_indexed_at(indexed_at).unwrap();
-        let root = ScanRoot::local(source.clone());
+        let roots = [(ConnectorKind::OpenClaw, ScanRoot::local(source.clone()))];
+        let mut opts = watch_lexical_options(tmp.path());
+        opts.watch_once_paths = Some(vec![source.clone()]);
         let set_mtime = |path: &Path, epoch_ms: i64| {
             std::fs::OpenOptions::new()
                 .write(true)
@@ -75107,42 +75016,52 @@ c.close()
                 .unwrap();
         };
         set_mtime(&source, indexed_at - 60_000);
-        let unchanged = || {
-            explicit_watch_once_root_unchanged_after_last_index(
-                &storage,
-                ConnectorKind::OpenClaw,
-                &root,
-            )
-            .unwrap()
-        };
+        let should_skip = || should_skip_unclaimed_explicit_watch_once_paths(&opts, &roots);
 
-        // Negative control: nothing newer than the last index keeps the fast path.
-        assert!(unchanged(), "an unchanged database must skip");
+        assert!(
+            !should_skip(),
+            "an indexed database still needs source-specific read evidence"
+        );
         let shm = database_path_with_suffix(&source, "-shm");
         std::fs::write(&shm, b"reader index").unwrap();
         set_mtime(&shm, indexed_at + 60_000);
-        assert!(
-            unchanged(),
-            "a reader-rewritten -shm is not a source change"
-        );
+        assert!(!should_skip(), "reader activity must not bypass ingestion");
         let wal = database_path_with_suffix(&source, "-wal");
-        std::fs::write(&wal, b"old frames").unwrap();
+        std::fs::write(&wal, b"committed frames").unwrap();
         set_mtime(&wal, indexed_at - 30_000);
-        assert!(unchanged(), "a WAL already covered by the last index skips");
+        assert!(
+            !should_skip(),
+            "a sibling's newer archive timestamp cannot certify this WAL"
+        );
 
-        // The bug: a WAL-only commit after the last index, main file untouched.
         set_mtime(&wal, indexed_at + 1);
-        assert!(!unchanged(), "a committed WAL append must be re-read");
+        assert!(!should_skip(), "a committed WAL append must be re-read");
         set_mtime(&wal, indexed_at - 30_000);
         let journal = database_path_with_suffix(&source, "-journal");
         std::fs::write(&journal, b"rollback journal").unwrap();
         set_mtime(&journal, indexed_at + 1);
-        assert!(!unchanged(), "a newer rollback journal must be re-read");
+        assert!(!should_skip(), "a newer rollback journal must be re-read");
+    }
+
+    #[test]
+    fn explicit_watch_once_only_skips_unclaimed_paths() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("unclaimed.txt");
+        std::fs::write(&source, "not an agent transcript").unwrap();
+        let mut opts = watch_lexical_options(tmp.path());
+        opts.watch_once_paths = Some(vec![source]);
+        assert!(should_skip_unclaimed_explicit_watch_once_paths(&opts, &[]));
+
+        opts.full = true;
+        assert!(!should_skip_unclaimed_explicit_watch_once_paths(&opts, &[]));
+        opts.full = false;
+        opts.semantic = true;
+        assert!(!should_skip_unclaimed_explicit_watch_once_paths(&opts, &[]));
     }
 
     #[test]
     #[serial]
-    fn reindex_paths_watch_once_skips_unchanged_indexed_file() {
+    fn reindex_paths_watch_once_reconciles_writes_before_archive_watermark() {
         let tmp = TempDir::new().unwrap();
         let xdg = tmp.path().join("xdg_watch_once_unchanged");
         std::fs::create_dir_all(&xdg).unwrap();
@@ -75156,7 +75075,7 @@ c.close()
         let amp_file = amp_dir.join("thread-unchanged.json");
         std::fs::write(
             &amp_file,
-            r#"{"id":"unchanged","messages":[{"role":"user","text":"p","createdAt":1700000000100}]}"#,
+            r#"{"id":"unchanged","messages":[{"role":"user","text":"originalwatchneedle","createdAt":1700000000100}]}"#,
         )
         .unwrap();
 
@@ -75194,92 +75113,42 @@ c.close()
         .unwrap();
         assert_eq!(first, 1);
 
-        storage.lock().unwrap().set_last_indexed_at(0).unwrap();
+        let canonical_before = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        assert_eq!(canonical_before.len(), 1);
+        let lexical_before = watch_lexical_search_ids(&index_path, "originalwatchneedle");
+        assert_eq!(lexical_before.len(), 1);
 
-        let before_last_indexed_marker = {
-            let guard = storage.lock().unwrap();
-            should_skip_unchanged_explicit_watch_once_paths(
-                &opts,
-                &guard,
-                &[(ConnectorKind::Amp, ScanRoot::local(amp_dir.clone()))],
-            )
-            .unwrap()
-        };
-        assert!(
-            !before_last_indexed_marker,
-            "indexed files without a settled last_indexed_at marker must still flow through watch-once ingest"
-        );
-
+        // The archive timestamp may be a later sibling's completion or the
+        // end of a batch whose source snapshot was taken before a new write.
+        let batch_finished_at = FrankenStorage::now_millis().saturating_add(10_000);
         storage
             .lock()
             .unwrap()
-            .set_last_indexed_at(FrankenStorage::now_millis().saturating_add(10_000))
+            .set_last_indexed_at(batch_finished_at)
             .unwrap();
-
-        let preopen_skip = {
-            let guard = storage.lock().unwrap();
-            should_skip_unchanged_explicit_watch_once_paths(
-                &opts,
-                &guard,
-                &[(ConnectorKind::Amp, ScanRoot::local(amp_dir.clone()))],
-            )
-            .unwrap()
-        };
+        let roots = [(ConnectorKind::Amp, ScanRoot::local(amp_dir.clone()))];
         assert!(
-            preopen_skip,
-            "unchanged explicit watch-once files can skip before Tantivy is opened"
+            !should_skip_unclaimed_explicit_watch_once_paths(&opts, &roots),
+            "claimed paths cannot bypass ingestion on an archive-wide timestamp"
         );
-
-        let startup_skip = {
+        for (lexical_rebuild, analytics_rebuild) in [(false, false), (true, false), (false, true)] {
             let guard = storage.lock().unwrap();
-            can_skip_unchanged_explicit_watch_once_index_run(
-                &opts,
-                &guard,
-                &index_path,
-                false,
-                false,
-            )
-            .unwrap()
-        };
-        assert!(
-            startup_skip,
-            "unchanged explicit watch-once files with current lexical assets can skip startup maintenance"
-        );
-        let migration_skip = {
-            let guard = storage.lock().unwrap();
-            can_skip_unchanged_explicit_watch_once_index_run(
-                &opts,
-                &guard,
-                &index_path,
-                true,
-                false,
-            )
-            .unwrap()
-        };
-        assert!(
-            !migration_skip,
-            "a pending canonical identity migration must publish fresh lexical assets"
-        );
-        let analytics_migration_skip = {
-            let guard = storage.lock().unwrap();
-            can_skip_unchanged_explicit_watch_once_index_run(
-                &opts,
-                &guard,
-                &index_path,
-                false,
-                true,
-            )
-            .unwrap()
-        };
-        assert!(
-            !analytics_migration_skip,
-            "an analytics-only legacy OMP migration must resume after lexical publication"
-        );
+            assert!(
+                !can_skip_unclaimed_explicit_watch_once_index_run(
+                    &opts,
+                    &guard,
+                    &index_path,
+                    lexical_rebuild,
+                    analytics_rebuild,
+                ),
+                "claimed paths and pending migrations must reach the indexing pipeline"
+            );
+        }
 
         let second = reindex_paths(
             &opts,
-            vec![amp_file],
-            &[(ConnectorKind::Amp, ScanRoot::local(amp_dir))],
+            vec![amp_file.clone()],
+            &roots,
             &state,
             &storage,
             &t_index,
@@ -75287,9 +75156,64 @@ c.close()
             false,
         )
         .unwrap();
+        assert_eq!(second, 1, "the unchanged source is reconciled");
         assert_eq!(
-            second, 0,
-            "unchanged explicit watch-once files already indexed before last_indexed_at should skip storage ingest"
+            watch_lexical_canonical_rows(&storage.lock().unwrap()),
+            canonical_before,
+            "re-reading must preserve canonical identities and avoid duplicate messages"
+        );
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "originalwatchneedle"),
+            lexical_before,
+            "re-reading must preserve lexical identities and avoid duplicate hits"
+        );
+
+        std::fs::write(
+            &amp_file,
+            r#"{"id":"unchanged","messages":[{"role":"user","text":"originalwatchneedle","createdAt":1700000000100},{"role":"assistant","text":"windowappendneedle","createdAt":1700000000200}]}"#,
+        )
+        .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&amp_file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                UNIX_EPOCH + Duration::from_millis(u64::try_from(batch_finished_at - 1).unwrap()),
+            ))
+            .unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .set_last_indexed_at(batch_finished_at)
+            .unwrap();
+        assert!(watch_lexical_search_ids(&index_path, "windowappendneedle").is_empty());
+        assert!(
+            !should_skip_unclaimed_explicit_watch_once_paths(&opts, &roots),
+            "a write inside the previous batch's window must still be ingested"
+        );
+        assert_eq!(
+            reindex_paths(
+                &opts,
+                vec![amp_file],
+                &roots,
+                &state,
+                &storage,
+                &t_index,
+                &index_path,
+                false,
+            )
+            .unwrap(),
+            1
+        );
+        let canonical_after = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        assert_eq!(canonical_after.len(), 2);
+        assert_eq!(canonical_after[0], canonical_before[0]);
+        assert_eq!(canonical_after[1].0, canonical_before[0].0);
+        assert_eq!(canonical_after[1].2, 1);
+        assert_eq!(canonical_after[1].3, "windowappendneedle");
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "windowappendneedle").len(),
+            1
         );
 
         if let Some(prev) = prev {

@@ -355,10 +355,10 @@ mod registry_and_cli {
             .success();
     }
 
-    /// GH #502: targeted watch-once must see a commit that lands only in the
-    /// WAL while the provider's writer stays open, whether the database alone
-    /// or the database plus its WAL is named. Before the fix both passes
-    /// exited 0 having read nothing: freshness looked only at the main file.
+    /// GH #502/#543: targeted watch-once must see a commit that lands only in
+    /// the WAL while the provider's writer stays open, whether the database
+    /// alone or the database plus its WAL is named. An intervening successful
+    /// index of another source must not certify this source as already read.
     #[test]
     fn watch_once_reads_wal_only_commits_while_the_writer_stays_open() -> Result<()> {
         let home = tempfile::tempdir()?;
@@ -380,9 +380,21 @@ mod registry_and_cli {
             "the seeded message must be searchable before the WAL-only commits: {seeded} hits"
         );
 
-        for (seq, needle, paths) in [
-            (6, "secondwalneedle", vec![database.as_path()]),
-            (7, "thirdwalneedle", vec![database.as_path(), wal.as_path()]),
+        for (seq, needle, paths, interleave_source) in [
+            (6, "secondwalneedle", vec![database.as_path()], false),
+            (
+                7,
+                "thirdwalneedle",
+                vec![database.as_path(), wal.as_path()],
+                false,
+            ),
+            (8, "crosssourcewalneedle", vec![database.as_path()], true),
+            (
+                9,
+                "crosssourcesidecarneedle",
+                vec![database.as_path(), wal.as_path()],
+                true,
+            ),
         ] {
             // Keep the commit strictly after the last index on coarse clocks.
             std::thread::sleep(Duration::from_millis(1_100));
@@ -401,12 +413,50 @@ mod registry_and_cli {
                 search_hit_count(home.path(), &data, needle)? == 0,
                 "{needle} must not be searchable before the pass"
             );
+            let source_before = bundle(&database)?;
+            if interleave_source {
+                let sessions = home.path().join(".openclaw/agents/openclaw/sessions");
+                fs::create_dir_all(&sessions)?;
+                let other = sessions.join(format!("other-{seq}.jsonl"));
+                let other_needle = format!("othersourceneedle{seq}");
+                fs::write(
+                    &other,
+                    format!(
+                        "{}\n{}\n",
+                        json!({"type": "session", "id": format!("other-{seq}"), "cwd": "/work/other"}),
+                        json!({"type": "message", "message": {"role": "user", "content": other_needle}}),
+                    ),
+                )?;
+                // This pass advances last_indexed_at after the WAL append,
+                // without reading the explicitly unselected native database.
+                watch_once(home.path(), &data, &[other.as_path()]);
+                ensure!(
+                    search_hit_count(home.path(), &data, &other_needle)? > 0,
+                    "the intervening source must actually be indexed"
+                );
+                ensure!(
+                    search_hit_count(home.path(), &data, needle)? == 0,
+                    "the intervening source must not broaden to the native database"
+                );
+            }
             watch_once(home.path(), &data, &paths);
             let hits = search_hit_count(home.path(), &data, needle)?;
             ensure!(
                 hits > 0,
                 "watch-once {paths:?} missed the WAL-only commit of {needle}: {hits} hits"
             );
+            assert_eq!(
+                bundle(&database)?,
+                source_before,
+                "targeted indexing must preserve provider database/WAL/SHM bytes and mtimes"
+            );
+            watch_once(home.path(), &data, &paths);
+            assert_eq!(
+                search_hit_count(home.path(), &data, needle)?,
+                hits,
+                "re-reading an unchanged source must not duplicate search hits"
+            );
+            assert_eq!(bundle(&database)?, source_before);
         }
         writer.close_without_checkpoint()?;
         Ok(())
