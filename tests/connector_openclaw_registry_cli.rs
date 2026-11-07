@@ -14,20 +14,45 @@ mod registry_and_cli {
     //! These tests must not be feature-gated: disabling SQLite support in an ordinary
     //! CASS build must fail positive discovery/retrieval assertions, not skip them.
 
-    use anyhow::{Result, ensure};
+    use anyhow::{Context, Result, ensure};
     use coding_agent_search::connectors::{
         Connector, DiscoveredSourceRole, ScanContext, ScanRoot, get_connector_factories,
     };
     use coding_agent_search::franken_sync::Connection;
-    use coding_agent_search::franken_sync::compat::{ConnectionExt, ParamValue};
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use serde::Deserialize;
     use serde_json::{Value, json};
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     const AT: i64 = 1_780_000_000_000;
     type SourceBundle = Vec<Option<(Vec<u8>, SystemTime)>>;
+
+    // Exclude ranking scores and timing diagnostics: these can change when a
+    // sibling is indexed, while canonical identity and historical content must not.
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    struct SearchMessage {
+        conversation_id: i64,
+        line_number: usize,
+        source_id: String,
+        source_path: PathBuf,
+        agent: String,
+        created_at: Option<i64>,
+        content: String,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CanonicalMessage {
+        conversation_id: i64,
+        message_id: i64,
+        idx: i64,
+        created_at: Option<i64>,
+        content: String,
+    }
 
     fn connector() -> Box<dyn Connector + Send> {
         let (_, factory) = get_connector_factories()
@@ -101,7 +126,12 @@ mod registry_and_cli {
             session,
             1,
             json!({
-                "type": "message", "message": {"role": "user", "content": needle}
+                // OpenClaw uses the first line as the conversation title, which
+                // lexical search indexes on every message. Keep the needle out
+                // of that title so exactly one content hit proves no duplication.
+                "type": "message", "message": {
+                    "role": "user", "content": format!("Historical OpenClaw transcript\n{needle}")
+                }
             }),
         )?;
         conn.close_without_checkpoint()?;
@@ -186,7 +216,10 @@ mod registry_and_cli {
         assert_eq!(conversation.messages.len(), 2);
         assert_eq!(conversation.messages[0].idx, 0);
         assert_eq!(conversation.messages[0].role, "user");
-        assert_eq!(conversation.messages[0].content, "nativeclawneedle");
+        assert_eq!(
+            conversation.messages[0].content,
+            "Historical OpenClaw transcript\nnativeclawneedle"
+        );
         assert_eq!(conversation.messages[0].created_at, Some(AT + 1_000));
         assert_eq!(conversation.messages[1].idx, 1);
         assert!(conversation.messages[1].content.contains("東京 🚀"));
@@ -225,7 +258,10 @@ mod registry_and_cli {
             .find(|c| c.external_id.as_deref() == Some("shared"))
             .unwrap();
         assert_eq!(native.source_path, database);
-        assert_eq!(native.messages[0].content, "nativeclawneedle");
+        assert_eq!(
+            native.messages[0].content,
+            "Historical OpenClaw transcript\nnativeclawneedle"
+        );
         assert!(conversations.iter().any(|c| {
             c.external_id.as_deref() == Some("legacy-only")
                 && c.messages[0].content == "legacy legacy-only"
@@ -280,38 +316,9 @@ mod registry_and_cli {
             .timeout(Duration::from_secs(120))
             .assert()
             .success();
-        let output = assert_cmd::Command::from_std(command(home.path(), &data))
-            .args([
-                "search",
-                "nativeclawneedle",
-                "--mode",
-                "lexical",
-                "--json",
-                "--no-maintenance",
-                "--limit",
-                "10",
-            ])
-            .timeout(Duration::from_secs(30))
-            .output()?;
-        ensure!(
-            output.status.success(),
-            "lexical retrieval failed: {output:?}"
-        );
-        let result: Value = serde_json::from_slice(&output.stdout)?;
-        let hits = result["hits"]
-            .as_array()
-            .expect("search must return a hits array");
-        assert!(
-            !hits.is_empty(),
-            "a successful empty query does not prove ingestion: {result}"
-        );
-        assert!(
-            hits.iter().any(|hit| {
-                hit["agent"].as_str() == Some("openclaw")
-                    && hit["source_path"].as_str() == database.to_str()
-            }),
-            "native source provenance must survive indexing and retrieval: {result}"
-        );
+        let rows = canonical_messages(&data, &database)?;
+        assert_eq!(rows.len(), 2);
+        native_search_message(home.path(), &data, &database, "nativeclawneedle", &rows[0])?;
         assert_eq!(
             bundle(&database)?,
             before,
@@ -320,7 +327,7 @@ mod registry_and_cli {
         Ok(())
     }
 
-    fn search_hit_count(home: &Path, data: &Path, needle: &str) -> Result<usize> {
+    fn search_hits(home: &Path, data: &Path, needle: &str) -> Result<Vec<SearchMessage>> {
         let output = assert_cmd::Command::from_std(command(home, data))
             .args([
                 "search",
@@ -338,8 +345,131 @@ mod registry_and_cli {
             output.status.success(),
             "search {needle} failed: {output:?}"
         );
-        let result: Value = serde_json::from_slice(&output.stdout)?;
-        Ok(result["hits"].as_array().map_or(0, Vec::len))
+        #[derive(Deserialize)]
+        struct SearchOutput {
+            hits: Vec<SearchMessage>,
+        }
+        let result: SearchOutput = serde_json::from_slice(&output.stdout)
+            .with_context(|| format!("search {needle} returned malformed hits: {output:?}"))?;
+        Ok(result.hits)
+    }
+
+    fn single_search_message(home: &Path, data: &Path, needle: &str) -> Result<SearchMessage> {
+        let hits = search_hits(home, data, needle)?;
+        ensure!(
+            hits.len() == 1,
+            "unique needle {needle} must have exactly one hit: {hits:?}"
+        );
+        hits.into_iter().next().context("validated search hit")
+    }
+
+    fn native_search_message(
+        home: &Path,
+        data: &Path,
+        database: &Path,
+        needle: &str,
+        expected: &CanonicalMessage,
+    ) -> Result<SearchMessage> {
+        let hit = single_search_message(home, data, needle)?;
+        assert_eq!(hit.agent, "openclaw");
+        assert_eq!(hit.source_id, "local");
+        assert_eq!(hit.source_path, dunce::canonicalize(database)?);
+        assert_eq!(hit.conversation_id, expected.conversation_id);
+        assert_eq!(hit.line_number, usize::try_from(expected.idx)? + 1);
+        assert_eq!(hit.created_at, expected.created_at);
+        assert_eq!(hit.content, expected.content);
+        Ok(hit)
+    }
+
+    fn canonical_messages(data: &Path, source: &Path) -> Result<Vec<CanonicalMessage>> {
+        let storage = FrankenStorage::open_readonly(&data.join("agent_search.db"))?;
+        let source = dunce::canonicalize(source)?;
+        let rows = storage.raw().query_map_collect(
+            "SELECT c.id, m.id, m.idx, m.created_at, m.content
+             FROM conversations c JOIN messages m ON m.conversation_id = c.id
+             WHERE c.source_id = 'local' AND c.source_path = ?1 ORDER BY m.id",
+            &[ParamValue::from(source.to_string_lossy().as_ref())],
+            |row| {
+                Ok(CanonicalMessage {
+                    conversation_id: row.get_typed(0)?,
+                    message_id: row.get_typed(1)?,
+                    idx: row.get_typed(2)?,
+                    created_at: row.get_typed(3)?,
+                    content: row.get_typed(4)?,
+                })
+            },
+        )?;
+        storage.close_without_checkpoint()?;
+        let mut next_idx = BTreeMap::new();
+        for row in &rows {
+            let expected = next_idx.entry(row.conversation_id).or_insert(0);
+            assert_eq!(row.idx, *expected, "canonical message order changed");
+            *expected += 1;
+        }
+        Ok(rows)
+    }
+
+    fn canonical_append(
+        data: &Path,
+        database: &Path,
+        previous: &[CanonicalMessage],
+        conversation_id: i64,
+        needle: &str,
+        created_at: i64,
+    ) -> Result<Vec<CanonicalMessage>> {
+        let rows = canonical_messages(data, database)?;
+        assert_eq!(rows.len(), previous.len() + 1);
+        assert_eq!(&rows[..previous.len()], previous, "older history changed");
+        let appended = rows.last().context("new canonical message")?;
+        let prior_count = previous
+            .iter()
+            .filter(|row| row.conversation_id == conversation_id)
+            .count();
+        ensure!(prior_count > 0, "append must target an indexed session");
+        assert_eq!(appended.conversation_id, conversation_id);
+        assert_eq!(appended.idx, i64::try_from(prior_count)?);
+        assert_eq!(appended.created_at, Some(created_at));
+        assert_eq!(appended.content, needle);
+        Ok(rows)
+    }
+
+    fn last_indexed_at(data: &Path) -> Result<i64> {
+        let storage = FrankenStorage::open_readonly(&data.join("agent_search.db"))?;
+        // The old timestamp shortcut also admitted sources with replay debt.
+        // Prove this fixture exercises freshness admission, not recovery.
+        let replay_debt: Vec<i64> = storage.raw().query_map_collect(
+            "SELECT 1 FROM meta WHERE key >= ?1 AND key < ?2 LIMIT 1",
+            &[
+                ParamValue::from("watch_lexical_replay_v1:"),
+                ParamValue::from("watch_lexical_replay_v1;"),
+            ],
+            |row| row.get_typed(0),
+        )?;
+        ensure!(
+            replay_debt.is_empty(),
+            "fixture must have no pending watch lexical replay debt"
+        );
+        let indexed_at = storage
+            .get_last_indexed_at()?
+            .context("successful indexing must record its completion")?;
+        storage.close_without_checkpoint()?;
+        Ok(indexed_at)
+    }
+
+    fn assert_source_mtimes_before(database: &Path, indexed_at: i64) -> Result<()> {
+        for suffix in ["", "-wal"] {
+            let path = sidecar(database, suffix);
+            let modified_ms = fs::metadata(&path)?
+                .modified()?
+                .duration_since(UNIX_EPOCH)?
+                .as_millis();
+            ensure!(
+                modified_ms <= u128::try_from(indexed_at)?,
+                "fixture must reproduce the stale shortcut: {} mtime {modified_ms} exceeds archive completion {indexed_at}",
+                path.display()
+            );
+        }
+        Ok(())
     }
 
     fn watch_once(home: &Path, data: &Path, paths: &[&Path]) {
@@ -363,22 +493,31 @@ mod registry_and_cli {
     fn watch_once_reads_wal_only_commits_while_the_writer_stays_open() -> Result<()> {
         let home = tempfile::tempdir()?;
         let database = fixture(home.path(), "openclaw", "live", "firstwalneedle")?;
+        let unselected = fixture(home.path(), "unselected", "hidden", "neverselectedneedle")?;
+        let unselected_before = bundle(&unselected)?;
         let wal = sidecar(&database, "-wal");
         let data = home.path().join("cass-data");
         // The provider's writer opens before cass indexes, so anything its open
         // does to the main file happens before the archive's last index.
         let writer = Connection::open(database.to_string_lossy().as_ref())?;
         writer.execute("PRAGMA wal_autocheckpoint = 0")?;
-        assert_cmd::Command::from_std(command(home.path(), &data))
-            .args(["index", "--full", "--json"])
-            .timeout(Duration::from_secs(120))
-            .assert()
-            .success();
-        let seeded = search_hit_count(home.path(), &data, "firstwalneedle")?;
-        ensure!(
-            seeded > 0,
-            "the seeded message must be searchable before the WAL-only commits: {seeded} hits"
-        );
+        let source_before = bundle(&database)?;
+        watch_once(home.path(), &data, &[database.as_path()]);
+        assert_eq!(bundle(&database)?, source_before);
+        let mut previous = canonical_messages(&data, &database)?;
+        assert_eq!(previous.len(), 2);
+        assert_eq!(previous[0].idx, 0);
+        assert_eq!(previous[1].idx, 1);
+        assert_eq!(previous[0].created_at, Some(AT + 1_000));
+        let seeded = native_search_message(
+            home.path(),
+            &data,
+            &database,
+            "firstwalneedle",
+            &previous[0],
+        )?;
+        assert!(search_hits(home.path(), &data, "neverselectedneedle")?.is_empty());
+        assert!(canonical_messages(&data, &unselected)?.is_empty());
 
         for (seq, needle, paths, interleave_source) in [
             (6, "secondwalneedle", vec![database.as_path()], false),
@@ -410,7 +549,7 @@ mod registry_and_cli {
                 "the commit must land only in the WAL, leaving the main file untouched"
             );
             ensure!(
-                search_hit_count(home.path(), &data, needle)? == 0,
+                search_hits(home.path(), &data, needle)?.is_empty(),
                 "{needle} must not be searchable before the pass"
             );
             let source_before = bundle(&database)?;
@@ -429,21 +568,41 @@ mod registry_and_cli {
                 )?;
                 // This pass advances last_indexed_at after the WAL append,
                 // without reading the explicitly unselected native database.
+                let before_other = last_indexed_at(&data)?;
                 watch_once(home.path(), &data, &[other.as_path()]);
-                ensure!(
-                    search_hit_count(home.path(), &data, &other_needle)? > 0,
-                    "the intervening source must actually be indexed"
+                single_search_message(home.path(), &data, &other_needle)?;
+                let after_other = last_indexed_at(&data)?;
+                assert!(
+                    after_other > before_other,
+                    "the other source must advance the archive marker"
                 );
+                assert_source_mtimes_before(&database, after_other)?;
                 ensure!(
-                    search_hit_count(home.path(), &data, needle)? == 0,
+                    search_hits(home.path(), &data, needle)?.is_empty(),
                     "the intervening source must not broaden to the native database"
                 );
+                assert_eq!(canonical_messages(&data, &database)?, previous);
             }
             watch_once(home.path(), &data, &paths);
-            let hits = search_hit_count(home.path(), &data, needle)?;
-            ensure!(
-                hits > 0,
-                "watch-once {paths:?} missed the WAL-only commit of {needle}: {hits} hits"
+            let rows = canonical_append(
+                &data,
+                &database,
+                &previous,
+                seeded.conversation_id,
+                needle,
+                AT + seq * 1_000,
+            )?;
+            let appended = native_search_message(
+                home.path(),
+                &data,
+                &database,
+                needle,
+                rows.last().context("appended canonical message")?,
+            )?;
+            assert_eq!(
+                single_search_message(home.path(), &data, "firstwalneedle")?,
+                seeded,
+                "historical search identity must survive later appends"
             );
             assert_eq!(
                 bundle(&database)?,
@@ -452,11 +611,158 @@ mod registry_and_cli {
             );
             watch_once(home.path(), &data, &paths);
             assert_eq!(
-                search_hit_count(home.path(), &data, needle)?,
-                hits,
-                "re-reading an unchanged source must not duplicate search hits"
+                single_search_message(home.path(), &data, needle)?,
+                appended,
+                "re-reading must preserve search identity without duplicate hits"
             );
+            assert_eq!(
+                single_search_message(home.path(), &data, "firstwalneedle")?,
+                seeded
+            );
+            assert_eq!(canonical_messages(&data, &database)?, rows);
             assert_eq!(bundle(&database)?, source_before);
+            previous = rows;
+        }
+        assert!(search_hits(home.path(), &data, "neverselectedneedle")?.is_empty());
+        assert!(canonical_messages(&data, &unselected)?.is_empty());
+        assert_eq!(bundle(&unselected)?, unselected_before);
+        writer.close_without_checkpoint()?;
+        Ok(())
+    }
+
+    /// GH #543: reproduce the durable state left when a source commits after
+    /// its snapshot was ingested but before that batch records completion.
+    /// The completion marker is set deliberately; this is not a live race test.
+    #[test]
+    fn watch_once_reads_wal_commit_inside_previous_indexing_window() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let database = fixture(home.path(), "openclaw", "historical", "beforewindowneedle")?;
+        let wal = sidecar(&database, "-wal");
+        let data = home.path().join("cass-data");
+        let writer = Connection::open(database.to_string_lossy().as_ref())?;
+        writer.execute("PRAGMA wal_autocheckpoint = 0")?;
+        append(
+            &writer,
+            "other-history",
+            0,
+            json!({"type": "session", "cwd": "/work/other-history"}),
+        )?;
+        append(
+            &writer,
+            "other-history",
+            1,
+            json!({"type": "message", "message": {"role": "user", "content": "otherhistoryneedle"}}),
+        )?;
+        let source_before = bundle(&database)?;
+        watch_once(home.path(), &data, &[database.as_path()]);
+        assert_eq!(bundle(&database)?, source_before);
+        let previous = canonical_messages(&data, &database)?;
+        assert_eq!(previous.len(), 3);
+        let seeded_row = previous
+            .iter()
+            .find(|row| row.content.contains("beforewindowneedle"))
+            .context("seeded historical message")?;
+        assert_eq!(seeded_row.created_at, Some(AT + 1_000));
+        let seeded = native_search_message(
+            home.path(),
+            &data,
+            &database,
+            "beforewindowneedle",
+            seeded_row,
+        )?;
+        let other_history = native_search_message(
+            home.path(),
+            &data,
+            &database,
+            "otherhistoryneedle",
+            previous
+                .iter()
+                .find(|row| row.content == "otherhistoryneedle")
+                .context("second historical session")?,
+        )?;
+        assert_ne!(seeded.conversation_id, other_history.conversation_id);
+        let snapshot_indexed_at = last_indexed_at(&data)?;
+        // The real append follows the completed snapshot. Only the archive's
+        // completion marker is reconstructed below; no timing race is required.
+        append(
+            &writer,
+            "historical",
+            6,
+            json!({"type": "message", "message": {"role": "user", "content": "insidewindowneedle"}}),
+        )?;
+        let source_after_append = bundle(&database)?;
+        assert_eq!(
+            source_after_append[0], source_before[0],
+            "commit must be WAL-only"
+        );
+        let wal_written_at = i64::try_from(
+            fs::metadata(&wal)?
+                .modified()?
+                .duration_since(UNIX_EPOCH)?
+                .as_millis(),
+        )?;
+        let batch_finished_at = wal_written_at
+            .max(snapshot_indexed_at)
+            .max(FrankenStorage::now_millis())
+            + 10_000;
+        {
+            let storage = FrankenStorage::open_writer(&data.join("agent_search.db"))?;
+            storage.set_last_indexed_at(batch_finished_at)?;
+            storage.close_without_checkpoint()?;
+        }
+        assert_eq!(last_indexed_at(&data)?, batch_finished_at);
+        assert_source_mtimes_before(&database, batch_finished_at)?;
+        assert!(
+            AT + 6_000 < snapshot_indexed_at,
+            "the appended event is historical"
+        );
+        assert!(search_hits(home.path(), &data, "insidewindowneedle")?.is_empty());
+        assert_eq!(canonical_messages(&data, &database)?, previous);
+
+        watch_once(home.path(), &data, &[database.as_path()]);
+        let rows = canonical_append(
+            &data,
+            &database,
+            &previous,
+            seeded.conversation_id,
+            "insidewindowneedle",
+            AT + 6_000,
+        )?;
+        let appended = native_search_message(
+            home.path(),
+            &data,
+            &database,
+            "insidewindowneedle",
+            rows.last().context("appended historical message")?,
+        )?;
+        assert_eq!(bundle(&database)?, source_after_append);
+        assert_eq!(
+            single_search_message(home.path(), &data, "beforewindowneedle")?,
+            seeded
+        );
+        assert_eq!(
+            single_search_message(home.path(), &data, "otherhistoryneedle")?,
+            other_history
+        );
+        for paths in [
+            vec![database.as_path()],
+            vec![database.as_path(), wal.as_path()],
+        ] {
+            watch_once(home.path(), &data, &paths);
+            assert_eq!(
+                single_search_message(home.path(), &data, "insidewindowneedle")?,
+                appended
+            );
+            assert_eq!(
+                single_search_message(home.path(), &data, "beforewindowneedle")?,
+                seeded
+            );
+            assert_eq!(
+                single_search_message(home.path(), &data, "otherhistoryneedle")?,
+                other_history
+            );
+            assert_eq!(canonical_messages(&data, &database)?, rows);
+            assert_eq!(bundle(&database)?, source_after_append);
         }
         writer.close_without_checkpoint()?;
         Ok(())
