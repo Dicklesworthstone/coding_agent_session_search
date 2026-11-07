@@ -225,6 +225,62 @@ fn seed_archive_conversation(db_path: &Path, agent_slug: &str, marker: &str) {
         .unwrap();
 }
 
+fn isolated_agent_exclusion_command(
+    tracker: &PhaseTracker,
+    home: &Path,
+    config: &Path,
+    data: &Path,
+) -> assert_cmd::Command {
+    let mut command = tracker.cass_assert_command();
+    command
+        .env_clear()
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("PATH", "")
+        .env("XDG_CONFIG_HOME", config)
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("APPDATA", home.join("AppData/Roaming"))
+        .env("LOCALAPPDATA", home.join("AppData/Local"))
+        .env("CASS_DATA_DIR", data)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("RUST_MIN_STACK", "134217728")
+        .env("RAYON_NUM_THREADS", "2")
+        .current_dir(home)
+        .timeout(std::time::Duration::from_secs(90));
+    if let Ok(system_root) = dotenvy::var("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
+    tracker.command_environment().apply_to_assert(&mut command);
+    command
+}
+
+fn agent_exclusion_archive_rows(data: &Path) -> Vec<(i64, String, String, i64, i64, String)> {
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+    let storage = FrankenStorage::open_readonly(&data.join("agent_search.db")).unwrap();
+    let rows = storage
+        .raw()
+        .query_map_collect(
+            "SELECT c.id, a.slug, c.external_id, m.id, m.idx, m.content
+             FROM conversations c JOIN agents a ON a.id = c.agent_id
+             JOIN messages m ON m.conversation_id = c.id ORDER BY m.id",
+            &[],
+            |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                    row.get_typed(4)?,
+                    row.get_typed(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    storage.close_without_checkpoint().unwrap();
+    rows
+}
+
 // =============================================================================
 // sources list tests
 // =============================================================================
@@ -928,6 +984,303 @@ fn sources_agents_exclude_purges_local_archive_data_by_default() {
         "expected retained codex data to remain searchable: {}",
         String::from_utf8_lossy(&search_output.stdout)
     );
+}
+
+#[test]
+fn sources_agents_exclude_openclaw_purges_named_agents_and_preserves_other_history() {
+    #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+    struct Hit {
+        conversation_id: i64,
+        line_number: usize,
+        source_id: String,
+        source_path: std::path::PathBuf,
+        agent: String,
+        created_at: Option<i64>,
+        content: String,
+    }
+
+    for (selector, include_base) in [
+        ("openclaw", false),
+        ("open-claw", true),
+        ("open_claw", false),
+    ] {
+        let tracker = tracker_for(&format!("sources_agents_exclude_openclaw_family_{selector}"));
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let config = root.path().join("config");
+        let data = root.path().join("data");
+        fs::create_dir_all(&home).unwrap();
+        let mut agents = vec!["alice", "bob"];
+        if include_base {
+            agents.push("openclaw");
+        }
+        let mut providers = Vec::new();
+        let mut targets = Vec::new();
+        for agent in agents {
+            let path = home
+                .join(".openclaw/agents")
+                .join(agent)
+                .join("sessions/history.jsonl");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let needle = format!("excludedfamily{agent}needle");
+            let session = serde_json::json!({
+                "type": "session", "id": format!("history-{agent}"),
+                "cwd": "/synthetic/history", "timestamp": 1_780_000_000_000_i64
+            });
+            let message = serde_json::json!({
+                "type": "message", "timestamp": 1_780_000_001_000_i64,
+                "message": {"role": "user", "content": format!("Historical neutral title\n{needle}")}
+            });
+            fs::write(&path, format!("{session}\n{message}\n")).unwrap();
+            let slug = if agent == "openclaw" {
+                agent.to_string()
+            } else {
+                format!("openclaw/{agent}")
+            };
+            targets.push((slug, needle));
+            providers.push(path);
+        }
+        let kept_needle = "retainedcodexfamilyneedle";
+        util::seed_codex_session(
+            &home.join(".codex"),
+            "rollout-family.jsonl",
+            kept_needle,
+            false,
+        );
+        providers.push(home.join(".codex/sessions/2026/04/23/rollout-family.jsonl"));
+        let snapshot = || {
+            providers
+                .iter()
+                .map(|path| {
+                    (
+                        fs::read(path).unwrap(),
+                        fs::metadata(path).unwrap().modified().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let command = || isolated_agent_exclusion_command(&tracker, &home, &config, &data);
+        let run = |command: &mut assert_cmd::Command| {
+            let before = snapshot();
+            let output = command.output().unwrap();
+            assert_eq!(
+                snapshot(),
+                before,
+                "CLI operations must preserve provider bytes and mtimes"
+            );
+            assert!(
+                output.status.success(),
+                "status={} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        let search = |needle: &str| -> Vec<Hit> {
+            let output = run(command().args([
+                "search",
+                needle,
+                "--mode",
+                "lexical",
+                "--json",
+                "--no-maintenance",
+                "--limit",
+                "10",
+            ]));
+            let response: Value = serde_json::from_slice(&output.stdout).expect("valid search JSON");
+            let hits = response
+                .get("hits")
+                .and_then(Value::as_array)
+                .expect("search hits array");
+            serde_json::from_value(Value::Array(hits.clone())).expect("complete search identity")
+        };
+        run(command()
+            .args(["index", "--watch-once"])
+            .args(&providers)
+            .args(["--json", "--no-progress-events"]));
+        let initial = agent_exclusion_archive_rows(&data);
+        assert_eq!(initial.len(), targets.len() + 1);
+        for (slug, needle) in &targets {
+            let hits = search(needle);
+            assert_eq!(hits.len(), 1, "initial unique hit for {slug}");
+            assert_eq!(&hits[0].agent, slug);
+        }
+        let kept_hits = search(kept_needle);
+        assert_eq!(kept_hits.len(), 1);
+        assert_eq!(kept_hits[0].agent, "codex");
+        let retained_rows = initial
+            .iter()
+            .filter(|row| row.1 == "codex")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(retained_rows.len(), 1);
+
+        run(command().args([
+            "sources",
+            "agents",
+            "exclude",
+            selector,
+            "--keep-indexed-data",
+        ]));
+        assert_eq!(agent_exclusion_archive_rows(&data), initial);
+        for (_, needle) in &targets {
+            assert_eq!(
+                search(needle).len(),
+                1,
+                "keep-indexed-data must preserve history"
+            );
+        }
+        let listed = run(command().args(["sources", "agents", "list", "--json"]));
+        let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+        assert_eq!(listed["disabled_agents"], serde_json::json!(["openclaw"]));
+
+        let purged = run(command().args(["sources", "agents", "exclude", selector]));
+        let stdout = String::from_utf8(purged.stdout).unwrap();
+        assert!(
+            stdout.contains(&format!(
+                "Purged {} conversations and {} messages",
+                targets.len(),
+                targets.len()
+            )),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("No already archived data"), "{stdout}");
+        assert_eq!(agent_exclusion_archive_rows(&data), retained_rows);
+        for (_, needle) in &targets {
+            assert_eq!(
+                search(needle).len(),
+                0,
+                "purged named-agent history must not remain searchable"
+            );
+        }
+        assert_eq!(search(kept_needle), kept_hits);
+
+        let repeated = run(command().args(["sources", "agents", "exclude", selector]));
+        assert!(
+            String::from_utf8(repeated.stdout)
+                .unwrap()
+                .contains("No already archived data")
+        );
+        assert_eq!(agent_exclusion_archive_rows(&data), retained_rows);
+
+        // A provider append after exclusion must not repopulate the purged family.
+        let future_needle = "excludedfamilyfutureappendneedle";
+        let mut writer = fs::OpenOptions::new()
+            .append(true)
+            .open(&providers[0])
+            .unwrap();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "type": "message", "timestamp": 1_780_000_002_000_i64,
+                "message": {"role": "assistant", "content": future_needle}
+            })
+        )
+        .unwrap();
+        writer.flush().unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        run(command()
+            .args(["index", "--watch-once"])
+            .args(&providers)
+            .args(["--json", "--no-progress-events"]));
+        assert_eq!(agent_exclusion_archive_rows(&data), retained_rows);
+        for (_, needle) in &targets {
+            assert_eq!(search(needle).len(), 0);
+        }
+        assert_eq!(search(future_needle).len(), 0);
+        assert_eq!(search(kept_needle), kept_hits);
+        tracker.complete();
+    }
+}
+
+#[test]
+fn sources_agents_exclude_rejects_qualified_names_before_config_or_archive_mutation() {
+    let tracker = tracker_for("sources_agents_exclude_rejects_qualified_names");
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let config = root.path().join("config");
+    let data = root.path().join("data");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&data).unwrap();
+    create_sources_config(&config, "disabled_agents = [\"codex\"]\n");
+    let db = data.join("agent_search.db");
+    seed_archive_conversation(&db, "openclaw/alice", "retained-qualified");
+    seed_archive_conversation(&db, "codex", "retained-codex");
+    let archive_bundle = || {
+        ["", "-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| {
+                let mut path = db.as_os_str().to_owned();
+                path.push(suffix);
+                let path = std::path::PathBuf::from(path);
+                match fs::metadata(&path) {
+                    Ok(metadata) => Ok(Some((fs::read(path)?, metadata.modified()?))),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error),
+                }
+            })
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let before_archive = archive_bundle();
+    let config_path = config.join("cass/sources.toml");
+    let before_config = (
+        fs::read(&config_path).unwrap(),
+        fs::metadata(&config_path).unwrap().modified().unwrap(),
+    );
+    for qualified in ["openclaw/alice", " open-claw/Alice "] {
+        let output = isolated_agent_exclusion_command(&tracker, &home, &config, &data)
+            .args(["sources", "agents", "exclude", qualified])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(11),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("whole connectors"));
+        assert_eq!(
+            archive_bundle(),
+            before_archive,
+            "rejected selectors must not open the archive for writing"
+        );
+        assert_eq!(
+            (
+                fs::read(&config_path).unwrap(),
+                fs::metadata(&config_path).unwrap().modified().unwrap(),
+            ),
+            before_config,
+            "rejected selectors must not persist an inert or widened exclusion"
+        );
+    }
+
+    // Re-enable removes old inert qualified entries without changing other exclusions.
+    create_sources_config(
+        &config,
+        "disabled_agents = [\"codex\", \"openclaw/alice\"]\n",
+    );
+    let included = isolated_agent_exclusion_command(&tracker, &home, &config, &data)
+        .args(["sources", "agents", "include", "openclaw/alice"])
+        .output()
+        .unwrap();
+    assert!(
+        included.status.success(),
+        "{}",
+        String::from_utf8_lossy(&included.stderr)
+    );
+    let listed = isolated_agent_exclusion_command(&tracker, &home, &config, &data)
+        .args(["sources", "agents", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["disabled_agents"], serde_json::json!(["codex"]));
+    assert_eq!(archive_bundle(), before_archive);
+    tracker.complete();
 }
 
 /// Bead dndyv: an archive that exists but cannot be opened, and a path with

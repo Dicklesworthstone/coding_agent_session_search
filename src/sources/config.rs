@@ -61,7 +61,7 @@ pub(crate) fn agent_name_key(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace('-', "_")
 }
 
-fn normalize_agent_config_name(name: &str) -> Option<String> {
+pub(crate) fn normalize_agent_config_name(name: &str) -> Option<String> {
     let normalized = match agent_name_key(name).as_str() {
         "claude_code" => "claude".to_string(),
         "oh_my_pi" | "ohmypi" => "omp".to_string(),
@@ -632,6 +632,11 @@ impl SourcesConfig {
     pub fn exclude_agent_from_indexing(&mut self, agent: &str) -> Result<bool, ConfigError> {
         let normalized = normalize_agent_config_name(agent)
             .ok_or_else(|| ConfigError::Validation("agent name cannot be empty".into()))?;
+        if normalized.contains('/') {
+            return Err(ConfigError::Validation(
+                "agent exclusions apply to whole connectors, not qualified agents; use a connector slug such as 'openclaw' to exclude all of its agents".into(),
+            ));
+        }
         if self.is_agent_disabled(&normalized) {
             return Ok(false);
         }
@@ -3250,6 +3255,24 @@ Host production !legacy-prod
         assert!(config.is_agent_disabled("omp"));
         assert!(config.is_agent_disabled("ohmypi"));
         assert_eq!(config.configured_disabled_agents(), vec!["claude", "omp"]);
+    }
+
+    #[test]
+    fn test_qualified_agent_exclusion_is_rejected_without_widening_scope() {
+        let mut config = SourcesConfig::default();
+        config.exclude_agent_from_indexing("codex").unwrap();
+        for qualified in ["openclaw/alice", " open-claw/Alice "] {
+            let error = config.exclude_agent_from_indexing(qualified).unwrap_err();
+            assert!(error.to_string().contains("whole connectors"));
+            assert_eq!(config.configured_disabled_agents(), vec!["codex"]);
+            assert!(!config.is_agent_disabled("openclaw"));
+        }
+
+        // Older versions accepted inert qualified exclusions. Operators must
+        // still be able to remove those entries without enabling other agents.
+        config.disabled_agents.push("openclaw/alice".into());
+        assert!(config.include_agent_in_indexing("openclaw/alice").unwrap());
+        assert_eq!(config.configured_disabled_agents(), vec!["codex"]);
     }
 
     #[test]

@@ -2926,7 +2926,7 @@ pub enum AgentsAction {
     },
     /// Exclude an agent/connector from future indexing runs
     Exclude {
-        /// Agent slug to exclude (e.g. openclaw, claude_code, codex)
+        /// Connector slug to exclude, including all named agents (e.g. openclaw)
         agent: String,
         /// Persist the exclusion but leave already indexed archive data untouched
         #[arg(long, default_value_t = false)]
@@ -128979,11 +128979,8 @@ fn run_agents_command(action: AgentsAction, cli: &Cli) -> CliResult<()> {
 }
 
 fn archive_agent_slug_for_exclusion(agent: &str) -> String {
-    match agent.trim().to_ascii_lowercase().as_str() {
-        "claude" | "claude-code" | "claude_code" => "claude_code".to_string(),
-        "oh-my-pi" | "oh_my_pi" | "ohmypi" => "omp".to_string(),
-        other => other.to_string(),
-    }
+    let connector = crate::sources::config::normalize_agent_config_name(agent).unwrap_or_default();
+    crate::connectors::archive_provider_slug(&connector).to_string()
 }
 
 fn archive_data_dir_for_agents_command(cli: &Cli) -> PathBuf {
@@ -129030,7 +129027,7 @@ fn purge_excluded_agent_archive_data(agent: &str, cli: &Cli) -> CliResult<Exclud
     };
 
     let purge = storage
-        .purge_agent_archive_data(&archive_agent_slug)
+        .purge_connector_archive_data(&archive_agent_slug)
         .map_err(|e| CliError {
             code: 5,
             kind: CliErrorKind::ArchivePurge.kind_str(),
@@ -129157,7 +129154,7 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
             code: 11,
             kind: CliErrorKind::Config.kind_str(),
             message: format!("Failed to update excluded agents: {e}"),
-            hint: Some("Provide a non-empty agent slug such as 'openclaw'".into()),
+            hint: Some("Provide a connector slug such as 'openclaw'; qualified names such as 'openclaw/alice' are not connector-wide exclusions".into()),
             retryable: false,
         })?;
 

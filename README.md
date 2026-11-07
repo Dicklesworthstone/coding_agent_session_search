@@ -858,6 +858,8 @@ cass sources agents include openclaw
 
 By default, `cass sources agents exclude <agent>` also removes already archived local data for that agent and rebuilds the lexical index so the exclusion frees space instead of only blocking future imports.
 
+Exclusions apply to a whole connector. Excluding `openclaw` also removes archived conversations for named agents such as `openclaw/alice` and `openclaw/bob`. Qualified names such as `openclaw/alice` are rejected by `exclude`; they are never silently widened to the whole connector. Use `cass forget --agent openclaw/alice` to preview removing only that named agent's archived conversations, then add `--apply` to confirm the deletion.
+
 If you want to block future indexing but keep the data already archived:
 
 ```bash
