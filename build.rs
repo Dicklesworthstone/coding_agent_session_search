@@ -194,7 +194,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // OpenClaw backport also preserves explicit JSONL file scope (#350/#543).
         // Keep the source contract exact until a registry release carries both.
         expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "c5b45b5dc3f7d4146fb753ae4e2da2c6f6444b1d",
+        expected_rev: "3a2d7b3e2d89d2abb946b417f7a060f136e829e1",
         expected_version: "0.3.10",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.

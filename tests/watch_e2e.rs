@@ -246,6 +246,253 @@ mod deferred_watch_sources {
             .collect()
     }
 
+    #[cfg(unix)]
+    fn assert_openclaw_watch_preserves_historical_activity(state_override: bool) {
+        use coding_agent_search::franken_sync::{Connection, FrankenError};
+        use coding_agent_search::franken_sync::compat::ParamValue;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const OLD: i64 = 1_780_000_000_000;
+        const SEED: &str = "History title\nopenclawwatchseedclock";
+        const EARLIER: &str = "Earlier title\nopenclawwatcholdhistoryclock";
+        const APPEND: &str = "openclawwatchhistoricalappendclock";
+        const WAL_APPEND: &str = "openclawwatchwalhistoryclock";
+        const FRESH: &str = "Fresh title\nopenclawwatchfreshclock";
+
+        fn insert(writer: &Connection, session: &str, seq: i64, at: i64, content: &str) {
+            let event = serde_json::json!({
+                "type": "message", "message": {"role": "user", "content": content}
+            })
+            .to_string();
+            writer
+                .execute_compat(
+                    "INSERT INTO transcript_events VALUES (?1, ?2, ?3, ?4)",
+                    &[
+                        ParamValue::from(session),
+                        ParamValue::from(seq),
+                        ParamValue::from(event.as_str()),
+                        ParamValue::from(at),
+                    ],
+                )
+                .expect("commit provider transcript event");
+        }
+
+        fn provider_bundle(database: &Path) -> Vec<Option<(Vec<u8>, SystemTime)>> {
+            ["", "-wal", "-shm"]
+                .into_iter()
+                .map(|suffix| {
+                    let mut name = database.as_os_str().to_os_string();
+                    name.push(suffix);
+                    let path = std::path::PathBuf::from(name);
+                    match fs::read(&path) {
+                        Ok(bytes) => Some((
+                            bytes,
+                            fs::metadata(&path).unwrap().modified().unwrap(),
+                        )),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => panic!("cannot snapshot {}: {error}", path.display()),
+                    }
+                })
+                .collect()
+        }
+
+        fn canonical_rows(data: &Path) -> Vec<(i64, String, String, i64, i64, String, i64)> {
+            let storage = SqliteStorage::open_readonly(&data.join("agent_search.db"))
+                .expect("inspect canonical history");
+            storage
+                .raw()
+                .query_map_collect(
+                    "SELECT c.id, c.external_id, c.source_path, m.id, m.idx, m.content, m.created_at \
+                     FROM conversations c JOIN messages m ON m.conversation_id = c.id \
+                     ORDER BY c.id, m.idx",
+                    &[],
+                    |row| {
+                        Ok((
+                            row.get_typed(0)?,
+                            row.get_typed(1)?,
+                            row.get_typed(2)?,
+                            row.get_typed(3)?,
+                            row.get_typed(4)?,
+                            row.get_typed(5)?,
+                            row.get_typed(6)?,
+                        ))
+                    },
+                )
+                .expect("read canonical message identities")
+        }
+
+        let home = TempDir::new().expect("isolated OpenClaw watch home");
+        let canonical_home = fs::canonicalize(home.path()).expect("canonical fixture home");
+        let data = canonical_home.as_path().join("cass-data");
+        let state_dir = canonical_home.as_path().join(".openclaw");
+        let database = state_dir.join("agents/openclaw/agent/openclaw-agent.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let seed_writer = Connection::open(database.to_string_lossy().into_owned()).unwrap();
+        seed_writer.execute("PRAGMA journal_mode = DELETE").unwrap();
+        seed_writer
+            .execute(
+                "CREATE TABLE transcript_events (session_id TEXT NOT NULL, seq INTEGER NOT NULL, \
+                 event_json TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, seq))",
+            )
+            .unwrap();
+        insert(&seed_writer, "historical", 1, OLD + 1_000, SEED);
+        insert(&seed_writer, "earlier", 1, OLD - 90_000, EARLIER);
+        seed_writer.close().unwrap();
+        assert_cmd::Command::from_std(cass(canonical_home.as_path(), &data))
+            .env("CASS_RAW_MIRROR_MIN_FREE_BYTES", "0")
+            .args(["index", "--full", "--json", "--no-progress-events"])
+            .timeout(Duration::from_secs(120))
+            .assert()
+            .success();
+        let initial = canonical_rows(&data);
+        assert_eq!(initial.len(), 2);
+        let writer = Connection::open(database.to_string_lossy().into_owned()).unwrap();
+        writer.execute("PRAGMA journal_mode = WAL").unwrap();
+        writer.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+
+        let override_path = state_dir.to_string_lossy().into_owned();
+        let mut environment = vec![("CASS_RAW_MIRROR_MIN_FREE_BYTES", "0")];
+        if state_override {
+            environment.push(("OPENCLAW_STATE_DIR", override_path.as_str()));
+        }
+        let (mut child, log) =
+            start_watch_with_env(canonical_home.as_path(), &data, true, &environment);
+        let before_commit = provider_bundle(&database);
+        let fresh_at = i64::try_from(
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis(),
+        )
+        .unwrap();
+        assert!(OLD + 3_000 < fresh_at - 10_000);
+        insert(&writer, "historical", 2, OLD + 2_000, APPEND);
+        insert(&writer, "fresh-control", 1, fresh_at, FRESH);
+        // An ordinary watcher read can briefly own a WAL reader mark.
+        // Retry only busy checkpoint outcomes, never the committed inserts.
+        let checkpoint_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                child.0.try_wait().expect("watcher status during checkpoint").is_none(),
+                "watcher exited before provider checkpoint completed"
+            );
+            let checkpoint: Result<Vec<(i64, i64, i64)>, FrankenError> =
+                writer.query_map_collect("PRAGMA wal_checkpoint(TRUNCATE)", &[], |row| {
+                    Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+                });
+            match &checkpoint {
+                Ok(rows) if rows.as_slice() == [(0, 0, 0)] => break,
+                Ok(rows) if matches!(rows.as_slice(), [(1, _, _)]) => {}
+                Err(FrankenError::Busy) => {}
+                _ => panic!("unexpected provider checkpoint outcome: {checkpoint:?}"),
+            }
+            assert!(
+                Instant::now() < checkpoint_deadline,
+                "provider checkpoint remained busy: {checkpoint:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Keep main-DB mtime behind the published watch watermark. A later
+        // WAL-only notification must not depend on that older main-file mtime.
+        let database_at = u64::try_from(fresh_at - 10_000).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&database)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_millis(database_at))
+            .unwrap();
+        let checkpointed = provider_bundle(&database);
+        assert_ne!(checkpointed[0], before_commit[0]);
+        wait_for_hit(&mut child, canonical_home.as_path(), &data, &log, "openclawwatchfreshclock");
+        wait_for_hit(&mut child, canonical_home.as_path(), &data, &log, APPEND);
+        assert_eq!(provider_bundle(&database), checkpointed);
+
+        let watermark_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state: Value = match fs::read(data.join("watch_state.json")) {
+                Ok(bytes) => serde_json::from_slice(&bytes).expect("watch-state JSON"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Value::Null,
+                Err(error) => panic!("cannot read watch state: {error}"),
+            };
+            if state["m"]["ow"].as_i64().is_some_and(|value| value >= fresh_at) {
+                break;
+            }
+            assert!(Instant::now() < watermark_deadline, "watch watermark: {state}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        insert(&writer, "historical", 3, OLD + 3_000, WAL_APPEND);
+        let wal_committed = provider_bundle(&database);
+        assert_eq!(wal_committed[0], checkpointed[0], "main DB must not change");
+        assert_ne!(wal_committed[1], checkpointed[1]);
+        assert!(wal_committed[1].as_ref().unwrap().0.len() > 32);
+        wait_for_hit(&mut child, canonical_home.as_path(), &data, &log, WAL_APPEND);
+        assert_eq!(provider_bundle(&database), wal_committed);
+
+        for needle in [
+            "openclawwatchseedclock",
+            "openclawwatcholdhistoryclock",
+            "openclawwatchfreshclock",
+            APPEND,
+            WAL_APPEND,
+        ] {
+            assert_eq!(
+                content_hit_count(&search(canonical_home.as_path(), &data, needle), needle),
+                1,
+                "each historical or new message must remain searchable once: {needle}"
+            );
+        }
+        child.0.kill().expect("stop watcher before canonical inspection");
+        child.0.wait().expect("reap watcher");
+
+        let after = canonical_rows(&data);
+        assert_eq!(after.len(), 5, "no hidden or duplicate canonical messages");
+        assert!(initial.iter().all(|row| after.contains(row)));
+        assert_eq!(
+            after.iter().map(|row| row.0).collect::<std::collections::BTreeSet<_>>().len(),
+            3
+        );
+        let canonical_source = fs::canonicalize(&database).unwrap();
+        assert!(after.iter().all(|row| {
+            fs::canonicalize(&row.2).unwrap() == canonical_source
+        }));
+        let historical: Vec<_> = after
+            .iter()
+            .filter(|row| row.1 == "historical")
+            .map(|row| (row.4, row.5.as_str(), row.6))
+            .collect();
+        assert_eq!(
+            historical,
+            [(0, SEED, OLD + 1_000), (1, APPEND, OLD + 2_000), (2, WAL_APPEND, OLD + 3_000)]
+        );
+        let watch_state = fs::read(data.join("watch_state.json")).unwrap();
+        for _ in 0..2 {
+            assert_cmd::Command::from_std(cass(canonical_home.as_path(), &data))
+                .env("CASS_RAW_MIRROR_MIN_FREE_BYTES", "0")
+                .args(["index", "--watch-once"])
+                .arg(&database)
+                .args(["--json", "--no-progress-events"])
+                .timeout(Duration::from_secs(120))
+                .assert()
+                .success();
+            assert_eq!(canonical_rows(&data), after, "unchanged refresh is idempotent");
+            assert_eq!(fs::read(data.join("watch_state.json")).unwrap(), watch_state);
+            assert_eq!(provider_bundle(&database), wal_committed);
+        }
+        writer.close_without_checkpoint().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_openclaw_native_commits_with_historical_activity_are_searchable() {
+        assert_openclaw_watch_preserves_historical_activity(false);
+    }
+
+    // The state override supplies a broad agents root. Linux inotify observes
+    // its WAL writes; this case does not claim macOS broad-root poll coverage.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watch_openclaw_state_override_preserves_historical_activity() {
+        assert_openclaw_watch_preserves_historical_activity(true);
+    }
+
     fn assert_deferred_source_retried(skipped_at_startup: bool, streaming: bool) {
         let home = indexed_watch_home();
         let data = home.path().join("cass-data");

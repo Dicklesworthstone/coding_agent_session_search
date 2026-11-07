@@ -176,9 +176,9 @@ impl Connector for OpenClawConnector {
                 .filter(|parent| parent.file_name().is_some_and(|name| name == "agent"))
                 .and_then(Path::parent)
                 .map(|agent| agent.join("sessions"));
-            // Prefer authoritative native history over migration leftovers,
-            // including stale sessions that should not be re-emitted. Scope
-            // suppression to this physical agent directory, not another mirror.
+            // Prefer authoritative native history over migration leftovers.
+            // Scope suppression to this physical agent directory, not another
+            // mirror.
             conversations.retain(|conversation| {
                 let same_store = conversation.source_path == source.source_path;
                 let legacy_copy = legacy_root.as_ref().is_some_and(|root| {
@@ -190,20 +190,10 @@ impl Connector for OpenClawConnector {
                 });
                 !same_store && !legacy_copy
             });
-            conversations.extend(native.into_iter().filter(|conversation| {
-                // Match FAD's session-level cutoff and clock-skew allowance.
-                // Keep every event of a selected session, not only new messages.
-                match (
-                    ctx.since_ts,
-                    conversation
-                        .metadata
-                        .get("last_event_at")
-                        .and_then(|v| v.as_i64()),
-                ) {
-                    (Some(since), Some(last)) => last >= since.saturating_sub(1_000),
-                    _ => true,
-                }
-            }));
+            // The WAL's filesystem freshness selected this store. Event times
+            // can be historical even for a newly committed transaction, so
+            // reconcile complete native sessions without an activity cutoff.
+            conversations.extend(native);
         }
         Ok(conversations)
     }
@@ -236,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_wal_updates_preserve_prefixes_and_suppress_stale_migration_copies() -> Result<()>
+    fn incremental_wal_updates_keep_historical_sessions_and_suppress_migration_copies() -> Result<()>
     {
         let temp = tempfile::tempdir()?;
         let agent = temp.path().join(".openclaw/agents/main");
@@ -251,7 +241,7 @@ mod tests {
         conn.close()?;
         let writer = Connection::open(database.to_string_lossy().into_owned())?;
         writer.execute("PRAGMA journal_mode = WAL")?;
-        insert(&writer, "fresh", 1, NEW, "WAL append")?;
+        insert(&writer, "fresh", 1, OLD + 10_000, "WAL append")?;
         writer.close_without_checkpoint()?;
         fs::File::options()
             .write(true)
@@ -259,6 +249,10 @@ mod tests {
             .set_modified(UNIX_EPOCH + Duration::from_millis(OLD as u64))?;
         let wal = wal_path(&database);
         assert!(fs::metadata(&wal)?.len() > 32);
+        fs::File::options()
+            .write(true)
+            .open(&wal)?
+            .set_modified(UNIX_EPOCH + Duration::from_millis(NEW as u64))?;
         for name in ["fresh", "stale", "legacy-only"] {
             let body = json!({"type":"message", "message":{"role":"user", "content":format!("legacy {name}")}});
             fs::write(
@@ -296,7 +290,7 @@ mod tests {
             && s.role == DiscoveredSourceRole::MetadataSidecar
             && s.required_for_reconstruction));
         let conversations = connector.scan(&ctx)?;
-        assert_eq!(conversations.len(), 2);
+        assert_eq!(conversations.len(), 3);
         let fresh = conversations
             .iter()
             .find(|c| c.external_id.as_deref() == Some("main/fresh"))
@@ -305,6 +299,17 @@ mod tests {
         assert_eq!(fresh.messages.len(), 2);
         assert_eq!(fresh.messages[0].content, "original prefix");
         assert_eq!(fresh.messages[1].content, "WAL append");
+        assert!(
+            fresh.metadata["last_event_at"].as_i64().unwrap() < ctx.since_ts.unwrap(),
+            "the committed append must predate the filesystem cutoff"
+        );
+        let historical = conversations
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some("main/stale"))
+            .unwrap();
+        assert_eq!(historical.source_path, database);
+        assert_eq!(historical.messages.len(), 1);
+        assert_eq!(historical.messages[0].content, "native stale history");
         assert!(
             conversations
                 .iter()

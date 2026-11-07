@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::Result;
 use coding_agent_search::connectors::{
@@ -158,22 +159,70 @@ fn native_databases_are_discovered_and_scanned_by_the_cass_connector() -> Result
 }
 
 #[test]
-fn incremental_native_scan_returns_all_events_of_fresh_sessions() -> Result<()> {
+fn incremental_native_scan_uses_source_freshness_without_activity_filtering() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let (path, conn) = database(temp.path(), "main")?;
     seed(&conn, "fresh", "old prefix remains")?;
-    event(&conn, "stale", 0, OLD, message("user", "stale session"))?;
+    event(&conn, "historical", 0, OLD, message("user", "historical session"))?;
     conn.close()?;
+
+    let sessions = temp.path().join(".openclaw/agents/main/sessions");
+    fs::create_dir_all(&sessions)?;
+    let legacy = sessions.join("historical-legacy.jsonl");
+    fs::write(
+        &legacy,
+        format!("{}\n", message("user", "unchanged legacy source")),
+    )?;
+    fs::File::options()
+        .write(true)
+        .open(&legacy)?
+        .set_modified(UNIX_EPOCH + Duration::from_millis(OLD as u64))?;
+    let cutoff = NEW + 10_000;
+    fs::File::options()
+        .write(true)
+        .open(&path)?
+        .set_modified(UNIX_EPOCH + Duration::from_millis((cutoff + 10_000) as u64))?;
+    let before = (snapshot(&path)?, snapshot(&legacy)?);
     let connector = OpenClawConnector::new();
-    let conversations = connector.scan(&context(&path, Some(NEW - 1_000)))?;
-    assert_eq!(conversations.len(), 1);
-    assert_eq!(conversations[0].external_id.as_deref(), Some("main/fresh"));
-    assert_eq!(
-        conversations[0].messages.len(),
-        2,
-        "freshness selects sessions, not partial message tails"
-    );
-    assert_eq!(conversations[0].messages[0].content, "old prefix remains");
+    let mut previous = None;
+    for root in [path.as_path(), temp.path()] {
+        let ctx = context(root, Some(cutoff));
+        let sources = connector.discover_source_files(&ctx)?;
+        assert_eq!(sources.len(), 1, "unchanged JSONL sources remain filtered");
+        assert_eq!(sources[0].source_path, path);
+        let conversations = connector.scan(&ctx)?;
+        let ids = by_id(&conversations);
+        assert_eq!(ids.len(), 2, "changed stores retain historical sessions");
+        assert_eq!(ids["main/fresh"]["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(ids["main/fresh"]["messages"][0]["content"], "old prefix remains");
+        assert_eq!(
+            ids["main/historical"]["messages"][0]["content"],
+            "historical session"
+        );
+        assert!(conversations.iter().all(|conversation| {
+            conversation.source_path == path
+                && conversation.metadata["last_event_at"].as_i64().unwrap() < cutoff
+        }));
+        if let Some(previous) = &previous {
+            assert_eq!(&ids, previous, "broad and database roots retain one identity");
+        }
+        assert_eq!(by_id(&connector.scan(&ctx)?), ids, "repeat is deterministic");
+        previous = Some(ids);
+        assert_eq!((snapshot(&path)?, snapshot(&legacy)?), before);
+    }
+
+    // Preserve the filesystem gate: no changed database or WAL means no parse.
+    fs::File::options()
+        .write(true)
+        .open(&path)?
+        .set_modified(UNIX_EPOCH + Duration::from_millis(OLD as u64))?;
+    let unchanged = (snapshot(&path)?, snapshot(&legacy)?);
+    for root in [path.as_path(), temp.path()] {
+        let ctx = context(root, Some(cutoff));
+        assert!(connector.discover_source_files(&ctx)?.is_empty());
+        assert!(connector.scan(&ctx)?.is_empty());
+        assert_eq!((snapshot(&path)?, snapshot(&legacy)?), unchanged);
+    }
     Ok(())
 }
 
