@@ -427,7 +427,6 @@ fn committed_wal_transcripts_are_read_without_checkpointing_the_source() -> Resu
     Ok(())
 }
 
-
 #[test]
 fn opaque_mirrors_preserve_wal_history_and_physical_migration_scope() -> Result<()> {
     let temp = tempfile::tempdir()?;
@@ -495,7 +494,8 @@ fn opaque_mirrors_preserve_wal_history_and_physical_migration_scope() -> Result<
         )
         .with_mirrored_source_path("~/.openclaw/agents/"),
     ];
-    let provider_snapshot = || -> Result<Vec<Option<(Vec<u8>, std::time::SystemTime)>>> {
+    type ProviderFileSnapshot = Option<(Vec<u8>, std::time::SystemTime)>;
+    let provider_snapshot = || -> Result<Vec<ProviderFileSnapshot>> {
         let mut paths = ["", "-wal", "-shm"]
             .map(|suffix| {
                 let mut path = native.as_os_str().to_os_string();
@@ -535,11 +535,7 @@ fn opaque_mirrors_preserve_wal_history_and_physical_migration_scope() -> Result<
     for since in [None, Some(cutoff)] {
         let mut repeated_roots = roots.clone();
         repeated_roots.extend(roots.clone());
-        let ctx = ScanContext::with_roots(
-            temp.path().join("cass"),
-            repeated_roots,
-            since,
-        );
+        let ctx = ScanContext::with_roots(temp.path().join("cass"), repeated_roots, since);
         let sources = connector.discover_source_files(&ctx)?;
         assert_eq!(sources.len(), 5, "database, WAL, and three legacy files");
         for source in &sources {
@@ -563,12 +559,20 @@ fn opaque_mirrors_preserve_wal_history_and_physical_migration_scope() -> Result<
         let native_history = &conversations[&(native.clone(), "alice/shared".to_string())];
         assert_eq!(native_history["agent_slug"], "openclaw/alice");
         assert_eq!(native_history["messages"].as_array().unwrap().len(), 3);
-        assert_eq!(native_history["messages"][0]["content"], "native mirror history");
+        assert_eq!(
+            native_history["messages"][0]["content"],
+            "native mirror history"
+        );
         assert_eq!(
             native_history["messages"][2]["content"],
             "historical committed mirror append"
         );
-        assert!(native_history["metadata"]["last_event_at"].as_i64().unwrap() < cutoff);
+        assert!(
+            native_history["metadata"]["last_event_at"]
+                .as_i64()
+                .unwrap()
+                < cutoff
+        );
         assert_eq!(
             conversations[&(unmatched.clone(), "alice/legacy-only".to_string())]["messages"][0]["content"],
             "unmatched first-mirror history"
@@ -578,7 +582,10 @@ fn opaque_mirrors_preserve_wal_history_and_physical_migration_scope() -> Result<
             "independent second-mirror history"
         );
         if let Some(previous) = &previous {
-            assert_eq!(&conversations, previous, "full and WAL-only scans must agree");
+            assert_eq!(
+                &conversations, previous,
+                "full and WAL-only scans must agree"
+            );
         }
         let mut streamed = Vec::new();
         connector.scan_with_callback(&ctx, &mut |conversation| {

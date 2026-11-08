@@ -618,7 +618,8 @@ pub(crate) struct ModelAcquisitionSignals {
     /// Every present file matches its expected SHA-256 (only meaningful when
     /// `files_present`).
     pub checksum_ok: bool,
-    /// A corrupt-cache quarantine marker is present.
+    /// A quarantine marker is present, or otherwise valid payloads have an
+    /// unreadable regular verification marker.
     pub quarantined: bool,
     /// An offline policy is in effect.
     pub offline: bool,
@@ -784,7 +785,14 @@ pub(crate) fn probe_on_disk(
     let files_present = present == manifest.files.len() && !manifest.files.is_empty();
     let partial_present = present > 0 && !files_present;
 
-    let source = read_model_marker(&model_dir.join(VERIFIED_MARKER_NAME))
+    let verified_path = model_dir.join(VERIFIED_MARKER_NAME);
+    let verified_marker = read_model_marker(&verified_path);
+    // The cache classifier treats unreadable regular verification metadata as
+    // corruption, after checking payloads. Preserve its checksum precedence
+    // and marker-less/nonregular-marker preseeded behavior in this projection.
+    let unreadable_verified_marker =
+        files_present && checksum_ok && verified_path.is_file() && verified_marker.is_err();
+    let source = verified_marker
         .ok()
         .and_then(|c| VerifiedMarker::parse(&c))
         .map(|m| m.source)
@@ -796,7 +804,8 @@ pub(crate) fn probe_on_disk(
             ModelSource::Unknown
         });
 
-    let quarantined = model_dir.join(QUARANTINE_MARKER_NAME).is_file();
+    let quarantined =
+        model_dir.join(QUARANTINE_MARKER_NAME).is_file() || unreadable_verified_marker;
     let budget_exceeded = policy.budget_max_bytes.is_some_and(|max| total > max);
 
     ModelAcquisitionSignals {
@@ -1352,6 +1361,48 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn probe_unreadable_verified_marker_preserves_checksum_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let manifest = synthetic_manifest(&[("model.onnx", "weights")]);
+        write(dir, "model.onnx", "weights");
+        let preseeded = probe_on_disk(dir, &manifest, RuntimeLoadability::NotProbed, policy(None));
+        assert_eq!(preseeded.state(), ModelAcquisitionState::Ready);
+        assert_eq!(preseeded.source, ModelSource::Preseeded);
+
+        let marker = dir.join(VERIFIED_MARKER_NAME);
+        std::fs::write(&marker, [0xff]).unwrap();
+        let invalid = probe_on_disk(dir, &manifest, RuntimeLoadability::NotProbed, policy(None));
+        assert!(invalid.files_present && invalid.checksum_ok && invalid.quarantined);
+        assert_eq!(invalid.state(), ModelAcquisitionState::QuarantinedCorrupt);
+        assert!(!invalid.report("minilm").usable);
+        assert_eq!(
+            invalid.report("minilm").fallback_mode,
+            FallbackMode::Lexical
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), [0xff]);
+        assert_eq!(std::fs::read(dir.join("model.onnx")).unwrap(), b"weights");
+
+        write(dir, "model.onnx", "CORRUPT");
+        let corrupt = probe_on_disk(dir, &manifest, RuntimeLoadability::NotProbed, policy(None));
+        assert!(corrupt.files_present && !corrupt.checksum_ok);
+        assert!(!corrupt.quarantined);
+        assert_eq!(corrupt.state(), ModelAcquisitionState::ChecksumMismatch);
+
+        write(dir, "model.onnx", "weights");
+        let partial_manifest =
+            synthetic_manifest(&[("model.onnx", "weights"), ("tokenizer.json", "v")]);
+        let partial = probe_on_disk(
+            dir,
+            &partial_manifest,
+            RuntimeLoadability::NotProbed,
+            policy(None),
+        );
+        assert!(partial.partial_present && !partial.quarantined);
+        assert_eq!(partial.state(), ModelAcquisitionState::PartialDownload);
+    }
+
     #[cfg(unix)]
     #[test]
     fn probe_fifo_marker_does_not_block() {
@@ -1402,6 +1453,8 @@ mod tests {
         let refused = probe_on_disk(&dir, &manifest, RuntimeLoadability::NotProbed, policy(None));
         assert!(refused.files_present && refused.checksum_ok);
         assert_eq!(refused.source, ModelSource::Preseeded);
+        assert!(!refused.quarantined);
+        assert_eq!(refused.state(), ModelAcquisitionState::Ready);
         assert!(read_model_marker(&marker).is_err());
         assert_eq!(std::fs::read_to_string(saved).unwrap(), content);
         assert_eq!(std::fs::read(dir.join("model.onnx")).unwrap(), b"weights");

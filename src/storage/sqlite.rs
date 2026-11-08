@@ -11525,7 +11525,7 @@ impl FrankenStorage {
         &self,
         agent_slug: &str,
     ) -> Result<AgentArchivePurgeResult> {
-        if agent_slug.trim().to_ascii_lowercase() != "openclaw" {
+        if !agent_slug.trim().eq_ignore_ascii_case("openclaw") {
             return self.purge_agent_archive_data(agent_slug);
         }
         // This literal prefix range includes only `openclaw/` descendants.
@@ -11540,7 +11540,10 @@ impl FrankenStorage {
         self.purge_archive_data_for_agent_ids(&agent_ids)
     }
 
-    fn purge_archive_data_for_agent_ids(&self, agent_ids: &[i64]) -> Result<AgentArchivePurgeResult> {
+    fn purge_archive_data_for_agent_ids(
+        &self,
+        agent_ids: &[i64],
+    ) -> Result<AgentArchivePurgeResult> {
         if agent_ids.is_empty() {
             return Ok(AgentArchivePurgeResult::default());
         }
@@ -47364,8 +47367,13 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                     .unwrap()
             };
             let before = rows();
-            let exact = storage.purge_agent_archive_data("openclaw/alice_%").unwrap();
-            assert_eq!((exact.conversations_deleted, exact.messages_deleted), (1, 2));
+            let exact = storage
+                .purge_agent_archive_data("openclaw/alice_%")
+                .unwrap();
+            assert_eq!(
+                (exact.conversations_deleted, exact.messages_deleted),
+                (1, 2)
+            );
             assert_eq!(
                 rows(),
                 before

@@ -1398,13 +1398,28 @@ impl ModelDownloader {
             return Err(std::io::Error::other("model manifest contains no artifacts").into());
         }
 
+        // Portable bundles cannot contain basenames that alias under ASCII
+        // case folding, even when installed on a case-sensitive filesystem.
         let mut names = HashSet::new();
         for file in &manifest.files {
             let name = file.local_name();
+            // Payloads must never become lifecycle metadata, including on
+            // case-insensitive filesystems used by portable model bundles.
+            let lifecycle_marker = [
+                crate::search::model_acquisition::VERIFIED_MARKER_NAME,
+                crate::search::model_acquisition::QUARANTINE_MARKER_NAME,
+                MODEL_ACQUISITION_RECORD,
+            ]
+            .iter()
+            .any(|marker| name.eq_ignore_ascii_case(marker));
+            // Win32 can trim trailing ASCII dots and spaces, aliasing a
+            // payload to another artifact or to lifecycle metadata.
             if name.is_empty()
-                || matches!(name, "." | ".." | ".verified" | MODEL_ACQUISITION_RECORD)
+                || matches!(name, "." | "..")
+                || lifecycle_marker
+                || name.ends_with(['.', ' '])
                 || name.contains(['/', '\\', ':'])
-                || !names.insert(name)
+                || !names.insert(name.to_ascii_lowercase())
             {
                 return Err(std::io::Error::other(format!(
                     "unsafe or duplicate model artifact filename: {}",
@@ -2331,7 +2346,10 @@ fn model_download_staging_dirs(target_dir: &Path) -> Vec<PathBuf> {
     if model_dir_is_real_directory(&legacy).unwrap_or(false) {
         directories.push(legacy);
     }
-    let parent = target_dir.parent().unwrap_or_else(|| Path::new("."));
+    let parent = target_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let name = target_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -3367,6 +3385,20 @@ mod tests {
             assert_eq!(metadata.state_code(), "quarantined_corrupt");
             assert!(!full.is_usable());
             assert!(!metadata.is_usable());
+            let acquisition = crate::search::model_acquisition::live_acquisition_block(
+                tmp.path(),
+                &manifest,
+                crate::search::model_acquisition::RuntimeLoadability::NotProbed,
+                crate::search::model_acquisition::OnDiskPolicyInputs {
+                    policy_enabled: true,
+                    offline: false,
+                    budget_max_bytes: None,
+                },
+                "minilm",
+            );
+            assert_eq!(acquisition["state"], "quarantined_corrupt");
+            assert_eq!(acquisition["usable"], false);
+            assert_eq!(acquisition["fallback_mode"], "lexical");
             assert_eq!(fs::metadata(&marker).unwrap().len(), 64 * 1024 * 1024);
             assert_eq!(fs::read(tmp.path().join("model.onnx")).unwrap(), b"model");
             if name == ".verified" {
@@ -3812,6 +3844,30 @@ mod tests {
         ));
         assert_prior_install_unchanged(&prior);
 
+        let interrupted = ModelDownloader::new(PathBuf::from("model"));
+        interrupted
+            .prepare_acquisition(&manifest, "registry", true)
+            .unwrap();
+        fs::write(interrupted.temp_dir.join("model.safetensors"), b"partial").unwrap();
+        assert_eq!(
+            classify_model_cache(
+                Path::new("model"),
+                &manifest,
+                &ModelAcquisitionPolicy::default(),
+            )
+            .state_code(),
+            "acquiring"
+        );
+        relative
+            .prepare_acquisition(&manifest, "registry", true)
+            .unwrap();
+        assert!(!interrupted.temp_dir.exists());
+        assert_eq!(
+            fs::read(relative.temp_dir.join("model.safetensors")).unwrap(),
+            b"partial"
+        );
+        assert_prior_install_unchanged(&prior);
+
         relative
             .install_from_directory(&manifest, &source, None)
             .unwrap();
@@ -4018,6 +4074,75 @@ mod tests {
             );
             assert_prior_install_unchanged(&downloader);
             assert!(!downloader.temp_dir.exists());
+        }
+    }
+
+    #[test]
+    fn test_install_rejects_artifact_name_collisions_before_staging() {
+        for invalid_name in [
+            ".verified",
+            ".VERIFIED",
+            ".quarantined",
+            ".QUARANTINED",
+            ".acquisition.json",
+            ".ACQUISITION.JSON",
+            "onnx/.quarantined",
+            "TOKENIZER.JSON",
+            "onnx/TOKENIZER.JSON",
+            ".verified.",
+            ".VERIFIED ",
+            ".quarantined.",
+            ".QUARANTINED ",
+            ".acquisition.json.",
+            ".ACQUISITION.JSON ",
+            "onnx/.verified. ",
+            "tokenizer.json.",
+            "TOKENIZER.JSON ",
+            "onnx/tokenizer.json. ",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (downloader, source, manifest) = offline_install_fixture(tmp.path());
+            let mut invalid = manifest.clone();
+            invalid.files[0].name = invalid_name.into();
+            let source_path = source.join(invalid.files[0].local_name());
+            // Supply the renamed artifact's pinned bytes: a missing-file
+            // error must not stand in for rejecting the filename collision.
+            fs::write(&source_path, b"next-weights").unwrap();
+
+            let error = downloader
+                .install_from_directory(&invalid, &source, None)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                DownloadError::IoError(error)
+                    if error.to_string().contains("unsafe or duplicate model artifact filename")
+            ));
+            assert_prior_install_unchanged(&downloader);
+            assert!(!downloader.temp_dir.exists());
+            assert!(!model_install_lock_path(&downloader.target_dir).exists());
+            assert_eq!(fs::read(&source_path).unwrap(), b"next-weights");
+
+            // Case folding or Win32 suffix trimming can overwrite the
+            // tokenizer source. Restore the valid bundle before the
+            // positive-control install.
+            fs::write(source.join("tokenizer.json"), b"next-tokenizer").unwrap();
+            downloader
+                .install_from_directory(&manifest, &source, None)
+                .unwrap();
+            assert!(
+                classify_model_cache(
+                    &downloader.target_dir,
+                    &manifest,
+                    &ModelAcquisitionPolicy::default(),
+                )
+                .is_usable()
+            );
+            for file in &manifest.files {
+                assert_eq!(
+                    compute_sha256(&downloader.target_dir.join(file.local_name())).unwrap(),
+                    file.sha256
+                );
+            }
         }
     }
 
