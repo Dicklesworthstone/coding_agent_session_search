@@ -66713,6 +66713,564 @@ c.close()
         );
     }
 
+    /// Deterministic xorshift64* stream for the consumer A/B corpus.
+    struct ConsumerAbRng(u64);
+
+    impl ConsumerAbRng {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn unit(&mut self) -> f64 {
+            (self.next_u64() >> 11) as f64 / (1_u64 << 53) as f64
+        }
+    }
+
+    /// Head of the Zipf vocabulary: words transcripts lead with, the five
+    /// equivalence probes among them, so probe hits (each one re-hashes the
+    /// document) happen at a transcript-like rate.
+    const CONSUMER_AB_HEAD_WORDS: &[&str] = &[
+        "the", "to", "a", "and", "in", "is", "of", "error", "test", "fn", "let", "use", "function",
+        "import", "self", "return", "file", "src", "TODO", "cargo",
+    ];
+
+    const CONSUMER_AB_VOCABULARY: u64 = 200_000;
+
+    /// The head word for small ranks, else one unique lowercase word per
+    /// rank (bijective base 26 past every one- and two-letter string).
+    fn consumer_ab_word(rank: u64, out: &mut String) {
+        if let Some(word) = usize::try_from(rank)
+            .ok()
+            .and_then(|rank| CONSUMER_AB_HEAD_WORDS.get(rank))
+        {
+            out.push_str(word);
+            return;
+        }
+        let mut letters = [0_u8; 16];
+        let mut len = 0;
+        let mut n = rank + 703;
+        while n > 0 {
+            n -= 1;
+            letters[len] = b'a' + (n % 26) as u8;
+            len += 1;
+            n /= 26;
+        }
+        for letter in letters[..len].iter().rev() {
+            out.push(char::from(*letter));
+        }
+    }
+
+    /// Zipf-like (1/rank) words with 5% one-off identifiers; one message in
+    /// 64 is eight times the mean length.
+    fn consumer_ab_message_text(rng: &mut ConsumerAbRng, mean_bytes: usize, idx: usize) -> String {
+        let scale = if idx % 64 == 63 {
+            8.0
+        } else {
+            0.25 + 1.5 * rng.unit()
+        };
+        let target = ((mean_bytes as f64) * scale) as usize;
+        let mut text = String::with_capacity(target + 32);
+        let log_vocabulary = ((CONSUMER_AB_VOCABULARY + 1) as f64).ln();
+        while text.len() < target.max(8) {
+            if rng.unit() < 0.05 {
+                use std::fmt::Write as _;
+                let _ = write!(text, "id{:x}", rng.next_u64() >> 20);
+            } else {
+                let rank = ((rng.unit() * log_vocabulary).exp() as u64)
+                    .saturating_sub(1)
+                    .min(CONSUMER_AB_VOCABULARY - 1);
+                consumer_ab_word(rank, &mut text);
+            }
+            text.push(' ');
+        }
+        text
+    }
+
+    /// One page of canonical-replay packets, built the way page prep builds
+    /// them from fetched rows.
+    fn consumer_ab_packets(
+        first: usize,
+        count: usize,
+        messages: usize,
+        mean_bytes: usize,
+    ) -> Vec<LexicalRebuildConversationPacket> {
+        let source_map: HashMap<String, (SourceKind, Option<String>)> = HashMap::new();
+        (first..first + count)
+            .into_par_iter()
+            .map(|sequence| {
+                let mut rng = ConsumerAbRng::new(sequence as u64 + 1);
+                let base = 1_700_000_000_000_i64 + sequence as i64 * 100_000;
+                let conversation_id = sequence as i64 + 1;
+                let row = crate::storage::sqlite::LexicalRebuildConversationRow {
+                    id: Some(conversation_id),
+                    agent_slug: "codex".into(),
+                    workspace: Some(PathBuf::from(format!(
+                        "/workspace/consumer{}",
+                        sequence % 8
+                    ))),
+                    external_id: Some(format!("consumer-{sequence}")),
+                    title: Some(format!("Consumer fixture {sequence}")),
+                    source_path: PathBuf::from(format!("/archive/consumer-{sequence}.jsonl")),
+                    started_at: Some(base),
+                    ended_at: Some(base + messages as i64),
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                };
+                let rows = (0..messages)
+                    .map(|idx| Message {
+                        id: Some(conversation_id * 1_000_000 + idx as i64),
+                        idx: idx as i64,
+                        role: if idx % 2 == 0 {
+                            MessageRole::User
+                        } else {
+                            MessageRole::Agent
+                        },
+                        author: None,
+                        created_at: Some(base + idx as i64),
+                        content: consumer_ab_message_text(&mut rng, mean_bytes, idx),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    })
+                    .collect();
+                LexicalRebuildConversationPacket::from_canonical_replay_messages(
+                    row,
+                    rows,
+                    &source_map,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn consumer_ab_status_mib(field: &str) -> f64 {
+        let kib: u64 = fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    line.strip_prefix(field)?
+                        .trim()
+                        .trim_end_matches("kB")
+                        .trim()
+                        .parse()
+                        .ok()
+                })
+            })
+            .unwrap_or(0);
+        kib as f64 / 1024.0
+    }
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    struct ConsumerAbRun {
+        arm: String,
+        round: usize,
+        /// Absorb + flush + commit: the consumer thread's busy time.
+        consumer_ms: f64,
+        absorb_ms: f64,
+        /// `lexical_rebuild_prepare_prebuilt_doc_refs` alone.
+        prepare_ms: f64,
+        /// `add_prebuilt_document_refs_slice`: projection plus engine ingest.
+        add_ms: f64,
+        commit_ms: f64,
+        /// Packet generation stands in for the producer; excluded.
+        generate_ms: f64,
+        commits: usize,
+        flushes: usize,
+        docs: usize,
+        peak_rss_mib: f64,
+        rss_start_mib: f64,
+    }
+
+    /// Drive the full rebuild's consumer work for one arm: absorb every
+    /// packet into the equivalence accumulator, flush batches through the
+    /// production flush (prepare + add), and commit on the production
+    /// startup-then-steady cadence, exactly as the consumer loop of
+    /// `rebuild_tantivy_from_db` does. Returns the run and a witness of its
+    /// output: equivalence evidence, indexed count, every segment's docid
+    /// range and doc count, and the ranked hits (score bits, global docid,
+    /// document id) and exact totals of `queries`.
+    fn consumer_ab_run_arm(
+        base: &Path,
+        (conversations, messages, mean_bytes, batch_limit): (usize, usize, usize, usize),
+        (arm, serial_projection, round): (&str, bool, usize),
+        queries: &[String],
+    ) -> (ConsumerAbRun, Vec<String>) {
+        use crate::search::quill_bridge::{
+            QuillCassIndex, search_paginated, set_serial_projection_for_ab,
+        };
+        use frankensearch::quill::query::{CassQueryFilters, CassQueryParser};
+        use frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA;
+        let tmp = TempDir::new_in(base).unwrap();
+        let index_path = tmp.path().join("index");
+        let _ = fs::write("/proc/self/clear_refs", "5");
+        let rss_start_mib = consumer_ab_status_mib("VmRSS:");
+        set_serial_projection_for_ab(serial_projection);
+        let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        t_index.configure_bulk_load_merge_policy();
+        let mut accumulator = LexicalRebuildEquivalenceAccumulator::new();
+        let mut profile = LexicalRebuildPerfProfile::default();
+        let steady = (
+            lexical_rebuild_commit_interval_conversations(),
+            lexical_rebuild_commit_interval_messages(),
+            lexical_rebuild_commit_interval_message_bytes(),
+        );
+        let mut intervals = (
+            lexical_rebuild_initial_commit_interval_conversations().min(steady.0),
+            lexical_rebuild_initial_commit_interval_messages().min(steady.1),
+            lexical_rebuild_initial_commit_interval_message_bytes().min(steady.2),
+        );
+        let mut pending: Vec<LexicalRebuildConversationPacket> = Vec::new();
+        let (mut pending_messages, mut pending_bytes) = (0_usize, 0_usize);
+        let (mut messages_since_commit, mut bytes_since_commit) = (0_usize, 0_usize);
+        let mut conversations_since_commit = 0_usize;
+        let mut indexed_docs = 0_usize;
+        let mut commits = 0_usize;
+        let mut absorb = Duration::ZERO;
+        let mut flush = Duration::ZERO;
+        let mut commit = Duration::ZERO;
+        let mut generate = Duration::ZERO;
+        macro_rules! flush_pending {
+            () => {{
+                let started = Instant::now();
+                flush_streamed_lexical_rebuild_batch(
+                    &mut pending,
+                    &mut pending_messages,
+                    &mut pending_bytes,
+                    None,
+                    None,
+                    &mut t_index,
+                    &mut indexed_docs,
+                    &mut messages_since_commit,
+                    &mut bytes_since_commit,
+                    batch_limit,
+                    LEXICAL_REBUILD_PAGE_SIZE,
+                    Some(&mut profile),
+                )
+                .unwrap();
+                flush += started.elapsed();
+            }};
+        }
+        macro_rules! commit_now {
+            () => {{
+                let started = Instant::now();
+                t_index.commit().unwrap();
+                commit += started.elapsed();
+                commits += 1;
+            }};
+        }
+        let mut next = 0;
+        while next < conversations {
+            let page_end = (next + batch_limit).min(conversations);
+            let started = Instant::now();
+            let packets = consumer_ab_packets(next, page_end - next, messages, mean_bytes);
+            generate += started.elapsed();
+            next = page_end;
+            for packet in packets {
+                let started = Instant::now();
+                accumulator.absorb_packet(&packet);
+                absorb += started.elapsed();
+                pending_messages += packet.message_count;
+                pending_bytes += packet.message_bytes;
+                pending.push(packet);
+                conversations_since_commit += 1;
+                if pending_lexical_rebuild_batch_reached_runtime_limit(pending.len(), batch_limit) {
+                    flush_pending!();
+                }
+                if should_commit_lexical_rebuild(
+                    conversations_since_commit,
+                    messages_since_commit + pending_messages,
+                    bytes_since_commit + pending_bytes,
+                    intervals.0,
+                    intervals.1,
+                    intervals.2,
+                ) {
+                    flush_pending!();
+                    commit_now!();
+                    (messages_since_commit, bytes_since_commit) = (0, 0);
+                    conversations_since_commit = 0;
+                    intervals = steady;
+                }
+            }
+        }
+        flush_pending!();
+        commit_now!();
+        let peak_rss_mib = consumer_ab_status_mib("VmHWM:");
+        set_serial_projection_for_ab(false);
+        drop(t_index);
+
+        let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        let run = ConsumerAbRun {
+            arm: arm.to_string(),
+            round,
+            consumer_ms: ms(absorb + flush + commit),
+            absorb_ms: ms(absorb),
+            prepare_ms: ms(profile
+                .prepare_duration
+                .saturating_sub(profile.add_duration)),
+            add_ms: ms(profile.add_duration),
+            commit_ms: ms(commit),
+            generate_ms: ms(generate),
+            commits,
+            flushes: profile.batch_flushes,
+            docs: indexed_docs,
+            peak_rss_mib,
+            rss_start_mib,
+        };
+        eprintln!("CONSUMER_AB_RUN {}", serde_json::to_string(&run).unwrap());
+
+        let mut witness = vec![
+            format!("evidence {:?}", accumulator.finalize()),
+            format!("indexed {indexed_docs}"),
+        ];
+        let writer = QuillCassIndex::open_or_create(&index_path).unwrap();
+        for segment in writer.committed_snapshot().unwrap().segments() {
+            let manifest = segment.manifest();
+            witness.push(format!(
+                "segment {}..{} docs {}",
+                manifest.docid_lo, manifest.docid_hi, manifest.doc_count
+            ));
+        }
+        let reader = writer.reader().unwrap();
+        let parser = CassQueryParser::new(CASS_SEMANTIC_SCHEMA).unwrap();
+        for query in queries {
+            let parsed = parser.parse(query, &CassQueryFilters::default());
+            let page = search_paginated(&reader, &parsed.query, 200, 0, true).unwrap();
+            witness.push(format!("{query:?} total {:?}", page.total_count));
+            witness.extend(page.hits.iter().map(|hit| {
+                format!(
+                    "{:08x} {} {}",
+                    hit.bm25_score.to_bits(),
+                    hit.global_docid,
+                    hit.document_id
+                )
+            }));
+        }
+        (run, witness)
+    }
+
+    /// Same-invocation A/B of the bridge's schema projection on the full
+    /// rebuild's consumer path: the pooled projection (`candidate`) against
+    /// the serial projection the bridge used before (`incumbent`, selected by
+    /// `set_serial_projection_for_ab`), plus an A/A `null` arm that repeats
+    /// the incumbent. `CASS_CONSUMER_AB_CONVERSATIONS` conversations of
+    /// `CASS_CONSUMER_AB_MESSAGES` messages (mean
+    /// `CASS_CONSUMER_AB_MESSAGE_BYTES` bytes) flush every
+    /// `CASS_CONSUMER_AB_BATCH_CONVERSATIONS` conversations. First a stage
+    /// profile of the consumer's own work on the first page set (absorb,
+    /// prepare, serial and pooled projection; the two projections must be
+    /// equal), then one unrecorded warm-up round plus
+    /// `CASS_CONSUMER_AB_ROUNDS`, alternating arm order. Every arm must
+    /// produce one witness (evidence, count, segment docid ranges, ranked
+    /// hits with global docids).
+    #[test]
+    #[ignore = "consumer projection A/B; run explicitly with --ignored --nocapture"]
+    #[serial]
+    fn consumer_projection_benchmark_arms() {
+        use crate::search::quill_bridge::{
+            project_cass_document_refs, set_serial_projection_for_ab,
+        };
+        let size = |key: &str, default: usize| {
+            dotenvy::var(key)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        };
+        let conversations = size("CASS_CONSUMER_AB_CONVERSATIONS", 4096);
+        let messages = size("CASS_CONSUMER_AB_MESSAGES", 64);
+        let mean_bytes = size("CASS_CONSUMER_AB_MESSAGE_BYTES", 1024).max(8);
+        let rounds = size("CASS_CONSUMER_AB_ROUNDS", 3);
+        let batch_limit = size("CASS_CONSUMER_AB_BATCH_CONVERSATIONS", 100);
+        let base = dotenvy::var("CASS_CONSUMER_AB_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        // The governor scales writer parallelism and add-batch splits with
+        // host load; pin it so every arm sees one batch shape.
+        let _governor = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
+        eprintln!(
+            "CONSUMER_AB_SHAPE {}",
+            serde_json::json!({
+                "conversations": conversations,
+                "messages_per_conversation": messages,
+                "mean_message_bytes": mean_bytes,
+                "batch_conversations": batch_limit,
+                "rounds": rounds,
+                "available_parallelism":
+                    std::thread::available_parallelism().map_or(1, usize::from),
+                "rayon_threads": rayon::current_num_threads(),
+            })
+        );
+
+        // Stage profile of the consumer thread's own work, one pass.
+        let profile_conversations =
+            conversations.min(size("CASS_CONSUMER_AB_PROFILE_CONVERSATIONS", 1024));
+        let mut accumulator = LexicalRebuildEquivalenceAccumulator::new();
+        let mut absorb = Duration::ZERO;
+        let mut prepare = Duration::ZERO;
+        let mut serial = Duration::ZERO;
+        let mut pooled = Duration::ZERO;
+        let (mut docs, mut bytes) = (0_usize, 0_usize);
+        let mut next = 0;
+        while next < profile_conversations {
+            let page_end = (next + batch_limit).min(profile_conversations);
+            let packets = consumer_ab_packets(next, page_end - next, messages, mean_bytes);
+            next = page_end;
+            let started = Instant::now();
+            for packet in &packets {
+                accumulator.absorb_packet(packet);
+            }
+            absorb += started.elapsed();
+            let started = Instant::now();
+            let refs = lexical_rebuild_prepare_prebuilt_doc_refs(&packets, None);
+            prepare += started.elapsed();
+            docs += refs.len();
+            bytes += refs.iter().map(|doc| doc.content.len()).sum::<usize>();
+            set_serial_projection_for_ab(true);
+            let started = Instant::now();
+            let serial_docs = project_cass_document_refs(&refs);
+            serial += started.elapsed();
+            set_serial_projection_for_ab(false);
+            let started = Instant::now();
+            let pooled_docs = project_cass_document_refs(&refs);
+            pooled += started.elapsed();
+            assert!(
+                serial_docs == pooled_docs,
+                "pooled projection differs from serial"
+            );
+        }
+        let per_doc_ns = |duration: Duration| duration.as_nanos() as f64 / docs.max(1) as f64;
+        eprintln!(
+            "CONSUMER_PROFILE {}",
+            serde_json::json!({
+                "docs": docs,
+                "content_bytes": bytes,
+                "absorb_ns_per_doc": per_doc_ns(absorb),
+                "prepare_ns_per_doc": per_doc_ns(prepare),
+                "serial_projection_ns_per_doc": per_doc_ns(serial),
+                "pooled_projection_ns_per_doc": per_doc_ns(pooled),
+            })
+        );
+
+        let arms: [(&str, bool); 3] = [("incumbent", true), ("candidate", false), ("null", true)];
+        let queries: Vec<String> = [
+            "error", "test", "function", "import", "the", "cargo", "aab", "fixture", "consumer",
+            "zzz",
+        ]
+        .iter()
+        .map(|query| (*query).to_string())
+        .collect();
+        let mut reference: Option<Vec<String>> = None;
+        let mut mismatches = Vec::new();
+        let mut runs: Vec<ConsumerAbRun> = Vec::new();
+        for round in 0..=rounds {
+            let order: Vec<usize> = if round % 2 == 0 {
+                (0..arms.len()).collect()
+            } else {
+                (0..arms.len()).rev().collect()
+            };
+            for index in order {
+                let (arm, serial_projection) = arms[index];
+                let (run, witness) = consumer_ab_run_arm(
+                    &base,
+                    (conversations, messages, mean_bytes, batch_limit),
+                    (arm, serial_projection, round),
+                    &queries,
+                );
+                if let Some(expected) = &reference {
+                    if *expected != witness {
+                        let first = expected
+                            .iter()
+                            .zip(&witness)
+                            .position(|(left, right)| left != right);
+                        mismatches.push(format!(
+                            "arm {arm} round {round}: {} vs {} lines, first diff {first:?}",
+                            expected.len(),
+                            witness.len()
+                        ));
+                    }
+                } else {
+                    reference = Some(witness);
+                }
+                if round > 0 {
+                    runs.push(run);
+                }
+            }
+        }
+
+        let percentile = |mut samples: Vec<f64>, q: f64| {
+            samples.sort_by(f64::total_cmp);
+            samples[((samples.len() - 1) as f64 * q).round() as usize]
+        };
+        for (arm, _) in arms {
+            let mine: Vec<&ConsumerAbRun> = runs.iter().filter(|run| run.arm == arm).collect();
+            let field = |pick: fn(&ConsumerAbRun) -> f64| -> Vec<f64> {
+                mine.iter().map(|run| pick(run)).collect()
+            };
+            let ratio = |pick: fn(&ConsumerAbRun) -> f64| -> Vec<f64> {
+                mine.iter()
+                    .filter_map(|run| {
+                        runs.iter()
+                            .find(|other| other.arm == "incumbent" && other.round == run.round)
+                            .map(|other| pick(run) / pick(other))
+                    })
+                    .collect()
+            };
+            let consumer = field(|run| run.consumer_ms);
+            let add = field(|run| run.add_ms);
+            let consumer_ratio = ratio(|run| run.consumer_ms);
+            let add_ratio = ratio(|run| run.add_ms);
+            eprintln!(
+                "CONSUMER_AB_SUMMARY {}",
+                serde_json::json!({
+                    "arm": arm,
+                    "consumer_ms_p50": percentile(consumer.clone(), 0.5),
+                    "consumer_ms_min": percentile(consumer.clone(), 0.0),
+                    "consumer_ms_max": percentile(consumer, 1.0),
+                    "add_ms_p50": percentile(add.clone(), 0.5),
+                    "add_ms_min": percentile(add.clone(), 0.0),
+                    "add_ms_max": percentile(add, 1.0),
+                    "absorb_ms_p50": percentile(field(|run| run.absorb_ms), 0.5),
+                    "prepare_ms_p50": percentile(field(|run| run.prepare_ms), 0.5),
+                    "commit_ms_p50": percentile(field(|run| run.commit_ms), 0.5),
+                    "consumer_ratio_p50": percentile(consumer_ratio.clone(), 0.5),
+                    "consumer_ratio_min": percentile(consumer_ratio.clone(), 0.0),
+                    "consumer_ratio_max": percentile(consumer_ratio, 1.0),
+                    "add_ratio_p50": percentile(add_ratio.clone(), 0.5),
+                    "add_ratio_min": percentile(add_ratio.clone(), 0.0),
+                    "add_ratio_max": percentile(add_ratio, 1.0),
+                    "peak_rss_mib_p50": percentile(field(|run| run.peak_rss_mib), 0.5),
+                    "peak_rss_mib_max": percentile(field(|run| run.peak_rss_mib), 1.0),
+                    "peak_growth_mib_p50":
+                        percentile(field(|run| run.peak_rss_mib - run.rss_start_mib), 0.5),
+                    "docs": mine.first().map(|run| run.docs),
+                    "commits": mine.first().map(|run| run.commits),
+                    "flushes": mine.first().map(|run| run.flushes),
+                })
+            );
+        }
+        assert_eq!(
+            runs.iter()
+                .map(|run| run.docs)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            1,
+            "every arm must index the same document count"
+        );
+        assert!(
+            mismatches.is_empty(),
+            "arms produced different generations:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
     #[test]
     #[serial]
     fn rebuild_tantivy_from_db_promotes_pipeline_budgets_after_first_commit() {

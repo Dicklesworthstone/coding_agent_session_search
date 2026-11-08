@@ -27,12 +27,13 @@ use asupersync::runtime::{Runtime, RuntimeBuilder};
 use frankensearch::Cx;
 use frankensearch::quill::cass::{
     CASS_MERGE_COOLDOWN_MS, CASS_MERGE_SEGMENT_THRESHOLD, CassDocument as QuillCassDocument,
-    CassMergeStatus,
+    CassDocumentRef, CassMergeStatus,
 };
 use frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA;
 use frankensearch::quill::{
     KeeperSnapshot, QuillConfig, QuillIndex, QuillSearchIndex, SchemaDocument,
 };
+use rayon::prelude::*;
 
 #[path = "quill_bridge/fuel_errors.rs"]
 mod fuel_errors;
@@ -148,6 +149,73 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn reader_open_count() -> u64 {
     READER_OPEN_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Same-invocation A/B switch: project on the calling thread, as the
+    /// bridge did before [`project_cass_documents`] moved to the rayon pool.
+    static SERIAL_PROJECTION_FOR_AB: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Select the serial (incumbent) projection for this thread's bridge calls.
+#[cfg(test)]
+pub(crate) fn set_serial_projection_for_ab(serial: bool) {
+    SERIAL_PROJECTION_FOR_AB.with(|flag| flag.set(serial));
+}
+
+/// Project a batch onto the CASS schema, in input order.
+///
+/// `to_schema_document` (edge-ngram, prefix and preview columns, the document
+/// identity, owned column copies) is a pure function of its one document, so
+/// the batch is projected on the rayon pool instead of serially on the writer
+/// thread, which a full rebuild otherwise spends between the engine's parallel
+/// accumulate waves. The indexed `collect` keeps input order: the engine
+/// receives the same documents in the same order.
+pub(crate) fn project_cass_documents(documents: &[QuillCassDocument]) -> Vec<SchemaDocument> {
+    #[cfg(test)]
+    if SERIAL_PROJECTION_FOR_AB.with(std::cell::Cell::get) {
+        return documents
+            .iter()
+            .map(QuillCassDocument::to_schema_document)
+            .collect();
+    }
+    documents
+        .par_iter()
+        .map(QuillCassDocument::to_schema_document)
+        .collect()
+}
+
+/// [`project_cass_documents`] for borrowed documents. Each owned form lives
+/// only for its own projection, so the batch is never materialized twice.
+pub(crate) fn project_cass_document_refs(documents: &[CassDocumentRef<'_>]) -> Vec<SchemaDocument> {
+    #[cfg(test)]
+    if SERIAL_PROJECTION_FOR_AB.with(std::cell::Cell::get) {
+        let owned: Vec<QuillCassDocument> = documents.iter().map(owned_cass_document).collect();
+        return project_cass_documents(&owned);
+    }
+    documents
+        .par_iter()
+        .map(|document| owned_cass_document(document).to_schema_document())
+        .collect()
+}
+
+fn owned_cass_document(document: &CassDocumentRef<'_>) -> QuillCassDocument {
+    QuillCassDocument {
+        agent: document.agent.to_owned(),
+        workspace: document.workspace.map(str::to_owned),
+        workspace_original: document.workspace_original.map(str::to_owned),
+        source_path: document.source_path.to_owned(),
+        msg_idx: document.msg_idx,
+        created_at: document.created_at,
+        title: document.title.map(str::to_owned),
+        content: document.content.to_owned(),
+        source_id: document.source_id.to_owned(),
+        origin_kind: document.origin_kind.to_owned(),
+        origin_host: document.origin_host.map(str::to_owned),
+        conversation_id: document.conversation_id,
+    }
 }
 
 pub(crate) fn shutdown_driver() -> bool {
@@ -1154,15 +1222,15 @@ impl QuillCassIndex {
         if documents.is_empty() {
             return Ok(());
         }
-        let projected: Vec<SchemaDocument> = documents
-            .iter()
-            .map(QuillCassDocument::to_schema_document)
-            .collect();
+        self.index_projected_documents(&project_cass_documents(documents))
+    }
+
+    /// Accumulate one non-empty batch already projected onto the CASS schema.
+    fn index_projected_documents(&mut self, projected: &[SchemaDocument]) -> Result<()> {
         // Accumulation can seal a segment on budget, so it is sampled like a
         // commit; the completed batch then ticks synchronously.
         self.with_engine_liveness(|| {
             drive(|cx| {
-                let projected = &projected;
                 let index = &self.index;
                 async move { index.index_schema_documents(&cx, projected).await }
             })
@@ -1194,13 +1262,13 @@ impl QuillCassIndex {
         if documents.is_empty() {
             return Ok(());
         }
-        let projected: Vec<SchemaDocument> = documents
-            .iter()
-            .map(QuillCassDocument::to_schema_document)
-            .collect();
+        self.upsert_projected_documents(&project_cass_documents(documents))
+    }
+
+    /// Upsert one non-empty batch already projected onto the CASS schema.
+    fn upsert_projected_documents(&mut self, projected: &[SchemaDocument]) -> Result<()> {
         self.with_engine_liveness(|| {
             drive(|cx| {
-                let projected = &projected;
                 let index = &self.index;
                 async move { index.upsert_schema_documents(&cx, projected).await }
             })
@@ -1360,36 +1428,17 @@ impl QuillCassIndex {
     /// Quill's ingest owns its column values, so the borrowed form is
     /// materialized here. This keeps the caller's streaming shape — it never
     /// has to clone message bodies just to hold a batch — while paying the
-    /// copy once, at the engine boundary.
+    /// copy once, at the engine boundary, per document as it is projected
+    /// (see [`project_cass_document_refs`]).
     ///
     /// # Errors
     ///
     /// Returns an error when admission or accumulation refuses the batch.
-    pub fn add_cass_document_refs(
-        &mut self,
-        documents: &[frankensearch::quill::cass::CassDocumentRef<'_>],
-    ) -> Result<()> {
+    pub fn add_cass_document_refs(&mut self, documents: &[CassDocumentRef<'_>]) -> Result<()> {
         if documents.is_empty() {
             return Ok(());
         }
-        let owned: Vec<QuillCassDocument> = documents
-            .iter()
-            .map(|document| QuillCassDocument {
-                agent: document.agent.to_owned(),
-                workspace: document.workspace.map(str::to_owned),
-                workspace_original: document.workspace_original.map(str::to_owned),
-                source_path: document.source_path.to_owned(),
-                msg_idx: document.msg_idx,
-                created_at: document.created_at,
-                title: document.title.map(str::to_owned),
-                content: document.content.to_owned(),
-                source_id: document.source_id.to_owned(),
-                origin_kind: document.origin_kind.to_owned(),
-                origin_host: document.origin_host.map(str::to_owned),
-                conversation_id: document.conversation_id,
-            })
-            .collect();
-        self.add_cass_documents(&owned)
+        self.index_projected_documents(&project_cass_document_refs(documents))
     }
 
     /// Upsert one batch of borrowed CASS documents under their stable
@@ -1399,31 +1448,11 @@ impl QuillCassIndex {
     ///
     /// Returns an error when admission, identity resolution, or accumulation
     /// refuses the batch.
-    pub fn upsert_cass_document_refs(
-        &mut self,
-        documents: &[frankensearch::quill::cass::CassDocumentRef<'_>],
-    ) -> Result<()> {
+    pub fn upsert_cass_document_refs(&mut self, documents: &[CassDocumentRef<'_>]) -> Result<()> {
         if documents.is_empty() {
             return Ok(());
         }
-        let owned: Vec<QuillCassDocument> = documents
-            .iter()
-            .map(|document| QuillCassDocument {
-                agent: document.agent.to_owned(),
-                workspace: document.workspace.map(str::to_owned),
-                workspace_original: document.workspace_original.map(str::to_owned),
-                source_path: document.source_path.to_owned(),
-                msg_idx: document.msg_idx,
-                created_at: document.created_at,
-                title: document.title.map(str::to_owned),
-                content: document.content.to_owned(),
-                source_id: document.source_id.to_owned(),
-                origin_kind: document.origin_kind.to_owned(),
-                origin_host: document.origin_host.map(str::to_owned),
-                conversation_id: document.conversation_id,
-            })
-            .collect();
-        self.upsert_cass_documents(&owned)
+        self.upsert_projected_documents(&project_cass_document_refs(documents))
     }
 
     /// Live segment count in the published snapshot.
@@ -2702,6 +2731,139 @@ mod tests {
             origin_host: None,
             conversation_id: Some(1),
         }
+    }
+
+    /// A batch varied in every column the projection reads: absent optional
+    /// fields, non-ASCII words, content past the edge-ngram prefix and preview
+    /// caps, and empty content.
+    fn projection_batch(len: u64) -> Vec<QuillCassDocument> {
+        (0..len)
+            .map(|msg_idx| {
+                let mut document = sample(&format!("source-{}", msg_idx % 7), msg_idx, "");
+                document.content = match msg_idx % 5 {
+                    0 => String::new(),
+                    1 => "naïve café — 東京 🦀 rust-lang ".repeat(1 + (msg_idx % 3) as usize),
+                    2 => format!("token{msg_idx} longwordprefixcapture ").repeat(300),
+                    3 => format!("short message {msg_idx}"),
+                    _ => format!("error: test {msg_idx} failed in function import TODO"),
+                };
+                if msg_idx % 3 == 0 {
+                    document.title = None;
+                }
+                if msg_idx % 4 == 0 {
+                    document.workspace = None;
+                    document.workspace_original = None;
+                }
+                if msg_idx % 6 == 0 {
+                    document.origin_host = Some(format!("host-{}", msg_idx % 2));
+                }
+                document.conversation_id = (msg_idx % 11 != 0).then_some((msg_idx / 10) as i64);
+                document.created_at = (msg_idx % 13 != 0).then_some(1_700_000_000 + msg_idx as i64);
+                document
+            })
+            .collect()
+    }
+
+    /// Projecting on the rayon pool must hand the engine exactly the serial
+    /// projection, document for document and in input order, from both the
+    /// owned and the borrowed entry points.
+    #[test]
+    fn pooled_projection_matches_the_serial_projection_in_input_order() {
+        let documents = projection_batch(1_500);
+        let serial: Vec<SchemaDocument> = documents
+            .iter()
+            .map(QuillCassDocument::to_schema_document)
+            .collect();
+        let refs: Vec<CassDocumentRef<'_>> =
+            documents.iter().map(QuillCassDocument::as_ref).collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("projection pool");
+        let (owned, borrowed) = pool.install(|| {
+            (
+                project_cass_documents(&documents),
+                project_cass_document_refs(&refs),
+            )
+        });
+        assert_eq!(owned, serial, "owned batch");
+        assert_eq!(borrowed, serial, "borrowed batch");
+        set_serial_projection_for_ab(true);
+        let incumbent = project_cass_document_refs(&refs);
+        set_serial_projection_for_ab(false);
+        assert_eq!(incumbent, serial, "the A/B incumbent arm");
+        assert!(project_cass_document_refs(&[]).is_empty());
+        assert!(project_cass_documents(&[]).is_empty());
+    }
+
+    /// Segment layout, live count, and ranked hits (score bits, global docid,
+    /// document id) of one committed generation.
+    fn generation_witness(index: &QuillCassIndex, queries: &[&str]) -> Vec<String> {
+        let mut witness: Vec<String> = index
+            .published_segment_fold_profile()
+            .expect("segment profile")
+            .iter()
+            .map(|segment| {
+                format!(
+                    "segment {}..{} docs {}",
+                    segment.docid_lo, segment.docid_hi, segment.doc_count
+                )
+            })
+            .collect();
+        witness.push(format!("live {}", index.doc_count().expect("doc count")));
+        let reader = index.reader().expect("reader");
+        let parser = frankensearch::quill::query::CassQueryParser::new(CASS_SEMANTIC_SCHEMA)
+            .expect("CASS query parser");
+        for query in queries {
+            let parsed = parser.parse(
+                query,
+                &frankensearch::quill::query::CassQueryFilters::default(),
+            );
+            let page = search_paginated(&reader, &parsed.query, 500, 0, true).expect("search");
+            witness.push(format!("{query:?} total {:?}", page.total_count));
+            witness.extend(page.hits.iter().map(|hit| {
+                format!(
+                    "{:08x} {} {}",
+                    hit.bm25_score.to_bits(),
+                    hit.global_docid,
+                    hit.document_id
+                )
+            }));
+        }
+        witness
+    }
+
+    /// The pooled projection must build the same generation as the serial
+    /// one through the add and the upsert entry points.
+    #[test]
+    fn pooled_projection_indexes_the_same_generation_as_the_serial_projection() {
+        let documents = projection_batch(600);
+        let refs: Vec<CassDocumentRef<'_>> =
+            documents.iter().map(QuillCassDocument::as_ref).collect();
+        let queries = ["error", "token5*", "café", "東京", "short message", "rust"];
+        let build = |serial: bool| {
+            set_serial_projection_for_ab(serial);
+            let directory = tempfile::tempdir().expect("bridge index directory");
+            let mut index =
+                QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+            for batch in refs.chunks(128) {
+                index.add_cass_document_refs(batch).expect("add batch");
+            }
+            index.commit().expect("commit adds");
+            let added = generation_witness(&index, &queries);
+            index
+                .upsert_cass_document_refs(&refs[100..300])
+                .expect("upsert batch");
+            index.commit().expect("commit upserts");
+            let upserted = generation_witness(&index, &queries);
+            set_serial_projection_for_ab(false);
+            (added, upserted)
+        };
+        let incumbent = build(true);
+        let candidate = build(false);
+        assert!(incumbent.0.len() > queries.len() + 2, "{:?}", incumbent.0);
+        assert_eq!(candidate.0, incumbent.0, "added generation");
+        assert_eq!(candidate.1, incumbent.1, "upserted generation");
     }
 
     /// The bridge must drive a full write/commit/read cycle from sync code.
