@@ -16,7 +16,7 @@
 
 use assert_cmd::Command;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 use std::io::Write;
@@ -372,6 +372,8 @@ fn forget_combines_source_workspace_and_age_selectors() -> TestResult {
     let selectors = [
         "--source-glob",
         "**/rollout-old-*.jsonl",
+        "--source-glob",
+        "**/rollout-recent-*.jsonl",
         "--workspace-glob",
         "/work/scratch/*",
         "--older-than",
@@ -389,6 +391,58 @@ fn forget_combines_source_workspace_and_age_selectors() -> TestResult {
     archive.index(&["--full"])?;
     assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
     assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn forget_source_path_treats_glob_metacharacters_literally() -> TestResult {
+    let home = TempDir::new()?;
+    let data_dir = home.path().join("cass-data");
+    fs::create_dir_all(&data_dir)?;
+    let codex_home = home.path().join(".codex");
+    let literal = write_codex_rollout(&codex_home, "literal-[ab]", FORGOTTEN_MARKER)?;
+    let neighbour = write_codex_rollout(&codex_home, "literal-a", KEPT_MARKER)?;
+    let archive = Archive { home, data_dir };
+    archive.index(&["--full"])?;
+    let literal_str = literal.to_str().ok_or("non-utf8 fixture path")?;
+    let neighbour_str = neighbour.to_str().ok_or("non-utf8 fixture path")?;
+    let source_before = fs::read(&literal)?;
+
+    // This spelling is an active glob and would select the unrelated file.
+    // A source-path selector must instead select the literal bracketed name.
+    assert_eq!(
+        archive.forget(literal_str, false)?["conversations_matched"],
+        1
+    );
+    assert!(
+        archive
+            .search_hit_paths(FORGOTTEN_MARKER)?
+            .contains(&literal_str.to_owned())
+    );
+    assert!(
+        archive
+            .search_hit_paths(KEPT_MARKER)?
+            .contains(&neighbour_str.to_owned())
+    );
+    let selectors = ["--source-path", literal_str, "--source-path", literal_str];
+    let preview = archive.forget_selected(&selectors, false)?;
+    assert_eq!(preview["conversations_matched"], 1);
+    let applied = archive.forget_selected(&selectors, true)?;
+    assert_eq!(applied["conversations_deleted"], 1);
+    assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    assert!(
+        archive
+            .search_hit_paths(KEPT_MARKER)?
+            .contains(&neighbour_str.to_owned())
+    );
+    assert_eq!(fs::read(&literal)?, source_before);
+    archive.index(&["--full"])?;
+    assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    assert!(
+        archive
+            .search_hit_paths(KEPT_MARKER)?
+            .contains(&neighbour_str.to_owned())
+    );
     Ok(())
 }
 
@@ -675,6 +729,96 @@ fn forgotten_opencode_session_stays_out_when_sibling_changes() -> TestResult {
     drop(conn);
     assert_shared_forget_survives_rescans(&archive, &source, &original_captures)?;
     assert_shared_session_tombstone(&archive, &source, "opencode")?;
+    Ok(())
+}
+
+#[test]
+fn a_batch_of_shared_session_paths_preserves_siblings_and_durable_identities() -> TestResult {
+    use coding_agent_search::franken_sync::Connection;
+    use coding_agent_search::storage::sqlite::{ForgottenConversationKey, FrankenStorage};
+
+    let (archive, source) = indexed_opencode_archive_with_sessions(
+        TempDir::new()?,
+        &[
+            ("ses-forgotten", "/work/selected", FORGOTTEN_MARKER),
+            ("ses-forgotten-two", "/work/selected", SIBLING_MARKER),
+            ("ses-kept", "/work/production", KEPT_MARKER),
+        ],
+    )?;
+    let first = source.join("ses-forgotten");
+    let second = source.join("ses-forgotten-two");
+    let first_str = first.to_str().ok_or("non-utf8 logical source")?;
+    let second_str = second.to_str().ok_or("non-utf8 logical source")?;
+    for marker in [FORGOTTEN_MARKER, SIBLING_MARKER, KEPT_MARKER] {
+        assert!(!archive.search_hit_paths(marker)?.is_empty());
+    }
+    let original = fs::read(&source)?;
+    let selectors = [
+        "--source-path",
+        first_str,
+        "--source-path",
+        second_str,
+        "--source-glob",
+        "**/opencode.db/ses-forgotten*",
+        "--source-path",
+        first_str,
+    ];
+    let report = archive.forget_selected(&selectors, true)?;
+    assert_eq!(report["conversations_deleted"], 2);
+    assert_eq!(
+        fs::read(&source)?,
+        original,
+        "batch rewrote the shared source store"
+    );
+    let captures = raw_source_manifest_ids(&archive.data_dir, &source)?;
+    let storage = FrankenStorage::open_readonly(&archive.data_dir.join("agent_search.db"))?;
+    let keys = storage.forgotten_conversation_keys()?;
+    assert_eq!(keys.len(), 2);
+    assert!(storage.forgotten_source_stamps()?.is_empty());
+    for (path, session) in [
+        (first_str, "ses-forgotten"),
+        (second_str, "ses-forgotten-two"),
+    ] {
+        assert!(keys.contains(&ForgottenConversationKey {
+            source_id: "local".into(),
+            agent_slug: "opencode".into(),
+            source_path: path.into(),
+            external_id: session.into(),
+        }));
+    }
+    drop(storage);
+
+    let conn = Connection::open(source.to_string_lossy().as_ref())?;
+    insert_opencode_message(
+        &conn,
+        "ses-kept",
+        "msg-kept-new",
+        LATE_MARKER,
+        chrono::Utc::now().timestamp_millis() + 2_000,
+    )?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    drop(conn);
+    assert_ne!(
+        fs::read(&source)?,
+        original,
+        "the fixture must change its shared file stamp"
+    );
+    for extra in [&[][..], &["--full"][..]] {
+        index_shared_with_raw_capture(&archive, extra)?;
+        assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+        assert!(archive.search_hit_paths(SIBLING_MARKER)?.is_empty());
+        assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+        assert!(!archive.search_hit_paths(LATE_MARKER)?.is_empty());
+        let storage = FrankenStorage::open_readonly(&archive.data_dir.join("agent_search.db"))?;
+        assert_eq!(storage.forgotten_conversation_keys()?, keys);
+        assert_eq!(storage.total_conversation_count()?, 1);
+        assert_eq!(
+            raw_source_manifest_ids(&archive.data_dir, &source)?,
+            captures,
+            "rescanning the shared file must not capture forgotten raw content again"
+        );
+        assert!(!raw_mirror_holds(&archive.data_dir, LATE_MARKER)?);
+    }
     Ok(())
 }
 
@@ -993,7 +1137,24 @@ fn exclusion_management_rejects_ambiguous_or_unsupported_selectors() -> TestResu
             "--json",
         ],
         vec!["forget", "--reinclude", "--older-than", "30d", "--json"],
-        vec!["forget", "--source-path", "/transcript.jsonl", "--json"],
+        vec![
+            "forget",
+            "--list",
+            "--source-path",
+            "/first.jsonl",
+            "--source-path",
+            "/second.jsonl",
+            "--json",
+        ],
+        vec![
+            "forget",
+            "--reinclude",
+            "--source-glob",
+            "first*",
+            "--source-glob",
+            "second*",
+            "--json",
+        ],
         vec!["forget", "--source-id", "local", "--json"],
         vec!["forget", "--agent", "opencode", "--json"],
         vec!["forget", "--external-id", "session", "--json"],
@@ -1202,6 +1363,338 @@ fn derived_assets(data_dir: &Path) -> TestResult<BTreeMap<PathBuf, Vec<u8>>> {
         );
     }
     Ok(files)
+}
+
+/// The published lexical and vector generations, excluding maintenance logs
+/// that may legitimately record an applied no-op.
+fn published_search_assets(data_dir: &Path) -> TestResult<BTreeMap<PathBuf, Vec<u8>>> {
+    Ok(derived_assets(data_dir)?
+        .into_iter()
+        .filter(|(path, _)| path.starts_with("index") || path.starts_with("vector_index"))
+        .collect())
+}
+
+fn lexical_publish_backups(data_dir: &Path) -> TestResult<BTreeSet<PathBuf>> {
+    let root = data_dir.join("index/.lexical-publish-backups");
+    let mut backups = BTreeSet::new();
+    if root.is_dir() {
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                backups.insert(entry.path());
+            }
+        }
+    }
+    Ok(backups)
+}
+
+/// Include complete exclusion records and rollups (including timestamps), so
+/// equality proves that a no-op did not rewrite durable or derived SQL state.
+fn forget_state(archive: &Archive) -> TestResult<BTreeMap<String, Vec<String>>> {
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let storage = FrankenStorage::open_readonly(&archive.data_dir.join("agent_search.db"))?;
+    let mut snapshot = BTreeMap::new();
+    for table in [
+        "conversations",
+        "messages",
+        "forgotten_sources",
+        "forgotten_conversations",
+        "daily_stats",
+        "token_daily_stats",
+        "message_metrics",
+        "usage_daily",
+        "usage_hourly",
+        "usage_models_daily",
+    ] {
+        let mut rows: Vec<_> = storage
+            .raw()
+            .query(&format!("SELECT * FROM {table}"))?
+            .into_iter()
+            .map(|row| format!("{:?}", row.values()))
+            .collect();
+        rows.sort();
+        snapshot.insert(table.to_string(), rows);
+    }
+    let mut meta: Vec<_> = storage
+        .raw()
+        .query(
+            "SELECT key, value FROM meta WHERE key LIKE 'last_embedded_message_id%'
+             OR key = 'forget_derived_rebuild_pending'",
+        )?
+        .into_iter()
+        .map(|row| format!("{:?}", row.values()))
+        .collect();
+    meta.sort();
+    snapshot.insert("meta".to_string(), meta);
+    Ok(snapshot)
+}
+
+fn assert_archive_counts(archive: &Archive, conversations: usize, messages: usize) -> TestResult {
+    use coding_agent_search::franken_sync::compat::RowExt;
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let storage = FrankenStorage::open_readonly(&archive.data_dir.join("agent_search.db"))?;
+    assert_eq!(storage.total_conversation_count()?, conversations);
+    assert_eq!(storage.total_message_count()?, messages);
+    for sql in [
+        "SELECT COALESCE(SUM(message_count), 0) FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+        "SELECT COALESCE(SUM(message_count), 0) FROM usage_daily",
+        "SELECT COALESCE(SUM(message_count), 0) FROM usage_hourly",
+        "SELECT COALESCE(SUM(message_count), 0) FROM usage_models_daily",
+        "SELECT COUNT(*) FROM message_metrics",
+    ] {
+        let rows = storage.raw().query(sql)?;
+        assert_eq!(rows[0].get_typed::<i64>(0)?, messages as i64, "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn batch_forget_unions_exact_and_overlapping_selectors_once_across_all_surfaces() -> TestResult {
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let home = TempDir::new()?;
+    let data_dir = home.path().join("cass-data");
+    fs::create_dir_all(&data_dir)?;
+    let codex_home = home.path().join(".codex");
+    let first = write_codex_rollout(&codex_home, FORGOTTEN_SESSION, FORGOTTEN_MARKER)?;
+    let second = write_codex_rollout(&codex_home, "forget-c", SIBLING_MARKER)?;
+    write_codex_rollout(&codex_home, "keep-b", KEPT_MARKER)?;
+    let archive = Archive { home, data_dir };
+    archive.index(&["--full", "--semantic", "--embedder", "hash"])?;
+    assert_archive_counts(&archive, 3, 6)?;
+    let first_str = first.to_str().ok_or("non-utf8 fixture path")?;
+    let second_str = second.to_str().ok_or("non-utf8 fixture path")?;
+    let selectors = [
+        "--source-path",
+        first_str,
+        "--source-path",
+        first_str,
+        "--source-path",
+        second_str,
+        "--source-glob",
+        "**/rollout-*-forget-*.jsonl",
+        "--source-glob",
+        first_str,
+    ];
+    let sources = [(first_str, FORGOTTEN_MARKER), (second_str, SIBLING_MARKER)];
+    let originals = [fs::read(&first)?, fs::read(&second)?];
+    let mut kept_before = BTreeMap::new();
+    for (surface, args) in SURFACES {
+        for (path, marker) in sources {
+            assert!(
+                archive
+                    .search_hits(marker, args)?
+                    .iter()
+                    .any(|(hit, _)| hit == path),
+                "{surface}: selected fixture missing before forget"
+            );
+        }
+        let kept: BTreeSet<_> = archive
+            .search_hits(KEPT_MARKER, args)?
+            .into_iter()
+            .filter(|(path, _)| path != first_str && path != second_str)
+            .collect();
+        assert!(!kept.is_empty(), "{surface}: unrelated fixture missing");
+        kept_before.insert(*surface, kept);
+    }
+    let assets_before = derived_assets(&archive.data_dir)?;
+    let state_before = forget_state(&archive)?;
+    let preview = archive.forget_selected(&selectors, false)?;
+    assert_eq!(preview["conversations_matched"], 2);
+    assert_eq!(preview["messages_matched"], 4);
+    assert_eq!(preview["conversations_deleted"], 0);
+    assert_eq!(preview["derived_rebuilt"], false);
+    assert_eq!(derived_assets(&archive.data_dir)?, assets_before);
+    assert_eq!(forget_state(&archive)?, state_before);
+
+    let backups_before = lexical_publish_backups(&archive.data_dir)?;
+    let mut batch = archive.cmd();
+    // Retaining all generations makes each real publish independently
+    // countable, rather than trusting only the command's report flag.
+    batch.env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "64");
+    let mut args = vec!["forget", "--apply", "--json"];
+    args.extend_from_slice(&selectors);
+    let output = archive.run_step("one derived rebuild for the selector union", batch, &args)?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let applied: Value = serde_json::from_slice(&output.stdout)?;
+    let backups_after = lexical_publish_backups(&archive.data_dir)?;
+    assert!(backups_before.is_subset(&backups_after));
+    assert_eq!(
+        backups_after.difference(&backups_before).count(),
+        1,
+        "the whole batch must publish exactly one replacement lexical generation"
+    );
+    assert_eq!(applied["conversations_matched"], 2);
+    assert_eq!(applied["conversations_deleted"], 2);
+    assert_eq!(applied["messages_matched"], 4);
+    assert_eq!(applied["derived_rebuilt"], true);
+    assert_archive_counts(&archive, 1, 2)?;
+    for (surface, args) in SURFACES {
+        for (path, marker) in sources {
+            match archive.search_hits_or_unavailable(marker, args)? {
+                Some(hits) => assert!(
+                    hits.iter()
+                        .all(|(hit, text)| hit != path && !text.contains(marker)),
+                    "{surface}: forgotten content survived the batch"
+                ),
+                None => assert!(surface.starts_with("semantic")),
+            }
+        }
+        if !surface.starts_with("semantic") {
+            assert_eq!(
+                archive
+                    .search_hits(KEPT_MARKER, args)?
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                kept_before[surface],
+                "{surface}: unrelated hits changed"
+            );
+        }
+    }
+    for (marker, session) in [
+        (FORGOTTEN_MARKER, FORGOTTEN_SESSION),
+        (SIBLING_MARKER, "forget-c"),
+    ] {
+        assert!(
+            !archive.pack(marker)?.contains(session),
+            "pack retained {session}"
+        );
+    }
+    let storage = FrankenStorage::open_readonly(&archive.data_dir.join("agent_search.db"))?;
+    let stamps = storage.forgotten_source_stamps()?;
+    assert_eq!(
+        stamps.len(),
+        2,
+        "overlapping selectors must not duplicate exclusions"
+    );
+    assert!(stamps.contains_key(first_str));
+    assert!(stamps.contains_key(second_str));
+    assert!(!storage.forget_derived_rebuild_pending()?);
+    drop(storage);
+    assert_eq!(fs::read(&first)?, originals[0]);
+    assert_eq!(fs::read(&second)?, originals[1]);
+
+    archive.index(&["--full", "--semantic", "--embedder", "hash"])?;
+    assert_archive_counts(&archive, 1, 2)?;
+    assert!(archive.semantic_status_is_current()?);
+    for (surface, args) in SURFACES {
+        for (path, marker) in sources {
+            assert!(
+                archive
+                    .search_hits(marker, args)?
+                    .iter()
+                    .all(|(hit, text)| hit != path && !text.contains(marker)),
+                "{surface}: a full rescan resurrected forgotten content"
+            );
+        }
+        assert_eq!(
+            archive
+                .search_hits(KEPT_MARKER, args)?
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            kept_before[surface],
+            "{surface}: unrelated hits changed after semantic catch-up"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_zero_match_batch_leaves_exclusions_analytics_and_published_assets_unchanged() -> TestResult {
+    let (archive, forgotten) = indexed_archive(&["--semantic", "--embedder", "hash"])?;
+    let source = forgotten.to_str().ok_or("non-utf8 fixture path")?;
+    archive.forget_selected(&["--source-path", source], true)?;
+    archive.index(&["--semantic", "--embedder", "hash"])?;
+    let missing = archive.home.path().join("never-created.jsonl");
+    let missing = missing.to_str().ok_or("non-utf8 missing source path")?;
+    assert!(archive.semantic_status_is_current()?);
+    let before = forget_state(&archive)?;
+    assert!(
+        !before["forgotten_sources"].is_empty(),
+        "no-op must preserve an existing tombstone"
+    );
+    let assets = published_search_assets(&archive.data_dir)?;
+    assert!(!assets.is_empty());
+    let mut no_rebuild = archive.cmd();
+    no_rebuild.env("CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE", "1");
+    let output = archive.run_step(
+        "no-match batch with rebuild failpoint",
+        no_rebuild,
+        &[
+            "forget",
+            "--source-path",
+            source,
+            "--source-path",
+            source,
+            "--source-path",
+            missing,
+            "--source-glob",
+            "**/never-indexed-*.jsonl",
+            "--apply",
+            "--json",
+        ],
+    )?;
+    assert!(
+        output.status.success(),
+        "a true no-op attempted lexical rebuilding: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["conversations_matched"], 0);
+    assert_eq!(report["conversations_deleted"], 0);
+    assert_eq!(report["derived_rebuilt"], false);
+    assert_eq!(forget_state(&archive)?, before);
+    assert_eq!(published_search_assets(&archive.data_dir)?, assets);
+    assert!(archive.semantic_status_is_current()?);
+    for (_, args) in SURFACES {
+        assert!(!archive.search_hits(KEPT_MARKER, args)?.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn an_invalid_later_batch_selector_cannot_partially_forget() -> TestResult {
+    let (archive, forgotten) = indexed_archive(&[])?;
+    let source = forgotten.to_str().ok_or("non-utf8 fixture path")?;
+    let before = forget_state(&archive)?;
+    let assets = published_search_assets(&archive.data_dir)?;
+    for invalid in [["--source-glob", "["], ["--source-path", "   "]] {
+        let output = archive.run_step(
+            "invalid later batch selector",
+            archive.cmd(),
+            &[
+                "forget",
+                "--source-path",
+                source,
+                invalid[0],
+                invalid[1],
+                "--apply",
+                "--json",
+            ],
+        )?;
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(forget_state(&archive)?, before);
+        assert_eq!(published_search_assets(&archive.data_dir)?, assets);
+        assert!(!archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    }
+    // Exact paths must not silently trim to a different stored filename.
+    let with_space = format!("{source} ");
+    assert_eq!(
+        archive.forget_selected(&["--source-path", &with_space], false)?["conversations_matched"],
+        0
+    );
+    Ok(())
 }
 
 #[test]
@@ -1511,9 +2004,29 @@ fn a_failed_lexical_purge_is_a_typed_error_and_the_next_index_completes_it() -> 
 
 #[test]
 fn a_failed_lexical_purge_is_repaired_by_retrying_the_same_forget() -> TestResult {
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
     let (archive, forgotten) = indexed_archive(&[])?;
+    let second = write_codex_rollout(
+        &archive.home.path().join(".codex"),
+        "forget-c",
+        SIBLING_MARKER,
+    )?;
+    archive.index(&[])?;
     let forgotten_str = forgotten.to_str().ok_or("non-utf8 fixture path")?;
+    let second_str = second.to_str().ok_or("non-utf8 fixture path")?;
     let original = fs::read(&forgotten)?;
+    let second_original = fs::read(&second)?;
+    let selectors = [
+        "--source-path",
+        forgotten_str,
+        "--source-path",
+        second_str,
+        "--source-glob",
+        forgotten_str,
+        "--source-path",
+        second_str,
+    ];
     assert!(
         archive
             .search_hit_paths(FORGOTTEN_MARKER)?
@@ -1521,6 +2034,7 @@ fn a_failed_lexical_purge_is_repaired_by_retrying_the_same_forget() -> TestResul
             .any(|path| path == forgotten_str),
         "negative control: the forgotten session must be searchable"
     );
+    assert!(!archive.search_hit_paths(SIBLING_MARKER)?.is_empty());
     assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
 
     // A fresh process must retry the derived rebuild even after the first
@@ -1529,16 +2043,12 @@ fn a_failed_lexical_purge_is_repaired_by_retrying_the_same_forget() -> TestResul
     for attempt in 1..=2 {
         let mut failing = archive.cmd();
         failing.env("CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE", "1");
+        let mut args = vec!["forget", "--apply", "--json"];
+        args.extend_from_slice(&selectors);
         let output = archive.run_step(
             &format!("forget --apply (injected lexical failure, attempt {attempt})"),
             failing,
-            &[
-                "forget",
-                "--source-glob",
-                forgotten_str,
-                "--apply",
-                "--json",
-            ],
+            &args,
         )?;
         assert_eq!(
             output.status.code(),
@@ -1556,28 +2066,45 @@ fn a_failed_lexical_purge_is_repaired_by_retrying_the_same_forget() -> TestResul
         )?;
         assert_eq!(envelope["error"]["kind"], "lexical-rebuild");
         assert_eq!(
-            archive.forget(forgotten_str, false)?["conversations_matched"],
+            archive.forget_selected(&selectors, false)?["conversations_matched"],
             0,
             "canonical deletion must survive each failed rebuild"
         );
+        let storage = FrankenStorage::open_readonly(&archive.data_dir.join("agent_search.db"))?;
+        assert_eq!(storage.total_conversation_count()?, 1);
+        assert_eq!(storage.forgotten_source_stamps()?.len(), 2);
+        assert!(
+            storage.forget_derived_rebuild_pending()?,
+            "a failed batch must remain repairable"
+        );
     }
 
-    let repaired = archive.forget(forgotten_str, true)?;
+    let repaired = archive.forget_selected(&selectors, true)?;
     assert_eq!(repaired["conversations_matched"], 0);
     assert_eq!(repaired["conversations_deleted"], 0);
     assert_eq!(repaired["applied"], true);
+    assert_eq!(
+        repaired["derived_rebuilt"], true,
+        "zero matches must not skip a pending repair"
+    );
+    let storage = FrankenStorage::open_readonly(&archive.data_dir.join("agent_search.db"))?;
+    assert!(!storage.forget_derived_rebuild_pending()?);
+    drop(storage);
 
     // Check freshness before any search can run its own recovery path.
     let status = archive.succeed("status after forget retry", &["status", "--json"])?;
     let status: Value = serde_json::from_slice(&status.stdout)?;
     assert_eq!(status["index"]["stale"], false);
     assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    assert!(archive.search_hit_paths(SIBLING_MARKER)?.is_empty());
     assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
 
     archive.index(&["--full"])?;
     assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    assert!(archive.search_hit_paths(SIBLING_MARKER)?.is_empty());
     assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
     assert_eq!(fs::read(&forgotten)?, original);
+    assert_eq!(fs::read(&second)?, second_original);
     Ok(())
 }
 

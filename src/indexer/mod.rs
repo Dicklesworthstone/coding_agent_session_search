@@ -47223,7 +47223,7 @@ mod tests {
         )?;
         storage.forget_conversations(
             &crate::storage::sqlite::ForgetConversationsFilter {
-                source_glob: Some(source_path.to_str().context("source path")?),
+                source_paths: &[source_path.to_str().context("source path")?.to_owned()],
                 ..Default::default()
             },
             false,

@@ -12085,15 +12085,16 @@ impl FrankenStorage {
     ) -> Result<ForgetConversationsResult> {
         self.forget_conversations(
             &ForgetConversationsFilter {
-                source_glob: Some(pattern),
+                source_globs: &[pattern.to_owned()],
                 ..Default::default()
             },
             dry_run,
         )
     }
 
-    /// Select canonical conversations by intersecting source, workspace and
-    /// age predicates. One snapshot covers selection, tombstones and deletion;
+    /// Select the union of source globs and literal paths, intersected with
+    /// workspace and age predicates. One snapshot covers the entire batch's
+    /// selection, tombstones and deletion;
     /// a dry run uses only reads and explicitly releases its snapshot. The
     /// caller rebuilds derived search/analytics assets after an applied change.
     ///
@@ -12118,15 +12119,35 @@ impl FrankenStorage {
                 })
                 .transpose()
         };
-        let source_glob = parse_glob(filter.source_glob, "source-glob")?;
+        // Compile every selector before beginning the transaction. Never
+        // combine globs into a broader pattern or apply selectors one by one:
+        // that would change both the selection and shared-store tombstones.
+        let source_globs: BTreeSet<_> = filter.source_globs.iter().map(|s| s.trim()).collect();
+        let source_patterns: Vec<_> = source_globs
+            .iter()
+            .map(|pattern| {
+                parse_glob(Some(pattern), "source-glob")?
+                    .context("missing forget source-glob pattern")
+            })
+            .collect::<Result<_>>()?;
+        let source_paths: BTreeSet<_> = filter.source_paths.iter().map(String::as_str).collect();
+        if source_paths.iter().any(|path| path.trim().is_empty()) {
+            bail!("forget source-path cannot be empty");
+        }
         let workspace_glob = parse_glob(filter.workspace_glob, "workspace-glob")?;
-        if source_glob.is_none() && workspace_glob.is_none() && filter.before_ms.is_none() {
-            bail!("forget requires a source-glob, workspace-glob or age cutoff");
+        let has_source_selector = !source_patterns.is_empty() || !source_paths.is_empty();
+        if !has_source_selector && workspace_glob.is_none() && filter.before_ms.is_none() {
+            bail!("forget requires a source-glob, source-path, workspace-glob or age cutoff");
         }
 
+        let single_source_glob = (source_globs.len() == 1 && source_paths.is_empty())
+            .then(|| source_globs.first().map(|pattern| (*pattern).to_owned()))
+            .flatten();
         let mut report = ForgetConversationsResult {
-            pattern: filter.source_glob.unwrap_or_default().trim().to_owned(),
-            source_glob: filter.source_glob.map(|value| value.trim().to_owned()),
+            pattern: single_source_glob.clone().unwrap_or_default(),
+            source_glob: single_source_glob,
+            source_globs: source_globs.into_iter().map(str::to_owned).collect(),
+            source_paths: source_paths.iter().map(|path| (*path).to_owned()).collect(),
             workspace_glob: filter.workspace_glob.map(|value| value.trim().to_owned()),
             before_ms: filter.before_ms,
             dry_run,
@@ -12160,17 +12181,17 @@ impl FrankenStorage {
             let candidates: Vec<_> = page
                 .into_iter()
                 .filter(|candidate| {
-                    source_glob.as_ref().is_none_or(|pattern| {
-                        candidate
-                            .source_path
-                            .as_deref()
-                            .is_some_and(|path| pattern.matches(path))
-                    }) && workspace_glob.as_ref().is_none_or(|pattern| {
-                        candidate
-                            .workspace
-                            .as_deref()
-                            .is_some_and(|path| pattern.matches(path))
-                    })
+                    (!has_source_selector
+                        || candidate.source_path.as_deref().is_some_and(|path| {
+                            source_paths.contains(path)
+                                || source_patterns.iter().any(|pattern| pattern.matches(path))
+                        }))
+                        && workspace_glob.as_ref().is_none_or(|pattern| {
+                            candidate
+                                .workspace
+                                .as_deref()
+                                .is_some_and(|path| pattern.matches(path))
+                        })
                 })
                 .collect();
             if !candidates.is_empty() {
@@ -24757,13 +24778,16 @@ pub struct AgentArchivePurgeResult {
     pub messages_deleted: usize,
 }
 
-/// Selectors for an explicit `cass forget` operation. Present selectors are
-/// intersected, and an empty selection request is refused. `before_ms` is an
+/// Selectors for an explicit `cass forget` operation. Source globs and literal
+/// source paths form a union, intersected with workspace and age predicates.
+/// An empty selection request is refused. `before_ms` is an
 /// absolute, exclusive cutoff for the latest message timestamp; conversations
 /// with no messages or any unknown message timestamp are kept.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ForgetConversationsFilter<'a> {
-    pub source_glob: Option<&'a str>,
+    pub source_globs: &'a [String],
+    /// Exact stored paths, including any glob metacharacters or whitespace.
+    pub source_paths: &'a [String],
     pub workspace_glob: Option<&'a str>,
     pub before_ms: Option<i64>,
 }
@@ -24923,10 +24947,13 @@ pub struct ForgetSessionSample {
 /// removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ForgetConversationsResult {
-    /// The source glob, retained for existing report consumers; empty when
-    /// selection uses workspace or age alone.
+    /// The source glob for a single-glob selection, or empty for a batch or
+    /// a selection using literal paths, workspace or age alone.
     pub pattern: String,
     pub source_glob: Option<String>,
+    /// Deduplicated source selectors; their union is evaluated only once.
+    pub source_globs: Vec<String>,
+    pub source_paths: Vec<String>,
     pub workspace_glob: Option<String>,
     pub before_ms: Option<i64>,
     pub dry_run: bool,
@@ -47709,7 +47736,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         }
         assert_eq!(storage.total_conversation_count()?, 8);
         let source = ForgetConversationsFilter {
-            source_glob: Some("**/retire-*.jsonl"),
+            source_globs: &["**/retire-*.jsonl".to_owned()],
             ..Default::default()
         };
         let workspace = ForgetConversationsFilter {
@@ -47754,7 +47781,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         for filter in [
             ForgetConversationsFilter::default(),
             ForgetConversationsFilter {
-                source_glob: Some("["),
+                source_globs: &["[".to_owned()],
                 ..Default::default()
             },
             ForgetConversationsFilter {
@@ -47765,7 +47792,8 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             assert!(storage.forget_conversations(&filter, true).is_err());
         }
         let intersection = ForgetConversationsFilter {
-            source_glob: source.source_glob,
+            source_globs: source.source_globs,
+            source_paths: &[],
             workspace_glob: workspace.workspace_glob,
             before_ms: age.before_ms,
         };
@@ -47789,21 +47817,43 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
     }
 
     #[test]
-    fn forget_derived_rebuild_marker_is_atomic_durable_and_survives_empty_retry() -> Result<()> {
+    fn forget_batch_rebuild_marker_is_atomic_durable_and_survives_empty_retry() -> Result<()> {
         let directory = TempDir::new()?;
         let path = directory.path().join("forget-retry.db");
         let storage = FrankenStorage::open(&path)?;
         let source = "/fixture/retry.sqlite";
+        let first_source = "/fixture/first.jsonl";
+        // This row is deleted before the guarded row. A failure later in
+        // the batch must roll back the earlier deletion and both kinds of
+        // tombstone, not leave a partially applied prefix of selectors.
+        seed_forget_fixture(
+            &storage,
+            &forget_fixture_conversation(
+                first_source,
+                Some("first"),
+                Some("/work/old"),
+                &[Some(5)],
+            ),
+        )?;
         let conversation_id = seed_forget_fixture(
             &storage,
             &forget_fixture_conversation(source, Some("retired"), Some("/work/old"), &[Some(10)]),
         )?;
+        let filter = ForgetConversationsFilter {
+            source_paths: &[
+                first_source.to_owned(),
+                source.to_owned(),
+                first_source.to_owned(),
+            ],
+            source_globs: &[source.to_owned()],
+            ..Default::default()
+        };
         assert!(!storage.forget_derived_rebuild_pending()?);
         assert_eq!(
             storage
-                .forget_conversations_by_source_glob(source, true)?
+                .forget_conversations(&filter, true)?
                 .conversations_matched,
-            1
+            2
         );
         assert!(!storage.forget_derived_rebuild_pending()?);
 
@@ -47819,13 +47869,9 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             "INSERT INTO forget_retry_guard(conversation_id) VALUES (?1)",
             fparams![conversation_id],
         )?;
-        assert!(
-            storage
-                .forget_conversations_by_source_glob(source, false)
-                .is_err()
-        );
-        assert_eq!(storage.total_conversation_count()?, 1);
-        assert_eq!(storage.total_message_count()?, 1);
+        assert!(storage.forget_conversations(&filter, false).is_err());
+        assert_eq!(storage.total_conversation_count()?, 2);
+        assert_eq!(storage.total_message_count()?, 2);
         assert!(storage.forgotten_conversation_keys()?.is_empty());
         assert!(storage.forgotten_source_stamps()?.is_empty());
         assert!(!storage.forget_derived_rebuild_pending()?);
@@ -47833,18 +47879,19 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
 
         assert_eq!(
             storage
-                .forget_conversations_by_source_glob(source, false)?
+                .forget_conversations(&filter, false)?
                 .conversations_deleted,
-            1
+            2
         );
         assert!(storage.forget_derived_rebuild_pending()?);
         assert_eq!(storage.forgotten_conversation_keys()?.len(), 1);
+        assert_eq!(storage.forgotten_source_stamps()?.len(), 1);
         storage.close()?;
 
         let reopened = FrankenStorage::open(&path)?;
         assert!(reopened.forget_derived_rebuild_pending()?);
         for dry_run in [true, false] {
-            let retry = reopened.forget_conversations_by_source_glob(source, dry_run)?;
+            let retry = reopened.forget_conversations(&filter, dry_run)?;
             assert_eq!(retry.conversations_matched, 0);
             assert_eq!(retry.conversations_deleted, 0);
             assert!(
@@ -48924,6 +48971,70 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         let applied = storage.forget_conversations_by_source_glob("**/selected.jsonl", false)?;
         assert_eq!(applied.conversations_deleted, 1);
         assert_eq!(storage.total_conversation_count()?, 256);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_hundreds_of_literal_paths_crosses_candidate_and_tombstone_pages() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("large-batch-forget.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "fixture".into(),
+            name: "Fixture".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let mut paths = Vec::new();
+        let mut tx = storage.raw().transaction()?;
+        for id in 1..=600_i64 {
+            let path = format!("/fixture/session[{id}].jsonl");
+            tx.execute_compat(
+                "INSERT INTO conversations(id, agent_id, source_path, external_id) VALUES(?1, ?2, ?3, ?4)",
+                fparams![id, agent_id, path.as_str(), id.to_string()],
+            )?;
+            tx.execute_compat(
+                "INSERT INTO messages(conversation_id, idx, role, created_at, content) VALUES(?1, 0, 'user', 1, 'synthetic batch fixture')",
+                fparams![id],
+            )?;
+            if id > 256 {
+                paths.push(path);
+            }
+        }
+        tx.commit()?;
+        // The first candidate page is entirely unselected, and the selected
+        // paths require more than one bounded tombstone-count query. Brackets
+        // must stay literal. Repetition and missing files must not add rows.
+        paths.push(paths[0].clone());
+        paths.push("/fixture/absent.jsonl".into());
+        let filter = ForgetConversationsFilter {
+            source_paths: &paths,
+            source_globs: &[glob::Pattern::escape("/fixture/session[600].jsonl")],
+            ..Default::default()
+        };
+        let preview = storage.forget_conversations(&filter, true)?;
+        assert_eq!(preview.conversations_matched, 344);
+        assert_eq!(preview.messages_matched, 344);
+        assert_eq!(preview.conversations_deleted, 0);
+        assert_eq!(preview.source_paths.len(), 345);
+        assert_eq!(preview.sample_sessions.len(), 20);
+        assert_eq!(storage.total_conversation_count()?, 600);
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        assert!(!storage.forget_derived_rebuild_pending()?);
+
+        let applied = storage.forget_conversations(&filter, false)?;
+        assert_eq!(applied.conversations_deleted, 344);
+        assert_eq!(applied.conversations_matched, preview.conversations_matched);
+        assert_eq!(storage.total_conversation_count()?, 256);
+        assert_eq!(storage.total_message_count()?, 256);
+        let stamps = storage.forgotten_source_stamps()?;
+        assert_eq!(stamps.len(), 344);
+        assert!(!stamps.contains_key("/fixture/absent.jsonl"));
+        assert!(!stamps.contains_key("/fixture/session[256].jsonl"));
+        assert!(stamps.contains_key("/fixture/session[257].jsonl"));
+        assert!(stamps.contains_key("/fixture/session[600].jsonl"));
+        assert!(storage.forgotten_conversation_keys()?.is_empty());
+        assert!(storage.forget_derived_rebuild_pending()?);
         Ok(())
     }
 
