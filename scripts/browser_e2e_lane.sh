@@ -57,6 +57,7 @@ cass="$CARGO_TARGET_DIR/release/cass$exe"
 [ -x "$cass" ] || { echo "browser lane: no cass binary at $cass" >&2; exit 2; }
 
 cd "$repo/tests" || exit
+node --experimental-strip-types --test "$repo/tests/js/global_setup_readiness.test.mjs"
 [ -d node_modules/@playwright/test ] || npm ci --no-audit --no-fund
 project_args=()
 browsers=()
