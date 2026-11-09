@@ -26332,6 +26332,62 @@ thread_local! {
     /// Documents this thread's streamed rebuild batches handed to the writer.
     static LEXICAL_REBUILD_TEST_ADDED_DOCS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// The incumbent arm: this thread's rebuilds fold without first returning
+    /// the free heap to the OS.
+    static LEXICAL_FOLD_HEAP_RELEASE_DISABLED_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// One entry per pre-fold heap release on this thread: the generation's
+    /// segment count at that moment, which is still the unfolded count.
+    static LEXICAL_FOLD_HEAP_RELEASES_FOR_TEST: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Hand the allocator's free heap back to the OS before the post-rebuild
+/// fold. The fold is the rebuild's memory peak: it streams every segment of
+/// the generation into one while the merge buffers grow. By then the ingest
+/// working set (packet pages, projected documents, the writer's per-commit
+/// buffers, allocated across one glibc arena per worker thread) has been
+/// freed, but glibc keeps freed pages that are not at the top of an arena
+/// resident until something trims them, so the fold's peak sat on top of that
+/// dead ingest heap. Trimming releases only pages that no live allocation
+/// occupies, so nothing the fold reads or writes changes.
+fn release_free_heap_before_lexical_fold(t_index: &TantivyIndex) {
+    #[cfg(test)]
+    {
+        if LEXICAL_FOLD_HEAP_RELEASE_DISABLED_FOR_TEST.with(std::cell::Cell::get) {
+            return;
+        }
+        let segments = t_index.segment_count().unwrap_or(0);
+        LEXICAL_FOLD_HEAP_RELEASES_FOR_TEST.with(|releases| releases.borrow_mut().push(segments));
+    }
+    #[cfg(not(test))]
+    let _ = t_index;
+    let started = Instant::now();
+    let released = return_free_heap_pages_to_os();
+    tracing::debug!(
+        released,
+        trim_ms = started.elapsed().as_millis() as u64,
+        "returned the rebuild's free heap pages to the OS before the post-rebuild fold"
+    );
+}
+
+/// `malloc_trim(0)`: return the free pages of every glibc arena to the OS,
+/// reporting whether any were released.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[allow(unsafe_code)]
+fn return_free_heap_pages_to_os() -> bool {
+    // SAFETY: unavoidable FFI with no safe wrapper. malloc_trim takes no
+    // pointers, locks each arena while it walks that arena's free chunks, and
+    // only gives back (MADV_DONTNEED or sbrk shrink) pages lying entirely
+    // inside free chunks, so every live allocation stays valid and unchanged.
+    unsafe { libc::malloc_trim(0) != 0 }
+}
+
+/// Other allocators keep no such per-arena free heap for an explicit trim to
+/// return; nothing to do.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn return_free_heap_pages_to_os() -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -30056,6 +30112,7 @@ fn rebuild_tantivy_from_db_once(
             "skipping the post-rebuild segment fold for lack of disk space; publishing the unmerged generation (#441)"
         );
     } else {
+        release_free_heap_before_lexical_fold(&t_index);
         match t_index.force_merge() {
             Ok(()) => {
                 let segments =
@@ -68043,6 +68100,738 @@ c.close()
             ],
             rounds,
         );
+    }
+
+    /// Messages in conversation `sequence` of the memory A/B archive: a
+    /// repeating eight-conversation mix from a quarter to twice `mean`
+    /// messages (mean exactly `mean`), so pages carry uneven conversations.
+    fn memory_ab_messages(sequence: usize, mean: usize) -> usize {
+        const EIGHTHS: [usize; 8] = [2, 4, 4, 8, 8, 8, 16, 14];
+        (mean * EIGHTHS[sequence % 8] / 8).max(1)
+    }
+
+    /// Write the memory A/B archive through the production batched insert;
+    /// returns the message count.
+    fn memory_ab_build_archive(
+        db_path: &Path,
+        conversations: usize,
+        mean_messages: usize,
+        mean_bytes: usize,
+    ) -> usize {
+        let storage = FrankenStorage::open(db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace_ids: Vec<i64> = (0..8)
+            .map(|workspace| {
+                storage
+                    .ensure_workspace(Path::new(&format!("/workspace/consumer{workspace}")), None)
+                    .unwrap()
+            })
+            .collect();
+        let mut total_messages = 0;
+        let mut start = 0;
+        while start < conversations {
+            let end = (start + 64).min(conversations);
+            let batch: Vec<Conversation> = (start..end)
+                .into_par_iter()
+                .map(|sequence| {
+                    let (row, rows) = consumer_ab_rows(
+                        sequence,
+                        memory_ab_messages(sequence, mean_messages),
+                        mean_bytes,
+                    );
+                    Conversation {
+                        id: None,
+                        agent_slug: row.agent_slug,
+                        workspace: row.workspace,
+                        external_id: row.external_id,
+                        title: row.title,
+                        source_path: row.source_path,
+                        started_at: row.started_at,
+                        ended_at: row.ended_at,
+                        approx_tokens: None,
+                        metadata_json: serde_json::Value::Null,
+                        messages: rows
+                            .into_iter()
+                            .map(|message| Message {
+                                id: None,
+                                ..message
+                            })
+                            .collect(),
+                        source_id: row.source_id,
+                        origin_host: row.origin_host,
+                    }
+                })
+                .collect();
+            total_messages += batch
+                .iter()
+                .map(|conversation| conversation.messages.len())
+                .sum::<usize>();
+            let rows: Vec<(i64, Option<i64>, &Conversation)> = batch
+                .iter()
+                .enumerate()
+                .map(|(offset, conversation)| {
+                    (
+                        agent_id,
+                        Some(workspace_ids[(start + offset) % 8]),
+                        conversation,
+                    )
+                })
+                .collect();
+            storage.insert_conversations_batched(&rows).unwrap();
+            start = end;
+        }
+        drop(storage);
+        total_messages
+    }
+
+    /// One `/proc/self/status` reading: VmRSS, RssAnon, RssFile (MiB), threads.
+    fn memory_ab_status() -> (f64, f64, f64, u64) {
+        let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let field = |name: &str| -> u64 {
+            status
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix(name)?
+                        .trim()
+                        .trim_end_matches("kB")
+                        .trim()
+                        .parse()
+                        .ok()
+                })
+                .unwrap_or(0)
+        };
+        (
+            field("VmRSS:") as f64 / 1024.0,
+            field("RssAnon:") as f64 / 1024.0,
+            field("RssFile:") as f64 / 1024.0,
+            field("Threads:"),
+        )
+    }
+
+    /// glibc heap counters in MiB: (in use in arenas, free but retained in
+    /// arenas, mmapped chunks). `None` off glibc.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn memory_ab_heap_mib() -> Option<(f64, f64, f64)> {
+        // SAFETY: mallinfo2 only reads glibc's allocator statistics.
+        let info = unsafe { libc::mallinfo2() };
+        let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        Some((mib(info.uordblks), mib(info.fordblks), mib(info.hblkhd)))
+    }
+
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    fn memory_ab_heap_mib() -> Option<(f64, f64, f64)> {
+        None
+    }
+
+    #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+    struct MemoryAbSample {
+        t_ms: f64,
+        rss_mib: f64,
+        anon_mib: f64,
+        file_mib: f64,
+        /// Latest glibc heap reading (taken every `CASS_MEMORY_AB_HEAP_EVERY_MS`).
+        heap_in_use_mib: f64,
+        heap_free_mib: f64,
+        heap_mmapped_mib: f64,
+        threads: u64,
+    }
+
+    /// Log sink that timestamps the rebuild's phase boundaries and runs
+    /// `fold_hook` on the consumer thread right before the post-run fold.
+    #[derive(Clone)]
+    struct MemoryAbLog {
+        started: Instant,
+        markers: Arc<Mutex<Vec<(f64, &'static str)>>>,
+        flushes: Arc<AtomicUsize>,
+        fold_hook: Arc<dyn Fn() + Send + Sync>,
+    }
+
+    impl std::io::Write for MemoryAbLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let line = String::from_utf8_lossy(buf);
+            let t_ms = self.started.elapsed().as_secs_f64() * 1000.0;
+            if line.contains("flushed a streamed conversation batch") {
+                self.flushes.fetch_add(1, Ordering::Relaxed);
+            }
+            let marker = if line.contains("entering consumer loop") {
+                Some("ingest")
+            } else if line.contains("commit_candidate") && line.contains("step started") {
+                Some("final_commit")
+            } else if line.contains("count_candidate_segments") && line.contains("step completed") {
+                Some("fold")
+            } else if line.contains("checkpoint_after_fold") && line.contains("step started") {
+                Some("publish")
+            } else {
+                None
+            };
+            if let Some(marker) = marker {
+                self.markers.lock().unwrap().push((t_ms, marker));
+                if marker == "fold" {
+                    (self.fold_hook)();
+                }
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Per-phase memory of one rebuild: startup, ingest, final commit, fold,
+    /// publish (markers from [`MemoryAbLog`]).
+    fn memory_ab_phases(
+        samples: &[MemoryAbSample],
+        markers: &[(f64, &'static str)],
+        end_ms: f64,
+    ) -> serde_json::Value {
+        let at = |name: &str| {
+            markers
+                .iter()
+                .find(|(_, marker)| *marker == name)
+                .map(|(t, _)| *t)
+        };
+        let bounds = [
+            ("startup", Some(0.0), at("ingest")),
+            ("ingest", at("ingest"), at("final_commit")),
+            ("final_commit", at("final_commit"), at("fold")),
+            ("fold", at("fold"), at("publish")),
+            ("publish", at("publish"), Some(end_ms)),
+        ];
+        let mut phases = serde_json::Map::new();
+        for (name, start, end) in bounds {
+            let (Some(start), Some(end)) = (start, end) else {
+                continue;
+            };
+            let window: Vec<&MemoryAbSample> = samples
+                .iter()
+                .filter(|sample| sample.t_ms >= start && sample.t_ms < end)
+                .collect();
+            let max = |pick: fn(&MemoryAbSample) -> f64| {
+                window
+                    .iter()
+                    .map(|sample| pick(sample))
+                    .fold(0.0_f64, f64::max)
+            };
+            // Mean over the phase's evenly spaced samples: the phase's
+            // memory-time product divided by its length.
+            let mean = |pick: fn(&MemoryAbSample) -> f64| {
+                window.iter().map(|sample| pick(sample)).sum::<f64>() / window.len().max(1) as f64
+            };
+            phases.insert(
+                name.to_string(),
+                serde_json::json!({
+                    "ms": end - start,
+                    "rss_max": max(|s| s.rss_mib),
+                    "rss_mean": mean(|s| s.rss_mib),
+                    "anon_max": max(|s| s.anon_mib),
+                    "anon_mean": mean(|s| s.anon_mib),
+                    "file_max": max(|s| s.file_mib),
+                    "heap_in_use_max": max(|s| s.heap_in_use_mib),
+                    "heap_free_max": max(|s| s.heap_free_mib),
+                    "heap_mmapped_max": max(|s| s.heap_mmapped_mib),
+                    "first": window.first(),
+                    "last": window.last(),
+                }),
+            );
+        }
+        serde_json::Value::Object(phases)
+    }
+
+    /// Sorted identities and score bits of every hit for each query, hashed:
+    /// rare terms only, so each hit list is the query's complete answer and
+    /// does not depend on how ties at a cutoff were ordered.
+    fn memory_ab_query_witness(index_path: &Path, queries: &[String]) -> String {
+        use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+        let client = SearchClient::open(index_path, None).unwrap().unwrap();
+        let mut hasher = blake3::Hasher::new();
+        for query in queries {
+            let mut hits: Vec<String> = client
+                .search(query, SearchFilters::default(), 1000, 0, FieldMask::FULL)
+                .unwrap()
+                .into_iter()
+                .map(|hit| {
+                    format!(
+                        "{:08x} {:?} {:?} {} {:016x}",
+                        hit.score.to_bits(),
+                        hit.conversation_id,
+                        hit.line_number,
+                        hit.source_path,
+                        hit.content_hash
+                    )
+                })
+                .collect();
+            assert!(
+                hits.len() < 1000,
+                "witness query {query:?} must be answered in full"
+            );
+            hits.sort();
+            hasher.update(format!("{query} {}\n", hits.len()).as_bytes());
+            for hit in hits {
+                hasher.update(hit.as_bytes());
+                hasher.update(b"\n");
+            }
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+
+    /// Child half of `rebuild_memory_benchmark_arms`: one full
+    /// `rebuild_tantivy_from_db` of the parent's archive in this fresh
+    /// process (so no arm inherits another's allocator state), sampled every
+    /// 50 ms. Prints `MEMORY_AB_RUN` and `MEMORY_AB_WITNESS` lines.
+    fn memory_ab_child(arm: &str) {
+        let var = |key: &str| dotenvy::var(key).unwrap();
+        let db_path = PathBuf::from(var("CASS_MEMORY_AB_DB"));
+        let conversations: usize = var("CASS_MEMORY_AB_CONVERSATIONS").parse().unwrap();
+        let round: usize = var("CASS_MEMORY_AB_ROUND").parse().unwrap();
+        let heap_every = Duration::from_millis(
+            dotenvy::var("CASS_MEMORY_AB_HEAP_EVERY_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(500),
+        );
+        let _governor = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
+        let tmp = TempDir::new_in(var("CASS_MEMORY_AB_DIR")).unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let started = Instant::now();
+        let probe: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let fold_hook: Arc<dyn Fn() + Send + Sync> = {
+            let probe = Arc::clone(&probe);
+            let arm = arm.to_string();
+            Arc::new(move || {
+                let (rss_before, anon_before, _, _) = memory_ab_status();
+                let heap_before = memory_ab_heap_mib();
+                if dotenvy::var("CASS_MEMORY_AB_MALLOC_STATS").is_ok() {
+                    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                    // SAFETY: malloc_stats only prints glibc's allocator statistics.
+                    unsafe {
+                        libc::malloc_stats();
+                    }
+                }
+                // Which threads are still alive when the fold starts, by
+                // name with the pool index stripped.
+                let mut threads = std::collections::BTreeMap::<String, usize>::new();
+                if let Ok(tasks) = fs::read_dir("/proc/self/task") {
+                    for task in tasks.flatten() {
+                        let comm = fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+                        let name = comm.trim().trim_end_matches(|c: char| c.is_ascii_digit());
+                        *threads.entry(name.to_string()).or_default() += 1;
+                    }
+                }
+                *probe.lock().unwrap() = Some(serde_json::json!({
+                    "arm": arm,
+                    "rss_before": rss_before,
+                    "anon_before": anon_before,
+                    "heap_before": heap_before,
+                    "threads": threads,
+                }));
+            })
+        };
+        let log = MemoryAbLog {
+            started,
+            markers: Arc::new(Mutex::new(Vec::new())),
+            flushes: Arc::new(AtomicUsize::new(0)),
+            fold_hook,
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let samples = Arc::new(Mutex::new(Vec::<MemoryAbSample>::new()));
+        let sampler = {
+            let stop = Arc::clone(&stop);
+            let samples = Arc::clone(&samples);
+            thread::spawn(move || {
+                let mut heap = (0.0, 0.0, 0.0);
+                let mut heap_at: Option<Instant> = None;
+                let mut heap_cost_max_ms = 0.0_f64;
+                while !stop.load(Ordering::Relaxed) {
+                    if heap_every > Duration::ZERO
+                        && heap_at.is_none_or(|at| at.elapsed() >= heap_every)
+                    {
+                        let cost = Instant::now();
+                        heap = memory_ab_heap_mib().unwrap_or_default();
+                        heap_cost_max_ms =
+                            heap_cost_max_ms.max(cost.elapsed().as_secs_f64() * 1000.0);
+                        heap_at = Some(Instant::now());
+                    }
+                    let (rss_mib, anon_mib, file_mib, threads) = memory_ab_status();
+                    samples.lock().unwrap().push(MemoryAbSample {
+                        t_ms: started.elapsed().as_secs_f64() * 1000.0,
+                        rss_mib,
+                        anon_mib,
+                        file_mib,
+                        heap_in_use_mib: heap.0,
+                        heap_free_mib: heap.1,
+                        heap_mmapped_mib: heap.2,
+                        threads,
+                    });
+                    thread::sleep(Duration::from_millis(50));
+                }
+                heap_cost_max_ms
+            })
+        };
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "coding_agent_search::indexer=info",
+            ))
+            .finish();
+        // The candidate arm is production; the incumbent and the null arm
+        // fold without first returning the free heap to the OS.
+        LEXICAL_FOLD_HEAP_RELEASE_DISABLED_FOR_TEST
+            .with(|disabled| disabled.set(arm != "candidate"));
+        LEXICAL_FOLD_HEAP_RELEASES_FOR_TEST.with(|releases| releases.borrow_mut().clear());
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            rebuild_tantivy_from_db(&db_path, &data_dir, conversations, None).unwrap()
+        });
+        let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let releases =
+            LEXICAL_FOLD_HEAP_RELEASES_FOR_TEST.with(|releases| releases.borrow().clone());
+        assert_eq!(
+            releases.len(),
+            usize::from(arm == "candidate"),
+            "{arm}: pre-fold heap releases {releases:?}"
+        );
+        stop.store(true, Ordering::Relaxed);
+        let heap_cost_max_ms = sampler.join().unwrap();
+        let hwm_mib = consumer_ab_status_mib("VmHWM:");
+        let samples = samples.lock().unwrap().clone();
+        let markers = log.markers.lock().unwrap().clone();
+        let index_path = index_dir(&data_dir).unwrap();
+        let summary = crate::search::tantivy::searchable_index_summary(&index_path)
+            .unwrap()
+            .unwrap();
+        let run = serde_json::json!({
+            "arm": arm,
+            "round": round,
+            "wall_ms": wall_ms,
+            "hwm_mib": hwm_mib,
+            "indexed_docs": outcome.indexed_docs,
+            "docs": summary.docs,
+            "segments": summary.segments,
+            "flushes": log.flushes.load(Ordering::Relaxed),
+            "markers": markers,
+            "phases": memory_ab_phases(&samples, &markers, wall_ms),
+            "probe": probe.lock().unwrap().clone(),
+            "heap_cost_max_ms": heap_cost_max_ms,
+            "samples": samples.len(),
+        });
+        eprintln!("MEMORY_AB_RUN {run}");
+        if dotenvy::var("CASS_MEMORY_AB_TIMELINE").is_ok() {
+            let mut next_ms = 0.0;
+            let timeline: Vec<&MemoryAbSample> = samples
+                .iter()
+                .filter(|sample| {
+                    let keep = sample.t_ms >= next_ms;
+                    if keep {
+                        next_ms = sample.t_ms + 1000.0;
+                    }
+                    keep
+                })
+                .collect();
+            eprintln!(
+                "MEMORY_AB_TIMELINE {}",
+                serde_json::json!({ "arm": arm, "samples": timeline })
+            );
+        }
+        let queries: Vec<String> = [60_000_u64, 120_000, 180_000]
+            .into_iter()
+            .map(|rank| {
+                let mut word = String::new();
+                consumer_ab_word(rank, &mut word);
+                word
+            })
+            .collect();
+        eprintln!(
+            "MEMORY_AB_WITNESS {}",
+            serde_json::json!({
+                "arm": arm,
+                "round": round,
+                "evidence": format!("{:?}", outcome.equivalence),
+                "indexed_docs": outcome.indexed_docs,
+                "docs": summary.docs,
+                "queries": memory_ab_query_witness(&index_path, &queries),
+            })
+        );
+    }
+
+    /// Same-binary A/B of the full rebuild's memory: the parent writes one
+    /// canonical archive (`CASS_MEMORY_AB_CONVERSATIONS` conversations of
+    /// `CASS_MEMORY_AB_MESSAGES` mean messages of
+    /// `CASS_MEMORY_AB_MESSAGE_BYTES` mean bytes), then re-runs this test
+    /// binary once per arm and round (alternating order, one unrecorded
+    /// warm-up round), each child doing one production
+    /// `rebuild_tantivy_from_db` with its RSS, RssAnon, RssFile and glibc
+    /// heap sampled per phase. Every child must produce the same witness
+    /// (equivalence evidence, document counts, complete answers to rare-term
+    /// queries).
+    #[test]
+    #[ignore = "rebuild memory A/B; run explicitly with --ignored --nocapture"]
+    #[serial]
+    fn rebuild_memory_benchmark_arms() {
+        if let Ok(arm) = dotenvy::var("CASS_MEMORY_AB_CHILD_ARM") {
+            memory_ab_child(&arm);
+            return;
+        }
+        let size = |key: &str, default: usize| {
+            dotenvy::var(key)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        };
+        let conversations = size("CASS_MEMORY_AB_CONVERSATIONS", 2048);
+        let mean_messages = size("CASS_MEMORY_AB_MESSAGES", 256);
+        let mean_bytes = size("CASS_MEMORY_AB_MESSAGE_BYTES", 1024).max(8);
+        let rounds = size("CASS_MEMORY_AB_ROUNDS", 3);
+        let arms: Vec<String> = dotenvy::var("CASS_MEMORY_AB_ARMS")
+            .unwrap_or_else(|_| "incumbent,candidate,null".to_string())
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        let base = dotenvy::var("CASS_MEMORY_AB_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let archive = TempDir::new_in(&base).unwrap();
+        let db_path = archive.path().join("agent_search.db");
+        let build_started = Instant::now();
+        let messages = memory_ab_build_archive(&db_path, conversations, mean_messages, mean_bytes);
+        eprintln!(
+            "MEMORY_AB_SHAPE {}",
+            serde_json::json!({
+                "conversations": conversations,
+                "messages": messages,
+                "mean_message_bytes": mean_bytes,
+                "db_bytes": fs::metadata(&db_path).map(|meta| meta.len()).unwrap_or(0),
+                "build_ms": build_started.elapsed().as_millis() as u64,
+                "rounds": rounds,
+                "arms": arms,
+                "available_parallelism":
+                    std::thread::available_parallelism().map_or(1, usize::from),
+                "mem_total": fs::read_to_string("/proc/meminfo")
+                    .ok()
+                    .and_then(|info| info.lines().next().map(str::to_string)),
+            })
+        );
+
+        let exe = std::env::current_exe().unwrap();
+        let mut runs: Vec<serde_json::Value> = Vec::new();
+        let mut witnesses: Vec<serde_json::Value> = Vec::new();
+        for round in 0..=rounds {
+            let order: Vec<&String> = if round % 2 == 0 {
+                arms.iter().collect()
+            } else {
+                arms.iter().rev().collect()
+            };
+            for arm in order {
+                let output = std::process::Command::new(&exe)
+                    .args([
+                        "indexer::tests::rebuild_memory_benchmark_arms",
+                        "--exact",
+                        "--ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env("CASS_MEMORY_AB_CHILD_ARM", arm)
+                    .env("CASS_MEMORY_AB_DB", &db_path)
+                    .env("CASS_MEMORY_AB_DIR", &base)
+                    .env("CASS_MEMORY_AB_CONVERSATIONS", conversations.to_string())
+                    .env("CASS_MEMORY_AB_ROUND", round.to_string())
+                    .output()
+                    .unwrap();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success(),
+                    "memory A/B child {arm} round {round} failed: {}",
+                    stderr.lines().rev().take(40).collect::<Vec<_>>().join("\n")
+                );
+                for line in stderr.lines() {
+                    let malloc_stats_line = dotenvy::var("CASS_MEMORY_AB_MALLOC_STATS").is_ok()
+                        && (line.starts_with("Arena")
+                            || line.contains("system bytes")
+                            || line.contains("in use bytes"));
+                    if line.starts_with("MEMORY_AB") || malloc_stats_line {
+                        eprintln!("{line}");
+                    }
+                    if let Some(json) = line.strip_prefix("MEMORY_AB_RUN ") {
+                        if round > 0 {
+                            runs.push(serde_json::from_str(json).unwrap());
+                        }
+                    } else if let Some(json) = line.strip_prefix("MEMORY_AB_WITNESS ") {
+                        witnesses.push(serde_json::from_str(json).unwrap());
+                    }
+                }
+            }
+        }
+
+        let percentile = |mut samples: Vec<f64>, q: f64| {
+            if samples.is_empty() {
+                return f64::NAN;
+            }
+            samples.sort_by(f64::total_cmp);
+            samples[((samples.len() - 1) as f64 * q).round() as usize]
+        };
+        let metric = |run: &serde_json::Value, path: &[&str]| {
+            path.iter()
+                .try_fold(run, |value, key| value.get(*key))
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::NAN)
+        };
+        let metrics: [(&str, &[&str]); 12] = [
+            ("wall_ms", &["wall_ms"]),
+            ("hwm_mib", &["hwm_mib"]),
+            ("ingest_rss_max", &["phases", "ingest", "rss_max"]),
+            ("ingest_anon_max", &["phases", "ingest", "anon_max"]),
+            ("fold_rss_max", &["phases", "fold", "rss_max"]),
+            ("fold_anon_max", &["phases", "fold", "anon_max"]),
+            ("fold_rss_mean", &["phases", "fold", "rss_mean"]),
+            ("fold_anon_mean", &["phases", "fold", "anon_mean"]),
+            ("fold_ms", &["phases", "fold", "ms"]),
+            ("publish_rss_max", &["phases", "publish", "rss_max"]),
+            ("publish_rss_mean", &["phases", "publish", "rss_mean"]),
+            ("publish_ms", &["phases", "publish", "ms"]),
+        ];
+        for arm in &arms {
+            let mine: Vec<&serde_json::Value> =
+                runs.iter().filter(|run| run["arm"] == **arm).collect();
+            let mut summary = serde_json::Map::new();
+            summary.insert("arm".into(), serde_json::json!(arm));
+            for (name, path) in metrics {
+                let values: Vec<f64> = mine.iter().map(|run| metric(run, path)).collect();
+                let ratios: Vec<f64> = mine
+                    .iter()
+                    .filter_map(|run| {
+                        runs.iter()
+                            .find(|other| {
+                                other["arm"] == "incumbent" && other["round"] == run["round"]
+                            })
+                            .map(|other| metric(run, path) / metric(other, path))
+                    })
+                    .collect();
+                summary.insert(
+                    name.into(),
+                    serde_json::json!({
+                        "p50": percentile(values.clone(), 0.5),
+                        "min": percentile(values.clone(), 0.0),
+                        "max": percentile(values, 1.0),
+                        "ratio_p50": percentile(ratios.clone(), 0.5),
+                        "ratio_min": percentile(ratios.clone(), 0.0),
+                        "ratio_max": percentile(ratios, 1.0),
+                    }),
+                );
+            }
+            eprintln!("MEMORY_AB_SUMMARY {}", serde_json::Value::Object(summary));
+        }
+        let distinct = witnesses
+            .iter()
+            .map(|witness| {
+                format!(
+                    "{} {} {} {}",
+                    witness["evidence"],
+                    witness["indexed_docs"],
+                    witness["docs"],
+                    witness["queries"]
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "arms produced different generations: {distinct:#?}"
+        );
+        assert_eq!(witnesses.len(), (rounds + 1) * arms.len());
+    }
+
+    /// The trim the rebuild runs before its fold really hands freed, still
+    /// resident heap back to the OS. 256 MiB of small blocks are written,
+    /// then fifteen of every sixteen are freed: each freed run lies between
+    /// two live blocks, so `free` cannot shrink the arena and the runs stay
+    /// resident, the way a finished ingest phase leaves its arenas, until the
+    /// trim gives their pages back.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    #[serial]
+    fn return_free_heap_pages_to_os_releases_freed_resident_heap() {
+        const BLOCK_BYTES: usize = 4096;
+        const BLOCKS: usize = 64 * 1024;
+        // RssAnon is process-wide and `#[serial]` does not hold back the
+        // non-serial tests, which may allocate while the trim runs. A trim
+        // that works releases the freed blocks on almost every attempt; one
+        // that releases nothing fails all of them.
+        let mut attempts = Vec::new();
+        for _ in 0..3 {
+            // Below the mmap threshold, so they come from this thread's arena;
+            // nonzero, so every page is written and resident.
+            let mut blocks: Vec<Vec<u8>> = (0..BLOCKS)
+                .map(|block| vec![(block % 251) as u8 + 1; BLOCK_BYTES])
+                .collect();
+            let resident = consumer_ab_status_mib("RssAnon:");
+            let mut index = 0_usize;
+            blocks.retain(|_| {
+                index += 1;
+                index.is_multiple_of(16)
+            });
+            let freed = consumer_ab_status_mib("RssAnon:");
+            let released = return_free_heap_pages_to_os();
+            let trimmed = consumer_ab_status_mib("RssAnon:");
+            assert_eq!(blocks.len(), BLOCKS / 16);
+            if released && freed - trimmed >= 128.0 {
+                return;
+            }
+            attempts.push((released, resident, freed, trimmed));
+        }
+        panic!(
+            "trim never released 128 MiB of the 240 MiB freed between live blocks; \
+             (released, RssAnon MiB written, after free, after trim) per attempt: \
+             {attempts:?}"
+        );
+    }
+
+    /// A full rebuild returns its free heap to the OS exactly once, between
+    /// its final ingest commit and its fold (the generation still has every
+    /// ingest segment), and not at all when it skips the fold.
+    #[test]
+    #[serial]
+    fn full_rebuild_releases_free_heap_once_right_before_its_fold() {
+        let _env = forced_resume_env(4, 32 * 1024 * 1024);
+        let fixture = forced_resume_fixture(24, 3, 96);
+        let take_releases = || LEXICAL_FOLD_HEAP_RELEASES_FOR_TEST.with(|releases| releases.take());
+        take_releases();
+
+        let folded_dir = fixture.root.join("folded");
+        let folded = forced_resume_rebuild(&fixture, &folded_dir, None)
+            .0
+            .unwrap();
+        let releases = take_releases();
+        let published =
+            crate::search::tantivy::searchable_index_summary(&index_dir(&folded_dir).unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(releases.len(), 1, "one release per fold, got {releases:?}");
+        assert!(
+            releases[0] > published.segments,
+            "the release must precede the fold: {} segments then, {} published",
+            releases[0],
+            published.segments
+        );
+
+        let _skip = set_env("CASS_TEST_SKIP_POST_RUN_LEXICAL_MAINTENANCE", "1");
+        let unfolded_dir = fixture.root.join("unfolded");
+        let unfolded = forced_resume_rebuild(&fixture, &unfolded_dir, None)
+            .0
+            .unwrap();
+        assert_eq!(take_releases(), Vec::<usize>::new());
+        assert_eq!(unfolded.indexed_docs, folded.indexed_docs);
     }
 
     #[test]
