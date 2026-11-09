@@ -106565,7 +106565,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "model_acquisition": {
                     "type": "object",
                     "additionalProperties": true,
-                    "description": "Hardened acquisition contract: state (absent|partial_download|ready|checksum_mismatch|quarantined_corrupt|budget_blocked|offline_blocked|disabled_by_policy|baseline_no_semantic|incompatible_runtime|runtime_load_failed), runtime, source, cost_class, expected_download_bytes, fallback_mode, next_step, next_command, state_detail, rollback_guidance, fingerprint{revision,content_digest,marker_token}, and skipped_network_reason (the typed proof cass never auto-downloads outside `cass models install`)."
+                    "description": "Hardened acquisition contract: state (absent|partial_download|ready|checksum_mismatch|incompatible_version|quarantined_corrupt|budget_blocked|offline_blocked|disabled_by_policy|baseline_no_semantic|incompatible_runtime|runtime_load_failed), runtime, source, cost_class, expected_download_bytes, fallback_mode, next_step, next_command, state_detail, rollback_guidance, fingerprint{revision,content_digest,marker_token}, and skipped_network_reason (the typed proof cass never auto-downloads outside `cass models install`)."
                 },
                 "files": response_schema_opaque_object_array()
             },
@@ -126962,7 +126962,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
                     "installed": s.cache_report.is_usable(),
                     "state": s.cache_report.state_code(),
                     "state_detail": s.cache_report.state.summary(),
-                    "next_step": s.cache_report.state.next_step(),
+                    "next_step": s.cache_report.state.next_step(s.registry_name),
                     "revision": s.manifest.revision,
                     "license": s.manifest.license,
                     "total_size_bytes": s.total_size,
@@ -126991,7 +126991,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
                 "installed": s.cache_report.is_usable(),
                 "state": s.cache_report.state_code(),
                 "state_detail": s.cache_report.state.summary(),
-                "next_step": s.cache_report.state.next_step(),
+                "next_step": s.cache_report.state.next_step(s.registry_name),
                 "revision": s.manifest.revision,
                 "license": s.manifest.license,
                 "total_size_bytes": s.total_size,
@@ -127098,7 +127098,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
                 "{} ok / {} partial / {} missing",
                 installed, partial, missing
             );
-            if let Some(next_step) = s.cache_report.state.next_step() {
+            if let Some(next_step) = s.cache_report.state.next_step(s.registry_name) {
                 println!("  Next:     {}", next_step);
             }
             println!();
@@ -127243,7 +127243,7 @@ fn run_models_install(
     data_dir_override: Option<PathBuf>,
 ) -> CliResult<()> {
     use crate::search::model_download::{
-        ModelDownloader, check_model_installed, normalize_mirror_base_url,
+        ModelAcquisitionPolicy, ModelDownloader, classify_model_cache, normalize_mirror_base_url,
     };
     use colored::Colorize;
     use indicatif::{ProgressBar, ProgressStyle};
@@ -127385,11 +127385,10 @@ fn run_models_install(
         return Ok(());
     }
 
-    // Check current state — pass the resolved manifest so the
-    // file-presence check matches the model the user asked to install
-    // (bead coding_agent_session_search-odbnh).
-    let state = check_model_installed(&model_dir, &manifest);
-    if state.is_ready() {
+    // Presence alone cannot make a corrupt or revision-incompatible cache a
+    // successful install. Verify the selected manifest before skipping work.
+    let state = classify_model_cache(&model_dir, &manifest, &ModelAcquisitionPolicy::default());
+    if state.is_usable() {
         println!(
             "{} Model files are already installed and verified.",
             "✓".green()
@@ -127549,7 +127548,8 @@ fn run_models_verify(
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::search::model_download::{
-        ModelAcquisitionPolicy, classify_model_cache, compute_sha256, model_file_path,
+        ModelAcquisitionPolicy, ModelCacheState, ModelDownloader, classify_model_cache,
+        compute_sha256, model_file_path,
     };
     use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
     use colored::Colorize;
@@ -127586,14 +127586,14 @@ fn run_models_verify(
         }
     });
 
-    if !model_dir.is_dir() {
+    if !model_dir.is_dir() && !repair {
         if let Some(_fmt) = structured_format {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "status": cache_report.state_code(),
                     "state_detail": cache_report.state.summary(),
-                    "next_step": cache_report.state.next_step(),
+                    "next_step": cache_report.state.next_step(registry_name),
                     "lexical_fail_open": true,
                     "model_dir": model_dir.display().to_string(),
                     "all_valid": false,
@@ -127607,7 +127607,7 @@ fn run_models_verify(
             println!("{} {}", "✗".red(), cache_report.state.summary());
             println!("  Expected location: {}", model_dir.display());
             println!();
-            if let Some(next_step) = cache_report.state.next_step() {
+            if let Some(next_step) = cache_report.state.next_step(registry_name) {
                 println!("{}", next_step);
             }
         }
@@ -127677,6 +127677,34 @@ fn run_models_verify(
         }
     }
 
+    // Explicit repair must run in robot mode too. Use the same staged,
+    // verified downloader directly so installation progress cannot corrupt a
+    // JSON response, then report the post-repair state without another repair.
+    if repair
+        && (!all_valid
+            || matches!(
+                &cache_report.state,
+                ModelCacheState::IncompatibleVersion { .. }
+                    | ModelCacheState::QuarantinedCorrupt { .. }
+            ))
+    {
+        if !is_robot {
+            println!("Repairing by re-downloading model files...");
+        }
+        ModelDownloader::new(model_dir.clone())
+            .download(&manifest, None)
+            .map_err(|error| CliError {
+                code: 21,
+                kind: CliErrorKind::Model.kind_str(),
+                message: format!("Failed to repair model '{registry_name}': {error}"),
+                hint: Some(format!(
+                    "Retry with cass models install --model {registry_name}; lexical search remains available"
+                )),
+                retryable: error.is_retryable(),
+            })?;
+        return run_models_verify(registry_name, false, data_dir_override, output_format);
+    }
+
     if let Some(_fmt) = structured_format {
         println!(
             "{}",
@@ -127684,7 +127712,7 @@ fn run_models_verify(
                 "model_dir": model_dir.display().to_string(),
                 "status": cache_report.state_code(),
                 "state_detail": cache_report.state.summary(),
-                "next_step": cache_report.state.next_step(),
+                "next_step": cache_report.state.next_step(registry_name),
                 "lexical_fail_open": true,
                 "all_valid": all_valid,
                 "cache_lifecycle": &cache_report,
@@ -127703,19 +127731,11 @@ fn run_models_verify(
                 "✗".red(),
                 files_to_repair.len()
             );
-            if repair {
-                println!();
-                println!("Repairing by re-downloading model files...");
-                println!();
-                // Actually perform the repair by re-running install
-                return run_models_install(registry_name, None, None, true, data_dir_override);
-            } else {
-                println!();
-                println!("To repair corrupted files, run:");
-                println!("  cass models verify --model {registry_name} --repair");
-                println!("Or reinstall:");
-                println!("  cass models install --model {registry_name} -y");
-            }
+            println!();
+            println!("To repair corrupted files, run:");
+            println!("  cass models verify --model {registry_name} --repair");
+            println!("Or reinstall:");
+            println!("  cass models install --model {registry_name} -y");
         }
     }
 

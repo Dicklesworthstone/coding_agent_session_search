@@ -1,4 +1,5 @@
 use clap::{Parser, error::ErrorKind};
+use coding_agent_search::search::policy::MAX_MODEL_SIZE_MB;
 use coding_agent_search::{Cli, Commands, ModelsCommand};
 
 fn parse(args: &[&str]) -> Result<Cli, String> {
@@ -224,6 +225,15 @@ fn models_verify_json_missing_cache_stays_fail_open_and_read_only() {
         .arg(&data_dir)
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_DATA_DIR", &data_dir)
+        .env("FRANKENSEARCH_MODEL_DIR", "")
+        .env("CASS_SEMANTIC_MODE", "hybrid_preferred")
+        .env("CASS_SEMANTIC_DOWNLOAD_POLICY", "opt_in")
+        .env("CASS_SEMANTIC_EMBEDDER", "minilm")
+        .env(
+            "CASS_SEMANTIC_MAX_MODEL_SIZE_MB",
+            MAX_MODEL_SIZE_MB.to_string(),
+        )
         .env("HOME", tmp.path())
         .env("XDG_DATA_HOME", tmp.path().join(".local/share"))
         .env("XDG_CONFIG_HOME", tmp.path().join(".config"))
@@ -265,16 +275,155 @@ fn models_verify_json_missing_cache_stays_fail_open_and_read_only() {
 }
 
 #[test]
+fn explicit_model_repair_and_install_reach_the_shared_lease_in_robot_mode() {
+    use assert_cmd::cargo::cargo_bin;
+    use coding_agent_search::search::model_download::ModelManifest;
+    use serde_json::Value;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("cass-data");
+    std::fs::create_dir_all(&data_dir).expect("create data dir");
+    let run = |args: &[&str]| {
+        let mut command = assert_cmd::Command::new(cargo_bin("cass"));
+        command
+            .args(args)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_DATA_DIR", &data_dir)
+            .env("FRANKENSEARCH_MODEL_DIR", "")
+            .env("CASS_SEMANTIC_MODE", "hybrid_preferred")
+            .env("CASS_SEMANTIC_DOWNLOAD_POLICY", "opt_in")
+            .env("CASS_SEMANTIC_EMBEDDER", "minilm")
+            .env(
+                "CASS_SEMANTIC_MAX_MODEL_SIZE_MB",
+                MAX_MODEL_SIZE_MB.to_string(),
+            )
+            .env("HOME", tmp.path())
+            .env("XDG_DATA_HOME", tmp.path().join(".local/share"))
+            .env("XDG_CONFIG_HOME", tmp.path().join(".config"))
+            .timeout(Duration::from_secs(10));
+        command.output().expect("run bounded model command")
+    };
+
+    let absent = run(&["models", "verify", "--model", "minilm", "--json"]);
+    assert!(absent.status.success());
+    let absent: Value = serde_json::from_slice(&absent.stdout).expect("absent-cache JSON");
+    let model_dir =
+        std::path::PathBuf::from(absent["model_dir"].as_str().expect("model directory"));
+    assert!(model_dir.starts_with(&data_dir));
+    assert!(
+        !model_dir.exists(),
+        "inspection must leave the cache absent"
+    );
+    std::fs::create_dir_all(model_dir.parent().unwrap()).expect("create install lease parent");
+    let lock_name = format!(
+        ".{}.install.lock",
+        model_dir.file_name().unwrap().to_str().unwrap()
+    );
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(model_dir.with_file_name(lock_name))
+        .expect("open real shared install lease");
+    fs2::FileExt::lock_exclusive(&lock).expect("hold install lease");
+
+    let assert_mutation_is_blocked = |args: &[&str]| {
+        let output = run(args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "unexpected no-op success: {stdout}; {stderr}"
+        );
+        assert!(
+            stdout.contains("another model installation is in progress")
+                || stderr.contains("another model installation is in progress"),
+            "expected actual lease refusal: {stdout}; {stderr}"
+        );
+    };
+    // Repair must reach installation even when the entire cache is absent.
+    // The held sibling lease refuses admission before any network access.
+    assert_mutation_is_blocked(&[
+        "models", "verify", "--model", "minilm", "--repair", "--json",
+    ]);
+    assert!(
+        !model_dir.exists(),
+        "refusal must not create the live cache"
+    );
+
+    let manifest = ModelManifest::for_embedder("minilm").expect("registered native manifest");
+    std::fs::create_dir_all(&model_dir).expect("create model directory");
+    for file in &manifest.files {
+        std::fs::write(model_dir.join(file.local_name()), b"corrupt payload")
+            .expect("write actual invalid payload");
+    }
+    let marker = format!("revision={}\nsource=registry\n", manifest.revision);
+    std::fs::write(model_dir.join(".verified"), &marker).expect("write marker");
+
+    // Ordinary verification remains read-only and does not require the lease.
+    let inspected = run(&["models", "verify", "--model", "minilm", "--json"]);
+    assert!(inspected.status.success());
+    let inspected: Value = serde_json::from_slice(&inspected.stdout).expect("inspection JSON");
+    assert_eq!(inspected["all_valid"], false);
+    assert_eq!(inspected["status"], "checksum_mismatch");
+
+    // Both explicit mutations must reach the actual shared lease BEFORE any
+    // network access. The old JSON-repair and presence-only-install paths
+    // incorrectly returned success without attempting that admission.
+    let attempts: &[&[&str]] = &[
+        &[
+            "models", "verify", "--model", "minilm", "--repair", "--json",
+        ],
+        &[
+            "models",
+            "install",
+            "--model",
+            "minilm",
+            "--yes",
+            "--robot-format",
+            "json",
+        ],
+    ];
+    for args in attempts {
+        assert_mutation_is_blocked(args);
+        assert_eq!(
+            std::fs::read_to_string(model_dir.join(".verified")).unwrap(),
+            marker
+        );
+        for file in &manifest.files {
+            assert_eq!(
+                std::fs::read(model_dir.join(file.local_name())).unwrap(),
+                b"corrupt payload"
+            );
+        }
+    }
+}
+
+#[test]
 fn models_status_json_reports_explicit_multilingual_space_without_acquiring_it() {
     use assert_cmd::cargo::cargo_bin;
     use serde_json::Value;
 
     let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("cass-data");
     let output = std::process::Command::new(cargo_bin("cass"))
         .args(["models", "status", "--json"])
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_DATA_DIR", &data_dir)
+        .env("FRANKENSEARCH_MODEL_DIR", "")
+        .env("CASS_SEMANTIC_MODE", "hybrid_preferred")
+        .env("CASS_SEMANTIC_DOWNLOAD_POLICY", "opt_in")
         .env("CASS_SEMANTIC_EMBEDDER", "multilingual-minilm")
+        .env(
+            "CASS_SEMANTIC_MAX_MODEL_SIZE_MB",
+            MAX_MODEL_SIZE_MB.to_string(),
+        )
         .env("HOME", tmp.path())
         .env("XDG_DATA_HOME", tmp.path().join(".local/share"))
         .env("XDG_CONFIG_HOME", tmp.path().join(".config"))
@@ -318,6 +467,29 @@ fn models_status_json_reports_explicit_multilingual_space_without_acquiring_it()
     assert_eq!(baseline["active"].as_bool(), Some(false));
     assert_eq!(multilingual["active"].as_bool(), Some(true));
     assert_ne!(baseline["model_dir"], multilingual["model_dir"]);
+    for (status, model_name) in [
+        (&payload, "multilingual-minilm"),
+        (multilingual, "multilingual-minilm"),
+        (baseline, "minilm"),
+    ] {
+        let model_dir = status["model_dir"].as_str().expect("model directory");
+        assert!(
+            std::path::Path::new(model_dir).starts_with(&data_dir),
+            "model cache must stay under the isolated data directory: {model_dir}"
+        );
+        assert!(
+            !std::path::Path::new(model_dir).exists(),
+            "status must leave the isolated model cache absent: {model_dir}"
+        );
+        let advice = status["next_step"].as_str().expect("model-specific advice");
+        let command = advice.split('`').nth(1).expect("explicit install command");
+        let cli = <Cli as clap::Parser>::try_parse_from(command.split_whitespace())
+            .expect("accepted install syntax");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Models(ModelsCommand::Install { model, .. })) if model == model_name
+        ));
+    }
 }
 
 #[test]

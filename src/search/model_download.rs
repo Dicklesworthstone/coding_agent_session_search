@@ -301,33 +301,33 @@ impl ModelCacheState {
         }
     }
 
-    /// Suggested next operator action.
-    pub fn next_step(&self) -> Option<&'static str> {
+    /// Suggested next operator action for the model being inspected.
+    pub fn next_step(&self, model_name: &str) -> Option<String> {
         match self {
-            Self::NotAcquired { .. } => {
-                Some("Run `cass models install`, or keep using lexical search.")
-            }
+            Self::NotAcquired { .. } => Some(format!(
+                "Run `cass models install --model {model_name}`, or keep using lexical search."
+            )),
             Self::Acquiring { .. } => {
-                Some("Wait for model acquisition to finish, or keep using lexical search.")
+                Some("Wait for model acquisition to finish, or keep using lexical search.".into())
             }
             Self::Acquired { .. } | Self::PreseededLocal { .. } | Self::MirrorSourced { .. } => {
                 None
             }
-            Self::ChecksumMismatch { .. } | Self::QuarantinedCorrupt { .. } => Some(
-                "Run `cass models verify --repair`, or reinstall with `cass models install -y`.",
-            ),
-            Self::IncompatibleVersion { .. } => {
-                Some("Run `cass models install -y` to refresh the model cache.")
-            }
+            Self::ChecksumMismatch { .. } | Self::QuarantinedCorrupt { .. } => Some(format!(
+                "Run `cass models verify --model {model_name} --repair`, or reinstall with `cass models install --model {model_name} -y`."
+            )),
+            Self::IncompatibleVersion { .. } => Some(format!(
+                "Run `cass models install --model {model_name} -y` to refresh the model cache."
+            )),
             Self::DisabledByPolicy { .. } => {
-                Some("Use lexical search or re-enable semantic model acquisition in policy.")
+                Some("Use lexical search or re-enable semantic model acquisition in policy.".into())
             }
             Self::BudgetBlocked { .. } => {
-                Some("Increase the semantic model budget or keep using lexical search.")
+                Some("Increase the semantic model budget or keep using lexical search.".into())
             }
-            Self::OfflineBlocked { .. } => Some(
-                "Reconnect or install from local files with `cass models install --from-file`.",
-            ),
+            Self::OfflineBlocked { .. } => Some(format!(
+                "Reconnect or install from local files with `cass models install --model {model_name} --from-file <dir>`."
+            )),
         }
     }
 
@@ -1010,7 +1010,7 @@ pub enum DownloadError {
 }
 
 impl DownloadError {
-    fn is_retryable(&self) -> bool {
+    pub(crate) fn is_retryable(&self) -> bool {
         match self {
             DownloadError::NetworkError(_)
             | DownloadError::IoError(_)
@@ -2034,7 +2034,9 @@ fn classify_model_cache_state(
     // install as not-installed — even after `install --from-file` succeeded and
     // verified all files (#370). A valid install outranks leftover staging
     // debris; the marker/checksum logic below decides the concrete ready state.
-    let install_looks_complete = missing_files.is_empty() && model_dir.join(".verified").is_file();
+    // Preseeded bundles need no marker. Complete payloads still pass the
+    // integrity/revision checks below before being considered usable.
+    let install_looks_complete = missing_files.is_empty();
     if !install_looks_complete
         && let Some(staging_dir) = model_download_staging_dirs(model_dir).into_iter().next()
     {
@@ -2340,7 +2342,7 @@ fn model_install_lock_path(target_dir: &Path) -> PathBuf {
 /// Recognize legacy resumable directories and uniquely owned new attempts.
 /// Never follow symlinks while discovering staging or count recovery backups as
 /// active acquisition. A complete installed model continues to outrank debris.
-fn model_download_staging_dirs(target_dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn model_download_staging_dirs(target_dir: &Path) -> Vec<PathBuf> {
     let mut directories = Vec::new();
     let legacy = model_download_temp_dir(target_dir);
     if model_dir_is_real_directory(&legacy).unwrap_or(false) {
@@ -3164,6 +3166,74 @@ mod tests {
         );
         assert!(download_error_looks_like_tls(&chain.to_ascii_lowercase()));
         assert!(!download_error_looks_like_tls("connection refused"));
+    }
+
+    #[test]
+    fn cache_next_steps_preserve_the_selected_model_in_every_command() {
+        for model_name in ["all-minilm-l6-v2", "multilingual-minilm", "ms-marco"] {
+            let states = [
+                ModelCacheState::NotAcquired {
+                    missing_files: vec!["weights".into()],
+                    needs_consent: true,
+                },
+                ModelCacheState::ChecksumMismatch {
+                    file: "weights".into(),
+                    expected: "expected".into(),
+                    actual: "corrupt".into(),
+                },
+                ModelCacheState::QuarantinedCorrupt {
+                    marker_path: PathBuf::from(".quarantined"),
+                    reason: "integrity failure".into(),
+                },
+                ModelCacheState::IncompatibleVersion {
+                    current_revision: "old".into(),
+                    expected_revision: "pinned".into(),
+                },
+                ModelCacheState::OfflineBlocked {
+                    missing_files: vec!["weights".into()],
+                },
+            ];
+            for state in states {
+                let advice = state
+                    .next_step(model_name)
+                    .expect("explicit operator action");
+                let commands: Vec<_> = advice.split('`').skip(1).step_by(2).collect();
+                let needs_repair = matches!(
+                    state,
+                    ModelCacheState::ChecksumMismatch { .. }
+                        | ModelCacheState::QuarantinedCorrupt { .. }
+                );
+                assert_eq!(commands.len(), if needs_repair { 2 } else { 1 });
+                for command in commands {
+                    let cli =
+                        <crate::Cli as clap::Parser>::try_parse_from(command.split_whitespace())
+                            .expect("accepted model command");
+                    match cli.command {
+                        Some(crate::Commands::Models(crate::ModelsCommand::Install {
+                            model,
+                            from_file,
+                            ..
+                        })) => {
+                            assert_eq!(model, model_name);
+                            assert_eq!(
+                                from_file.as_deref(),
+                                matches!(state, ModelCacheState::OfflineBlocked { .. })
+                                    .then_some(Path::new("<dir>"))
+                            );
+                        }
+                        Some(crate::Commands::Models(crate::ModelsCommand::Verify {
+                            model,
+                            repair,
+                            ..
+                        })) => {
+                            assert!(needs_repair && repair);
+                            assert_eq!(model, model_name);
+                        }
+                        other => panic!("unexpected model action: {other:?}"),
+                    }
+                }
+            }
+        }
     }
 
     #[test]

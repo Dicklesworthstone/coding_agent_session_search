@@ -5,7 +5,8 @@
 //!
 //! The pure contract (src/search/model_acquisition.rs) is now projected into
 //! both robot surfaces as a `model_acquisition` block. These tests drive the
-//! installed `cass` against a fully isolated, network-free HOME and prove, end
+//! test-built `cass` against a fully isolated HOME through the bounded shared
+//! E2E runner and check, end
 //! to end:
 //!   1. status + verify emit the report fields (state / runtime / source /
 //!      cost_class / skipped_network_reason / next_command / model identity),
@@ -18,34 +19,165 @@
 //!      the model identity, elapsed_ms, the skipped-network reason, and the
 //!      artifact paths.
 //!
+//! These report/cache assertions do not independently count network attempts.
+//!
 //! Authored Result-returning and panic-free (no unwrap/expect/assert/panic, no
 //! `format!`-in-loop, and no raw `==`/`!=`) so a brand-new test file stays at
 //! zero UBS findings even though the proof-log vocabulary is secret-adjacent.
 
 use assert_cmd::cargo::cargo_bin;
+use coding_agent_search::e2e_runner::{
+    ArtifactRunSpec, RunEvent, RunExpectation, RunMode, RunSpec, ScenarioArtifactEntry,
+    ScenarioArtifactManifest, run_with_artifacts,
+};
+use coding_agent_search::proof_artifact::{ProofArtifact, ProofStatus};
+use coding_agent_search::search::policy::MAX_MODEL_SIZE_MB;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Run the real `cass` binary in a fully isolated HOME so a missing model can
-/// never trigger a download. Returns `(exit_code, stdout, stderr, elapsed_ms)`.
+/// Run the real `cass` binary with a private cache, bounded execution and
+/// retained runner artifacts. Returns `(entry, stdout, stderr)` so callers can
+/// preserve the actual execution facts when emitting another proof format.
 fn run_isolated_cass(
     home: &std::path::Path,
     args: &[&str],
-) -> Result<(Option<i32>, String, String, i64), String> {
-    let start = std::time::Instant::now();
-    let output = std::process::Command::new(cargo_bin("cass"))
-        .args(args)
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
-        .env("HOME", home)
-        .env("XDG_DATA_HOME", home.join(".local/share"))
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_CACHE_HOME", home.join(".cache"))
-        .output()
-        .map_err(|e| format!("run cass {args:?}: {e}"))?;
-    let elapsed_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    Ok((output.status.code(), stdout, stderr, elapsed_ms))
+) -> Result<(ScenarioArtifactEntry, String, String), String> {
+    let phase = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| "model command is missing its subcommand".to_string())?;
+    let is_status = matches!(phase, "status");
+    let env_overrides = BTreeMap::from([
+        ("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT".into(), "1".into()),
+        ("CASS_IGNORE_SOURCES_CONFIG".into(), "1".into()),
+        (
+            "CASS_DATA_DIR".into(),
+            home.join("cass-data").display().to_string(),
+        ),
+        ("FRANKENSEARCH_MODEL_DIR".into(), String::new()),
+        ("CASS_SEMANTIC_MODE".into(), "hybrid_preferred".into()),
+        ("CASS_SEMANTIC_DOWNLOAD_POLICY".into(), "opt_in".into()),
+        ("CASS_SEMANTIC_EMBEDDER".into(), "minilm".into()),
+        (
+            "CASS_SEMANTIC_MAX_MODEL_SIZE_MB".into(),
+            MAX_MODEL_SIZE_MB.to_string(),
+        ),
+        ("HOME".into(), home.display().to_string()),
+        (
+            "XDG_DATA_HOME".into(),
+            home.join(".local/share").display().to_string(),
+        ),
+        (
+            "XDG_CONFIG_HOME".into(),
+            home.join(".config").display().to_string(),
+        ),
+        (
+            "XDG_CACHE_HOME".into(),
+            home.join(".cache").display().to_string(),
+        ),
+    ]);
+    let spec = RunSpec {
+        binary_path: cargo_bin("cass").display().to_string(),
+        args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        timeout: Duration::from_secs(30),
+        env_overrides,
+        cwd: home.to_path_buf(),
+        fixture_id: Some("isolated-empty-model-cache".into()),
+        require_path: Some(home.to_path_buf()),
+        phase: format!("models-{phase}"),
+        mode: RunMode::Quick,
+    };
+    let expectation = RunExpectation {
+        expect_json: true,
+        assertions: vec![
+            (
+                "empty-cache-acquisition-report".into(),
+                Box::new(move |stdout, _stderr| {
+                    serde_json::from_str::<Value>(stdout)
+                        .map_err(|error| error.to_string())
+                        .and_then(|payload| {
+                            if is_status {
+                                minilm_acquisition(&payload)
+                            } else {
+                                payload.get("model_acquisition").cloned().ok_or_else(|| {
+                                    "verify JSON missing model_acquisition".to_string()
+                                })
+                            }
+                        })
+                        .and_then(|acquisition| {
+                            check_no_auto_download(&acquisition)?;
+                            check_model_identity(&acquisition).map(|_| ())
+                        })
+                        .is_ok()
+                }),
+            ),
+            (
+                "private-model-cache-remains-absent".into(),
+                Box::new(move |stdout, _stderr| {
+                    serde_json::from_str::<Value>(stdout)
+                        .map_err(|error| error.to_string())
+                        .and_then(|payload| {
+                            if is_status {
+                                minilm_model_dir(&payload, home)
+                            } else {
+                                payload
+                                    .get("model_dir")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                                    .ok_or_else(|| "verify JSON missing model_dir".to_string())
+                            }
+                        })
+                        .is_ok_and(|model_dir| {
+                            let path = std::path::Path::new(&model_dir);
+                            path.starts_with(home.join("cass-data")) && !path.exists()
+                        })
+                }),
+            ),
+        ],
+    };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("runner clock: {error}"))?
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let artifact_root = home.join("runner-artifacts");
+    let entry = run_with_artifacts(
+        &spec,
+        &expectation,
+        &ArtifactRunSpec {
+            artifact_root: &artifact_root,
+            run_id: "model-acquisition-no-download",
+            scenario_id: "empty-cache",
+            command_id: phase,
+            issue_ids: &["coding_agent_session_search-0qxwg"],
+            privacy_note: "Synthetic private model cache; no archived conversation content.",
+            suite_started_ms: now_ms,
+            accepted_exit_codes: &[0],
+            forbidden_stream_markers: &[],
+            extra_artifact_paths: &[],
+        },
+        now_ms,
+    )
+    .map_err(|error| format!("bounded cass {args:?}: {error}"))?;
+    let stdout = std::fs::read_to_string(&entry.stdout_path)
+        .map_err(|error| format!("read runner stdout: {error}"))?;
+    let stderr = std::fs::read_to_string(&entry.stderr_path)
+        .map_err(|error| format!("read runner stderr: {error}"))?;
+    if !entry.outcome.is_success()
+        || !matches!(entry.proof_status, ProofStatus::Pass)
+        || !entry.assertions_ran
+        || entry.generated_only
+        || !entry.redaction_safe
+        || !entry.fresh_for_suite
+    {
+        return Err(format!(
+            "bounded cass {args:?} failed: outcome={:?}, proof={:?}, event={}; stdout: {stdout}; stderr: {stderr}",
+            entry.outcome, entry.proof_status, entry.event_path
+        ));
+    }
+    Ok((entry, stdout, stderr))
 }
 
 /// Extract `models[registry_name=="minilm"].model_acquisition` from a
@@ -67,8 +199,8 @@ fn minilm_acquisition(status: &Value) -> Result<Value, String> {
 }
 
 /// `models[registry_name=="minilm"].model_dir` from a status payload.
-fn minilm_model_dir(status: &Value) -> Result<String, String> {
-    status
+fn minilm_model_dir(status: &Value, home: &std::path::Path) -> Result<String, String> {
+    let model_dir = status
         .get("models")
         .and_then(Value::as_array)
         .and_then(|models| {
@@ -81,7 +213,13 @@ fn minilm_model_dir(status: &Value) -> Result<String, String> {
         })
         .and_then(|m| m.get("model_dir").and_then(Value::as_str))
         .map(str::to_string)
-        .ok_or_else(|| format!("status JSON missing models[minilm].model_dir: {status}"))
+        .ok_or_else(|| format!("status JSON missing models[minilm].model_dir: {status}"))?;
+    if !std::path::Path::new(&model_dir).starts_with(home.join("cass-data")) {
+        return Err(format!(
+            "model cache must stay under the isolated data directory: {model_dir}"
+        ));
+    }
+    Ok(model_dir)
 }
 
 /// Assert that an acquisition block for an *empty* cache proves cass did not
@@ -132,7 +270,20 @@ fn check_no_auto_download(acq: &Value) -> Result<(), String> {
         .get("next_command")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if !(next_cmd.starts_with("cass models install --model ") && next_cmd.ends_with(" --json")) {
+    let parsed =
+        <coding_agent_search::Cli as clap::Parser>::try_parse_from(next_cmd.split_whitespace())
+            .map_err(|error| {
+                format!("next_command is not accepted by the CLI: {error}; acq: {acq}")
+            })?;
+    if !matches!(
+        parsed.command,
+        Some(coding_agent_search::Commands::Models(coding_agent_search::ModelsCommand::Install {
+            model,
+            from_file: None,
+            mirror: None,
+            ..
+        })) if matches!(model.as_str(), "minilm" | "all-minilm-l6-v2")
+    ) {
         return Err(format!(
             "an absent model's next_command must be the explicit install; got {next_cmd:?}; acq: {acq}"
         ));
@@ -168,10 +319,11 @@ fn check_model_identity(acq: &Value) -> Result<String, String> {
 fn status_and_verify_emit_acquisition_block_and_prove_no_auto_download() -> Result<(), String> {
     let tmp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
 
-    // `cass models status` takes no --data-dir flag; isolation comes from the
-    // XDG_DATA_HOME this helper sets, so the model cache is an empty dir.
-    let (code, stdout, stderr, _ms) =
-        run_isolated_cass(tmp.path(), &["models", "status", "--json"])?;
+    // Pin the data directory and policy and neutralize the runtime model-dir
+    // override: inherited environment or .env values must not redirect or
+    // disable this empty cache. Explicit values also prevent dotenv refills.
+    let (entry, stdout, stderr) = run_isolated_cass(tmp.path(), &["models", "status", "--json"])?;
+    let code = entry.actual_exit_code;
     if !matches!(code, Some(0)) {
         return Err(format!(
             "models status --json exit {code:?}; stderr: {stderr}"
@@ -194,7 +346,7 @@ fn status_and_verify_emit_acquisition_block_and_prove_no_auto_download() -> Resu
 
     // No model file may have appeared — the filesystem proof that status did
     // not download anything.
-    let model_dir = minilm_model_dir(&status)?;
+    let model_dir = minilm_model_dir(&status, tmp.path())?;
     if std::path::Path::new(&model_dir)
         .join("model.safetensors")
         .exists()
@@ -204,9 +356,10 @@ fn status_and_verify_emit_acquisition_block_and_prove_no_auto_download() -> Resu
         ));
     }
 
-    // --- cass models verify --json (also XDG-isolated; no --data-dir needed) ---
-    let (vcode, vstdout, vstderr, _vms) =
+    // --- cass models verify --json (same isolated data directory and policy) ---
+    let (verify_entry, vstdout, vstderr) =
         run_isolated_cass(tmp.path(), &["models", "verify", "--json"])?;
+    let vcode = verify_entry.actual_exit_code;
     if !matches!(vcode, Some(0)) {
         return Err(format!(
             "models verify --json exit {vcode:?}; stderr: {vstderr}"
@@ -214,6 +367,15 @@ fn status_and_verify_emit_acquisition_block_and_prove_no_auto_download() -> Resu
     }
     let verify: Value = serde_json::from_str(&vstdout)
         .map_err(|e| format!("models verify stdout is not JSON: {e}; stdout: {vstdout}"))?;
+    let verify_dir = verify
+        .get("model_dir")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("verify --json must expose its model directory: {verify}"))?;
+    if !std::path::Path::new(verify_dir).starts_with(tmp.path().join("cass-data")) {
+        return Err(format!(
+            "verify must stay under the isolated data directory: {verify_dir}"
+        ));
+    }
     let vacq = verify
         .get("model_acquisition")
         .cloned()
@@ -249,9 +411,9 @@ fn no_download_proof_emits_redaction_safe_proof_log_artifact() -> Result<(), Str
     let artifact_dir = tmp.path().join("proof");
     std::fs::create_dir_all(&artifact_dir).map_err(|e| format!("create artifact dir: {e}"))?;
 
-    // `cass models status` takes no --data-dir flag; XDG_DATA_HOME isolates it.
-    let (code, stdout, stderr, elapsed_ms) =
-        run_isolated_cass(tmp.path(), &["models", "status", "--json"])?;
+    // The helper pins the model cache and semantic policy to this fixture.
+    let (entry, stdout, stderr) = run_isolated_cass(tmp.path(), &["models", "status", "--json"])?;
+    let code = entry.actual_exit_code;
     if !matches!(code, Some(0)) {
         return Err(format!(
             "models status --json exit {code:?}; stderr: {stderr}"
@@ -267,7 +429,19 @@ fn no_download_proof_emits_redaction_safe_proof_log_artifact() -> Result<(), Str
         .and_then(Value::as_str)
         .unwrap_or("host_blocked")
         .to_string();
-    let model_dir = minilm_model_dir(&status)?;
+    let model_dir = minilm_model_dir(&status, tmp.path())?;
+    let event: RunEvent = serde_json::from_slice(
+        &std::fs::read(&entry.event_path).map_err(|e| format!("read runner event: {e}"))?,
+    )
+    .map_err(|e| format!("parse runner event: {e}"))?;
+    let proof: ProofArtifact = serde_json::from_slice(
+        &std::fs::read(&entry.proof_path).map_err(|e| format!("read runner proof: {e}"))?,
+    )
+    .map_err(|e| format!("parse runner proof: {e}"))?;
+    let binary_version = event
+        .binary_version
+        .as_deref()
+        .ok_or("runner event is missing the observed binary version")?;
 
     // Persist the real stdout/stderr as redaction-safe artifacts under a temp
     // dir (no $HOME leakage), then emit one `.12.3`-schema proof-log record.
@@ -282,11 +456,6 @@ fn no_download_proof_emits_redaction_safe_proof_log_artifact() -> Result<(), Str
         .to_str()
         .ok_or("stderr artifact path not UTF-8")?;
 
-    // sanitized_env: only the safe, non-secret variables this harness sets.
-    let sanitized_env = json!({
-        "CASS_IGNORE_SOURCES_CONFIG": "1",
-        "CODING_AGENT_SEARCH_NO_UPDATE_PROMPT": "1",
-    });
     let outcome = if matches!(code, Some(0)) {
         "passed"
     } else {
@@ -298,24 +467,25 @@ fn no_download_proof_emits_redaction_safe_proof_log_artifact() -> Result<(), Str
         "issue_ids_covered": ["coding_agent_session_search-0qxwg"],
         "command_id": "models_status_json",
         "phase": "verify",
-        "started_at_ms": 0,
-        "finished_at_ms": elapsed_ms,
-        "elapsed_ms": elapsed_ms,
+        "started_at_ms": event.start_ms,
+        "finished_at_ms": event.end_ms,
+        "elapsed_ms": event.elapsed_ms,
         "meta": {
-            "cass_binary_path": cargo_bin("cass").display().to_string(),
-            "cass_version": env!("CARGO_PKG_VERSION"),
+            "cass_binary_path": event.binary_path,
+            "cass_version": binary_version,
             "cargo_profile": "test",
             "target_dir": std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string()),
-            "data_dir": tmp.path().join(".local/share").display().to_string(),
+            "data_dir": tmp.path().join("cass-data").display().to_string(),
             "config_dir": tmp.path().join(".config").display().to_string(),
             "model_dir": model_dir,
         },
         "execution": {
-            "argv": ["cass", "models", "status", "--json"],
-            "sanitized_env": sanitized_env,
-            "timeout_ms": 60_000,
-            "exit_code": code,
-            "timed_out": false,
+            "argv": event.command_line,
+            "sanitized_env": event.env_overrides,
+            "timeout_ms": proof.run.timeout_ms,
+            "exit_code": event.exit_code,
+            "signal": event.signal,
+            "timed_out": event.timed_out,
             "retry_count": 0,
         },
         "artifacts": {
@@ -392,6 +562,45 @@ fn no_download_proof_emits_redaction_safe_proof_log_artifact() -> Result<(), Str
     if parsed.get("elapsed_ms").and_then(Value::as_i64).is_none() {
         return Err(format!(
             "proof record must carry numeric elapsed_ms: {parsed}"
+        ));
+    }
+
+    // Feed the serialized log's timestamps through the real runner consumer.
+    // A fabricated epoch-zero record must fail against its actual event and
+    // this run's suite boundary, even when its JSON shape looks valid.
+    let mut recorded_entry = entry.clone();
+    recorded_entry.started_at_ms = parsed
+        .get("started_at_ms")
+        .and_then(Value::as_u64)
+        .ok_or("proof record is missing its actual start timestamp")?;
+    recorded_entry.finished_at_ms = parsed
+        .get("finished_at_ms")
+        .and_then(Value::as_u64)
+        .ok_or("proof record is missing its actual finish timestamp")?;
+    let mut manifest = ScenarioArtifactManifest::new(
+        entry.run_id.clone(),
+        RunMode::Quick,
+        entry.started_at_ms,
+        vec![entry.scenario_id.clone()],
+        vec![format!("{}/{}", entry.scenario_id, entry.command_id)],
+        1,
+    );
+    manifest.record(recorded_entry);
+    let errors = manifest.validation_errors();
+    if !errors.is_empty() {
+        return Err(format!(
+            "proof log does not describe its actual run: {errors:?}"
+        ));
+    }
+    if !matches!(
+        parsed
+            .get("execution")
+            .and_then(|e| e.get("timeout_ms"))
+            .and_then(Value::as_u64),
+        Some(30_000)
+    ) {
+        return Err(format!(
+            "proof log must preserve the actual 30s command limit: {parsed}"
         ));
     }
 

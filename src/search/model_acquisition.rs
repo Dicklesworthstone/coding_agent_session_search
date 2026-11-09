@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::search::model_download::{
-    ModelManifest, compute_sha256, model_file_path, read_model_marker,
+    ModelManifest, compute_sha256, model_download_staging_dirs, model_file_path, read_model_marker,
 };
 use crate::search::semantic_readiness::FallbackMode;
 
@@ -427,6 +427,9 @@ pub(crate) enum ModelAcquisitionState {
     BudgetBlocked,
     /// Files are present but at least one failed checksum verification.
     ChecksumMismatch,
+    /// Valid payloads have a verification marker for a different or unknown
+    /// revision than the pinned manifest.
+    IncompatibleVersion,
     /// Files are present and checksum-valid, but the ONNX runtime failed to
     /// load them (knowable only after a load attempt).
     RuntimeLoadFailed,
@@ -450,6 +453,7 @@ impl ModelAcquisitionState {
             Self::OfflineBlocked => "offline_blocked",
             Self::BudgetBlocked => "budget_blocked",
             Self::ChecksumMismatch => "checksum_mismatch",
+            Self::IncompatibleVersion => "incompatible_version",
             Self::RuntimeLoadFailed => "runtime_load_failed",
             Self::Ready => "ready",
         }
@@ -492,6 +496,9 @@ impl ModelAcquisitionState {
             Self::ChecksumMismatch => {
                 "model files failed checksum verification; repair or reinstall them"
             }
+            Self::IncompatibleVersion => {
+                "the verified model revision does not match the pinned manifest; reinstall the selected model"
+            }
             Self::RuntimeLoadFailed => {
                 "model files are valid but the ONNX runtime failed to load them; reinstall or run \
                  on a compatible host"
@@ -508,6 +515,7 @@ impl ModelAcquisitionState {
             Self::BaselineNoSemantic => N::UseFullBuildOnCompatibleHost,
             Self::IncompatibleRuntime | Self::RuntimeLoadFailed => N::ReinstallOnCompatibleHost,
             Self::QuarantinedCorrupt | Self::ChecksumMismatch => N::RepairOrReinstall,
+            Self::IncompatibleVersion => N::InstallModel,
             Self::PartialDownload => N::ResumeInstall,
             Self::Absent => N::InstallModel,
             Self::OfflineBlocked => N::InstallFromFileOffline,
@@ -522,6 +530,7 @@ impl ModelAcquisitionState {
             Self::Absent
             | Self::PartialDownload
             | Self::ChecksumMismatch
+            | Self::IncompatibleVersion
             | Self::QuarantinedCorrupt => Some(R::ExplicitInstallRequired),
             Self::OfflineBlocked => Some(R::OfflinePolicy),
             Self::BudgetBlocked => Some(R::BudgetExceeded),
@@ -586,12 +595,14 @@ impl ModelAcquisitionNextStep {
             | Self::ReinstallOnCompatibleHost
             | Self::RaiseBudgetOrUseLexical => None,
             Self::InstallModel | Self::ResumeInstall => {
-                Some(format!("cass models install --model {model_name} --json"))
+                Some(format!("cass models install --model {model_name}"))
             }
             Self::InstallFromFileOffline => Some(format!(
-                "cass models install --model {model_name} --from-file <dir> --json"
+                "cass models install --model {model_name} --from-file <dir>"
             )),
-            Self::RepairOrReinstall => Some("cass models verify --repair --json".to_string()),
+            Self::RepairOrReinstall => Some(format!(
+                "cass models verify --model {model_name} --repair --json"
+            )),
         }
     }
 }
@@ -618,6 +629,8 @@ pub(crate) struct ModelAcquisitionSignals {
     /// Every present file matches its expected SHA-256 (only meaningful when
     /// `files_present`).
     pub checksum_ok: bool,
+    /// A regular verification marker, when present, names the pinned revision.
+    pub revision_matches: bool,
     /// A quarantine marker is present, or otherwise valid payloads have an
     /// unreadable regular verification marker.
     pub quarantined: bool,
@@ -662,6 +675,9 @@ impl ModelAcquisitionSignals {
         }
         if !self.checksum_ok {
             return S::ChecksumMismatch;
+        }
+        if !self.revision_matches {
+            return S::IncompatibleVersion;
         }
         if self.runtime == RuntimeLoadability::OnnxLoadFailed {
             return S::RuntimeLoadFailed;
@@ -783,22 +799,30 @@ pub(crate) fn probe_on_disk(
     }
 
     let files_present = present == manifest.files.len() && !manifest.files.is_empty();
-    let partial_present = present > 0 && !files_present;
+    let partial_present =
+        !files_present && (present > 0 || !model_download_staging_dirs(model_dir).is_empty());
 
     let verified_path = model_dir.join(VERIFIED_MARKER_NAME);
     let verified_marker = read_model_marker(&verified_path);
+    let verified_marker_present = verified_path.is_file();
     // The cache classifier treats unreadable regular verification metadata as
     // corruption, after checking payloads. Preserve its checksum precedence
     // and marker-less/nonregular-marker preseeded behavior in this projection.
     let unreadable_verified_marker =
-        files_present && checksum_ok && verified_path.is_file() && verified_marker.is_err();
-    let source = verified_marker
+        files_present && checksum_ok && verified_marker_present && verified_marker.is_err();
+    let parsed_marker = verified_marker
+        .as_ref()
         .ok()
-        .and_then(|c| VerifiedMarker::parse(&c))
+        .and_then(|content| VerifiedMarker::parse(content));
+    let revision_matches = !verified_marker_present
+        || parsed_marker
+            .as_ref()
+            .is_some_and(|marker| marker.revision == manifest.revision);
+    let source = parsed_marker
         .map(|m| m.source)
-        // Files present but no parseable marker ⇒ preseeded (matches the live
-        // classifier, which treats marker-less complete files as preseeded).
-        .unwrap_or(if files_present {
+        // Only marker-less complete files establish preseeded provenance.
+        // A malformed regular marker does not establish an installed source.
+        .unwrap_or(if files_present && !verified_marker_present {
             ModelSource::Preseeded
         } else {
             ModelSource::Unknown
@@ -817,6 +841,7 @@ pub(crate) fn probe_on_disk(
         // checksum_ok is only consulted when files_present; report the real
         // verdict either way.
         checksum_ok: files_present && checksum_ok,
+        revision_matches,
         quarantined,
         offline: policy.offline,
         budget_exceeded,
@@ -908,6 +933,7 @@ mod tests {
             files_present: true,
             partial_present: false,
             checksum_ok: true,
+            revision_matches: true,
             quarantined: false,
             offline: false,
             budget_exceeded: false,
@@ -1019,7 +1045,7 @@ mod tests {
         assert_eq!(r.next_step, ModelAcquisitionNextStep::InstallModel);
         assert_eq!(
             r.next_command.as_deref(),
-            Some("cass models install --model minilm --json")
+            Some("cass models install --model minilm")
         );
         assert_eq!(r.fallback_mode, FallbackMode::Lexical);
     }
@@ -1048,17 +1074,42 @@ mod tests {
 
     #[test]
     fn checksum_mismatch_offers_safe_rollback() {
-        let mut s = ready();
-        s.checksum_ok = false;
-        let r = s.report("snowflake-arctic-s");
-        assert_eq!(r.state, ModelAcquisitionState::ChecksumMismatch);
-        let guidance = r.rollback_guidance.expect("rollback guidance");
-        assert!(guidance.contains("cass models remove --model snowflake-arctic-s"));
-        assert!(guidance.contains("lexical search keeps working"));
-        assert_eq!(
-            r.next_command.as_deref(),
-            Some("cass models verify --repair --json")
-        );
+        for model_name in [
+            "all-minilm-l6-v2",
+            "multilingual-minilm",
+            "ms-marco",
+            "snowflake-arctic-s",
+        ] {
+            for quarantined in [false, true] {
+                let mut s = ready();
+                s.checksum_ok = false;
+                s.quarantined = quarantined;
+                let r = s.report(model_name);
+                assert_eq!(
+                    r.state,
+                    if quarantined {
+                        ModelAcquisitionState::QuarantinedCorrupt
+                    } else {
+                        ModelAcquisitionState::ChecksumMismatch
+                    }
+                );
+                let guidance = r.rollback_guidance.expect("rollback guidance");
+                assert!(guidance.contains(&format!("cass models remove --model {model_name}")));
+                assert!(guidance.contains("lexical search keeps working"));
+                let command = r.next_command.expect("model-specific repair command");
+                let cli = <crate::Cli as clap::Parser>::try_parse_from(command.split_whitespace())
+                    .unwrap();
+                assert!(matches!(
+                    cli.command,
+                    Some(crate::Commands::Models(crate::ModelsCommand::Verify {
+                        model,
+                        repair: true,
+                        json: true,
+                        ..
+                    })) if model == model_name
+                ));
+            }
+        }
     }
 
     #[test]
@@ -1115,6 +1166,11 @@ mod tests {
             },
             {
                 let mut s = ready();
+                s.revision_matches = false;
+                s.state()
+            },
+            {
+                let mut s = ready();
                 s.runtime = RuntimeLoadability::OnnxLoadFailed;
                 s.state()
             },
@@ -1122,7 +1178,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        assert_eq!(reached.len(), 11, "all eleven states must be reachable");
+        assert_eq!(reached.len(), 12, "all twelve states must be reachable");
     }
 
     // --- serialization ------------------------------------------------------
@@ -1151,6 +1207,7 @@ mod tests {
         for state in [
             ModelAcquisitionState::Absent,
             ModelAcquisitionState::ChecksumMismatch,
+            ModelAcquisitionState::IncompatibleVersion,
             ModelAcquisitionState::Ready,
             ModelAcquisitionState::BaselineNoSemantic,
             ModelAcquisitionState::RuntimeLoadFailed,
@@ -1328,6 +1385,86 @@ mod tests {
     }
 
     #[test]
+    fn probe_staged_downloads_and_complete_preseeded_cache_agree() {
+        use crate::search::model_download::{
+            DownloadError, ModelAcquisitionPolicy, ModelDownloader, classify_model_cache,
+        };
+
+        for legacy in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("model");
+            let manifest =
+                synthetic_manifest(&[("model.onnx", "weights"), ("tokenizer.json", "v")]);
+            // Recovery backups are not resumable attempts.
+            std::fs::create_dir(tmp.path().join(".model.bak.123.456")).unwrap();
+            let absent =
+                probe_on_disk(&dir, &manifest, RuntimeLoadability::NotProbed, policy(None));
+            assert_eq!(absent.state(), ModelAcquisitionState::Absent);
+
+            if legacy {
+                let staging = tmp.path().join("model.downloading");
+                std::fs::create_dir(&staging).unwrap();
+                write(&staging, "model.onnx", "partial");
+            } else {
+                // Exercise the real producer of uniquely named sibling staging
+                // directories: a later missing source file leaves the first
+                // copied artifact retained beside the absent live cache.
+                let source = tmp.path().join("source");
+                std::fs::create_dir(&source).unwrap();
+                write(&source, "model.onnx", "weights");
+                let error = ModelDownloader::new(dir.clone())
+                    .install_from_directory(&manifest, &source, None)
+                    .unwrap_err();
+                assert!(matches!(error, DownloadError::IoError(_)));
+            }
+            let staging = model_download_staging_dirs(&dir);
+            assert_eq!(staging.len(), 1);
+            let staged_bytes = std::fs::read(staging[0].join("model.onnx")).unwrap();
+
+            let partial =
+                probe_on_disk(&dir, &manifest, RuntimeLoadability::NotProbed, policy(None));
+            assert!(!partial.files_present && partial.partial_present);
+            assert_eq!(partial.state(), ModelAcquisitionState::PartialDownload);
+            assert!(!partial.report("minilm").usable);
+            assert!(!dir.exists(), "inspection must not create the live cache");
+            assert_eq!(
+                classify_model_cache(&dir, &manifest, &ModelAcquisitionPolicy::default())
+                    .state_code(),
+                "acquiring"
+            );
+
+            std::fs::create_dir(&dir).unwrap();
+            write(&dir, "model.onnx", "weights");
+            write(&dir, "tokenizer.json", "v");
+            let ready = probe_on_disk(&dir, &manifest, RuntimeLoadability::NotProbed, policy(None));
+            assert!(ready.files_present && !ready.partial_present && ready.checksum_ok);
+            assert_eq!(ready.state(), ModelAcquisitionState::Ready);
+            assert_eq!(ready.source, ModelSource::Preseeded);
+            let cache = classify_model_cache(&dir, &manifest, &ModelAcquisitionPolicy::default());
+            assert_eq!(cache.state_code(), "preseeded_local");
+            assert!(cache.is_usable());
+
+            // Complete files do not bypass integrity checks just because an
+            // interrupted attempt is present beside the live generation.
+            write(&dir, "tokenizer.json", "CORRUPT");
+            let corrupt =
+                probe_on_disk(&dir, &manifest, RuntimeLoadability::NotProbed, policy(None));
+            assert_eq!(corrupt.state(), ModelAcquisitionState::ChecksumMismatch);
+            assert_eq!(
+                classify_model_cache(&dir, &manifest, &ModelAcquisitionPolicy::default())
+                    .state_code(),
+                "checksum_mismatch"
+            );
+            assert_eq!(
+                std::fs::read(staging[0].join("model.onnx")).unwrap(),
+                staged_bytes,
+                "classification must preserve the interrupted attempt"
+            );
+            assert!(!dir.join(VERIFIED_MARKER_NAME).exists());
+        }
+    }
+
+    #[test]
     fn probe_checksum_mismatch_model_dir() {
         let manifest = synthetic_manifest(&[("model.onnx", "weights"), ("tokenizer.json", "v")]);
         let dir = temp_model_dir("mismatch");
@@ -1359,6 +1496,96 @@ mod tests {
         assert_eq!(signals.source, ModelSource::FromFile);
         assert_eq!(signals.state(), ModelAcquisitionState::Ready);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn probe_revision_mismatch_is_not_ready_and_preserves_precedence() {
+        use crate::search::model_download::{ModelAcquisitionPolicy, classify_model_cache};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let manifest = synthetic_manifest(&[("model.onnx", "weights")]);
+        write(dir, "model.onnx", "weights");
+        let marker = dir.join(VERIFIED_MARKER_NAME);
+        for content in [
+            "revision=old\nsource=registry\n",
+            "source=registry\n",
+            "revision= \nsource=registry\n",
+        ] {
+            std::fs::write(&marker, content).unwrap();
+            let signals =
+                probe_on_disk(dir, &manifest, RuntimeLoadability::NotProbed, policy(None));
+            assert!(signals.files_present && signals.checksum_ok && !signals.quarantined);
+            assert!(!signals.revision_matches);
+            assert_eq!(signals.state(), ModelAcquisitionState::IncompatibleVersion);
+            assert_eq!(
+                classify_model_cache(dir, &manifest, &ModelAcquisitionPolicy::default())
+                    .state_code(),
+                "incompatible_version"
+            );
+            let block = live_acquisition_block(
+                dir,
+                &manifest,
+                RuntimeLoadability::NotProbed,
+                policy(None),
+                "multilingual-minilm",
+            );
+            assert_eq!(block["state"], "incompatible_version");
+            assert_eq!(block["usable"], false);
+            assert_eq!(block["fallback_mode"], "lexical");
+            assert_eq!(block["skipped_network_reason"], "explicit_install_required");
+            let cli = <crate::Cli as clap::Parser>::try_parse_from(
+                block["next_command"].as_str().unwrap().split_whitespace(),
+            )
+            .unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(crate::Commands::Models(crate::ModelsCommand::Install { model, .. }))
+                    if model == "multilingual-minilm"
+            ));
+            assert_eq!(std::fs::read(&marker).unwrap(), content.as_bytes());
+            assert_eq!(std::fs::read(dir.join("model.onnx")).unwrap(), b"weights");
+        }
+
+        write(dir, "model.onnx", "CORRUPT");
+        let corrupt = probe_on_disk(dir, &manifest, RuntimeLoadability::NotProbed, policy(None));
+        assert_eq!(corrupt.state(), ModelAcquisitionState::ChecksumMismatch);
+        write(dir, "model.onnx", "weights");
+        let partial_manifest =
+            synthetic_manifest(&[("model.onnx", "weights"), ("tokenizer.json", "v")]);
+        let partial = probe_on_disk(
+            dir,
+            &partial_manifest,
+            RuntimeLoadability::NotProbed,
+            policy(None),
+        );
+        assert_eq!(partial.state(), ModelAcquisitionState::PartialDownload);
+        write(dir, QUARANTINE_MARKER_NAME, "quarantined");
+        let quarantined =
+            probe_on_disk(dir, &manifest, RuntimeLoadability::NotProbed, policy(None));
+        assert_eq!(
+            quarantined.state(),
+            ModelAcquisitionState::QuarantinedCorrupt
+        );
+
+        // Retain the quarantine evidence, then restore a matching verification
+        // marker as the positive control.
+        std::fs::rename(
+            dir.join(QUARANTINE_MARKER_NAME),
+            dir.join("saved-quarantine"),
+        )
+        .unwrap();
+        let verified = VerifiedMarker::for_from_file(
+            &manifest,
+            Path::new("/srv/airgap"),
+            "2026-06-15T00:00:00Z".into(),
+        );
+        std::fs::write(&marker, verified.render()).unwrap();
+        let ready = probe_on_disk(dir, &manifest, RuntimeLoadability::NotProbed, policy(None));
+        assert!(ready.revision_matches && ready.checksum_ok);
+        assert_eq!(ready.state(), ModelAcquisitionState::Ready);
+        assert!(ready.report("multilingual-minilm").usable);
+        assert_eq!(ready.source, ModelSource::FromFile);
     }
 
     #[test]
@@ -1511,7 +1738,7 @@ mod tests {
         assert_eq!(block["fallback_mode"].as_str(), Some("lexical"));
         assert_eq!(
             block["next_command"].as_str(),
-            Some("cass models install --model minilm --json")
+            Some("cass models install --model minilm")
         );
         // The fingerprint sub-object is present and deterministic.
         assert_eq!(
