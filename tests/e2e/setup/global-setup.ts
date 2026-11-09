@@ -510,8 +510,11 @@ export async function cleanupPreview(): Promise<void> {
     const pipesOpen = [child?.stdout, child?.stderr].some(stream => stream && !stream.closed);
     if (child?.pid && (running || pipesOpen)) {
       await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => {
+        let timer = setTimeout(() => {
           if (child.exitCode === null && child.signalCode === null) {
+            timer = setTimeout(() => {
+              onError(new Error("Preview output did not close after SIGKILL"));
+            }, 2000);
             child.kill("SIGKILL");
           } else {
             onError(new Error("Preview output did not close after process exit"));

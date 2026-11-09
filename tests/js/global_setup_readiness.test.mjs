@@ -342,3 +342,36 @@ test("cleanup bounds a pipe inherited by a descendant of an exited preview", asy
     await cleanupPreview();
   }
 });
+
+test("cleanup bounds inherited stderr after hard-killing the preview", async () => {
+  const logPath = path.join(path.dirname(modulePath), "preview-killed-pipe.log");
+  const log = createWriteStream(logPath);
+  await once(log, "open");
+  const child = spawn(process.execPath, ["-e", `
+    const { spawn } = require("node:child_process");
+    process.on("SIGTERM", () => {});
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 8000)"], {
+      stdio: ["ignore", "ignore", 2],
+    });
+    holder.once("spawn", () => console.error("preview-parent-ready"));
+    holder.once("error", () => process.exit(1));
+  `], { stdio: ["ignore", "ignore", "pipe"] });
+  const closed = once(child, "close");
+  child.stderr.pipe(log, { end: false });
+  child.once("close", () => log.end());
+  trackPreviewForTest(child, log);
+  try {
+    const [ready] = await within(once(child.stderr, "data"), 2000);
+    assert.match(ready.toString(), /preview-parent-ready/);
+    await assert.rejects(
+      within(cleanupPreview(), 7000),
+      /Preview output did not close after SIGKILL/,
+    );
+    assert.equal(log.closed, true);
+    if (process.platform !== "win32") assert.equal(child.signalCode, "SIGKILL");
+  } finally {
+    await stopChild(child);
+    await within(closed, 10000);
+    await cleanupPreview();
+  }
+});
