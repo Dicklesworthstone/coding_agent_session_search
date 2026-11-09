@@ -1705,7 +1705,8 @@ pub enum Commands {
     Quarantine(QuarantineCommand),
     /// Prune archived conversations by source path, workspace, or age
     /// (dry-run by default; `--apply` to commit). At least one selector is
-    /// required; supplied selectors are ANDed. Rebuilds derived search and
+    /// required; source selectors form a union, intersected with workspace
+    /// and age. Rebuilds derived search and
     /// analytics assets while keeping source files. Forgotten sessions in
     /// shared stores stay forgotten until explicitly released with --reinclude.
     /// Use --list to inspect recorded exclusions without changing the archive.
@@ -1713,16 +1714,16 @@ pub enum Commands {
         group(clap::ArgGroup::new("forget_selectors")
             .required(true)
             .multiple(true)
-            .args(["source_glob", "workspace_glob", "older_than", "list", "reinclude"])),
+            .args(["source_glob", "source_path", "workspace_glob", "older_than", "list", "reinclude"])),
         group(clap::ArgGroup::new("exclusion_action")
             .multiple(false)
             .args(["list", "reinclude"])),
-        after_long_help = "Globs match stored paths case-sensitively; * also matches /. A source path can be a logical database/session handle. Missing workspaces do not match --workspace-glob. Age uses the latest message timestamp, strictly before the reported cutoff; sessions with no messages or any missing message timestamp are kept.\n\nShared stores use durable per-session tombstones scoped by source provenance, agent, source path and external session ID. Edits, appends, sibling changes, --full and changes to CASS_EXCLUDE_WORKSPACES do not restore that identity. Inspect exclusions with --list, then preview an explicit release with --reinclude and --source-path, --source-glob, --source-id, --agent and/or --external-id. Add --apply to release the reviewed exclusions, then run cass index. Current workspace/path policies still apply.\n\nHistorical exclusions have no recorded workspace or message-age metadata, so --workspace-glob and --older-than cannot select --list or --reinclude records. Exact identity selectors never silently release a path-wide source exclusion; preview a source-only release if such an overlap is reported.\n\nOrdinary single-session files retain size/mtime tombstones: unchanged files stay forgotten, and a changed stamp makes the file eligible for indexing again. Source files and existing raw-mirror captures are kept. All deletion and re-inclusion is explicit; there is no automatic age pruning."
+        after_long_help = "Repeat --source-path for a batch of exact stored paths; glob metacharacters and whitespace are literal. Repeat --source-glob for a union of patterns. The union of all source paths and globs is intersected with workspace and age, then deleted in one transaction with one derived rebuild. Duplicates and overlaps select each conversation once. A zero-match apply skips rebuilding unless an interrupted forget still needs repair.\n\nGlobs match stored paths case-sensitively; * also matches /. A source path can be a logical database/session handle. Missing workspaces do not match --workspace-glob. Age uses the latest message timestamp, strictly before the reported cutoff; sessions with no messages or any missing message timestamp are kept.\n\nShared stores use durable per-session tombstones scoped by source provenance, agent, source path and external session ID. Edits, appends, sibling changes, --full and changes to CASS_EXCLUDE_WORKSPACES do not restore that identity. Inspect exclusions with --list, then preview an explicit release with --reinclude and --source-path, --source-glob, --source-id, --agent and/or --external-id. These management modes accept only one source path or glob. Add --apply to release the reviewed exclusions, then run cass index. Current workspace/path policies still apply.\n\nHistorical exclusions have no recorded workspace or message-age metadata, so --workspace-glob and --older-than cannot select --list or --reinclude records. Exact identity selectors never silently release a path-wide source exclusion; preview a source-only release if such an overlap is reported.\n\nOrdinary single-session files retain size/mtime tombstones: unchanged files stay forgotten, and a changed stamp makes the file eligible for indexing again. Source files and existing raw-mirror captures are kept. All deletion and re-inclusion is explicit; there is no automatic age pruning."
     )]
     Forget {
-        /// Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`).
+        /// Glob over conversation `source_path`; repeat to select a union.
         #[arg(long = "source-glob")]
-        source_glob: Option<String>,
+        source_glob: Vec<String>,
 
         /// Glob over the recorded workspace path (e.g. `/work/scratch/**`).
         #[arg(long = "workspace-glob", conflicts_with_all = ["list", "reinclude"])]
@@ -1741,9 +1742,9 @@ pub enum Commands {
         #[arg(long, conflicts_with = "list")]
         reinclude: bool,
 
-        /// Exact stored source path for --list/--reinclude (no glob expansion).
-        #[arg(long, requires = "exclusion_action", conflicts_with = "source_glob")]
-        source_path: Option<String>,
+        /// Exact stored source path (no glob expansion); repeat to batch forget.
+        #[arg(long)]
+        source_path: Vec<String>,
 
         /// Exact source/provenance ID for --list/--reinclude (e.g. local).
         #[arg(long, requires = "exclusion_action")]
@@ -10190,37 +10191,46 @@ fn run_quarantine_clear(
 /// must never turn a selective forget into a broader deletion or trigger a
 /// storage migration. Resolve relative age exactly once for this invocation.
 fn forget_filter<'a>(
-    source_glob: Option<&'a str>,
+    source_globs: &'a [String],
+    source_paths: &'a [String],
     workspace_glob: Option<&'a str>,
     older_than: Option<&str>,
     now_ms: i64,
 ) -> CliResult<crate::storage::sqlite::ForgetConversationsFilter<'a>> {
-    if source_glob.is_none() && workspace_glob.is_none() && older_than.is_none() {
+    if source_globs.is_empty()
+        && source_paths.is_empty()
+        && workspace_glob.is_none()
+        && older_than.is_none()
+    {
         return Err(CliError::usage(
             "cass forget requires at least one selector",
-            Some("Pass --source-glob, --workspace-glob, or --older-than. Supplied selectors are ANDed; preview with --json before adding --apply.".to_string()),
+            Some("Pass --source-path, --source-glob, --workspace-glob, or --older-than. Source selectors form a union, intersected with workspace and age; preview with --json before adding --apply.".to_string()),
         ));
     }
-    let source_glob = source_glob.map(str::trim);
     let workspace_glob = workspace_glob.map(str::trim);
-    for (name, pattern) in [
-        ("source-glob", source_glob),
-        ("workspace-glob", workspace_glob),
-    ] {
-        if let Some(pattern) = pattern {
-            if pattern.is_empty() {
-                return Err(CliError::usage(
-                    format!("forget --{name} must not be empty"),
-                    None,
-                ));
-            }
-            glob::Pattern::new(pattern).map_err(|error| {
-                CliError::usage(
-                    format!("invalid forget --{name} glob: {error}"),
-                    Some("Quote the glob so your shell passes it to cass unchanged.".to_string()),
-                )
-            })?;
+    for (name, pattern) in source_globs
+        .iter()
+        .map(|pattern| ("source-glob", pattern.trim()))
+        .chain(workspace_glob.map(|pattern| ("workspace-glob", pattern)))
+    {
+        if pattern.is_empty() {
+            return Err(CliError::usage(
+                format!("forget --{name} must not be empty"),
+                None,
+            ));
         }
+        glob::Pattern::new(pattern).map_err(|error| {
+            CliError::usage(
+                format!("invalid forget --{name} glob: {error}"),
+                Some("Quote the glob so your shell passes it to cass unchanged.".to_string()),
+            )
+        })?;
+    }
+    if source_paths.iter().any(|path| path.trim().is_empty()) {
+        return Err(CliError::usage(
+            "forget --source-path must not be empty",
+            None,
+        ));
     }
     let before_ms = older_than
         .map(|duration| {
@@ -10231,7 +10241,8 @@ fn forget_filter<'a>(
         })
         .transpose()?;
     Ok(crate::storage::sqlite::ForgetConversationsFilter {
-        source_glob,
+        source_globs,
+        source_paths,
         workspace_glob,
         before_ms,
     })
@@ -10246,13 +10257,25 @@ mod forget_selector_tests {
         for args in [vec!["cass", "forget"], vec!["cass", "forget", "--apply"]] {
             assert!(Cli::try_parse_from(args).is_err());
         }
-        assert!(forget_filter(None, None, None, 0).is_err());
+        assert!(forget_filter(&[], &[], None, None, 0).is_err());
     }
 
     #[test]
     fn forget_accepts_each_selector_and_intersections() {
         for selectors in [
             vec!["--source-glob", "**/rollout-*.jsonl"],
+            vec![
+                "--source-path",
+                "/logs/one[1].jsonl",
+                "--source-path",
+                "/logs/two.jsonl",
+            ],
+            vec![
+                "--source-glob",
+                "**/one.jsonl",
+                "--source-glob",
+                "**/two.jsonl",
+            ],
             vec!["--workspace-glob", "/work/scratch/**"],
             vec!["--older-than", "90d"],
             vec![
@@ -10273,14 +10296,18 @@ mod forget_selector_tests {
                 Some(Commands::Forget { apply: false, .. })
             ));
         }
+        let source_globs = [" **/*.jsonl ".to_string()];
+        let source_paths = [" /logs/literal[1].jsonl ".to_string()];
         let filter = forget_filter(
-            Some(" **/*.jsonl "),
+            &source_globs,
+            &source_paths,
             Some("/work/*"),
             Some("2d"),
             200_000_000,
         )
         .expect("valid selection");
-        assert_eq!(filter.source_glob, Some("**/*.jsonl"));
+        assert_eq!(filter.source_globs, source_globs);
+        assert_eq!(filter.source_paths, source_paths);
         assert_eq!(filter.workspace_glob, Some("/work/*"));
         assert_eq!(filter.before_ms, Some(27_200_000));
     }
@@ -10288,9 +10315,23 @@ mod forget_selector_tests {
     #[test]
     fn forget_rejects_invalid_selectors_before_storage() {
         for pattern in ["", "   ", "["] {
-            assert!(forget_filter(Some(pattern), None, None, 0).is_err());
-            assert!(forget_filter(None, Some(pattern), None, 0).is_err());
+            assert!(forget_filter(&[pattern.to_owned()], &[], None, None, 0).is_err());
+            assert!(forget_filter(&[], &[], Some(pattern), None, 0).is_err());
+            assert!(
+                forget_filter(
+                    &["/valid.jsonl".to_owned(), pattern.to_owned()],
+                    &[],
+                    None,
+                    None,
+                    0
+                )
+                .is_err()
+            );
         }
+        for path in ["", "   "] {
+            assert!(forget_filter(&[], &[path.to_owned()], None, None, 0).is_err());
+        }
+        assert!(forget_filter(&[], &["/literal[1]?*.jsonl".to_owned()], None, None, 0).is_ok());
         for duration in [
             "",
             "yesterday",
@@ -10299,11 +10340,11 @@ mod forget_selector_tests {
             "90fortnights",
             "9223372036854775807d",
         ] {
-            assert!(forget_filter(None, None, Some(duration), 0).is_err());
+            assert!(forget_filter(&[], &[], None, Some(duration), 0).is_err());
         }
-        assert!(forget_filter(None, None, Some("1s"), i64::MIN).is_err());
+        assert!(forget_filter(&[], &[], None, Some("1s"), i64::MIN).is_err());
         assert_eq!(
-            forget_filter(None, None, Some("0s"), 42)
+            forget_filter(&[], &[], None, Some("0s"), 42)
                 .expect("explicit zero age")
                 .before_ms,
             Some(42)
@@ -10313,12 +10354,12 @@ mod forget_selector_tests {
 
 #[derive(Default)]
 struct ForgetCommandOptions {
-    source_glob: Option<String>,
+    source_glob: Vec<String>,
     workspace_glob: Option<String>,
     older_than: Option<String>,
     list: bool,
     reinclude: bool,
-    source_path: Option<String>,
+    source_path: Vec<String>,
     source_id: Option<String>,
     agent: Option<String>,
     external_id: Option<String>,
@@ -10329,8 +10370,8 @@ struct ForgetCommandOptions {
 impl ForgetCommandOptions {
     fn exclusion_selector(&self) -> crate::storage::sqlite::ForgetExclusionSelector<'_> {
         crate::storage::sqlite::ForgetExclusionSelector {
-            source_glob: self.source_glob.as_deref(),
-            source_path: self.source_path.as_deref(),
+            source_glob: self.source_glob.first().map(String::as_str),
+            source_path: self.source_path.first().map(String::as_str),
             source_id: self.source_id.as_deref(),
             agent_slug: self.agent.as_deref(),
             external_id: self.external_id.as_deref(),
@@ -10352,6 +10393,12 @@ fn run_forget_command(
     let older_than = &options.older_than;
     let exclusion_action = options.list || options.reinclude;
     let filter = if exclusion_action {
+        if options.source_glob.len() > 1 || options.source_path.len() > 1 {
+            return Err(CliError::usage(
+                "--list/--reinclude accept only one --source-glob or --source-path",
+                Some("Repeated source selectors are supported for forgetting conversations. Review and release exclusions separately.".to_string()),
+            ));
+        }
         if (options.list && (options.reinclude || apply))
             || options.workspace_glob.is_some()
             || older_than.is_some()
@@ -10367,18 +10414,15 @@ fn run_forget_command(
             .map_err(|error| CliError::usage(error.to_string(), None))?;
         None
     } else {
-        if options.source_path.is_some()
-            || options.source_id.is_some()
-            || options.agent.is_some()
-            || options.external_id.is_some()
-        {
+        if options.source_id.is_some() || options.agent.is_some() || options.external_id.is_some() {
             return Err(CliError::usage(
                 "exact exclusion identity selectors require --list or --reinclude",
                 None,
             ));
         }
         Some(forget_filter(
-            options.source_glob.as_deref(),
+            &options.source_glob,
+            &options.source_path,
             options.workspace_glob.as_deref(),
             older_than.as_deref(),
             chrono::Utc::now().timestamp_millis(),
@@ -10546,11 +10590,12 @@ fn run_forget_command(
         None
     };
 
-    // WS-B.5 (z2uon): an applied forget deletes rows and rewrites FTS,
+    // WS-B.5 (z2uon): an actual forget deletes rows and rewrites FTS,
     // analytics and daily-stats tables; close through the checkpointing path
     // so the next opener does not replay all of that from the WAL. A dry run
-    // wrote nothing and must not checkpoint anything.
-    if apply {
+    // and an empty apply without a pending repair wrote nothing in the
+    // forget transaction. Neither needs to checkpoint the archive.
+    if remaining_conversations.is_some() {
         if let Err(err) =
             crate::indexer::close_storage_with_wal_checkpoint(storage, &db_path, "forget")
         {
@@ -10567,7 +10612,7 @@ fn run_forget_command(
             .map_err(|error| CliError {
                 code: 5,
                 kind: "forget",
-                message: format!("failed to close forget preview: {error}"),
+                message: format!("failed to close forget inspection: {error}"),
                 hint: None,
                 retryable: false,
             })?;
@@ -10646,6 +10691,10 @@ fn run_forget_command(
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("schema_version".to_string(), serde_json::json!(1));
             obj.insert("applied".to_string(), serde_json::json!(apply));
+            obj.insert(
+                "derived_rebuilt".to_string(),
+                serde_json::json!(remaining_conversations.is_some()),
+            );
             obj.insert("older_than".to_string(), serde_json::json!(older_than));
             obj.insert(
                 "db_path".to_string(),
@@ -10666,7 +10715,10 @@ fn run_forget_command(
             "dry-run (inspect only)"
         }
     );
-    if let Some(pattern) = &report.source_glob {
+    for path in &report.source_paths {
+        println!("Exact source path: {path}");
+    }
+    for pattern in &report.source_globs {
         println!("Source glob: {pattern}");
     }
     if let Some(pattern) = &report.workspace_glob {
@@ -10678,7 +10730,17 @@ fn run_forget_command(
             .unwrap_or_else(|| format!("{cutoff} ms since the Unix epoch"));
         println!("Last message before: {cutoff} (unknown message times are kept)");
     }
-    println!("All supplied selectors must match.");
+    println!("Source paths/globs form a union; workspace and age must also match.");
+    if apply {
+        println!(
+            "Derived rebuild: {}",
+            if remaining_conversations.is_some() {
+                "completed"
+            } else {
+                "skipped (no deletion or pending repair)"
+            }
+        );
+    }
     println!();
     println!(
         "Matched conversations: {} ({} messages)",
@@ -10717,11 +10779,13 @@ fn run_forget_command(
         }
     }
     println!();
-    if apply {
+    if remaining_conversations.is_some() {
         println!(
             "Deleted {} conversation(s) from the canonical DB and rebuilt derived assets.",
             report.conversations_deleted
         );
+    } else if apply {
+        println!("No conversations matched and no derived repair was pending. Nothing to rebuild.");
     } else if report.conversations_matched > 0 {
         println!("Re-run with --apply to delete these conversations.");
     } else {
@@ -10898,8 +10962,8 @@ fn run_forget_exclusion_action(
         object.insert(
             "selector".to_string(),
             serde_json::json!({
-                "source_glob": options.source_glob,
-                "source_path": options.source_path,
+                "source_glob": options.source_glob.first(),
+                "source_path": options.source_path.first(),
                 "source_id": options.source_id,
                 "agent_slug": options.agent,
                 "external_id": options.external_id,
@@ -28126,7 +28190,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass expand <path> --message-index N [--source ID] [--conversation-id ID] [-C CONTEXT] [--json]  Follow search line_number; --line is for raw JSONL.".to_string(),
             "  cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.".to_string(),
             "  cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.".to_string(),
-            "  cass forget [--source-glob '<glob>'] [--workspace-glob '<glob>'] [--older-than 90d] [--apply] [--json]  Require at least one selector; combine with AND. Preview matching sessions; --apply removes indexed copies and keeps source files. Shared-session tombstones persist until explicitly released.".to_string(),
+            "  cass forget [--source-path PATH]... [--source-glob '<glob>']... [--workspace-glob '<glob>'] [--older-than 90d] [--apply] [--json]  Require at least one selector. Source paths/globs form a union, intersected with workspace and age. Apply deletes the batch atomically and rebuilds once; no-match skips rebuilding unless a repair is pending. Shared-session tombstones persist until explicitly released.".to_string(),
             "  cass forget --list [--source-glob '<glob>' | --source-path PATH] [--source-id ID] [--agent SLUG] [--external-id ID] --json  Inspect recorded exclusions; historical records have no workspace or message-age metadata.".to_string(),
             "  cass forget --reinclude [identity selectors] [--apply] --json  Preview explicit exclusion release; at least one selector is required. After apply, run cass index; current indexing policies still apply.".to_string(),
             "  cass mirror prune [--older-than 90d] [--max-size 100GB] [--keep-latest 1] [--keep-tag important] [--apply] [--json]  Plan or apply raw-mirror retention with an audit log.".to_string(),

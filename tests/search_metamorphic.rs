@@ -896,6 +896,116 @@ fn forgetting_a_session_removes_exactly_its_messages() -> TestResult {
     )
 }
 
+/// Repeated exact paths and overlapping globs select a union of sessions.
+/// Both the published lexical generation and canonical FTS fallback must
+/// equal the original message oracle minus that union, with no other loss.
+#[test]
+fn forgetting_a_batch_removes_exactly_the_selected_message_union() -> TestResult {
+    use coding_agent_search::search::query::{
+        FieldMask, SearchClient, SearchClientOptions, SearchFilters,
+    };
+
+    const SELECTED: [usize; 2] = [7, 9];
+    let corpus = build_corpus()?;
+    let forgotten: BTreeSet<_> = SELECTED
+        .into_iter()
+        .flat_map(|session| (0..MESSAGES_PER_SESSION).map(move |index| session * 100 + index))
+        .collect();
+    let source = |session: usize| {
+        corpus
+            .home
+            .join(".codex/sessions/2026/08")
+            .join(format!("{:02}", session + 1))
+            .join(format!(
+                "rollout-2026-08-{:02}T00-00-00-meta{session:02}.jsonl",
+                session + 1
+            ))
+    };
+    let sources = SELECTED.map(source);
+    for session in SELECTED {
+        let own = session * 100 + 3;
+        assert_same(
+            "selected session before the batch",
+            &corpus.search(&format!("msgid{own}"), &[])?,
+            &BTreeSet::from([own]),
+        )?;
+    }
+    let output = corpus
+        .cmd()
+        .args(["forget", "--source-path"])
+        .arg(&sources[0])
+        .arg("--source-path")
+        .arg(&sources[1])
+        .arg("--source-glob")
+        .arg(&sources[0])
+        .arg("--source-glob")
+        .arg(&sources[1])
+        .arg("--source-path")
+        .arg(&sources[0])
+        .args(["--apply", "--json"])
+        .output()?;
+    eprintln!(
+        "{}",
+        json!({"event": "forget_batch", "sessions": SELECTED, "exit": output.status.code()})
+    );
+    if !output.status.success() {
+        return Err(format!(
+            "batch forget failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["conversations_deleted"], SELECTED.len());
+    assert_eq!(report["messages_matched"], forgotten.len());
+
+    let fts = SearchClient::open_with_options(
+        &corpus.data_dir.join("no-lexical-index"),
+        Some(&corpus.data_dir.join("agent_search.db")),
+        SearchClientOptions {
+            enable_reload: false,
+            enable_warm: false,
+            strict_read_only: true,
+        },
+    )?
+    .ok_or("no SQLite search client after batch forget")?;
+    assert!(
+        !fts.has_tantivy(),
+        "the canonical FTS fallback must be exercised"
+    );
+    for term in TERMS {
+        let expected = corpus
+            .with_term(term)
+            .difference(&forgotten)
+            .copied()
+            .collect();
+        assert_same(
+            &format!("lexical {term} after batch forget"),
+            &corpus.search(term, &[])?,
+            &expected,
+        )?;
+        let mut canonical = BTreeSet::new();
+        for hit in fts.search(term, SearchFilters::default(), 1000, 0, FieldMask::FULL)? {
+            canonical.insert(
+                message_id(&hit.content)
+                    .ok_or_else(|| format!("FTS hit without msgid: {:?}", hit.content))?,
+            );
+        }
+        assert_same(
+            &format!("canonical FTS {term} after batch forget"),
+            &canonical,
+            &expected,
+        )?;
+    }
+    for id in &forgotten {
+        assert!(
+            corpus.search(&format!("msgid{id}"), &[])?.is_empty(),
+            "forgotten message {id} survived the batch"
+        );
+    }
+    Ok(())
+}
+
 /// The same relations through the SQLite FTS5 lane (2l1b0.68), which answers
 /// when no lexical index is readable. A client opened on the canonical
 /// database with no index directory, read-only so the shared corpus is not

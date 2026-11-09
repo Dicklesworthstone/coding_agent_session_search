@@ -3186,14 +3186,15 @@
     },
     {
       "name": "forget",
-      "description": "Prune archived conversations by source path, workspace, or age (dry-run by default; `--apply` to commit). At least one selector is required; supplied selectors are ANDed. Rebuilds derived search and analytics assets while keeping source files. Forgotten sessions in shared stores stay forgotten until explicitly released with --reinclude. Use --list to inspect recorded exclusions without changing the archive",
+      "description": "Prune archived conversations by source path, workspace, or age (dry-run by default; `--apply` to commit). At least one selector is required; source selectors form a union, intersected with workspace and age. Rebuilds derived search and analytics assets while keeping source files. Forgotten sessions in shared stores stay forgotten until explicitly released with --reinclude. Use --list to inspect recorded exclusions without changing the archive",
       "arguments": [
         {
           "name": "source-glob",
-          "description": "Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`)",
+          "description": "Glob over conversation `source_path`; repeat to select a union",
           "arg_type": "option",
           "value_type": "string",
-          "required": false
+          "required": false,
+          "repeatable": true
         },
         {
           "name": "workspace-glob",
@@ -3231,10 +3232,11 @@
         },
         {
           "name": "source-path",
-          "description": "Exact stored source path for --list/--reinclude (no glob expansion)",
+          "description": "Exact stored source path (no glob expansion); repeat to batch forget",
           "arg_type": "option",
           "value_type": "string",
-          "required": false
+          "required": false,
+          "repeatable": true
         },
         {
           "name": "source-id",
