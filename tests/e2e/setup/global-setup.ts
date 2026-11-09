@@ -505,9 +505,18 @@ export async function cleanupPreview(): Promise<void> {
   previewProcess = undefined;
   previewLogStream = undefined;
   try {
-    if (child?.pid && child.exitCode === null && child.signalCode === null) {
+    const running = child?.exitCode === null && child.signalCode === null;
+    // Exit precedes stdio close; ending the log in that interval loses output.
+    const pipesOpen = [child?.stdout, child?.stderr].some(stream => stream && !stream.closed);
+    if (child?.pid && (running || pipesOpen)) {
       await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => child.kill("SIGKILL"), 2000);
+        const timer = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) {
+            child.kill("SIGKILL");
+          } else {
+            onError(new Error("Preview output did not close after process exit"));
+          }
+        }, 2000);
         const onClose = () => {
           clearTimeout(timer);
           child.off("error", onError);
@@ -516,11 +525,12 @@ export async function cleanupPreview(): Promise<void> {
         const onError = (error: Error) => {
           clearTimeout(timer);
           child.off("close", onClose);
+          child.off("error", onError);
           reject(error);
         };
         child.once("close", onClose);
         child.once("error", onError);
-        child.kill("SIGTERM");
+        if (running) child.kill("SIGTERM");
       });
     }
   } finally {

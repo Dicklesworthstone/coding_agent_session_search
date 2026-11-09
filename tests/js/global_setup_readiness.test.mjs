@@ -277,3 +277,68 @@ test("a failed log still closes the child and propagates the stream error", asyn
     await cleanupPreview();
   }
 });
+
+test("cleanup drains stderr after the preview child has exited", async () => {
+  const logPath = path.join(path.dirname(modulePath), "preview-exited-cleanup.log");
+  const log = createWriteStream(logPath);
+  await once(log, "open");
+  const child = spawn(process.execPath, ["-e", "process.stderr.write('final-preview-marker\\n')"], {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  const closed = once(child, "close");
+  child.stderr.pipe(log, { end: false });
+  child.once("close", () => log.end());
+  // Hold real pipe data until exit to exercise the interval before close.
+  child.stderr.pause();
+  trackPreviewForTest(child, log);
+  const cleaned = new Promise((resolve, reject) => {
+    child.once("exit", () => {
+      const cleanup = cleanupPreview();
+      child.stderr.resume();
+      cleanup.then(resolve, reject);
+    });
+  });
+  try {
+    await within(cleaned, 2000);
+    await within(closed, 2000);
+    assert.equal(log.closed, true);
+    assert.match(readFileSync(logPath, "utf8"), /final-preview-marker/);
+  } finally {
+    child.stderr.resume();
+    await stopChild(child);
+    await within(closed, 2000);
+    await cleanupPreview();
+  }
+});
+
+test("cleanup bounds a pipe inherited by a descendant of an exited preview", async () => {
+  const logPath = path.join(path.dirname(modulePath), "preview-inherited-pipe.log");
+  const log = createWriteStream(logPath);
+  await once(log, "open");
+  const child = spawn(process.execPath, ["-e", `
+    const { spawn } = require("node:child_process");
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 3000)"], {
+      stdio: ["ignore", "ignore", 2],
+    });
+    holder.once("spawn", () => process.exit(0));
+    holder.once("error", () => process.exit(1));
+  `], { stdio: ["ignore", "ignore", "pipe"] });
+  const closed = once(child, "close");
+  child.stderr.pipe(log, { end: false });
+  child.once("close", () => log.end());
+  trackPreviewForTest(child, log);
+  try {
+    await within(once(child, "exit"), 2000);
+    assert.equal(child.exitCode, 0);
+    assert.equal(child.stderr.closed, false);
+    await assert.rejects(
+      within(cleanupPreview(), 4000),
+      /Preview output did not close after process exit/,
+    );
+    assert.equal(log.closed, true);
+  } finally {
+    await stopChild(child);
+    await within(closed, 5000);
+    await cleanupPreview();
+  }
+});
