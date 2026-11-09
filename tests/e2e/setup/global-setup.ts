@@ -529,6 +529,10 @@ export async function cleanupPreview(): Promise<void> {
           clearTimeout(timer);
           child.off("close", onClose);
           child.off("error", onError);
+          // An inherited writer can outlive the child. Once draining fails,
+          // release our read handles so they cannot keep teardown alive.
+          child.stdout?.destroy();
+          child.stderr?.destroy();
           reject(error);
         };
         child.once("close", onClose);

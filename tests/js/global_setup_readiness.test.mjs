@@ -336,6 +336,9 @@ test("cleanup bounds a pipe inherited by a descendant of an exited preview", asy
       /Preview output did not close after process exit/,
     );
     assert.equal(log.closed, true);
+    // The rejected cleanup must release our pipe handles, even while the
+    // descendant still holds its inherited write end.
+    await within(closed, 500);
   } finally {
     await stopChild(child);
     await within(closed, 5000);
@@ -369,6 +372,7 @@ test("cleanup bounds inherited stderr after hard-killing the preview", async () 
     );
     assert.equal(log.closed, true);
     if (process.platform !== "win32") assert.equal(child.signalCode, "SIGKILL");
+    await within(closed, 500);
   } finally {
     await stopChild(child);
     await within(closed, 10000);
