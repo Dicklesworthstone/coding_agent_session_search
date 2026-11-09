@@ -700,6 +700,8 @@ const COMPONENT_STYLES: &str = r#"
   justify-content: space-between;
   gap: var(--space-3);
   margin-bottom: var(--space-3);
+  /* Keep the absolute copy-link button clear of the tool badges. */
+  padding-right: calc(var(--touch-min) + var(--space-2));
   padding-bottom: var(--space-2);
   border-bottom: 1px solid oklch(0.25 0.02 260 / 0.5);
 }
@@ -1593,6 +1595,7 @@ pre:hover .copy-code-btn { opacity: 1; }
     break-inside: avoid;
   }
   .message-link { display: none; }
+  .message-header { padding-right: 0; }
   .copy-code-btn { display: none; }
   .tool-popover { display: none !important; }
   .tool-badge {

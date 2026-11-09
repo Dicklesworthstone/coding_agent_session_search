@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createWriteStream, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -13,7 +13,7 @@ import { pathToFileURL } from "node:url";
 // unchanged, and importing it does not invoke setup or launch any browsers.
 const source = readFileSync(new URL("../e2e/setup/global-setup.ts", import.meta.url), "utf8");
 const modulePath = path.join(mkdtempSync(path.join(tmpdir(), "cass-readiness-")), "global-setup.ts");
-writeFileSync(modulePath, `${source}\nexport { waitForUrl };\nexport function trackPreviewForTest(child) { previewProcess = child; }\n`);
+writeFileSync(modulePath, `${source}\nexport { waitForUrl };\nexport function trackPreviewForTest(child, log) { previewProcess = child; previewLogStream = log; }\n`);
 const { waitForUrl, cleanupPreview, trackPreviewForTest } = await import(pathToFileURL(modulePath).href);
 
 async function listen(server) {
@@ -112,7 +112,7 @@ function previewChild(url, mode = "respond") {
 async function stopChild(child) {
   if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
   const closed = new Promise(resolve => child.once("close", resolve));
-  child.kill("SIGTERM");
+  child.kill("SIGKILL");
   await within(closed, 2000);
 }
 
@@ -223,5 +223,57 @@ test("preview exit aborts an HTTP request already in progress", async () => {
     assert.equal(child.exitCode, 2);
   } finally {
     await stopChild(child);
+  }
+});
+
+test("fixture cleanup stops a real child that ignores SIGTERM", async () => {
+  const url = await unusedUrl();
+  const child = previewChild(url, "ignore-term");
+  try {
+    assert.equal(await waitForUrl(url, 1000, child), true);
+    await stopChild(child);
+    assert.notEqual(child.signalCode ?? child.exitCode, null);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      const closed = once(child, "close");
+      child.kill("SIGKILL");
+      await within(closed, 2000);
+    }
+  }
+});
+
+test("cleanup drains and closes the actual preview log", async () => {
+  const logPath = path.join(path.dirname(modulePath), "preview-cleanup.log");
+  const log = createWriteStream(logPath);
+  await once(log, "open");
+  const url = await unusedUrl();
+  const child = previewChild(url);
+  child.stderr.pipe(log, { end: false });
+  trackPreviewForTest(child, log);
+  try {
+    assert.equal(await waitForUrl(url, 1000, child), true);
+    await within(cleanupPreview(), 3000);
+    assert.equal(log.closed, true);
+    assert.match(readFileSync(logPath, "utf8"), /Preview server running/);
+    assert.match(readFileSync(logPath, "utf8"), /request-received/);
+  } finally {
+    await stopChild(child);
+    await cleanupPreview();
+  }
+});
+
+test("a failed log still closes the child and propagates the stream error", async () => {
+  const url = await unusedUrl();
+  const child = previewChild(url);
+  try {
+    assert.equal(await waitForUrl(url, 1000, child), true);
+    const log = createWriteStream(path.dirname(modulePath));
+    const [error] = await once(log, "error");
+    trackPreviewForTest(child, log);
+    await assert.rejects(cleanupPreview(), actual => actual === error);
+    assert.notEqual(child.signalCode ?? child.exitCode, null);
+  } finally {
+    await stopChild(child);
+    await cleanupPreview();
   }
 });

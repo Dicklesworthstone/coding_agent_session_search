@@ -1,13 +1,16 @@
 import { execFileSync, spawn } from "child_process";
 import { randomUUID } from "crypto";
+import { once } from "events";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import path from "path";
+import { finished } from "stream/promises";
 import { fileURLToPath } from "url";
 import { stripVTControlCharacters } from "util";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 let previewProcess: ReturnType<typeof spawn> | undefined;
+let previewLogStream: ReturnType<typeof createWriteStream> | undefined;
 
 /**
  * Global setup for HTML export E2E tests.
@@ -18,7 +21,13 @@ async function globalSetup() {
   try {
     await generateFixtures();
   } catch (error) {
-    await cleanupPreview();
+    try {
+      await cleanupPreview();
+    } catch (cleanupError) {
+      if (cleanupError !== error) {
+        throw new AggregateError([error, cleanupError], "Preview setup and cleanup failed");
+      }
+    }
     throw error;
   }
 }
@@ -403,14 +412,18 @@ async function generateFixtures() {
     ];
 
     console.log(`Starting preview server on port ${previewPort}...`);
+    const logStream = createWriteStream(previewLog, { flags: "a" });
+    previewLogStream = logStream;
+    // An unusable destination must reject before there is a child to orphan.
+    await once(logStream, "open");
     const previewProc = spawn(cassPath, previewArgs, {
       cwd: projectRoot,
       stdio: ["ignore", "pipe", "pipe"],
     });
     previewProcess = previewProc;
+    const logFailure = new Promise<never>((_, reject) => logStream.once("error", reject));
 
     if (previewProc.stdout && previewProc.stderr) {
-      const logStream = createWriteStream(previewLog, { flags: "a" });
       previewProc.stdout.pipe(logStream, { end: false });
       previewProc.stderr.pipe(logStream, { end: false });
       previewProc.once("close", () => logStream.end());
@@ -418,8 +431,16 @@ async function generateFixtures() {
 
     previewPid = String(previewProc.pid ?? "");
 
-    const ready = await waitForUrl(`http://127.0.0.1:${previewPort}/index.html`, 8000, previewProc);
+    const ready = await Promise.race([
+      waitForUrl(`http://127.0.0.1:${previewPort}/index.html`, 8000, previewProc),
+      logFailure,
+    ]);
     if (ready) {
+      // Drain writes queued by the startup acknowledgement before declaring
+      // readiness: the file may open successfully but fail its first write.
+      await new Promise<void>((resolve, reject) => {
+        logStream.write("", error => error ? reject(error) : resolve());
+      });
       previewUrl = `http://127.0.0.1:${previewPort}/index.html`;
       console.log(`Preview server ready at ${previewUrl}`);
     } else {
@@ -480,26 +501,34 @@ export default globalSetup;
 // identify an unrelated process. Playwright calls this through global teardown.
 export async function cleanupPreview(): Promise<void> {
   const child = previewProcess;
+  const logStream = previewLogStream;
   previewProcess = undefined;
-  if (!child?.pid || child.exitCode !== null || child.signalCode !== null) {
-    return;
+  previewLogStream = undefined;
+  try {
+    if (child?.pid && child.exitCode === null && child.signalCode === null) {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => child.kill("SIGKILL"), 2000);
+        const onClose = () => {
+          clearTimeout(timer);
+          child.off("error", onError);
+          resolve();
+        };
+        const onError = (error: Error) => {
+          clearTimeout(timer);
+          child.off("close", onClose);
+          reject(error);
+        };
+        child.once("close", onClose);
+        child.once("error", onError);
+        child.kill("SIGTERM");
+      });
+    }
+  } finally {
+    if (logStream) {
+      if (!logStream.writableEnded) logStream.end();
+      await finished(logStream, { cleanup: true });
+    }
   }
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => child.kill("SIGKILL"), 2000);
-    const onClose = () => {
-      clearTimeout(timer);
-      child.off("error", onError);
-      resolve();
-    };
-    const onError = (error: Error) => {
-      clearTimeout(timer);
-      child.off("close", onClose);
-      reject(error);
-    };
-    child.once("close", onClose);
-    child.once("error", onError);
-    child.kill("SIGTERM");
-  });
 }
 
 async function waitForUrl(

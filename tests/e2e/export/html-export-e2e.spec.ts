@@ -32,6 +32,22 @@ test.beforeAll(async () => {
 });
 
 test.describe("HTML Export - Plain Mode", () => {
+  test("tool badge remains hoverable beside the copy-link button", async ({ page, exportPath }) => {
+    await gotoFile(page, exportPath);
+    await waitForPageReady(page);
+
+    const badge = page.locator(".tool-badge").first();
+    await expect(badge).toBeVisible();
+    await badge.hover();
+    await expect(badge.locator(".tool-popover")).toBeVisible();
+
+    const message = badge.locator("xpath=ancestor::article[1]");
+    await expect(message.locator(".message-link")).toBeVisible();
+    await message.locator(".message-link").hover();
+    await badge.hover();
+    await expect(badge.locator(".tool-popover")).toBeVisible();
+  });
+
   test("renders basic export with all messages visible", async ({ page, exportPath }, testInfo) => {
     const browserErrors = collectBrowserErrors(page);
     await test.step("Verify export file exists", async () => {
