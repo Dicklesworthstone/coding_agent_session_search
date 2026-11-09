@@ -385,6 +385,65 @@ fn scripts_rch_compliance_helper_module_exists() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn browser_lane_resolves_target_paths_before_changing_directory() {
+    use assert_cmd::cargo::cargo_bin;
+    use std::os::unix::fs::symlink;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().expect("temporary checkout");
+    let repo = tmp.path().join("checkout with spaces");
+    let target = repo.join("artifacts with spaces");
+    let caller = tmp.path().join("caller");
+    std::fs::create_dir_all(target.join("release")).expect("create target directory");
+    std::fs::create_dir(&caller).expect("create caller directory");
+    symlink(cargo_bin("cass"), target.join("release/cass")).expect("link actual cass binary");
+    let script = project_root().join("scripts/browser_e2e_lane.sh");
+    let run = |repo_arg: &Path, target_arg: &Path| {
+        let mut command = assert_cmd::Command::new("bash");
+        command
+            .arg(&script)
+            .arg("--skip-build")
+            .current_dir(&caller)
+            .env("LANE_REPO", repo_arg)
+            .env("CARGO_TARGET_DIR", target_arg)
+            .timeout(Duration::from_secs(5));
+        command.output().expect("run browser lane preflight")
+    };
+
+    // The real executable must be discovered before the deliberately missing
+    // tests directory stops execution. No npm, Playwright or browser is run.
+    let missing_tests = repo.canonicalize().expect("resolve checkout").join("tests");
+    let missing_tests = missing_tests.to_string_lossy();
+    for (repo_arg, target_arg) in [
+        (repo.as_path(), Path::new("artifacts with spaces")),
+        (repo.as_path(), target.as_path()),
+        (
+            Path::new("../checkout with spaces"),
+            Path::new("artifacts with spaces"),
+        ),
+    ] {
+        let output = run(repo_arg, target_arg);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains(missing_tests.as_ref()), "{stderr}");
+        assert!(!stderr.contains("no cass binary"), "{stderr}");
+    }
+
+    let missing = run(&repo, Path::new("missing"));
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    let expected = repo
+        .canonicalize()
+        .expect("resolve checkout")
+        .join("missing/release/cass");
+    assert_eq!(missing.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(expected.to_string_lossy().as_ref()),
+        "{stderr}"
+    );
+}
+
 fn missing_contract_token(path: &std::path::Path, required: &str) -> String {
     format!(
         "{} is missing strict run-bundle token {required:?}",

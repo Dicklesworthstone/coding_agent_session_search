@@ -35,7 +35,14 @@ done
     e2e/offline/cdn-fallback.spec.ts
 )
 
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo/target}"
+repo="$(cd "$repo" && pwd -P)"
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo/target}"
+# Keep binary discovery and Playwright setup on the same path after cd tests.
+case "$CARGO_TARGET_DIR" in
+    /*|[A-Za-z]:[\\/]*|\\\\*) ;;
+    *) CARGO_TARGET_DIR="$repo/$CARGO_TARGET_DIR" ;;
+esac
+export CARGO_TARGET_DIR
 receipt="${LANE_RECEIPT:-$repo/tests/e2e-lane-receipt.json}"
 exe=""
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) exe=".exe" ;; esac
