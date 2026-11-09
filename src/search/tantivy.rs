@@ -1683,6 +1683,12 @@ impl TantivyIndex {
         Ok(())
     }
 
+    /// Test-only: stop [`Self::force_merge`] after its first `runs` merges.
+    #[cfg(test)]
+    pub(crate) fn force_merge_first_runs_for_test(&mut self, runs: usize) -> Result<()> {
+        self.inner.force_merge_first_runs_for_test(runs)
+    }
+
     pub fn merge_compatible_index_directories<P: AsRef<Path>>(
         output_path: &Path,
         input_paths: &[P],

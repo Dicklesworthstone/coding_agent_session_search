@@ -1596,6 +1596,20 @@ impl QuillCassIndex {
         Ok(())
     }
 
+    /// Test-only: the first `runs` publications of [`Self::force_merge`] and
+    /// nothing after, the state a process killed between two of them leaves.
+    #[cfg(test)]
+    pub(crate) fn force_merge_first_runs_for_test(&mut self, runs: usize) -> Result<()> {
+        let planned = plan_capped_merge_runs(
+            &self.published_segment_fold_profile()?,
+            lexical_merge_max_output_bytes(),
+        );
+        for run in planned.into_iter().take(runs) {
+            self.concat_merge_run(&run)?;
+        }
+        Ok(())
+    }
+
     /// The fold profile of every published segment, in manifest (docid)
     /// order: what the merge-output cap plans against.
     fn published_segment_fold_profile(&self) -> Result<Vec<SegmentFoldProfile>> {

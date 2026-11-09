@@ -1190,6 +1190,8 @@ fn run_inner(
     state.pending = None;
     state.completed = false;
     state.completed_source_epoch = None;
+    // An audited candidate is no longer only what a forced pass built.
+    state.forced_rebuild_origin = None;
     state.clear_runtime();
     state.resume_binding = Some(current_binding);
     state.set_execution_mode(LexicalRebuildExecutionMode::StagedVerifiedReplay);

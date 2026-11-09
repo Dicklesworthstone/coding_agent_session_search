@@ -5520,6 +5520,8 @@ fn flush_streamed_lexical_rebuild_batch(
         lexical_rebuild_add_absorbing_equivalence(pending_batch, equivalence_accumulator, || {
             t_index.add_prebuilt_document_refs_slice(prepared_docs.as_slice())
         })?;
+    #[cfg(test)]
+    LEXICAL_REBUILD_TEST_ADDED_DOCS.with(|count| count.set(count.get().saturating_add(added)));
     *indexed_docs = (*indexed_docs).saturating_add(added);
     // `prepared_docs` borrows the packet strings. Drop those views, then free
     // the packets before publishing their byte capacity back to page prep.
@@ -7231,8 +7233,38 @@ struct LexicalRebuildState {
     /// alone cannot detect an equal-count content or metadata edit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     completed_source_epoch: Option<lexical_resume::ArchiveEpoch>,
+    /// Present only while an explicit forced rebuild owns the incomplete staged
+    /// candidate it started from zero. A later forced run continues that
+    /// candidate only while this still describes the archive and the cass
+    /// build (`forced_lexical_rebuild_resume_admitted`). Completion, an audited
+    /// resume and every fresh state drop it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    forced_rebuild_origin: Option<ForcedLexicalRebuildOrigin>,
     #[serde(default)]
     runtime: LexicalRebuildPipelineRuntimeSnapshot,
+}
+
+/// What an explicit forced rebuild started from. The canonical archive's
+/// physical DB/WAL write epoch at that start is the same evidence the run's
+/// own publication must still observe, so a candidate continued under an
+/// unchanged epoch holds only documents built from the rows an uninterrupted
+/// forced run would read. Any write to the archive, or another cass build,
+/// discards the candidate instead.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForcedLexicalRebuildOrigin {
+    source_epoch: lexical_resume::ArchiveEpoch,
+    /// `CASS_VERSION_FULL`: the release and, when known, its build commit.
+    cass_version: String,
+}
+
+impl ForcedLexicalRebuildOrigin {
+    fn capture(source_epoch: &lexical_resume::ArchiveEpoch) -> Self {
+        Self {
+            source_epoch: source_epoch.clone(),
+            cass_version: env!("CASS_VERSION_FULL").to_string(),
+        }
+    }
 }
 
 impl LexicalRebuildState {
@@ -7253,6 +7285,7 @@ impl LexicalRebuildState {
             execution_mode: Some(LexicalRebuildExecutionMode::SharedWriter),
             resume_binding: None,
             completed_source_epoch: None,
+            forced_rebuild_origin: None,
             runtime: LexicalRebuildPipelineRuntimeSnapshot::default(),
         }
     }
@@ -7351,6 +7384,7 @@ impl LexicalRebuildState {
         self.committed_meta_fingerprint = committed_meta_fingerprint;
         self.pending = None;
         self.clear_runtime();
+        self.forced_rebuild_origin = None;
         self.completed = true;
         self.updated_at_ms = FrankenStorage::now_millis();
         self.execution_mode = Some(LexicalRebuildExecutionMode::SharedWriter);
@@ -10351,6 +10385,108 @@ fn reconcile_pending_lexical_commit(
     state.clear_runtime();
     persist_lexical_rebuild_state(index_path, &state)?;
     Ok(state)
+}
+
+/// Whether an explicit forced rebuild may continue `state`'s candidate rather
+/// than start over. Only an incomplete staged candidate that an earlier forced
+/// run of this cass build started from zero qualifies, and only while the
+/// canonical archive still shows the physical write epoch that run started
+/// from, so every committed document came from the rows an uninterrupted
+/// forced run reads. Ordinary, audited, completed and legacy checkpoints, any
+/// archive write and any archive replacement all start over instead.
+fn forced_lexical_rebuild_resume_admitted(
+    index_path: &Path,
+    db_path: &Path,
+    state: &LexicalRebuildState,
+    source_epoch: &lexical_resume::ArchiveEpoch,
+) -> Result<bool> {
+    #[cfg(test)]
+    if FORCED_LEXICAL_RESUME_DISABLED_FOR_TEST.with(std::cell::Cell::get) {
+        return Ok(false);
+    }
+    let Some(origin) = state.forced_rebuild_origin.as_ref() else {
+        return Ok(false);
+    };
+    if !state.is_incomplete()
+        || state.execution_mode != Some(LexicalRebuildExecutionMode::StagedSingleIndex)
+        || state.version != LEXICAL_REBUILD_STATE_VERSION
+        || state.schema_hash != crate::search::tantivy::SCHEMA_HASH
+        || !lexical_rebuild_page_size_is_compatible(state.page_size)
+        || origin.cass_version != env!("CASS_VERSION_FULL")
+        || origin.source_epoch != *source_epoch
+        || !crate::stored_path_identity_matches(&state.db.db_path, db_path)
+    {
+        return Ok(false);
+    }
+    let Some(binding) = state.resume_binding.as_ref() else {
+        return Ok(false);
+    };
+    if lexical_resume::Binding::capture(db_path)?.as_ref() != Some(binding) {
+        return Ok(false);
+    }
+    match fs::symlink_metadata(staged_lexical_rebuild_scratch_path(index_path)) {
+        Ok(metadata) => Ok(metadata.is_dir() && !metadata.file_type().is_symlink()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("inspecting forced lexical rebuild candidate"),
+    }
+}
+
+/// The checkpoint an explicit forced rebuild continues, reconciled as any
+/// resume reconciles it, or `None` to start from zero. Its committed prefix is
+/// replayed by stable conversation id.
+fn forced_lexical_rebuild_resume_state(
+    index_path: &Path,
+    db_path: &Path,
+    storage: &FrankenStorage,
+    source_epoch: &lexical_resume::ArchiveEpoch,
+) -> Result<Option<LexicalRebuildState>> {
+    let Some(state) = load_lexical_rebuild_state(index_path)? else {
+        return Ok(None);
+    };
+    if !forced_lexical_rebuild_resume_admitted(index_path, db_path, &state, source_epoch)? {
+        return Ok(None);
+    }
+    let mut state = reconcile_pending_lexical_commit(index_path, state)?;
+    normalize_lexical_rebuild_state_for_current_run(index_path, &mut state)?;
+    upgrade_lexical_rebuild_state_resume_cursor_if_needed(storage, index_path, &mut state)?;
+    prepare_lexical_rebuild_state_for_active_run(index_path, &mut state)?;
+    Ok(
+        (state.processed_conversations > 0 && state.committed_conversation_id.is_some())
+            .then_some(state),
+    )
+}
+
+/// A resumed forced rebuild re-streams the canonical prefix its candidate
+/// already holds. These are the totals that prefix must reproduce exactly.
+#[derive(Debug, Clone, Copy)]
+struct ForcedLexicalResumePrefix {
+    committed_conversation_id: i64,
+    processed_conversations: usize,
+    indexed_docs: usize,
+}
+
+/// The replayed prefix disagrees with the checkpoint it resumes. Drop the
+/// forced origin so the next forced run starts over instead of repeating this.
+fn refuse_forced_lexical_resume_prefix(
+    index_path: &Path,
+    rebuild_state: &mut LexicalRebuildState,
+    prefix: ForcedLexicalResumePrefix,
+    processed_conversations: usize,
+    indexed_docs: usize,
+) -> anyhow::Error {
+    rebuild_state.forced_rebuild_origin = None;
+    let refusal = anyhow::anyhow!(
+        "forced lexical resume replayed {processed_conversations} conversations and \
+         {indexed_docs} documents through conversation {}, but its checkpoint committed \
+         {} and {}; the next forced rebuild starts from zero",
+        prefix.committed_conversation_id,
+        prefix.processed_conversations,
+        prefix.indexed_docs,
+    );
+    match persist_lexical_rebuild_state(index_path, rebuild_state) {
+        Ok(()) => refusal,
+        Err(error) => anyhow::anyhow!("{refusal:#}; clearing its forced origin failed: {error:#}"),
+    }
 }
 
 fn prepare_lexical_rebuild_state_for_active_run(
@@ -14008,6 +14144,7 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
     // checkpoint's indexed_docs against live Tantivy observations.
     state.indexed_docs = observed_tantivy_docs;
     state.pending = None;
+    state.forced_rebuild_origin = None;
     state.completed = true;
     state.committed_meta_fingerprint = committed_meta_fingerprint;
     state.updated_at_ms = FrankenStorage::now_millis();
@@ -26175,6 +26312,58 @@ fn lexical_post_run_maintenance_skipped_for_test() -> bool {
         .is_some_and(|raw| matches!(raw.trim(), "1" | "true" | "yes"))
 }
 
+/// Where the next lexical rebuild on this test thread stops, as a process
+/// killed at that point would: after its Nth durable ingest commit, or after
+/// its final ingest commit and the first publication of its post-run fold.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexicalRebuildTestInterrupt {
+    AfterCommits(usize),
+    DuringFold,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEXICAL_REBUILD_TEST_INTERRUPT: std::cell::Cell<Option<LexicalRebuildTestInterrupt>> =
+        const { std::cell::Cell::new(None) };
+    /// The incumbent arm: forced rebuilds on this thread never resume.
+    static FORCED_LEXICAL_RESUME_DISABLED_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Documents this thread's streamed rebuild batches handed to the writer.
+    static LEXICAL_REBUILD_TEST_ADDED_DOCS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn lexical_rebuild_test_interrupt_after_commit() -> Result<()> {
+    LEXICAL_REBUILD_TEST_INTERRUPT.with(|interrupt| match interrupt.get() {
+        Some(LexicalRebuildTestInterrupt::AfterCommits(commits)) if commits <= 1 => {
+            interrupt.set(None);
+            anyhow::bail!("test interrupt after a durable lexical rebuild commit")
+        }
+        Some(LexicalRebuildTestInterrupt::AfterCommits(commits)) => {
+            interrupt.set(Some(LexicalRebuildTestInterrupt::AfterCommits(commits - 1)));
+            Ok(())
+        }
+        _ => Ok(()),
+    })
+}
+
+#[cfg(test)]
+fn lexical_rebuild_test_interrupt_during_fold(t_index: &mut TantivyIndex) -> Result<()> {
+    if LEXICAL_REBUILD_TEST_INTERRUPT.with(|interrupt| {
+        let armed = interrupt.get() == Some(LexicalRebuildTestInterrupt::DuringFold);
+        if armed {
+            interrupt.set(None);
+        }
+        armed
+    }) {
+        t_index.force_merge_first_runs_for_test(1)?;
+        anyhow::bail!("test interrupt during the post-rebuild lexical fold");
+    }
+    Ok(())
+}
+
 /// GH #440 test hook (tests/cli_index.rs): after the Nth staged engine commit
 /// (`CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMITS`, default 1), write a
 /// sentinel describing the authority/checkpoint gap the commit just opened
@@ -28497,7 +28686,22 @@ fn rebuild_tantivy_from_db_once(
     );
 
     let mut rebuild_state = if options.defer_initial_content_fingerprint {
-        LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
+        // An explicit forced rebuild never trusts a generation from before it
+        // started; it may continue only the candidate its own forced pass
+        // started from zero against this unchanged archive.
+        let forced_resume = if options.force_fresh {
+            forced_lexical_rebuild_resume_state(
+                &index_path,
+                db_path,
+                &storage,
+                &rebuild_source_epoch,
+            )?
+        } else {
+            None
+        };
+        forced_resume.unwrap_or_else(|| {
+            LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
+        })
     } else {
         match load_lexical_rebuild_state(&index_path)? {
             Some(state) if state.matches_run(&db_state, LEXICAL_REBUILD_PAGE_SIZE) => {
@@ -28815,8 +29019,27 @@ fn rebuild_tantivy_from_db_once(
     });
     if restart_from_zero && staged_build_path.is_some() {
         rebuild_state.resume_binding = lexical_resume::Binding::capture(db_path)?;
+        rebuild_state.forced_rebuild_origin = options
+            .force_fresh
+            .then(|| ForcedLexicalRebuildOrigin::capture(&rebuild_source_epoch));
     }
     let resumed_from_checkpoint = rebuild_state.processed_conversations > 0;
+    // A resumed forced rebuild streams the canonical archive from its start,
+    // as an uninterrupted run does, but does not re-add the conversations its
+    // candidate already committed: every count, fingerprint and equivalence
+    // proof then sees the uninterrupted run's exact packet stream.
+    let mut forced_resume_prefix = if options.force_fresh && !restart_from_zero {
+        rebuild_state
+            .committed_conversation_id
+            .map(|committed_conversation_id| ForcedLexicalResumePrefix {
+                committed_conversation_id,
+                processed_conversations: rebuild_state.processed_conversations,
+                indexed_docs: rebuild_state.indexed_docs,
+            })
+    } else {
+        None
+    };
+    let replays_forced_prefix = forced_resume_prefix.is_some();
     log_prep_step("restart_from_zero_reset", &mut prep_step_started);
     let batch_conversation_limit = lexical_rebuild_batch_fetch_conversation_limit(page_size);
     let initial_batch_conversation_limit =
@@ -28828,10 +29051,22 @@ fn rebuild_tantivy_from_db_once(
     let progress_heartbeat_interval_conversations =
         lexical_rebuild_progress_heartbeat_interval_conversations();
     let progress_heartbeat_interval = lexical_rebuild_progress_heartbeat_interval();
-    let mut indexed_docs = rebuild_state.indexed_docs;
-    let mut observed_messages = rebuild_state.indexed_docs;
-    let mut processed_conversations = rebuild_state.processed_conversations;
-    let mut last_processed_conversation_id = rebuild_state.committed_conversation_id;
+    // A replayed forced prefix counts its own conversations again, from zero.
+    let (
+        mut indexed_docs,
+        mut observed_messages,
+        mut processed_conversations,
+        mut last_processed_conversation_id,
+    ) = if replays_forced_prefix {
+        (0, 0, 0, None)
+    } else {
+        (
+            rebuild_state.indexed_docs,
+            rebuild_state.indexed_docs,
+            rebuild_state.processed_conversations,
+            rebuild_state.committed_conversation_id,
+        )
+    };
     let mut conversations_since_commit = 0usize;
     let mut messages_since_commit = 0usize;
     let mut message_bytes_since_commit = 0usize;
@@ -29082,8 +29317,7 @@ fn rebuild_tantivy_from_db_once(
         p.phase.store(2, Ordering::Relaxed);
         p.is_rebuilding.store(true, Ordering::Relaxed);
         p.total.store(total_conversations, Ordering::Relaxed);
-        p.current
-            .store(rebuild_state.processed_conversations, Ordering::Relaxed);
+        p.current.store(processed_conversations, Ordering::Relaxed);
         p.total_is_final.store(
             !options.defer_initial_content_fingerprint,
             Ordering::Relaxed,
@@ -29094,7 +29328,7 @@ fn rebuild_tantivy_from_db_once(
     if producer_handle.is_none() {
         producer_handle = Some(spawn_lexical_rebuild_packet_producer(
             db_path.to_path_buf(),
-            rebuild_state.committed_conversation_id,
+            last_processed_conversation_id,
             staged_shard_plan.clone(),
             page_size,
             pipeline_channel_size,
@@ -29286,6 +29520,8 @@ fn rebuild_tantivy_from_db_once(
                         true,
                         perf_profile.as_mut(),
                     )?;
+                    #[cfg(test)]
+                    lexical_rebuild_test_interrupt_after_commit()?;
                     conversations_since_commit = 0;
                     messages_since_commit = 0;
                     message_bytes_since_commit = 0;
@@ -29444,6 +29680,69 @@ fn rebuild_tantivy_from_db_once(
                                 && let Some(last_message_id) = packet.last_message_id
                             {
                                 max_message_id = max_message_id.max(last_message_id);
+                            }
+                            if let Some(prefix) = forced_resume_prefix {
+                                let conversation_id =
+                                    packet.identity.conversation_id.ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "forced lexical resume replay packet has no stable conversation id"
+                                        )
+                                    })?;
+                                if conversation_id > prefix.committed_conversation_id {
+                                    return Err(refuse_forced_lexical_resume_prefix(
+                                        &index_path,
+                                        &mut rebuild_state,
+                                        prefix,
+                                        processed_conversations,
+                                        indexed_docs,
+                                    ));
+                                }
+                                // Committed by the forced run being resumed:
+                                // account for it as its flush did, in arrival
+                                // order, without adding it to the index again.
+                                equivalence_accumulator.absorb_packet(&packet);
+                                indexed_docs =
+                                    indexed_docs.saturating_add(packet.prebuilt_docs().len());
+                                observed_messages =
+                                    observed_messages.saturating_add(packet.message_count);
+                                let chunk = packet.chunk.clone();
+                                let reserved_bytes = packet.flow_reservation_bytes;
+                                drop(packet);
+                                StreamingBatchFlowReservation::new(
+                                    Some(lexical_rebuild_flow_limiter.as_ref()),
+                                    reserved_bytes,
+                                )
+                                .release_now();
+                                if let Some(chunk) = chunk.filter(|chunk| !chunk.is_final) {
+                                    chunk.gate.flushed();
+                                    bump_index_run_lock_progress_if_present(progress_bump.as_ref());
+                                    continue;
+                                }
+                                processed_conversations = processed_conversations.saturating_add(1);
+                                last_processed_conversation_id = Some(conversation_id);
+                                if let Some(p) = &progress {
+                                    p.current.fetch_add(1, Ordering::Relaxed);
+                                    if options.defer_initial_content_fingerprint {
+                                        p.total
+                                            .fetch_max(processed_conversations, Ordering::Relaxed);
+                                    }
+                                }
+                                bump_index_run_lock_progress_if_present(progress_bump.as_ref());
+                                if conversation_id == prefix.committed_conversation_id {
+                                    if processed_conversations != prefix.processed_conversations
+                                        || indexed_docs != prefix.indexed_docs
+                                    {
+                                        return Err(refuse_forced_lexical_resume_prefix(
+                                            &index_path,
+                                            &mut rebuild_state,
+                                            prefix,
+                                            processed_conversations,
+                                            indexed_docs,
+                                        ));
+                                    }
+                                    forced_resume_prefix = None;
+                                }
+                                continue;
                             }
                             // Every packet enters `pending_batch` in arrival
                             // order; each flush absorbs its batch into the
@@ -29655,6 +29954,15 @@ fn rebuild_tantivy_from_db_once(
         }
         pipeline_result?;
     }
+    if let Some(prefix) = forced_resume_prefix {
+        return Err(refuse_forced_lexical_resume_prefix(
+            &index_path,
+            &mut rebuild_state,
+            prefix,
+            processed_conversations,
+            indexed_docs,
+        ));
+    }
 
     flush_streamed_lexical_rebuild_batch(
         &mut pending_batch,
@@ -29731,6 +30039,8 @@ fn rebuild_tantivy_from_db_once(
     let candidate_segments =
         publication.run("count_candidate_segments", || t_index.segment_count())?;
     let merge_started = Instant::now();
+    #[cfg(test)]
+    lexical_rebuild_test_interrupt_during_fold(&mut t_index)?;
     if lexical_post_run_maintenance_skipped_for_test() {
         tracing::warn!(
             segments = candidate_segments,
@@ -29821,8 +30131,9 @@ fn rebuild_tantivy_from_db_once(
     // GH #440: indexed_docs omits hard-noise messages from the committed
     // prefix, so prefix docs + newly streamed rows is not an exact canonical
     // count after resume. Count once at completion while the readonly handle
-    // is still open; fresh rebuilds already observed every canonical packet.
-    let final_observed_messages = if resumed_from_checkpoint {
+    // is still open; fresh rebuilds and a replayed forced prefix already
+    // observed every canonical packet.
+    let final_observed_messages = if resumed_from_checkpoint && !replays_forced_prefix {
         publication.run("count_canonical_messages", || {
             count_total_messages_exact(&storage)
         })?
@@ -46654,6 +46965,7 @@ mod tests {
     include!("gh494_tests.rs");
     include!("gh496_tests.rs");
     include!("gh496_completed_tests.rs");
+    include!("forced_resume_tests.rs");
     use super::*;
     use crate::connectors::{
         Connector, DetectionResult, NormalizedConversation, NormalizedMessage, ScanContext,

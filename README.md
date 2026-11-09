@@ -1666,7 +1666,13 @@ Edits or deletions affecting retained search documents, a replaced archive,
 incompatible projection settings, and damaged or inconsistent index evidence
 reject reuse. The rejected candidate is retained in a
 `.lexical-rebuild-quarantine-*` directory and a fresh replacement is built
-off-live. Explicit `--force-rebuild` still requests a fresh pass.
+off-live. Explicit `--force-rebuild` still requests a fresh pass: it never
+reuses a generation from before it started. If that pass is itself
+interrupted, rerunning `cass index --force-rebuild` with the same cass build
+continues it, provided the archive has not been written since the pass began.
+The rerun reads the archive from the start again but indexes only the
+conversations the pass had not committed, or only finishes its final merge.
+Any archive write, another cass build, or `--full` starts over.
 
 The audit shares the immutable native snapshot admitted by the candidate's
 writer. It does not independently open an earlier generation and then assume
