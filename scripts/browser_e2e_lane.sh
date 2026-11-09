@@ -42,12 +42,14 @@ case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) exe=".exe" ;; esac
 sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
 
 if [ "$build" = 1 ]; then
-    (cd "$repo" && cargo build --locked --release --bin cass --bin cass-pages-perf-bundle)
+    RCH_TARGET_DIR="$CARGO_TARGET_DIR"
+    source "$repo/scripts/lib/run_cargo.sh"
+    (cd "$repo" && run_cargo build --locked --release --bin cass --bin cass-pages-perf-bundle)
 fi
 cass="$CARGO_TARGET_DIR/release/cass$exe"
 [ -x "$cass" ] || { echo "browser lane: no cass binary at $cass" >&2; exit 2; }
 
-cd "$repo/tests"
+cd "$repo/tests" || exit
 [ -d node_modules/@playwright/test ] || npm ci --no-audit --no-fund
 project_args=()
 browsers=()
