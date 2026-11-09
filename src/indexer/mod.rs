@@ -5421,6 +5421,53 @@ struct LexicalRebuildPacketSemanticView {
     message_bytes: usize,
 }
 
+/// Run `add` (the batch's Quill ingest) on the calling thread while a helper
+/// thread absorbs `batch` into `equivalence_accumulator`, packet by packet in
+/// batch order, exactly as the consumer loop used to absorb each packet on
+/// arrival. The consumer pushes every packet into the pending batch in arrival
+/// order and every flush drains the whole batch, so the accumulator sees the
+/// same packets in the same order; only the thread doing the hashing changes.
+/// Without an accumulator this is just `add()`. If the OS refuses the helper
+/// thread, the batch is absorbed inline before the add.
+fn lexical_rebuild_add_absorbing_equivalence<T>(
+    batch: &[LexicalRebuildConversationPacket],
+    equivalence_accumulator: Option<&mut LexicalRebuildEquivalenceAccumulator>,
+    add: impl FnOnce() -> T,
+) -> T {
+    let Some(accumulator) = equivalence_accumulator else {
+        return add();
+    };
+    let accumulator = Mutex::new(accumulator);
+    let absorb = || {
+        let mut accumulator = accumulator.lock().unwrap_or_else(|e| e.into_inner());
+        for packet in batch {
+            accumulator.absorb_packet(packet);
+        }
+    };
+    std::thread::scope(|scope| {
+        match std::thread::Builder::new()
+            .name("cass-index-evidence".to_string())
+            .spawn_scoped(scope, absorb)
+        {
+            Ok(absorber) => {
+                let added = add();
+                if let Err(payload) = absorber.join() {
+                    std::panic::resume_unwind(payload);
+                }
+                added
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "lexical rebuild could not spawn the equivalence-evidence thread; absorbing the batch on the consumer thread"
+                );
+                absorb();
+                add()
+            }
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn flush_streamed_lexical_rebuild_batch(
     pending_batch: &mut Vec<LexicalRebuildConversationPacket>,
@@ -5428,6 +5475,7 @@ fn flush_streamed_lexical_rebuild_batch(
     pending_batch_message_bytes: &mut usize,
     lexical_rebuild_flow_limiter: Option<&StreamingByteLimiter>,
     lexical_rebuild_worker_pool: Option<&ThreadPool>,
+    equivalence_accumulator: Option<&mut LexicalRebuildEquivalenceAccumulator>,
     t_index: &mut TantivyIndex,
     indexed_docs: &mut usize,
     messages_since_commit: &mut usize,
@@ -5468,8 +5516,11 @@ fn flush_streamed_lexical_rebuild_batch(
     let prepared_docs =
         lexical_rebuild_prepare_prebuilt_doc_refs(pending_batch, lexical_rebuild_worker_pool);
     let add_started = perf_profile.as_ref().map(|_| Instant::now());
-    *indexed_docs = (*indexed_docs)
-        .saturating_add(t_index.add_prebuilt_document_refs_slice(prepared_docs.as_slice())?);
+    let added =
+        lexical_rebuild_add_absorbing_equivalence(pending_batch, equivalence_accumulator, || {
+            t_index.add_prebuilt_document_refs_slice(prepared_docs.as_slice())
+        })?;
+    *indexed_docs = (*indexed_docs).saturating_add(added);
     // `prepared_docs` borrows the packet strings. Drop those views, then free
     // the packets before publishing their byte capacity back to page prep.
     // Releasing first lets a newly awakened worker allocate the next giant
@@ -6754,6 +6805,7 @@ fn flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
     pending_batch_message_bytes: &mut usize,
     lexical_rebuild_flow_limiter: Option<&StreamingByteLimiter>,
     lexical_rebuild_worker_pool: Option<&ThreadPool>,
+    equivalence_accumulator: Option<&mut LexicalRebuildEquivalenceAccumulator>,
     t_index: &mut TantivyIndex,
     indexed_docs: &mut usize,
     messages_since_commit: &mut usize,
@@ -6778,6 +6830,7 @@ fn flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
         pending_batch_message_bytes,
         lexical_rebuild_flow_limiter,
         lexical_rebuild_worker_pool,
+        equivalence_accumulator,
         t_index,
         indexed_docs,
         messages_since_commit,
@@ -29148,6 +29201,7 @@ fn rebuild_tantivy_from_db_once(
                         &mut pending_batch_message_bytes,
                         Some(lexical_rebuild_flow_limiter.as_ref()),
                         lexical_rebuild_worker_pool.as_deref(),
+                        Some(&mut equivalence_accumulator),
                         &mut t_index,
                         &mut indexed_docs,
                         &mut messages_since_commit,
@@ -29192,6 +29246,7 @@ fn rebuild_tantivy_from_db_once(
                         &mut pending_batch_message_bytes,
                         Some(lexical_rebuild_flow_limiter.as_ref()),
                         lexical_rebuild_worker_pool.as_deref(),
+                        Some(&mut equivalence_accumulator),
                         &mut t_index,
                         &mut indexed_docs,
                         &mut messages_since_commit,
@@ -29390,7 +29445,9 @@ fn rebuild_tantivy_from_db_once(
                             {
                                 max_message_id = max_message_id.max(last_message_id);
                             }
-                            equivalence_accumulator.absorb_packet(&packet);
+                            // Every packet enters `pending_batch` in arrival
+                            // order; each flush absorbs its batch into the
+                            // equivalence accumulator while Quill ingests it.
                             if let Some(chunk) =
                                 packet.chunk.clone().filter(|chunk| !chunk.is_final)
                             {
@@ -29412,6 +29469,7 @@ fn rebuild_tantivy_from_db_once(
                                     &mut pending_batch_message_bytes,
                                     Some(lexical_rebuild_flow_limiter.as_ref()),
                                     lexical_rebuild_worker_pool.as_deref(),
+                                    Some(&mut equivalence_accumulator),
                                     &mut t_index,
                                     &mut indexed_docs,
                                     &mut messages_since_commit,
@@ -29434,6 +29492,7 @@ fn rebuild_tantivy_from_db_once(
                             &mut pending_batch_message_bytes,
                             Some(lexical_rebuild_flow_limiter.as_ref()),
                             lexical_rebuild_worker_pool.as_deref(),
+                            Some(&mut equivalence_accumulator),
                             &mut t_index,
                             &mut indexed_docs,
                             &mut messages_since_commit,
@@ -29512,6 +29571,7 @@ fn rebuild_tantivy_from_db_once(
                                 &mut pending_batch_message_bytes,
                                 Some(lexical_rebuild_flow_limiter.as_ref()),
                                 lexical_rebuild_worker_pool.as_deref(),
+                                Some(&mut equivalence_accumulator),
                                 &mut t_index,
                                 &mut indexed_docs,
                                 &mut messages_since_commit,
@@ -29553,6 +29613,7 @@ fn rebuild_tantivy_from_db_once(
                                 &mut pending_batch_message_bytes,
                                 Some(lexical_rebuild_flow_limiter.as_ref()),
                                 lexical_rebuild_worker_pool.as_deref(),
+                                Some(&mut equivalence_accumulator),
                                 &mut t_index,
                                 &mut indexed_docs,
                                 &mut messages_since_commit,
@@ -29601,6 +29662,7 @@ fn rebuild_tantivy_from_db_once(
         &mut pending_batch_message_bytes,
         Some(lexical_rebuild_flow_limiter.as_ref()),
         lexical_rebuild_worker_pool.as_deref(),
+        Some(&mut equivalence_accumulator),
         &mut t_index,
         &mut indexed_docs,
         &mut messages_since_commit,
@@ -52135,6 +52197,7 @@ mod tests {
             &mut pending_batch_message_bytes,
             Some(&limiter),
             None,
+            None,
             &mut t_index,
             &mut indexed_docs,
             &mut messages_since_commit,
@@ -52238,6 +52301,7 @@ mod tests {
             &mut pending_batch_message_count,
             &mut pending_batch_message_bytes,
             Some(&limiter),
+            None,
             None,
             &mut t_index,
             &mut indexed_docs,
@@ -66713,6 +66777,231 @@ c.close()
         );
     }
 
+    /// Packets for the flush-time absorption tests: every default probe,
+    /// unicode, noise (empty, whitespace, a short acknowledgement), tool rows,
+    /// one long message, absent optional fields, and one conversation without
+    /// an id (it absorbs a packet header but contributes no documents).
+    fn equivalence_absorb_fixture_packets() -> Vec<LexicalRebuildConversationPacket> {
+        let contents = [
+            "error: cannot find function `parse` in this scope",
+            "TODO: add a test for the import path",
+            "",
+            "   ",
+            "ok",
+            "plain words without any probe",
+            "función de prueba: 東京 import test",
+            "import std::collections::HashMap; // test the error branch",
+        ];
+        (0..24_i64)
+            .map(|sequence| {
+                let messages = (0..sequence % 5 + 1)
+                    .map(
+                        |idx| crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
+                            idx,
+                            is_tool_role: idx % 3 == 2,
+                            created_at: (idx % 2 == 0)
+                                .then_some(1_700_000_900_000 + sequence * 100 + idx),
+                            content: if sequence == 7 && idx == 0 {
+                                "function body ".repeat(700)
+                            } else {
+                                let slot =
+                                    usize::try_from(sequence + idx).unwrap() % contents.len();
+                                contents[slot].to_string()
+                            },
+                        },
+                    )
+                    .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>();
+                LexicalRebuildConversationPacket::from_canonical_replay(
+                    crate::storage::sqlite::LexicalRebuildConversationRow {
+                        id: (sequence != 11).then_some(900 + sequence),
+                        agent_slug: if sequence % 2 == 0 {
+                            "codex"
+                        } else {
+                            "claude_code"
+                        }
+                        .into(),
+                        workspace: (sequence % 4 != 3)
+                            .then(|| PathBuf::from(format!("/tmp/absorb-ws-{}", sequence % 3))),
+                        external_id: Some(format!("absorb-{sequence}")),
+                        title: (sequence % 5 != 4).then(|| format!("Absorb test {sequence}")),
+                        source_path: PathBuf::from(format!("/tmp/absorb-{sequence}.jsonl")),
+                        started_at: Some(1_700_000_900_000 + sequence * 100),
+                        ended_at: Some(1_700_000_900_050 + sequence * 100),
+                        source_id: LOCAL_SOURCE_ID.into(),
+                        origin_host: None,
+                    },
+                    messages,
+                    Some(10_000 + sequence),
+                    &HashMap::new(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flush_absorbs_equivalence_evidence_identical_to_arrival_order_absorption() {
+        let packets = equivalence_absorb_fixture_packets();
+        let mut arrival = LexicalRebuildEquivalenceAccumulator::new();
+        for packet in &packets {
+            arrival.absorb_packet(packet);
+        }
+        let arrival = arrival.finalize();
+
+        let tmp = TempDir::new().unwrap();
+        let mut t_index = TantivyIndex::open_or_create(&tmp.path().join("tantivy")).unwrap();
+        let mut flushed = LexicalRebuildEquivalenceAccumulator::new();
+        let mut pending = Vec::new();
+        let (mut pending_messages, mut pending_bytes) = (0_usize, 0_usize);
+        let (mut indexed_docs, mut messages_since_commit, mut bytes_since_commit) =
+            (0_usize, 0_usize, 0_usize);
+        let mut remaining = packets.clone().into_iter();
+        for batch_len in [1_usize, 7, 3, 9, 4] {
+            for packet in remaining.by_ref().take(batch_len) {
+                pending_messages += packet.message_count;
+                pending_bytes += packet.message_bytes;
+                pending.push(packet);
+            }
+            flush_streamed_lexical_rebuild_batch(
+                &mut pending,
+                &mut pending_messages,
+                &mut pending_bytes,
+                None,
+                None,
+                Some(&mut flushed),
+                &mut t_index,
+                &mut indexed_docs,
+                &mut messages_since_commit,
+                &mut bytes_since_commit,
+                8,
+                8,
+                None,
+            )
+            .unwrap();
+            assert!(pending.is_empty(), "a flush must drain its batch");
+        }
+        assert!(remaining.next().is_none(), "every packet must be flushed");
+        t_index.commit().unwrap();
+        let flushed = flushed.finalize();
+
+        assert_eq!(
+            flushed, arrival,
+            "absorbing each flushed batch must reproduce the arrival-order evidence"
+        );
+        assert_eq!(flushed.document_count, indexed_docs as u64);
+        assert!(
+            flushed
+                .golden_query_hit_counts
+                .iter()
+                .all(|hit| hit.hit_count > 0),
+            "the fixture must exercise every probe hasher: {:?}",
+            flushed.golden_query_hit_counts
+        );
+        // The evidence is order-sensitive, so the equality above would catch
+        // a reordered or partial absorption.
+        let mut reversed = LexicalRebuildEquivalenceAccumulator::new();
+        for packet in packets.iter().rev() {
+            reversed.absorb_packet(packet);
+        }
+        assert_ne!(
+            reversed.finalize().manifest_fingerprint,
+            arrival.manifest_fingerprint
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn rebuild_tantivy_from_db_equivalence_evidence_matches_arrival_order_packet_absorption() {
+        let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
+        let _conversation_limit = set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "2");
+        let _initial_conversation_limit = set_env(
+            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
+            "1",
+        );
+        let _commit_messages = set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES", "5");
+        let _initial_commit_messages =
+            set_env("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES", "3");
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let contents = [
+            "error: the function returned early",
+            "TODO: cover the import path with a test",
+            "ok",
+            "plain words without any probe",
+        ];
+        for sequence in 0..9_i64 {
+            let base_ts = 1_700_000_950_000 + sequence * 1_000;
+            let external_id = format!("absorb-rebuild-{sequence}");
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &Conversation {
+                        id: None,
+                        agent_slug: "codex".into(),
+                        workspace: Some(PathBuf::from("/tmp/workspace")),
+                        external_id: Some(external_id.clone()),
+                        title: Some(format!("Absorb rebuild {sequence}")),
+                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+                        started_at: Some(base_ts),
+                        ended_at: Some(base_ts + 100),
+                        approx_tokens: Some(64),
+                        metadata_json: serde_json::Value::Null,
+                        messages: (0..3_i64)
+                            .map(|idx| Message {
+                                id: None,
+                                idx,
+                                role: if idx % 2 == 0 {
+                                    MessageRole::User
+                                } else {
+                                    MessageRole::Agent
+                                },
+                                author: None,
+                                created_at: Some(base_ts + 10 * (idx + 1)),
+                                content: format!(
+                                    "{} ({external_id}/{idx})",
+                                    contents[usize::try_from(sequence + idx).unwrap() % 4]
+                                ),
+                                extra_json: serde_json::Value::Null,
+                                snippets: Vec::new(),
+                            })
+                            .collect(),
+                        source_id: LOCAL_SOURCE_ID.into(),
+                        origin_host: None,
+                    },
+                )
+                .unwrap();
+        }
+        let mut arrival = LexicalRebuildEquivalenceAccumulator::new();
+        for packet in &keyset_batched_lexical_rebuild_packets(&storage, 4, 2).unwrap() {
+            arrival.absorb_packet(packet);
+        }
+        let arrival = arrival.finalize();
+        drop(storage);
+
+        let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 9, None).unwrap();
+        assert_eq!(rebuild.indexed_docs, 27);
+        let evidence = rebuild
+            .equivalence
+            .expect("authoritative rebuild must emit equivalence evidence");
+        assert_eq!(
+            evidence, arrival,
+            "the rebuild's flush-time absorption must equal arrival-order absorption of its packets"
+        );
+        assert_eq!(evidence.document_count, 27);
+    }
+
     /// Deterministic xorshift64* stream for the consumer A/B corpus.
     struct ConsumerAbRng(u64);
 
@@ -66795,6 +67084,53 @@ c.close()
         text
     }
 
+    /// The fetched conversation row and message rows of conversation
+    /// `sequence`, as page prep receives them from SQLite.
+    fn consumer_ab_rows(
+        sequence: usize,
+        messages: usize,
+        mean_bytes: usize,
+    ) -> (
+        crate::storage::sqlite::LexicalRebuildConversationRow,
+        Vec<Message>,
+    ) {
+        let mut rng = ConsumerAbRng::new(sequence as u64 + 1);
+        let base = 1_700_000_000_000_i64 + sequence as i64 * 100_000;
+        let conversation_id = sequence as i64 + 1;
+        let row = crate::storage::sqlite::LexicalRebuildConversationRow {
+            id: Some(conversation_id),
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from(format!(
+                "/workspace/consumer{}",
+                sequence % 8
+            ))),
+            external_id: Some(format!("consumer-{sequence}")),
+            title: Some(format!("Consumer fixture {sequence}")),
+            source_path: PathBuf::from(format!("/archive/consumer-{sequence}.jsonl")),
+            started_at: Some(base),
+            ended_at: Some(base + messages as i64),
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        let rows = (0..messages)
+            .map(|idx| Message {
+                id: Some(conversation_id * 1_000_000 + idx as i64),
+                idx: idx as i64,
+                role: if idx % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Agent
+                },
+                author: None,
+                created_at: Some(base + idx as i64),
+                content: consumer_ab_message_text(&mut rng, mean_bytes, idx),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            })
+            .collect();
+        (row, rows)
+    }
+
     /// One page of canonical-replay packets, built the way page prep builds
     /// them from fetched rows.
     fn consumer_ab_packets(
@@ -66807,40 +67143,7 @@ c.close()
         (first..first + count)
             .into_par_iter()
             .map(|sequence| {
-                let mut rng = ConsumerAbRng::new(sequence as u64 + 1);
-                let base = 1_700_000_000_000_i64 + sequence as i64 * 100_000;
-                let conversation_id = sequence as i64 + 1;
-                let row = crate::storage::sqlite::LexicalRebuildConversationRow {
-                    id: Some(conversation_id),
-                    agent_slug: "codex".into(),
-                    workspace: Some(PathBuf::from(format!(
-                        "/workspace/consumer{}",
-                        sequence % 8
-                    ))),
-                    external_id: Some(format!("consumer-{sequence}")),
-                    title: Some(format!("Consumer fixture {sequence}")),
-                    source_path: PathBuf::from(format!("/archive/consumer-{sequence}.jsonl")),
-                    started_at: Some(base),
-                    ended_at: Some(base + messages as i64),
-                    source_id: LOCAL_SOURCE_ID.into(),
-                    origin_host: None,
-                };
-                let rows = (0..messages)
-                    .map(|idx| Message {
-                        id: Some(conversation_id * 1_000_000 + idx as i64),
-                        idx: idx as i64,
-                        role: if idx % 2 == 0 {
-                            MessageRole::User
-                        } else {
-                            MessageRole::Agent
-                        },
-                        author: None,
-                        created_at: Some(base + idx as i64),
-                        content: consumer_ab_message_text(&mut rng, mean_bytes, idx),
-                        extra_json: serde_json::Value::Null,
-                        snippets: Vec::new(),
-                    })
-                    .collect();
+                let (row, rows) = consumer_ab_rows(sequence, messages, mean_bytes);
                 LexicalRebuildConversationPacket::from_canonical_replay_messages(
                     row,
                     rows,
@@ -66893,14 +67196,17 @@ c.close()
     /// packet into the equivalence accumulator, flush batches through the
     /// production flush (prepare + add), and commit on the production
     /// startup-then-steady cadence, exactly as the consumer loop of
-    /// `rebuild_tantivy_from_db` does. Returns the run and a witness of its
+    /// `rebuild_tantivy_from_db` does. With `overlap_absorb` the flush absorbs
+    /// its batch while Quill ingests it (the production consumer); without
+    /// it each packet is absorbed on arrival on this thread (the consumer
+    /// before that change). Returns the run and a witness of its
     /// output: equivalence evidence, indexed count, every segment's docid
     /// range and doc count, and the ranked hits (score bits, global docid,
     /// document id) and exact totals of `queries`.
     fn consumer_ab_run_arm(
         base: &Path,
         (conversations, messages, mean_bytes, batch_limit): (usize, usize, usize, usize),
-        (arm, serial_projection, round): (&str, bool, usize),
+        (arm, serial_projection, overlap_absorb, round): (&str, bool, bool, usize),
         queries: &[String],
     ) -> (ConsumerAbRun, Vec<String>) {
         use crate::search::quill_bridge::{
@@ -66946,6 +67252,7 @@ c.close()
                     &mut pending_bytes,
                     None,
                     None,
+                    overlap_absorb.then_some(&mut accumulator),
                     &mut t_index,
                     &mut indexed_docs,
                     &mut messages_since_commit,
@@ -66974,9 +67281,11 @@ c.close()
             generate += started.elapsed();
             next = page_end;
             for packet in packets {
-                let started = Instant::now();
-                accumulator.absorb_packet(&packet);
-                absorb += started.elapsed();
+                if !overlap_absorb {
+                    let started = Instant::now();
+                    accumulator.absorb_packet(&packet);
+                    absorb += started.elapsed();
+                }
                 pending_messages += packet.message_count;
                 pending_bytes += packet.message_bytes;
                 pending.push(packet);
@@ -67159,7 +67468,29 @@ c.close()
             })
         );
 
-        let arms: [(&str, bool); 3] = [("incumbent", true), ("candidate", false), ("null", true)];
+        consumer_ab_rounds_and_report(
+            &base,
+            (conversations, messages, mean_bytes, batch_limit),
+            &[
+                ("incumbent", true, false),
+                ("candidate", false, false),
+                ("null", true, false),
+            ],
+            rounds,
+        );
+    }
+
+    /// One unrecorded warm-up round plus `rounds` recorded rounds of every
+    /// `(arm, serial_projection, overlap_absorb)` in `arms`, alternating arm
+    /// order each round; prints a `CONSUMER_AB_SUMMARY` per arm (p50, min,
+    /// max, paired ratios against the same round's `incumbent`) and asserts
+    /// that every run produced one witness and one document count.
+    fn consumer_ab_rounds_and_report(
+        base: &Path,
+        shape: (usize, usize, usize, usize),
+        arms: &[(&str, bool, bool)],
+        rounds: usize,
+    ) {
         let queries: Vec<String> = [
             "error", "test", "function", "import", "the", "cargo", "aab", "fixture", "consumer",
             "zzz",
@@ -67177,11 +67508,11 @@ c.close()
                 (0..arms.len()).rev().collect()
             };
             for index in order {
-                let (arm, serial_projection) = arms[index];
+                let (arm, serial_projection, overlap_absorb) = arms[index];
                 let (run, witness) = consumer_ab_run_arm(
-                    &base,
-                    (conversations, messages, mean_bytes, batch_limit),
-                    (arm, serial_projection, round),
+                    base,
+                    shape,
+                    (arm, serial_projection, overlap_absorb, round),
                     &queries,
                 );
                 if let Some(expected) = &reference {
@@ -67209,7 +67540,7 @@ c.close()
             samples.sort_by(f64::total_cmp);
             samples[((samples.len() - 1) as f64 * q).round() as usize]
         };
-        for (arm, _) in arms {
+        for &(arm, _, _) in arms {
             let mine: Vec<&ConsumerAbRun> = runs.iter().filter(|run| run.arm == arm).collect();
             let field = |pick: fn(&ConsumerAbRun) -> f64| -> Vec<f64> {
                 mine.iter().map(|run| pick(run)).collect()
@@ -67268,6 +67599,137 @@ c.close()
             mismatches.is_empty(),
             "arms produced different generations:\n{}",
             mismatches.join("\n")
+        );
+    }
+
+    /// Same-invocation A/B of where the full rebuild's consumer absorbs
+    /// packets into the equivalence accumulator: on arrival, on the consumer
+    /// thread (`incumbent`, the consumer before this change), against inside
+    /// each flush on a helper thread while Quill ingests the batch
+    /// (`candidate`, production), plus an A/A `null` arm that repeats the
+    /// incumbent. Same shape knobs as `consumer_projection_benchmark_arms`.
+    /// First a single-thread stage profile of the per-document work on the
+    /// first pages: page prep's packet build from fetched rows (producer
+    /// side), `prebuilt_docs`, the accumulator without probes (packet and doc
+    /// manifest hashing) and with the default probes, and doc-ref prepare.
+    /// Every arm must produce one witness, equivalence evidence included.
+    #[test]
+    #[ignore = "consumer equivalence-absorb A/B; run explicitly with --ignored --nocapture"]
+    #[serial]
+    fn consumer_equivalence_absorb_benchmark_arms() {
+        let size = |key: &str, default: usize| {
+            dotenvy::var(key)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        };
+        let conversations = size("CASS_CONSUMER_AB_CONVERSATIONS", 4096);
+        let messages = size("CASS_CONSUMER_AB_MESSAGES", 64);
+        let mean_bytes = size("CASS_CONSUMER_AB_MESSAGE_BYTES", 1024).max(8);
+        let rounds = size("CASS_CONSUMER_AB_ROUNDS", 3);
+        let batch_limit = size("CASS_CONSUMER_AB_BATCH_CONVERSATIONS", 100);
+        let base = dotenvy::var("CASS_CONSUMER_AB_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let _governor = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
+        eprintln!(
+            "CONSUMER_AB_SHAPE {}",
+            serde_json::json!({
+                "lever": "equivalence_absorb_overlap",
+                "conversations": conversations,
+                "messages_per_conversation": messages,
+                "mean_message_bytes": mean_bytes,
+                "batch_conversations": batch_limit,
+                "rounds": rounds,
+                "available_parallelism":
+                    std::thread::available_parallelism().map_or(1, usize::from),
+                "rayon_threads": rayon::current_num_threads(),
+            })
+        );
+
+        let profile_conversations =
+            conversations.min(size("CASS_CONSUMER_AB_PROFILE_CONVERSATIONS", 1024));
+        let source_map: HashMap<String, (SourceKind, Option<String>)> = HashMap::new();
+        let mut manifest_only = LexicalRebuildEquivalenceAccumulator::with_probes(Vec::new());
+        let mut accumulator = LexicalRebuildEquivalenceAccumulator::new();
+        let mut build = Duration::ZERO;
+        let mut doc_views = Duration::ZERO;
+        let mut manifest = Duration::ZERO;
+        let mut absorb = Duration::ZERO;
+        let mut prepare = Duration::ZERO;
+        let (mut docs, mut bytes, mut viewed) = (0_usize, 0_usize, 0_usize);
+        let mut next = 0;
+        while next < profile_conversations {
+            let page_end = (next + batch_limit).min(profile_conversations);
+            let fetched: Vec<_> = (next..page_end)
+                .map(|sequence| consumer_ab_rows(sequence, messages, mean_bytes))
+                .collect();
+            next = page_end;
+            let started = Instant::now();
+            let packets: Vec<LexicalRebuildConversationPacket> = fetched
+                .into_iter()
+                .map(|(row, rows)| {
+                    LexicalRebuildConversationPacket::from_canonical_replay_messages(
+                        row,
+                        rows,
+                        &source_map,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            build += started.elapsed();
+            let started = Instant::now();
+            for packet in &packets {
+                viewed += std::hint::black_box(packet.prebuilt_docs()).len();
+            }
+            doc_views += started.elapsed();
+            let started = Instant::now();
+            for packet in &packets {
+                manifest_only.absorb_packet(packet);
+            }
+            manifest += started.elapsed();
+            let started = Instant::now();
+            for packet in &packets {
+                accumulator.absorb_packet(packet);
+            }
+            absorb += started.elapsed();
+            let started = Instant::now();
+            let refs = lexical_rebuild_prepare_prebuilt_doc_refs(&packets, None);
+            prepare += started.elapsed();
+            docs += refs.len();
+            bytes += refs.iter().map(|doc| doc.content.len()).sum::<usize>();
+        }
+        assert_eq!(viewed, docs, "prebuilt_docs and prepare saw different docs");
+        let evidence = accumulator.finalize();
+        let per_doc_ns = |duration: Duration| duration.as_nanos() as f64 / docs.max(1) as f64;
+        eprintln!(
+            "CONSUMER_PROFILE {}",
+            serde_json::json!({
+                "docs": docs,
+                "content_bytes": bytes,
+                "packet_build_ns_per_doc": per_doc_ns(build),
+                "prebuilt_docs_ns_per_doc": per_doc_ns(doc_views),
+                "absorb_no_probes_ns_per_doc": per_doc_ns(manifest),
+                "absorb_ns_per_doc": per_doc_ns(absorb),
+                "prepare_ns_per_doc": per_doc_ns(prepare),
+                "probe_hits": evidence
+                    .golden_query_hit_counts
+                    .iter()
+                    .map(|hit| (hit.probe.clone(), hit.hit_count))
+                    .collect::<Vec<_>>(),
+            })
+        );
+
+        consumer_ab_rounds_and_report(
+            &base,
+            (conversations, messages, mean_bytes, batch_limit),
+            &[
+                ("incumbent", false, false),
+                ("candidate", false, true),
+                ("null", false, false),
+            ],
+            rounds,
         );
     }
 
