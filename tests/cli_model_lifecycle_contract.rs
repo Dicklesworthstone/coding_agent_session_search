@@ -44,6 +44,8 @@ fn models_install_from_file_keeps_acquisition_data_dir_scoped() -> Result<(), St
                 mirror: None,
                 from_file: Some(from_file),
                 yes: true,
+                dry_run: false,
+                json: false,
                 data_dir: Some(data_dir),
             })) if model == "all-minilm-l6-v2"
                 && from_file.display().to_string() == "/seeded/models/all-minilm-l6-v2"
@@ -80,6 +82,8 @@ fn models_install_from_mirror_keeps_acquisition_data_dir_scoped() -> Result<(), 
                 mirror: Some(mirror),
                 from_file: None,
                 yes: true,
+                dry_run: false,
+                json: false,
                 data_dir: Some(data_dir),
             })) if model == "all-minilm-l6-v2"
                 && mirror == "https://mirror.example/models"
@@ -134,6 +138,8 @@ fn models_install_defaults_to_standard_model_with_confirmation() -> Result<(), S
                 mirror: None,
                 from_file: None,
                 yes: false,
+                dry_run: false,
+                json: false,
                 data_dir: Some(data_dir),
             })) if model == "all-minilm-l6-v2"
                 && data_dir.display().to_string() == "/cass/models" =>
@@ -145,6 +151,47 @@ fn models_install_defaults_to_standard_model_with_confirmation() -> Result<(), S
             )),
         }
     })
+}
+
+#[test]
+fn models_install_dry_run_keeps_preview_structured_and_data_dir_scoped() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let cli = parse(&[
+            "cass",
+            "models",
+            "install",
+            "--model",
+            "minilm",
+            "--dry-run",
+            "--json",
+            "--data-dir",
+            "/cass/preview",
+        ])?;
+        match cli.command {
+            Some(Commands::Models(ModelsCommand::Install {
+                model,
+                mirror: None,
+                from_file: None,
+                yes: false,
+                dry_run: true,
+                json: true,
+                data_dir: Some(data_dir),
+            })) if model == "minilm" && data_dir.display().to_string() == "/cass/preview" => Ok(()),
+            other => Err(format!("expected a scoped JSON preview, got {other:?}")),
+        }
+    })
+}
+
+#[test]
+fn models_install_json_requires_dry_run() -> Result<(), String> {
+    run_on_large_stack(
+        || match Cli::try_parse_from(["cass", "models", "install", "--json"]) {
+            Err(error) if error.kind() == ErrorKind::MissingRequiredArgument => Ok(()),
+            other => Err(format!(
+                "expected --json to require --dry-run, got {other:?}"
+            )),
+        },
+    )
 }
 
 #[test]

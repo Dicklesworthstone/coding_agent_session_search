@@ -316,6 +316,85 @@ fn check_model_identity(acq: &Value) -> Result<String, String> {
 }
 
 #[test]
+fn models_install_dry_run_reports_a_plan_without_acquiring_files() -> Result<(), String> {
+    use coding_agent_search::search::model_download::ModelManifest;
+
+    let manifest = ModelManifest::minilm_v2();
+    for (source_kind, extra) in [
+        ("registry", Vec::<&str>::new()),
+        (
+            "mirror",
+            vec!["--mirror", "https://mirror.example.invalid/models"],
+        ),
+        (
+            "from_file",
+            vec!["--from-file", "unavailable-airgap-source"],
+        ),
+    ] {
+        let tmp = tempfile::tempdir().map_err(|error| format!("tempdir: {error}"))?;
+        let mut args = vec![
+            "models",
+            "install",
+            "--model",
+            "minilm",
+            "--dry-run",
+            "--json",
+        ];
+        args.extend(extra);
+        let (_, stdout, _) = run_isolated_cass(tmp.path(), &args)?;
+        let plan: Value = serde_json::from_str(&stdout)
+            .map_err(|error| format!("parse installation preview: {error}"))?;
+        if !matches!(plan.get("dry_run").and_then(Value::as_bool), Some(true))
+            || !matches!(plan.get("status").and_then(Value::as_str), Some("planned"))
+            || plan.get("source_kind").and_then(Value::as_str) != Some(source_kind)
+            || plan.get("manifest_bytes").and_then(Value::as_u64) != Some(manifest.total_size())
+        {
+            return Err(format!("incorrect {source_kind} installation plan: {plan}"));
+        }
+        let expected_download_bytes = if matches!(source_kind, "from_file") {
+            0
+        } else {
+            manifest.total_size()
+        };
+        if plan.get("expected_download_bytes").and_then(Value::as_u64)
+            != Some(expected_download_bytes)
+        {
+            return Err(format!(
+                "incorrect {source_kind} expected download size: {plan}"
+            ));
+        }
+        let model_dir = plan
+            .get("model_dir")
+            .and_then(Value::as_str)
+            .ok_or("installation preview is missing model_dir")?;
+        let files = plan
+            .get("files")
+            .and_then(Value::as_array)
+            .ok_or("installation preview is missing manifest files")?;
+        if files.len() != manifest.files.len() {
+            return Err(format!(
+                "installation preview omitted manifest files: {plan}"
+            ));
+        }
+        for (file, expected) in files.iter().zip(&manifest.files) {
+            let destination = std::path::Path::new(model_dir).join(expected.local_name());
+            if file.get("local_name").and_then(Value::as_str) != Some(expected.local_name())
+                || file.get("size_bytes").and_then(Value::as_u64) != Some(expected.size)
+                || file.get("expected_sha256").and_then(Value::as_str)
+                    != Some(expected.sha256.as_str())
+                || file.get("destination").and_then(Value::as_str) != destination.to_str()
+            {
+                return Err(format!("incorrect installation file plan: {file}"));
+            }
+        }
+        if tmp.path().join("cass-data").exists() {
+            return Err("installation preview created its destination directory".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn status_and_verify_emit_acquisition_block_and_prove_no_auto_download() -> Result<(), String> {
     let tmp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
 

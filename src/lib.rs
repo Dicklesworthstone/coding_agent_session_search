@@ -2685,6 +2685,12 @@ pub enum ModelsCommand {
         /// Skip confirmation prompt
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Preview the installation without downloading, writing files, or prompting
+        #[arg(long)]
+        dry_run: bool,
+        /// Output the installation preview as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot", requires = "dry_run")]
+        json: bool,
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
@@ -27704,7 +27710,8 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Swarm(SwarmCommand::Dashboard { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
-        Commands::Models(ModelsCommand::Status { json }) => {
+        Commands::Models(ModelsCommand::Install { json, .. })
+        | Commands::Models(ModelsCommand::Status { json }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Models(ModelsCommand::Verify { json, .. }) => {
@@ -126119,6 +126126,8 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
             mirror,
             from_file,
             yes,
+            dry_run,
+            json,
             data_dir,
         } => run_models_install(
             &model,
@@ -126126,6 +126135,8 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
             from_file.as_deref(),
             yes,
             data_dir,
+            dry_run,
+            resolve_subcommand_structured_format(cli, json),
         ),
         ModelsCommand::Verify {
             model,
@@ -127305,6 +127316,8 @@ fn run_models_install(
     from_file: Option<&Path>,
     skip_confirm: bool,
     data_dir_override: Option<PathBuf>,
+    dry_run: bool,
+    output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::search::model_download::{
         ModelAcquisitionPolicy, ModelDownloader, classify_model_cache, normalize_mirror_base_url,
@@ -127346,6 +127359,83 @@ fn run_models_install(
             ),
             retryable: false,
         })?;
+
+    if dry_run {
+        use crate::search::model_acquisition::{
+            OnDiskPolicyInputs, RuntimeLoadability, live_acquisition_block,
+        };
+        use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
+
+        // Resolve and inspect only. The installer, acquisition lease, staging,
+        // parent-directory creation and confirmation prompt are all below.
+        let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
+        let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
+        let acquisition = live_acquisition_block(
+            &model_dir,
+            &manifest,
+            RuntimeLoadability::probe_cheap_host(),
+            OnDiskPolicyInputs {
+                policy_enabled: acquisition_policy.downloads_enabled,
+                offline: acquisition_policy.offline,
+                budget_max_bytes: acquisition_policy.max_model_bytes,
+            },
+            registry_name,
+        );
+        let source_kind = if from_file.is_some() {
+            "from_file"
+        } else if mirror_base_url.is_some() {
+            "mirror"
+        } else {
+            "registry"
+        };
+        let files: Vec<_> = manifest
+            .files
+            .iter()
+            .map(|file| {
+                serde_json::json!({
+                    "name": file.name,
+                    "local_name": file.local_name(),
+                    "size_bytes": file.size,
+                    "expected_sha256": file.sha256,
+                    "destination": model_dir.join(file.local_name()).display().to_string(),
+                })
+            })
+            .collect();
+        let plan = serde_json::json!({
+            "status": "planned",
+            "dry_run": true,
+            "model": registry_name,
+            "model_id": manifest.id,
+            "revision": manifest.revision,
+            "model_dir": model_dir.display().to_string(),
+            "source_kind": source_kind,
+            "source_path": from_file.map(|path| path.display().to_string()),
+            "manifest_bytes": manifest.total_size(),
+            "expected_download_bytes": if from_file.is_some() { 0 } else { manifest.total_size() },
+            "files": files,
+            "model_acquisition": acquisition,
+        });
+        if let Some(format) = output_format {
+            output_structured_value(plan, format)?;
+        } else {
+            println!("{}", "Model installation preview".bold());
+            println!("  Model: {} ({})", manifest.id, manifest.revision);
+            println!("  Source: {source_kind}");
+            if let Some(source_path) = from_file {
+                println!("  Local source: {}", source_path.display());
+            }
+            println!("  Destination: {}", model_dir.display());
+            for file in &manifest.files {
+                println!(
+                    "  {}: {} bytes, expected SHA256 {}",
+                    file.local_name(),
+                    file.size,
+                    file.sha256,
+                );
+            }
+        }
+        return Ok(());
+    }
 
     // Install from local directory (for air-gapped environments)
     if let Some(source_path) = from_file {
@@ -130328,6 +130418,7 @@ mod subcommand_robot_output_tests {
                 ],
                 vec!["cass", "export-html", "session.jsonl", "--json"],
                 vec!["cass", "sources", "setup", "--json"],
+                vec!["cass", "models", "install", "--dry-run", "--json"],
             ];
 
             for args in cases {
@@ -130359,6 +130450,9 @@ mod subcommand_robot_output_tests {
                         | AnalyticsCommand::Validate { common, .. },
                     ) => resolve_subcommand_structured_format(&cli, common.json),
                     Commands::Sources(SourcesCommand::Setup { json, .. }) => {
+                        resolve_subcommand_structured_format(&cli, *json)
+                    }
+                    Commands::Models(ModelsCommand::Install { json, .. }) => {
                         resolve_subcommand_structured_format(&cli, *json)
                     }
                     other => panic!("unexpected command variant for args {args:?}: {other:?}"),
