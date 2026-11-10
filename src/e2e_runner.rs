@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -184,7 +184,7 @@ pub struct RunEvent {
     pub command_line: Vec<String>,
     /// Resolved binary path.
     pub binary_path: String,
-    /// Binary version, when known.
+    /// Version reported by a bounded `cass --version` probe, when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binary_version: Option<String>,
     /// Binary content hash, when known.
@@ -779,17 +779,59 @@ fn binary_hash(path: &str) -> Option<String> {
     Some(hasher.finalize().to_hex().to_string())
 }
 
-fn binary_version(path: &str) -> Option<String> {
-    Path::new(path)
+fn binary_version(spec: &RunSpec, remaining: Duration) -> Option<String> {
+    if remaining.is_zero() {
+        return None;
+    }
+    Path::new(&spec.binary_path)
         .file_name()
         .and_then(|name| name.to_str())
-        .filter(|name| *name == "cass" || name.starts_with("cass-"))
-        .map(|_| env!("CARGO_PKG_VERSION").to_string())
+        .filter(|name| matches!(*name, "cass" | "cass.exe") || name.starts_with("cass-"))?;
+    let started = Instant::now();
+    // A regular file has no pipe EOF to wait for, including on Windows. Keep
+    // this small auxiliary probe independent of the threaded pipe collector.
+    let mut stdout_file = tempfile::tempfile().ok()?;
+    let mut command = Command::new(&spec.binary_path);
+    command
+        .arg("--version")
+        .current_dir(&spec.cwd)
+        .envs(&spec.env_overrides)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file.try_clone().ok()?))
+        .stderr(Stdio::inherit());
+    crate::sources::configure_child_process_group(&mut command);
+    let child = command.spawn().ok()?;
+    let remaining = remaining.saturating_sub(started.elapsed());
+    #[cfg(not(unix))]
+    if remaining.is_zero() {
+        // The legacy non-Unix wait helper grants zero a fresh second. This
+        // metadata probe must keep the original command's remaining budget.
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    let output = crate::sources::wait_for_child_output_with_timeout(child, remaining).ok()??;
+    if !output.status.success() {
+        return None;
+    }
+    stdout_file.rewind().ok()?;
+    let mut stdout = String::new();
+    stdout_file.take(4097).read_to_string(&mut stdout).ok()?;
+    if stdout.len() > 4096 {
+        return None;
+    }
+    let mut words = stdout.split_whitespace();
+    if words.next()? != "cass" {
+        return None;
+    }
+    let version = words.next()?;
+    words.next().is_none().then(|| version.to_string())
 }
 
-/// Spawn the command and wait up to `timeout`, draining stdout/stderr on
-/// background threads so a chatty process cannot deadlock on a full pipe, and
-/// killing the process if the deadline passes.
+/// Spawn the command under one deadline. Unix capture owns nonblocking pipes
+/// and includes pipe EOF in that deadline; partial timeout diagnostics survive.
+/// Non-Unix retains the threaded collector and its inherited-pipe limitation.
 fn execute_bounded(spec: &RunSpec) -> std::io::Result<RawRun> {
     let start = Instant::now();
     let mut cmd = Command::new(&spec.binary_path); // ubs:ignore — trusted in-process E2E spec, never user input.
@@ -805,7 +847,52 @@ fn execute_bounded(spec: &RunSpec) -> std::io::Result<RawRun> {
     // an orphaned grandchild keeps the stdout pipe open and the drain blocks,
     // defeating the bound).
     crate::sources::configure_child_process_group(&mut cmd);
-    let mut child = cmd.spawn()?;
+    let child = cmd.spawn()?;
+
+    #[cfg(unix)]
+    {
+        let captured = crate::sources::child_output::collect(
+            child,
+            spec.timeout.saturating_sub(start.elapsed()),
+            None,
+        )?;
+        let elapsed_ms = start.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        let timed_out = captured.timed_out;
+        let output = captured.output;
+        let (exit_code, signal) = decode_status(&output.status);
+        let text = |bytes: Vec<u8>| {
+            if timed_out {
+                // A deadline may interrupt a UTF-8 codepoint. Keep readable
+                // partial diagnostics; timeout can never become a JSON pass.
+                String::from_utf8_lossy(&bytes).into_owned()
+            } else {
+                // Match the former read_to_string collector: invalid UTF-8
+                // cannot be turned into valid JSON through replacement text.
+                String::from_utf8(bytes).unwrap_or_default()
+            }
+        };
+        Ok(RawRun {
+            exit_code: if timed_out { None } else { exit_code },
+            timed_out,
+            signal,
+            stdout: text(output.stdout),
+            stderr: text(output.stderr),
+            elapsed_ms,
+        })
+    }
+
+    #[cfg(not(unix))]
+    {
+        execute_bounded_non_unix(child, start, spec.timeout)
+    }
+}
+
+#[cfg(not(unix))]
+fn execute_bounded_non_unix(
+    mut child: std::process::Child,
+    start: Instant,
+    timeout: Duration,
+) -> std::io::Result<RawRun> {
     let pid = child.id();
 
     // Drain pipes on threads to avoid deadlock on large output.
@@ -826,13 +913,12 @@ fn execute_bounded(spec: &RunSpec) -> std::io::Result<RawRun> {
         buf
     });
 
-    let deadline = start + spec.timeout;
     let mut timed_out = false;
     let status = loop {
         match child.try_wait()? {
             Some(status) => break status,
             None => {
-                if Instant::now() >= deadline {
+                if start.elapsed() >= timeout {
                     // Kill the whole group so orphaned grandchildren die and
                     // release the pipes, keeping the drain (and thus the run)
                     // bounded.
@@ -862,20 +948,6 @@ fn execute_bounded(spec: &RunSpec) -> std::io::Result<RawRun> {
         stderr,
         elapsed_ms,
     })
-}
-
-/// Kill an entire process group (the child placed itself in its own group via
-/// `process_group(0)`). Uses `/bin/kill -KILL -<pid>` to avoid a libc
-/// dependency, matching the sources runner's approach.
-#[cfg(unix)]
-fn kill_process_group(pid: u32) {
-    let group = format!("-{pid}");
-    let _ = Command::new("/bin/kill")
-        .args(["-KILL", &group])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
 
 #[cfg(not(unix))]
@@ -1033,7 +1105,7 @@ pub fn run_capture_with_exit_codes(
                 timed_out: false,
                 signal: None,
                 stdout: String::new(),
-                stderr: format!("spawn failed: {err}"),
+                stderr: format!("command execution failed: {err}"),
                 elapsed_ms: 0,
             };
             return base(
@@ -1075,9 +1147,17 @@ pub fn run_with_artifacts(
     artifact: &ArtifactRunSpec<'_>,
     now_ms: u64,
 ) -> io::Result<ScenarioArtifactEntry> {
+    let started = Instant::now();
     let mut capture =
         run_capture_with_exit_codes(spec, expect, artifact.accepted_exit_codes, now_ms);
-    capture.event.binary_version = binary_version(&spec.binary_path);
+    // Missing fixtures and spawn failures must not execute a metadata probe.
+    // A timeout gets no fresh budget just to label the failed command.
+    let executed =
+        capture.event.exit_code.is_some_and(|code| code != -1) || capture.event.signal.is_some();
+    if executed && !capture.event.timed_out {
+        capture.event.binary_version =
+            binary_version(spec, spec.timeout.saturating_sub(started.elapsed()));
+    }
     capture.event.binary_hash = binary_hash(&spec.binary_path);
 
     let command_dir = artifact
@@ -1255,6 +1335,114 @@ mod tests {
             "timeout was not bounded: {}ms",
             ev.elapsed_ms
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_child_with_inherited_pipes_obeys_the_original_deadline() {
+        for script in [
+            "trap '' HUP; sleep 3 & printf OUT; printf ERR >&2; exit 0",
+            "trap '' HUP; (exec 1>&-; sleep 3) & printf OUT; printf ERR >&2; exit 0",
+        ] {
+            let started = Instant::now();
+            let capture = run_capture(&sh_spec(script, 150), &RunExpectation::default(), 0);
+            assert_eq!(capture.event.outcome, RunOutcome::Timeout);
+            assert!(capture.event.timed_out);
+            assert_eq!(capture.event.exit_code, None);
+            assert_eq!(capture.stdout, "OUT");
+            assert_eq!(capture.stderr, "ERR");
+            assert!(capture.event.elapsed_ms >= 100);
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_keeps_partial_stdout_and_stderr() {
+        let capture = run_capture(
+            &sh_spec("printf OUT; printf ERR >&2; sleep 3", 150),
+            &RunExpectation::default(),
+            0,
+        );
+        assert_eq!(capture.event.outcome, RunOutcome::Timeout);
+        assert_eq!(capture.stdout, "OUT");
+        assert_eq!(capture.stderr, "ERR");
+        assert_eq!(capture.event.stdout_len, 3);
+        assert_eq!(capture.event.stderr_len, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zero_and_maximum_deadlines_are_not_renewed_or_overflowed() {
+        let mut spec = sh_spec("sleep 3", 0);
+        let started = Instant::now();
+        assert_eq!(
+            run(&spec, &RunExpectation::default(), 0).outcome,
+            RunOutcome::Timeout
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        spec.args = vec!["-c".to_string(), "printf done".to_string()];
+        spec.timeout = Duration::MAX;
+        let capture = run_capture(&spec, &RunExpectation::default(), 0);
+        assert_eq!(capture.event.outcome, RunOutcome::Success);
+        assert_eq!(capture.stdout, "done");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_utf8_cannot_become_a_json_pass_through_lossy_decoding() {
+        let capture = run_capture(
+            &sh_spec("printf '{\"value\":\"\\377\"}'", 5_000),
+            &RunExpectation {
+                expect_json: true,
+                ..Default::default()
+            },
+            0,
+        );
+        assert_eq!(capture.event.exit_code, Some(0));
+        assert_eq!(capture.event.outcome, RunOutcome::InvalidJson);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cass_filename_cannot_fabricate_a_version_for_another_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alias = tmp.path().join("cass");
+        std::os::unix::fs::symlink("/bin/sh", &alias).unwrap();
+        let root = tmp.path().join("artifacts");
+        for (command_id, missing) in [("real-shell", false), ("missing-fixture", true)] {
+            let mut spec = sh_spec("printf '{}'", 5_000);
+            spec.binary_path = alias.display().to_string();
+            if missing {
+                spec.require_path = Some(tmp.path().join("absent-fixture"));
+            }
+            let entry = run_with_artifacts(
+                &spec,
+                &RunExpectation::default(),
+                &ArtifactRunSpec {
+                    artifact_root: &root,
+                    run_id: "version-observation",
+                    scenario_id: "real-system-shell-alias",
+                    command_id,
+                    issue_ids: &[],
+                    privacy_note: "Unit check of a real system shell; no CASS capability proof.",
+                    suite_started_ms: 0,
+                    accepted_exit_codes: &[0],
+                    forbidden_stream_markers: &[],
+                    extra_artifact_paths: &[],
+                },
+                0,
+            )
+            .unwrap();
+            let event: RunEvent =
+                serde_json::from_slice(&std::fs::read(&entry.event_path).unwrap()).unwrap();
+            assert!(event.binary_version.is_none());
+            if missing {
+                assert!(matches!(event.outcome, RunOutcome::MissingFixture { .. }));
+            } else {
+                assert_eq!(event.outcome, RunOutcome::Success);
+            }
+        }
     }
 
     #[test]

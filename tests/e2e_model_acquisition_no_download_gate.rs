@@ -33,6 +33,19 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Keep the private HOME and actual runner evidence after success or failure.
+/// Use the OS temporary root so dotenv cannot find the repository's .env by
+/// walking up from the isolated command's working directory.
+fn isolated_home_with_retained_artifacts() -> Result<tempfile::TempDir, String> {
+    let home = tempfile::Builder::new()
+        .prefix("cass-model-acquisition-")
+        .disable_cleanup(true)
+        .tempdir()
+        .map_err(|error| format!("create isolated model HOME: {error}"))?;
+    eprintln!("Model acquisition artifacts: {}", home.path().display());
+    Ok(home)
+}
+
 fn decode_model_output(stdout: &str, format: &str) -> Result<Value, String> {
     if matches!(format, "toon") {
         if serde_json::from_str::<Value>(stdout).is_ok() {
@@ -275,7 +288,7 @@ fn check_no_auto_download(acq: &Value) -> Result<(), String> {
     }
     if !matches!(skipped, Some("explicit_install_required")) {
         return Err(format!(
-            "an absent model must prove no auto-download via \
+            "an absent model must report its acquisition decision via \
              skipped_network_reason=explicit_install_required; got {skipped:?}; acq: {acq}"
         ));
     }
@@ -354,7 +367,7 @@ fn models_install_dry_run_reports_a_plan_without_acquiring_files() -> Result<(),
             vec!["--from-file", "unavailable-airgap-source"],
         ),
     ] {
-        let tmp = tempfile::tempdir().map_err(|error| format!("tempdir: {error}"))?;
+        let tmp = isolated_home_with_retained_artifacts()?;
         let mut args = vec![
             "models",
             "install",
@@ -436,7 +449,7 @@ fn models_inspection_respects_structured_output_formats() -> Result<(), String> 
         for (phase, empty_model_dir_exists) in
             [("status", false), ("verify", false), ("verify", true)]
         {
-            let tmp = tempfile::tempdir().map_err(|error| format!("tempdir: {error}"))?;
+            let tmp = isolated_home_with_retained_artifacts()?;
             if empty_model_dir_exists {
                 let model_dir =
                     FastEmbedder::model_dir_for(&tmp.path().join("cass-data"), "minilm")
@@ -484,7 +497,7 @@ fn models_inspection_respects_structured_output_formats() -> Result<(), String> 
 
 #[test]
 fn status_and_verify_emit_acquisition_block_and_prove_no_auto_download() -> Result<(), String> {
-    let tmp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+    let tmp = isolated_home_with_retained_artifacts()?;
 
     // Pin the data directory and policy and neutralize the runtime model-dir
     // override: inherited environment or .env values must not redirect or
@@ -575,7 +588,7 @@ const PROOF_SECRET_MARKERS: &[&str] = &[
 
 #[test]
 fn no_download_proof_emits_redaction_safe_proof_log_artifact() -> Result<(), String> {
-    let tmp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+    let tmp = isolated_home_with_retained_artifacts()?;
     let artifact_dir = tmp.path().join("proof");
     std::fs::create_dir_all(&artifact_dir).map_err(|e| format!("create artifact dir: {e}"))?;
 
@@ -611,9 +624,14 @@ fn no_download_proof_emits_redaction_safe_proof_log_artifact() -> Result<(), Str
         .binary_version
         .as_deref()
         .ok_or("runner event is missing the observed binary version")?;
+    if binary_version != env!("CARGO_PKG_VERSION") {
+        return Err(format!(
+            "observed model CLI version does not match the test build: {binary_version}"
+        ));
+    }
 
-    // Persist the real stdout/stderr as redaction-safe artifacts under a temp
-    // dir (no $HOME leakage), then emit one `.12.3`-schema proof-log record.
+    // Persist the real stdout/stderr under the retained private HOME, then
+    // emit one `.12.3`-schema proof-log record.
     let stdout_path = artifact_dir.join("models_status.stdout.json");
     let stderr_path = artifact_dir.join("models_status.stderr.log");
     std::fs::write(&stdout_path, &stdout).map_err(|e| format!("write stdout artifact: {e}"))?;
@@ -793,7 +811,7 @@ fn no_download_proof_emits_redaction_safe_proof_log_artifact() -> Result<(), Str
         ));
     }
 
-    // Artifact paths must stay inside the temp artifact dir (no home leakage).
+    // Artifact paths must stay inside the private artifact dir.
     let artifact_root = artifact_dir.to_str().ok_or("artifact dir path not UTF-8")?;
     let unsafe_paths: Vec<&str> = ["stdout_path", "stderr_path"]
         .into_iter()
@@ -808,8 +826,23 @@ fn no_download_proof_emits_redaction_safe_proof_log_artifact() -> Result<(), Str
         .collect();
     if !unsafe_paths.is_empty() {
         return Err(format!(
-            "artifact paths must be redaction-safe temp paths; offending keys: {unsafe_paths:?}"
+            "artifact paths must be redaction-safe private paths; offending keys: {unsafe_paths:?}"
         ));
+    }
+
+    // Scope exit used to erase the evidence while every assertion still
+    // passed. Read the actual files after releasing the temporary handle.
+    drop(tmp);
+    for (path, expected) in [
+        (&log_path, jsonl.as_str()),
+        (&stdout_path, stdout.as_str()),
+        (&stderr_path, stderr.as_str()),
+    ] {
+        let retained = std::fs::read_to_string(path)
+            .map_err(|error| format!("read retained artifact {}: {error}", path.display()))?;
+        if retained != expected {
+            return Err(format!("retained artifact changed: {}", path.display()));
+        }
     }
     Ok(())
 }

@@ -7,7 +7,7 @@
 
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
-use std::process::{Child, Output};
+use std::process::{Child, ExitStatus, Output};
 use std::time::{Duration, Instant};
 
 const READ_BYTES: usize = 8 * 1024;
@@ -19,14 +19,33 @@ struct ChildOwner {
     armed: bool,
 }
 
+impl ChildOwner {
+    fn terminate(&mut self) -> io::Result<ExitStatus> {
+        super::kill_child_process_group(self.child.id());
+        let _ = self.child.kill();
+        let status = self.child.wait()?;
+        self.armed = false;
+        Ok(status)
+    }
+
+    fn finish_timeout(mut self, stdout: Vec<u8>, stderr: Vec<u8>) -> io::Result<CapturedOutput> {
+        Ok(CapturedOutput {
+            output: Output {
+                status: self.terminate()?,
+                stdout,
+                stderr,
+            },
+            timed_out: true,
+        })
+    }
+}
+
 impl Drop for ChildOwner {
     fn drop(&mut self) {
         if self.armed {
-            super::kill_child_process_group(self.child.id());
-            let _ = self.child.kill();
             // Reap the direct child even when it exited while descendants
             // retained a pipe. OS process teardown itself is not preemptible.
-            let _ = self.child.wait();
+            let _ = self.terminate();
         }
     }
 }
@@ -134,40 +153,62 @@ fn set_nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Captured bytes include partial diagnostics when the common deadline expires.
+/// A completed direct child is still a timeout if a descendant retained a pipe.
+pub(crate) struct CapturedOutput {
+    pub output: Output,
+    pub timed_out: bool,
+}
+
 pub(super) fn wait(
     child: Child,
     timeout: Duration,
     limit: Option<usize>,
 ) -> io::Result<Option<Output>> {
+    let captured = collect(child, timeout, limit)?;
+    Ok((!captured.timed_out).then_some(captured.output))
+}
+
+/// Collect both streams and process completion under one deadline. Callers
+/// that need timeout diagnostics retain the partial bytes as well as the flag.
+/// Spawn the child in its own process group to clean up descendants too.
+pub(crate) fn collect(
+    child: Child,
+    timeout: Duration,
+    limit: Option<usize>,
+) -> io::Result<CapturedOutput> {
     let started = Instant::now();
     let mut owner = ChildOwner { child, armed: true };
     // Like wait_with_output, finish any stdin still owned by this child
     // handle. Otherwise a command waiting for EOF can deadlock its own wait.
     drop(owner.child.stdin.take());
     if timeout.is_zero() {
-        return Ok(None);
+        return owner.finish_timeout(Vec::new(), Vec::new());
     }
     let mut stdout = Capture::new(owner.child.stdout.take())?;
     let mut stderr = Capture::new(owner.child.stderr.take())?;
     loop {
         if started.elapsed() >= timeout {
-            return Ok(None);
+            return owner.finish_timeout(stdout.bytes, stderr.bytes);
         }
         let out_progress = stdout.drain(started, timeout, limit)?;
         let err_progress = stderr.drain(started, timeout, limit)?;
         if started.elapsed() >= timeout {
-            return Ok(None);
+            return owner.finish_timeout(stdout.bytes, stderr.bytes);
         }
         if stdout.pipe.is_none()
             && stderr.pipe.is_none()
             && let Some(status) = owner.child.try_wait()?
         {
             owner.armed = false;
-            return Ok(Some(Output {
-                status,
-                stdout: stdout.bytes,
-                stderr: stderr.bytes,
-            }));
+            return Ok(CapturedOutput {
+                output: Output {
+                    status,
+                    stdout: stdout.bytes,
+                    stderr: stderr.bytes,
+                },
+                timed_out: false,
+            });
         }
         if !out_progress && !err_progress {
             // Subtraction avoids Instant overflow for very long budgets and

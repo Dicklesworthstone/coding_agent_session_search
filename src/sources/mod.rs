@@ -69,7 +69,7 @@
 //! ```
 
 #[cfg(unix)]
-mod child_output;
+pub(crate) mod child_output;
 
 pub mod config;
 pub(crate) mod config_validation;
