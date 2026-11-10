@@ -104701,6 +104701,7 @@ fn response_schema_search_meta() -> serde_json::Value {
                     "index_over_automatic_limit",
                     "automatic_retry_disabled",
                     "long_query_term",
+                    "query_normalization",
                     "query_fuel_exhausted",
                     null
                 ],
@@ -107020,6 +107021,37 @@ mod response_schema_tests {
         assert_eq!(
             meta["explanation_cards"]["items"]["properties"]["fallback_contract"]["type"],
             serde_json::json!(["object", "null"])
+        );
+    }
+
+    #[test]
+    fn search_schema_accepts_emitted_wildcard_fallback_skip_reasons() {
+        use crate::search::query::{
+            WILDCARD_FALLBACK_SKIPPED_DISABLED, WILDCARD_FALLBACK_SKIPPED_LARGE_INDEX,
+            WILDCARD_FALLBACK_SKIPPED_LONG_TERM, WILDCARD_FALLBACK_SKIPPED_QUERY_FUEL_EXHAUSTED,
+            WILDCARD_FALLBACK_SKIPPED_QUERY_NORMALIZATION,
+        };
+
+        let schemas = build_response_schemas();
+        let meta = &schemas["search"]["properties"]["_meta"]["properties"];
+        let published = meta["wildcard_fallback_skipped"]["enum"]
+            .as_array()
+            .expect("public search schema enumerates wildcard fallback skip reasons");
+        for reason in [
+            WILDCARD_FALLBACK_SKIPPED_DISABLED,
+            WILDCARD_FALLBACK_SKIPPED_LARGE_INDEX,
+            WILDCARD_FALLBACK_SKIPPED_LONG_TERM,
+            WILDCARD_FALLBACK_SKIPPED_QUERY_FUEL_EXHAUSTED,
+            WILDCARD_FALLBACK_SKIPPED_QUERY_NORMALIZATION,
+        ] {
+            assert!(
+                published.contains(&serde_json::json!(reason)),
+                "public search schema rejects emitted skip reason {reason:?}"
+            );
+        }
+        assert!(
+            published.contains(&serde_json::Value::Null),
+            "a search without a skipped retry must remain valid"
         );
     }
 

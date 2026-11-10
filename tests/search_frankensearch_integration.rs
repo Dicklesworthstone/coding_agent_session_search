@@ -917,6 +917,118 @@ fn raw_unicode_spelling_is_preserved_in_lexical_queries_and_cache_keys() {
 }
 
 #[test]
+fn refused_groups_and_bounds_cannot_recover_through_counts_or_wildcard_retry() {
+    use coding_agent_search::search::query::{QueryExplanation, SuggestionKind};
+
+    let dir = TempDir::new().expect("query admission corpus");
+    let mut index = TantivyIndex::open_or_create(dir.path()).expect("create admission index");
+    for (name, text) in [
+        ("backup", "backup evidence"),
+        ("accent", "Kérlek evidence"),
+        ("other", "unrelated evidence"),
+    ] {
+        let conversation = util::ConversationFixtureBuilder::new("codex")
+            .title("fixture")
+            .source_path(dir.path().join(format!("{name}.jsonl")))
+            .messages(1)
+            .with_content(0, text)
+            .build_normalized();
+        index
+            .add_conversation(&conversation)
+            .expect("ingest admission fixture");
+    }
+    index.commit().expect("publish admission corpus");
+    drop(index);
+    let client = SearchClient::open(dir.path(), None)
+        .expect("reopen admission index")
+        .expect("admission reader");
+
+    let baseline = client
+        .search_with_fallback("backup", SearchFilters::default(), 10, 0, 0, FieldMask::FULL)
+        .expect("ordinary query");
+    assert_eq!(baseline.hits.len(), 1);
+    assert_eq!(baseline.total_count, Some(1));
+
+    let mut refused = [
+        "backup AND ()",
+        "backup OR ()",
+        "NOT (backup AND ())",
+        "backup OR (NOT)",
+        "backup OR (AND OR)",
+        "backup AND (( ))",
+        "backup OR (",
+        "backup OR (NOT",
+        "kérlek OR ()",
+        "NOT (kérlek AND ())",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    refused.push(format!("{}backup{}", "(".repeat(129), ")".repeat(129)));
+    refused.push(format!("backup{}", "\u{2003}".repeat(10_001)));
+
+    for raw in refused {
+        // Repeat after a successful count, and exercise both ordinary pages
+        // and the application's limit=0 (unlimited) path. Neither a prior
+        // cached result nor automatic substring retry may weaken admission.
+        for limit in [1, 0, 1] {
+            let result = client
+                .search_with_fallback(
+                    &raw,
+                    SearchFilters::default(),
+                    limit,
+                    0,
+                    3,
+                    FieldMask::FULL,
+                )
+                .unwrap_or_else(|error| panic!("refused query {raw:?}: {error:#}"));
+            assert!(result.hits.is_empty(), "{raw:?}, limit={limit}");
+            assert_eq!(result.total_count, Some(0), "{raw:?}, limit={limit}");
+            assert!(!result.wildcard_fallback, "{raw:?}");
+            assert!(
+                result
+                    .suggestions
+                    .iter()
+                    .all(|suggestion| suggestion.kind != SuggestionKind::WildcardQuery),
+                "{raw:?} must not advertise a broader retry"
+            );
+        }
+        let explanation = QueryExplanation::analyze(&raw, &SearchFilters::default());
+        assert!(
+            explanation
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("error:")),
+            "{raw:?} must explain its refusal"
+        );
+    }
+
+    for raw in [
+        "(backup)",
+        "((backup))",
+        "backup AND (evidence",
+        "backup()",
+        "\"backup () evidence\"",
+    ] {
+        assert_lexical_sources(&client, raw, SearchFilters::default(), &["backup"]);
+    }
+    let maximum_depth = format!("{}backup{}", "(".repeat(128), ")".repeat(128));
+    assert_lexical_sources(
+        &client,
+        &maximum_depth,
+        SearchFilters::default(),
+        &["backup"],
+    );
+    for raw in ["", " \t\n ", "\u{2003}"] {
+        assert_lexical_sources(
+            &client,
+            raw,
+            SearchFilters::default(),
+            &["backup", "accent", "other"],
+        );
+    }
+}
+
+#[test]
 fn mixed_cjk_analysis_does_not_join_separated_runs_or_drop_latin_requirements() {
     let dir = TempDir::new().expect("mixed analyzer corpus");
     let mut index = TantivyIndex::open_or_create(dir.path()).expect("create mixed index");

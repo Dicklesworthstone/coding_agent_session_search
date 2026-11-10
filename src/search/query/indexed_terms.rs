@@ -22,7 +22,8 @@ use frankensearch::quill::scribe::{CassAnalyzer, TokenAnalyzer};
 
 use super::{
     CassBoolExpr, CassBoolParser, CassBoolToken, CassBoolUnsupported, FsCassQueryToken,
-    FsCassWildcardPattern, cass_bool_nesting_is_bounded, cass_bool_tokens, fs_cass_sanitize_query,
+    FsCassWildcardPattern, cass_bool_groups_have_operands, cass_bool_nesting_is_bounded,
+    cass_bool_tokens, fs_cass_sanitize_query,
 };
 use crate::search::quill_bridge::QuillCassFields;
 
@@ -47,7 +48,9 @@ pub(super) fn parse(parser: &CassQueryParser, raw: &str, filters: &CassQueryFilt
     // and the recursive compatibility parser never see an unbounded input.
     let admitted = cutoff.map_or(raw, |offset| &raw[..offset]);
     let tokens = cass_bool_tokens(admitted);
-    if !cass_bool_nesting_is_bounded(&tokens) {
+    // An empty group must not disappear from AND/OR or become a complement.
+    // Check before the released parser's ASCII/CJK delegation as well.
+    if !cass_bool_nesting_is_bounded(&tokens) || !cass_bool_groups_have_operands(&tokens) {
         return Query::empty();
     }
     if !requires_fragments {
@@ -626,6 +629,7 @@ mod tests {
         let filters = CassQueryFilters::default();
         for operand in [
             "é", "K", "İ", "привет", "שלום", "مرحبا", "🚀", "!!!", "*", "**",
+            "()", "(NOT)", "(AND OR)", "(())", "( \t)", "(",
             "\"\"", "\"   \"", "\"***\"", "*érlek", "*kérlek*", "ké*rlek",
             "\"kérlek 🚀 nézd\"", "\"kérlek é nézd\"", "\"f*o\"", "\"foo f*o\"",
         ] {

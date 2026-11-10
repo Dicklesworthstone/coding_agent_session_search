@@ -545,6 +545,31 @@ fn cass_bool_nesting_is_bounded(tokens: &[CassBoolToken]) -> bool {
     true
 }
 
+/// Every parenthesized group is a required syntactic operand. Empty groups
+/// cannot be erased from conjunctions or complemented into broad matches.
+/// Call after the depth check so the stack contains at most 128 entries.
+fn cass_bool_groups_have_operands(tokens: &[CassBoolToken]) -> bool {
+    let mut groups = Vec::new();
+    let mut operands = 0_usize;
+    for token in tokens {
+        match token {
+            CassBoolToken::Open => groups.push(operands),
+            CassBoolToken::Close => {
+                if groups.pop().is_none_or(|start| start == operands) {
+                    return false;
+                }
+            }
+            CassBoolToken::Token(FsCassQueryToken::Term(text)) if !text.trim().is_empty() => {
+                operands += 1;
+            }
+            CassBoolToken::Token(FsCassQueryToken::Phrase(_)) => operands += 1,
+            CassBoolToken::Token(_) => {}
+        }
+    }
+    // Nonempty unclosed groups retain the existing end-of-query recovery.
+    groups.into_iter().all(|start| start < operands)
+}
+
 /// An operand the lane cannot express: the whole query is declined.
 struct CassBoolUnsupported;
 
@@ -569,11 +594,12 @@ where
 {
     /// Parse `tokens`, lowering each term or phrase with `lower`: `Ok(None)`
     /// skips an operand that normalizes to nothing, `Err` declines the query.
+    /// An explicitly opened group must retain at least one operand.
     fn parse(
         tokens: &'a [CassBoolToken],
         lower: F,
     ) -> Result<Option<CassBoolExpr<T>>, CassBoolUnsupported> {
-        if !cass_bool_nesting_is_bounded(tokens) {
+        if !cass_bool_nesting_is_bounded(tokens) || !cass_bool_groups_have_operands(tokens) {
             return Err(CassBoolUnsupported);
         }
         let mut parser = Self {
@@ -686,7 +712,7 @@ where
                 if matches!(self.peek(), Some(CassBoolToken::Close)) {
                     self.position += 1;
                 }
-                Ok(inner)
+                inner.ok_or(CassBoolUnsupported).map(Some)
             }
             CassBoolToken::Token(token) => Ok((self.lower)(token)?.map(CassBoolExpr::Operand)),
             CassBoolToken::Close => Ok(None),
@@ -1550,7 +1576,7 @@ pub struct QueryReading {
     /// Operand grouping with every compound group parenthesized, e.g.
     /// `a OR (b AND c)`; `None` for a query without operands.
     pub structure: Option<String>,
-    /// Parentheses recovered instead of rejected, e.g. `1 unclosed '('
+    /// Grouping recovery or refusal notices, e.g. `1 unclosed '('
     /// closed at the end of the query`.
     pub recoveries: Vec<String>,
 }
@@ -1578,20 +1604,25 @@ pub fn read_query(query: &str) -> QueryReading {
     }
 }
 
-/// `--explain` warnings for parentheses the grammar recovers instead of
-/// rejecting, read the way the lexical engine reads them: an unclosed `(`
-/// closes at the end of the query and an empty `()` is skipped.
+/// `--explain` uses the same group admission as execution: nonempty
+/// unclosed groups close at the end, while empty groups refuse the query.
 fn group_recovery_warnings(tokens: &[CassBoolToken]) -> Vec<String> {
+    if !cass_bool_nesting_is_bounded(tokens) {
+        return vec![
+            "error: parenthesized query nesting exceeds the supported limit; the query matches no documents"
+                .to_string(),
+        ];
+    }
+    if !cass_bool_groups_have_operands(tokens) {
+        return vec![
+            "error: empty or operator-only parenthesized group; the query matches no documents"
+                .to_string(),
+        ];
+    }
     let mut open_groups = 0_usize;
-    let mut empty_groups = 0_usize;
-    for (index, token) in tokens.iter().enumerate() {
+    for token in tokens {
         match token {
-            CassBoolToken::Open => {
-                open_groups += 1;
-                if matches!(tokens.get(index + 1), Some(CassBoolToken::Close)) {
-                    empty_groups += 1;
-                }
-            }
+            CassBoolToken::Open => open_groups += 1,
             CassBoolToken::Close => open_groups = open_groups.saturating_sub(1),
             CassBoolToken::Token(_) => {}
         }
@@ -1601,9 +1632,6 @@ fn group_recovery_warnings(tokens: &[CassBoolToken]) -> Vec<String> {
         warnings.push(format!(
             "{open_groups} unclosed '(' closed at the end of the query"
         ));
-    }
-    if empty_groups > 0 {
-        warnings.push(format!("{empty_groups} empty '()' skipped"));
     }
     warnings
 }
@@ -21831,6 +21859,61 @@ mod tests {
     }
 
     #[test]
+    fn empty_groups_are_refused_by_reading_and_both_sqlite_query_lanes() {
+        for raw in [
+            "backup AND ()",
+            "backup OR ()",
+            "NOT (backup AND ())",
+            "backup OR (NOT)",
+            "backup OR (AND OR)",
+            "backup AND (( ))",
+            "backup OR (",
+            "backup OR (NOT",
+            "kérlek OR ()",
+            "NOT (kérlek AND ())",
+        ] {
+            let tokens = cass_bool_tokens(raw);
+            assert!(!cass_bool_groups_have_operands(&tokens), "{raw:?}");
+            assert!(read_query(raw).structure.is_none(), "{raw:?}");
+            assert!(transpile_to_fts5(raw).is_none(), "{raw:?}");
+            assert!(SearchClient::sqlite_message_scan_query(raw).is_none(), "{raw:?}");
+        }
+        // Syntactic operands can also disappear during a lane's own
+        // normalization. An entered group must not be dropped afterward.
+        for raw in ["backup AND (!!!)", "backup OR (\"\")"] {
+            assert!(transpile_to_fts5(raw).is_none(), "{raw:?}");
+            assert!(SearchClient::sqlite_message_scan_query(raw).is_none(), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn nonempty_groups_keep_recovery_and_opaque_parentheses() {
+        for raw in [
+            "(backup)",
+            "((backup))",
+            "backup AND (restore",
+            "\"backup () restore\"",
+            "backup()",
+            "backup(foo)",
+        ] {
+            let tokens = cass_bool_tokens(raw);
+            assert!(cass_bool_groups_have_operands(&tokens), "{raw:?}");
+            assert!(read_query(raw).structure.is_some(), "{raw:?}");
+            assert!(transpile_to_fts5(raw).is_some(), "{raw:?}");
+            assert!(SearchClient::sqlite_message_scan_query(raw).is_some(), "{raw:?}");
+        }
+        let accepted = format!("{}backup{}", "(".repeat(128), ")".repeat(128));
+        assert!(read_query(&accepted).structure.is_some());
+        let rejected = format!("{}backup{}", "(".repeat(129), ")".repeat(129));
+        assert!(read_query(&rejected).structure.is_none());
+        assert!(transpile_to_fts5(&rejected).is_none());
+        assert!(SearchClient::sqlite_message_scan_query(&rejected).is_none());
+        for raw in ["", " \t\n ", "\u{2003}"] {
+            assert!(cass_bool_groups_have_operands(&cass_bool_tokens(raw)));
+        }
+    }
+
+    #[test]
     fn transpile_to_fts5_ignores_leading_or() {
         assert_eq!(transpile_to_fts5("OR test"), Some("test".to_string()));
         assert_eq!(
@@ -22921,15 +23004,17 @@ mod tests {
         assert_eq!(structure("").as_deref(), None);
     }
 
-    /// Unbalanced parentheses are recovered, not rejected, and `--explain`
-    /// says how: the grouping shown is the one searched.
+    /// Nonempty unclosed groups recover at the end; empty groups refuse the
+    /// whole query. `--explain` must describe the same decision as execution.
     #[test]
     fn explanation_reports_recovered_parentheses() {
         let explain = |raw: &str| QueryExplanation::analyze(raw, &SearchFilters::default());
         let recovery = |warnings: &[String]| {
             warnings
                 .iter()
-                .filter(|warning| warning.contains("'('") || warning.contains("'()'"))
+                .filter(|warning| {
+                    warning.contains("'('") || warning.contains("parenthesized group")
+                })
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -22944,9 +23029,20 @@ mod tests {
             ["1 unclosed '(' closed at the end of the query"]
         );
 
-        let empty = explain("kiwi () lime");
-        assert_eq!(empty.parsed.structure.as_deref(), Some("kiwi AND lime"));
-        assert_eq!(recovery(&empty.warnings), ["1 empty '()' skipped"]);
+        for raw in [
+            "kiwi () lime",
+            "kiwi OR (NOT)",
+            "NOT (kiwi AND ())",
+            "kiwi AND (",
+        ] {
+            let empty = explain(raw);
+            assert_eq!(empty.parsed.structure, None, "{raw:?}");
+            assert_eq!(
+                recovery(&empty.warnings),
+                ["error: empty or operator-only parenthesized group; the query matches no documents"],
+                "{raw:?}"
+            );
+        }
 
         // Balanced groups, and parentheses inside a word, recover nothing.
         for balanced in ["(kiwi OR lime) mango", "call foo(bar) now", "kiwi lime)"] {
