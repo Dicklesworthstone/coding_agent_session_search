@@ -44943,6 +44943,32 @@ fn doctor_forensic_bundle_failed(reason: impl Into<String>) -> DoctorForensicBun
     }
 }
 
+/// Reference a captured bundle without copying its potentially archive-sized inventory.
+/// The owning report and the checksum-bound manifest retain the full artifact list;
+/// per-source/action receipts need only its identity, counts and safety outcome.
+fn doctor_forensic_bundle_receipt_ref(
+    bundle: &DoctorForensicBundleMetadata,
+) -> DoctorForensicBundleMetadata {
+    DoctorForensicBundleMetadata {
+        bundle_id: bundle.bundle_id.clone(),
+        path: bundle.path.clone(),
+        redacted_path: bundle.redacted_path.clone(),
+        manifest_path: bundle.manifest_path.clone(),
+        redacted_manifest_path: bundle.redacted_manifest_path.clone(),
+        checksum_blake3: bundle.checksum_blake3.clone(),
+        status: bundle.status.clone(),
+        created_at_ms: bundle.created_at_ms,
+        artifact_count: bundle.artifact_count,
+        copied_artifact_count: bundle.copied_artifact_count,
+        missing_artifact_count: bundle.missing_artifact_count,
+        failed_artifact_count: bundle.failed_artifact_count,
+        sidecar_complete: bundle.sidecar_complete,
+        redaction_status: bundle.redaction_status.clone(),
+        blocked_reason: bundle.blocked_reason.clone(),
+        artifacts: Vec::new(),
+    }
+}
+
 fn doctor_forensic_bundle_root(data_dir: &Path) -> PathBuf {
     data_dir.join("doctor").join("forensic-bundles")
 }
@@ -54493,7 +54519,8 @@ fn collect_doctor_raw_mirror_backfill_report(
                     if doctor_raw_mirror_backfill_receipt_would_mutate(&receipt) {
                         receipt.action = "blocked_forensic_bundle_capture_failed".to_string();
                         receipt.warnings.push(blocked_reason.clone());
-                        receipt.forensic_bundle = report.forensic_bundle.clone();
+                        receipt.forensic_bundle =
+                            doctor_forensic_bundle_receipt_ref(&report.forensic_bundle);
                     }
                     accumulate_doctor_raw_mirror_backfill_receipt(&mut report, receipt);
                 }
@@ -54517,7 +54544,7 @@ fn collect_doctor_raw_mirror_backfill_report(
             || receipt.action == "capture_live_source_failed"
             || receipt.action == "existing_raw_manifest_link_failed";
         if report.forensic_bundle.status == "captured" && mutating_receipt {
-            receipt.forensic_bundle = report.forensic_bundle.clone();
+            receipt.forensic_bundle = doctor_forensic_bundle_receipt_ref(&report.forensic_bundle);
         }
         accumulate_doctor_raw_mirror_backfill_receipt(&mut report, receipt);
     }
@@ -68788,7 +68815,7 @@ fn build_cleanup_doctor_plan(
         actions,
         artifact_manifest: doctor_artifact_manifest(artifacts),
         event_log: DoctorEventLogMetadata::default(),
-        forensic_bundle: result.forensic_bundle.clone(),
+        forensic_bundle: doctor_forensic_bundle_receipt_ref(&result.forensic_bundle),
         selected_authorities,
         rejected_authorities: Vec::new(),
         blocked_reasons: result.blocked_reasons.clone(),
@@ -70489,7 +70516,7 @@ fn finalize_cleanup_apply_contract(
         verification_outcomes,
         remaining_risk,
         event_log,
-        forensic_bundle: plan.forensic_bundle.clone(),
+        forensic_bundle: doctor_forensic_bundle_receipt_ref(&plan.forensic_bundle),
         artifact_manifest: artifact_manifest.clone(),
         artifact_checksums,
         drift_detection_status: artifact_manifest.drift_detection_status,
@@ -71573,7 +71600,7 @@ fn apply_diag_quarantine_cleanup(
             required_min_age_seconds: None,
         });
         let mutation_ended_at_ms = doctor_now_ms();
-        mutation_receipt.forensic_bundle = result.forensic_bundle.clone();
+        mutation_receipt.forensic_bundle = doctor_forensic_bundle_receipt_ref(&result.forensic_bundle);
         match mutation_receipt.status {
             DoctorActionStatus::Applied => {
                 let reclaimed_bytes = mutation_receipt.affected_bytes;
@@ -71690,7 +71717,8 @@ fn apply_diag_quarantine_cleanup(
                 required_min_age_seconds: None,
             });
             let mutation_ended_at_ms = doctor_now_ms();
-            mutation_receipt.forensic_bundle = result.forensic_bundle.clone();
+            mutation_receipt.forensic_bundle =
+                doctor_forensic_bundle_receipt_ref(&result.forensic_bundle);
             match mutation_receipt.status {
                 DoctorActionStatus::Applied => {
                     let reclaimed_bytes = mutation_receipt.affected_bytes;
@@ -78896,6 +78924,18 @@ mod doctor_asset_taxonomy_tests {
             file_blake3_hex(&manifest_path).expect("manifest hash"),
             bundle.checksum_blake3.clone().expect("metadata checksum")
         );
+        let mut expected_reference = serde_json::to_value(&bundle).expect("bundle metadata");
+        expected_reference["artifacts"] = serde_json::json!([]);
+        assert_eq!(
+            serde_json::to_value(doctor_forensic_bundle_receipt_ref(&bundle))
+                .expect("receipt reference"),
+            expected_reference,
+            "receipts must retain all identity and safety fields without duplicating the inventory"
+        );
+        assert!(
+            !bundle.artifacts.is_empty(),
+            "referencing a bundle must leave its owning inventory intact"
+        );
         let env_metadata_path = PathBuf::from(bundle.path.as_deref().expect("bundle path"))
             .join("metadata")
             .join("env-metadata.json");
@@ -78936,6 +78976,53 @@ mod doctor_asset_taxonomy_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn doctor_forensic_bundle_receipt_ref_bounds_inventory_fanout() {
+        let artifact = DoctorForensicBundleArtifact {
+            artifact_kind: "raw_mirror_manifest".to_string(),
+            source_path: "/archive/raw-mirror/manifest.json".to_string(),
+            redacted_source_path: "[cass-data]/raw-mirror/manifest.json".to_string(),
+            checksum_blake3: Some("ab".repeat(32)),
+            copied: true,
+            ..DoctorForensicBundleArtifact::default()
+        };
+        let bundle = DoctorForensicBundleMetadata {
+            bundle_id: Some("archive-backfill".to_string()),
+            manifest_path: Some("/archive/doctor/manifest.json".to_string()),
+            checksum_blake3: Some("cd".repeat(32)),
+            status: "captured".to_string(),
+            artifact_count: 4096,
+            copied_artifact_count: 4096,
+            sidecar_complete: true,
+            redaction_status: "redacted".to_string(),
+            artifacts: vec![artifact; 4096],
+            ..DoctorForensicBundleMetadata::default()
+        };
+        let references = (0..256)
+            .map(|_| doctor_forensic_bundle_receipt_ref(&bundle))
+            .collect::<Vec<_>>();
+        assert!(references.iter().all(|reference| {
+            reference.artifacts.is_empty()
+                && reference.artifact_count == 4096
+                && reference.checksum_blake3 == bundle.checksum_blake3
+        }));
+        let reference_bytes = serde_json::to_vec(&references).expect("serialize references");
+        let bundle_bytes = serde_json::to_vec(&bundle).expect("serialize full bundle");
+        assert!(
+            reference_bytes.len() < bundle_bytes.len(),
+            "hundreds of receipts must not multiply the archive-sized inventory in robot output"
+        );
+        assert_eq!(bundle.artifacts.len(), 4096);
+
+        let failed = doctor_forensic_bundle_failed("required SQLite sidecar could not be captured");
+        assert_eq!(
+            serde_json::to_value(doctor_forensic_bundle_receipt_ref(&failed))
+                .expect("failed reference"),
+            serde_json::to_value(&failed).expect("failed bundle"),
+            "failure and sidecar refusal must survive reference projection"
+        );
     }
 
     fn test_doctor_raw_mirror_report_for_candidate(data_dir: &Path) -> DoctorRawMirrorReport {

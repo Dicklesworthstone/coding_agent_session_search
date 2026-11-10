@@ -5860,6 +5860,28 @@ fn doctor_fix_backfills_legacy_raw_mirror_metadata_without_touching_provider_fil
         "raw mirror backfill forensic bundle manifest should exist on disk: {backfill:#}"
     );
     assert_eq!(backfill["captured_live_source_count"].as_u64(), Some(1));
+    let mut expected_bundle_reference = backfill["forensic_bundle"].clone();
+    assert!(
+        !expected_bundle_reference["artifacts"]
+            .as_array()
+            .expect("full backfill forensic inventory")
+            .is_empty(),
+        "the report must retain the full pre-mutation inventory"
+    );
+    expected_bundle_reference["artifacts"] = json!([]);
+    let mut referencing_receipts = 0;
+    for receipt in backfill["receipts"].as_array().expect("backfill receipts") {
+        if receipt["raw_source_captured"].as_bool() == Some(true)
+            || receipt["raw_mirror_db_linked"].as_bool() == Some(true)
+        {
+            referencing_receipts += 1;
+            assert_eq!(
+                receipt["forensic_bundle"], expected_bundle_reference,
+                "each capture/link receipt must reference the bundle without copying its artifact list"
+            );
+        }
+    }
+    assert_eq!(referencing_receipts, 2);
     assert_eq!(
         backfill["existing_raw_manifest_link_count"].as_u64(),
         Some(1)
@@ -6842,6 +6864,27 @@ fn doctor_cleanup_apply_prunes_safe_derivative_cleanup_candidates() {
         "cleanup_apply should carry planned_actions alongside applied/skipped action results"
     );
     let receipt = &cleanup["receipt"];
+    let mut expected_bundle_reference = cleanup["forensic_bundle"].clone();
+    assert!(
+        !expected_bundle_reference["artifacts"]
+            .as_array()
+            .expect("full cleanup forensic inventory")
+            .is_empty(),
+        "the cleanup result must retain the full pre-mutation inventory"
+    );
+    expected_bundle_reference["artifacts"] = json!([]);
+    for reference in [
+        &cleanup["plan"]["forensic_bundle"],
+        &receipt["forensic_bundle"],
+    ] {
+        assert_eq!(reference, &expected_bundle_reference);
+    }
+    for action in actions {
+        assert_eq!(
+            action["mutation_receipt"]["forensic_bundle"], expected_bundle_reference,
+            "cleanup actions must not duplicate the forensic inventory"
+        );
+    }
     assert_eq!(
         receipt["receipt_kind"].as_str(),
         Some("doctor_cleanup_apply_v1")
