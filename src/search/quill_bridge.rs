@@ -17,6 +17,7 @@
 
 use std::cell::RefCell;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +33,8 @@ use frankensearch::quill::cass::{
 };
 use frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA;
 use frankensearch::quill::{
-    KeeperSnapshot, QuillConfig, QuillIndex, QuillSearchIndex, SchemaDocument,
+    ConcatMergeRun, DEFAULT_CONCAT_MERGE_RUN_CONCURRENCY, KeeperSnapshot, QuillConfig, QuillIndex,
+    QuillSearchIndex, SchemaDocument,
 };
 use rayon::prelude::*;
 
@@ -1573,6 +1575,9 @@ impl QuillCassIndex {
     /// about. Each run also holds at most [`MAX_FOLD_OUTPUT_DOCS`] documents,
     /// so a multi-million-message archive folds into several segments rather
     /// than one whose common-token posting lists no reader could open (#498).
+    /// The planned runs are disjoint, and several are built at once only
+    /// while that many fit in available memory ([`lexical_fold_concurrency`]);
+    /// they still publish one at a time in plan order.
     ///
     /// # Errors
     ///
@@ -1588,11 +1593,11 @@ impl QuillCassIndex {
     ///
     /// Returns an error when the merge or compaction fails.
     pub fn force_merge_with_output_cap(&mut self, max_output_bytes: u64) -> Result<()> {
-        let runs =
-            plan_capped_merge_runs(&self.published_segment_fold_profile()?, max_output_bytes);
-        for run in runs {
-            self.concat_merge_run(&run)?;
-        }
+        self.fold_capped_runs(
+            max_output_bytes,
+            usize::MAX,
+            lexical_fold_concurrency_override(),
+        )?;
         self.compact_tombstones()?;
         Ok(())
     }
@@ -1601,14 +1606,94 @@ impl QuillCassIndex {
     /// nothing after, the state a process killed between two of them leaves.
     #[cfg(test)]
     pub(crate) fn force_merge_first_runs_for_test(&mut self, runs: usize) -> Result<()> {
-        let planned = plan_capped_merge_runs(
-            &self.published_segment_fold_profile()?,
+        self.fold_capped_runs(
             lexical_merge_max_output_bytes(),
+            runs,
+            lexical_fold_concurrency_override(),
+        )
+    }
+
+    /// Publish the first `limit` runs of the capped fold plan, in plan order.
+    ///
+    /// The plan's runs are disjoint, so up to [`lexical_fold_concurrency`] of
+    /// them are built at once, where the one-run path built them one after
+    /// another. The engine still publishes them one at a time in plan order,
+    /// each exactly as its own `concat_merge` would, so a process stopped
+    /// mid-fold leaves the same published prefix of runs.
+    fn fold_capped_runs(
+        &mut self,
+        max_output_bytes: u64,
+        limit: usize,
+        concurrency_override: Option<NonZeroUsize>,
+    ) -> Result<()> {
+        let profile = self.published_segment_fold_profile()?;
+        let mut runs = plan_capped_merge_runs(&profile, max_output_bytes);
+        runs.truncate(limit);
+        let largest_run_bytes = largest_planned_fold_output_bytes(&profile, &runs);
+        let available_memory_bytes = crate::indexer::responsiveness::available_memory_bytes();
+        let concurrency = lexical_fold_concurrency(
+            runs.len(),
+            largest_run_bytes,
+            concurrency_override,
+            available_memory_bytes,
         );
-        for run in planned.into_iter().take(runs) {
-            self.concat_merge_run(&run)?;
+        tracing::info!(
+            segments = profile.len(),
+            runs = runs.len(),
+            concurrency = concurrency.get(),
+            largest_run_bytes,
+            ?available_memory_bytes,
+            "planned the capped lexical fold"
+        );
+        let planned = plan_fold_publications(&profile, runs, unix_now_s());
+        self.publish_fold_runs(&planned, concurrency)
+    }
+
+    /// Publish `planned` in order, building up to `concurrency` runs at once.
+    fn publish_fold_runs(
+        &mut self,
+        planned: &[ConcatMergeRun],
+        concurrency: NonZeroUsize,
+    ) -> Result<()> {
+        if concurrency.get() == 1 || planned.len() < 2 {
+            for run in planned {
+                self.concat_merge_planned(run)?;
+            }
+            return Ok(());
         }
-        Ok(())
+        let outcome = self.with_engine_liveness(|| {
+            drive(|cx| {
+                let index = &self.index;
+                async move { index.concat_merge_runs(&cx, planned, concurrency).await }
+            })
+        });
+        // Runs publish in plan order, so the published ones are a prefix: each
+        // is one unit of completed work, as in the one-run path. A published
+        // run's sources have left the manifest and its output has joined it.
+        let published = match &outcome {
+            Ok(_) => planned.len(),
+            Err(_) => {
+                let live = self.published_segment_profile().unwrap_or_default();
+                let is_live = |segment_id: u64| live.iter().any(|(id, _)| *id == segment_id);
+                planned
+                    .iter()
+                    .take_while(|run| {
+                        is_live(run.output_segment_id)
+                            && !run.source_segment_ids.iter().copied().any(is_live)
+                    })
+                    .count()
+            }
+        };
+        for _ in 0..published {
+            self.tick_heartbeat();
+        }
+        outcome.map(|_| ()).map_err(|error| {
+            // The one-run path's message, naming the run that failed.
+            let sources = planned
+                .get(published)
+                .map_or(0, |run| run.source_segment_ids.len());
+            anyhow!("concat-merging {sources} Quill CASS segments: {error}")
+        })
     }
 
     /// The fold profile of every published segment, in manifest (docid)
@@ -1690,10 +1775,17 @@ impl QuillCassIndex {
     /// the live manifest, matching the engine's own id discipline.
     fn concat_merge_run(&mut self, source_segment_ids: &[u64]) -> Result<()> {
         let output_segment_id = fresh_segment_id(&self.published_segment_profile()?);
-        let created_unix_s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
-            .unwrap_or(0);
+        self.concat_merge_planned(&ConcatMergeRun {
+            source_segment_ids: source_segment_ids.to_vec(),
+            output_segment_id,
+            created_unix_s: unix_now_s(),
+        })
+    }
+
+    /// One concat merge under an identity chosen by the caller.
+    fn concat_merge_planned(&mut self, run: &ConcatMergeRun) -> Result<()> {
+        let source_segment_ids = run.source_segment_ids.as_slice();
+        let (output_segment_id, created_unix_s) = (run.output_segment_id, run.created_unix_s);
         self.with_engine_liveness(|| {
             drive(|cx| {
                 let index = &self.index;
@@ -2138,6 +2230,123 @@ fn fresh_segment_id(profile: &[(u64, u64)]) -> u64 {
             return candidate;
         }
     }
+}
+
+/// Seconds since the Unix epoch for a merged segment's header (0 before it).
+fn unix_now_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Give each planned fold run its output identity: a random nonzero id absent
+/// from the live manifest and from every earlier run's output, and the
+/// header time. When a run publishes, the live manifest is the initial one
+/// minus earlier runs' sources plus their outputs, so its id is still free,
+/// as the one-run path's per-publication pick would be.
+fn plan_fold_publications(
+    profile: &[SegmentFoldProfile],
+    runs: Vec<Vec<u64>>,
+    created_unix_s: i64,
+) -> Vec<ConcatMergeRun> {
+    let mut taken: Vec<(u64, u64)> = profile
+        .iter()
+        .map(|segment| (segment.segment_id, 0))
+        .collect();
+    runs.into_iter()
+        .map(|source_segment_ids| {
+            let output_segment_id = fresh_segment_id(&taken);
+            taken.push((output_segment_id, 0));
+            ConcatMergeRun {
+                source_segment_ids,
+                output_segment_id,
+                created_unix_s,
+            }
+        })
+        .collect()
+}
+
+/// The largest [`estimated_fold_output_bytes`] among `runs`, each a
+/// consecutive slice of `profile` by segment id.
+fn largest_planned_fold_output_bytes(profile: &[SegmentFoldProfile], runs: &[Vec<u64>]) -> u64 {
+    runs.iter()
+        .filter_map(|run| {
+            let start = profile
+                .iter()
+                .position(|segment| Some(&segment.segment_id) == run.first())?;
+            profile
+                .get(start..start + run.len())
+                .map(estimated_fold_output_bytes)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Environment override for how many fold runs the end-of-rebuild fold
+/// builds at once (a positive integer; `0` or unparsable keeps the
+/// memory-bounded default of [`lexical_fold_concurrency`]; `1` folds one run
+/// at a time).
+pub const CASS_LEXICAL_FOLD_CONCURRENCY_ENV: &str = "CASS_LEXICAL_FOLD_CONCURRENCY";
+
+/// Resident bytes budgeted for one fold run in flight, per byte of its
+/// estimated output. A run holds its assembled output plus the section
+/// buffers it is built from. Measured on a CASS-shaped generation folded in
+/// 1 GiB runs, each run in flight added about 2.4 times its output to the
+/// anonymous peak (one at a time +2.5 GiB, four at once +9.5 GiB) and about
+/// 2.5 times to the resident high-water mark; 4 leaves room for allocator
+/// slack and the mapped source pages.
+const FOLD_RUN_RESIDENT_BYTES_PER_OUTPUT_BYTE: u64 = 4;
+
+/// The fold plans to occupy at most `1 / FOLD_MEMORY_SHARE_DIVISOR` of the
+/// memory available when it starts.
+const FOLD_MEMORY_SHARE_DIVISOR: u64 = 2;
+
+fn lexical_fold_concurrency_override() -> Option<NonZeroUsize> {
+    lexical_fold_concurrency_override_from(
+        dotenvy::var(CASS_LEXICAL_FOLD_CONCURRENCY_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn lexical_fold_concurrency_override_from(raw: Option<&str>) -> Option<NonZeroUsize> {
+    raw.map(|value| value.trim().replace('_', ""))
+        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(NonZeroUsize::new)
+}
+
+/// How many of `run_count` disjoint fold runs to build at once.
+///
+/// An override is honoured up to the run count. Otherwise every run in flight
+/// is budgeted at [`FOLD_RUN_RESIDENT_BYTES_PER_OUTPUT_BYTE`] times the
+/// largest run's estimated output, the runs in flight must fit in
+/// `1 / FOLD_MEMORY_SHARE_DIVISOR` of `available_memory_bytes`, and the
+/// engine's [`DEFAULT_CONCAT_MERGE_RUN_CONCURRENCY`] is the ceiling (the
+/// engine further caps it at the available parallelism). With unknown
+/// memory, or room for only one run, the fold runs one at a time as before.
+fn lexical_fold_concurrency(
+    run_count: usize,
+    largest_run_bytes: u64,
+    concurrency_override: Option<NonZeroUsize>,
+    available_memory_bytes: Option<u64>,
+) -> NonZeroUsize {
+    let runs = NonZeroUsize::new(run_count).unwrap_or(NonZeroUsize::MIN);
+    if let Some(requested) = concurrency_override {
+        return requested.min(runs);
+    }
+    let Some(available) = available_memory_bytes else {
+        return NonZeroUsize::MIN;
+    };
+    let per_run = largest_run_bytes
+        .saturating_mul(FOLD_RUN_RESIDENT_BYTES_PER_OUTPUT_BYTE)
+        .max(1);
+    let fit =
+        usize::try_from(available / FOLD_MEMORY_SHARE_DIVISOR / per_run).unwrap_or(usize::MAX);
+    NonZeroUsize::new(fit)
+        .unwrap_or(NonZeroUsize::MIN)
+        .min(DEFAULT_CONCAT_MERGE_RUN_CONCURRENCY)
+        .min(runs)
 }
 
 #[cfg(test)]
@@ -2585,6 +2794,302 @@ mod tests {
             let id = fresh_segment_id(&profile);
             assert!(id != 0 && id != 1 && id != 2);
         }
+    }
+
+    #[test]
+    fn fold_concurrency_override_parses_positive_integers_only() {
+        assert_eq!(lexical_fold_concurrency_override_from(None), None);
+        assert_eq!(lexical_fold_concurrency_override_from(Some("")), None);
+        assert_eq!(lexical_fold_concurrency_override_from(Some("0")), None);
+        assert_eq!(lexical_fold_concurrency_override_from(Some("-2")), None);
+        assert_eq!(lexical_fold_concurrency_override_from(Some("many")), None);
+        assert_eq!(
+            lexical_fold_concurrency_override_from(Some(" 3 ")),
+            NonZeroUsize::new(3)
+        );
+        assert_eq!(
+            lexical_fold_concurrency_override_from(Some("1_0")),
+            NonZeroUsize::new(10)
+        );
+    }
+
+    /// Every run in flight is budgeted at the per-output-byte factor; the
+    /// runs in flight fit in the available-memory share, never exceed the
+    /// engine default or the run count, and an override wins.
+    #[test]
+    fn fold_concurrency_is_bounded_by_memory_runs_and_the_engine_default() {
+        let n = |value: usize| NonZeroUsize::new(value).expect("nonzero");
+        let gib = 1_u64 << 30;
+        let per_run = gib * FOLD_RUN_RESIDENT_BYTES_PER_OUTPUT_BYTE;
+        let share = FOLD_MEMORY_SHARE_DIVISOR;
+        // Nothing to overlap, or no memory reading: one run at a time.
+        assert_eq!(lexical_fold_concurrency(0, gib, None, Some(u64::MAX)), n(1));
+        assert_eq!(lexical_fold_concurrency(1, gib, None, Some(u64::MAX)), n(1));
+        assert_eq!(lexical_fold_concurrency(8, gib, None, None), n(1));
+        // The runs in flight fit in the share of available memory.
+        assert_eq!(
+            lexical_fold_concurrency(8, gib, None, Some(share * per_run * 2 - 1)),
+            n(1)
+        );
+        assert_eq!(
+            lexical_fold_concurrency(8, gib, None, Some(share * per_run * 2)),
+            n(2)
+        );
+        assert_eq!(
+            lexical_fold_concurrency(8, gib, None, Some(share * per_run * 3)),
+            n(3)
+        );
+        assert_eq!(
+            lexical_fold_concurrency(8, gib / 4, None, Some(share * per_run)),
+            n(4),
+            "smaller runs fit more at once"
+        );
+        // The engine default is the ceiling, and the run count bounds it.
+        assert_eq!(
+            lexical_fold_concurrency(8, gib, None, Some(u64::MAX)),
+            DEFAULT_CONCAT_MERGE_RUN_CONCURRENCY
+        );
+        assert_eq!(lexical_fold_concurrency(3, gib, None, Some(u64::MAX)), n(3));
+        assert_eq!(lexical_fold_concurrency(2, 0, None, Some(1)), n(1));
+        assert_eq!(lexical_fold_concurrency(2, 0, None, Some(u64::MAX)), n(2));
+        // An override is honoured up to the run count, whatever the memory.
+        assert_eq!(lexical_fold_concurrency(8, gib, Some(n(6)), None), n(6));
+        assert_eq!(lexical_fold_concurrency(3, gib, Some(n(6)), Some(0)), n(3));
+        assert_eq!(
+            lexical_fold_concurrency(8, gib, Some(n(1)), Some(u64::MAX)),
+            n(1)
+        );
+    }
+
+    /// Copy a closed index directory tree.
+    fn copy_index_tree(from: &Path, to: &Path) {
+        for entry in std::fs::read_dir(from).expect("read index directory") {
+            let entry = entry.expect("index directory entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("entry type").is_dir() {
+                std::fs::create_dir_all(&target).expect("create directory");
+                copy_index_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy index file");
+            }
+        }
+    }
+
+    /// Two byte-identical copies of a closed, single-shard generation of
+    /// `segments` committed segments of uneven content.
+    fn copied_fold_fixtures(segments: u64) -> (tempfile::TempDir, tempfile::TempDir) {
+        let first = tempfile::tempdir().expect("fold fixture directory");
+        {
+            let config = QuillConfig {
+                deterministic_ingest: true,
+                ..cass_quill_config()
+            };
+            let mut index = QuillCassIndex::open_or_create_with_config(first.path(), &config)
+                .expect("open fold fixture");
+            for segment in 0..segments {
+                let batch: Vec<_> = (0..6 + segment % 3)
+                    .map(|msg_idx| {
+                        sample(
+                            &format!("fold-{segment}"),
+                            msg_idx,
+                            &format!("fold token{} wave{} message", msg_idx % 5, segment % 4),
+                        )
+                    })
+                    .collect();
+                index.add_cass_documents(&batch).expect("index fold batch");
+                index.commit().expect("commit fold batch");
+            }
+        }
+        let second = tempfile::tempdir().expect("fold fixture copy");
+        copy_index_tree(first.path(), second.path());
+        (first, second)
+    }
+
+    fn manifest_segments(index: &QuillCassIndex) -> Vec<frankensearch::quill::ManifestSegment> {
+        index
+            .index
+            .snapshot()
+            .expect("snapshot")
+            .segments()
+            .iter()
+            .map(|segment| segment.manifest().clone())
+            .collect()
+    }
+
+    fn fixed_fold_run(sources: &[u64], output_segment_id: u64) -> ConcatMergeRun {
+        ConcatMergeRun {
+            source_segment_ids: sources.to_vec(),
+            output_segment_id,
+            created_unix_s: 1_700_000_000,
+        }
+    }
+
+    const FOLD_QUERIES: [&str; 5] = ["fold", "token3", "wave1 message", "token*", "fold-7"];
+
+    /// Under the same output identities, the concurrent fold publishes the
+    /// serial fold's segments byte for byte (same `file_xxh3`, length, docid
+    /// range, seal sequence) in plan order, and a stop after any prefix of
+    /// runs leaves the serial fold's state.
+    #[test]
+    fn concurrent_fold_publishes_the_serial_folds_bytes_in_plan_order() {
+        let (serial_dir, concurrent_dir) = copied_fold_fixtures(12);
+        let mut serial = QuillCassIndex::open_or_create(serial_dir.path()).expect("open serial");
+        let mut concurrent =
+            QuillCassIndex::open_or_create(concurrent_dir.path()).expect("open concurrent");
+        let before = manifest_segments(&serial);
+        assert_eq!(before, manifest_segments(&concurrent), "copies start equal");
+        let ids: Vec<u64> = before.iter().map(|segment| segment.segment_id).collect();
+        assert_eq!(ids.len(), 12);
+        let outputs = [0xF01D_0001_u64, 0xF01D_0002, 0xF01D_0003, 0xF01D_0004];
+        assert!(outputs.iter().all(|output| !ids.contains(output)));
+        // Disjoint consecutive runs of uneven length; segment 5 stays alone.
+        let planned = [
+            fixed_fold_run(&ids[0..2], outputs[0]),
+            fixed_fold_run(&ids[2..5], outputs[1]),
+            fixed_fold_run(&ids[6..8], outputs[2]),
+            fixed_fold_run(&ids[8..12], outputs[3]),
+        ];
+        let four = NonZeroUsize::new(4).expect("nonzero");
+
+        serial
+            .publish_fold_runs(&planned[..2], NonZeroUsize::MIN)
+            .expect("serial prefix");
+        concurrent
+            .publish_fold_runs(&planned[..2], four)
+            .expect("concurrent prefix");
+        assert_eq!(
+            manifest_segments(&serial),
+            manifest_segments(&concurrent),
+            "a stop after two runs leaves the same published prefix"
+        );
+
+        serial
+            .publish_fold_runs(&planned[2..], NonZeroUsize::MIN)
+            .expect("serial rest");
+        concurrent
+            .publish_fold_runs(&planned[2..], four)
+            .expect("concurrent rest");
+        let folded = manifest_segments(&serial);
+        assert_eq!(folded, manifest_segments(&concurrent));
+        assert_eq!(
+            folded
+                .iter()
+                .map(|segment| segment.segment_id)
+                .collect::<Vec<_>>(),
+            vec![outputs[0], outputs[1], ids[5], outputs[2], outputs[3]],
+            "outputs replace their runs in manifest order"
+        );
+        assert!(
+            folded
+                .windows(2)
+                .all(|pair| pair[0].docid_hi <= pair[1].docid_lo),
+            "{folded:?}"
+        );
+        assert_eq!(
+            generation_witness(&serial, &FOLD_QUERIES),
+            generation_witness(&concurrent, &FOLD_QUERIES)
+        );
+        let expected_docs: u64 = (0..12).map(|segment| 6 + segment % 3).sum();
+        assert_eq!(serial.doc_count().expect("doc count"), expected_docs);
+        assert_eq!(concurrent.doc_count().expect("doc count"), expected_docs);
+    }
+
+    /// A run that cannot publish fails the concurrent fold with the serial
+    /// fold's error, naming that run, after the same earlier runs published.
+    #[test]
+    fn concurrent_fold_fails_where_the_serial_fold_fails_and_keeps_its_prefix() {
+        let (serial_dir, concurrent_dir) = copied_fold_fixtures(10);
+        let mut serial = QuillCassIndex::open_or_create(serial_dir.path()).expect("open serial");
+        let mut concurrent =
+            QuillCassIndex::open_or_create(concurrent_dir.path()).expect("open concurrent");
+        let ids: Vec<u64> = manifest_segments(&serial)
+            .iter()
+            .map(|segment| segment.segment_id)
+            .collect();
+        // The second run's output id is still live (a source of the third).
+        let planned = [
+            fixed_fold_run(&ids[0..2], 0xF01D_0011),
+            fixed_fold_run(&ids[2..5], ids[6]),
+            fixed_fold_run(&ids[5..9], 0xF01D_0013),
+        ];
+        let serial_error = format!(
+            "{:#}",
+            serial
+                .publish_fold_runs(&planned, NonZeroUsize::MIN)
+                .expect_err("serial fold must refuse a live output id")
+        );
+        let concurrent_error = format!(
+            "{:#}",
+            concurrent
+                .publish_fold_runs(&planned, NonZeroUsize::new(4).expect("nonzero"))
+                .expect_err("concurrent fold must refuse a live output id")
+        );
+        assert_eq!(concurrent_error, serial_error);
+        assert!(
+            serial_error.starts_with("concat-merging 3 Quill CASS segments: "),
+            "{serial_error}"
+        );
+        let after = manifest_segments(&concurrent);
+        assert_eq!(after, manifest_segments(&serial));
+        assert_eq!(after.len(), 9, "only the first run published");
+        assert_eq!(after[0].segment_id, 0xF01D_0011);
+        assert_eq!(
+            generation_witness(&serial, &FOLD_QUERIES),
+            generation_witness(&concurrent, &FOLD_QUERIES)
+        );
+    }
+
+    /// The production capped fold, concurrent and one run at a time, folds
+    /// the same plan into the same generation: segment layout, seal order,
+    /// live count, and ranked answers with score bits. Only the randomly
+    /// drawn output ids (random in the serial fold as well) differ.
+    #[test]
+    fn concurrent_capped_fold_folds_the_serial_plan_into_the_same_generation() {
+        let (serial_dir, concurrent_dir) = copied_fold_fixtures(12);
+        let mut serial = QuillCassIndex::open_or_create(serial_dir.path()).expect("open serial");
+        let mut concurrent =
+            QuillCassIndex::open_or_create(concurrent_dir.path()).expect("open concurrent");
+        let before = serial
+            .published_segment_fold_profile()
+            .expect("fold profile");
+        let cap = estimated_fold_output_bytes(&before[..3]);
+        let planned = plan_capped_merge_runs(&before, cap);
+        assert!(planned.len() >= 3, "several runs to overlap: {planned:?}");
+        let folded_away: usize = planned.iter().map(|run| run.len() - 1).sum();
+
+        serial
+            .fold_capped_runs(cap, usize::MAX, NonZeroUsize::new(1))
+            .expect("serial capped fold");
+        concurrent
+            .fold_capped_runs(cap, usize::MAX, NonZeroUsize::new(4))
+            .expect("concurrent capped fold");
+        let layout = |index: &QuillCassIndex| {
+            manifest_segments(index)
+                .into_iter()
+                .map(|segment| {
+                    (
+                        segment.seal_seq,
+                        segment.docid_lo,
+                        segment.docid_hi,
+                        segment.doc_count,
+                        segment.tombstones,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(layout(&serial), layout(&concurrent));
+        assert_eq!(layout(&serial).len(), before.len() - folded_away);
+        assert_eq!(
+            generation_witness(&serial, &FOLD_QUERIES),
+            generation_witness(&concurrent, &FOLD_QUERIES)
+        );
+        let input_ids: Vec<u64> = before.iter().map(|segment| segment.segment_id).collect();
+        let new_ids: Vec<u64> = manifest_segments(&concurrent)
+            .iter()
+            .map(|segment| segment.segment_id)
+            .filter(|id| !input_ids.contains(id))
+            .collect();
+        assert_eq!(new_ids.len(), planned.len(), "one fresh id per run");
     }
 
     // GH #446: the sampler's decision core — first sample is a baseline, then
@@ -4055,5 +4560,352 @@ mod tests {
             .map(|metadata| metadata.len())
             .sum();
         assert_eq!(after.live_bytes, referenced + bookkeeping);
+    }
+
+    /// Words of the fold A/B corpus: rank `r` of a 60,000-word vocabulary
+    /// drawn with weight about `1 / (r + 8)`, so common words have long
+    /// posting lists and most words are rare, as in agent transcripts.
+    struct FoldAbVocabulary {
+        cumulative: Vec<f64>,
+    }
+
+    impl FoldAbVocabulary {
+        fn new() -> Self {
+            let mut total = 0.0;
+            let cumulative = (0..60_000_u32)
+                .map(|rank| {
+                    total += 1.0 / (f64::from(rank) + 8.0);
+                    total
+                })
+                .collect();
+            Self { cumulative }
+        }
+
+        /// Append `bytes` (about) of text for message `seed` to `out`.
+        fn text(&self, seed: u64, bytes: usize, out: &mut String) {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let total = *self.cumulative.last().expect("vocabulary");
+            while out.len() < bytes {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let draw = (state >> 11) as f64 / (1_u64 << 53) as f64 * total;
+                let rank = self.cumulative.partition_point(|&edge| edge < draw);
+                out.push_str(&format!("w{rank:x} "));
+            }
+        }
+    }
+
+    /// Message length of document `doc`: an uneven mix around `mean` bytes
+    /// with an occasional long tool-output-like body.
+    fn fold_ab_message_bytes(doc: u64, mean: usize) -> usize {
+        const MIX: [usize; 8] = [1, 2, 4, 8, 8, 12, 14, 15];
+        if doc.is_multiple_of(97) {
+            return mean * 8;
+        }
+        (mean * MIX[usize::try_from(doc % 8).expect("small")] / 8).max(16)
+    }
+
+    fn fold_ab_status_mib(field: &str) -> f64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap_or_default()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(field)?
+                    .trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+            })
+            .map_or(f64::NAN, |kib| kib / 1024.0)
+    }
+
+    const FOLD_AB_QUERIES: [&str; 6] = ["w3", "w1f", "w2a7", "w5 w9", "\"w0 w1\"", "w1a*"];
+
+    /// Child half of `fold_concurrency_benchmark_arms`: fold a fresh copy of
+    /// the parent's generation with the production `force_merge` (its fold
+    /// concurrency from the environment the parent set), sampling RSS every
+    /// 50 ms. Prints one `FOLD_AB_RUN` line.
+    fn fold_ab_child(arm: &str) {
+        let var = |key: &str| dotenvy::var(key).expect(key);
+        let base = PathBuf::from(var("CASS_FOLD_AB_BASE"));
+        let round: usize = var("CASS_FOLD_AB_ROUND").parse().expect("round");
+        let scratch =
+            tempfile::TempDir::new_in(var("CASS_FOLD_AB_DIR")).expect("child scratch directory");
+        let copy_started = std::time::Instant::now();
+        copy_index_tree(&base, scratch.path());
+        let copy_ms = copy_started.elapsed().as_secs_f64() * 1000.0;
+        let mut index = QuillCassIndex::open_or_create(scratch.path()).expect("open the copy");
+        let profile = index
+            .published_segment_fold_profile()
+            .expect("fold profile");
+        let runs = plan_capped_merge_runs(&profile, lexical_merge_max_output_bytes());
+        let largest_run_bytes = largest_planned_fold_output_bytes(&profile, &runs);
+        let concurrency = lexical_fold_concurrency(
+            runs.len(),
+            largest_run_bytes,
+            lexical_fold_concurrency_override(),
+            crate::indexer::responsiveness::available_memory_bytes(),
+        );
+        let rss_before = fold_ab_status_mib("VmRSS:");
+        let anon_before = fold_ab_status_mib("RssAnon:");
+        let stop = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let (mut rss_max, mut anon_max) = (0.0_f64, 0.0_f64);
+                while !stop.load(Ordering::Relaxed) {
+                    rss_max = rss_max.max(fold_ab_status_mib("VmRSS:"));
+                    anon_max = anon_max.max(fold_ab_status_mib("RssAnon:"));
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                (rss_max, anon_max)
+            })
+        };
+        let started = std::time::Instant::now();
+        index.force_merge().expect("fold the copy");
+        let fold_ms = started.elapsed().as_secs_f64() * 1000.0;
+        stop.store(true, Ordering::Relaxed);
+        let (fold_rss_max, fold_anon_max) = sampler.join().expect("sampler");
+        let witness = generation_witness(&index, &FOLD_AB_QUERIES);
+        let mut hasher = blake3::Hasher::new();
+        for line in &witness {
+            hasher.update(line.as_bytes());
+            hasher.update(b"\n");
+        }
+        let run = serde_json::json!({
+            "arm": arm,
+            "round": round,
+            "fold_ms": fold_ms,
+            "copy_ms": copy_ms,
+            "segments_before": profile.len(),
+            "segments_after": index.segment_count().expect("segment count"),
+            "docs": index.doc_count().expect("doc count"),
+            "runs": runs.len(),
+            "largest_run_bytes": largest_run_bytes,
+            "concurrency": concurrency.get(),
+            "rss_before_mib": rss_before,
+            "anon_before_mib": anon_before,
+            "fold_rss_max_mib": fold_rss_max,
+            "fold_anon_max_mib": fold_anon_max,
+            "hwm_mib": fold_ab_status_mib("VmHWM:"),
+            "witness": hasher.finalize().to_hex().to_string(),
+            "witness_lines": witness.len(),
+        });
+        eprintln!("FOLD_AB_RUN {run}");
+    }
+
+    /// Same-binary A/B of the end-of-rebuild fold: the parent ingests one
+    /// production-config generation (`CASS_FOLD_AB_DOCS` CASS documents of
+    /// `CASS_FOLD_AB_MESSAGE_BYTES` mean bytes in batches of 6,400, committed
+    /// every `CASS_FOLD_AB_COMMIT_EVERY` documents), then re-runs this test
+    /// binary once per arm and round (alternating order, one unrecorded
+    /// warm-up round). Each child folds its own copy with `force_merge`. The
+    /// incumbent and null arms fold one run at a time
+    /// (`CASS_LEXICAL_FOLD_CONCURRENCY=1`); the candidate uses the production
+    /// default, or `CASS_FOLD_AB_CANDIDATE_CONCURRENCY`. Every child must
+    /// publish the same layout and the same ranked answers (score bits).
+    #[test]
+    #[ignore = "fold concurrency A/B; run explicitly with --ignored --nocapture"]
+    fn fold_concurrency_benchmark_arms() {
+        if let Ok(arm) = dotenvy::var("CASS_FOLD_AB_CHILD_ARM") {
+            fold_ab_child(&arm);
+            return;
+        }
+        let size = |key: &str, default: u64| {
+            dotenvy::var(key)
+                .ok()
+                .and_then(|value| value.replace('_', "").parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        };
+        let docs = size("CASS_FOLD_AB_DOCS", 1 << 21);
+        let mean_bytes = usize::try_from(size("CASS_FOLD_AB_MESSAGE_BYTES", 1024)).expect("bytes");
+        let commit_every = size("CASS_FOLD_AB_COMMIT_EVERY", 1 << 19);
+        let rounds = size("CASS_FOLD_AB_ROUNDS", 3);
+        let root = dotenvy::var("CASS_FOLD_AB_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let base = tempfile::TempDir::new_in(&root).expect("base generation directory");
+
+        let build_started = std::time::Instant::now();
+        {
+            let vocabulary = FoldAbVocabulary::new();
+            let mut index = QuillCassIndex::open_or_create(base.path()).expect("open base");
+            let mut doc = 0_u64;
+            let mut since_commit = 0_u64;
+            while doc < docs {
+                let end = (doc + 6_400).min(docs);
+                let batch: Vec<QuillCassDocument> = (doc..end)
+                    .into_par_iter()
+                    .map(|doc| {
+                        let conversation = doc / 256;
+                        let mut content = String::new();
+                        vocabulary.text(doc, fold_ab_message_bytes(doc, mean_bytes), &mut content);
+                        QuillCassDocument {
+                            agent: ["codex", "claude", "gemini"]
+                                [usize::try_from(conversation % 3).expect("small")]
+                            .to_owned(),
+                            workspace: Some(format!("/work/ws{}", conversation % 16)),
+                            workspace_original: None,
+                            source_path: format!("/sessions/fold-ab-{conversation:06}.jsonl"),
+                            msg_idx: doc % 256,
+                            created_at: Some(1_700_000_000 + i64::try_from(doc).expect("small")),
+                            title: Some(format!("fold ab session {conversation}")),
+                            content,
+                            source_id: "local".to_owned(),
+                            origin_kind: "local".to_owned(),
+                            origin_host: None,
+                            conversation_id: Some(i64::try_from(conversation).expect("small")),
+                        }
+                    })
+                    .collect();
+                index.add_cass_documents(&batch).expect("index base batch");
+                since_commit += end - doc;
+                doc = end;
+                if since_commit >= commit_every || doc == docs {
+                    index.commit().expect("commit base");
+                    since_commit = 0;
+                }
+            }
+        }
+        let index = QuillCassIndex::open_or_create(base.path()).expect("reopen base");
+        let profile = index.published_segment_fold_profile().expect("profile");
+        let runs = plan_capped_merge_runs(&profile, lexical_merge_max_output_bytes());
+        eprintln!(
+            "FOLD_AB_SHAPE {}",
+            serde_json::json!({
+                "docs": docs,
+                "mean_message_bytes": mean_bytes,
+                "commit_every": commit_every,
+                "segments": profile.len(),
+                "generation_bytes": profile.iter().map(|segment| segment.file_len).sum::<u64>(),
+                "runs": runs.len(),
+                "run_sources": runs.iter().map(Vec::len).collect::<Vec<_>>(),
+                "largest_run_bytes": largest_planned_fold_output_bytes(&profile, &runs),
+                "build_ms": build_started.elapsed().as_millis() as u64,
+                "rounds": rounds,
+                "available_parallelism":
+                    std::thread::available_parallelism().map_or(1, usize::from),
+                "available_memory_bytes": crate::indexer::responsiveness::available_memory_bytes(),
+            })
+        );
+        drop(index);
+
+        let arms = ["incumbent", "candidate", "null"];
+        let exe = std::env::current_exe().expect("test binary");
+        let mut runs_seen: Vec<serde_json::Value> = Vec::new();
+        for round in 0..=rounds {
+            let order: Vec<&str> = if round % 2 == 0 {
+                arms.to_vec()
+            } else {
+                arms.iter().rev().copied().collect()
+            };
+            for arm in order {
+                let mut command = std::process::Command::new(&exe);
+                command
+                    .args([
+                        "search::quill_bridge::tests::fold_concurrency_benchmark_arms",
+                        "--exact",
+                        "--ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env("CASS_FOLD_AB_CHILD_ARM", arm)
+                    .env("CASS_FOLD_AB_BASE", base.path())
+                    .env("CASS_FOLD_AB_DIR", &root)
+                    .env("CASS_FOLD_AB_ROUND", round.to_string());
+                match (arm, dotenvy::var("CASS_FOLD_AB_CANDIDATE_CONCURRENCY")) {
+                    ("candidate", Ok(requested)) => {
+                        command.env(CASS_LEXICAL_FOLD_CONCURRENCY_ENV, requested);
+                    }
+                    ("candidate", Err(_)) => {
+                        command.env_remove(CASS_LEXICAL_FOLD_CONCURRENCY_ENV);
+                    }
+                    _ => {
+                        command.env(CASS_LEXICAL_FOLD_CONCURRENCY_ENV, "1");
+                    }
+                }
+                let output = command.output().expect("run fold A/B child");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success(),
+                    "fold A/B child {arm} round {round} failed: {}",
+                    stderr.lines().rev().take(40).collect::<Vec<_>>().join("\n")
+                );
+                for line in stderr.lines() {
+                    if let Some(json) = line.strip_prefix("FOLD_AB_RUN ") {
+                        eprintln!("{line}");
+                        runs_seen.push(serde_json::from_str(json).expect("run json"));
+                    }
+                }
+            }
+        }
+
+        let percentile = |mut samples: Vec<f64>, q: f64| {
+            samples.sort_by(f64::total_cmp);
+            samples
+                .get(((samples.len().max(1) - 1) as f64 * q).round() as usize)
+                .copied()
+                .unwrap_or(f64::NAN)
+        };
+        let recorded: Vec<&serde_json::Value> = runs_seen
+            .iter()
+            .filter(|run| run["round"].as_u64() != Some(0))
+            .collect();
+        for arm in arms {
+            let mut summary = serde_json::Map::new();
+            summary.insert("arm".into(), serde_json::json!(arm));
+            for metric in [
+                "fold_ms",
+                "hwm_mib",
+                "fold_rss_max_mib",
+                "fold_anon_max_mib",
+            ] {
+                let mine: Vec<&&serde_json::Value> =
+                    recorded.iter().filter(|run| run["arm"] == arm).collect();
+                let values: Vec<f64> = mine.iter().filter_map(|run| run[metric].as_f64()).collect();
+                let ratios: Vec<f64> = mine
+                    .iter()
+                    .filter_map(|run| {
+                        let incumbent = recorded.iter().find(|other| {
+                            other["arm"] == "incumbent" && other["round"] == run["round"]
+                        })?;
+                        Some(run[metric].as_f64()? / incumbent[metric].as_f64()?)
+                    })
+                    .collect();
+                summary.insert(
+                    metric.into(),
+                    serde_json::json!({
+                        "p50": percentile(values.clone(), 0.5),
+                        "min": percentile(values.clone(), 0.0),
+                        "max": percentile(values, 1.0),
+                        "ratio_p50": percentile(ratios.clone(), 0.5),
+                        "ratio_min": percentile(ratios.clone(), 0.0),
+                        "ratio_max": percentile(ratios, 1.0),
+                    }),
+                );
+            }
+            eprintln!("FOLD_AB_SUMMARY {}", serde_json::Value::Object(summary));
+        }
+        let distinct: std::collections::BTreeSet<String> = runs_seen
+            .iter()
+            .map(|run| {
+                format!(
+                    "{} {} {} {}",
+                    run["witness"], run["witness_lines"], run["docs"], run["segments_after"]
+                )
+            })
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "arms folded different generations: {distinct:#?}"
+        );
+        assert_eq!(
+            runs_seen.len(),
+            usize::try_from(rounds + 1).expect("small") * arms.len()
+        );
     }
 }
