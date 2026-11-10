@@ -71600,7 +71600,8 @@ fn apply_diag_quarantine_cleanup(
             required_min_age_seconds: None,
         });
         let mutation_ended_at_ms = doctor_now_ms();
-        mutation_receipt.forensic_bundle = doctor_forensic_bundle_receipt_ref(&result.forensic_bundle);
+        mutation_receipt.forensic_bundle =
+            doctor_forensic_bundle_receipt_ref(&result.forensic_bundle);
         match mutation_receipt.status {
             DoctorActionStatus::Applied => {
                 let reclaimed_bytes = mutation_receipt.affected_bytes;
@@ -127112,7 +127113,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
     let active_status =
         active_registry_name.and_then(|name| statuses.iter().find(|s| s.registry_name == name));
 
-    if let Some(_fmt) = structured_format {
+    if let Some(fmt) = structured_format {
         let models_json: Vec<serde_json::Value> = statuses
             .iter()
             .map(|s| {
@@ -127179,10 +127180,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
                 obj.insert(k.clone(), v.clone());
             }
         }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&output).unwrap_or_default()
-        );
+        output_structured_value(output, fmt)?;
     } else {
         use colored::Colorize;
 
@@ -127783,9 +127781,9 @@ fn run_models_verify(
 
     // Hardened model-acquisition projection (bead 0qxwg): the same probe-based
     // block `cass models status` emits, so verify and status agree. The probe
-    // is filesystem-only — `skipped_network_reason` proves verify never
-    // auto-downloads. `probe_cheap_host()` never loads ONNX, so it is safe even
-    // on a corrupt/incompatible cache.
+    // reports its filesystem-only decision; observing the whole command is
+    // required to establish whether other paths attempted networking.
+    // `probe_cheap_host()` never initializes a model runtime.
     let acquisition_block = crate::search::model_acquisition::live_acquisition_block(
         &model_dir,
         &manifest,
@@ -127807,10 +127805,9 @@ fn run_models_verify(
     });
 
     if !model_dir.is_dir() && !repair {
-        if let Some(_fmt) = structured_format {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
+        if let Some(fmt) = structured_format {
+            output_structured_value(
+                serde_json::json!({
                     "status": cache_report.state_code(),
                     "state_detail": cache_report.state.summary(),
                     "next_step": cache_report.state.next_step(registry_name),
@@ -127820,9 +127817,9 @@ fn run_models_verify(
                     "cache_lifecycle": &cache_report,
                     "model_acquisition": &acquisition_block,
                     "error": "model directory does not exist",
-                }))
-                .unwrap_or_default()
-            );
+                }),
+                fmt,
+            )?;
         } else {
             println!("{} {}", "✗".red(), cache_report.state.summary());
             println!("  Expected location: {}", model_dir.display());
@@ -127925,10 +127922,9 @@ fn run_models_verify(
         return run_models_verify(registry_name, false, data_dir_override, output_format);
     }
 
-    if let Some(_fmt) = structured_format {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+    if let Some(fmt) = structured_format {
+        output_structured_value(
+            serde_json::json!({
                 "model_dir": model_dir.display().to_string(),
                 "status": cache_report.state_code(),
                 "state_detail": cache_report.state.summary(),
@@ -127938,9 +127934,9 @@ fn run_models_verify(
                 "cache_lifecycle": &cache_report,
                 "model_acquisition": &acquisition_block,
                 "files": results,
-            }))
-            .unwrap_or_default()
-        );
+            }),
+            fmt,
+        )?;
     } else {
         println!();
         if all_valid {
