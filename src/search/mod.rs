@@ -50,6 +50,7 @@ pub mod model_download;
 pub mod model_manager;
 pub mod pack_planner;
 pub mod policy;
+pub mod privacy;
 pub(crate) mod progress_contract;
 pub(crate) mod proof_log;
 pub(crate) mod quarantine_status;

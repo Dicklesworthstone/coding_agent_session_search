@@ -12053,7 +12053,12 @@ impl FrankenStorage {
                 |row| row.get_typed(0),
             )
             .optional()?;
-        Ok(pending.is_some())
+        // The file is published before canonical mutation so database-free
+        // search readers are fenced too. A crash (or transaction rollback)
+        // between that publication and the SQL commit still requires repair:
+        // do not reopen reader admission merely because the SQL marker is absent.
+        let reader_repair_pending = crate::search::privacy::repair_pending(&self.db_path)?;
+        Ok(pending.is_some() || reader_repair_pending)
     }
 
     /// The caller must hold the maintenance lease and clear this only after
@@ -12061,6 +12066,10 @@ impl FrankenStorage {
     pub fn clear_forget_derived_rebuild_pending(&self) -> Result<()> {
         self.conn
             .execute("DELETE FROM meta WHERE key = 'forget_derived_rebuild_pending'")?;
+        // Clear reader admission last. If this write fails or the process
+        // stops here, the sidecar keeps the operation retryable and readers
+        // fail closed until the same repair succeeds.
+        crate::search::privacy::complete_forget(&self.db_path)?;
         Ok(())
     }
 
@@ -12332,6 +12341,11 @@ impl FrankenStorage {
             return Ok(report);
         }
 
+        // Invalidate every retained reader before deletion can commit, not
+        // after publication. The epoch survives the lexical directory swap
+        // and remains changed after repair, so pinned readers and their
+        // caches cannot resume serving a pre-forget generation.
+        crate::search::privacy::begin_forget(&self.db_path)?;
         tx.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('forget_derived_rebuild_pending', '1')",
         )?;
@@ -47874,7 +47888,17 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(storage.total_message_count()?, 2);
         assert!(storage.forgotten_conversation_keys()?.is_empty());
         assert!(storage.forgotten_source_stamps()?.is_empty());
-        assert!(!storage.forget_derived_rebuild_pending()?);
+        assert!(
+            storage
+                .raw()
+                .query("SELECT value FROM meta WHERE key = 'forget_derived_rebuild_pending'")?
+                .is_empty(),
+            "the SQL marker must roll back with canonical deletion"
+        );
+        assert!(
+            storage.forget_derived_rebuild_pending()?,
+            "the pre-commit reader fence stays closed until a successful repair"
+        );
         storage.raw().execute("DELETE FROM forget_retry_guard")?;
 
         assert_eq!(
