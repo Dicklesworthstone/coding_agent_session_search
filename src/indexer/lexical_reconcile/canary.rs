@@ -11,8 +11,10 @@ use anyhow::{Result, ensure};
 #[cfg(test)]
 use frankensearch::quill::QuillSearchIndex;
 #[cfg(test)]
+use frankensearch::quill::cass::legacy_v9::cass_document_identity;
+#[cfg(test)]
 use frankensearch::quill::cass::{
-    CassConversationKey, CassDerivedColumns, CassDocument, cass_document_identity, field,
+    CassConversationKey, CassDerivedColumns, CassDocument, field,
 };
 #[cfg(test)]
 use frankensearch::quill::query::{

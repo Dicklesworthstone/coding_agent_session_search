@@ -254,13 +254,11 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensearch",
         crate_package_name: "frankensearch",
         manifest_package_field: None,
-        // Registry release on asupersync 0.5. Preserve explicit native
-        // MiniLM, Quill and cass-compat lexical behavior; a manifest pin
-        // alone is not runtime acceptance.
-        // Empty `expected_git` signals `validate_manifest_dependency_spec`
-        // to skip git/rev checks.
-        expected_git: "",
-        expected_rev: "",
+        // GH #548: the query executor and explicit legacy_v9 adapter are
+        // not yet published. Preserve the reviewed Git source, existing
+        // feature set and v9 CASS identity contract together.
+        expected_git: "https://github.com/Dicklesworthstone/frankensearch",
+        expected_rev: "b103f2edb167d14e8eac9307a8b99432749acd10",
         expected_version: "0.7.1",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`

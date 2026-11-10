@@ -25,6 +25,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use asupersync::runtime::{Runtime, RuntimeBuilder};
 use frankensearch::Cx;
+use frankensearch::quill::cass::legacy_v9;
 use frankensearch::quill::cass::{
     CASS_MERGE_COOLDOWN_MS, CASS_MERGE_SEGMENT_THRESHOLD, CassDocument as QuillCassDocument,
     CassDocumentRef, CassMergeStatus,
@@ -178,12 +179,12 @@ pub(crate) fn project_cass_documents(documents: &[QuillCassDocument]) -> Vec<Sch
     if SERIAL_PROJECTION_FOR_AB.with(std::cell::Cell::get) {
         return documents
             .iter()
-            .map(QuillCassDocument::to_schema_document)
+            .map(legacy_v9::to_schema_document)
             .collect();
     }
     documents
         .par_iter()
-        .map(QuillCassDocument::to_schema_document)
+        .map(legacy_v9::to_schema_document)
         .collect()
 }
 
@@ -197,7 +198,7 @@ pub(crate) fn project_cass_document_refs(documents: &[CassDocumentRef<'_>]) -> V
     }
     documents
         .par_iter()
-        .map(|document| owned_cass_document(document).to_schema_document())
+        .map(|document| legacy_v9::to_schema_document(&owned_cass_document(document)))
         .collect()
 }
 
@@ -343,7 +344,7 @@ pub struct QuillLexicalDocHit {
     /// Snapshot-global document id, used to read stored columns back.
     pub global_docid: u32,
     /// External document identity, as minted by
-    /// [`frankensearch::quill::cass::cass_document_identity`].
+    /// [`frankensearch::quill::cass::legacy_v9::cass_document_identity`].
     ///
     /// Deliberately NOT documented as a literal format string: the shape is the
     /// engine's to define and it has already changed once (it was
@@ -2786,7 +2787,7 @@ mod tests {
         let documents = projection_batch(1_500);
         let serial: Vec<SchemaDocument> = documents
             .iter()
-            .map(QuillCassDocument::to_schema_document)
+            .map(legacy_v9::to_schema_document)
             .collect();
         let refs: Vec<CassDocumentRef<'_>> =
             documents.iter().map(QuillCassDocument::as_ref).collect();
@@ -3020,7 +3021,7 @@ mod tests {
 
         let opens = reader_open_count();
         let removed = sample("batch-0", 0, "merge and deletion count fixture");
-        let removed_id = frankensearch::quill::cass::cass_document_identity(
+        let removed_id = legacy_v9::cass_document_identity(
             &removed.source_id,
             frankensearch::quill::cass::CassConversationKey::new(
                 &removed.source_path,

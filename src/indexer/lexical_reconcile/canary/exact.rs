@@ -11,9 +11,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use frankensearch::quill::cass::legacy_v9::cass_document_identity;
 use frankensearch::quill::cass::{
     CassConversationKey, CassDerivedColumns, CassDocument, CassDocumentRef, CassFieldValues,
-    cass_document_identity, field,
+    field,
 };
 use frankensearch::quill::quiver::NumericValue;
 use frankensearch::quill::{

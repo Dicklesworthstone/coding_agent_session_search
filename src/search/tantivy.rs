@@ -31,8 +31,12 @@ use frankensearch::lexical_tantivy::{
     Index, Schema, cass_build_schema as fs_build_schema,
     cass_ensure_tokenizer as fs_ensure_tokenizer, tantivy_crate,
 };
-use frankensearch::quill::cass::{CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION};
-use frankensearch::quill::cass::{cass_index_dir as fs_index_dir, cass_schema_hash_matches};
+// Query-engine upgrades must retain the released v9 directory and identity
+// contract. Upstream's default v10 namespace is an independent migration.
+use frankensearch::quill::cass::legacy_v9::{
+    CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, cass_document_identity,
+    cass_index_dir as fs_index_dir, cass_schema_hash_matches,
+};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
@@ -2083,7 +2087,7 @@ impl TantivyIndex {
                 pending_bytes = pending_bytes.saturating_add(doc.content.len());
                 docs.push(doc);
             } else {
-                let identity = frankensearch::quill::cass::cass_document_identity(
+                let identity = cass_document_identity(
                     &context.source_id,
                     frankensearch::quill::cass::CassConversationKey {
                         source_path: &context.source_path,
@@ -2816,7 +2820,7 @@ mod tests {
         conversation_id: i64,
     ) -> String {
         let context = cass_doc_context_from_packet(packet);
-        frankensearch::quill::cass::cass_document_identity(
+        cass_document_identity(
             &context.source_id,
             frankensearch::quill::cass::CassConversationKey {
                 source_path: &context.source_path,

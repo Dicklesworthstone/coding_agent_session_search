@@ -171,6 +171,189 @@ fn cass_serve_searches_repeatedly_through_the_real_cli() -> anyhow::Result<()> {
 }
 
 #[test]
+fn multilingual_cli_stdio_and_mcp_share_the_v9_query_contract() -> anyhow::Result<()> {
+    use coding_agent_search::search::tantivy::{TantivyIndex, expected_index_dir};
+    use frankensearch::quill::cass::CassDocument;
+    use serde_json::{Value, json};
+    use std::collections::BTreeSet;
+
+    let temp = tempfile::tempdir()?;
+    let path = expected_index_dir(temp.path());
+    assert_eq!(path.file_name().and_then(|name| name.to_str()), Some("v9-quill"));
+    let mut writer = TantivyIndex::open_or_create(&path)?;
+    let documents = [
+        (1, "fixture", "Kérlek nézd"),
+        (2, "fixture", "k unrelated rlek"),
+        (3, "k", "rlek"),
+        (4, "fixture", "größere Straße München"),
+        (5, "fixture", "ke\u{301}rlek"),
+        (6, "fixture", "café"),
+        (7, "fixture", "cafeteria"),
+        (8, "fixture", "日本語"),
+    ]
+    .into_iter()
+    .map(|(id, title, content)| CassDocument {
+        agent: "codex".into(),
+        workspace: Some("/work".into()),
+        workspace_original: None,
+        source_path: format!("/history/multilingual-{id}.jsonl"),
+        msg_idx: 0,
+        created_at: Some(1_700_000_000_000 + id),
+        title: Some(title.into()),
+        content: content.into(),
+        source_id: "local".into(),
+        origin_kind: "local".into(),
+        origin_host: None,
+        conversation_id: Some(id),
+    })
+    .collect::<Vec<_>>();
+    writer.add_prebuilt_documents_slice(&documents)?;
+    writer.commit()?;
+    drop(writer);
+    let manifest = std::fs::read(path.join("MANIFEST"))?;
+    let queries: &[(&str, &[i64])] = &[
+        ("kérlek", &[1]),
+        ("KÉRLEK", &[1]),
+        ("ke\u{301}rlek", &[5]),
+        ("kérlek", &[1]),
+        ("kérl*", &[1]),
+        ("\"kérlek nézd\"", &[1]),
+        ("GRÖẞERE", &[4]),
+        ("Straße", &[4]),
+        ("café*", &[6]),
+        ("日本語", &[8]),
+        ("kérlek OR é", &[]),
+        ("NOT é", &[]),
+        ("NOT 🚀", &[]),
+        ("kérlek OR *kérlek*", &[]),
+        ("*", &[]),
+        ("OR", &[]),
+        ("\"\"", &[]),
+    ];
+
+    for mcp in [false, true] {
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command
+            .args(["serve", "--stdio", "--data-dir"])
+            .arg(temp.path())
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+        if mcp {
+            command.arg("--mcp");
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut input = child.stdin.take().expect("service stdin");
+        if mcp {
+            writeln!(
+                input,
+                "{}",
+                json!({"jsonrpc":"2.0", "id":"handshake", "method":"initialize",
+                    "params":{"protocolVersion":"2025-11-25", "capabilities":{},
+                        "clientInfo":{"name":"multilingual-regression","version":"1"}}})
+            )?;
+            writeln!(
+                input,
+                "{}",
+                json!({"jsonrpc":"2.0", "method":"notifications/initialized"})
+            )?;
+        }
+        for (id, (query, _)) in queries.iter().enumerate() {
+            let request = if mcp {
+                json!({"jsonrpc":"2.0", "id":id, "method":"tools/call",
+                    "params":{"name":"cass_search", "arguments":{"query":query,"limit":20}}})
+            } else {
+                json!({"op":"search", "id":id, "query":query, "limit":20})
+            };
+            writeln!(input, "{request}")?;
+        }
+        drop(input);
+        let output = wait_with_output_timeout(
+            child,
+            Duration::from_secs(30),
+            "multilingual search worker did not finish",
+        )?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let replies = std::str::from_utf8(&output.stdout)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        let search_replies = if mcp { &replies[1..] } else { &replies[..] };
+        assert_eq!(search_replies.len(), queries.len());
+        for ((query, expected), reply) in queries.iter().zip(search_replies) {
+            let result = if mcp {
+                assert_eq!(reply["result"]["isError"], false, "{query:?}: {reply}");
+                &reply["result"]["structuredContent"]
+            } else {
+                assert_eq!(reply["ok"], true, "{query:?}: {reply}");
+                &reply["result"]
+            };
+            let hits = result["hits"].as_array().expect("search hits");
+            let actual = hits
+                .iter()
+                .map(|hit| hit["conversation_id"].as_i64().expect("conversation identity"))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual, expected.iter().copied().collect(), "MCP={mcp}, {query:?}");
+            assert_eq!(hits.len(), expected.len(), "duplicate hits for {query:?}");
+            assert_eq!(result["count"], expected.len());
+        }
+    }
+    // The ordinary CLI dispatch has its own argument projection and sparse
+    // fallback path. Exercise it as well as the retained worker interfaces.
+    for (query, expected) in [
+        ("kérlek", vec![1]),
+        ("ke\u{301}rlek", vec![5]),
+        ("kérl*", vec![1]),
+        ("NOT é", vec![]),
+        ("kérlek OR 🚀", vec![]),
+    ] {
+        let child = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args([
+                "search",
+                query,
+                "--robot",
+                "--no-maintenance",
+                "--mode",
+                "lexical",
+                "--fields",
+                "source_path,conversation_id",
+                "--limit",
+                "20",
+                "--timeout",
+                "10000",
+                "--data-dir",
+            ])
+            .arg(temp.path())
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let output = wait_with_output_timeout(
+            child,
+            Duration::from_secs(30),
+            "multilingual CLI search did not finish",
+        )?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let reply: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(reply["budget"]["timed_out"], false, "{reply}");
+        let hits = reply["hits"].as_array().expect("CLI search hits");
+        let actual = hits
+            .iter()
+            .map(|hit| hit["conversation_id"].as_i64().expect("conversation identity"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected.iter().copied().collect(), "CLI {query:?}");
+        assert_eq!(hits.len(), expected.len());
+    }
+    assert_eq!(std::fs::read(path.join("MANIFEST"))?, manifest);
+    assert!(!temp.path().join("index/v10-quill").exists());
+    assert!(!temp.path().join("agent_search.db").exists());
+    Ok(())
+}
+
+#[test]
 fn cass_serve_mcp_dispatches_real_negotiation_without_archive_access() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let absent = temp.path().join("never-opened");

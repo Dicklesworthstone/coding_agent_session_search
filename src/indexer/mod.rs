@@ -75737,7 +75737,7 @@ c.close()
             .unwrap();
         let t_index = Mutex::new(None);
         let state = Mutex::new(HashMap::new());
-        let expected_id = frankensearch::quill::cass::cass_document_identity(
+        let expected_id = frankensearch::quill::cass::legacy_v9::cass_document_identity(
             "local",
             frankensearch::quill::cass::CassConversationKey {
                 source_path: &amp_file.to_string_lossy(),
@@ -76894,7 +76894,7 @@ c.close()
         assert_eq!(canonical_before[0], amp_rows[0]);
         assert_eq!(canonical_before[1].3, "claudeconnectorneedle");
         let expected_id = |source: &Path, row: &(i64, i64, i64, String)| {
-            frankensearch::quill::cass::cass_document_identity(
+            frankensearch::quill::cass::legacy_v9::cass_document_identity(
                 "local",
                 frankensearch::quill::cass::CassConversationKey {
                     source_path: &source.to_string_lossy(),

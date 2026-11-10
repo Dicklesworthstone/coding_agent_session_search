@@ -157,13 +157,11 @@ bytemuck = "1.25.0"
 # not run the all-MiniLM LayerNorm export, and its prebuilt AVX/AVX2 vendor
 # binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
 # AVX-static-init hazard and no separate `-baseline` artifact is needed.
-# 0.7.1 (quill 0.4.0) keeps the CASS schema hash (v9-quill, no rebuild) and
-# carries the standard CASS Boolean grammar, the union seek_danger fix and the
-# GH #499 live-doc numeric scoring that the 0.3.4 hotfix published, plus
-# concurrent segment verification on open (GH #501), snippets only for
-# returned hits, and a read-only refresh that skips the reopen when nothing
-# was published.
-frankensearch = { version = "=0.7.1", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
+# GH #548 requires the corrected positional-prefix executor and explicit
+# legacy_v9 identity adapter, which are not in the published Quill 0.4.1.
+# Pin the complete existing family to one reviewed revision; CASS explicitly
+# retains v9 paths, sentinels and identities rather than adopting v10 defaults.
+frankensearch = { version = "=0.7.1", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "b103f2edb167d14e8eac9307a8b99432749acd10", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
 # Native OpenClaw transcripts and legacy VS Code Copilot sessions require SQLite.
 # Keep both readers unconditional, including --no-default-features builds.
 # codex-zstd reads Codex rollouts compressed to .jsonl.zst (GH #513).
@@ -340,7 +338,7 @@ debug = "line-tables-only"
 strip = false
 
 # The dependency graph is pinned to the asupersync 0.5.x line (0.5.0). Keep
-# the frankensqlite, frankensearch, and franken-agent-detection registry pins
+# the frankensqlite, frankensearch, and franken-agent-detection source pins
 # aligned so Cargo.lock does not reintroduce an older parallel runtime stack.
 #
 # If you need to build against a local checkout of asupersync (sibling

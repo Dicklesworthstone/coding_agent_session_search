@@ -617,9 +617,10 @@ offers it only to hosts above those floors.
 
 > **crates.io lags the releases:** the newest version on crates.io is 0.7.0
 > (2026-08-25), so `cargo install coding-agent-search` builds 0.7.0. Later
-> versions depend on `franken-agent-detection` at a git revision, and crates.io
-> does not accept git dependencies, so they cannot be published there until FAD
-> is (bead zztql). Use the installer or the GitHub Release binaries for a
+> versions depend on `franken-agent-detection` and `frankensearch` at exact git
+> revisions. Their required APIs must be published before CASS can return to
+> registry-only dependencies (bead zztql; GH #548). Use the installer or the
+> GitHub Release binaries for a
 > current version.
 
 **Resource Requirements**:
@@ -1887,7 +1888,30 @@ Phrases match their words adjacent and in order (no slop). Useful for error mess
 | `*config*` | Substring | "reconfigure", "config.json", "misconfigured" | Slowest (term-dictionary expansion) |
 | `test_*` | Prefix on `test` | anything whose token starts with "test" | Fast |
 
-**Tip**: Prefix wildcards (`foo*`) use edge n-grams computed at index time: prefixes of 2–20 characters of every alphanumeric word, taken from titles and from the first 4 KiB of each message. Suffix and substring wildcards expand over the index's term dictionary, at most 16,384 terms per pattern; a pattern matching more terms fails rather than scanning. The tokenizer splits on anything that is not a letter or digit: `test_*` is a prefix match on `test`, `c++` searches for `c`, and `foo.bar` means `foo` AND `bar` anywhere in the message, not the literal string. Phrases (`"..."`) match adjacent words in order (slop 0).
+**Tip**: Ordinary ASCII prefix wildcards (`foo*`) retain the existing edge n-grams: prefixes of 2–20 characters, taken from titles and from the first 4 KiB of each message. Suffix and substring wildcards expand over the index's term dictionary, at most 16,384 terms per pattern; a pattern matching more terms fails rather than scanning. ASCII punctuation separates terms: `test_*` is a prefix match on `test`, `c++` searches for `c`, and `foo.bar` means `foo` AND `bar` anywhere in the message. Phrases (`"..."`) match adjacent words in order (slop 0).
+
+Accented Latin queries use the same fragments as the existing index. For example,
+`"kérlek"` requires adjacent exact `k` and `rlek` terms in one field. Bare words
+of 2–20 Unicode scalars retain the existing implicit final-token prefix:
+`kérlek` also matches `kérleknek`, while `"kérlek"` does not. An explicit
+`kérl*` requires `k` followed by a term starting with `rl`. These prefixes search the full
+dictionary, including text beyond the first 4 KiB and prefixes longer than 20
+characters. They allow up to 1,024 matching terms per field and immutable index
+segment; exceeding that budget returns an error instead of a partial result.
+If a final accented character was discarded by the original tokenizer, the last
+surviving fragment stays exact: `café*` searches for `caf`, not `cafeteria`.
+
+This correction reads the existing `v9-quill` index without a schema rebuild.
+The existing ingestion fingerprint policy may revalidate source files on the
+next incremental indexing run after the dependency update.
+It preserves the old tokenizer's limits: adjacent literal `k rlek` can match
+`kérlek`, and canonically equivalent Unicode spellings can produce different
+terms. Mixed CJK queries require the analyzer's actual terms in one field, with
+the existing conjunction behavior for overlapping bigrams. Unsupported scripts
+or an operand with no indexed terms refuse the whole nonempty query, including
+under `OR` and `NOT`; they cannot turn into an empty browse query. Accented
+suffix, substring and interior wildcard patterns are unsupported. A quoted
+phrase ignores edge stars under the existing syntax but rejects interior stars.
 
 ### Query Modifiers
 
@@ -3916,19 +3940,19 @@ archive.
 The build guard enforces the reviewed
 uniform SQLite 0.4.12 versions, a single resolution per package, and registry sources.
 
-`cass` pins its contract-critical ecosystem dependencies with exact registry requirements in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. One dependency currently resolves from git: `franken-agent-detection`, pinned to an exact published-main revision (below). Optional sibling-path overrides stay commented out by default and must never be committed active.
+`cass` pins its contract-critical ecosystem dependencies with exact versions in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. `franken-agent-detection` and `frankensearch` additionally pin immutable Git revisions (below). Optional sibling-path overrides stay commented out by default and must never be committed active.
 
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.12` (tag v0.4.12 = `26aa19afcbd5afdb01658a10bb33417ad0b513be`). Carries 0.4.12's fixes for explicit-transaction inserts corrupting a table b-tree (bd-obwsy, the 0.4.10 advisory), AUTOINCREMENT after ROLLBACK (bd-gwoit) and stock-truncated empty WALs (bd-yxqs9), plus 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs, 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes, 0.4.7's large multi-row INSERT index fix (bd-2eebi), serialized-DDL race fix (bd-4iaoi), GH#503 shadow-autoindex repair open, bounded page plane and first-`sqlite_master` full-file read fix, and 0.4.9's prompt stale-WAL-index refusal for strict read-only opens (48c6cf6b2) and first-write recovery from stock SQLite's empty WAL index (GH#443 / cass GH#509). The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. `src/franken_sync.rs` keeps cass's synchronous call shape through a current-thread asupersync `block_on` bridge. |
 | `franken-agent-detection` | git `0ea083ea4c470a6b7e7607cdeff335cb14690cdc` (package version 0.3.10; narrow OpenClaw explicit-file isolation, historical sessions, opaque mirror discovery, and physical-store migration backports; native qualification pending; `build.rs` checks the repository, revision and version), features `codex-zstd` (compressed Codex rollouts), `pi-durable` and `pi-sqlite` (Pi durable-harness stores, `pi_agent_rust` SQLite sessions) |
 | `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x names in its public API) |
-| `frankensearch` | crates.io `=0.7.1`, resolving `frankensearch-index 0.4.2` (on Windows an open reader no longer blocks replacing the semantic index, and `--build-hnsw` works), `frankensearch-quill 0.4.1` (the GH #499 fix, the standard Boolean query grammar and the nested-union fix, plus concurrent segment verification on open for GH #501; 0.4.1 opens a writer with one verification of each segment instead of four), `frankenhnsw 0.3.5` and the `frankentorch-*` family (features `hash`, `cass-compat`, `quill`, `ann`, `native`; `cass-compat` enables `lexical-tantivy`, the Tantivy-backed `frankensearch-lexical` differential oracle). Exact pins remain required. |
+| `frankensearch` | `=0.7.1` at Git revision `b103f2edb167d14e8eac9307a8b99432749acd10`, with the entire Frankensearch family from that revision. Carries GH #548 tokenizer-aligned queries, complete bounded positional prefixes and the explicit `cass::legacy_v9` adapter. CASS retains v9 paths, sentinels and every write/delete identity; upstream v10 defaults remain unchanged. Features remain `hash`, `cass-compat`, `quill`, `ann`, `native`; `cass-compat` enables `lexical-tantivy`, the retained Tantivy-backed differential oracle. The new APIs are not yet in a registry release. |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |
 | `toon` (`tru`) | crates.io `=0.2.4` (2026-08-24; production sources byte-identical to the previously pinned git rev `d7185c78` — registry 0.2.3 was rejected because its tree differs from the rev in real source despite the matching version field) |
 
 **Build-time validation**
-- `build.rs` validates every named dependency contract against its exact registry requirement, package name, enabled features, and `default-features` policy. It also rejects git/revision fields for these registry-only contracts.
+- `build.rs` validates every named dependency contract against its exact version, package name, enabled features, and `default-features` policy. Registry-only contracts reject Git fields; Git contracts require the exact repository and revision.
 - The fsqlite-family gate additionally checks `Cargo.lock` for exactly one registry resolution per package at `0.4.12` and rejects every `[patch.crates-io]` redirect for the family, including the facade.
 - Enable optional sibling-manifest validation with `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation` or `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target CASS_STRICT_PATH_DEP_VALIDATION=1 cargo check`. For sibling checkouts that are present, this verifies package names, versions, and required features before you switch to local path overrides; registry-only contracts do not require a particular sibling branch or clean worktree.
 - Use `cass swarm dependency-drift --json` for a fast read-only preflight. It reports each manifest pin, optional sibling checkout HEAD/dirty state, upstream status as `not_checked`, and the exact strict-validation commands to run; it never fetches remotes or mutates files.
@@ -3936,7 +3960,7 @@ uniform SQLite 0.4.12 versions, a single resolution per package, and registry so
 **Expected interface contract**
 - `frankensqlite` (`fsqlite`): `Connection`, `params!`, and `compat::{ConnectionExt, RowExt}` with `row.get_typed(...)`.
 - `franken-agent-detection`: `AgentDetectOptions` and `detect_installed_agents(...)`.
-- `frankensearch`: the Quill CASS document/reader/writer surface used by the active lexical backend, the retained `lexical_tantivy` compatibility surface used by legacy federated assembly and differential checks, plus `ModelCategory` and `ModelTier`.
+- `frankensearch`: the Quill CASS document/reader/writer surface, explicit `cass::legacy_v9` identity and schema policy, bounded positional-prefix execution, retained `lexical_tantivy` compatibility surface, plus `ModelCategory` and `ModelTier`.
 - `frankentui`: `ftui::Frame`, `GraphemePool`, `Style`, `ftui-runtime`, `ftui-tty`, and the `ftui-extras` features enabled by cass.
 - `asupersync`: `runtime::RuntimeBuilder` and `http::h1::HttpClient::builder()`.
 - `toon` (`tru`): `toon::encode(...)`.

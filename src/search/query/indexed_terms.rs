@@ -1,15 +1,17 @@
 //! Query-only compatibility with the tokenizer in CASS's released v9 index.
 //!
-//! Based on the contributor's tokenizer reuse in Frankensearch PR #74. The
-//! upstream fix cannot yet be selected through CASS's published dependencies:
-//! current Frankensearch main also changes durable identity/schema. Keep the
-//! registry source contract and existing indexes, and lower affected operands
-//! through public Quill APIs until a compatible release carries the correction.
+//! Based on the contributor's tokenizer reuse in Frankensearch PR #74. CASS
+//! selects Quill's explicit legacy-v9 document contract while using the current
+//! query executor, so normalization and bounded positional prefixes do not
+//! change existing index paths, sentinels, or document identities.
 //!
-//! Bare affected words use adjacent exact fragments in one field. Explicit
-//! trailing prefixes still use the released bounded prefix columns, which do
-//! not guarantee adjacency or complete deep/long-prefix recall. Mixed CJK
-//! fragments use a same-field conjunction because bigrams share positions.
+//! Affected words use adjacent fragments in one field. Bare operands retain
+//! the legacy implicit prefix for 2–20 scalars when the last token reaches the
+//! raw end; quotes keep every fragment exact. Trailing prefixes use the full
+//! term dictionary and preserve adjacency.
+//! Expansion beyond the engine's CASS budget fails instead of truncating the
+//! result set. Mixed CJK fragments use a same-field conjunction because
+//! bigrams share positions; an ASCII terminal prefix still expands completely.
 //! Canonically equivalent spellings can have different legacy indexed terms;
 //! adjacent literal fragments remain indistinguishable from an accented word.
 
@@ -268,9 +270,10 @@ fn lower_term_part(raw: &str) -> Result<Option<Query>, CassBoolUnsupported> {
             let fragments = analyzed_fragments(raw.trim_matches('*'))?;
             if raw.chars().any(needs_indexed_fragments) {
                 let ascii_tail = fragments.terms.last().is_some_and(|term| term.is_ascii());
+                let implicit_prefix = (2..=20).contains(&raw.chars().take(21).count());
                 return Ok(Some(lower_fragments(
                     &fragments,
-                    prefix && fragments.ends_with_token && ascii_tail,
+                    (prefix || implicit_prefix) && fragments.ends_with_token && ascii_tail,
                 )));
             }
             if term.chars().any(is_cass_cjk) {
@@ -316,12 +319,12 @@ fn lower_term_part(raw: &str) -> Result<Option<Query>, CassBoolUnsupported> {
 fn lower_fragments(fragments: &IndexedFragments, prefix: bool) -> Query {
     let terms = &fragments.terms;
     let fields = QuillCassFields::compiled();
-    if !prefix && !terms.iter().any(|term| term.chars().any(is_cass_cjk)) {
+    if !terms.iter().any(|term| term.chars().any(is_cass_cjk)) {
         let exact_fields = vec![
             QueryField::new(fields.title, 1.0),
             QueryField::new(fields.content, 1.0),
         ];
-        if terms.len() == 1 {
+        if terms.len() == 1 && !prefix {
             return Query::term(exact_fields, terms[0].clone());
         }
         return Query::phrase(
@@ -332,34 +335,36 @@ fn lower_fragments(fragments: &IndexedFragments, prefix: bool) -> Query {
                 .map(|(text, position)| PositionedTerm::new(*position, text.clone()))
                 .collect(),
             0,
-            false,
+            prefix,
         );
     }
     // CJK bigrams share a position but are all required, not alternatives.
-    // Explicit prefixes retain the released prefix-column behavior: this
-    // bounded compatibility route still cannot enforce adjacency or find
-    // every deep/long prefix. Do not substitute the released phrase-prefix
-    // API, which silently truncates each segment's expansion to 50 terms.
-    let alternatives = [
-        (fields.title, fields.title_prefix),
-        (fields.content, fields.content_prefix),
-    ]
-    .into_iter()
-    .map(|(field, prefix_field)| {
-        let required = terms
-            .iter()
-            .enumerate()
-            .map(|(index, text)| {
-                let mut fields = vec![QueryField::new(field, 1.0)];
-                if prefix && index + 1 == terms.len() {
-                    fields.push(QueryField::new(prefix_field, 1.0));
-                }
-                Query::term(fields, text.clone())
-            })
-            .collect();
-        BooleanClause::new(Occur::Should, conjunction(required))
-    })
-    .collect();
+    // Keep the legacy same-field conjunction for these runs. Only the final
+    // ASCII fragment can carry a prefix, using the same bounded dictionary
+    // expansion as a positional Latin query rather than the prefix column.
+    let alternatives = [fields.title, fields.content]
+        .into_iter()
+        .map(|field| {
+            let required = terms
+                .iter()
+                .enumerate()
+                .map(|(index, text)| {
+                    let fields = vec![QueryField::new(field, 1.0)];
+                    if prefix && index + 1 == terms.len() {
+                        Query::phrase(
+                            fields,
+                            vec![PositionedTerm::new(fragments.positions[index], text.clone())],
+                            0,
+                            true,
+                        )
+                    } else {
+                        Query::term(fields, text.clone())
+                    }
+                })
+                .collect();
+            BooleanClause::new(Occur::Should, conjunction(required))
+        })
+        .collect();
     Query::boolean(alternatives, Some(BooleanOperator::Or))
 }
 
