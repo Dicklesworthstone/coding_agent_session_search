@@ -1310,8 +1310,7 @@ fn run_inner(
     observer(Event::CandidateReleased)?;
     publication.run("validate_recovered_candidate", || {
         verify_candidate_generation(&candidate_path, &verified_fingerprint)?;
-        crate::search::tantivy::validate_searchable_index_contract(&candidate_path)?;
-        super::verify_published_lexical_doc_count(
+        super::validate_and_verify_published_lexical_doc_count(
             &candidate_path,
             indexed_docs,
             "verified_replay",
@@ -1366,8 +1365,11 @@ fn run_inner(
     })?;
     publication.run("validate_recovered_publication", || {
         verify_candidate_generation(index_path, &verified_fingerprint)?;
-        crate::search::tantivy::validate_searchable_index_contract(index_path)?;
-        super::verify_published_lexical_doc_count(index_path, indexed_docs, "verified_replay")?;
+        super::validate_and_verify_published_lexical_doc_count(
+            index_path,
+            indexed_docs,
+            "verified_replay",
+        )?;
         verify_candidate_generation(index_path, &verified_fingerprint)
     })?;
     super::log_lexical_generation_manifest_published(&manifest, &evidence);

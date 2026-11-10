@@ -9946,15 +9946,62 @@ pub(crate) fn verify_published_lexical_doc_count(
                 index_path.display()
             )
         })?;
-    if summary.docs != indexed_docs {
+    ensure_published_lexical_doc_count(summary.docs, indexed_docs, publish_mode)
+}
+
+fn ensure_published_lexical_doc_count(
+    observed: usize,
+    indexed_docs: usize,
+    publish_mode: &str,
+) -> Result<()> {
+    if observed != indexed_docs {
         return Err(LexicalDocCountMismatch {
             publish_mode: publish_mode.to_owned(),
             counted: indexed_docs,
-            observed: summary.docs,
+            observed,
         }
         .into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Same-invocation A/B switch: check a generation's contract and its
+    /// GH #457 count with one open each, as publication did before
+    /// [`validate_and_verify_published_lexical_doc_count`].
+    static SEPARATE_CONTRACT_AND_COUNT_OPENS_FOR_AB: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// `validate_searchable_index_contract` followed by
+/// [`verify_published_lexical_doc_count`], from ONE validated open.
+///
+/// Each check used to open its own reader, and every Quill open validates
+/// every live segment (minutes on a large archive), so certifying a
+/// generation paid for two full opens. Both checks still run, in the same
+/// order, against the same files: the contract check's errors come first and
+/// unchanged, and the GH #457 count is read from the reader that passed it,
+/// the snapshot being certified, instead of from a second fresh reader.
+pub(crate) fn validate_and_verify_published_lexical_doc_count(
+    index_path: &Path,
+    indexed_docs: usize,
+    publish_mode: &str,
+) -> Result<()> {
+    #[cfg(test)]
+    if SEPARATE_CONTRACT_AND_COUNT_OPENS_FOR_AB.with(std::cell::Cell::get) {
+        crate::search::tantivy::validate_searchable_index_contract(index_path)?;
+        return verify_published_lexical_doc_count(index_path, indexed_docs, publish_mode);
+    }
+    let opened = crate::search::tantivy::open_validated_lexical_index(index_path)?;
+    let summary = crate::search::tantivy::opened_lexical_index_summary(&opened).with_context(|| {
+        format!(
+            "{publish_mode} lexical rebuild published {indexed_docs} docs but the generation at {} \
+             cannot be opened for verification; refusing to certify it (GH #457)",
+            index_path.display()
+        )
+    })?;
+    ensure_published_lexical_doc_count(summary.docs, indexed_docs, publish_mode)
 }
 
 /// GH #457: a fresh reader serves a different number of live documents than
@@ -28829,8 +28876,7 @@ fn rebuild_tantivy_from_db_once(
                 index_meta_fingerprint(&index_path)? == rebuild_state.committed_meta_fingerprint,
                 "completed lexical checkpoint no longer identifies the live native generation"
             );
-            crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
-            verify_published_lexical_doc_count(
+            validate_and_verify_published_lexical_doc_count(
                 &index_path,
                 rebuild_state.indexed_docs,
                 "completed",
@@ -30164,8 +30210,7 @@ fn rebuild_tantivy_from_db_once(
     // Refuse an unreadable/hollow candidate before it can replace a usable
     // live generation. Reopen and validate the actual live path again after swap.
     if let Err(refusal) = publication.run("validate_candidate", || {
-        crate::search::tantivy::validate_searchable_index_contract(&build_path)?;
-        verify_published_lexical_doc_count(&build_path, indexed_docs, "candidate")
+        validate_and_verify_published_lexical_doc_count(&build_path, indexed_docs, "candidate")
     }) {
         // GH #494: only a resumed staged candidate whose count disagrees is
         // rebuilt. A from-zero build that miscounts is a defect to report, and
@@ -30283,8 +30328,7 @@ fn rebuild_tantivy_from_db_once(
         })?;
     }
     publication.run("validate_published_generation", || {
-        crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
-        verify_published_lexical_doc_count(&index_path, indexed_docs, "direct")
+        validate_and_verify_published_lexical_doc_count(&index_path, indexed_docs, "direct")
     })?;
     log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
 
@@ -47075,6 +47119,278 @@ mod tests {
         ));
         assert!(producer_state_transition_is_work("handoff_send", "idle"));
         assert!(producer_state_transition_is_work("waiting_result", "idle"));
+    }
+
+    /// A Quill generation built with `commits` commits of `docs_per_commit`
+    /// messages each; every commit seals the shards its batch touched. Each
+    /// message holds `words` tokens drawn from a fixed 65,536-word vocabulary,
+    /// so each segment carries its own term dictionary. Returns the live
+    /// document and segment counts.
+    fn certification_fixture_index(
+        index_path: &Path,
+        commits: usize,
+        docs_per_commit: usize,
+        words: usize,
+    ) -> (usize, usize) {
+        let mut index = TantivyIndex::open_or_create(index_path).unwrap();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for commit in 0..commits {
+            let conversation = NormalizedConversation {
+                agent_slug: "codex".into(),
+                external_id: Some(format!("certify-{commit}")),
+                title: Some(format!("Certification fixture {commit}")),
+                workspace: Some(PathBuf::from("/workspace/certify")),
+                source_path: PathBuf::from(format!("/archive/certify-{commit}.jsonl")),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_000),
+                metadata: serde_json::Value::Null,
+                messages: (0..docs_per_commit)
+                    .map(|position| NormalizedMessage {
+                        idx: position as i64,
+                        role: "user".into(),
+                        author: None,
+                        created_at: Some(1_700_000_000_000 + position as i64),
+                        content: (0..words)
+                            .map(|_| {
+                                state = state
+                                    .wrapping_mul(6_364_136_223_846_793_005)
+                                    .wrapping_add(1_442_695_040_888_963_407);
+                                format!("w{:04x}", state >> 48)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        extra: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    })
+                    .collect(),
+            };
+            index.add_conversation(&conversation).unwrap();
+            index.commit().unwrap();
+        }
+        (
+            usize::try_from(index.doc_count().unwrap()).unwrap(),
+            index.segment_count().unwrap(),
+        )
+    }
+
+    /// One certification of `index_path`, by the separate contract and count
+    /// opens (`incumbent`) or by one validated open, with its reader opens and
+    /// its outcome rendered for comparison.
+    fn certify_generation_for_test(
+        index_path: &Path,
+        indexed_docs: usize,
+        incumbent: bool,
+    ) -> (u64, Result<(), (String, bool)>) {
+        SEPARATE_CONTRACT_AND_COUNT_OPENS_FOR_AB.with(|cell| cell.set(incumbent));
+        let opens = crate::search::quill_bridge::reader_open_count();
+        let outcome =
+            validate_and_verify_published_lexical_doc_count(index_path, indexed_docs, "test");
+        let opened = crate::search::quill_bridge::reader_open_count() - opens;
+        SEPARATE_CONTRACT_AND_COUNT_OPENS_FOR_AB.with(|cell| cell.set(false));
+        (
+            opened,
+            outcome.map_err(|error| {
+                (
+                    format!("{error:#}"),
+                    error.downcast_ref::<LexicalDocCountMismatch>().is_some(),
+                )
+            }),
+        )
+    }
+
+    /// Certifying a generation (contract check + GH #457 count) opens it
+    /// once, not once per check, and answers exactly as the two separate
+    /// checks did: same verdict, same error text, same mismatch type.
+    #[test]
+    fn generation_certification_opens_once_and_matches_separate_checks() {
+        let tmp = TempDir::new().unwrap();
+        let healthy = tmp.path().join("healthy");
+        let (docs, segments) = certification_fixture_index(&healthy, 3, 24, 16);
+        assert_eq!(docs, 72);
+        assert!(segments >= 3, "segments={segments}");
+
+        // Healthy generation, right count, then a count it does not serve.
+        for (indexed_docs, mismatch) in [(docs, false), (docs + 1, true), (docs - 1, true)] {
+            let (incumbent_opens, incumbent) =
+                certify_generation_for_test(&healthy, indexed_docs, true);
+            let (candidate_opens, candidate) =
+                certify_generation_for_test(&healthy, indexed_docs, false);
+            assert_eq!((incumbent_opens, candidate_opens), (2, 1));
+            assert_eq!(candidate, incumbent, "indexed_docs={indexed_docs}");
+            match candidate {
+                Ok(()) => assert!(!mismatch),
+                Err((message, typed)) => {
+                    assert!(mismatch && typed, "{message}");
+                    assert!(message.contains("GH #457"), "{message}");
+                }
+            }
+        }
+
+        // Faults the contract check refuses before any count is read.
+        let faulted = |name: &str, fault: &dyn Fn(&Path)| -> PathBuf {
+            let path = tmp.path().join(name);
+            certification_fixture_index(&path, 3, 24, 16);
+            fault(&path);
+            path
+        };
+        let segment_files = |path: &Path| -> Vec<PathBuf> {
+            let mut files = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|file| {
+                    file.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("seg-") && name.ends_with(".fslx"))
+                })
+                .collect::<Vec<_>>();
+            files.sort();
+            assert!(!files.is_empty());
+            files
+        };
+        let empty = tmp.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let faults = [
+            empty,
+            faulted("schema-drift", &|path| {
+                fs::write(
+                    path.join("schema_hash.json"),
+                    r#"{"schema_hash":"not-this-schema"}"#,
+                )
+                .unwrap();
+            }),
+            faulted("flipped-segment-byte", &|path| {
+                let segment = segment_files(path).swap_remove(1);
+                let mut bytes = fs::read(&segment).unwrap();
+                let middle = bytes.len() / 2;
+                bytes[middle] ^= 0x5a;
+                fs::write(&segment, bytes).unwrap();
+            }),
+            faulted("truncated-segment", &|path| {
+                let segment = segment_files(path).pop().unwrap();
+                let bytes = fs::read(&segment).unwrap();
+                fs::write(&segment, &bytes[..bytes.len() - 7]).unwrap();
+            }),
+            faulted("missing-segment", &|path| {
+                let segment = segment_files(path).swap_remove(0);
+                fs::rename(&segment, path.join("moved-aside.bin")).unwrap();
+            }),
+        ];
+        for path in &faults {
+            let (_, incumbent) = certify_generation_for_test(path, docs, true);
+            let (candidate_opens, candidate) = certify_generation_for_test(path, docs, false);
+            assert!(candidate_opens <= 1, "{}", path.display());
+            assert_eq!(candidate, incumbent, "{}", path.display());
+            let (message, typed) = candidate.expect_err("a faulted generation is refused");
+            assert!(!typed, "{}: {message}", path.display());
+        }
+    }
+
+    /// A full rebuild certifies its candidate before the swap and the live
+    /// path after it, each with one open: the incumbent spent two opens on
+    /// each. Both arms publish the same generation.
+    #[test]
+    #[serial]
+    fn full_rebuild_certifies_candidate_and_publication_with_one_open_each() {
+        let fixture = forced_resume_fixture(6, 4, 64);
+        let mut opens = Vec::new();
+        let mut published = Vec::new();
+        for incumbent in [true, false] {
+            let data_dir = fixture
+                .root
+                .join(if incumbent { "incumbent" } else { "candidate" });
+            fs::create_dir_all(&data_dir).unwrap();
+            SEPARATE_CONTRACT_AND_COUNT_OPENS_FOR_AB.with(|cell| cell.set(incumbent));
+            let before = crate::search::quill_bridge::reader_open_count();
+            let outcome = rebuild_tantivy_from_db(&fixture.db_path, &data_dir, 6, None);
+            opens.push(crate::search::quill_bridge::reader_open_count() - before);
+            SEPARATE_CONTRACT_AND_COUNT_OPENS_FOR_AB.with(|cell| cell.set(false));
+            let outcome = outcome.unwrap();
+            let index_path = index_dir(&data_dir).unwrap();
+            let summary = crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap();
+            published.push((outcome.indexed_docs, summary.docs, summary.segments));
+        }
+        assert_eq!(published[0], published[1]);
+        assert_eq!(published[1].0, 24);
+        assert_eq!(opens[0] - opens[1], 2, "opens={opens:?}");
+    }
+
+    /// Same-binary A/B (run with `--ignored --nocapture`): certify one
+    /// generation by separate contract and count opens (incumbent, and again
+    /// as an A/A null arm) and by one validated open (candidate), arms
+    /// alternating, at each scale in CASS_CERTIFY_AB_COMMITS.
+    #[test]
+    #[ignore = "same-binary A/B harness; run explicitly with --ignored --nocapture"]
+    fn generation_certification_open_count_ab() {
+        let commit_scales =
+            dotenvy::var("CASS_CERTIFY_AB_COMMITS").unwrap_or_else(|_| "16,64,256".to_string());
+        let docs_per_commit = forced_resume_ab_setting("CASS_CERTIFY_AB_DOCS_PER_COMMIT", 2048);
+        let words = forced_resume_ab_setting("CASS_CERTIFY_AB_WORDS", 48);
+        let rounds = forced_resume_ab_setting("CASS_CERTIFY_AB_ROUNDS", 9);
+        for commits in commit_scales
+            .split(',')
+            .filter_map(|value| value.trim().parse::<usize>().ok())
+        {
+            let tmp = TempDir::new().unwrap();
+            let index_path = tmp.path().join("index");
+            let built = Instant::now();
+            let (docs, segments) =
+                certification_fixture_index(&index_path, commits, docs_per_commit, words);
+            let bytes: u64 = fs::read_dir(&index_path)
+                .unwrap()
+                .map(|entry| entry.unwrap().metadata().unwrap().len())
+                .sum();
+            eprintln!(
+                "CERTIFY_AB scale commits={commits} segments={segments} docs={docs} words_per_doc={words} index_bytes={bytes} build_s={:.1} rounds={rounds}",
+                built.elapsed().as_secs_f64()
+            );
+            // Warm the page cache once so every arm reads the same cached bytes.
+            certify_generation_for_test(&index_path, docs, false)
+                .1
+                .unwrap();
+            let mut arms: [(&str, bool, Vec<f64>, u64); 3] = [
+                ("incumbent", true, Vec::new(), 0),
+                ("null", true, Vec::new(), 0),
+                ("candidate", false, Vec::new(), 0),
+            ];
+            for round in 0..rounds {
+                for slot in 0..arms.len() {
+                    let arm = &mut arms[(slot + round) % 3];
+                    let started = Instant::now();
+                    let (opened, outcome) = certify_generation_for_test(&index_path, docs, arm.1);
+                    arm.2.push(started.elapsed().as_secs_f64() * 1000.0);
+                    arm.3 = opened;
+                    assert_eq!(outcome, Ok(()), "{}", arm.0);
+                }
+            }
+            let paired = |left: &[f64], right: &[f64]| {
+                left.iter()
+                    .zip(right)
+                    .map(|(left, right)| left / right)
+                    .collect::<Vec<_>>()
+            };
+            let ratio = paired(&arms[2].2, &arms[0].2);
+            let null = paired(&arms[1].2, &arms[0].2);
+            for (name, _, times, opened) in &arms {
+                eprintln!(
+                    "CERTIFY_AB arm segments={segments} arm={name} opens={opened} p50_ms={:.1} min_ms={:.1} max_ms={:.1}",
+                    forced_resume_percentile(times, 0.5),
+                    forced_resume_percentile(times, 0.0),
+                    forced_resume_percentile(times, 1.0),
+                );
+            }
+            eprintln!(
+                "CERTIFY_AB summary segments={segments} candidate/incumbent_p50={:.3} [{:.3}, {:.3}] null/incumbent_p50={:.3} [{:.3}, {:.3}]",
+                forced_resume_percentile(&ratio, 0.5),
+                forced_resume_percentile(&ratio, 0.0),
+                forced_resume_percentile(&ratio, 1.0),
+                forced_resume_percentile(&null, 0.5),
+                forced_resume_percentile(&null, 0.0),
+                forced_resume_percentile(&null, 1.0),
+            );
+        }
     }
 
     fn read_index_run_lock_metadata_for_test(lock_path: &Path) -> Result<String> {

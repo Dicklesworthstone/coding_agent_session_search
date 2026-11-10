@@ -949,6 +949,15 @@ pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
 /// opened the index twice, and every Quill open hashes every live segment.
 pub fn validated_searchable_index_summary(index_path: &Path) -> Result<SearchableIndexSummary> {
     let opened = open_validated_lexical_index(index_path)?;
+    opened_lexical_index_summary(&opened)
+}
+
+/// The [`SearchableIndexSummary`] of a generation that
+/// [`open_validated_lexical_index`] already opened, read from its own reader
+/// rather than from another open.
+pub(crate) fn opened_lexical_index_summary(
+    opened: &OpenedLexicalIndex,
+) -> Result<SearchableIndexSummary> {
     if let Some((reader, _)) = opened.reader.as_ref() {
         return Ok(SearchableIndexSummary {
             docs: usize::try_from(reader.doc_count()?).unwrap_or(usize::MAX),
@@ -957,10 +966,10 @@ pub fn validated_searchable_index_summary(index_path: &Path) -> Result<Searchabl
     }
     // A federated bundle validated each shard above; its summary comes from
     // the bundle manifest without another open.
-    searchable_index_summary(index_path)?.ok_or_else(|| {
+    searchable_index_summary(&opened.path)?.ok_or_else(|| {
         anyhow::anyhow!(
             "validated lexical index has no summary: {}",
-            index_path.display()
+            opened.path.display()
         )
     })
 }
