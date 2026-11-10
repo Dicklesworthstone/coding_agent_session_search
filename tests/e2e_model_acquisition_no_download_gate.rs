@@ -21,9 +21,8 @@
 //!
 //! These report/cache assertions do not independently count network attempts.
 //!
-//! Authored Result-returning and panic-free (no unwrap/expect/assert/panic, no
-//! `format!`-in-loop, and no raw `==`/`!=`) so a brand-new test file stays at
-//! zero UBS findings even though the proof-log vocabulary is secret-adjacent.
+//! Tests return diagnostic errors and retain actual runner artifacts. Scanner
+//! results are established by running UBS; this module makes no clean-scan claim.
 
 use assert_cmd::cargo::cargo_bin;
 use coding_agent_search::e2e_runner::{
@@ -356,6 +355,16 @@ fn models_install_dry_run_reports_a_plan_without_acquiring_files() -> Result<(),
         } else {
             manifest.total_size()
         };
+        let expected_action = if matches!(source_kind, "from_file") {
+            "install_from_file"
+        } else {
+            "download_and_install"
+        };
+        if plan.get("action").and_then(Value::as_str) != Some(expected_action) {
+            return Err(format!(
+                "incorrect {source_kind} installation action: {plan}"
+            ));
+        }
         if plan.get("expected_download_bytes").and_then(Value::as_u64)
             != Some(expected_download_bytes)
         {

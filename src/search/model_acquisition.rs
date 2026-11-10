@@ -645,6 +645,13 @@ pub(crate) struct ModelAcquisitionSignals {
 }
 
 impl ModelAcquisitionSignals {
+    /// Physical cache validity used by explicit installation's reuse check.
+    /// Runtime readiness and acquisition policy do not invalidate verified
+    /// installed files; an explicit local-source install still replaces them.
+    fn cache_files_usable(&self) -> bool {
+        self.files_present && self.checksum_ok && self.revision_matches && !self.quarantined
+    }
+
     /// Classify the single precise acquisition state in priority order.
     pub(crate) fn state(&self) -> ModelAcquisitionState {
         use ModelAcquisitionState as S;
@@ -860,12 +867,10 @@ pub(crate) fn probe_on_disk(
 /// `skipped_network_reason`, `next_command`, `rollback_guidance`, …) plus a
 /// stable [`ModelFingerprint`].
 ///
-/// The work is an on-disk probe — **filesystem reads only, never a socket** —
-/// so a surface that emits this block *proves* cass did not auto-acquire the
-/// model: the typed `skipped_network_reason` is exactly the "no command
-/// downloads except explicit `cass models install`" contract made machine
-/// checkable. Both `models status` and `models verify` emit this single
-/// projection so the two surfaces cannot drift. Bead
+/// The probe reads the filesystem and never acquires a model. The typed
+/// `skipped_network_reason` reports its decision; independently observing the
+/// whole CLI is required to establish that no other path attempted networking.
+/// Status, verify and installation preview share this projection. Bead
 /// `coding_agent_session_search-0qxwg` (follow-on to
 /// `cass-fleet-resilience-20260608-uojcg.5.5`).
 pub(crate) fn live_acquisition_block(
@@ -875,7 +880,16 @@ pub(crate) fn live_acquisition_block(
     policy: OnDiskPolicyInputs,
     model_name: &str,
 ) -> serde_json::Value {
-    let report = probe_on_disk(model_dir, manifest, runtime, policy).report(model_name);
+    let signals = probe_on_disk(model_dir, manifest, runtime, policy);
+    acquisition_block(&signals, manifest, model_name)
+}
+
+fn acquisition_block(
+    signals: &ModelAcquisitionSignals,
+    manifest: &ModelManifest,
+    model_name: &str,
+) -> serde_json::Value {
+    let report = signals.report(model_name);
     let fingerprint = ModelFingerprint::from_manifest(manifest);
     let mut block = serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(obj) = block.as_object_mut() {
@@ -889,6 +903,63 @@ pub(crate) fn live_acquisition_block(
         );
     }
     block
+}
+
+/// Plan the explicit install action from the same inspected files as its
+/// acquisition report. Reuse follows the installer's policy-neutral file
+/// validity check, while the report retains runtime/policy restrictions.
+pub(crate) fn installation_preview(
+    model_dir: &Path,
+    manifest: &ModelManifest,
+    runtime: RuntimeLoadability,
+    policy: OnDiskPolicyInputs,
+    model_name: &str,
+    from_file: Option<&Path>,
+    use_mirror: bool,
+) -> serde_json::Value {
+    let signals = probe_on_disk(model_dir, manifest, runtime, policy);
+    let action = if from_file.is_some() {
+        "install_from_file"
+    } else if signals.cache_files_usable() {
+        "reuse_verified_cache"
+    } else {
+        "download_and_install"
+    };
+    let source_kind = if from_file.is_some() {
+        "from_file"
+    } else if use_mirror {
+        "mirror"
+    } else {
+        "registry"
+    };
+    let files: Vec<_> = manifest
+        .files
+        .iter()
+        .map(|file| {
+            serde_json::json!({
+                "name": file.name,
+                "local_name": file.local_name(),
+                "size_bytes": file.size,
+                "expected_sha256": file.sha256,
+                "destination": model_dir.join(file.local_name()).display().to_string(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "status": "planned",
+        "dry_run": true,
+        "action": action,
+        "model": model_name,
+        "model_id": manifest.id,
+        "revision": manifest.revision,
+        "model_dir": model_dir.display().to_string(),
+        "source_kind": source_kind,
+        "source_path": from_file.map(|path| path.display().to_string()),
+        "manifest_bytes": manifest.total_size(),
+        "expected_download_bytes": if action == "download_and_install" { manifest.total_size() } else { 0 },
+        "files": files,
+        "model_acquisition": acquisition_block(&signals, manifest, model_name),
+    })
 }
 
 #[cfg(test)]
@@ -1753,6 +1824,152 @@ mod tests {
             block["fingerprint"]["marker_token"]
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn installation_preview_reuses_verified_files_independently_of_policy() {
+        use crate::search::model_download::{ModelAcquisitionPolicy, classify_model_cache};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let manifest = synthetic_manifest(&[("model.onnx", "weights"), ("tokenizer.json", "v")]);
+        write(dir, "model.onnx", "weights");
+        write(dir, "tokenizer.json", "v");
+        write(
+            dir,
+            VERIFIED_MARKER_NAME,
+            "revision=rev-abc123\nsource=registry\n",
+        );
+        assert!(
+            classify_model_cache(dir, &manifest, &ModelAcquisitionPolicy::default()).is_usable()
+        );
+        for policy_enabled in [true, false] {
+            for use_mirror in [false, true] {
+                let plan = installation_preview(
+                    dir,
+                    &manifest,
+                    RuntimeLoadability::NotProbed,
+                    OnDiskPolicyInputs {
+                        policy_enabled,
+                        ..policy(None)
+                    },
+                    "minilm",
+                    None,
+                    use_mirror,
+                );
+                assert_eq!(plan["action"], "reuse_verified_cache");
+                assert_eq!(plan["expected_download_bytes"], 0);
+                let state = if policy_enabled {
+                    "ready"
+                } else {
+                    "disabled_by_policy"
+                };
+                assert_eq!(plan["model_acquisition"]["state"], state);
+                assert_eq!(plan["model_acquisition"]["usable"], policy_enabled);
+                let source_kind = if use_mirror { "mirror" } else { "registry" };
+                assert_eq!(plan["source_kind"], source_kind);
+            }
+        }
+        assert_eq!(std::fs::read(dir.join("model.onnx")).unwrap(), b"weights");
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn installation_preview_refuses_incomplete_corrupt_stale_and_quarantined_cache() {
+        use crate::search::model_download::{ModelAcquisitionPolicy, classify_model_cache};
+
+        for (scenario, state) in [
+            ("partial", "partial_download"),
+            ("corrupt", "checksum_mismatch"),
+            ("stale", "incompatible_version"),
+            ("quarantined", "quarantined_corrupt"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            let manifest =
+                synthetic_manifest(&[("model.onnx", "weights"), ("tokenizer.json", "v")]);
+            let weights = if scenario == "corrupt" {
+                "corrupt"
+            } else {
+                "weights"
+            };
+            write(dir, "model.onnx", weights);
+            if scenario != "partial" {
+                write(dir, "tokenizer.json", "v");
+            }
+            write(
+                dir,
+                VERIFIED_MARKER_NAME,
+                if scenario == "stale" {
+                    "revision=old\n"
+                } else {
+                    "revision=rev-abc123\n"
+                },
+            );
+            if scenario == "quarantined" {
+                write(dir, QUARANTINE_MARKER_NAME, "retained integrity failure");
+            }
+            let before = std::fs::read_dir(dir).unwrap().count();
+            assert!(
+                !classify_model_cache(dir, &manifest, &ModelAcquisitionPolicy::default())
+                    .is_usable()
+            );
+            let plan = installation_preview(
+                dir,
+                &manifest,
+                RuntimeLoadability::NotProbed,
+                policy(None),
+                "minilm",
+                None,
+                false,
+            );
+            assert_eq!(plan["action"], "download_and_install", "{scenario}");
+            assert_eq!(
+                plan["expected_download_bytes"],
+                manifest.total_size(),
+                "{scenario}"
+            );
+            assert_eq!(plan["model_acquisition"]["state"], state, "{scenario}");
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), before);
+            assert_eq!(
+                std::fs::read(dir.join("model.onnx")).unwrap(),
+                weights.as_bytes(),
+            );
+        }
+    }
+
+    #[test]
+    fn installation_preview_from_file_replaces_even_a_verified_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("model");
+        let source = tmp.path().join("source");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(&source).unwrap();
+        let manifest = synthetic_manifest(&[("model.onnx", "weights"), ("tokenizer.json", "v")]);
+        for path in [&dir, &source] {
+            write(path, "model.onnx", "weights");
+            write(path, "tokenizer.json", "v");
+        }
+        let plan = installation_preview(
+            &dir,
+            &manifest,
+            RuntimeLoadability::NotProbed,
+            policy(None),
+            "minilm",
+            Some(&source),
+            false,
+        );
+        assert_eq!(plan["action"], "install_from_file");
+        assert_eq!(plan["expected_download_bytes"], 0);
+        assert_eq!(plan["model_acquisition"]["state"], "ready");
+        assert_eq!(plan["source_path"].as_str(), source.to_str());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        assert_eq!(std::fs::read_dir(&source).unwrap().count(), 2);
+        assert_eq!(std::fs::read(dir.join("model.onnx")).unwrap(), b"weights");
+        assert_eq!(
+            std::fs::read(source.join("model.onnx")).unwrap(),
+            b"weights"
+        );
     }
 
     // --- composition with the semantic readiness contract (bead 5.1) --------

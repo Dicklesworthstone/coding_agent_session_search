@@ -127449,7 +127449,7 @@ fn run_models_install(
 
     if dry_run {
         use crate::search::model_acquisition::{
-            OnDiskPolicyInputs, RuntimeLoadability, live_acquisition_block,
+            OnDiskPolicyInputs, RuntimeLoadability, installation_preview,
         };
         use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
 
@@ -127457,7 +127457,7 @@ fn run_models_install(
         // parent-directory creation and confirmation prompt are all below.
         let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
         let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
-        let acquisition = live_acquisition_block(
+        let plan = installation_preview(
             &model_dir,
             &manifest,
             RuntimeLoadability::probe_cheap_host(),
@@ -127467,47 +127467,26 @@ fn run_models_install(
                 budget_max_bytes: acquisition_policy.max_model_bytes,
             },
             registry_name,
+            from_file,
+            mirror_base_url.is_some(),
         );
-        let source_kind = if from_file.is_some() {
-            "from_file"
-        } else if mirror_base_url.is_some() {
-            "mirror"
-        } else {
-            "registry"
-        };
-        let files: Vec<_> = manifest
-            .files
-            .iter()
-            .map(|file| {
-                serde_json::json!({
-                    "name": file.name,
-                    "local_name": file.local_name(),
-                    "size_bytes": file.size,
-                    "expected_sha256": file.sha256,
-                    "destination": model_dir.join(file.local_name()).display().to_string(),
-                })
-            })
-            .collect();
-        let plan = serde_json::json!({
-            "status": "planned",
-            "dry_run": true,
-            "model": registry_name,
-            "model_id": manifest.id,
-            "revision": manifest.revision,
-            "model_dir": model_dir.display().to_string(),
-            "source_kind": source_kind,
-            "source_path": from_file.map(|path| path.display().to_string()),
-            "manifest_bytes": manifest.total_size(),
-            "expected_download_bytes": if from_file.is_some() { 0 } else { manifest.total_size() },
-            "files": files,
-            "model_acquisition": acquisition,
-        });
         if let Some(format) = output_format {
             output_structured_value(plan, format)?;
         } else {
             println!("{}", "Model installation preview".bold());
             println!("  Model: {} ({})", manifest.id, manifest.revision);
-            println!("  Source: {source_kind}");
+            println!(
+                "  Source: {}",
+                plan["source_kind"].as_str().unwrap_or("unknown")
+            );
+            let action = match plan["action"].as_str() {
+                Some("reuse_verified_cache") => {
+                    "Reuse verified installed files; no download needed."
+                }
+                Some("install_from_file") => "Install files from the local source.",
+                _ => "Download and install model files.",
+            };
+            println!("  Action: {action}");
             if let Some(source_path) = from_file {
                 println!("  Local source: {}", source_path.display());
             }
