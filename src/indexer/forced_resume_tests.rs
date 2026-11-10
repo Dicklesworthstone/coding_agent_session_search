@@ -32,27 +32,37 @@ fn forced_resume_fixture(
     }
 }
 
+/// The settings one forced-resume test runs under, restored when dropped.
+struct ForcedResumeEnv {
+    _env: Vec<EnvGuard>,
+    _fold_cap: crate::search::quill_bridge::LexicalMergeCapTestGuard,
+}
+
 /// Small commits and pages, so one rebuild of a small archive commits several
-/// segments before its fold, and an explicit fold run cap.
-fn forced_resume_env(commit_every_conversations: usize, fold_cap_bytes: u64) -> Vec<EnvGuard> {
+/// segments before its fold, and an explicit fold run cap. The cap is set for
+/// this test thread only, where the rebuild plans its fold: through the
+/// process environment it also split the folds of unrelated tests running
+/// beside this one.
+fn forced_resume_env(commit_every_conversations: usize, fold_cap_bytes: u64) -> ForcedResumeEnv {
     let commit = commit_every_conversations.to_string();
-    vec![
-        set_env("CASS_RESPONSIVENESS_DISABLE", "1"),
-        set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", &commit),
-        set_env(
-            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
-            &commit,
+    ForcedResumeEnv {
+        _env: vec![
+            set_env("CASS_RESPONSIVENESS_DISABLE", "1"),
+            set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", &commit),
+            set_env(
+                "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
+                &commit,
+            ),
+            set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "2"),
+            set_env(
+                "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
+                "2",
+            ),
+        ],
+        _fold_cap: crate::search::quill_bridge::lexical_merge_max_output_bytes_for_test(
+            fold_cap_bytes,
         ),
-        set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "2"),
-        set_env(
-            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
-            "2",
-        ),
-        set_env(
-            "CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES",
-            &fold_cap_bytes.to_string(),
-        ),
-    ]
+    }
 }
 
 /// One explicit forced rebuild (the `cass index --force-rebuild` call), with

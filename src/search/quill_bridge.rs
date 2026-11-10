@@ -1938,9 +1938,50 @@ pub const CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_DEFAULT: u64 = 1 << 30;
 /// (bytes; underscores allowed; `0`/unparsable keep the default).
 pub const CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_ENV: &str = "CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES";
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the merge-output cap for folds planned on this thread, in
+    /// place of [`CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_ENV`]. Setting the
+    /// process variable changes the cap for every test running beside the one
+    /// that set it, and the hull term of [`estimated_fold_output_bytes`] makes
+    /// even a 32 MiB cap split a fold of a handful of one-document sessions.
+    static LEXICAL_MERGE_MAX_OUTPUT_BYTES_FOR_TEST: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Restores this thread's previous test merge-output cap when dropped.
+#[cfg(test)]
+pub(crate) struct LexicalMergeCapTestGuard {
+    previous: Option<u64>,
+}
+
+#[cfg(test)]
+impl Drop for LexicalMergeCapTestGuard {
+    fn drop(&mut self) {
+        LEXICAL_MERGE_MAX_OUTPUT_BYTES_FOR_TEST.with(|cap| cap.set(self.previous));
+    }
+}
+
+/// Test-only: plan this thread's folds under `max_output_bytes` until the
+/// returned guard drops.
+#[cfg(test)]
+pub(crate) fn lexical_merge_max_output_bytes_for_test(
+    max_output_bytes: u64,
+) -> LexicalMergeCapTestGuard {
+    let previous =
+        LEXICAL_MERGE_MAX_OUTPUT_BYTES_FOR_TEST.with(|cap| cap.replace(Some(max_output_bytes)));
+    LexicalMergeCapTestGuard { previous }
+}
+
 /// The effective merge-output byte cap (GH #456).
 #[must_use]
 pub fn lexical_merge_max_output_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(max_output_bytes) =
+        LEXICAL_MERGE_MAX_OUTPUT_BYTES_FOR_TEST.with(std::cell::Cell::get)
+    {
+        return max_output_bytes;
+    }
     lexical_merge_max_output_bytes_from(
         dotenvy::var(CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_ENV)
             .ok()
@@ -3426,6 +3467,40 @@ mod tests {
             lexical_merge_max_output_bytes_from(Some(" 268_435_456 ")),
             268_435_456
         );
+    }
+
+    /// The test-only merge cap is seen by the thread that set it and by no
+    /// other, and its guard restores the effective cap: the forced-resume
+    /// tests set a 32 MiB cap through the process environment, which split
+    /// the folds of the segment-count tests running beside them.
+    #[test]
+    fn test_merge_output_cap_stays_on_the_thread_that_set_it() {
+        let effective = || {
+            lexical_merge_max_output_bytes_from(
+                dotenvy::var(CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_ENV)
+                    .ok()
+                    .as_deref(),
+            )
+        };
+        let small = 32 * 1024 * 1024;
+        {
+            let _cap = lexical_merge_max_output_bytes_for_test(small);
+            assert_eq!(lexical_merge_max_output_bytes(), small);
+            {
+                let _inner = lexical_merge_max_output_bytes_for_test(small / 2);
+                assert_eq!(lexical_merge_max_output_bytes(), small / 2);
+            }
+            assert_eq!(
+                lexical_merge_max_output_bytes(),
+                small,
+                "a nested guard restores the outer cap"
+            );
+            let elsewhere = std::thread::spawn(lexical_merge_max_output_bytes)
+                .join()
+                .expect("cap on another thread");
+            assert_eq!(elsewhere, effective(), "another thread keeps its own cap");
+        }
+        assert_eq!(lexical_merge_max_output_bytes(), effective());
     }
 
     /// GH #456: under a cap that fits only some of the session segments, the
