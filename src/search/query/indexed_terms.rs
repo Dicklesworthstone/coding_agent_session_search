@@ -5,6 +5,13 @@
 //! current Frankensearch main also changes durable identity/schema. Keep the
 //! registry source contract and existing indexes, and lower affected operands
 //! through public Quill APIs until a compatible release carries the correction.
+//!
+//! Bare affected words use adjacent exact fragments in one field. Explicit
+//! trailing prefixes still use the released bounded prefix columns, which do
+//! not guarantee adjacency or complete deep/long-prefix recall. Mixed CJK
+//! fragments use a same-field conjunction because bigrams share positions.
+//! Canonically equivalent spellings can have different legacy indexed terms;
+//! adjacent literal fragments remain indistinguishable from an accented word.
 
 use frankensearch::quill::query::{
     BooleanClause, BooleanOperator, CassQueryFilters, CassQueryParser, Occur, PositionedTerm,
@@ -43,14 +50,29 @@ pub(super) fn parse(parser: &CassQueryParser, raw: &str, filters: &CassQueryFilt
     if !cass_bool_nesting_is_bounded(&tokens) {
         return Query::empty();
     }
-    let has_empty_operand = tokens.iter().any(|token| match token {
-        CassBoolToken::Token(FsCassQueryToken::Term(text) | FsCassQueryToken::Phrase(text)) => {
-            !text.chars().any(char::is_alphanumeric) && !only_stars_and_whitespace(text)
+    if !requires_fragments {
+        // Keep the native tree/scoring for ordinary ASCII and CJK queries,
+        // but never delegate an expression that would erase an operand.
+        let mut has_operand = false;
+        for token in &tokens {
+            let (text, phrase) = match token {
+                CassBoolToken::Token(FsCassQueryToken::Term(text)) => (text, false),
+                CassBoolToken::Token(FsCassQueryToken::Phrase(text)) => (text, true),
+                _ => continue,
+            };
+            if !phrase && text.trim().is_empty() {
+                continue;
+            }
+            has_operand = true;
+            if !operand_is_searchable(text, phrase) {
+                return Query::empty();
+            }
         }
-        _ => false,
-    });
-    if !requires_fragments && !has_empty_operand && !tokens.is_empty() {
-        return parser.parse(raw, filters).query;
+        return if has_operand {
+            parser.parse(raw, filters).query
+        } else {
+            Query::empty()
+        };
     }
     if cutoff.is_some() {
         return Query::empty();
@@ -62,9 +84,8 @@ pub(super) fn parse(parser: &CassQueryParser, raw: &str, filters: &CassQueryFilt
     });
     let expression = match lowered {
         Ok(Some(expression)) => expression,
-        // Explicit unindexable operands have already become contradictions.
-        // Only deliberately skipped stars/recovered empty groups remain.
-        Ok(None) => return parser.parse("", filters).query,
+        // A nonempty expression without an operand is never a browse query.
+        Ok(None) => return Query::empty(),
         Err(_) => return Query::empty(),
     };
     let (query, negative) = lower_expression(expression);
@@ -72,8 +93,67 @@ pub(super) fn parse(parser: &CassQueryParser, raw: &str, filters: &CassQueryFilt
     apply_native_filters(parser, query, filters)
 }
 
-fn only_stars_and_whitespace(raw: &str) -> bool {
-    raw.contains('*') && raw.chars().all(|ch| ch == '*' || ch.is_whitespace())
+/// Substring retries cannot preserve the boundaries of analyzed Unicode
+/// operands. Validate ordinary operands too, so punctuation or a dropped
+/// required token cannot be retried as a match-all wildcard.
+pub(super) fn allows_automatic_wildcard(raw: &str) -> bool {
+    if raw.trim().is_empty()
+        || raw.chars().nth(MAX_QUERY_SCALARS).is_some()
+        || raw.chars().any(needs_indexed_fragments)
+    {
+        return false;
+    }
+    let tokens = cass_bool_tokens(raw);
+    !tokens.is_empty()
+        && tokens.iter().all(|token| {
+            matches!(token, CassBoolToken::Token(FsCassQueryToken::Term(text))
+                if !text.contains('*') && operand_is_searchable(text, false))
+        })
+}
+
+fn operand_is_searchable(raw: &str, phrase: bool) -> bool {
+    let mut found = 0;
+    for part in operand_parts(raw) {
+        let core = part.trim_matches('*');
+        if core.is_empty() && phrase {
+            continue;
+        }
+        if phrase && (core.contains('*') || found == MAX_INDEXED_FRAGMENTS) {
+            return false;
+        }
+        // Every nonempty ASCII run in this bound is admitted by the index.
+        // Avoid allocating token vectors on ordinary short ASCII searches.
+        let admitted_ascii = core.is_ascii()
+            && core.len() <= MAX_INDEXED_TERM_BYTES
+            && core.bytes().any(|byte| byte.is_ascii_alphanumeric());
+        if !admitted_ascii && analyzed_fragments(core).is_err() {
+            return false;
+        }
+        found += 1;
+    }
+    found != 0
+}
+
+/// Preserve raw combining marks and case until the indexing analyzer runs.
+/// ASCII punctuation separates independent bare operands; a single compound
+/// hyphen is retained, while repeated hyphens remain separators.
+fn operand_parts(raw: &str) -> Vec<String> {
+    if !raw.chars().any(needs_indexed_fragments) {
+        return fs_cass_sanitize_query(raw)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+    }
+    raw.split("--")
+        .flat_map(|part| {
+            part.split(|ch: char| {
+                ch.is_whitespace()
+                    || (ch.is_ascii() && !ch.is_ascii_alphanumeric() && !matches!(ch, '*' | '-'))
+            })
+        })
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 // These are the exact ranges in the released CASS tokenizer. Broadening them
@@ -99,16 +179,15 @@ fn needs_indexed_fragments(ch: char) -> bool {
 
 struct IndexedFragments {
     terms: Vec<String>,
+    positions: Vec<u32>,
     ends_with_token: bool,
 }
 
 /// Analyze original case before any Unicode mapping. In particular, İ must
 /// remain an index separator, rather than first becoming an indexed ASCII i.
-fn indexed_fragments(raw: &str) -> Result<Option<IndexedFragments>, CassBoolUnsupported> {
-    if !raw.chars().any(needs_indexed_fragments) || raw.chars().any(is_cass_cjk) {
-        return Ok(None);
-    }
+fn analyzed_fragments(raw: &str) -> Result<IndexedFragments, CassBoolUnsupported> {
     let mut terms = Vec::new();
+    let mut positions = Vec::new();
     let mut covered_to = 0;
     let mut rejected = false;
     CassAnalyzer::default().analyze(Analyzer::CassPrefixNormalize, raw, &mut |token| {
@@ -120,34 +199,33 @@ fn indexed_fragments(raw: &str) -> Result<Option<IndexedFragments>, CassBoolUnsu
                 .any(|byte| byte.is_ascii_alphanumeric());
         }
         covered_to = covered_to.max(token.offset_to);
-        if terms.len() == MAX_INDEXED_FRAGMENTS {
+        if terms.len() == MAX_INDEXED_FRAGMENTS || token.text.len() > MAX_INDEXED_TERM_BYTES {
             rejected = true;
         } else {
             terms.push(token.text.clone());
+            positions.push(token.position);
         }
     });
     rejected |= raw[covered_to..]
         .bytes()
         .any(|byte| byte.is_ascii_alphanumeric());
-    if rejected {
+    if rejected || terms.is_empty() {
         return Err(CassBoolUnsupported);
     }
-    Ok(Some(IndexedFragments {
+    Ok(IndexedFragments {
         terms,
+        positions,
         ends_with_token: covered_to == raw.len(),
-    }))
+    })
 }
 
 fn lower_term(raw: &str) -> Result<Option<Query>, CassBoolUnsupported> {
-    let parts = fs_cass_sanitize_query(raw)
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let query = lower_compound(&parts)?;
-    if query.is_none() && !raw.trim().is_empty() && !only_stars_and_whitespace(raw) {
-        return Ok(Some(impossible()));
+    // The released lexer can retain Unicode whitespace as an unquoted token.
+    // It is spacing, not a required empty quoted operand.
+    if raw.trim().is_empty() {
+        return Ok(None);
     }
-    Ok(query)
+    lower_compound(&operand_parts(raw))
 }
 
 fn lower_compound(parts: &[String]) -> Result<Option<Query>, CassBoolUnsupported> {
@@ -157,7 +235,10 @@ fn lower_compound(parts: &[String]) -> Result<Option<Query>, CassBoolUnsupported
             queries.push(query);
         }
     }
-    Ok((!queries.is_empty()).then(|| conjunction(queries)))
+    if queries.is_empty() {
+        return Err(CassBoolUnsupported);
+    }
+    Ok(Some(conjunction(queries)))
 }
 
 fn searchable_fields() -> Vec<QueryField> {
@@ -179,12 +260,14 @@ fn lower_term_part(raw: &str) -> Result<Option<Query>, CassBoolUnsupported> {
     match pattern {
         FsCassWildcardPattern::Exact(term) | FsCassWildcardPattern::Prefix(term) => {
             if term.is_empty() {
-                return Ok(None);
+                return Err(CassBoolUnsupported);
             }
-            if let Some(fragments) = indexed_fragments(raw.trim_matches('*'))? {
+            let fragments = analyzed_fragments(raw.trim_matches('*'))?;
+            if raw.chars().any(needs_indexed_fragments) {
+                let ascii_tail = fragments.terms.last().is_some_and(|term| term.is_ascii());
                 return Ok(Some(lower_fragments(
-                    &fragments.terms,
-                    prefix && fragments.ends_with_token,
+                    &fragments,
+                    prefix && fragments.ends_with_token && ascii_tail,
                 )));
             }
             if term.chars().any(is_cass_cjk) {
@@ -209,11 +292,15 @@ fn lower_term_part(raw: &str) -> Result<Option<Query>, CassBoolUnsupported> {
             }
             Ok(Some(Query::term(searchable_fields(), term)))
         }
-        // Existing indexes cannot express these wildcard shapes for accented
-        // words. Keep the native behavior; never expand dictionary terms.
+        // A wildcard over one dictionary term cannot span the fragments of
+        // an affected word. Refuse it before Boolean complementation.
         FsCassWildcardPattern::Suffix(_)
         | FsCassWildcardPattern::Substring(_)
         | FsCassWildcardPattern::Complex(_) => {
+            if raw.chars().any(needs_indexed_fragments) {
+                return Err(CassBoolUnsupported);
+            }
+            analyzed_fragments(raw.trim_matches('*'))?;
             let fields = QuillCassFields::compiled();
             Ok(Some(Query::glob(
                 vec![fields.content, fields.title],
@@ -223,11 +310,33 @@ fn lower_term_part(raw: &str) -> Result<Option<Query>, CassBoolUnsupported> {
     }
 }
 
-fn lower_fragments(terms: &[String], prefix: bool) -> Query {
-    if terms.is_empty() {
-        return impossible();
-    }
+fn lower_fragments(fragments: &IndexedFragments, prefix: bool) -> Query {
+    let terms = &fragments.terms;
     let fields = QuillCassFields::compiled();
+    if !prefix && !terms.iter().any(|term| term.chars().any(is_cass_cjk)) {
+        let exact_fields = vec![
+            QueryField::new(fields.title, 1.0),
+            QueryField::new(fields.content, 1.0),
+        ];
+        if terms.len() == 1 {
+            return Query::term(exact_fields, terms[0].clone());
+        }
+        return Query::phrase(
+            exact_fields,
+            terms
+                .iter()
+                .zip(&fragments.positions)
+                .map(|(text, position)| PositionedTerm::new(*position, text.clone()))
+                .collect(),
+            0,
+            false,
+        );
+    }
+    // CJK bigrams share a position but are all required, not alternatives.
+    // Explicit prefixes retain the released prefix-column behavior: this
+    // bounded compatibility route still cannot enforce adjacency or find
+    // every deep/long prefix. Do not substitute the released phrase-prefix
+    // API, which silently truncates each segment's expansion to 50 terms.
     let alternatives = [
         (fields.title, fields.title_prefix),
         (fields.content, fields.content_prefix),
@@ -252,69 +361,43 @@ fn lower_fragments(terms: &[String], prefix: bool) -> Query {
 }
 
 fn lower_phrase(raw: &str) -> Result<Option<Query>, CassBoolUnsupported> {
-    let mut terms = Vec::new();
-    let mut original_terms = Vec::new();
-    let mut normalized = false;
-    let mut unindexable = false;
-    for part in fs_cass_sanitize_query(raw).split_whitespace() {
-        let part = part.trim_matches('*');
-        if part.is_empty() {
-            continue;
-        }
-        original_terms.push(part.to_owned());
-        match if part.contains('*') {
-            // Quoted interior stars remain literal/legacy wildcard syntax;
-            // tokenizing them as separators would invent new matches.
-            None
-        } else {
-            indexed_fragments(part)?
-        } {
-            Some(fragments) => {
-                normalized = true;
-                unindexable |= fragments.terms.is_empty();
-                terms.extend(fragments.terms);
-            }
-            None => terms.push(part.to_lowercase()),
-        }
-        if normalized
-            && (terms.len() > MAX_INDEXED_FRAGMENTS
-                || terms
-                    .iter()
-                    .any(|term| term.is_ascii() && term.len() > MAX_INDEXED_TERM_BYTES))
-        {
+    let parts = operand_parts(raw)
+        .into_iter()
+        .map(|part| part.trim_matches('*').to_owned())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return Err(CassBoolUnsupported);
+    }
+    let affected = raw.chars().any(needs_indexed_fragments);
+    for part in &parts {
+        if part.contains('*') {
             return Err(CassBoolUnsupported);
         }
+        // Validate each word independently. A standalone unsupported word
+        // must not disappear between the searchable words of a phrase.
+        analyzed_fragments(part)?;
     }
-    if unindexable {
-        return Ok(Some(impossible()));
+    if affected {
+        let fragments = analyzed_fragments(&parts.join(" "))?;
+        return Ok(Some(lower_fragments(&fragments, false)));
     }
-    if terms.is_empty() {
-        return Ok(if only_stars_and_whitespace(raw) {
-            None
-        } else {
-            Some(impossible())
-        });
+    let terms = parts
+        .iter()
+        .map(|part| part.to_lowercase())
+        .collect::<Vec<_>>();
+    if terms.len() > MAX_INDEXED_FRAGMENTS {
+        return Err(CassBoolUnsupported);
+    }
+    if terms.len() <= 1 || terms.iter().any(|term| term.chars().any(is_cass_cjk)) {
+        return lower_compound(&parts);
     }
     let fields = QuillCassFields::compiled();
-    let exact_fields = vec![
-        QueryField::new(fields.title, 1.0),
-        QueryField::new(fields.content, 1.0),
-    ];
-    if normalized && terms.len() == 1 {
-        return Ok(Some(lower_fragments(&terms, false)));
-    }
-    if terms.iter().any(|term| term.chars().any(is_cass_cjk)) {
-        // CJK phrases keep their legacy non-positional AND. Preserve each
-        // original affected word's exact same-field group: flattening it into
-        // separate legacy terms would reintroduce prefix/cross-field matches.
-        return lower_compound(&original_terms);
-    }
-    if terms.len() <= 1 {
-        // Unchanged ASCII single-word phrases keep existing prefix fields.
-        return lower_compound(&terms);
-    }
     Ok(Some(Query::phrase(
-        exact_fields,
+        vec![
+            QueryField::new(fields.title, 1.0),
+            QueryField::new(fields.content, 1.0),
+        ],
         terms
             .into_iter()
             .zip(0_u32..)
@@ -346,10 +429,6 @@ fn complement(query: Query) -> Query {
         ],
         None,
     )
-}
-
-fn impossible() -> Query {
-    complement(Query::all())
 }
 
 /// Match the native parser's negative-clause scoring: direct exclusions do
@@ -486,12 +565,11 @@ mod tests {
             "NOT backup AND NOT debug",
             "\"hello world\"",
             "\"AND\"",
+            "\"*backup*\"",
+            "backup \r",
             "ca*",
             "*fix",
             "m*d",
-            "*",
-            "***\u{2003}",
-            "\"*** \u{2003}\"",
             "日本語",
             "\"日本語 検索\"",
         ] {
@@ -510,24 +588,77 @@ mod tests {
     }
 
     #[test]
-    fn tokenizer_runs_before_case_mapping_and_preserves_empty_results() {
+    fn tokenizer_runs_before_case_mapping_and_rejects_empty_results() {
         for (raw, expected) in [
             ("KÉRLEK", vec!["k", "rlek"]),
             ("İstanbul", vec!["stanbul"]),
             ("GRÖẞERE", vec!["gr", "ere"]),
             ("Straße", vec!["stra", "e"]),
             ("cafe\u{301}", vec!["cafe"]),
-            ("éß", vec![]),
+            ("ke\u{301}rlek", vec!["ke", "rlek"]),
+            ("Key", vec!["ey"]),
+            ("日本語é", vec!["日本", "本語"]),
+            ("日é本", vec!["日", "本"]),
         ] {
-            let fragments = indexed_fragments(raw)
+            let fragments = analyzed_fragments(raw)
                 .ok()
-                .flatten()
-                .expect("affected operand");
+                .expect("searchable original spelling");
             assert_eq!(fragments.terms, expected, "{raw:?}");
         }
-        assert!(indexed_fragments("日本語é").is_ok_and(|value| value.is_none()));
-        assert!(indexed_fragments(&format!("{}é", "a".repeat(257))).is_err());
-        assert!(indexed_fragments(&"aé".repeat(257)).is_err());
+        assert_eq!(
+            analyzed_fragments("日本語é")
+                .ok()
+                .expect("mixed CJK input")
+                .positions,
+            vec![0, 0],
+            "all bigrams from one CJK run share an analyzer position"
+        );
+        for raw in ["éß", "K", "İ", "привет", "🚀", "*", ""] {
+            assert!(analyzed_fragments(raw).is_err(), "{raw:?}");
+        }
+        assert!(analyzed_fragments(&format!("{}é", "a".repeat(257))).is_err());
+        assert!(analyzed_fragments(&"aé".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn unsearchable_operands_fail_the_complete_expression() {
+        let parser = parser();
+        let filters = CassQueryFilters::default();
+        for operand in [
+            "é", "K", "İ", "привет", "שלום", "مرحبا", "🚀", "!!!", "*", "**",
+            "\"\"", "\"   \"", "\"***\"", "*érlek", "*kérlek*", "ké*rlek",
+            "\"kérlek 🚀 nézd\"", "\"kérlek é nézd\"", "\"f*o\"", "\"foo f*o\"",
+        ] {
+            for raw in [
+                operand.to_owned(),
+                format!("NOT {operand}"),
+                format!("backup OR {operand}"),
+                format!("backup NOT {operand}"),
+            ] {
+                assert!(parse(&parser, &raw, &filters).is_empty(), "{raw:?}");
+            }
+        }
+        for raw in ["AND", "OR", "NOT", "()", "(NOT)", "&& ||"] {
+            assert!(parse(&parser, raw, &filters).is_empty(), "{raw:?}");
+        }
+        for raw in ["", " \t\n ", "\u{2003}"] {
+            assert!(matches!(parse(&parser, raw, &filters).root(), QueryNode::All));
+        }
+    }
+
+    #[test]
+    fn retries_preserve_token_boundaries_and_require_searchable_operands() {
+        for raw in ["apple", "pple", "日本語", "foo bar"] {
+            assert!(allows_automatic_wildcard(raw), "{raw:?}");
+        }
+        for raw in [
+            "", "!!!", "*", "AND", "backup OR é", "kérlek", "ke\u{301}rlek",
+            "Key", "é", "🚀", "\"exact phrase\"", "foo*",
+        ] {
+            assert!(!allows_automatic_wildcard(raw), "{raw:?}");
+        }
+        assert!(!allows_automatic_wildcard(&"x".repeat(257)));
+        assert!(!allows_automatic_wildcard(&"x ".repeat(MAX_QUERY_SCALARS)));
     }
 
     #[test]
@@ -560,6 +691,7 @@ mod tests {
             format!("{}kérlek{}", "(".repeat(129), ")".repeat(129)),
             format!("\"é {}\"", "a".repeat(257)),
             format!("\"{} café\"", "a".repeat(257)),
+            format!("\"{}\"", "backup ".repeat(MAX_INDEXED_FRAGMENTS + 1)),
         ] {
             for raw in [
                 format!("NOT ({oversized})"),

@@ -531,7 +531,7 @@ fn durable_index_hashes(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, 
 }
 
 /// GH #548 must be fixed in the engine actually used by CASS, including the
-/// application's NFC query normalization, filtering, cache, and fresh reopen.
+/// application's raw query spelling, filtering, cache, and fresh reopen.
 /// This receipt deliberately pins the released generation: a dependency update
 /// that moves to a new namespace does not establish the no-reindex correction.
 #[test]
@@ -594,7 +594,7 @@ fn accented_latin_queries_reopen_the_released_cass_generation() {
         for (query, expected) in [
             ("kérlek", vec!["hu"]),
             ("KÉRLEK", vec!["hu"]),
-            ("ke\u{301}rlek", vec!["hu"]),
+            ("ke\u{301}rlek", vec![]),
             ("ellenőrizd", vec!["hu"]),
             ("İSTANBULBAN", vec!["hu"]),
             ("GRÖẞERE", vec!["de"]),
@@ -604,18 +604,18 @@ fn accented_latin_queries_reopen_the_released_cass_generation() {
             ("příliš", vec!["cs"]),
             ("kérl*", vec!["hu"]),
             ("kérlek OR backup", vec!["hu", "ascii"]),
-            ("kérlek OR 🚀", vec!["hu"]),
-            ("kérlek OR \"\"", vec!["hu"]),
-            ("kérlek OR *", vec!["hu"]),
-            ("kérlek OR \"*\"", vec!["hu"]),
+            ("kérlek OR 🚀", vec![]),
+            ("kérlek OR \"\"", vec![]),
+            ("kérlek OR *", vec![]),
+            ("kérlek OR \"*\"", vec![]),
             ("kérlek AND backup", vec![]),
             ("kérlek AND \"\"", vec![]),
             ("kérlek AND \"   \"", vec![]),
-            ("kérlek NOT \"\"", vec!["hu"]),
+            ("kérlek NOT \"\"", vec![]),
             ("(kérlek OR backup) -backup", vec!["hu"]),
             ("NOT kérlek", vec!["de", "fr", "pl", "cs", "ascii"]),
-            ("NOT é", vec!["hu", "de", "fr", "pl", "cs", "ascii"]),
-            ("NOT \"\"", vec!["hu", "de", "fr", "pl", "cs", "ascii"]),
+            ("NOT é", vec![]),
+            ("NOT \"\"", vec![]),
             ("backup", vec!["ascii"]),
             ("привет", vec![]),
             ("é", vec![]),
@@ -625,11 +625,12 @@ fn accented_latin_queries_reopen_the_released_cass_generation() {
             ("\"\"", vec![]),
             ("\"   \"", vec![]),
             ("!***", vec![]),
-            ("*", vec!["hu", "de", "fr", "pl", "cs", "ascii"]),
-            (
-                "\"*** \u{2003}\"",
-                vec!["hu", "de", "fr", "pl", "cs", "ascii"],
-            ),
+            ("*", vec![]),
+            ("\"*** \u{2003}\"", vec![]),
+            ("NOT", vec![]),
+            ("AND OR", vec![]),
+            ("()", vec![]),
+            ("backup \u{2003}", vec!["ascii"]),
             ("*érlek", vec![]),
             ("ké*rlek", vec![]),
             ("\"ké*rlek\"", vec![]),
@@ -681,8 +682,8 @@ fn accented_latin_queries_reopen_the_released_cass_generation() {
 }
 
 /// Fragment expansion must preserve phrase positions and field boundaries.
-/// Bare words retain compound-term AND semantics within one field, whereas
-/// quoted phrases reject scattered fragments and reversed word ordering.
+/// Bare affected words require adjacent ordered fragments in one field;
+/// quoted phrases also preserve the ordering between separate words.
 #[test]
 fn accented_latin_queries_keep_phrase_and_boolean_boundaries() {
     let dir = TempDir::new().expect("accented phrase corpus directory");
@@ -692,6 +693,7 @@ fn accented_latin_queries_keep_phrase_and_boolean_boundaries() {
         ("reversed", "fixture", "nézd kérlek"),
         ("gap", "fixture", "k rlek unrelated n zd"),
         ("scattered", "fixture", "k unrelated rlek n unrelated zd"),
+        ("reversed_fragments", "fixture", "rlek k nézd"),
         ("crossfield", "k", "rlek nézd"),
         ("prefixonly", "fixture", "king rlekin"),
         ("suffixword", "fixture", "k rlekin"),
@@ -718,17 +720,19 @@ fn accented_latin_queries_keep_phrase_and_boolean_boundaries() {
         .search_with_fallback("kérlek", SearchFilters::default(), 1, 0, 0, FieldMask::FULL)
         .expect("first uncached accented page");
     assert_eq!(first_page.hits.len(), 1);
-    assert_eq!(first_page.total_count, Some(5));
+    assert_eq!(first_page.total_count, Some(4));
 
     for (query, expected) in [
         ("\"kérlek nézd\"", vec!["ordered", "hyphen"]),
         ("\"kérlek !!! nézd\"", vec!["ordered", "hyphen"]),
-        ("\"kérlek 🚀 nézd\"", vec!["ordered", "hyphen"]),
+        ("\"kérlek 🚀 nézd\"", vec![]),
         ("\"nézd kérlek\"", vec!["reversed"]),
-        (
-            "kérlek",
-            vec!["ordered", "reversed", "gap", "scattered", "hyphen"],
-        ),
+        ("kérlek--nézd", vec!["ordered", "reversed", "gap", "hyphen"]),
+        ("kérlek.nézd", vec!["ordered", "reversed", "gap", "hyphen"]),
+        ("\"kérlek--nézd\"", vec!["ordered", "hyphen"]),
+        ("kérlek", vec!["ordered", "reversed", "gap", "hyphen"]),
+        ("\"kérlek\"", vec!["ordered", "reversed", "gap", "hyphen"]),
+        ("\"*kérlek*\"", vec!["ordered", "reversed", "gap", "hyphen"]),
         (
             "kérl*",
             vec![
@@ -736,17 +740,15 @@ fn accented_latin_queries_keep_phrase_and_boolean_boundaries() {
                 "reversed",
                 "gap",
                 "scattered",
+                "reversed_fragments",
                 "hyphen",
                 "suffixword",
             ],
         ),
-        (
-            "kérlek -\"kérlek nézd\"",
-            vec!["reversed", "gap", "scattered"],
-        ),
+        ("kérlek -\"kérlek nézd\"", vec!["reversed", "gap"]),
         (
             "(kérlek OR backup) AND -\"kérlek nézd\"",
-            vec!["reversed", "gap", "scattered", "ascii"],
+            vec!["reversed", "gap", "ascii"],
         ),
         ("\"kérlek é nézd\"", vec![]),
         ("\"kérlek привет nézd\"", vec![]),
@@ -755,7 +757,7 @@ fn accented_latin_queries_keep_phrase_and_boolean_boundaries() {
         ("kérlek AND \"AND\"", vec![]),
         (
             "kérlek OR \"NOT\"",
-            vec!["ordered", "reversed", "gap", "scattered", "hyphen"],
+            vec!["ordered", "reversed", "gap", "hyphen"],
         ),
     ] {
         assert_lexical_sources(&client, query, SearchFilters::default(), &expected);
@@ -805,11 +807,12 @@ fn accented_latin_queries_keep_phrase_and_boolean_boundaries() {
             FieldMask::FULL,
         )
         .expect("sparse accented fallback");
-    assert_eq!(sparse.hits.len(), 5);
+    assert_eq!(sparse.hits.len(), 4);
     assert!(
         !sparse.wildcard_fallback,
         "unsupported accent substring retry must retain exact hits"
     );
+    assert_eq!(client.wildcard_fallback_skipped_reason(), Some("query_normalization"));
 }
 
 #[test]
@@ -837,13 +840,115 @@ fn accented_words_keep_their_field_boundary_in_cjk_phrase_fallback() {
     let client = SearchClient::open(dir.path(), None)
         .expect("open mixed-script corpus")
         .expect("mixed-script reader exists");
-    for query in ["kérlek", "\"kérlek 日本語\"", "\"日本語 kérlek\""] {
-        assert_lexical_sources(
-            &client,
-            query,
-            SearchFilters::default(),
-            &["mixed", "otherfield"],
+    assert_lexical_sources(
+        &client,
+        "kérlek",
+        SearchFilters::default(),
+        &["mixed", "otherfield"],
+    );
+    for query in ["\"kérlek 日本語\"", "\"日本語 kérlek\""] {
+        assert_lexical_sources(&client, query, SearchFilters::default(), &["mixed"]);
+    }
+}
+
+#[test]
+fn raw_unicode_spelling_is_preserved_in_lexical_queries_and_cache_keys() {
+    let dir = TempDir::new().expect("raw spelling corpus");
+    let mut index = TantivyIndex::open_or_create(dir.path()).expect("create spelling index");
+    for (name, text) in [
+        ("nfc", "kérlek spelling fixture"),
+        ("nfd", "ke\u{301}rlek spelling fixture"),
+        ("kelvin", "Key spelling fixture"),
+        ("ascii", "Key spelling fixture"),
+        ("dotted", "İstanbul spelling fixture"),
+        ("lowercase", "istanbul spelling fixture"),
+    ] {
+        let conversation = util::ConversationFixtureBuilder::new("codex")
+            .title("fixture")
+            .source_path(dir.path().join(format!("{name}.jsonl")))
+            .messages(1)
+            .with_content(0, text)
+            .build_normalized();
+        index.add_conversation(&conversation).expect("ingest original spelling");
+    }
+    index.commit().expect("publish original spelling");
+    drop(index);
+    let client = SearchClient::open(dir.path(), None)
+        .expect("reopen spelling index")
+        .expect("spelling reader");
+
+    // A one-hit request can reuse the complete cached page on repetition.
+    // Canonicalizing either the parser input or its key aliases these pairs.
+    for _ in 0..2 {
+        for (query, expected) in [
+            ("kérlek", "nfc"),
+            ("ke\u{301}rlek", "nfd"),
+            ("Key", "kelvin"),
+            ("Key", "ascii"),
+            ("İSTANBUL", "dotted"),
+            ("istanbul", "lowercase"),
+        ] {
+            let hits = client
+                .search(query, SearchFilters::default(), 1, 0, FieldMask::FULL)
+                .unwrap_or_else(|error| panic!("{query:?}: {error:#}"));
+            assert_eq!(hits.len(), 1, "{query:?}");
+            assert_eq!(
+                std::path::Path::new(&hits[0].source_path)
+                    .file_stem()
+                    .and_then(|name| name.to_str()),
+                Some(expected),
+                "{query:?}"
+            );
+        }
+    }
+    for raw in ["é", "K", "İ", "привет", "🚀", "!!!"] {
+        let result = client
+            .search_with_fallback(raw, SearchFilters::default(), 10, 0, 3, FieldMask::FULL)
+            .expect("unsearchable input must fail closed");
+        assert!(result.hits.is_empty(), "{raw:?}");
+        assert!(!result.wildcard_fallback, "{raw:?}");
+        assert_eq!(client.wildcard_fallback_skipped_reason(), Some("query_normalization"));
+        assert!(
+            result.suggestions.iter().all(|suggestion| suggestion.kind
+                != coding_agent_search::search::query::SuggestionKind::WildcardQuery),
+            "{raw:?} must not suggest a semantically different substring query"
         );
+    }
+}
+
+#[test]
+fn mixed_cjk_analysis_does_not_join_separated_runs_or_drop_latin_requirements() {
+    let dir = TempDir::new().expect("mixed analyzer corpus");
+    let mut index = TantivyIndex::open_or_create(dir.path()).expect("create mixed index");
+    for (name, title, content) in [
+        ("separated", "fixture", "日é本 evidence"),
+        ("bridged", "fixture", "日本 evidence"),
+        ("mixed", "fixture", "Kérlek日本語 evidence"),
+        ("onebigram", "fixture", "kérlek 日本 evidence"),
+        ("splitfield", "kérlek", "日本語 evidence"),
+        ("cjkonly", "fixture", "日本語 evidence"),
+    ] {
+        let conversation = util::ConversationFixtureBuilder::new("codex")
+            .title(title)
+            .source_path(dir.path().join(format!("{name}.jsonl")))
+            .messages(1)
+            .with_content(0, content)
+            .build_normalized();
+        index.add_conversation(&conversation).expect("ingest mixed runs");
+    }
+    index.commit().expect("publish mixed runs");
+    drop(index);
+    let client = SearchClient::open(dir.path(), None)
+        .expect("reopen mixed index")
+        .expect("mixed reader");
+    for (query, expected) in [
+        ("日é本", vec!["separated"]),
+        ("\"日é本\"", vec!["separated"]),
+        ("kérlek日本語", vec!["mixed"]),
+        ("\"kérlek 日本語\"", vec!["mixed"]),
+        ("日本語", vec!["mixed", "splitfield", "cjkonly"]),
+    ] {
+        assert_lexical_sources(&client, query, SearchFilters::default(), &expected);
     }
 }
 

@@ -476,8 +476,8 @@ fn cass_bool_tokens(raw: &str) -> Vec<CassBoolToken> {
         match ch {
             '"' if !in_phrase && (chars.peek() == Some(&'"') || chars.peek().is_none()) => {
                 // The published lexer drops an empty phrase. Preserve that
-                // explicit operand so AND "" cannot lose a requirement and
-                // NOT "" complements match-none rather than the whole query.
+                // explicit operand so normalization cannot erase a required
+                // word or hide an unsearchable operand under OR/NOT.
                 if chars.peek().is_some() {
                     chars.next();
                 }
@@ -821,9 +821,10 @@ fn open_search_hydration_sqlite(
     })
 }
 
-/// NFC-normalize a query string before sanitization so that decomposed
-/// Unicode (NFD — common on macOS keyboard input) matches NFC-indexed content
-/// produced by `DefaultCanonicalizer`.
+/// NFC-normalize display/snippet text and SQLite fallback terms.
+///
+/// Lexical parsing and cache identity retain the original spelling: the
+/// released index analyzes raw text before Unicode case or canonical mapping.
 fn nfc_sanitize_query(raw: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     let nfc: String = raw.nfc().collect();
@@ -1753,6 +1754,31 @@ impl QueryExplanation {
         // Generate warnings
         let mut warnings = Self::generate_warnings(&parsed, &sanitized, filters);
         warnings.extend(reading.recoveries);
+        if !query.trim().is_empty() {
+            // The display sanitizer cannot determine whether the index can
+            // represent an operand. Use the same adapter as execution so
+            // --dry-run cannot describe a refused query as a valid browse.
+            match frankensearch::quill::query::CassQueryParser::new(
+                frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+            ) {
+                Ok(parser) => {
+                    if indexed_terms::parse(&parser, query, &FsCassQueryFilters::default())
+                        .is_empty()
+                    {
+                        warnings.retain(|warning| {
+                            warning != "Empty query will return all documents (expensive)"
+                        });
+                        warnings.push(
+                            "error: lexical query contains an unsearchable operand, an unsupported wildcard, or exceeds normalization limits; it matches no documents"
+                                .to_string(),
+                        );
+                    }
+                }
+                Err(error) => warnings.push(format!(
+                    "error: could not initialize the lexical query parser: {error}"
+                )),
+            }
+        }
 
         Self {
             original_query: query.to_string(),
@@ -3701,6 +3727,9 @@ pub const WILDCARD_FALLBACK_SKIPPED_DISABLED: &str = "automatic_retry_disabled";
 /// longer than the automatic retry accepts.
 pub const WILDCARD_FALLBACK_SKIPPED_LONG_TERM: &str = "long_query_term";
 
+/// Automatic substring retries cannot preserve this query's indexed operands.
+pub const WILDCARD_FALLBACK_SKIPPED_QUERY_NORMALIZATION: &str = "query_normalization";
+
 /// `_meta.wildcard_fallback_skipped` value when the automatic retry ran out of
 /// Quill query fuel; the plain query's hits are returned
 /// (coding_agent_session_search-7hvlg).
@@ -4903,12 +4932,10 @@ impl SearchClient {
     ) -> Result<Vec<SearchHit>> {
         // This is per-search diagnostics, never a sticky property of a reader.
         self.record_lexical_degrade_reason(None);
-        // NFC-normalize early so every downstream consumer (Tantivy query
-        // builder, sanitizer, FTS5 fallback) sees consistent Unicode form
-        // matching the NFC-indexed content.
-        use unicode_normalization::UnicodeNormalization;
-        let query: String = query.nfc().collect();
-        let query: &str = &query;
+        // Keep the spelling that produced the indexed fragments and use it
+        // as the cache identity. NFC can change that sequence (ke + rlek into
+        // k + rlek), and can turn a discarded Kelvin sign into ASCII K.
+        // SQLite fallbacks and presentation keep their existing NFC transform.
         let sanitized = nfc_sanitize_query(query);
         let field_mask = effective_field_mask(field_mask);
         // Only lexical readers provide a publication generation with which to
@@ -4939,7 +4966,7 @@ impl SearchClient {
 
         // A prior query's top-k is not the top-k of an extended query, even
         // when every cached hit still matches: scores and omitted competitors
-        // can change. Reuse only the exact NFC query and field projection.
+        // can change. Reuse only the exact raw query and field projection.
         // Prefixes remain useful solely as hints for posting-list prewarming.
         let cache_epoch = self.reload_epoch.load(Ordering::SeqCst);
         if can_use_cache
@@ -7782,6 +7809,29 @@ impl SearchClient {
             });
         }
 
+        // Substring wildcards cannot preserve an analyzed word's fragment
+        // boundaries. The same admission also prevents an empty/unsupported
+        // operand from becoming a broad wildcard retry.
+        if !indexed_terms::allows_automatic_wildcard(query) {
+            self.record_wildcard_fallback_skip(Some(
+                WILDCARD_FALLBACK_SKIPPED_QUERY_NORMALIZATION,
+            ));
+            let suggestions = if hits.is_empty() {
+                self.generate_suggestions(query, &filters)
+            } else {
+                Vec::new()
+            };
+            return Ok(SearchResult {
+                hits,
+                wildcard_fallback: false,
+                cache_stats: baseline_stats,
+                suggestions,
+                ann_stats: None,
+                ann_unavailable_reason: None,
+                total_count: tantivy_total,
+            });
+        }
+
         // Try wildcard fallback: wrap each term in *term*
         let wildcard_query = query
             .split_whitespace()
@@ -8116,7 +8166,10 @@ impl SearchClient {
         let query_lower = query.to_lowercase();
 
         // 1. Suggest wildcard search if query doesn't have wildcards
-        if !query.contains('*') && query.len() >= 2 {
+        if !query.contains('*')
+            && query.len() >= 2
+            && indexed_terms::allows_automatic_wildcard(query)
+        {
             suggestions.push(QuerySuggestion::wildcard(query).with_shortcut(1));
         }
 
@@ -22939,6 +22992,37 @@ mod tests {
     }
 
     #[test]
+    fn explanation_reports_refused_queries_without_a_browse_warning() {
+        for raw in [
+            "🚀",
+            "!!!",
+            "NOT é",
+            "backup OR \"\"",
+            "*kérlek*",
+            "AND",
+            "()",
+            "\"f*o\"",
+        ] {
+            let explanation = QueryExplanation::analyze(raw, &SearchFilters::default());
+            assert!(
+                explanation.warnings.iter().any(|warning| warning.starts_with("error:")),
+                "refused query {raw:?} must be invalid in --dry-run"
+            );
+            assert!(
+                explanation.warnings.iter().all(|warning| !warning.contains("return all")),
+                "refused query {raw:?} must not be described as browsing"
+            );
+        }
+        for raw in ["", " \t\n", "kérlek", "ke\u{301}rlek", "日本語", "\"*kérlek*\"", "café*"] {
+            let explanation = QueryExplanation::analyze(raw, &SearchFilters::default());
+            assert!(
+                explanation.warnings.iter().all(|warning| !warning.starts_with("error:")),
+                "searchable or intentionally blank query {raw:?} must remain valid"
+            );
+        }
+    }
+
+    #[test]
     fn explanation_warns_short_terms() {
         let exp = QueryExplanation::analyze("a", &SearchFilters::default());
         assert!(exp.warnings.iter().any(|w| w.contains("Very short term")));
@@ -25545,9 +25629,9 @@ mod tests {
         let san_nfc = sanitize_query(nfc);
         let san_nfd = sanitize_query(nfd);
 
-        // Both produce "café" because nfc_sanitize_query normalizes to NFC
-        // before sanitization, matching the NFC-indexed content from
-        // DefaultCanonicalizer.
+        // The display/SQLite sanitizer normalizes both spellings to "café".
+        // Lexical parsing does not use this transform: the legacy index can
+        // contain different fragments for the original NFC and NFD spellings.
         assert_eq!(san_nfc, "café");
         assert_eq!(san_nfd, "café");
         assert_eq!(san_nfc, san_nfd);
