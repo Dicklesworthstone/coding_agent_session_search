@@ -100,7 +100,8 @@ fn graph(selected: &SemanticShardExpectation, path: &Path, seed: u64) -> Semanti
         ef_construction: 64,
         ef_search: 8,
     };
-    let graph = ValidatedNativeHnsw::build(owner, params, seed).unwrap();
+    let graph =
+        ValidatedNativeHnsw::build(&frankensearch::Cx::for_request(), owner, params, seed).unwrap();
     let receipt = graph.save(path).unwrap();
     SemanticAnnExpectation {
         graph_path: path.to_owned(),

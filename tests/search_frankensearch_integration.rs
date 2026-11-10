@@ -1024,7 +1024,7 @@ fn accented_prefix_overflow_propagates_through_counts_and_retry_without_partial_
             .title("fixture")
             .source_path(dir.path().join(format!("budget_{ordinal:04}.jsonl")))
             .messages(1)
-            .with_content(0, &format!("kérlek{ordinal:04}"))
+            .with_content(0, format!("kérlek{ordinal:04}"))
             .build_normalized();
         index.add_conversation(&conversation).expect("ingest expansion");
     }

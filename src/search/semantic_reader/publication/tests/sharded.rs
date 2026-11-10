@@ -108,7 +108,9 @@ fn attach_graphs(root: &Path, m: &mut SemanticGenerationManifestV1, sequence: u6
             ef_construction: 16,
             ef_search: 16,
         };
-        let graph = ValidatedNativeHnsw::build(owner, params, 17).unwrap();
+        let graph =
+            ValidatedNativeHnsw::build(&frankensearch::Cx::for_request(), owner, params, 17)
+                .unwrap();
         let relative = format!("{}/graph-{ordinal}.fshnsw", base.role.as_str());
         let receipt = graph.save(&directory.join(&relative)).unwrap();
         m.artifacts

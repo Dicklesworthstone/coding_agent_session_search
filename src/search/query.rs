@@ -3474,7 +3474,17 @@ fn build_in_memory_two_tier_index(
         None
     };
 
-    Ok(Arc::new(FsInMemoryTwoTierIndex::new(fast, quality)))
+    match FsInMemoryTwoTierIndex::new(fast, quality) {
+        Ok(index) => Ok(Arc::new(index)),
+        Err(err) => {
+            tracing::debug!(
+                fast_path = %fast_path.display(),
+                error = %err,
+                "pair exact semantic artifacts failed"
+            );
+            Err(SemanticProgressiveUnavailableReason::ExactArtifactOpenFailed)
+        }
+    }
 }
 
 fn two_tier_index_supports_mode(

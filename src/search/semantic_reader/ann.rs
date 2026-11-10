@@ -643,7 +643,11 @@ fn native_window(
     width: usize,
     filter: Option<&dyn SearchFilter>,
 ) -> SemanticReaderResult<(Vec<VectorHit>, usize)> {
-    let candidates = graph.search(query.vector(), width, Some(width))?;
+    // No caller context reaches here: an infinite-budget request context that
+    // nothing cancels keeps this search unbounded and uncancellable, as before
+    // the engine took a caller `Cx`.
+    let cx = frankensearch::Cx::for_request();
+    let candidates = graph.search(&cx, query.vector(), width, Some(width))?;
     if candidates.len() > width {
         return Err(SemanticReaderError::InvalidCandidate);
     }
