@@ -3,6 +3,8 @@ use crossbeam_channel as mpsc;
 
 #[path = "query/coverage.rs"]
 mod coverage;
+#[path = "query/indexed_terms.rs"]
+mod indexed_terms;
 #[path = "query/retry_budget.rs"]
 mod retry_budget;
 pub use retry_budget::LEXICAL_RETRY_QUERY_FUEL_EXHAUSTED;
@@ -472,6 +474,19 @@ fn cass_bool_tokens(raw: &str) -> Vec<CassBoolToken> {
     let mut open_groups = 0_usize;
     while let Some(ch) = chars.next() {
         match ch {
+            '"' if !in_phrase && (chars.peek() == Some(&'"') || chars.peek().is_none()) => {
+                // The published lexer drops an empty phrase. Preserve that
+                // explicit operand so AND "" cannot lose a requirement and
+                // NOT "" complements match-none rather than the whole query.
+                if chars.peek().is_some() {
+                    chars.next();
+                }
+                flush(&mut segment, &mut tokens);
+                tokens.push(CassBoolToken::Token(
+                    FsCassQueryToken::Phrase(String::new()),
+                ));
+                at_word_start = true;
+            }
             '"' => {
                 in_phrase = !in_phrase;
                 at_word_start = true;
@@ -510,6 +525,26 @@ fn cass_bool_tokens(raw: &str) -> Vec<CassBoolToken> {
     tokens
 }
 
+/// Bound the existing recursive parser before it consumes any group. The
+/// tokens already distinguish real grouping from opaque quoted/code text.
+fn cass_bool_nesting_is_bounded(tokens: &[CassBoolToken]) -> bool {
+    const MAX_GROUP_DEPTH: usize = 128;
+    let mut depth = 0_usize;
+    for token in tokens {
+        match token {
+            CassBoolToken::Open => {
+                depth += 1;
+                if depth > MAX_GROUP_DEPTH {
+                    return false;
+                }
+            }
+            CassBoolToken::Close => depth = depth.saturating_sub(1),
+            CassBoolToken::Token(_) => {}
+        }
+    }
+    true
+}
+
 /// An operand the lane cannot express: the whole query is declined.
 struct CassBoolUnsupported;
 
@@ -538,6 +573,9 @@ where
         tokens: &'a [CassBoolToken],
         lower: F,
     ) -> Result<Option<CassBoolExpr<T>>, CassBoolUnsupported> {
+        if !cass_bool_nesting_is_bounded(tokens) {
+            return Err(CassBoolUnsupported);
+        }
         let mut parser = Self {
             tokens,
             position: 0,
@@ -8464,14 +8502,14 @@ impl SearchClient {
 
         // NOTE: session_paths filtering is applied post-search since source_path
         // is STORED but not indexed. See apply_session_paths_filter().
-        // Quill parses CASS's query language natively; the parsed tree is the
-        // engine-neutral form its executor takes.
+        // Keep the released index generation while aligning affected Unicode
+        // operands with its actual tokenizer. Counts and ranked pages share
+        // this one engine-neutral query.
         let parser = frankensearch::quill::query::CassQueryParser::new(
             frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
         )
         .map_err(|error| anyhow::anyhow!("building the CASS query parser: {error}"))?;
-        let parsed = parser.parse(raw_query, &fs_filters);
-        let q = parsed.query;
+        let q = indexed_terms::parse(&parser, raw_query, &fs_filters);
 
         let prefix_only = is_prefix_only(sanitized_query);
         let top_docs = execute_query_with_bounded_exact_count(reader, &q, limit, offset)?;
@@ -10422,7 +10460,8 @@ fn maybe_spawn_warm_worker(
                 // incumbent hand-built here, so this warms the identical
                 // posting lists. Limit 1 doc.
                 if !job.query.trim().is_empty() {
-                    let parsed = warm_parser.parse(
+                    let query = indexed_terms::parse(
+                        &warm_parser,
                         &job.query,
                         &frankensearch::quill::query::CassQueryFilters::default(),
                     );
@@ -10431,13 +10470,9 @@ fn maybe_spawn_warm_worker(
                     // swallowing it entirely makes a persistently broken warm
                     // path invisible. Log at debug so it is diagnosable without
                     // being noisy.
-                    if let Err(err) = crate::search::quill_bridge::search_paginated(
-                        &reader,
-                        &parsed.query,
-                        1,
-                        0,
-                        false,
-                    ) {
+                    if let Err(err) =
+                        crate::search::quill_bridge::search_paginated(&reader, &query, 1, 0, false)
+                    {
                         tracing::debug!(
                             error = %err,
                             query = %job.query,
