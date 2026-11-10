@@ -765,7 +765,38 @@ fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.flush()
 }
 
-fn binary_hash(path: &str) -> Option<String> {
+/// Resolve explicit relative programs consistently across platforms without
+/// following executable symlinks, whose names can affect program behavior.
+fn command_program(spec: &RunSpec) -> io::Result<PathBuf> {
+    let path = Path::new(&spec.binary_path);
+    let has_parent = path
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty());
+    if path.is_absolute() || !has_parent {
+        return Ok(path.to_path_buf());
+    }
+    let cwd = if spec.cwd.is_absolute() {
+        spec.cwd.clone()
+    } else {
+        std::env::current_dir()?.join(&spec.cwd)
+    };
+    let program = cwd.join(path.strip_prefix(".").unwrap_or(path));
+    if !program.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "executable path must be absolute or relative to the command working directory",
+        ));
+    }
+    Ok(program)
+}
+
+fn binary_hash(spec: &RunSpec) -> Option<String> {
+    let path = command_program(spec).ok()?;
+    if !path.is_absolute() {
+        // A bare name is resolved through the child's PATH. A same-named file
+        // in either working directory does not establish executable identity.
+        return None;
+    }
     let mut file = fs::File::open(path).ok()?;
     let mut hasher = blake3::Hasher::new();
     let mut chunk = [0_u8; 64 * 1024];
@@ -791,7 +822,7 @@ fn binary_version(spec: &RunSpec, remaining: Duration) -> Option<String> {
     // A regular file has no pipe EOF to wait for, including on Windows. Keep
     // this small auxiliary probe independent of the threaded pipe collector.
     let mut stdout_file = tempfile::tempfile().ok()?;
-    let mut command = Command::new(&spec.binary_path);
+    let mut command = Command::new(command_program(spec).ok()?);
     command
         .arg("--version")
         .current_dir(&spec.cwd)
@@ -834,7 +865,7 @@ fn binary_version(spec: &RunSpec, remaining: Duration) -> Option<String> {
 /// Non-Unix retains the threaded collector and its inherited-pipe limitation.
 fn execute_bounded(spec: &RunSpec) -> std::io::Result<RawRun> {
     let start = Instant::now();
-    let mut cmd = Command::new(&spec.binary_path); // ubs:ignore — trusted in-process E2E spec, never user input.
+    let mut cmd = Command::new(command_program(spec)?); // ubs:ignore — trusted in-process E2E spec, never user input.
     cmd.args(&spec.args)
         .current_dir(&spec.cwd)
         .stdin(Stdio::null())
@@ -1028,8 +1059,11 @@ pub fn run_capture_with_exit_codes(
     accepted_exit_codes: &[i32],
     now_ms: u64,
 ) -> RunCapture {
+    let binary_path = command_program(spec)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| spec.binary_path.clone());
     let command_line = {
-        let mut v = vec![spec.binary_path.clone()];
+        let mut v = vec![binary_path.clone()];
         v.extend(spec.args.iter().cloned());
         v
     };
@@ -1050,7 +1084,7 @@ pub fn run_capture_with_exit_codes(
                 schema_version: E2E_RUNNER_SCHEMA_VERSION,
                 mode: spec.mode,
                 command_line: command_line.clone(),
-                binary_path: spec.binary_path.clone(),
+                binary_path: binary_path.clone(),
                 binary_version: None,
                 binary_hash: None,
                 env_overrides: env_overrides.clone(),
@@ -1158,7 +1192,7 @@ pub fn run_with_artifacts(
         capture.event.binary_version =
             binary_version(spec, spec.timeout.saturating_sub(started.elapsed()));
     }
-    capture.event.binary_hash = binary_hash(&spec.binary_path);
+    capture.event.binary_hash = binary_hash(spec);
 
     let command_dir = artifact
         .artifact_root
@@ -1197,7 +1231,7 @@ pub fn run_with_artifacts(
     let completed = capture.event.outcome.is_success();
     let proof_run = crate::proof_artifact::ProofRun {
         command: capture.event.command_line.join(" "),
-        binary_path: Some(spec.binary_path.clone()),
+        binary_path: Some(capture.event.binary_path.clone()),
         binary_version: capture.event.binary_version.clone(),
         data_dir_or_fixture: spec.fixture_id.clone(),
         // An expected non-zero diagnostic is a pass only because its assertions
@@ -1443,6 +1477,61 @@ mod tests {
                 assert_eq!(event.outcome, RunOutcome::Success);
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_executable_hash_uses_the_command_working_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let program_dir = tmp.path().join("program");
+        std::fs::create_dir(&program_dir).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", program_dir.join("shell")).unwrap();
+        let mut spec = sh_spec("printf '{}'", 5_000);
+        spec.binary_path = "./program/shell".to_string();
+        spec.cwd = tmp.path().to_path_buf();
+        let root = tmp.path().join("artifacts");
+        let entry = run_with_artifacts(
+            &spec,
+            &RunExpectation {
+                expect_json: true,
+                ..Default::default()
+            },
+            &ArtifactRunSpec {
+                artifact_root: &root,
+                run_id: "relative-executable",
+                scenario_id: "real-system-shell",
+                command_id: "hash-from-child-cwd",
+                issue_ids: &[],
+                privacy_note: "Unit check of real shell execution; no CASS capability proof.",
+                suite_started_ms: 0,
+                accepted_exit_codes: &[0],
+                forbidden_stream_markers: &[],
+                extra_artifact_paths: &[],
+            },
+            0,
+        )
+        .unwrap();
+        assert_eq!(entry.outcome, RunOutcome::Success);
+        let event: RunEvent =
+            serde_json::from_slice(&std::fs::read(&entry.event_path).unwrap()).unwrap();
+        let shell_bytes = std::fs::read("/bin/sh").unwrap();
+        let expected_hash = blake3::hash(&shell_bytes).to_hex().to_string();
+        assert_eq!(event.binary_hash.as_deref(), Some(expected_hash.as_str()));
+        let expected_program = program_dir.join("shell").display().to_string();
+        assert_eq!(event.binary_path, expected_program);
+        assert_eq!(event.command_line[0], expected_program);
+        let proof: crate::proof_artifact::ProofArtifact =
+            serde_json::from_slice(&std::fs::read(&entry.proof_path).unwrap()).unwrap();
+        assert_eq!(
+            proof.run.binary_path.as_deref(),
+            Some(expected_program.as_str())
+        );
+
+        // PATH lookup must stay unqualified even if cwd holds a same-named
+        // file: it does not prove that Command selected this file.
+        spec.binary_path = "shell".to_string();
+        spec.cwd = program_dir;
+        assert!(binary_hash(&spec).is_none());
     }
 
     #[test]
