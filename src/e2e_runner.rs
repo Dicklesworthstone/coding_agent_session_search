@@ -742,7 +742,7 @@ fn safe_stem(value: &str) -> String {
             }
         })
         .collect();
-    if stem.is_empty() {
+    if stem.is_empty() || matches!(stem.as_str(), "." | "..") {
         "proof".to_string()
     } else {
         stem
@@ -797,7 +797,22 @@ fn binary_hash(spec: &RunSpec) -> Option<String> {
         // in either working directory does not establish executable identity.
         return None;
     }
-    let mut file = fs::File::open(path).ok()?;
+    if !fs::metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Preserve regular-file symlinks without waiting for a pipe writer
+        // if the path changes between inspection and opening.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     let mut hasher = blake3::Hasher::new();
     let mut chunk = [0_u8; 64 * 1024];
     loop {
@@ -1194,16 +1209,17 @@ pub fn run_with_artifacts(
     }
     capture.event.binary_hash = binary_hash(spec);
 
+    let command_stem = safe_stem(artifact.command_id);
     let command_dir = artifact
         .artifact_root
         .join(safe_stem(artifact.run_id))
         .join(safe_stem(artifact.scenario_id))
-        .join(safe_stem(artifact.command_id));
+        .join(&command_stem);
     fs::create_dir_all(&command_dir)?;
     let stdout_path = command_dir.join("stdout.json");
     let stderr_path = command_dir.join("stderr.log");
     let event_path = command_dir.join("event.json");
-    let proof_path = command_dir.join(format!("{}.proof.json", safe_stem(artifact.command_id)));
+    let proof_path = command_dir.join(format!("{command_stem}.proof.json"));
     for path in [&stdout_path, &stderr_path, &event_path, &proof_path] {
         if path.exists() {
             return Err(io::Error::new(
@@ -1253,7 +1269,7 @@ pub fn run_with_artifacts(
         stderr_path: Some(stderr_path.display().to_string()),
     };
     let emitted =
-        crate::proof_artifact::emit_proof_artifact(&command_dir, artifact.command_id, proof_run)?;
+        crate::proof_artifact::emit_proof_artifact(&command_dir, &command_stem, proof_run)?;
     if Path::new(&emitted.path) != proof_path {
         return Err(io::Error::other(format!(
             "proof path mismatch: expected {}, wrote {}",
@@ -1532,6 +1548,158 @@ mod tests {
         spec.binary_path = "shell".to_string();
         spec.cwd = program_dir;
         assert!(binary_hash(&spec).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_hash_rejects_nonregular_inputs_without_blocking() {
+        // A blocking hash must fail in a bounded subprocess, rather than
+        // wedging the entire library harness. Retain its failure artifacts.
+        const CHILD_ROOT: &str = "CASS_TEST_RUNNER_HASH_FIFO_ROOT";
+        let Some(root) = std::env::var_os(CHILD_ROOT) else {
+            let tmp = tempfile::Builder::new()
+                .prefix("cass-runner-hash-")
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            eprintln!("Runner hash regression artifacts: {}", tmp.path().display());
+            let full_name = concat!(
+                module_path!(),
+                "::executable_hash_rejects_nonregular_inputs_without_blocking"
+            );
+            let (_, test_name) = full_name.split_once("::").unwrap();
+            assert_cmd::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD_ROOT, tmp.path())
+                .timeout(Duration::from_secs(5))
+                .assert()
+                .success()
+                .stdout(predicates::str::contains("1 passed; 0 failed"));
+            return;
+        };
+        let root = PathBuf::from(root);
+        let pipe = root.join("fifo");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&pipe)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let pipe_alias = root.join("fifo-alias");
+        std::os::unix::fs::symlink(&pipe, &pipe_alias).unwrap();
+        let mut spec = sh_spec("", 100);
+        spec.cwd = root.clone();
+        let artifacts = root.join("artifacts");
+        for (name, path) in [
+            ("fifo", pipe),
+            ("fifo-alias", pipe_alias),
+            ("directory", root.clone()),
+        ] {
+            spec.binary_path = path.display().to_string();
+            assert!(binary_hash(&spec).is_none());
+            let entry = run_with_artifacts(
+                &spec,
+                &RunExpectation::default(),
+                &ArtifactRunSpec {
+                    artifact_root: &artifacts,
+                    run_id: "nonregular-executable",
+                    scenario_id: "spawn-failure",
+                    command_id: name,
+                    issue_ids: &[],
+                    privacy_note: "Unit check of failed OS execution; no CASS capability proof.",
+                    suite_started_ms: 0,
+                    accepted_exit_codes: &[0],
+                    forbidden_stream_markers: &[],
+                    extra_artifact_paths: &[],
+                },
+                0,
+            )
+            .unwrap();
+            assert_eq!(entry.outcome, RunOutcome::CommandFailure { exit_code: -1 });
+            let event: RunEvent =
+                serde_json::from_slice(&fs::read(&entry.event_path).unwrap()).unwrap();
+            assert!(event.binary_hash.is_none());
+            assert!(event.binary_version.is_none());
+        }
+
+        let regular = root.join("regular");
+        let bytes = b"real regular-file bytes";
+        fs::write(&regular, bytes).unwrap();
+        let alias = root.join("regular-alias");
+        std::os::unix::fs::symlink(&regular, &alias).unwrap();
+        for path in [regular, alias] {
+            spec.binary_path = path.display().to_string();
+            assert_eq!(
+                binary_hash(&spec),
+                Some(blake3::hash(bytes).to_hex().to_string())
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_dot_components_stay_inside_the_run_root() {
+        for (run_id, scenario_id, command_id, expected_parts) in [
+            (".", "..", ".", ["proof", "proof", "proof"]),
+            (
+                "run.v1",
+                "normal-case",
+                "command",
+                ["run.v1", "normal-case", "command"],
+            ),
+        ] {
+            let tmp = tempfile::Builder::new()
+                .prefix("cass-runner-path-")
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            // Even the unfixed dot-dot case stays inside this private fixture.
+            let root = tmp.path().join("guard/a/b/artifacts");
+            let entry = run_with_artifacts(
+                &sh_spec("printf '{}'", 5_000),
+                &RunExpectation {
+                    expect_json: true,
+                    ..Default::default()
+                },
+                &ArtifactRunSpec {
+                    artifact_root: &root,
+                    run_id,
+                    scenario_id,
+                    command_id,
+                    issue_ids: &[],
+                    privacy_note: "Unit check of artifact containment; no CASS capability proof.",
+                    suite_started_ms: 0,
+                    accepted_exit_codes: &[0],
+                    forbidden_stream_markers: &[],
+                    extra_artifact_paths: &[],
+                },
+                0,
+            )
+            .unwrap();
+            assert_eq!(entry.outcome, RunOutcome::Success);
+            assert_eq!(
+                entry.proof_status,
+                crate::proof_artifact::ProofStatus::GeneratedOnly
+            );
+            assert_eq!(fs::read(&entry.stdout_path).unwrap(), b"{}");
+            let expected = fs::canonicalize(
+                root.join(expected_parts[0])
+                    .join(expected_parts[1])
+                    .join(expected_parts[2]),
+            )
+            .unwrap();
+            for path in [
+                &entry.stdout_path,
+                &entry.stderr_path,
+                &entry.event_path,
+                &entry.proof_path,
+            ] {
+                let actual = fs::canonicalize(path).unwrap();
+                assert_eq!(actual.parent(), Some(expected.as_path()));
+                assert!(actual.starts_with(fs::canonicalize(&root).unwrap()));
+            }
+        }
     }
 
     #[test]
