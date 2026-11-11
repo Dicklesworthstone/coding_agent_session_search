@@ -32,23 +32,25 @@ fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn list_shell_scripts(roots: &[&str]) -> Vec<PathBuf> {
+fn list_shell_scripts(roots: &[&Path]) -> std::io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for root in roots {
         let root_path = project_root().join(root);
-        if !root_path.is_dir() {
-            continue;
-        }
-        walk_dir(&root_path, &mut out);
+        walk_dir(&root_path, &mut out)?;
     }
-    out
+    out.sort();
+    Ok(out)
 }
 
-fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    let entries = std::fs::read_dir(dir).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("reading shell-policy directory {}: {error}", dir.display()),
+        )
+    })?;
+    for entry in entries {
+        let entry = entry?;
         let path = entry.path();
         // Skip hidden dirs (.git, etc.) and known-noise dirs.
         if let Some(name) = path.file_name().and_then(|n| n.to_str())
@@ -57,25 +59,41 @@ fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>) {
             continue;
         }
         if path.is_dir() {
-            walk_dir(&path, out);
+            walk_dir(&path, out)?;
         } else if path.extension().and_then(|s| s.to_str()) == Some("sh") {
             out.push(path);
         }
     }
+    Ok(())
 }
 
-/// Strip trailing comment from a line (after the first unquoted `#`).
-/// This is a heuristic — full bash parsing is out of scope; we mostly need
-/// to ignore "# cargo ..." which is overwhelming the dominant FP.
-fn strip_trailing_comment(line: &str) -> &str {
-    // Single-quoted and double-quoted regions hide #s; we punt on those and
-    // accept the FP risk. The conservative approach: split on " # " (space-#)
-    // which excludes the one common case where # appears in identifiers.
-    if let Some(idx) = line.find(" # ") {
-        return &line[..idx];
-    }
-    if line.trim_start().starts_with('#') {
-        return "";
+/// Strip shell comments while retaining literal hashes and closing quotes.
+/// Carry the caller's quote state so a multiline string cannot become a
+/// comment and conceal a later real command.
+fn strip_trailing_comment(line: &str, quote_state: (bool, bool)) -> &str {
+    let bytes = line.as_bytes();
+    let (mut in_single, mut in_double) = quote_state;
+    let mut word_start = !in_single && !in_double;
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if !in_single && !in_double && byte == b'#' && word_start {
+            return &line[..i];
+        }
+        match byte {
+            b'\\' if !in_single => {
+                word_start = false;
+                i += 2;
+                continue;
+            }
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            _ => {}
+        }
+        word_start = !in_single
+            && !in_double
+            && (byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&' | b'(' | b')'));
+        i += 1;
     }
     line
 }
@@ -142,8 +160,9 @@ fn cargo_spans_outside_quotes(line: &str, quote_state: &mut (bool, bool)) -> Vec
             }
         }
         match c {
-            b'\\' => {
-                // Skip the next byte regardless of state (escaped char).
+            b'\\' if !in_single => {
+                // Backslashes are literal inside single quotes. Treating one
+                // as an escape can hide the closing quote and later commands.
                 i += 2;
                 continue;
             }
@@ -170,12 +189,9 @@ struct Finding {
     hint: &'static str,
 }
 
-fn scan_for_bare_cargo(path: &Path) -> Vec<Finding> {
-    let body = match std::fs::read_to_string(path) {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
-    };
-    scan_shell_body_for_bare_cargo(path, &body)
+fn scan_for_bare_cargo(path: &Path) -> std::io::Result<Vec<Finding>> {
+    let body = std::fs::read_to_string(path)?;
+    Ok(scan_shell_body_for_bare_cargo(path, &body))
 }
 
 fn scan_shell_body_for_bare_cargo(path: &Path, body: &str) -> Vec<Finding> {
@@ -194,7 +210,7 @@ fn scan_shell_body_for_bare_cargo(path: &Path, body: &str) -> Vec<Finding> {
         });
     let mut in_gate_formatter = false;
     for (start_line, logical) in logical_lines(body) {
-        let line = strip_trailing_comment(&logical);
+        let line = strip_trailing_comment(&logical, quote_state);
         if serialized_gate_formatter && line.trim() == "run_fmt() {" {
             in_gate_formatter = true;
         } else if line.trim() == "}" {
@@ -217,7 +233,10 @@ fn scan_shell_body_for_bare_cargo(path: &Path, body: &str) -> Vec<Finding> {
         let mut has_real_match = false;
         for (start, _end) in &cargo_positions {
             let tail = &line[*start..];
-            if cargo_subcmd_re.is_match(tail) {
+            if cargo_subcmd_re
+                .find(tail)
+                .is_some_and(|matched| matched.start() == 0)
+            {
                 has_real_match = true;
                 break;
             }
@@ -250,7 +269,11 @@ fn scan_shell_body_for_bare_cargo(path: &Path, body: &str) -> Vec<Finding> {
         // logical lines so panics stay legible.
         let mut snippet = logical.trim().to_string();
         if snippet.len() > 200 {
-            snippet.truncate(197);
+            let mut end = 197;
+            while !snippet.is_char_boundary(end) {
+                end -= 1;
+            }
+            snippet.truncate(end);
             snippet.push_str("...");
         }
         findings.push(Finding {
@@ -264,11 +287,8 @@ fn scan_shell_body_for_bare_cargo(path: &Path, body: &str) -> Vec<Finding> {
     findings
 }
 
-fn scan_for_set_e_arithmetic(path: &Path) -> Vec<Finding> {
-    let body = match std::fs::read_to_string(path) {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
-    };
+fn scan_for_set_e_arithmetic(path: &Path) -> std::io::Result<Vec<Finding>> {
+    let body = std::fs::read_to_string(path)?;
     // Match `set -<flags>` where <flags> contains an `e`. This catches
     // `-e`, `-eu`, `-eo`, `-ex`, `-eux`, `-euo`, `-euxo`, `-eou`, etc.
     let set_e_re = regex::Regex::new(r"set\s+-[a-z]*e[a-z]*\b").expect("regex compiles");
@@ -276,7 +296,7 @@ fn scan_for_set_e_arithmetic(path: &Path) -> Vec<Finding> {
     let mut set_e_line: Option<usize> = None;
     let mut findings = Vec::new();
     for (idx, raw) in body.lines().enumerate() {
-        let line = strip_trailing_comment(raw);
+        let line = strip_trailing_comment(raw, (false, false));
         if set_e_line.is_none() && set_e_re.is_match(line) {
             set_e_line = Some(idx);
         }
@@ -290,16 +310,18 @@ fn scan_for_set_e_arithmetic(path: &Path) -> Vec<Finding> {
             });
         }
     }
-    findings
+    Ok(findings)
 }
 
 #[test]
 fn scripts_rch_compliance_no_bare_cargo() {
     tracing::info!(target: "scripts_rch_compliance", check = "bare_cargo");
-    let scripts = list_shell_scripts(&["scripts"]);
+    let scripts =
+        list_shell_scripts(&[Path::new("scripts")]).expect("discover shell-policy inputs");
     let mut all_findings = Vec::new();
     for s in &scripts {
-        let findings = scan_for_bare_cargo(s);
+        let findings = scan_for_bare_cargo(s)
+            .unwrap_or_else(|error| panic!("reading shell-policy input {}: {error}", s.display()));
         for f in &findings {
             tracing::info!(
                 target: "scripts_rch_compliance",
@@ -333,10 +355,12 @@ fn scripts_rch_compliance_no_bare_cargo() {
 #[test]
 fn scripts_rch_compliance_no_set_e_arithmetic() {
     tracing::info!(target: "scripts_rch_compliance", check = "set_e_arithmetic");
-    let scripts = list_shell_scripts(&["scripts"]);
+    let scripts =
+        list_shell_scripts(&[Path::new("scripts")]).expect("discover shell-policy inputs");
     let mut all_findings = Vec::new();
     for s in &scripts {
-        let findings = scan_for_set_e_arithmetic(s);
+        let findings = scan_for_set_e_arithmetic(s)
+            .unwrap_or_else(|error| panic!("reading shell-policy input {}: {error}", s.display()));
         for f in &findings {
             tracing::info!(
                 target: "scripts_rch_compliance",
@@ -658,6 +682,105 @@ fn e2e_acceptance_is_exact_worker_run_scoped_and_publish_last() -> Result<(), St
 // ---------------- Synthetic-fixture tests for scanner correctness ----------------
 
 #[test]
+fn scanner_distinguishes_empty_missing_and_non_directory_roots() {
+    let empty = tempdir_for_test("empty_roots");
+    assert!(list_shell_scripts(&[&empty]).unwrap().is_empty());
+    let missing = empty.join("missing");
+    let error = list_shell_scripts(&[&missing]).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    assert!(error.to_string().contains(&missing.display().to_string()));
+    let file = empty.join("not-a-directory");
+    std::fs::write(&file, b"not a script root").unwrap();
+    assert!(list_shell_scripts(&[&file]).is_err());
+}
+
+#[test]
+fn scanner_rejects_partial_input_discovery() {
+    let root = tempdir_for_test("partial_roots");
+    let nested = root.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let script = nested.join("violation.sh");
+    std::fs::write(&script, b"cargo build\n").unwrap();
+    assert_eq!(list_shell_scripts(&[&root]).unwrap(), vec![script]);
+    assert!(list_shell_scripts(&[&root, &root.join("missing")]).is_err());
+}
+
+#[test]
+fn scanner_rejects_unreadable_and_invalid_utf8_inputs() {
+    let root = tempdir_for_test("read_errors");
+    let invalid = root.join("invalid.sh");
+    std::fs::write(&invalid, [0xff]).unwrap();
+    for path in [root.join("missing.sh"), root.clone(), invalid] {
+        assert!(scan_for_bare_cargo(&path).is_err(), "{}", path.display());
+        assert!(
+            scan_for_set_e_arithmetic(&path).is_err(),
+            "{}",
+            path.display()
+        );
+    }
+    let empty = root.join("empty.sh");
+    std::fs::write(&empty, b"").unwrap();
+    assert!(scan_for_bare_cargo(&empty).unwrap().is_empty());
+    assert!(scan_for_set_e_arithmetic(&empty).unwrap().is_empty());
+}
+
+#[test]
+fn scanner_keeps_backslashes_literal_inside_single_quotes() {
+    let body = "printf '%s\\n' 'ends with \\'\ncargo build\n";
+    let findings = scan_shell_body_for_bare_cargo(Path::new("quoted.sh"), body);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].line, 2);
+    assert_eq!(findings[0].snippet, "cargo build");
+}
+
+#[test]
+fn scanner_preserves_quoted_hashes_without_hiding_later_commands() {
+    for body in [
+        "printf '%s\\n' 'hash # value'\ncargo build\n",
+        "printf '%s\\n' \"hash # value\"\ncargo build\n",
+        "value='first\n # text'\ncargo build\n",
+        "printf '%s\\n' 'hash # value'; # don't cargo test\ncargo build\n",
+        "cargo build;# rch exec -- cargo test\n",
+    ] {
+        let findings = scan_shell_body_for_bare_cargo(Path::new("hashes.sh"), body);
+        assert_eq!(findings.len(), 1, "{body:?}: {findings:?}");
+        assert!(findings[0].snippet.contains("cargo build"));
+    }
+    let escaped = "printf %s escaped\\ #literal";
+    assert_eq!(strip_trailing_comment(escaped, (false, false)), escaped);
+    assert!(
+        scan_shell_body_for_bare_cargo(
+            Path::new("comments.sh"),
+            "# cargo build\nrch exec -- cargo test # don't cargo build\n",
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn scanner_matches_subcommands_at_the_unquoted_cargo_token() {
+    let path = Path::new("version.sh");
+    let clean = "cargo --version; echo 'cargo build'\n";
+    assert!(scan_shell_body_for_bare_cargo(path, clean).is_empty());
+    let findings =
+        scan_shell_body_for_bare_cargo(path, &format!("{clean}cargo build; echo 'cargo test'\n"));
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].line, 2);
+    assert_eq!(findings[0].snippet, "cargo build; echo 'cargo test'");
+}
+
+#[test]
+fn scanner_truncates_unicode_findings_at_a_character_boundary() {
+    let body = format!("printf %s {}; cargo build\n", "界".repeat(66));
+    let findings = scan_shell_body_for_bare_cargo(Path::new("unicode.sh"), &body);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].line, 1);
+    assert!(findings[0].snippet.len() <= 200);
+    assert!(findings[0].snippet.ends_with("..."));
+    assert!(findings[0].snippet.starts_with("printf %s 界"));
+}
+
+#[test]
 fn scanner_exempts_only_the_serialized_gate_formatter() {
     let gate = project_root().join("scripts/gate.sh");
     let body = r#"run_fmt() {
@@ -693,7 +816,7 @@ fn scanner_flags_bare_cargo_in_synthetic_fixture() {
         b"#!/usr/bin/env bash\nset -e\ncargo build  # bare cargo, should violate\n",
     )
     .unwrap();
-    let findings = scan_for_bare_cargo(&path);
+    let findings = scan_for_bare_cargo(&path).unwrap();
     assert_eq!(
         findings.len(),
         1,
@@ -713,7 +836,7 @@ fn scanner_does_not_flag_run_cargo_calls() {
         b"#!/usr/bin/env bash\nset -euo pipefail\nsource ./run_cargo.sh\nrun_cargo build --release\nrch exec -- env CARGO_TARGET_DIR=/tmp cargo test --release\n",
     )
     .unwrap();
-    let findings = scan_for_bare_cargo(&path);
+    let findings = scan_for_bare_cargo(&path).unwrap();
     assert!(
         findings.is_empty(),
         "clean script should yield zero findings; got {findings:?}"
@@ -730,7 +853,7 @@ fn scanner_flags_set_e_with_increment() {
         b"#!/usr/bin/env bash\nset -e\nCOUNT=0\n((COUNT++))\necho ok\n",
     )
     .unwrap();
-    let findings = scan_for_set_e_arithmetic(&path);
+    let findings = scan_for_set_e_arithmetic(&path).unwrap();
     assert_eq!(findings.len(), 1, "expected 1 set-e arithmetic finding");
     assert!(findings[0].snippet.contains("((COUNT++))"));
 }
@@ -745,7 +868,7 @@ fn scanner_does_not_flag_increment_without_set_e() {
         b"#!/usr/bin/env bash\n# no set -e here\nCOUNT=0\n((COUNT++))\necho ok\n",
     )
     .unwrap();
-    let findings = scan_for_set_e_arithmetic(&path);
+    let findings = scan_for_set_e_arithmetic(&path).unwrap();
     assert!(
         findings.is_empty(),
         "without set -e, the increment is safe; got {findings:?}"
@@ -762,7 +885,7 @@ fn scanner_does_not_flag_safe_increment_form() {
         b"#!/usr/bin/env bash\nset -e\nCOUNT=0\n((COUNT += 1))\necho ok\n",
     )
     .unwrap();
-    let findings = scan_for_set_e_arithmetic(&path);
+    let findings = scan_for_set_e_arithmetic(&path).unwrap();
     assert!(
         findings.is_empty(),
         "((VAR += 1)) is the safe form and must not trigger; got {findings:?}"
@@ -779,7 +902,7 @@ fn scanner_ignores_cargo_in_comments() {
         b"#!/usr/bin/env bash\n# Don't use cargo build directly - wrap via run_cargo.\nrun_cargo build --release\n",
     )
     .unwrap();
-    let findings = scan_for_bare_cargo(&path);
+    let findings = scan_for_bare_cargo(&path).unwrap();
     assert!(
         findings.is_empty(),
         "cargo mentioned in a leading-# comment must not trigger; got {findings:?}"
@@ -796,7 +919,7 @@ fn scanner_ignores_cargo_in_double_quoted_strings() {
         b"#!/usr/bin/env bash\nset -e\necho \"  cargo install cargo-llvm-cov\"\nlog INFO \"using rch cargo test\"\n",
     )
     .unwrap();
-    let findings = scan_for_bare_cargo(&path);
+    let findings = scan_for_bare_cargo(&path).unwrap();
     assert!(
         findings.is_empty(),
         "cargo inside double-quoted strings must not trigger; got {findings:?}"
@@ -813,7 +936,7 @@ fn scanner_ignores_cargo_in_single_quoted_strings() {
         b"#!/usr/bin/env bash\nset -e\necho 'rch cargo test'\n",
     )
     .unwrap();
-    let findings = scan_for_bare_cargo(&path);
+    let findings = scan_for_bare_cargo(&path).unwrap();
     assert!(
         findings.is_empty(),
         "cargo inside single-quoted strings must not trigger; got {findings:?}"
@@ -830,7 +953,7 @@ fn scanner_handles_line_continuations_for_rch() {
         b"#!/usr/bin/env bash\nset -euo pipefail\nrch exec -- env CARGO_TARGET_DIR=/tmp \\\n    cargo test --test foo -- --nocapture\n",
     )
     .unwrap();
-    let findings = scan_for_bare_cargo(&path);
+    let findings = scan_for_bare_cargo(&path).unwrap();
     assert!(
         findings.is_empty(),
         "cargo following an `rch exec --` continuation line must not trigger; got {findings:?}"
@@ -846,7 +969,7 @@ fn scanner_tracks_multiline_quotes_and_still_flags_following_cargo() {
         b"#!/usr/bin/env bash\nREMOTE_SCRIPT=\"set -o pipefail\ncargo fmt --check\ncargo test\"\nrch exec --job -- bash -c \"$REMOTE_SCRIPT\"\ncargo build\n",
     )
     .unwrap();
-    let findings = scan_for_bare_cargo(&path);
+    let findings = scan_for_bare_cargo(&path).unwrap();
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert_eq!(findings[0].line, 6);
     assert_eq!(findings[0].snippet, "cargo build");
@@ -864,7 +987,7 @@ fn scanner_set_e_regex_catches_eo_pipefail() {
         b"#!/usr/bin/env bash\nset -eo pipefail\nCOUNT=0\n((COUNT++))\necho ok\n",
     )
     .unwrap();
-    let findings = scan_for_set_e_arithmetic(&path);
+    let findings = scan_for_set_e_arithmetic(&path).unwrap();
     assert_eq!(
         findings.len(),
         1,
@@ -882,7 +1005,7 @@ fn scanner_set_e_regex_catches_eux_combinations() {
         b"#!/usr/bin/env bash\nset -eux\nCOUNT=0\n((COUNT++))\n",
     )
     .unwrap();
-    let findings = scan_for_set_e_arithmetic(&path);
+    let findings = scan_for_set_e_arithmetic(&path).unwrap();
     assert_eq!(findings.len(), 1, "scanner must catch `set -eux`");
 }
 
@@ -896,7 +1019,7 @@ fn scanner_set_e_regex_does_not_match_uo_only() {
         b"#!/usr/bin/env bash\nset -uo pipefail\nCOUNT=0\n((COUNT++))\n",
     )
     .unwrap();
-    let findings = scan_for_set_e_arithmetic(&path);
+    let findings = scan_for_set_e_arithmetic(&path).unwrap();
     assert!(
         findings.is_empty(),
         "without `-e` flag the gate must stay quiet; got {findings:?}"
