@@ -65,7 +65,7 @@ fn unexecuted_json_proof_events_never_claim_parse_success() -> Result<(), String
             &spec,
             &RunExpectation {
                 expect_json,
-                ..Default::default()
+                assertions: vec![("must_not_run".to_string(), Box::new(|_, _| false))],
             },
             &ArtifactRunSpec {
                 artifact_root: &artifact_root,

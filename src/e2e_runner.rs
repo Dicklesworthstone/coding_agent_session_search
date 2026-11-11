@@ -1745,7 +1745,7 @@ mod tests {
 
         let expect = RunExpectation {
             expect_json: true,
-            ..Default::default()
+            assertions: vec![("must_not_run".to_string(), Box::new(|_, _| false))],
         };
         let ev = run(&spec, &expect, 0);
         assert!(matches!(ev.outcome, RunOutcome::MissingFixture { .. }));
