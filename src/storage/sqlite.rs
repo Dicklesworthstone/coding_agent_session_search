@@ -5180,6 +5180,23 @@ fn lexical_rebuild_message_after_id_sql(cap: usize) -> String {
     )
 }
 
+/// Apply the semantic checkpoint watermark before projecting message bodies.
+/// Keep the existing conversation/idx access path: scanning the global append
+/// tail once per conversation would repeat unrelated work for wide catch-ups.
+fn lexical_rebuild_conversation_after_id_sql(cap: usize, hinted: bool) -> String {
+    format!(
+        "SELECT id, idx, role, author, created_at, \
+             substr(content, 1, {cap}), COALESCE(octet_length(content), 0) \
+             FROM messages{} \
+             WHERE conversation_id = ?1 AND id > ?2 ORDER BY idx",
+        if hinted {
+            " INDEXED BY sqlite_autoindex_messages_1"
+        } else {
+            ""
+        }
+    )
+}
+
 /// One lexical-rebuild projection row (`id, idx, role, author, created_at,
 /// capped content, source byte length`) as a [`Message`] whose text is bounded
 /// by `cap` bytes on a UTF-8 boundary (#290).
@@ -13460,6 +13477,48 @@ impl FrankenStorage {
             Ok(true)
         })?;
         Ok(messages)
+    }
+
+    /// The same bounded lexical projection, restricted to this conversation's
+    /// messages strictly after a canonical message-ID watermark. Filtering in
+    /// SQL avoids materializing old bodies before a semantic checkpoint drops
+    /// them. Output remains in canonical `idx` order, which need not match ID
+    /// order. This still walks the conversation's index entries; it does not
+    /// claim an O(delta) index seek or bound an oversized appended conversation.
+    pub(crate) fn fetch_messages_for_lexical_rebuild_after_id(
+        &self,
+        conversation_id: i64,
+        after_message_id: i64,
+    ) -> Result<Vec<Message>> {
+        let cap = lexical_max_message_content_bytes().min(i32::MAX as usize);
+        let params = [
+            SqliteValue::from(conversation_id),
+            SqliteValue::from(after_message_id),
+        ];
+        let read = |hinted: bool| -> Result<Vec<Message>> {
+            let mut messages = Vec::new();
+            self.conn
+                .query_with_params_for_each(
+                    &lexical_rebuild_conversation_after_id_sql(cap, hinted),
+                    &params,
+                    |row| {
+                        messages.push(lexical_rebuild_message_from_row(row, cap)?);
+                        Ok(())
+                    },
+                )
+                .with_context(|| {
+                    format!(
+                        "fetching lexical rebuild messages for conversation {conversation_id} after message {after_message_id}"
+                    )
+                })?;
+            Ok(messages)
+        };
+        read(true).or_else(|err| {
+            if format!("{err:#}").contains("no such index: sqlite_autoindex_messages_1") {
+                return read(false);
+            }
+            Err(err)
+        })
     }
 
     /// [`Self::fetch_messages_for_lexical_rebuild`], but stops reading as soon
@@ -37503,6 +37562,185 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             ],
             "the stream preserves rowid order, holes and conversation identity"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_checkpoint_message_tail_preserves_projection_scope_and_idx_order() -> Result<()> {
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("semantic-message-tail.db"))?;
+        storage.raw().execute("PRAGMA foreign_keys = OFF")?;
+        storage.raw().execute(
+            "INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content) VALUES \
+             (1, 10, 0, 'user', NULL, NULL, 'old evidence'), \
+             (1000, 10, 1, 'assistant', NULL, NULL, 'watermark evidence'), \
+             (1001, 10, 9, 'tool', 'shell', 1700000000009, 'later idx 東京'), \
+             (1002, 20, 0, 'user', NULL, NULL, 'other conversation'), \
+             (1007, 10, 4, 'assistant', 'model', 1700000000004, 'earlier idx café')",
+        )?;
+
+        // The full-read negative control must fail: a tail reader cannot
+        // accidentally succeed by loading and then discarding historical rows.
+        storage
+            .raw()
+            .execute("UPDATE messages SET role = X'00' WHERE id <= 1000")?;
+        assert!(storage.fetch_messages_for_lexical_rebuild(10).is_err());
+        let messages = storage.fetch_messages_for_lexical_rebuild_after_id(10, 1000)?;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].id, Some(1007));
+        assert_eq!(messages[0].idx, 4);
+        assert_eq!(messages[0].role, MessageRole::Agent);
+        assert_eq!(messages[0].author.as_deref(), Some("model"));
+        assert_eq!(messages[0].created_at, Some(1_700_000_000_004));
+        assert_eq!(messages[0].content, "earlier idx café");
+        assert_eq!(messages[1].id, Some(1001));
+        assert_eq!(messages[1].idx, 9);
+        assert_eq!(messages[1].role, MessageRole::Tool);
+        assert_eq!(messages[1].author.as_deref(), Some("shell"));
+        assert_eq!(messages[1].created_at, Some(1_700_000_000_009));
+        assert_eq!(messages[1].content, "later idx 東京");
+        assert!(
+            messages
+                .iter()
+                .all(|message| { message.extra_json.is_null() && message.snippets.is_empty() })
+        );
+        assert!(
+            storage
+                .fetch_messages_for_lexical_rebuild_after_id(10, 1007)?
+                .is_empty()
+        );
+        assert!(
+            storage
+                .fetch_messages_for_lexical_rebuild_after_id(99, 0)?
+                .is_empty()
+        );
+
+        storage.raw().execute_with_params(
+            "INSERT INTO messages(id, conversation_id, idx, role, content) \
+             VALUES (?1, 10, 10, 'system', 'last representable message')",
+            &[SqliteValue::Integer(i64::MAX)],
+        )?;
+        let last = storage.fetch_messages_for_lexical_rebuild_after_id(10, i64::MAX - 1)?;
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].id, Some(i64::MAX));
+        assert_eq!(last[0].content, "last representable message");
+        assert!(
+            storage
+                .fetch_messages_for_lexical_rebuild_after_id(10, i64::MAX)?
+                .is_empty()
+        );
+
+        storage
+            .raw()
+            .execute("UPDATE messages SET role = X'00' WHERE id = 1007")?;
+        let error = storage
+            .fetch_messages_for_lexical_rebuild_after_id(10, 1000)
+            .expect_err("an unreadable selected row must remain an error");
+        assert!(
+            error
+                .downcast_ref::<crate::franken_sync::FrankenError>()
+                .is_some(),
+            "{error:#}"
+        );
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_checkpoint_message_tail_filters_before_content_projection() -> Result<()> {
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("semantic-tail-plan.db"))?;
+        let rootpage: i64 = storage.raw().query_row_map(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'messages'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        let columns: Vec<(i64, String)> =
+            storage
+                .raw()
+                .query_map_collect("PRAGMA table_info(messages)", fparams![], |row| {
+                    Ok((row.get_typed(0)?, row.get_typed(1)?))
+                })?;
+        let content_column = columns
+            .iter()
+            .find_map(|(index, name)| (name == "content").then_some(*index))
+            .expect("canonical messages have a content column");
+        type Instruction = (i64, String, i64, i64, i64);
+        let explain = |sql: &str, params: &[ParamValue]| -> Result<Vec<Instruction>> {
+            Ok(storage
+                .raw()
+                .query_map_collect(&format!("EXPLAIN {sql}"), params, |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                    ))
+                })?)
+        };
+        let all_body_reads_guarded = |program: &[Instruction]| {
+            let cursor = program
+                .iter()
+                .find_map(|(_, opcode, p1, p2, _)| {
+                    (opcode == "OpenRead" && *p2 == rootpage).then_some(*p1)
+                })
+                .expect("the projection opens the canonical messages table");
+            let body_reads: Vec<_> = program
+                .iter()
+                .filter(|(_, opcode, p1, p2, _)| {
+                    opcode.starts_with("Column") && *p1 == cursor && *p2 == content_column
+                })
+                .collect();
+            assert!(
+                !body_reads.is_empty(),
+                "the control must really project text"
+            );
+            body_reads.iter().all(|(address, _, _, _, _)| {
+                program
+                    .iter()
+                    .any(|(guard_address, opcode, rhs, skip, lhs)| {
+                        opcode == "Le"
+                            && guard_address < address
+                            && skip > address
+                            && program.iter().any(|(rowid_address, opcode, p1, p2, _)| {
+                                opcode == "Rowid"
+                                    && *p1 == cursor
+                                    && p2 == lhs
+                                    && rowid_address < guard_address
+                            })
+                            && program.iter().any(|(bound_address, opcode, p1, p2, _)| {
+                                opcode == "Variable"
+                                    && *p1 == 2
+                                    && p2 == rhs
+                                    && bound_address < guard_address
+                            })
+                    })
+            })
+        };
+        let cap = lexical_max_message_content_bytes().min(i32::MAX as usize);
+        let old_sql = format!(
+            "SELECT id, idx, role, author, created_at, \
+                 substr(content, 1, {cap}), COALESCE(octet_length(content), 0) \
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1 \
+                 WHERE conversation_id = ?1 ORDER BY idx"
+        );
+        let old = explain(&old_sql, fparams![10_i64])?;
+        assert!(
+            !all_body_reads_guarded(&old),
+            "the former full-conversation loader must fail the same control"
+        );
+        for hinted in [true, false] {
+            let program = explain(
+                &lexical_rebuild_conversation_after_id_sql(cap, hinted),
+                fparams![10_i64, 1000_i64],
+            )?;
+            assert!(
+                all_body_reads_guarded(&program),
+                "every content read must follow a strict watermark rejection, hinted={hinted}: {program:?}"
+            );
+        }
+        storage.close()?;
         Ok(())
     }
 

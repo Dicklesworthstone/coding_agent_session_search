@@ -1818,9 +1818,12 @@ fn fetch_canonical_embedding_batch_inner_with_caps_and_total(
         after_message_id,
         caps,
         |conversation_id| {
-            let mut loaded =
-                storage.fetch_messages_for_lexical_rebuild_batch(&[conversation_id], None, None)?;
-            Ok(loaded.remove(&conversation_id).unwrap_or_default())
+            if let Some(after_message_id) = after_message_id {
+                storage
+                    .fetch_messages_for_lexical_rebuild_after_id(conversation_id, after_message_id)
+            } else {
+                storage.fetch_messages_for_lexical_rebuild(conversation_id)
+            }
         },
     )?;
     let CheckpointCappedSelection {

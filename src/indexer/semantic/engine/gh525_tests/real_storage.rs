@@ -448,6 +448,159 @@ fn gh525_successive_production_batches_preserve_full_coverage_and_exact_exhausti
     Ok(())
 }
 
+#[test]
+fn gh525_production_delta_hydrates_only_post_watermark_messages_and_resumes() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let history = "historical text that must not be materialized 東京 ".repeat(4096);
+    let (storage, ids) = fixture(
+        &temp.path().join("message-tail.db"),
+        &[
+            &[&history, "watermark history"],
+            &["second history"],
+            &["untouched"],
+        ],
+    )?;
+    let watermark: i64 = storage.raw().query_row_map(
+        "SELECT MAX(id) FROM messages",
+        &[] as &[ParamValue],
+        |row| row.get_typed(0),
+    )?;
+    // IDs are interleaved across parents and deliberately differ from idx
+    // order inside the first conversation. Empty text still consumes coverage.
+    for (id, parent, idx, role, text) in [
+        (watermark + 1, ids[1], 1, "user", "second parent append"),
+        (watermark + 3, ids[0], 9, "tool", "later idx tool output"),
+        (watermark + 7, ids[0], 4, "assistant", "earlier idx answer"),
+        (watermark + 8, ids[1], 2, "system", ""),
+    ] {
+        storage.raw().execute_compat(
+            "INSERT INTO messages(id, conversation_id, idx, role, content) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                ParamValue::from(id),
+                ParamValue::from(parent),
+                ParamValue::from(idx),
+                ParamValue::from(role),
+                ParamValue::from(text),
+            ],
+        )?;
+    }
+    let full = fetch_canonical_embedding_batch_inner_with_caps_and_total(
+        &storage,
+        0,
+        8,
+        None,
+        SemanticCheckpointCaps::unlimited(),
+        3,
+        None,
+    )?;
+    assert_eq!(full.conversations_in_batch, 3);
+    assert!(
+        full.inputs
+            .iter()
+            .any(|input| input.content.contains("historical text"))
+    );
+    let expected = signature(
+        full.inputs
+            .into_iter()
+            .filter(|input| input.message_id > watermark as u64)
+            .collect(),
+    );
+
+    // A full loader must now fail, while a delta loader must never decode these
+    // old roles. This catches the previous load-everything-then-retain path.
+    storage.raw().execute_compat(
+        "UPDATE messages SET role = X'00' WHERE id <= ?1",
+        &[ParamValue::from(watermark)],
+    )?;
+    assert!(body(&storage, ids[0]).is_err());
+    assert!(body(&storage, ids[1]).is_err());
+
+    let caps = SemanticCheckpointCaps {
+        max_messages: 2,
+        max_bytes: 0,
+    };
+    let first = fetch_canonical_embedding_batch_inner_with_caps_and_total(
+        &storage,
+        0,
+        8,
+        Some(watermark),
+        caps,
+        3,
+        None,
+    )?;
+    assert_eq!(first.conversations_in_batch, 1);
+    assert_eq!(first.last_conversation_id, ids[0]);
+    assert!(!first.cursor_exhausted);
+    assert_eq!(
+        first
+            .inputs
+            .iter()
+            .map(|input| input.message_id)
+            .collect::<Vec<_>>(),
+        vec![(watermark + 7) as u64, (watermark + 3) as u64]
+    );
+    let second = fetch_canonical_embedding_batch_inner_with_caps_and_total(
+        &storage,
+        first.last_conversation_id,
+        8,
+        Some(watermark),
+        caps,
+        3,
+        None,
+    )?;
+    assert_eq!(second.conversations_in_batch, 1);
+    assert_eq!(second.last_conversation_id, ids[1]);
+    assert!(second.cursor_exhausted);
+    let mut actual = first.inputs;
+    actual.extend(second.inputs);
+    assert_eq!(signature(actual), expected);
+
+    let empty = fetch_canonical_embedding_batch_inner_with_caps_and_total(
+        &storage,
+        0,
+        8,
+        Some(watermark + 8),
+        caps,
+        3,
+        None,
+    )?;
+    assert!(empty.inputs.is_empty());
+    assert_eq!(empty.conversations_in_batch, 0);
+    assert!(empty.cursor_exhausted);
+
+    let full_error = fetch_canonical_embedding_batch_inner_with_caps_and_total(
+        &storage, 0, 8, None, caps, 3, None,
+    )
+    .err()
+    .expect("a full rebuild must still validate every selected historical row");
+    assert!(
+        full_error.downcast_ref::<FrankenError>().is_some(),
+        "{full_error:#}"
+    );
+    storage.raw().execute_compat(
+        "UPDATE messages SET role = X'00' WHERE id = ?1",
+        &[ParamValue::from(watermark + 7)],
+    )?;
+    let tail_error = fetch_canonical_embedding_batch_inner_with_caps_and_total(
+        &storage,
+        0,
+        8,
+        Some(watermark),
+        caps,
+        3,
+        None,
+    )
+    .err()
+    .expect("an unreadable selected delta message must still fail the checkpoint");
+    assert!(
+        tail_error.downcast_ref::<FrankenError>().is_some(),
+        "{tail_error:#}"
+    );
+    storage.close()?;
+    Ok(())
+}
+
 // Pre-change eager admission is a test-only oracle; it is not used by CASS.
 fn select_checkpoint_capped_conversations(
     conversations: Vec<CanonicalEmbeddingConversationRow>,
