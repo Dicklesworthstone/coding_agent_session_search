@@ -45,8 +45,9 @@ fn exact_pins(manifest: &str) -> BTreeMap<String, Pin> {
 
 /// Every mismatch between a doc's pin rows and the manifest, plus how many
 /// rows were checked. A registry row is `| names | crates.io `=X` ... |`; a
-/// row for a git-pinned dependency names git in its source cell and must
-/// carry the exact revision and the version. A row's pin is matched against
+/// row for a git-pinned dependency names git (in any case: "Git revision"
+/// counts) in its source cell and must carry the exact revision and the
+/// version. A row's pin is matched against
 /// the first backticked name that is an exactly pinned dependency
 /// (`frankentui` rows are keyed by `ftui`).
 fn pin_mismatches(doc: &str, pins: &BTreeMap<String, Pin>) -> (Vec<String>, usize) {
@@ -80,7 +81,7 @@ fn pin_mismatches(doc: &str, pins: &BTreeMap<String, Pin>) -> (Vec<String>, usiz
         };
         let pin = &pins[dependency];
         match (&pin.rev, registry) {
-            (Some(rev), _) if registry.is_some() || source.contains("git") => {
+            (Some(rev), _) if registry.is_some() || source.to_ascii_lowercase().contains("git") => {
                 checked += 1;
                 if !source.contains(rev.as_str()) || !source.contains(pin.version.as_str()) {
                     mismatches.push(format!(
@@ -127,17 +128,21 @@ fn readme_and_agents_dependency_pins_match_cargo_toml() {
 
 #[test]
 fn a_stale_registry_pin_row_is_reported() {
+    // asupersync resolves from the registry; frankensearch, the dependency
+    // this test used to stale, now resolves from git.
     let pins = exact_pins(&read("Cargo.toml"));
-    let current = &pins["frankensearch"].version;
-    let stale = read("README.md").replace(
-        &format!("| `frankensearch` | crates.io `={current}`"),
-        "| `frankensearch` | crates.io `=0.0.1`",
-    );
+    let pin = &pins["asupersync"];
+    assert!(pin.rev.is_none(), "asupersync resolves from the registry");
+    let current = &pin.version;
+    let readme = read("README.md");
+    let row = format!("| `asupersync` | crates.io `={current}`");
+    assert!(readme.contains(&row), "README has no {row:?} row to stale");
+    let stale = readme.replace(&row, "| `asupersync` | crates.io `=0.0.1`");
     let (mismatches, _) = pin_mismatches(&stale, &pins);
     assert_eq!(
         mismatches,
         vec![format!(
-            "frankensearch: documented `=0.0.1`, Cargo.toml pins `={current}`"
+            "asupersync: documented `=0.0.1`, Cargo.toml pins `={current}`"
         )]
     );
 }
