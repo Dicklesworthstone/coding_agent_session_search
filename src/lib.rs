@@ -6836,7 +6836,17 @@ mod canonical_top_level_command_tests {
     #[test]
     fn parse_error_examples_follow_the_failing_subcommand() {
         for (argv, prefix) in [
-            (&["cass", "models", "install", "--json"][..], "cass models "),
+            (
+                &[
+                    "cass",
+                    "models",
+                    "install",
+                    "--dry-run",
+                    "--json",
+                    "--nonexistent-flag",
+                ][..],
+                "cass models ",
+            ),
             (
                 &["cass", "stats", "--json", "--nonexistent-flag"][..],
                 "cass stats ",
