@@ -283,6 +283,7 @@ fn gh538_watch_checkpoint_requires_published_coverage_and_no_replay_debt() -> Re
             index.as_ref().context("live lexical writer")?,
             &fixture.options.db_path,
             &fixture.index_path,
+            false,
         )
     };
     assert_eq!(handles.scan(&fixture, true)?.0.published_conversations, 1);
@@ -369,6 +370,70 @@ fn gh538_watch_checkpoint_requires_published_coverage_and_no_replay_debt() -> Re
         published
     );
     handles.close()?;
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn gh538_watch_once_filtered_history_can_create_settled_checkpoint() -> Result<()> {
+    let fixture = Fixture::new(ConnectorKind::Codex)?;
+    fixture.source("filtered-checkpoint", "filteredcheckpointcontentgh538")?;
+    let handles = Handles::open(&fixture)?;
+    assert_eq!(handles.scan(&fixture, true)?.0.published_conversations, 1);
+    let conversation_id = canonical_rows(&handles)?[0].0;
+    handles.storage.lock().unwrap().raw().execute_compat(
+        "INSERT INTO messages(conversation_id, idx, role, content)
+         VALUES(?1, 1, 'tool', '')",
+        &[ParamValue::from(conversation_id)],
+    )?;
+    assert_eq!(canonical_rows(&handles)?.len(), 2);
+    assert!(load_lexical_rebuild_checkpoint(&fixture.index_path)?.is_none());
+    let refresh = |allow_full_scan| -> Result<bool> {
+        let storage = handles.storage.lock().unwrap();
+        let index = handles.index.lock().unwrap();
+        refresh_completed_watch_lexical_checkpoint(
+            &storage,
+            index.as_ref().context("live lexical writer")?,
+            &fixture.options.db_path,
+            &fixture.index_path,
+            allow_full_scan,
+        )
+    };
+    assert!(
+        !refresh(false)?,
+        "a live callback must not scan uncached canonical histories"
+    );
+    assert!(load_lexical_rebuild_checkpoint(&fixture.index_path)?.is_none());
+    assert!(
+        refresh(true)?,
+        "an admitted one-shot audit accounts for noise"
+    );
+    let state = load_lexical_rebuild_state(&fixture.index_path)?.context("count checkpoint")?;
+    assert_eq!(state.indexed_docs, 1);
+    assert!(state.completed_source_epoch.is_none());
+    handles.close()?;
+    let manifest_before = fs::read(fixture.index_path.join("MANIFEST"))?;
+    assert!(lexical_resume::certify_after_index(
+        &fixture.options.db_path,
+        &fixture.index_path,
+        true,
+        None,
+        None,
+    )?);
+    let checkpoint =
+        load_lexical_rebuild_checkpoint(&fixture.index_path)?.context("settled checkpoint")?;
+    assert_eq!(
+        completed_lexical_checkpoint_freshness(
+            &fixture.index_path,
+            &fixture.options.db_path,
+            &checkpoint,
+        )?,
+        LexicalCheckpointFreshness::Current
+    );
+    assert_eq!(
+        fs::read(fixture.index_path.join("MANIFEST"))?,
+        manifest_before
+    );
     Ok(())
 }
 

@@ -14243,10 +14243,11 @@ fn refresh_completed_watch_lexical_checkpoint(
     index: &TantivyIndex,
     db_path: &Path,
     index_path: &Path,
+    allow_full_expected_doc_scan: bool,
 ) -> Result<bool> {
     // An absent, invalidated or expired expectation must not trigger a scan
-    // of old message bodies on the live callback. Ordinary indexing performs
-    // that verification; until then this checkpoint stays uncertified.
+    // of old message bodies on the live callback. A one-shot run may opt in
+    // within the ordinary audit budget; otherwise this stays uncertified.
     // A successful source can publish while another source still owes a
     // replay. Never certify that partially published canonical archive.
     if !load_watch_lexical_replay_debt(storage)?.is_empty() {
@@ -14272,7 +14273,7 @@ fn refresh_completed_watch_lexical_checkpoint(
         total_messages,
         max_conversation_id,
         Some(observed_docs),
-        false,
+        allow_full_expected_doc_scan,
     )
 }
 
@@ -18849,6 +18850,7 @@ fn run_index_with_storage_ownership(
             "skipping unclaimed explicit watch-once index run before startup maintenance"
         );
         close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run")?;
+        certify_completed_watch_once_index(&opts, &index_path, &progress_bump)?;
         prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
         return Ok(());
     }
@@ -21125,6 +21127,7 @@ fn run_index_with_storage_ownership(
                 "skipping unclaimed explicit watch-once paths before opening Tantivy"
             );
             close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run")?;
+            certify_completed_watch_once_index(&opts, &index_path, &progress_bump)?;
             prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
             return Ok(());
         }
@@ -21399,7 +21402,7 @@ fn run_index_with_storage_ownership(
                         indexed
                     };
 
-                    if !watch_once_mode && watch_lexical_checkpoint_pending.get() {
+                    if watch_once_mode || watch_lexical_checkpoint_pending.get() {
                         let refreshed = (|| -> Result<bool> {
                             let storage = storage_for_watch
                                 .lock()
@@ -21415,11 +21418,17 @@ fn run_index_with_storage_ownership(
                                 index,
                                 &opts_clone.db_path,
                                 &index_path_for_watch,
+                                watch_once_mode
+                                    && watch_once_lexical_content_audit_allowed(&opts_clone),
                             )
                         })();
                         match refreshed {
                             Ok(true) => watch_lexical_checkpoint_pending.set(false),
                             Ok(false) => {}
+                            Err(error) if watch_once_mode => {
+                                return Err(error)
+                                    .context("refreshing completed watch-once lexical checkpoint");
+                            }
                             Err(error) => tracing::warn!(
                                 %error,
                                 "watch lexical checkpoint refresh failed; retaining pending refresh"
@@ -21503,6 +21512,9 @@ fn run_index_with_storage_ownership(
             return Err(err);
         }
         close_result?;
+        if watch_once_mode {
+            certify_completed_watch_once_index(&opts, &index_path, &progress_bump)?;
+        }
         prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
         return Ok(());
     }
@@ -21551,6 +21563,42 @@ fn run_index_with_storage_ownership(
     }
     prime_archive_fingerprint_cache_from_completed_checkpoint(&opts.db_path, &index_path);
     Ok(())
+}
+
+/// A one-shot watch owns the same publication obligation as ordinary indexing.
+/// Its callback and writer have ended, and the caller has closed canonical
+/// storage before entering this audit. Targeted ingestion must not turn into an
+/// unbounded scan of a large archive merely to refresh physical-epoch evidence.
+fn certify_completed_watch_once_index(
+    opts: &IndexOptions,
+    index_path: &Path,
+    progress_bump: &Arc<AtomicI64>,
+) -> Result<()> {
+    let allow_full_audit = watch_once_lexical_content_audit_allowed(opts);
+    if !lexical_resume::certify_after_index(
+        &opts.db_path,
+        index_path,
+        allow_full_audit,
+        opts.progress.clone(),
+        Some(Arc::clone(progress_bump)),
+    )
+    .context("verifying completed lexical content after watch-once archive checkpoint")?
+    {
+        tracing::warn!(
+            db_path = %opts.db_path.display(),
+            allow_full_audit,
+            "watch-once lexical source freshness remains unverified; run 'cass index --full' for authoritative content verification"
+        );
+    }
+    Ok(())
+}
+
+fn watch_once_lexical_content_audit_allowed(opts: &IndexOptions) -> bool {
+    opts.full
+        || opts.force_rebuild
+        || force_incremental_authoritative_lexical_repair_enabled()
+        || db_size_bytes_for_incremental_lexical_repair_policy(&opts.db_path)
+            <= incremental_authoritative_lexical_repair_max_db_bytes()
 }
 
 /// Close a write handle the way `cass index` closes its own: restore the
@@ -34389,10 +34437,8 @@ fn discover_openclaw_watch_databases(
             // Keep poll coverage inside that same provider discovery boundary.
             match entry.file_type() {
                 Ok(kind) if kind.is_dir() => {
-                    discovered.observe_file(
-                        entry.path().join("agent").join(DATABASE_NAME),
-                        progress,
-                    )?;
+                    discovered
+                        .observe_file(entry.path().join("agent").join(DATABASE_NAME), progress)?;
                 }
                 Ok(_) => {}
                 Err(error) => discovered.record_error(&entry.path(), &error),
@@ -35586,7 +35632,8 @@ mod watch_registration_tests {
         symlink(&outside, agents.join("linked-agent")).unwrap();
 
         for root in [mirror.clone(), mirror.join(".openclaw"), agents.clone()] {
-            let found = discover_openclaw_watch_databases(&ScanRoot::local(root.clone()), None).unwrap();
+            let found =
+                discover_openclaw_watch_databases(&ScanRoot::local(root.clone()), None).unwrap();
             assert_eq!(
                 found.paths,
                 BTreeSet::from([first.clone(), second.clone()]),
@@ -35596,12 +35643,14 @@ mod watch_registration_tests {
             assert!(!found.incomplete);
         }
         for root in [alice.clone(), alice.join("agent"), first.clone()] {
-            let found = discover_openclaw_watch_databases(&ScanRoot::local(root.clone()), None).unwrap();
+            let found =
+                discover_openclaw_watch_databases(&ScanRoot::local(root.clone()), None).unwrap();
             assert_eq!(found.paths, BTreeSet::from([first.clone()]));
             assert!(!found.incomplete);
         }
         for root in [sessions, jsonl, temp.path().join("not-present")] {
-            let found = discover_openclaw_watch_databases(&ScanRoot::local(root.clone()), None).unwrap();
+            let found =
+                discover_openclaw_watch_databases(&ScanRoot::local(root.clone()), None).unwrap();
             assert!(found.paths.is_empty(), "narrow log roots must stay narrow");
             assert!(!found.incomplete);
         }
@@ -35621,7 +35670,11 @@ mod watch_registration_tests {
             selected.database_roots,
             BTreeSet::from([first.clone(), second.clone()])
         );
-        assert_eq!(registered.len(), 1, "one recursive native watch covers the mirror");
+        assert_eq!(
+            registered.len(),
+            1,
+            "one recursive native watch covers the mirror"
+        );
         assert!(
             refresh_watch_root_registrations(&mut watcher, &roots, &mut registered, None)
                 .unwrap()
@@ -35638,19 +35691,17 @@ mod watch_registration_tests {
         assert_eq!(classified[0].1.path, root.path);
         assert_eq!(classified[0].1.origin, root.origin);
         assert_eq!(classified[0].1.platform, root.platform);
-        assert_eq!(classified[0].1.mirrored_source_path, root.mirrored_source_path);
+        assert_eq!(
+            classified[0].1.mirrored_source_path,
+            root.mirrored_source_path
+        );
 
         let no_openclaw = vec![(ConnectorKind::Codex, ScanRoot::local(mirror))];
         assert!(
-            refresh_watch_root_registrations(
-                &mut watcher,
-                &no_openclaw,
-                &mut registered,
-                None,
-            )
-            .unwrap()
-            .database_roots
-            .is_empty(),
+            refresh_watch_root_registrations(&mut watcher, &no_openclaw, &mut registered, None,)
+                .unwrap()
+                .database_roots
+                .is_empty(),
             "a disabled or unselected connector has no database poll coverage"
         );
         let progress = Arc::new(IndexingProgress::default());
@@ -35706,8 +35757,14 @@ mod watch_registration_tests {
             assert_eq!(classified.len(), 1);
             assert_eq!(classified[0].1.path, root.path);
             assert_eq!(classified[0].1.origin, root.origin);
-            assert_eq!(classified[0].1.mirrored_source_path, root.mirrored_source_path);
-            assert_eq!(fs::read(&unrelated).unwrap(), b"outside the selected agents store");
+            assert_eq!(
+                classified[0].1.mirrored_source_path,
+                root.mirrored_source_path
+            );
+            assert_eq!(
+                fs::read(&unrelated).unwrap(),
+                b"outside the selected agents store"
+            );
         }
 
         // Agent-subtree contents copies already have a valid fixed-path
@@ -35891,7 +35948,10 @@ mod watch_registration_tests {
                 .unwrap();
             collect_watch_notifications(&backlog, &rescan, &mut pending, &mut pending_rescan);
         }
-        assert!(!pending_rescan, "database polling must remain source scoped");
+        assert!(
+            !pending_rescan,
+            "database polling must remain source scoped"
+        );
         assert!(!pending.paths.contains(&unrelated));
         assert!(!rescan.load(Ordering::Acquire));
     }
@@ -60313,7 +60373,11 @@ mod tests {
             ConnectorKind::from_archive_slug("claude_code"),
             Some(ConnectorKind::Claude)
         );
-        for slug in ["openclaw/alice", "openclaw/研究-agent", "openclaw/agent-name"] {
+        for slug in [
+            "openclaw/alice",
+            "openclaw/研究-agent",
+            "openclaw/agent-name",
+        ] {
             assert_eq!(
                 ConnectorKind::from_archive_slug(slug),
                 Some(ConnectorKind::OpenClaw)

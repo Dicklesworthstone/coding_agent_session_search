@@ -258,6 +258,199 @@ fn seed_active_rebuild_runtime(data_dir: &Path) -> std::fs::File {
 }
 
 #[test]
+fn watch_once_publishes_settled_source_proof_and_respects_audit_budget() {
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use serde_json::Value;
+
+    for start_with_full_index in [false, true] {
+        let tmp = tempfile::Builder::new()
+            .prefix("cass-watch-once-health-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let home = tmp.path();
+        eprintln!("Watch-once health regression artifacts: {}", home.display());
+        // Do not let dotenv search ancestors of the private HOME.
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(home.join(".env"))
+            .unwrap();
+        let data = home.join("data");
+        let source = home.join(".claude/projects/health/session.jsonl");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(
+            &source,
+            include_str!("fixtures/claude_code_real/projects/-test-project/agent-test123.jsonl"),
+        )
+        .unwrap();
+        let cass = || {
+            let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+            cmd.env_clear();
+            for key in ["PATH", "SystemRoot", "WINDIR"] {
+                if let Some(value) = std::env::var_os(key) {
+                    cmd.env(key, value);
+                }
+            }
+            cmd.current_dir(home)
+                .env("HOME", home)
+                .env("USERPROFILE", home)
+                .env("XDG_DATA_HOME", home.join(".local/share"))
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("XDG_CACHE_HOME", home.join(".cache"))
+                .env("CODEX_HOME", home.join(".codex"))
+                .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+                .env("CASS_DATA_DIR", &data)
+                .env("CASS_AUTO_REFRESH", "0")
+                .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+                .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+                .env("CASS_SEMANTIC_DOWNLOAD_POLICY", "opt_in")
+                .env("FRANKENSEARCH_MODEL_DIR", "")
+                .env("RUST_MIN_STACK", "134217728")
+                .timeout(Duration::from_secs(30));
+            cmd
+        };
+        let index = |path: Option<&Path>, automatic_limit: Option<&str>| {
+            let mut cmd = cass();
+            cmd.args(["index", "--json", "--no-progress-events"]);
+            if let Some(path) = path {
+                cmd.arg("--watch-once").arg(path);
+            } else {
+                cmd.arg("--full");
+            }
+            if let Some(limit) = automatic_limit {
+                cmd.env(
+                    "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                    limit,
+                );
+            }
+            let output = cmd.output().unwrap();
+            assert!(output.status.success(), "index: {output:?}");
+        };
+        let ready = |phase: &str| {
+            let health = cass().args(["health", "--json"]).output().unwrap();
+            assert!(health.status.success(), "{phase}: {health:?}");
+            let health: Value = serde_json::from_slice(&health.stdout).unwrap();
+            assert_eq!(health["healthy"], true, "{phase}: {health}");
+            let status = cass().args(["status", "--json"]).output().unwrap();
+            assert!(status.status.success(), "{phase}: {status:?}");
+            let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+            assert_eq!(status["index"]["status"], "ready", "{phase}: {status}");
+            assert_eq!(status["index"]["fresh"], true, "{phase}: {status}");
+        };
+        if start_with_full_index {
+            // An explicit full index retains its existing audit exemption.
+            index(None, Some("1"));
+        } else {
+            index(Some(&source), None);
+        }
+        ready("initial publication");
+
+        writeln!(
+            OpenOptions::new().append(true).open(&source).unwrap(),
+            "{}",
+            json!({
+                "type": "user",
+                "uuid": "watch-once-health-append",
+                "parentUuid": "msg-001",
+                "sessionId": "test-session",
+                "timestamp": "2026-11-11T02:00:01.000Z",
+                "cwd": "/test/project",
+                "message": {"role": "user", "content": "zzwatchoncehealthyappend real provider input"}
+            })
+        )
+        .unwrap();
+        index(Some(&source), None);
+        ready("watch-once append");
+        let hit = cass()
+            .args([
+                "search",
+                "zzwatchoncehealthyappend",
+                "--json",
+                "--mode",
+                "lexical",
+                "--no-maintenance",
+                "--no-daemon",
+                "--limit",
+                "1",
+            ])
+            .output()
+            .unwrap();
+        assert!(hit.status.success(), "{hit:?}");
+        let hit: Value = serde_json::from_slice(&hit.stdout).unwrap();
+        assert_eq!(hit["hits"].as_array().unwrap().len(), 1, "{hit}");
+
+        let generation = expected_index_dir(&data);
+        let manifest_before = fs::read(generation.join("MANIFEST")).unwrap();
+        index(Some(&source), None);
+        ready("watch-once no-op");
+        assert_eq!(
+            fs::read(generation.join("MANIFEST")).unwrap(),
+            manifest_before,
+            "freshness verification must not republish the native index"
+        );
+        let unclaimed = home.join("unclaimed.input");
+        fs::write(&unclaimed, "not a provider transcript").unwrap();
+        index(Some(&unclaimed), None);
+        ready("unclaimed watch-once no-op");
+        assert_eq!(
+            fs::read(generation.join("MANIFEST")).unwrap(),
+            manifest_before
+        );
+
+        // A same-count raw edit is not an index-produced metadata transition.
+        // Passive reads and a size-deferred one-shot run cannot renew its proof.
+        let proof_path = generation.join(".lexical-rebuild-state.json");
+        let proof_before = fs::read(&proof_path).unwrap();
+        let storage = FrankenStorage::open(&data.join("agent_search.db")).unwrap();
+        assert_eq!(
+            storage
+                .raw()
+                .execute("UPDATE messages SET content = 'raw replacement body' WHERE idx = 0")
+                .unwrap(),
+            1
+        );
+        storage.close_without_checkpoint().unwrap();
+        let health = cass().args(["health", "--json"]).output().unwrap();
+        assert_eq!(health.status.code(), Some(1), "{health:?}");
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        index(Some(&source), Some("1"));
+        let health = cass().args(["health", "--json"]).output().unwrap();
+        assert_eq!(health.status.code(), Some(1), "{health:?}");
+        let proof_after: Value = serde_json::from_slice(&fs::read(&proof_path).unwrap()).unwrap();
+        let proof_before: Value = serde_json::from_slice(&proof_before).unwrap();
+        assert_eq!(
+            proof_after["completed_source_epoch"], proof_before["completed_source_epoch"],
+            "a deferred audit must not copy the changed archive epoch"
+        );
+        assert_eq!(
+            fs::read(generation.join("MANIFEST")).unwrap(),
+            manifest_before
+        );
+
+        for flag in ["--full", "--force-rebuild"] {
+            let output = cass()
+                .args([
+                    "index",
+                    "--json",
+                    "--no-progress-events",
+                    flag,
+                    "--watch-once",
+                ])
+                .arg(&source)
+                .env(
+                    "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                    "1",
+                )
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{flag}: {output:?}");
+            ready(flag);
+        }
+    }
+}
+
+#[test]
 fn status_and_health_json_surface_ingest_quarantine_as_nonfatal_degraded() {
     let test_home = tempfile::tempdir().expect("tempdir");
     let data_dir = test_home.path().join("cass-data");
