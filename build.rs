@@ -258,7 +258,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // not yet published. Preserve the reviewed Git source, existing
         // feature set and v9 CASS identity contract together.
         expected_git: "https://github.com/Dicklesworthstone/frankensearch",
-        expected_rev: "b103f2edb167d14e8eac9307a8b99432749acd10",
+        expected_rev: "d3d58a9f788e67b9cc0956efbf657f3257ab89e4",
         expected_version: "0.7.1",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`
