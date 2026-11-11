@@ -17,7 +17,9 @@
 //!      the model identity, elapsed_ms, the skipped-network reason, and the
 //!      artifact paths.
 //!
-//! These report/cache assertions do not independently count network attempts.
+//! The report/cache assertions alone do not count network attempts. The Linux
+//! syscall-observer case below traces the real process tree and calibrates its
+//! detector with an explicit install attempt against a closed loopback port.
 //!
 //! Tests return diagnostic errors and retain actual runner artifacts. Scanner
 //! results are established by running UBS; this module makes no clean-scan claim.
@@ -61,29 +63,21 @@ fn decode_model_output(stdout: &str, format: &str) -> Result<Value, String> {
     serde_json::from_str(stdout).map_err(|error| format!("decode model {format} output: {error}"))
 }
 
-/// Run the real `cass` binary with a private cache, bounded execution and
-/// retained runner artifacts. Returns `(entry, stdout, stderr)` so callers can
-/// preserve the actual execution facts when emitting another proof format.
-/// A prepared empty model directory must stay empty; other calls require it
-/// to remain absent.
-fn run_isolated_cass(
-    home: &std::path::Path,
-    args: &[&str],
-    empty_model_dir_exists: bool,
-) -> Result<(ScenarioArtifactEntry, String, String), String> {
-    let phase = args
-        .get(1)
-        .copied()
-        .ok_or_else(|| "model command is missing its subcommand".to_string())?;
-    let is_status = matches!(phase, "status");
-    let format = args
-        .windows(2)
-        .find(|pair| matches!(pair[0], "--robot-format"))
-        .map(|pair| pair[1])
-        .unwrap_or("json");
+/// Share the private source roots and model policy across direct and traced
+/// real-binary commands. Explicit install remains permitted by this policy.
+fn isolated_cass_spec(home: &std::path::Path, args: &[&str], phase: &str) -> RunSpec {
     let env_overrides = BTreeMap::from([
         ("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT".into(), "1".into()),
         ("CASS_IGNORE_SOURCES_CONFIG".into(), "1".into()),
+        ("CASS_AUTO_REFRESH".into(), "0".into()),
+        (
+            "CODEX_HOME".into(),
+            home.join(".codex").display().to_string(),
+        ),
+        (
+            "CLAUDE_CONFIG_DIR".into(),
+            home.join(".claude").display().to_string(),
+        ),
         (
             "CASS_DATA_DIR".into(),
             home.join("cass-data").display().to_string(),
@@ -110,7 +104,7 @@ fn run_isolated_cass(
             home.join(".cache").display().to_string(),
         ),
     ]);
-    let spec = RunSpec {
+    RunSpec {
         binary_path: cargo_bin("cass").display().to_string(),
         args: args.iter().map(|arg| (*arg).to_string()).collect(),
         timeout: Duration::from_secs(30),
@@ -118,9 +112,32 @@ fn run_isolated_cass(
         cwd: home.to_path_buf(),
         fixture_id: Some("isolated-empty-model-cache".into()),
         require_path: Some(home.to_path_buf()),
-        phase: format!("models-{phase}"),
+        phase: phase.to_string(),
         mode: RunMode::Quick,
-    };
+    }
+}
+
+/// Run the real `cass` binary with a private cache, bounded execution and
+/// retained runner artifacts. Returns `(entry, stdout, stderr)` so callers can
+/// preserve the actual execution facts when emitting another proof format.
+/// A prepared empty model directory must stay empty; other calls require it
+/// to remain absent.
+fn run_isolated_cass(
+    home: &std::path::Path,
+    args: &[&str],
+    empty_model_dir_exists: bool,
+) -> Result<(ScenarioArtifactEntry, String, String), String> {
+    let phase = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| "model command is missing its subcommand".to_string())?;
+    let is_status = matches!(phase, "status");
+    let format = args
+        .windows(2)
+        .find(|pair| matches!(pair[0], "--robot-format"))
+        .map(|pair| pair[1])
+        .unwrap_or("json");
+    let spec = isolated_cass_spec(home, args, &format!("models-{phase}"));
     let expectation = RunExpectation {
         expect_json: !matches!(format, "toon"),
         assertions: vec![
@@ -568,6 +585,246 @@ fn status_and_verify_emit_acquisition_block_and_prove_no_auto_download() -> Resu
         return Err(format!(
             "verify must keep cache_lifecycle alongside model_acquisition: {verify}"
         ));
+    }
+    Ok(())
+}
+
+/// This Linux acceptance case requires /usr/bin/strace and permission to trace
+/// its own children. Missing or denied tracing fails; it is never a zero-run pass.
+/// The explicit-install control must produce an observed INET connect attempt.
+#[cfg(target_os = "linux")]
+#[test]
+fn model_commands_have_no_network_syscalls_on_linux() -> Result<(), String> {
+    use coding_agent_search::search::model_download::compute_sha256;
+    use std::io::Read;
+    use std::path::PathBuf;
+
+    let now_ms = || -> Result<u64, String> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_millis()
+            .try_into()
+            .map_err(|_| "observer timestamp exceeds u64".to_string())
+    };
+    let suite_started_ms = now_ms()?;
+    let home = isolated_home_with_retained_artifacts()?;
+    let (identity_entry, status_stdout, _) =
+        run_isolated_cass(home.path(), &["models", "status", "--json"], false)?;
+    let identity: RunEvent = serde_json::from_slice(
+        &std::fs::read(&identity_entry.event_path)
+            .map_err(|e| format!("read CASS identity: {e}"))?,
+    )
+    .map_err(|e| format!("decode CASS identity: {e}"))?;
+    if identity.binary_version.as_deref() != Some(env!("CARGO_PKG_VERSION"))
+        || identity
+            .binary_hash
+            .as_ref()
+            .is_none_or(|hash| hash.len() != 64)
+    {
+        return Err("network observer requires the actual test-built CASS identity".into());
+    }
+    let subject = PathBuf::from(&identity.binary_path);
+    let subject_hash = compute_sha256(&subject).map_err(|e| format!("hash traced CASS: {e}"))?;
+    let status: Value = serde_json::from_str(&status_stdout).map_err(|e| e.to_string())?;
+    let model_dir = PathBuf::from(minilm_model_dir(&status, home.path())?);
+    let expected_fingerprint = check_model_identity(&minilm_acquisition(&status)?)?;
+    let artifacts = home.path().join("network-observer");
+    std::fs::create_dir_all(&artifacts).map_err(|e| e.to_string())?;
+
+    // Ingest a real provider fixture through CASS, then demand a real lexical
+    // hit. An empty/missing archive cannot satisfy the no-download search case.
+    let source = home
+        .path()
+        .join(".claude/projects/network-proof/session.jsonl");
+    std::fs::create_dir_all(source.parent().ok_or("fixture source has no parent")?)
+        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        &source,
+        include_str!("fixtures/claude_code_real/projects/-test-project/agent-test123.jsonl"),
+    )
+    .map_err(|e| e.to_string())?;
+    let source_arg = source.to_str().ok_or("fixture source is not UTF-8")?;
+    let seed = run_with_artifacts(
+        &isolated_cass_spec(home.path(), &["index", "--watch-once", source_arg, "--json"], "seed"),
+        &RunExpectation::default(),
+        &ArtifactRunSpec {
+            artifact_root: &artifacts,
+            run_id: "linux-network-observer",
+            scenario_id: "private-corpus",
+            command_id: "seed",
+            issue_ids: &["coding_agent_session_search-0qxwg"],
+            privacy_note: "Fixture setup only; the traced search must return an actual fixture hit.",
+            suite_started_ms,
+            accepted_exit_codes: &[0],
+            forbidden_stream_markers: &[],
+            extra_artifact_paths: &[],
+        },
+        now_ms()?,
+    )
+    .map_err(|e| format!("seed private archive: {e}"))?;
+    if !seed.outcome.is_success() {
+        return Err(format!(
+            "CASS fixture index failed; inspect {}",
+            seed.event_path
+        ));
+    }
+
+    let observe = |args: &[&str], label: &str, network_expected: bool| -> Result<Value, String> {
+        let trace_path = artifacts.join(format!("{label}.network.log"));
+        if trace_path.exists() {
+            return Err(format!("refusing to reuse trace {}", trace_path.display()));
+        }
+        let mut spec = isolated_cass_spec(home.path(), args, label);
+        if spec.binary_path != identity.binary_path {
+            return Err("traced CASS path differs from its identity event".into());
+        }
+        spec.binary_path = "/usr/bin/strace".into();
+        spec.args = vec![
+            "-f".into(),
+            "-s".into(),
+            "256".into(),
+            "-e".into(),
+            "trace=%network".into(),
+            "-o".into(),
+            trace_path.display().to_string(),
+            "--".into(),
+            identity.binary_path.clone(),
+        ];
+        spec.args.extend(args.iter().map(|arg| (*arg).to_string()));
+        let expected = RunExpectation {
+            expect_json: !network_expected,
+            assertions: vec![(
+                "observed-process-tree-network-policy".into(),
+                Box::new(|_, _| {
+                    let mut trace = String::new();
+                    let read = std::fs::File::open(&trace_path)
+                        .and_then(|file| file.take(1024 * 1024 + 1).read_to_string(&mut trace));
+                    read.is_ok()
+                        && trace.len() <= 1024 * 1024
+                        && trace.contains("+++ exited with")
+                        && if network_expected {
+                            trace
+                                .lines()
+                                .any(|line| line.contains("connect(") && line.contains("AF_INET"))
+                        } else {
+                            // Reject every network syscall, including Unix
+                            // resolver IPC that could delegate DNS elsewhere.
+                            !trace.contains('(')
+                        }
+                }),
+            )],
+        };
+        let extra = [
+            trace_path.clone(),
+            PathBuf::from(&identity_entry.event_path),
+        ];
+        let entry = run_with_artifacts(
+            &spec,
+            &expected,
+            &ArtifactRunSpec {
+                artifact_root: &artifacts,
+                run_id: "linux-network-observer",
+                scenario_id: "private-corpus",
+                command_id: label,
+                issue_ids: &["coding_agent_session_search-0qxwg"],
+                privacy_note: "Actual strace wrapper and CASS child; subject identity is cited separately. The failed explicit install calibrates the detector, not installation success.",
+                suite_started_ms,
+                accepted_exit_codes: if network_expected { &[23] } else { &[0] },
+                forbidden_stream_markers: &[],
+                extra_artifact_paths: &extra,
+            },
+            now_ms()?,
+        )
+        .map_err(|e| format!("observe {label}: {e}"))?;
+        if !entry.outcome.is_success()
+            || !entry.assertions_ran
+            || entry.generated_only
+            || !entry.redaction_safe
+            || !entry.fresh_for_suite
+            || entry.proof_status != ProofStatus::Pass
+        {
+            return Err(format!(
+                "network observation {label} failed; inspect {} and {}",
+                entry.event_path,
+                trace_path.display()
+            ));
+        }
+        if network_expected {
+            return Ok(Value::Null);
+        }
+        serde_json::from_slice(&std::fs::read(&entry.stdout_path).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("decode observed {label}: {e}"))
+    };
+
+    let status = observe(&["models", "status", "--json"], "status", false)?;
+    let acquisition = minilm_acquisition(&status)?;
+    check_no_auto_download(&acquisition)?;
+    if check_model_identity(&acquisition)? != expected_fingerprint {
+        return Err("traced status model fingerprint changed".into());
+    }
+    let verify = observe(&["models", "verify", "--json"], "verify", false)?;
+    let acquisition = verify
+        .get("model_acquisition")
+        .ok_or("verify lacks acquisition report")?;
+    check_no_auto_download(acquisition)?;
+    if check_model_identity(acquisition)? != expected_fingerprint {
+        return Err("traced verify model fingerprint changed".into());
+    }
+    let plan = observe(
+        &["models", "install", "--dry-run", "--json"],
+        "preview",
+        false,
+    )?;
+    if plan.get("status").and_then(Value::as_str) != Some("planned") {
+        return Err(format!(
+            "observed preview did not produce an install plan: {plan}"
+        ));
+    }
+    let search = observe(
+        &[
+            "search",
+            "smartedgar",
+            "--json",
+            "--limit",
+            "1",
+            "--fields",
+            "content",
+            "--no-daemon",
+        ],
+        "search",
+        false,
+    )?;
+    if !search
+        .get("hits")
+        .and_then(Value::as_array)
+        .is_some_and(|hits| {
+            hits.iter().any(|hit| {
+                hit.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("smartedgar"))
+            })
+        })
+        || model_dir.exists()
+    {
+        return Err(format!(
+            "expected a real lexical hit with no acquired model: {search}"
+        ));
+    }
+
+    let socket = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
+    let port = socket.local_addr().map_err(|e| e.to_string())?.port();
+    drop(socket);
+    let mirror = format!("http://127.0.0.1:{port}");
+    observe(
+        &[
+            "models", "install", "--model", "minilm", "--yes", "--mirror", &mirror,
+        ],
+        "install-control",
+        true,
+    )?;
+    if compute_sha256(&subject).map_err(|e| e.to_string())? != subject_hash {
+        return Err("CASS executable changed during network observation".into());
     }
     Ok(())
 }
