@@ -1141,7 +1141,7 @@ pub fn run_capture_with_exit_codes(
             RunOutcome::MissingFixture {
                 path: path.display().to_string(),
             },
-            true,
+            !expect.expect_json,
             Vec::new(),
         );
     }
@@ -1160,7 +1160,7 @@ pub fn run_capture_with_exit_codes(
             return base(
                 raw,
                 RunOutcome::CommandFailure { exit_code: -1 },
-                true,
+                !expect.expect_json,
                 Vec::new(),
             );
         }
@@ -1741,6 +1741,29 @@ mod tests {
         // Did not execute: no elapsed, no exit.
         assert_eq!(ev.exit_code, None);
         assert_eq!(ev.stdout_len, 0);
+        assert!(ev.parsed_json_ok, "JSON was not required");
+
+        let expect = RunExpectation {
+            expect_json: true,
+            ..Default::default()
+        };
+        let ev = run(&spec, &expect, 0);
+        assert!(matches!(ev.outcome, RunOutcome::MissingFixture { .. }));
+        assert!(!ev.parsed_json_ok, "a missing fixture produced no JSON");
+        assert!(ev.assertion_results.is_empty());
+
+        spec.require_path = None;
+        spec.binary_path = "/no/such/executable/path-xyz".to_string();
+        let ev = run(&spec, &expect, 0);
+        assert_eq!(ev.outcome, RunOutcome::CommandFailure { exit_code: -1 });
+        assert!(!ev.parsed_json_ok, "a spawn failure produced no JSON");
+        assert_eq!(ev.stdout_len, 0);
+        assert!(ev.stderr_len > 0, "retain the actual OS execution error");
+        assert!(ev.assertion_results.is_empty());
+
+        let ev = run(&spec, &RunExpectation::default(), 0);
+        assert_eq!(ev.outcome, RunOutcome::CommandFailure { exit_code: -1 });
+        assert!(ev.parsed_json_ok, "JSON was not required");
     }
 
     #[test]

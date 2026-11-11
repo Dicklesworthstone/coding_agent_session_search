@@ -26,7 +26,7 @@
 
 use assert_cmd::cargo::cargo_bin;
 use coding_agent_search::e2e_runner::{
-    ArtifactRunSpec, RunEvent, RunExpectation, RunMode, RunSpec, ScenarioArtifactEntry,
+    ArtifactRunSpec, RunEvent, RunExpectation, RunMode, RunOutcome, RunSpec, ScenarioArtifactEntry,
     ScenarioArtifactManifest, run_with_artifacts,
 };
 use coding_agent_search::proof_artifact::{ProofArtifact, ProofStatus};
@@ -46,6 +46,64 @@ fn isolated_home_with_retained_artifacts() -> Result<tempfile::TempDir, String> 
         .map_err(|error| format!("create isolated model HOME: {error}"))?;
     eprintln!("Model acquisition artifacts: {}", home.path().display());
     Ok(home)
+}
+
+#[test]
+fn unexecuted_json_proof_events_never_claim_parse_success() -> Result<(), String> {
+    let home = isolated_home_with_retained_artifacts()?;
+    let artifact_root = home.path().join("runner-short-circuit-artifacts");
+    for (require_fixture, expect_json, command_id) in [
+        (true, true, "missing-fixture-json"),
+        (false, true, "spawn-failure-json"),
+        (true, false, "missing-fixture-text"),
+        (false, false, "spawn-failure-text"),
+    ] {
+        let mut spec = isolated_cass_spec(home.path(), &[], "runner-short-circuit");
+        spec.binary_path = home.path().join("missing-executable").display().to_string();
+        spec.require_path = require_fixture.then(|| home.path().join("missing-fixture"));
+        let entry = run_with_artifacts(
+            &spec,
+            &RunExpectation {
+                expect_json,
+                ..Default::default()
+            },
+            &ArtifactRunSpec {
+                artifact_root: &artifact_root,
+                run_id: "runner-short-circuit",
+                scenario_id: "unexecuted-command",
+                command_id,
+                issue_ids: &["coding_agent_session_search-0qxwg"],
+                privacy_note: "Real missing fixture and OS spawn failures; no model capability proof.",
+                suite_started_ms: 0,
+                accepted_exit_codes: &[0],
+                forbidden_stream_markers: &[],
+                extra_artifact_paths: &[],
+            },
+            0,
+        )
+        .map_err(|error| format!("write {command_id} artifacts: {error}"))?;
+        let event: RunEvent = serde_json::from_slice(
+            &std::fs::read(&entry.event_path)
+                .map_err(|error| format!("read {command_id} event: {error}"))?,
+        )
+        .map_err(|error| format!("decode {command_id} event: {error}"))?;
+        let expected_failure = if require_fixture {
+            matches!(event.outcome, RunOutcome::MissingFixture { .. })
+        } else {
+            matches!(event.outcome, RunOutcome::CommandFailure { exit_code: -1 })
+        };
+        let expected_parsed_json = !expect_json;
+        if !expected_failure
+            || event.parsed_json_ok != expected_parsed_json
+            || event.stdout_len != 0
+            || !event.assertion_results.is_empty()
+            || entry.outcome.is_success()
+            || matches!(entry.proof_status, ProofStatus::Pass)
+        {
+            return Err(format!("untruthful {command_id} proof event: {event:?}"));
+        }
+    }
+    Ok(())
 }
 
 fn decode_model_output(stdout: &str, format: &str) -> Result<Value, String> {
