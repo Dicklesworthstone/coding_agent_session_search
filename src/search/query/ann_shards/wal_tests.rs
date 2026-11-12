@@ -175,7 +175,6 @@ fn a_full_native_page_cannot_hide_a_new_durable_wal_winner() {
 }
 
 #[test]
-#[ignore = "ds7uy.3.3: frankensearch-index 0.4.2 try_load_native refuses a graph whose source has WAL-tombstoned main rows (SidecarNotNative); search takes the exact fallback until replacements stay native"]
 fn latest_wal_replacement_supersedes_a_better_old_graph_vector() {
     let temp = tempfile::tempdir().unwrap();
     let ctx = context(vec![shard(
@@ -381,7 +380,6 @@ fn native_scores_use_the_exact_kernel_when_a_wal_delta_joins_the_merge() {
 }
 
 #[test]
-#[ignore = "ds7uy.3.3: frankensearch-index 0.4.2 try_load_native refuses a graph whose source has WAL-tombstoned main rows (SidecarNotNative); search takes the exact fallback until replacements stay native"]
 fn wal_chunk_replacement_keeps_unmodified_chunks_of_the_same_message() {
     let temp = tempfile::tempdir().unwrap();
     let other_chunk = SemanticDocId {
