@@ -1,2 +1,5 @@
 # Generated validation binaries are not build inputs.
 .gate-bin/
+
+# Runtime E2E logs are retained locally, not Cargo source inputs.
+/test-results/
