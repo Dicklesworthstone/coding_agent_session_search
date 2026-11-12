@@ -127055,8 +127055,16 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
     let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
     let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
 
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
     // Hardened model-acquisition contract (bead 0qxwg): cheap host loadability
-    // (never loads ONNX — safe on any host) folded with the on-disk policy
+    // (never initializes a model runtime) folded with the on-disk policy
     // inputs the filesystem-only probe needs. The same inputs drive every
     // model's `model_acquisition` block so the report cannot drift per model.
     let acq_runtime = crate::search::model_acquisition::RuntimeLoadability::probe_cheap_host();
@@ -127083,7 +127091,8 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         files: Vec<serde_json::Value>,
         /// Hardened model-acquisition projection (state, runtime, source,
         /// cost_class, skipped_network_reason, next_command, fingerprint, …).
-        acquisition: serde_json::Value,
+        /// Built only for structured output; human output uses the cache report.
+        acquisition: Option<serde_json::Value>,
     }
 
     let known: &[&str] = &["minilm", "multilingual-minilm"];
@@ -127125,13 +127134,15 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
                 "size_match": exists && size == mfile.size,
             }));
         }
-        let acquisition = crate::search::model_acquisition::live_acquisition_block(
-            &model_dir,
-            &manifest,
-            acq_runtime,
-            acq_policy_inputs,
-            name,
-        );
+        let acquisition = structured_format.is_some().then(|| {
+            crate::search::model_acquisition::live_acquisition_block(
+                &model_dir,
+                &manifest,
+                acq_runtime,
+                acq_policy_inputs,
+                name,
+            )
+        });
         statuses.push(ModelStatus {
             registry_name: name,
             manifest,
@@ -127143,14 +127154,6 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
             acquisition,
         });
     }
-
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
 
     let active_status =
         active_registry_name.and_then(|name| statuses.iter().find(|s| s.registry_name == name));
@@ -127821,29 +127824,33 @@ fn run_models_verify(
     let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
     let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
 
-    // Hardened model-acquisition projection (bead 0qxwg): the same probe-based
-    // block `cass models status` emits, so verify and status agree. The probe
-    // reports its filesystem-only decision; observing the whole command is
-    // required to establish whether other paths attempted networking.
-    // `probe_cheap_host()` never initializes a model runtime.
-    let acquisition_block = crate::search::model_acquisition::live_acquisition_block(
-        &model_dir,
-        &manifest,
-        crate::search::model_acquisition::RuntimeLoadability::probe_cheap_host(),
-        crate::search::model_acquisition::OnDiskPolicyInputs {
-            policy_enabled: acquisition_policy.downloads_enabled,
-            offline: acquisition_policy.offline,
-            budget_max_bytes: acquisition_policy.max_model_bytes,
-        },
-        registry_name,
-    );
-
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
         } else {
             fmt
         }
+    });
+
+    // Hardened model-acquisition projection (bead 0qxwg): the same probe-based
+    // block `cass models status` emits, so verify and status agree. The probe
+    // reports its filesystem-only decision; observing the whole command is
+    // required to establish whether other paths attempted networking.
+    // `probe_cheap_host()` never initializes a model runtime.
+    // Human output does not consume this full-hash projection. Its cache
+    // classifier and the per-file integrity verification below remain active.
+    let acquisition_block = structured_format.is_some().then(|| {
+        crate::search::model_acquisition::live_acquisition_block(
+            &model_dir,
+            &manifest,
+            crate::search::model_acquisition::RuntimeLoadability::probe_cheap_host(),
+            crate::search::model_acquisition::OnDiskPolicyInputs {
+                policy_enabled: acquisition_policy.downloads_enabled,
+                offline: acquisition_policy.offline,
+                budget_max_bytes: acquisition_policy.max_model_bytes,
+            },
+            registry_name,
+        )
     });
 
     if !model_dir.is_dir() && !repair {
