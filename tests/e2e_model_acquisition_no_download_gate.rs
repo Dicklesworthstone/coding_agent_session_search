@@ -36,14 +36,19 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Keep the private HOME and actual runner evidence after success or failure.
-/// Use the OS temporary root so dotenv cannot find the repository's .env by
-/// walking up from the isolated command's working directory.
+/// On Unix, choose /tmp explicitly: RCH rewrites TMPDIR into its expiring
+/// source snapshot. Evidence must outlive that snapshot, and dotenv must not
+/// find the repository's .env above the isolated working directory.
 fn isolated_home_with_retained_artifacts() -> Result<tempfile::TempDir, String> {
-    let home = tempfile::Builder::new()
+    let mut builder = tempfile::Builder::new();
+    builder
         .prefix("cass-model-acquisition-")
-        .disable_cleanup(true)
-        .tempdir()
-        .map_err(|error| format!("create isolated model HOME: {error}"))?;
+        .disable_cleanup(true);
+    #[cfg(unix)]
+    let home = builder.tempdir_in("/tmp");
+    #[cfg(not(unix))]
+    let home = builder.tempdir();
+    let home = home.map_err(|error| format!("create isolated model HOME: {error}"))?;
     eprintln!("Model acquisition artifacts: {}", home.path().display());
     Ok(home)
 }
