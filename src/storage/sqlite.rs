@@ -9022,7 +9022,7 @@ fn collect_new_messages_for_existing_conversation<'a>(
     existing_replay_fingerprints: &mut HashSet<MessageReplayFingerprint>,
     replay_skip_log: &'static str,
 ) -> ExistingConversationNewMessages<'a> {
-    if matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff") {
+    if native_messages_are_reconciled(conv) {
         return reconciled_native_messages(conv);
     }
     let mut idx_collision_count = 0usize;
@@ -9169,7 +9169,399 @@ fn grok_bot_native_entry_id(extra: &serde_json::Value) -> Result<&str> {
         .context("Grok Bot message is missing its native entry ID")
 }
 
-struct CodebuffRevision {
+const CHATGPT_CANONICAL_MESSAGES_SQL: &str = "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin FROM messages WHERE conversation_id = ?1 ORDER BY idx";
+const CHATGPT_CANONICAL_SNIPPETS_SQL: &str = "SELECT s.message_id, s.file_path, s.start_line, s.end_line, s.language, s.snippet_text FROM snippets s JOIN messages m ON s.message_id = m.id WHERE m.conversation_id = ?1 ORDER BY m.idx, s.id";
+
+fn chatgpt_message_identity(extra: &serde_json::Value) -> Option<&str> {
+    extra
+        .get("chatgpt_message_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .or_else(|| {
+            extra
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+        })
+}
+
+fn native_messages_are_reconciled(conv: &Conversation) -> bool {
+    matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff")
+        || (conv.agent_slug == "chatgpt"
+            && conv
+                .messages
+                .iter()
+                .all(|message| chatgpt_message_identity(&message.extra_json).is_some()))
+}
+
+fn chatgpt_source_envelope(extra: &serde_json::Value) -> serde_json::Value {
+    let mut envelope = extra.clone();
+    if let Some(object) = envelope.as_object_mut() {
+        object.remove("chatgpt_message_id");
+    }
+    envelope
+}
+
+fn chatgpt_payload_matches(old: &Message, new: &Message) -> bool {
+    old.role == new.role
+        && old.author == new.author
+        && old.created_at == new.created_at
+        && old.content == new.content
+        && old.extra_json == new.extra_json
+        && old.snippets.len() == new.snippets.len()
+        && old.snippets.iter().zip(&new.snippets).all(|(a, b)| {
+            (
+                &a.file_path,
+                a.start_line,
+                a.end_line,
+                &a.language,
+                &a.snippet_text,
+            ) == (
+                &b.file_path,
+                b.start_line,
+                b.end_line,
+                &b.language,
+                &b.snippet_text,
+            )
+        })
+}
+
+fn chatgpt_canonical_messages(
+    rows: Vec<FrankenRow>,
+    snippet_rows: Vec<FrankenRow>,
+) -> Result<Vec<Message>> {
+    let mut snippets: HashMap<i64, Vec<Snippet>> = HashMap::new();
+    for row in snippet_rows {
+        snippets
+            .entry(row.get_typed(0)?)
+            .or_default()
+            .push(Snippet {
+                id: None,
+                file_path: row.get_typed::<Option<String>>(1)?.map(PathBuf::from),
+                start_line: row.get_typed(2)?,
+                end_line: row.get_typed(3)?,
+                language: row.get_typed(4)?,
+                snippet_text: row.get_typed(5)?,
+            });
+    }
+    rows.iter()
+        .map(|row| {
+            let id = row.get_typed::<i64>(0)?;
+            Ok(Message {
+                id: Some(id),
+                idx: row.get_typed(1)?,
+                role: role_from_str(&row.get_typed::<String>(2)?),
+                author: row.get_typed(3)?,
+                created_at: row.get_typed(4)?,
+                content: row.get_typed(5)?,
+                extra_json: franken_read_message_extra_compat(row, 6, 7),
+                snippets: snippets.remove(&id).unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// A ChatGPT export is a mutable snapshot, not an append-only sequence.
+/// Native IDs bind rows; timestamps and IDs give a deterministic complete order.
+/// An omitted node is retained, and identity backfill requires an exact envelope.
+fn plan_chatgpt_snapshot(
+    existing: &[Message],
+    conv: &Conversation,
+) -> Result<Option<Vec<Message>>> {
+    if conv.agent_slug != "chatgpt"
+        || !conv.messages.iter().any(|message| {
+            message.extra_json.get("chatgpt_message_id").is_some()
+                || chatgpt_message_identity(&message.extra_json).is_some()
+        })
+    {
+        return Ok(None);
+    }
+    for message in existing.iter().chain(&conv.messages) {
+        if let Some(marker) = message.extra_json.get("chatgpt_message_id") {
+            let marker = marker
+                .as_str()
+                .filter(|id| !id.trim().is_empty())
+                .context("ChatGPT message has an invalid native identity")?;
+            if let Some(raw) = message
+                .extra_json
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+            {
+                anyhow::ensure!(
+                    marker == raw,
+                    "ChatGPT native identity contradicts its source envelope"
+                );
+            }
+        }
+    }
+    let mut packet = HashSet::new();
+    for message in &conv.messages {
+        let id = chatgpt_message_identity(&message.extra_json)
+            .context("ChatGPT native snapshot contains a message without identity")?;
+        anyhow::ensure!(
+            packet.insert(id),
+            "ChatGPT snapshot contains duplicate native identities"
+        );
+    }
+    let mut messages = existing.to_vec();
+    let mut native = HashMap::new();
+    for (position, message) in messages.iter().enumerate() {
+        anyhow::ensure!(
+            message.idx >= 0,
+            "ChatGPT canonical message has a negative position"
+        );
+        if let Some(id) = chatgpt_message_identity(&message.extra_json) {
+            anyhow::ensure!(
+                native.insert(id.to_owned(), position).is_none(),
+                "ChatGPT canonical history has duplicate native identities"
+            );
+        }
+    }
+    for incoming in &conv.messages {
+        let id = chatgpt_message_identity(&incoming.extra_json)
+            .context("ChatGPT native message identity disappeared")?;
+        let position = if let Some(position) = native.get(id) {
+            Some(*position)
+        } else {
+            let envelope = chatgpt_source_envelope(&incoming.extra_json);
+            let legacy: Vec<_> = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, old)| {
+                    chatgpt_message_identity(&old.extra_json).is_none()
+                        && old.role == incoming.role
+                        && old.author == incoming.author
+                        && old.created_at == incoming.created_at
+                        && chatgpt_source_envelope(&old.extra_json) == envelope
+                })
+                .map(|(position, _)| position)
+                .collect();
+            anyhow::ensure!(
+                legacy.len() <= 1,
+                "ChatGPT legacy message identity is ambiguous; history preserved"
+            );
+            if let Some(position) = legacy.first().copied() {
+                let matches = conv
+                    .messages
+                    .iter()
+                    .filter(|candidate| {
+                        !native.contains_key(
+                            chatgpt_message_identity(&candidate.extra_json).unwrap_or(""),
+                        ) && candidate.role == incoming.role
+                            && candidate.author == incoming.author
+                            && candidate.created_at == incoming.created_at
+                            && chatgpt_source_envelope(&candidate.extra_json) == envelope
+                    })
+                    .count();
+                anyhow::ensure!(
+                    matches == 1,
+                    "ChatGPT legacy envelope matches multiple native messages; history preserved"
+                );
+                Some(position)
+            } else {
+                anyhow::ensure!(
+                    !messages.iter().any(|old| {
+                        chatgpt_message_identity(&old.extra_json).is_none()
+                            && old.role == incoming.role
+                            && old.author == incoming.author
+                            && old.created_at == incoming.created_at
+                    }),
+                    "ChatGPT cannot bind a changed legacy message without its source identity; history preserved"
+                );
+                None
+            }
+        };
+        let mut replacement = incoming.clone();
+        if let Some(position) = position {
+            let old = &messages[position];
+            anyhow::ensure!(
+                old.role == incoming.role
+                    && old.author == incoming.author
+                    && old.created_at == incoming.created_at,
+                "ChatGPT native identity changed immutable role, author or timestamp"
+            );
+            if let (Some(old_time), Some(new_time)) = (
+                old.extra_json
+                    .get("update_time")
+                    .and_then(serde_json::Value::as_f64),
+                incoming
+                    .extra_json
+                    .get("update_time")
+                    .and_then(serde_json::Value::as_f64),
+            ) && new_time < old_time
+            {
+                continue;
+            }
+            if let Some(marker) = old.extra_json.get("chatgpt_message_id")
+                && let Some(object) = replacement.extra_json.as_object_mut()
+            {
+                object
+                    .entry("chatgpt_message_id")
+                    .or_insert_with(|| marker.clone());
+            }
+            replacement.id = old.id;
+            messages[position] = replacement;
+            native.insert(id.to_owned(), position);
+        } else {
+            replacement.id = None;
+            native.insert(id.to_owned(), messages.len());
+            messages.push(replacement);
+        }
+    }
+    messages.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| {
+                chatgpt_message_identity(&a.extra_json)
+                    .cmp(&chatgpt_message_identity(&b.extra_json))
+            })
+            .then_with(|| a.idx.cmp(&b.idx))
+    });
+    for (position, message) in messages.iter_mut().enumerate() {
+        message.idx = i64::try_from(position).context("ChatGPT canonical position exhausted")?;
+    }
+    Ok(Some(messages))
+}
+
+fn franken_reconcile_chatgpt_messages<'a>(
+    tx: &FrankenTransaction<'_>,
+    agent_id: i64,
+    conv: &'a Conversation,
+    revisions: &mut Vec<NativeMessageRevision>,
+) -> Result<Cow<'a, Conversation>> {
+    if conv.agent_slug != "chatgpt" {
+        return Ok(Cow::Borrowed(conv));
+    }
+    let existing_id = if let Some(external_id) = conv.external_id.as_deref() {
+        tx.query_row_map("SELECT id FROM conversations WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3",
+            fparams![conv.source_id.as_str(), agent_id, external_id], |row| row.get_typed::<i64>(0)).optional()?
+    } else {
+        franken_find_existing_conversation_by_key(
+            tx,
+            &conversation_merge_key(agent_id, conv),
+            Some(conv),
+        )?
+    };
+    let existing = if let Some(id) = existing_id {
+        chatgpt_canonical_messages(
+            tx.query_params(CHATGPT_CANONICAL_MESSAGES_SQL, fparams![id])?,
+            tx.query_params(CHATGPT_CANONICAL_SNIPPETS_SQL, fparams![id])?,
+        )?
+    } else {
+        Vec::new()
+    };
+    let Some(planned) = plan_chatgpt_snapshot(&existing, conv)? else {
+        return Ok(Cow::Borrowed(conv));
+    };
+    let mut reconciled = conv.clone();
+    reconciled.messages.clear();
+    if let Some(id) = existing_id {
+        let (started_at, source_path, title, workspace): (Option<i64>, String, Option<String>, Option<String>) = tx.query_row_map(
+            "SELECT c.started_at, c.source_path, c.title, (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id) FROM conversations c WHERE c.id = ?1",
+            fparams![id], |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+        )?;
+        reconciled.started_at = started_at;
+        reconciled.source_path = source_path.into();
+        reconciled.title = title;
+        reconciled.workspace = workspace.map(PathBuf::from);
+    }
+    let by_id: HashMap<_, _> = existing
+        .iter()
+        .filter_map(|message| message.id.map(|id| (id, message)))
+        .collect();
+    let reposition = planned.iter().any(|message| {
+        message
+            .id
+            .and_then(|id| by_id.get(&id))
+            .is_some_and(|old| old.idx != message.idx)
+    });
+    if reposition {
+        // The negative half is disjoint from every validated canonical index.
+        // Park all old rows so cycles and shifts cannot violate UNIQUE(conv,idx).
+        for old in &existing {
+            tx.execute_compat(
+                "UPDATE messages SET idx = ?2 WHERE id = ?1",
+                fparams![
+                    old.id.context("ChatGPT canonical row lacks ID")?,
+                    -old.idx - 1
+                ],
+            )?;
+        }
+    }
+    let revision_start = revisions.len();
+    for message in &planned {
+        let Some(id) = message.id else {
+            reconciled.messages.push(message.clone());
+            continue;
+        };
+        let old = by_id
+            .get(&id)
+            .context("ChatGPT planned row is outside its canonical conversation")?;
+        if old.idx == message.idx && chatgpt_payload_matches(old, message) {
+            if reposition {
+                tx.execute_compat(
+                    "UPDATE messages SET idx = ?2 WHERE id = ?1",
+                    fparams![id, message.idx],
+                )?;
+            }
+            continue;
+        }
+        let (json, bin) = franken_message_insert_payload(message)?;
+        tx.execute_compat("UPDATE messages SET idx = ?2, content = ?3, extra_json = ?4, extra_bin = ?5 WHERE id = ?1",
+            fparams![id, message.idx, message.content.as_str(), json.as_deref(), bin.as_deref()])?;
+        tx.execute_compat("DELETE FROM snippets WHERE message_id = ?1", fparams![id])?;
+        franken_insert_snippets(tx, id, &message.snippets)?;
+        let mut before = (**old).clone();
+        let mut after = message.clone();
+        before.extra_json = chatgpt_source_envelope(&before.extra_json);
+        after.extra_json = chatgpt_source_envelope(&after.extra_json);
+        revisions.push(NativeMessageRevision {
+            agent_slug: "chatgpt".into(),
+            projection_needed: !chatgpt_payload_matches(&before, &after),
+            conversation_id: existing_id.context("ChatGPT canonical row lacks conversation")?,
+            started_at: reconciled.started_at,
+            source_id: conv.source_id.clone(),
+            previous_content_chars: i64::try_from(old.content.len())
+                .context("message length exceeds analytics range")?,
+            fts: FtsEntry::from_message(id, message, &reconciled),
+            message: message.clone(),
+        });
+    }
+    if revisions.len() > revision_start {
+        record_semantic_conversation_changes(
+            tx,
+            &[existing_id.context("ChatGPT revision lacks conversation")?],
+            true,
+        )?;
+    }
+    if let Some(id) = existing_id {
+        let last_idx = planned.last().map(|message| message.idx);
+        let last_created = planned
+            .iter()
+            .filter_map(|message| message.created_at)
+            .max();
+        let ended_at = franken_tail_state_insert_ended_at(tx, id, conv.ended_at.max(last_created))?;
+        franken_insert_conversation_tail_state(tx, id, ended_at, last_idx, last_created)?;
+        tx.execute_compat("UPDATE conversations SET last_message_idx = ?2, last_message_created_at = ?3, ended_at = ?4 WHERE id = ?1",
+            fparams![id, last_idx, last_created, ended_at])?;
+        if let Some(key) = conversation_external_lookup_key_for_conv(agent_id, &reconciled) {
+            franken_insert_external_conversation_tail_lookup_key(
+                tx,
+                &key,
+                id,
+                ended_at,
+                last_idx,
+                last_created,
+            )?;
+        }
+    }
+    Ok(Cow::Owned(reconciled))
+}
+
+struct NativeMessageRevision {
+    agent_slug: String,
+    projection_needed: bool,
     conversation_id: i64,
     started_at: Option<i64>,
     source_id: String,
@@ -9199,7 +9591,7 @@ fn franken_reconcile_codebuff_messages<'a>(
     tx: &FrankenTransaction<'_>,
     agent_id: i64,
     conv: &'a Conversation,
-    revisions: &mut Vec<CodebuffRevision>,
+    revisions: &mut Vec<NativeMessageRevision>,
 ) -> Result<Cow<'a, Conversation>> {
     if conv.agent_slug != "codebuff" {
         return Ok(Cow::Borrowed(conv));
@@ -9293,7 +9685,9 @@ fn franken_reconcile_codebuff_messages<'a>(
                 &[existing.context("canonical message lacks conversation")?.0],
                 true,
             )?;
-            revisions.push(CodebuffRevision {
+            revisions.push(NativeMessageRevision {
+                agent_slug: conv.agent_slug.clone(),
+                projection_needed: true,
                 conversation_id: existing.context("canonical message lacks conversation")?.0,
                 started_at: reconciled.started_at,
                 source_id: conv.source_id.clone(),
@@ -9367,11 +9761,12 @@ fn codebuff_tool_count(extra: &serde_json::Value) -> u32 {
 /// Update only materialized analytics. A deferred initial insert has no metric
 /// row and remains due for normal backfill; a later deferred revision still
 /// corrects an already-published contribution instead of leaving it stale.
-fn franken_apply_codebuff_revision_projections(
+fn franken_apply_message_revision_projections(
     storage: &FrankenStorage,
     tx: &FrankenTransaction<'_>,
-    revision: &CodebuffRevision,
+    revision: &NativeMessageRevision,
     defer_lexical_updates: bool,
+    pricing_table: &PricingTable,
 ) -> Result<()> {
     let message_id = revision.fts.message_id;
     if !defer_lexical_updates
@@ -9446,20 +9841,27 @@ fn franken_apply_codebuff_revision_projections(
         .optional()?;
     let message = &revision.message;
     let mut usage = crate::connectors::extract_tokens_for_agent(
-        "codebuff",
+        &revision.agent_slug,
         &message.extra_json,
         &message.content,
         &role_str(&message.role),
     );
-    usage.tool_call_count = codebuff_tool_count(&message.extra_json);
-    usage.has_tool_calls = usage.tool_call_count > 0;
+    if revision.agent_slug == "codebuff" {
+        usage.tool_call_count = codebuff_tool_count(&message.extra_json);
+        usage.has_tool_calls = usage.tool_call_count > 0;
+    }
     let content_chars =
         i64::try_from(message.content.len()).context("message length exceeds analytics range")?;
     if let Some(old) = old {
         // Track A may have been backfilled while Track B remains deferred.
         anyhow::ensure!(
-            old.api_data_source == "estimated" && old.model_name.is_none(),
-            "Codebuff / Freebuff revision has unsupported provider-usage analytics"
+            old.api_data_source == "estimated"
+                && if revision.agent_slug == "codebuff" {
+                    old.model_name.is_none()
+                } else {
+                    old.model_name == usage.model_name
+                },
+            "Native message revision has unsupported provider-usage analytics"
         );
         let mut new = old.clone();
         new.content_chars = content_chars;
@@ -9472,7 +9874,7 @@ fn franken_apply_codebuff_revision_projections(
         new.tool_call_count = i64::from(usage.tool_call_count);
         new.has_tool_calls = usage.has_tool_calls;
         new.has_plan = has_plan_for_role(&new.role, &message.content);
-        franken_replace_codebuff_rollup_contribution(tx, &old, &new)?;
+        franken_replace_rollup_contribution(tx, &old, &new)?;
         tx.execute_compat(
             "UPDATE message_metrics SET content_chars = ?2, content_tokens_est = ?3,
              api_input_tokens = ?4, api_output_tokens = ?5, tool_call_count = ?6,
@@ -9505,8 +9907,21 @@ fn franken_apply_codebuff_revision_projections(
     if let Some(old) = ledger.first() {
         anyhow::ensure!(
             old.get_typed::<String>(12)? == "estimated"
-                && old.get_typed::<Option<String>>(13)?.is_none(),
-            "Codebuff / Freebuff revision has unsupported provider-usage token ledger"
+                && if revision.agent_slug == "codebuff" {
+                    old.get_typed::<Option<String>>(13)?.is_none()
+                } else {
+                    old.get_typed::<Option<String>>(13)? == usage.model_name
+                },
+            "Native message revision has unsupported provider-usage token ledger"
+        );
+        let day = old.get_typed::<i64>(0)?;
+        let cost = pricing_table.compute_cost(
+            usage.model_name.as_deref(),
+            day,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_tokens,
+            usage.cache_creation_tokens,
         );
         let delta = TokenStatsDelta {
             total_input_tokens: usage.input_tokens.unwrap_or(0)
@@ -9523,14 +9938,15 @@ fn franken_apply_codebuff_revision_projections(
                 - old.get_typed::<Option<i64>>(9)?.unwrap_or(0),
             total_content_chars: content_chars - old.get_typed::<i64>(3)?,
             total_tool_calls: i64::from(usage.tool_call_count) - old.get_typed::<i64>(10)?,
-            estimated_cost_usd: -old.get_typed::<Option<f64>>(11)?.unwrap_or(0.0),
+            estimated_cost_usd: cost.unwrap_or(0.0)
+                - old.get_typed::<Option<f64>>(11)?.unwrap_or(0.0),
             ..TokenStatsDelta::default()
         };
         let mut tokens = TokenStatsAggregator::new();
         tokens.deltas.insert(
             (
                 old.get_typed(0)?,
-                "codebuff".into(),
+                revision.agent_slug.clone(),
                 old.get_typed(1)?,
                 old.get_typed::<Option<String>>(2)?
                     .unwrap_or_else(|| "unknown".into()),
@@ -9573,7 +9989,7 @@ fn franken_apply_codebuff_revision_projections(
             "UPDATE token_usage SET content_chars = ?2, input_tokens = ?3, output_tokens = ?4,
              total_tokens = ?5, tool_call_count = ?6, has_tool_calls = ?7,
              cache_read_tokens = ?8, cache_creation_tokens = ?9, thinking_tokens = ?10,
-             estimated_cost_usd = NULL WHERE message_id = ?1",
+             estimated_cost_usd = ?11 WHERE message_id = ?1",
             fparams![
                 message_id,
                 content_chars,
@@ -9584,7 +10000,8 @@ fn franken_apply_codebuff_revision_projections(
                 i64::from(usage.has_tool_calls),
                 usage.cache_read_tokens,
                 usage.cache_creation_tokens,
-                usage.thinking_tokens
+                usage.thinking_tokens,
+                cost
             ],
         )?;
         franken_update_conversation_token_summaries_in_tx(tx, revision.conversation_id)?;
@@ -9596,12 +10013,13 @@ fn franken_apply_codebuff_revision_projections(
             .unwrap_or(0);
         tx.execute_compat(
             "UPDATE daily_stats SET total_chars = total_chars + ?3, last_updated = ?4
-             WHERE day_id = ?1 AND agent_slug IN ('codebuff', 'all') AND source_id IN (?2, 'all')",
+             WHERE day_id = ?1 AND agent_slug IN (?5, 'all') AND source_id IN (?2, 'all')",
             fparams![
                 day,
                 revision.source_id.as_str(),
                 content_chars - revision.previous_content_chars,
-                FrankenStorage::now_millis()
+                FrankenStorage::now_millis(),
+                revision.agent_slug.as_str()
             ],
         )?;
     } else {
@@ -9622,7 +10040,7 @@ fn franken_apply_codebuff_revision_projections(
     Ok(())
 }
 
-fn franken_replace_codebuff_rollup_contribution(
+fn franken_replace_rollup_contribution(
     tx: &FrankenTransaction<'_>,
     old: &MessageMetricsEntry,
     new: &MessageMetricsEntry,
@@ -10050,7 +10468,7 @@ fn collect_append_only_tail_messages<'a>(
     existing_max_idx: i64,
     existing_max_created_at: i64,
 ) -> Option<ExistingConversationNewMessages<'a>> {
-    if conv.agent_slug == "grok_bot" {
+    if native_messages_are_reconciled(conv) {
         return Some(reconciled_native_messages(conv));
     }
     if conv.messages.is_empty() {
@@ -10458,6 +10876,47 @@ impl FrankenStorage {
                 || !codebuff_snippet_rows_match(&snippets, &message.snippets)?;
         }
         Ok(changed)
+    }
+
+    /// Read-only admission uses the same ChatGPT planner as the write path.
+    pub(crate) fn chatgpt_message_revisions_needed(&self, conv: &Conversation) -> Result<bool> {
+        if conv.agent_slug != "chatgpt" {
+            return Ok(false);
+        }
+        let conv = normalized_conversation_for_storage(conv);
+        let existing: Option<i64> = if let Some(external_id) = conv.external_id.as_deref() {
+            self.conn.query_row_map(
+                "SELECT id FROM conversations WHERE source_id = ?1 AND external_id = ?2 AND agent_id = (SELECT id FROM agents WHERE slug = 'chatgpt')",
+                fparams![conv.source_id.as_str(), external_id], |row| row.get_typed(0),
+            ).optional()?
+        } else {
+            return Ok(self.conn.query_row_map(
+                "SELECT id FROM conversations WHERE source_id = ?1 AND source_path = ?2 AND agent_id = (SELECT id FROM agents WHERE slug = 'chatgpt') LIMIT 1",
+                fparams![conv.source_id.as_str(), path_to_string(&conv.source_path)], |row| row.get_typed::<i64>(0),
+            ).optional()?.is_some());
+        };
+        let Some(id) = existing else {
+            return Ok(false);
+        };
+        let messages = chatgpt_canonical_messages(
+            self.conn
+                .query_with_params(CHATGPT_CANONICAL_MESSAGES_SQL, &[SqliteValue::from(id)])?,
+            self.conn
+                .query_with_params(CHATGPT_CANONICAL_SNIPPETS_SQL, &[SqliteValue::from(id)])?,
+        )?;
+        let Some(planned) = plan_chatgpt_snapshot(&messages, &conv)? else {
+            return Ok(false);
+        };
+        let by_id: HashMap<_, _> = messages
+            .iter()
+            .filter_map(|message| message.id.map(|id| (id, message)))
+            .collect();
+        Ok(planned.iter().any(|message| {
+            message
+                .id
+                .and_then(|id| by_id.get(&id))
+                .is_some_and(|old| old.idx != message.idx || !chatgpt_payload_matches(old, message))
+        }))
     }
 
     /// Read-only admission for the indexer's durable pre-mutation checkpoint.
@@ -15001,14 +15460,14 @@ impl FrankenStorage {
         conv: &Conversation,
         defer_analytics_updates: bool,
     ) -> Result<InsertOutcome> {
-        if conv.agent_slug == "codebuff" {
+        if matches!(conv.agent_slug.as_str(), "codebuff" | "chatgpt") {
             return self
                 .insert_conversations_batched_with_analytics(
                     &[(agent_id, workspace_id, conv)],
                     defer_analytics_updates,
                 )?
                 .pop()
-                .context("Codebuff / Freebuff insert returned no outcome");
+                .context("Native-message insert returned no outcome");
         }
         let normalized_conv = normalized_conversation_for_storage(conv);
         let conv = normalized_conv.as_ref();
@@ -18360,7 +18819,7 @@ impl FrankenStorage {
         ensure_sources_in_tx(&tx, conversations)?;
 
         let mut outcomes = Vec::with_capacity(conversations.len());
-        let mut codebuff_revisions = Vec::new();
+        let mut native_revisions = Vec::new();
         let mut fts_entries = Vec::new();
         let mut fts_pending_chars = 0usize;
         let mut fts_inserted_total = 0usize;
@@ -18381,19 +18840,25 @@ impl FrankenStorage {
 
         for &(agent_id, workspace_id, raw_conv) in conversations {
             let normalized_conv = normalized_conversation_for_storage(raw_conv);
-            let revision_start = codebuff_revisions.len();
+            let revision_start = native_revisions.len();
             let codebuff_conv = franken_reconcile_codebuff_messages(
                 &tx,
                 agent_id,
                 normalized_conv.as_ref(),
-                &mut codebuff_revisions,
+                &mut native_revisions,
             )?;
-            let updated_indices = codebuff_revisions[revision_start..]
+            let chatgpt_conv = franken_reconcile_chatgpt_messages(
+                &tx,
+                agent_id,
+                codebuff_conv.as_ref(),
+                &mut native_revisions,
+            )?;
+            let updated_indices = native_revisions[revision_start..]
                 .iter()
                 .map(|revision| revision.message.idx)
                 .collect();
             let reconciled_conv =
-                franken_reconcile_native_message_indices(&tx, agent_id, codebuff_conv.as_ref())?;
+                franken_reconcile_native_message_indices(&tx, agent_id, chatgpt_conv.as_ref())?;
             let conv = reconciled_conv.as_ref();
             let mut total_chars: i64 = 0;
             let mut inserted_indices = Vec::with_capacity(conv.messages.len());
@@ -18516,7 +18981,7 @@ impl FrankenStorage {
                         for msg in &conv.messages {
                             let incoming_replay = message_replay_fingerprint(msg);
                             if pending_messages.contains_key(&msg.idx)
-                                || (!matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff")
+                                || (!native_messages_are_reconciled(conv)
                                     && pending_replay_fingerprints.contains(&incoming_replay))
                             {
                                 continue;
@@ -18961,15 +19426,18 @@ impl FrankenStorage {
         // Canonical rows changed during planning so later packets saw their
         // latest payload. Apply derived revisions after first-packet buffers:
         // otherwise buffered FTS/analytics could resurrect the older content.
-        for revision in &codebuff_revisions {
-            franken_apply_codebuff_revision_projections(
-                self,
-                &tx,
-                revision,
-                defer_lexical_updates,
-            )?;
+        for revision in &native_revisions {
+            if revision.projection_needed {
+                franken_apply_message_revision_projections(
+                    self,
+                    &tx,
+                    revision,
+                    defer_lexical_updates,
+                    &pricing_table,
+                )?;
+            }
         }
-        if !codebuff_revisions.is_empty() {
+        if !native_revisions.is_empty() {
             // Revisions do not advance the rowid watermark. A fresh generation
             // also invalidates checkpoints from an interrupted earlier revision.
             let generation = format!("message_revision:{:032x}", rand::random::<u128>());
@@ -20313,7 +20781,7 @@ fn franken_append_insert_new_messages<'a>(
 ) -> Result<Vec<(i64, &'a Message)>> {
     let mut inserted = Vec::with_capacity(messages.len());
     for msg in messages {
-        if matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff") {
+        if native_messages_are_reconciled(conv) {
             // Native-ID reconciliation proved this index new in this
             // transaction. A conflicting writer must abort/retry the packet,
             // never silently discard its new native entry via OR IGNORE.
@@ -20775,7 +21243,7 @@ fn franken_collect_batched_existing_new_messages<'a>(
     HashMap<i64, MessageMergeFingerprint>,
     HashSet<MessageReplayFingerprint>,
 )> {
-    if matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff") {
+    if native_messages_are_reconciled(conv) {
         return Ok((
             reconciled_native_messages(conv),
             HashMap::new(),
@@ -39005,6 +39473,288 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 .is_err()
         );
         assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    #[serial]
+    fn gh552_chatgpt_reimport_preserves_native_messages_order_and_revisions() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        for route in 0..3 {
+            let dir = tempfile::Builder::new()
+                .prefix("cass-gh552-")
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let storage = FrankenStorage::open(&dir.path().join("history.db")).unwrap();
+            storage.ensure_search_fallback_fts_consistency().unwrap();
+            let agent = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "chatgpt".into(),
+                    name: "ChatGPT".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let message = |native_id: &str, idx, timestamp, role, content: &str| Message {
+                id: None,
+                idx,
+                role,
+                author: None,
+                created_at: Some(timestamp),
+                content: content.into(),
+                snippets: Vec::new(),
+                extra_json: serde_json::json!({"id":native_id,"chatgpt_message_id":native_id,
+                    "update_time":20,"content":{"parts":[content]}}),
+            };
+            let mut original = Conversation {
+                id: None,
+                agent_slug: "chatgpt".into(),
+                workspace: None,
+                external_id: Some("gh552-growing-chat".into()),
+                title: Some("Voice history".into()),
+                source_path: dir.path().join("conversation.json"),
+                started_at: Some(1000),
+                ended_at: Some(2000),
+                approx_tokens: None,
+                metadata_json: serde_json::json!({}),
+                source_id: "local".into(),
+                origin_host: None,
+                messages: vec![message(
+                    "reply",
+                    0,
+                    2000,
+                    MessageRole::Agent,
+                    "typedreplyneedle",
+                )],
+            };
+            // Pre-fix FAD retained the raw message ID without the new marker.
+            original.messages[0]
+                .extra_json
+                .as_object_mut()
+                .unwrap()
+                .remove("chatgpt_message_id");
+            let first = gh423_persist(&storage, agent, &original, route).unwrap();
+            let reply_id = storage.fetch_messages(first.conversation_id).unwrap()[0].id;
+            let mut incoming = original.clone();
+            incoming.messages = vec![
+                message(
+                    "voice-b",
+                    0,
+                    1000,
+                    MessageRole::User,
+                    "voiceneedle same words",
+                ),
+                message(
+                    "voice-a",
+                    1,
+                    1000,
+                    MessageRole::User,
+                    "voiceneedle same words",
+                ),
+                message("reply", 2, 2000, MessageRole::Agent, "typedreplyneedle"),
+            ];
+            let grown = gh423_persist(&storage, agent, &incoming, route).unwrap();
+            let saved = storage.fetch_messages(first.conversation_id).unwrap();
+            assert_eq!(grown.conversation_id, first.conversation_id);
+            assert_eq!(
+                saved.len(),
+                3,
+                "occupied positions and equal text/time must not drop native IDs"
+            );
+            assert_eq!(
+                saved
+                    .iter()
+                    .map(|m| m.extra_json["chatgpt_message_id"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["voice-a", "voice-b", "reply"]
+            );
+            assert_eq!(
+                saved.iter().map(|m| m.idx).collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+            assert_eq!(
+                saved[2].id, reply_id,
+                "reordering preserves canonical row identity"
+            );
+            assert_eq!(grown.inserted_indices, vec![0, 1]);
+            assert_eq!(grown.updated_indices, vec![2]);
+            let before = serde_json::to_value(&saved).unwrap();
+            let repeat = gh423_persist(&storage, agent, &incoming, route).unwrap();
+            assert!(repeat.inserted_indices.is_empty() && repeat.updated_indices.is_empty());
+            assert_eq!(
+                serde_json::to_value(storage.fetch_messages(first.conversation_id).unwrap())
+                    .unwrap(),
+                before
+            );
+
+            let fresh = FrankenStorage::open(&dir.path().join("fresh.db")).unwrap();
+            let fresh_agent = fresh
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "chatgpt".into(),
+                    name: "ChatGPT".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let fresh_outcome = gh423_persist(&fresh, fresh_agent, &incoming, route).unwrap();
+            let projection = |messages: Vec<Message>| {
+                messages
+                    .into_iter()
+                    .map(|m| (m.idx, m.role, m.created_at, m.content, m.extra_json))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                projection(fresh.fetch_messages(fresh_outcome.conversation_id).unwrap()),
+                projection(saved)
+            );
+
+            let mut revised = incoming.clone();
+            revised.messages[2].content = "revisedneedle complete response".into();
+            revised.messages[2].extra_json["content"]["parts"] =
+                serde_json::json!([revised.messages[2].content]);
+            revised.messages[2].extra_json["update_time"] = serde_json::json!(30);
+            let changed = gh423_persist(&storage, agent, &revised, route).unwrap();
+            assert!(changed.inserted_indices.is_empty());
+            assert_eq!(changed.updated_indices, vec![2]);
+            let after = storage.fetch_messages(first.conversation_id).unwrap();
+            assert_eq!(after.len(), 3);
+            assert_eq!(after[2].id, reply_id);
+            assert_eq!(after[2].content, revised.messages[2].content);
+            let count: i64 = storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH 'revisedneedle'",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+            let totals: (i64, i64) = storage.raw().query_row_map(
+                "SELECT message_count, total_chars FROM daily_stats WHERE agent_slug = 'chatgpt' AND source_id = 'local'",
+                fparams![], |row| Ok((row.get_typed(0)?, row.get_typed(1)?))).unwrap();
+            assert_eq!(
+                totals,
+                (3, after.iter().map(|m| m.content.len() as i64).sum())
+            );
+            let mut partial = incoming.clone();
+            partial.messages = vec![incoming.messages[2].clone()];
+            let older = gh423_persist(&storage, agent, &partial, route).unwrap();
+            assert!(older.inserted_indices.is_empty() && older.updated_indices.is_empty());
+            let stable =
+                serde_json::to_value(storage.fetch_messages(first.conversation_id).unwrap())
+                    .unwrap();
+            assert_eq!(
+                stable,
+                serde_json::to_value(&after).unwrap(),
+                "older partial exports preserve newer content and omitted history"
+            );
+            let mut invalid = incoming.clone();
+            invalid.messages.push(invalid.messages[0].clone());
+            let mut pending = revised.clone();
+            pending.messages[2].content = "must roll back this revision".into();
+            pending.messages[2].extra_json["update_time"] = serde_json::json!(40);
+            assert!(
+                storage
+                    .insert_conversations_batched_with_analytics(
+                        &[(agent, None, &pending), (agent, None, &invalid)],
+                        false
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                serde_json::to_value(storage.fetch_messages(first.conversation_id).unwrap())
+                    .unwrap(),
+                stable
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn gh552_legacy_envelope_backfill_updates_model_analytics_and_rejects_ambiguity() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        let dir = tempfile::Builder::new()
+            .prefix("cass-gh552-legacy-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("history.db")).unwrap();
+        storage.ensure_search_fallback_fts_consistency().unwrap();
+        let agent = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "chatgpt".into(),
+                name: "ChatGPT".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let mut legacy = gh423_storage_snapshot();
+        legacy.agent_slug = "chatgpt".into();
+        legacy.external_id = Some("gh552-legacy".into());
+        legacy.source_path = dir.path().join("conversation.json");
+        legacy.messages.truncate(1);
+        legacy.messages[0].author = Some("gpt-4".into());
+        legacy.messages[0].content = "typedprefix typedsuffix".into();
+        legacy.messages[0].extra_json = serde_json::json!({
+            "metadata":{"model_slug":"gpt-4"}, "update_time":20,
+            "content":{"parts":["typedprefix",{"content_type":"audio_transcription","text":"spokentextneedle"},"typedsuffix"]}
+        });
+        let first = gh423_persist(&storage, agent, &legacy, 2).unwrap();
+        let old = storage.fetch_messages(first.conversation_id).unwrap();
+        let mut current = legacy.clone();
+        current.messages[0].extra_json["chatgpt_message_id"] =
+            serde_json::json!("mapping-node-without-raw-id");
+        current.messages[0].content = "typedprefix spokentextneedle typedsuffix".into();
+        assert!(storage.chatgpt_message_revisions_needed(&current).unwrap());
+        let revised = gh423_persist(&storage, agent, &current, 2).unwrap();
+        assert!(revised.inserted_indices.is_empty());
+        assert_eq!(revised.updated_indices, vec![0]);
+        let saved = storage.fetch_messages(first.conversation_id).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].id, old[0].id);
+        assert_eq!(saved[0].content, current.messages[0].content);
+        let (model, output): (Option<String>, Option<i64>) = storage
+            .raw()
+            .query_row_map(
+                "SELECT model_name, output_tokens FROM token_usage WHERE message_id = ?1",
+                fparams![saved[0].id.unwrap()],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(model.as_deref(), Some("gpt-4"));
+        assert_eq!(output, Some((current.messages[0].content.len() / 4) as i64));
+        assert!(!storage.chatgpt_message_revisions_needed(&current).unwrap());
+        let before = serde_json::to_value(&saved).unwrap();
+        current.messages[0].extra_json["id"] = serde_json::json!("contradictory-id");
+        assert!(gh423_persist(&storage, agent, &current, 2).is_err());
+        assert_eq!(
+            serde_json::to_value(storage.fetch_messages(first.conversation_id).unwrap()).unwrap(),
+            before
+        );
+
+        let mut packet = legacy.clone();
+        packet.messages[0].extra_json["chatgpt_message_id"] = serde_json::json!("node-a");
+        let mut duplicate_envelope = packet.messages[0].clone();
+        duplicate_envelope.extra_json["chatgpt_message_id"] = serde_json::json!("node-b");
+        packet.messages.push(duplicate_envelope);
+        assert!(
+            plan_chatgpt_snapshot(&legacy.messages, &packet).is_err(),
+            "two native nodes cannot claim one legacy row"
+        );
+        assert!(
+            plan_chatgpt_snapshot(
+                &[legacy.messages[0].clone(), legacy.messages[0].clone()],
+                &Conversation {
+                    messages: vec![packet.messages[0].clone()],
+                    ..packet
+                }
+            )
+            .is_err(),
+            "an incoming node cannot guess between identical legacy rows"
+        );
     }
 
     fn gh423_storage_snapshot() -> Conversation {
