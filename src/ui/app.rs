@@ -4824,11 +4824,19 @@ fn match_mode_token(mode: MatchMode) -> &'static str {
 }
 
 /// What the user must do for semantic or hybrid search to use the model, or
-/// `None` when it already can (or is being prepared). Until then those modes
-/// return lexical results. cass never downloads a model without an explicit
-/// command, so this names the command (2l1b0.66).
-fn semantic_mode_guidance(availability: &SemanticAvailability) -> Option<String> {
+/// `None` when it already can (or is being prepared). Hybrid keeps lexical
+/// results available; explicit Semantic reports its failure. cass never
+/// downloads a model without an explicit command (2l1b0.66).
+fn semantic_mode_guidance(
+    availability: &SemanticAvailability,
+    requested_mode: SearchMode,
+) -> Option<String> {
     use SemanticAvailability as S;
+    let outcome = match requested_mode {
+        SearchMode::Lexical => return None,
+        SearchMode::Semantic => "semantic search is unavailable",
+        SearchMode::Hybrid => "results stay lexical",
+    };
     match availability {
         S::Ready { .. }
         | S::HashFallback
@@ -4836,17 +4844,16 @@ fn semantic_mode_guidance(availability: &SemanticAvailability) -> Option<String>
         | S::Verifying
         | S::IndexBuilding { .. }
         | S::UpdateAvailable { .. } => None,
-        S::NotInstalled | S::NeedsConsent | S::ModelMissing { .. } => Some(
-            "results stay lexical until the MiniLM model is installed: run `cass models install` \
+        S::NotInstalled | S::NeedsConsent | S::ModelMissing { .. } => Some(format!(
+            "{outcome} until the MiniLM model is installed: run `cass models install` \
              (offline: `cass models install --from-file <dir>`)"
-                .to_string(),
-        ),
+        )),
         S::IndexMissing { .. } | S::IndexStale { .. } => Some(format!(
-            "results stay lexical ({}): run `cass index --semantic`",
+            "{outcome} ({}): run `cass index --semantic`",
             availability.summary()
         )),
         S::Disabled { .. } | S::DatabaseUnavailable { .. } | S::LoadFailed { .. } => {
-            Some(format!("results stay lexical ({})", availability.summary()))
+            Some(format!("{outcome} ({})", availability.summary()))
         }
     }
 }
@@ -9241,6 +9248,13 @@ impl CassApp {
                 }
             }
 
+            if failed_search {
+                Paragraph::new(ftui::text::Text::from_lines(lines))
+                    .style(text_muted_style)
+                    .wrap(ftui::text::WrapMode::Word)
+                    .render(inner, frame);
+                return;
+            }
             let y_offset = inner.height.saturating_sub(lines.len() as u16) / 3;
             let avail = inner.height.saturating_sub(y_offset);
             if avail > 0 {
@@ -9352,6 +9366,13 @@ impl CassApp {
                             subtle_s,
                         ),
                     ]));
+                }
+                if failed_search {
+                    Paragraph::new(ftui::text::Text::from_lines(zero_lines))
+                        .style(text_muted_style)
+                        .wrap(ftui::text::WrapMode::Word)
+                        .render(inner, frame);
+                    return;
                 }
                 let y_off = inner.height.saturating_sub(zero_lines.len() as u16) / 3;
                 let block_area = Rect::new(
@@ -15948,11 +15969,11 @@ impl SearchService for TantivySearchService {
             }
         };
 
-        // Semantic/hybrid modes can be unavailable if embedders are not installed.
-        // Fall back to lexical so typing always returns results instead of no-op.
+        // Hybrid keeps lexical results available without semantic assets.
+        // An explicit Semantic request must preserve the backend failure.
         let (backend, semantic_coverage) = match execute_mode(requested_mode) {
             Ok(result) => result,
-            Err(err) if matches!(requested_mode, SearchMode::Semantic | SearchMode::Hybrid) => {
+            Err(err) if matches!(requested_mode, SearchMode::Hybrid) => {
                 execute_mode(SearchMode::Lexical).map_err(|fallback_err| {
                     format!("search failed ({err}); lexical fallback failed: {fallback_err}")
                 })?
@@ -17637,9 +17658,24 @@ impl super::ftui_adapter::Model for CassApp {
                 }
                 ftui::Cmd::none()
             }
-            CassMsg::SearchFailed { generation, error } => {
+            CassMsg::SearchFailed {
+                generation,
+                mut error,
+            } => {
                 if generation != self.search_generation {
                     return ftui::Cmd::none();
+                }
+                let requested_mode = self
+                    .live_search_request
+                    .as_ref()
+                    .filter(|request| request.generation == generation)
+                    .map_or(self.search_mode, |request| request.params.mode);
+                if requested_mode == SearchMode::Semantic
+                    && let Some(guidance) =
+                        semantic_mode_guidance(&self.semantic_availability, requested_mode)
+                {
+                    error.push_str("; ");
+                    error.push_str(&guidance);
                 }
                 self.search_in_flight = false;
                 self.search_refining = false;
@@ -17838,11 +17874,11 @@ impl super::ftui_adapter::Model for CassApp {
                     search_mode_str(self.search_mode),
                     shortcuts::SEARCH_MODE
                 );
-                // Semantic and hybrid fall back to lexical silently when the
-                // model or vectors are missing; say so, with the command,
-                // because cass never downloads a model on its own (2l1b0.66).
+                // Name the recovery command and the selected mode's behavior;
+                // cass never downloads a model on its own (2l1b0.66).
                 if self.search_mode != SearchMode::Lexical
-                    && let Some(guidance) = semantic_mode_guidance(&self.semantic_availability)
+                    && let Some(guidance) =
+                        semantic_mode_guidance(&self.semantic_availability, self.search_mode)
                 {
                     self.status.push_str(": ");
                     self.status.push_str(&guidance);
@@ -26728,6 +26764,175 @@ mod tests {
         assert_eq!(prefix_match_query("NOT x AND yy"), "NOT x AND yy*");
     }
 
+    fn semantic_mode_fixture() -> (tempfile::TempDir, TantivySearchService) {
+        let mut builder = tempfile::Builder::new();
+        builder
+            .prefix("cass-tui-semantic-mode-")
+            .disable_cleanup(true);
+        #[cfg(unix)]
+        let dir = builder.tempdir_in("/tmp").expect("private native index");
+        #[cfg(not(unix))]
+        let dir = builder.tempdir().expect("private native index");
+        let mut index = crate::search::tantivy::TantivyIndex::open_or_create(dir.path())
+            .expect("create native lexical index");
+        for (id, agent) in [(1, "codex"), (2, "codex"), (3, "codex"), (4, "claude_code")] {
+            index
+                .add_conversation(&crate::connectors::NormalizedConversation {
+                    agent_slug: agent.into(),
+                    external_id: Some(format!("mode-{id}")),
+                    title: Some(format!("Mode fixture {id}")),
+                    workspace: Some("/tui-mode-fixture".into()),
+                    source_path: dir.path().join(format!("session-{id}.jsonl")),
+                    started_at: Some(1_700_000_000_000 + id),
+                    ended_at: None,
+                    metadata: serde_json::json!({}),
+                    messages: vec![crate::connectors::NormalizedMessage {
+                        idx: 0,
+                        role: "user".into(),
+                        author: None,
+                        created_at: Some(1_700_000_000_000 + id),
+                        content: format!("tuisemanticmodeprobe document {id}"),
+                        extra: serde_json::json!({}),
+                        snippets: vec![],
+                        invocations: vec![],
+                    }],
+                })
+                .expect("write actual indexed messages");
+        }
+        index.commit().expect("publish lexical fixture");
+        drop(index);
+        let client = crate::search::query::SearchClient::open_with_options(
+            dir.path(),
+            None,
+            crate::search::query::SearchClientOptions {
+                enable_reload: false,
+                enable_warm: false,
+                strict_read_only: true,
+            },
+        )
+        .expect("open actual lexical reader")
+        .expect("published index exists");
+        assert!(!client.can_progressively_refine());
+        (dir, TantivySearchService::new(Arc::new(client)))
+    }
+
+    fn semantic_mode_params(pass: SearchPass, mode: SearchMode, offset: usize) -> SearchParams {
+        SearchParams {
+            query: "tuisemanticmodeprobe".into(),
+            filters: SearchFilters {
+                agents: HashSet::from(["codex".into()]),
+                workspaces: HashSet::from(["/tui-mode-fixture".into()]),
+                ..SearchFilters::default()
+            },
+            pass,
+            mode,
+            match_mode: MatchMode::Standard,
+            ranking: RankingMode::Balanced,
+            context_window: ContextWindow::Medium,
+            limit: 1,
+            offset,
+        }
+    }
+
+    #[test]
+    fn semantic_mode_execute_preserves_errors_and_hybrid_lexical_results() {
+        let (_dir, service) = semantic_mode_fixture();
+        for pass in [
+            SearchPass::Interactive,
+            SearchPass::Upgrade,
+            SearchPass::Pagination,
+        ] {
+            for offset in [0, 1] {
+                let mut params = semantic_mode_params(pass, SearchMode::Lexical, offset);
+                let lexical = service
+                    .execute(&params)
+                    .expect("real lexical positive control");
+                assert_eq!(lexical.hits.len(), 1);
+                params.mode = SearchMode::Hybrid;
+                let hybrid = service
+                    .execute(&params)
+                    .expect("Hybrid keeps lexical results");
+                assert_eq!(hybrid.hits.len(), lexical.hits.len());
+                for (actual, expected) in hybrid.hits.iter().zip(&lexical.hits) {
+                    assert_eq!(actual.source_path, expected.source_path);
+                    assert_eq!(actual.agent, "codex");
+                    assert_eq!(actual.workspace, "/tui-mode-fixture");
+                }
+                params.mode = SearchMode::Semantic;
+                let error = service
+                    .execute(&params)
+                    .expect_err("explicit Semantic cannot return lexical success");
+                assert!(error.contains("semantic"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_mode_failed_search_keeps_original_request_guidance() {
+        let (_dir, service) = semantic_mode_fixture();
+        let params = semantic_mode_params(SearchPass::Interactive, SearchMode::Semantic, 0);
+        let error = service
+            .execute(&params)
+            .expect_err("actual missing-assets error");
+        for (availability, command) in [
+            (SemanticAvailability::NotInstalled, "cass models install"),
+            (
+                SemanticAvailability::IndexMissing {
+                    index_path: PathBuf::from("/missing-vectors"),
+                },
+                "cass index --semantic",
+            ),
+        ] {
+            for visible_mode in [SearchMode::Semantic, SearchMode::Hybrid] {
+                let mut app = CassApp::default();
+                app.query = params.query.clone();
+                app.filters = params.filters.clone();
+                app.semantic_availability = availability.clone();
+                app.search_mode = visible_mode;
+                app.search_generation = 17;
+                app.search_in_flight = true;
+                app.search_refining = true;
+                app.live_search_request = Some(LiveSearchRequest {
+                    generation: 17,
+                    params: params.clone(),
+                    progressive: true,
+                });
+                let _ = app.update(CassMsg::SearchFailed {
+                    generation: 17,
+                    error: error.clone(),
+                });
+                assert!(app.status.contains(command), "{}", app.status);
+                assert!(
+                    !app.status.contains("results stay lexical"),
+                    "{}",
+                    app.status
+                );
+                assert!(
+                    app.search_error_message
+                        .as_ref()
+                        .is_some_and(|message| message.contains(command))
+                );
+                assert_eq!(app.query, params.query);
+                assert_eq!(app.filters, params.filters);
+                assert!(!app.search_in_flight && !app.search_refining);
+                assert!(app.live_search_request.is_none());
+                for width in [64, 120] {
+                    let text = ftui_harness::buffer_to_text(&render_at_degradation(
+                        &app,
+                        width,
+                        24,
+                        ftui::render::budget::DegradationLevel::Full,
+                    ));
+                    assert!(text.contains("Search failed"), "{text}");
+                    assert!(
+                        text.contains(command.split_whitespace().last().unwrap()),
+                        "{text}"
+                    );
+                }
+            }
+        }
+    }
+
     /// 2l1b0.66: with no model installed, Alt+S to semantic or hybrid only
     /// said "Search mode: semantic" while results silently stayed lexical;
     /// nothing in the TUI named `cass models install`.
@@ -26742,10 +26947,25 @@ mod tests {
         assert_eq!(app.search_mode, SearchMode::Semantic);
         assert!(app.status.contains("cass models install"), "{}", app.status);
         assert!(app.status.contains("--from-file"), "{}", app.status);
+        assert!(
+            app.status.contains("semantic search is unavailable"),
+            "{}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("results stay lexical"),
+            "{}",
+            app.status
+        );
 
         let _ = app.update(CassMsg::SearchModeCycled);
         assert_eq!(app.search_mode, SearchMode::Hybrid);
         assert!(app.status.contains("cass models install"), "{}", app.status);
+        assert!(
+            app.status.contains("results stay lexical"),
+            "{}",
+            app.status
+        );
 
         let _ = app.update(CassMsg::SearchModeCycled);
         assert_eq!(app.search_mode, SearchMode::Lexical);
@@ -26768,9 +26988,14 @@ mod tests {
         app.semantic_availability = SemanticAvailability::IndexMissing {
             index_path: PathBuf::from("/data/vector_index"),
         };
-        let guidance = semantic_mode_guidance(&app.semantic_availability).unwrap();
+        let guidance =
+            semantic_mode_guidance(&app.semantic_availability, SearchMode::Semantic).unwrap();
         assert!(guidance.contains("cass index --semantic"), "{guidance}");
         assert!(!guidance.contains("models install"), "{guidance}");
+        assert!(!guidance.contains("results stay lexical"), "{guidance}");
+        let hybrid =
+            semantic_mode_guidance(&app.semantic_availability, SearchMode::Hybrid).unwrap();
+        assert!(hybrid.contains("results stay lexical"), "{hybrid}");
     }
 
     /// 2l1b0.55: F9 toggled a PFX/STD status token while every search ran the
