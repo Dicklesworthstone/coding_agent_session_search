@@ -8,10 +8,9 @@
 //!
 //! Bare `cargo build|test|bench|clippy|run|check|fmt|update|install` outside
 //! of comments/strings is a violation UNLESS one of these holds:
-//!   - The line is preceded (in the same logical command) by `rch exec --`.
-//!   - The invocation appears inside a `run_cargo()` function body or via
-//!     `$RCH_BIN exec --` substitution.
-//!   - The line defines a function named `*cargo*` (definition, not call).
+//!   - The invocation belongs to an `rch exec --` command (also accepting
+//!     RCH options and a quoted or unquoted `$RCH_BIN` program).
+//!   - The current command calls or defines the `run_cargo` helper.
 //!   - gate.sh's formatter callback is serialized into its remote command.
 //!
 //! ## Compliance rule 2: avoid `set -e + ((VAR++))`
@@ -180,6 +179,78 @@ fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Keep quoted descriptions as single words and reset at command separators.
+/// Parenthesized commands get their own words; after they close, their text
+/// remains part of one outer argument. This prevents local `$(cargo test)`
+/// from borrowing an outer RCH wrapper without rejecting wrapped commands
+/// that obtain an argument through a command substitution.
+fn command_words_before(line: &str, end: usize, quote_state: (bool, bool)) -> Vec<String> {
+    let (mut in_single, mut in_double) = quote_state;
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut parents = Vec::new();
+    let mut escaped = false;
+    for ch in line[..end].chars() {
+        if escaped {
+            word.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if !in_single => escaped = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '(' if !in_single && !in_double => {
+                parents.push((std::mem::take(&mut words), std::mem::take(&mut word)));
+            }
+            ')' if !in_single && !in_double => {
+                if let Some((outer_words, mut outer_word)) = parents.pop() {
+                    words = outer_words;
+                    outer_word.push_str("()");
+                    word = outer_word;
+                } else {
+                    words.clear();
+                    word.clear();
+                }
+            }
+            ';' | '|' | '&' if !in_single && !in_double => {
+                words.clear();
+                word.clear();
+            }
+            ch if !in_single && !in_double && ch.is_ascii_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word).to_ascii_lowercase());
+                }
+            }
+            _ => word.push(ch),
+        }
+    }
+    if !word.is_empty() {
+        words.push(word.to_ascii_lowercase());
+    }
+    words
+}
+
+fn cargo_has_remote_wrapper(words: &[String]) -> bool {
+    words.iter().enumerate().any(|(index, word)| {
+        if matches!(word.as_str(), "run_cargo" | "run_cargo()") {
+            return true;
+        }
+        if !matches!(word.as_str(), "rch" | "$rch_bin" | "${rch_bin}") {
+            return false;
+        }
+        let arguments = &words[index + 1..];
+        arguments
+            .iter()
+            .position(|argument| argument == "exec")
+            .is_some_and(|exec| {
+                arguments[exec + 1..]
+                    .iter()
+                    .any(|argument| argument == "--")
+            })
+    })
+}
+
 #[derive(Debug, Clone)]
 struct Finding {
     path: PathBuf,
@@ -218,6 +289,7 @@ fn scan_shell_body_for_bare_cargo(path: &Path, body: &str) -> Vec<Finding> {
         }
         // Shell assignments can contain a multiline remote script. Carry the
         // quote state even through lines that contain no cargo command.
+        let line_quote_state = quote_state;
         let cargo_positions = cargo_spans_outside_quotes(line, &mut quote_state);
         if !cargo_subcmd_re.is_match(line) {
             continue;
@@ -227,42 +299,22 @@ fn scan_shell_body_for_bare_cargo(path: &Path, body: &str) -> Vec<Finding> {
         if cargo_positions.is_empty() {
             continue;
         }
-        // For each unquoted `cargo` token, confirm the cargo_subcmd_re actually
-        // matches starting at that position; if all matches were inside
-        // quotes, treat the line as clean.
-        let mut has_real_match = false;
-        for (start, _end) in &cargo_positions {
+        // A wrapper must belong to this Cargo invocation's command. Quoted
+        // descriptions, later wrappers and neighboring commands cannot
+        // exempt an otherwise bare invocation on the same logical line.
+        let has_bare_match = cargo_positions.iter().any(|(start, _end)| {
             let tail = &line[*start..];
-            if cargo_subcmd_re
+            cargo_subcmd_re
                 .find(tail)
                 .is_some_and(|matched| matched.start() == 0)
-            {
-                has_real_match = true;
-                break;
-            }
-        }
-        if !has_real_match {
+                && !cargo_has_remote_wrapper(&command_words_before(line, *start, line_quote_state))
+        });
+        if !has_bare_match {
             continue;
         }
         // This exact callback is copied into the admitted remote command by
         // declare -f. Keep scanning every command outside its function body.
         if in_gate_formatter {
-            continue;
-        }
-        // Skip lines that ARE the rch-wrapped form. The wrapped form contains
-        // `rch exec --` or runs through `run_cargo` / `$RCH_BIN exec --`.
-        let lower = line.to_ascii_lowercase();
-        if lower.contains("rch exec --")
-            || lower.contains("$rch_bin exec --")
-            || lower.contains("\"$rch_bin\" exec --")
-            || lower.contains("${rch_bin} exec --")
-            // Definition site of run_cargo
-            || lower.contains("run_cargo()")
-            || lower.contains("function run_cargo")
-            || lower.contains("run_cargo ()")
-            // Call to run_cargo (the helper IS the wrap)
-            || lower.contains("run_cargo ")
-        {
             continue;
         }
         // Trim a snippet for reporting; truncate excessively long joined
