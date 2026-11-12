@@ -483,7 +483,15 @@ fn gh496_count_refresh_cannot_complete_or_overwrite_an_incomplete_staged_audit()
     let scratch = staged_lexical_rebuild_scratch_path(&fixture.index_path);
     let candidate_manifest = fs::read(scratch.join("MANIFEST")).unwrap();
     let storage = FrankenStorage::open_strict_readonly(&fixture.db_path).unwrap();
-    let db_state = lexical_rebuild_db_state(&storage, &fixture.db_path).unwrap();
+    // This probe needs exact live coverage; the structural helper deliberately
+    // omits message totals. Match the production refresh's counted inputs.
+    let db_state = lexical_rebuild_db_state_with_exact_totals(
+        &storage,
+        &fixture.db_path,
+        count_total_conversations_exact(&storage).unwrap(),
+        count_total_messages_exact(&storage).unwrap(),
+    )
+    .unwrap();
     let observed_docs = live_tantivy_doc_count(&fixture.index_path).unwrap();
     assert_eq!(observed_docs, Some(db_state.total_messages));
     assert!(
