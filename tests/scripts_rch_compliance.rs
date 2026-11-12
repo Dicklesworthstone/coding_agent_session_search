@@ -824,6 +824,34 @@ fn scanner_flags_bare_cargo_in_synthetic_fixture() {
         findings.len()
     );
     assert!(findings[0].snippet.contains("cargo build"));
+
+    let mut missed = Vec::new();
+    for body in [
+        "echo 'rch exec --'; cargo build",
+        "echo \"rch exec --\"; cargo test",
+        "RCH_MESSAGE='rch exec --' cargo check",
+        "cargo build; echo 'rch exec --'",
+        "rch exec -- cargo build; cargo test",
+        "cargo check && rch exec -- cargo test",
+        "run_cargo build && cargo test",
+        "cargo check || run_cargo build",
+        "echo 'run_cargo '; cargo check",
+        "echo '$RCH_BIN exec --'; cargo test",
+        r#"echo '"$RCH_BIN" exec --'; cargo test"#,
+        "rch exec -- echo $(cargo test)",
+        "rch exec -- cargo test | cargo check",
+        "cargo build & rch exec -- cargo check",
+    ] {
+        let findings = scan_shell_body_for_bare_cargo(Path::new("mixed.sh"), body);
+        if findings.len() != 1 {
+            missed.push((body, findings));
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "scanner missed {} bare Cargo inputs: {missed:?}",
+        missed.len()
+    );
 }
 
 #[test]
@@ -840,6 +868,30 @@ fn scanner_does_not_flag_run_cargo_calls() {
     assert!(
         findings.is_empty(),
         "clean script should yield zero findings; got {findings:?}"
+    );
+
+    let mut rejected = Vec::new();
+    for body in [
+        r#"rch exec -- env CARGO_TARGET_DIR="/tmp/with spaces" cargo test"#,
+        "true && rch exec -- cargo test",
+        "rch exec -- cargo test; rch exec -- cargo check",
+        r#""$RCH_BIN" exec -- cargo build"#,
+        r#""${RCH_BIN}" exec -- cargo build"#,
+        "${RCH_BIN} exec -- cargo build",
+        "rch --no-self-healing exec --source-content-receipt -- cargo check",
+        "rch exec -- env DIR=$(mktemp -d) cargo test",
+        "(rch exec -- cargo check)",
+        r#"run_cargo() { rch exec -- cargo "$@"; }"#,
+    ] {
+        let findings = scan_shell_body_for_bare_cargo(Path::new("wrapped.sh"), body);
+        if !findings.is_empty() {
+            rejected.push((body, findings));
+        }
+    }
+    assert!(
+        rejected.is_empty(),
+        "scanner rejected {} wrapped Cargo inputs: {rejected:?}",
+        rejected.len()
     );
 }
 
