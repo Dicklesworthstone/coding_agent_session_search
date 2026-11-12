@@ -893,6 +893,10 @@ fn scanner_flags_bare_cargo_in_synthetic_fixture() {
         "rch exec -- echo $(cargo test)",
         "rch exec -- cargo test | cargo check",
         "cargo build & rch exec -- cargo check",
+        "run_cargo() { cargo build; }",
+        "function run_cargo { cargo test; }",
+        "function run_cargo() { cargo check; }",
+        "function rch { exec -- cargo build; }",
     ] {
         let findings = scan_shell_body_for_bare_cargo(Path::new("mixed.sh"), body);
         if findings.len() != 1 {
@@ -934,6 +938,11 @@ fn scanner_does_not_flag_run_cargo_calls() {
         "rch exec -- env DIR=$(mktemp -d) cargo test",
         "(rch exec -- cargo check)",
         r#"run_cargo() { rch exec -- cargo "$@"; }"#,
+        "run_cargo() { rch exec -- cargo build; }",
+        "function run_cargo { rch exec -- cargo test; }",
+        "function rch { command rch exec -- cargo check; }",
+        "rch exec -- env -u '{' cargo test",
+        r"rch exec -- env -u \{ cargo test",
     ] {
         let findings = scan_shell_body_for_bare_cargo(Path::new("wrapped.sh"), body);
         if !findings.is_empty() {
