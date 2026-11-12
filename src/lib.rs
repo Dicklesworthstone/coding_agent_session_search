@@ -21250,8 +21250,6 @@ async fn import_chatgpt_export(
     output_dir: Option<&Path>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    use std::io::Write;
-
     // Validate export file exists
     if !export_path.exists() {
         return Err(CliError {
@@ -21319,41 +21317,53 @@ async fn import_chatgpt_export(
 
     let total = conversations.len();
     let mut imported = 0u64;
+    let mut updated = 0u64;
     let mut skipped = 0u64;
+
+    // Serialize read/merge/publish across importers. Atomic rename protects
+    // readers, but two importers must not both merge against the same old file.
+    let import_lock_path = base_dir.join(".chatgpt-import.lock");
+    let import_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&import_lock_path)
+        .map_err(|e| CliError {
+            code: 1,
+            kind: CliErrorKind::Io.kind_str(),
+            message: format!("Failed to open {}: {e}", import_lock_path.display()),
+            hint: None,
+            retryable: false,
+        })?;
+    fs2::FileExt::try_lock_exclusive(&import_lock).map_err(|e| CliError {
+        code: 7,
+        kind: CliErrorKind::Io.kind_str(),
+        message: format!("Cannot acquire ChatGPT import lock: {e}"),
+        hint: Some("Wait for the other import into this directory to finish, then retry".into()),
+        retryable: true,
+    })?;
 
     for conv in &conversations {
         let filepath = conv_dir.join(format!("{}.json", chatgpt_import_file_stem(conv)));
-
-        // Idempotent: skip if already exists
-        if filepath.exists() {
-            skipped += 1;
-            continue;
+        let change = store_chatgpt_import_conversation(&filepath, conv).map_err(|e| CliError {
+            code: 1,
+            kind: if e.kind() == io::ErrorKind::InvalidData {
+                CliErrorKind::ParseError.kind_str()
+            } else {
+                CliErrorKind::Io.kind_str()
+            },
+            message: format!("Failed to import {}: {e}", filepath.display()),
+            hint: Some(
+                "The existing conversation is preserved on validation or staging failure".into(),
+            ),
+            retryable: false,
+        })?;
+        match change {
+            ChatGptImportChange::Imported => imported += 1,
+            ChatGptImportChange::Updated => updated += 1,
+            ChatGptImportChange::Unchanged => skipped += 1,
         }
-
-        // Write individual conversation file
-        let mut file = std::fs::File::create(&filepath).map_err(|e| CliError {
-            code: 1,
-            kind: CliErrorKind::Io.kind_str(),
-            message: format!("Failed to write {}: {e}", filepath.display()),
-            hint: None,
-            retryable: false,
-        })?;
-        serde_json::to_writer(&mut file, conv).map_err(|e| CliError {
-            code: 1,
-            kind: CliErrorKind::Io.kind_str(),
-            message: format!("Failed to serialize conversation: {e}"),
-            hint: None,
-            retryable: false,
-        })?;
-        file.flush().map_err(|e| CliError {
-            code: 1,
-            kind: CliErrorKind::Io.kind_str(),
-            message: format!("Failed to flush: {e}"),
-            hint: None,
-            retryable: false,
-        })?;
-
-        imported += 1;
     }
 
     // GH #378: the indexer only scans a connector's *default* roots when
@@ -21399,6 +21409,7 @@ async fn import_chatgpt_export(
             "success": true,
             "total": total,
             "imported": imported,
+            "updated": updated,
             "skipped": skipped,
             "output_dir": conv_dir.display().to_string(),
             "scan_root": registered_scan_root.as_ref().map(|state| serde_json::json!({
@@ -21415,7 +21426,8 @@ async fn import_chatgpt_export(
         println!("Import complete!");
         println!("  Total conversations: {total}");
         println!("  Newly imported:      {imported}");
-        println!("  Skipped (existing):  {skipped}");
+        println!("  Updated existing:    {updated}");
+        println!("  Skipped (unchanged): {skipped}");
         println!("  Output directory:    {}", conv_dir.display());
         if let Some(state) = registered_scan_root {
             println!(
@@ -21429,6 +21441,219 @@ async fn import_chatgpt_export(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatGptImportChange {
+    Imported,
+    Updated,
+    Unchanged,
+}
+
+/// Refresh an imported snapshot without discarding nodes omitted by a partial
+/// export. The caller holds the directory's import lock until publication.
+fn store_chatgpt_import_conversation(
+    path: &Path,
+    incoming: &serde_json::Value,
+) -> io::Result<ChatGptImportChange> {
+    if !incoming.is_object() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected a conversation object",
+        ));
+    }
+    let existing = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "refusing to replace a non-regular conversation file",
+            ));
+        }
+        Ok(_) => {
+            let bytes = std::fs::read(path)?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Some(value)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let (snapshot, change) = if let Some(existing) = existing {
+        if existing == *incoming {
+            return Ok(ChatGptImportChange::Unchanged);
+        }
+        let merged = merge_chatgpt_import_snapshots(&existing, incoming)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if merged == existing {
+            return Ok(ChatGptImportChange::Unchanged);
+        }
+        (merged, ChatGptImportChange::Updated)
+    } else {
+        (incoming.clone(), ChatGptImportChange::Imported)
+    };
+    publish_chatgpt_import_snapshot(path, change == ChatGptImportChange::Updated, |file| {
+        serde_json::to_writer(file, &snapshot).map_err(io::Error::other)
+    })?;
+    Ok(change)
+}
+
+/// Changed web-export mappings are merged by their stable node keys. Unknown
+/// shapes or conflicting identities are refused instead of guessing a merge.
+fn merge_chatgpt_import_snapshots(
+    existing: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> Result<serde_json::Value, &'static str> {
+    use serde_json::Value;
+
+    let conversation_id = |value: &Value| {
+        value
+            .get("id")
+            .or_else(|| value.get("conversation_id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_owned)
+    };
+    let existing_id = conversation_id(existing);
+    if existing_id.is_none() || existing_id != conversation_id(incoming) {
+        return Err("existing and incoming conversation identities do not match");
+    }
+    let existing_mapping = existing
+        .get("mapping")
+        .and_then(Value::as_object)
+        .ok_or("cannot safely refresh an existing conversation without a mapping object")?;
+    let incoming_mapping = incoming
+        .get("mapping")
+        .and_then(Value::as_object)
+        .ok_or("cannot safely refresh from a conversation without a mapping object")?;
+    let update_time = |value: &Value| value.get("update_time").and_then(Value::as_f64);
+    let incoming_is_older = matches!(
+        (update_time(existing), update_time(incoming)),
+        (Some(old), Some(new)) if new < old
+    );
+
+    let mut merged = existing.clone();
+    let merged_object = merged
+        .as_object_mut()
+        .ok_or("existing conversation is not an object")?;
+    // Preserve absent metadata; a dated older export cannot roll metadata back.
+    if !incoming_is_older {
+        for (key, value) in incoming
+            .as_object()
+            .ok_or("incoming conversation is not an object")?
+        {
+            if key != "mapping"
+                && !(key == "update_time"
+                    && value.as_f64().is_none()
+                    && update_time(existing).is_some())
+            {
+                merged_object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    let mut mapping = existing_mapping.clone();
+    for node in existing_mapping.values().chain(incoming_mapping.values()) {
+        if !node.is_object()
+            || node
+                .get("message")
+                .is_some_and(|message| !message.is_null() && !message.is_object())
+        {
+            return Err("mapping contains a malformed node or message");
+        }
+    }
+    for (key, node) in incoming_mapping {
+        let Some(previous) = mapping.get(key) else {
+            mapping.insert(key.clone(), node.clone());
+            continue;
+        };
+        let old_message = previous.get("message").filter(|value| !value.is_null());
+        let new_message = node.get("message").filter(|value| !value.is_null());
+        let mut node_is_older = incoming_is_older;
+        if let (Some(old), Some(new)) = (old_message, new_message) {
+            if let (Some(old_id), Some(new_id)) = (
+                old.get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty()),
+                new.get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty()),
+            ) && old_id != new_id
+            {
+                return Err("a mapping node changed its native message identity");
+            }
+            // Message-level revision times are more precise than conversation
+            // metadata when only one of the messages was edited.
+            if let (Some(old), Some(new)) = (update_time(old), update_time(new))
+                && old != new
+            {
+                node_is_older = new < old;
+            }
+        }
+        // Missing/null messages and stale snapshots are not deletion requests.
+        if (old_message.is_some() && new_message.is_none())
+            || (node_is_older && !(old_message.is_none() && new_message.is_some()))
+        {
+            continue;
+        }
+        let mut merged_node = previous.clone();
+        merge_chatgpt_import_node(&mut merged_node, node);
+        mapping.insert(key.clone(), merged_node);
+    }
+    merged_object.insert("mapping".into(), Value::Object(mapping));
+    Ok(merged)
+}
+
+// A partial node may omit message/content fields as well as entire nodes. Keep
+// omitted fields; arrays (including ordered content parts) remain indivisible.
+fn merge_chatgpt_import_node(existing: &mut serde_json::Value, incoming: &serde_json::Value) {
+    if let (Some(old), Some(new)) = (existing.as_object_mut(), incoming.as_object()) {
+        for (key, value) in new {
+            if let Some(previous) = old.get_mut(key) {
+                // An absent native ID is not permission to replace an existing
+                // stable identity with the mapping-node fallback.
+                if key == "id"
+                    && previous.as_str().is_some_and(|id| !id.trim().is_empty())
+                    && !value.as_str().is_some_and(|id| !id.trim().is_empty())
+                {
+                    continue;
+                }
+                if key != "update_time" || value.as_f64().is_some() || previous.as_f64().is_none() {
+                    merge_chatgpt_import_node(previous, value);
+                }
+            } else {
+                old.insert(key.clone(), value.clone());
+            }
+        }
+    } else {
+        *existing = incoming.clone();
+    }
+}
+
+/// Stage a complete file beside its destination. Readers see the complete old
+/// or new snapshot, never a truncated in-place rewrite.
+fn publish_chatgpt_import_snapshot(
+    path: &Path,
+    replace: bool,
+    write_staged: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conversation path has no parent",
+        )
+    })?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".cass-chatgpt-import-")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    write_staged(staged.as_file_mut())?;
+    staged.as_file_mut().flush()?;
+    staged.as_file().sync_all()?;
+    if replace {
+        staged.persist(path).map_err(|e| e.error)?;
+    } else {
+        staged.persist_noclobber(path).map_err(|e| e.error)?;
+    }
+    sync_export_parent_directory(path)
 }
 
 /// File stem for one imported ChatGPT conversation.
@@ -21495,6 +21720,383 @@ mod chatgpt_import_file_stem_tests {
         let b = serde_json::json!({ "title": "second" });
         assert_ne!(chatgpt_import_file_stem(&a), chatgpt_import_file_stem(&b));
         assert_eq!(chatgpt_import_file_stem(&a), chatgpt_import_file_stem(&a));
+    }
+}
+
+#[cfg(test)]
+mod chatgpt_import_refresh_tests {
+    use super::{
+        ChatGptImportChange, publish_chatgpt_import_snapshot, store_chatgpt_import_conversation,
+    };
+    use serde_json::{Value, json};
+    use std::io::{self, Write};
+    use std::path::Path;
+
+    fn snapshot() -> Value {
+        json!({
+            "id": "growing-chat",
+            "title": "Current title",
+            "update_time": 20,
+            "mapping": {
+                "early": {
+                    "message": {
+                        "id": "native-early",
+                        "author": {"role": "user"},
+                        "create_time": 1,
+                        "update_time": 20,
+                        "content": {"content_type": "text", "parts": ["Existing prompt"]}
+                    }
+                },
+                "later": {
+                    "parent": "early",
+                    "message": {
+                        "id": "native-later",
+                        "author": {"role": "assistant"},
+                        "create_time": 3,
+                        "content": {"content_type": "text", "parts": ["Existing reply"]}
+                    }
+                }
+            }
+        })
+    }
+
+    fn read_snapshot(path: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn gh552_semantically_identical_import_preserves_bytes_and_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growing-chat.json");
+        let original = snapshot();
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &original).unwrap(),
+            ChatGptImportChange::Imported
+        );
+        let pretty = serde_json::to_vec_pretty(&original).unwrap();
+        std::fs::write(&path, &pretty).unwrap();
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567_890);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &original).unwrap(),
+            ChatGptImportChange::Unchanged
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), pretty);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), modified);
+    }
+
+    #[test]
+    fn gh552_refresh_retains_history_and_admits_interleaved_voice_nodes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growing-chat.json");
+        let original = snapshot();
+        store_chatgpt_import_conversation(&path, &original).unwrap();
+        let mut incoming = json!({
+            "id": "growing-chat",
+            "title": "Updated title",
+            "update_time": 30,
+            "mapping": {
+                "voice": {
+                    "parent": "early",
+                    "message": {
+                        "id": "native-voice",
+                        "author": {"role": "user"},
+                        "create_time": 2,
+                        "content": {
+                            "content_type": "multimodal_text",
+                            "parts": [
+                                {"content_type": "audio_transcription", "text": "Recovered voice"},
+                                {"content_type": "audio_asset_pointer", "asset_pointer": "file://audio"}
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &incoming).unwrap(),
+            ChatGptImportChange::Updated
+        );
+        let refreshed = read_snapshot(&path);
+        assert_eq!(refreshed["mapping"].as_object().unwrap().len(), 3);
+        assert_eq!(refreshed["title"], "Updated title");
+        assert_eq!(refreshed["mapping"]["early"], original["mapping"]["early"]);
+        assert_eq!(refreshed["mapping"]["later"], original["mapping"]["later"]);
+        assert_eq!(refreshed["mapping"]["voice"], incoming["mapping"]["voice"]);
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &incoming).unwrap(),
+            ChatGptImportChange::Unchanged
+        );
+
+        // Ordered content arrays are indivisible; do not concatenate revisions.
+        incoming["update_time"] = json!(40);
+        incoming["mapping"]["voice"]["message"]["content"]["parts"] =
+            json!(["Replacement preface", {
+                "content_type": "audio_transcription", "text": "Replacement voice"
+            }]);
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &incoming).unwrap(),
+            ChatGptImportChange::Updated
+        );
+        let replaced = read_snapshot(&path);
+        assert_eq!(
+            replaced["mapping"]["voice"]["message"]["content"]["parts"],
+            incoming["mapping"]["voice"]["message"]["content"]["parts"]
+        );
+        assert_eq!(replaced["mapping"]["early"], original["mapping"]["early"]);
+        assert_eq!(replaced["mapping"]["later"], original["mapping"]["later"]);
+    }
+
+    #[test]
+    fn gh552_older_partial_import_adds_missing_nodes_without_rolling_back_messages() {
+        // Equal message revisions must not override an older conversation date.
+        for message_revision in [10, 20] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("growing-chat.json");
+            let original = snapshot();
+            store_chatgpt_import_conversation(&path, &original).unwrap();
+            let incoming = json!({
+                "id": "growing-chat",
+                "title": "Stale title",
+                "update_time": 10,
+                "mapping": {
+                    "early": {
+                        "message": {
+                            "id": "native-early",
+                            "update_time": message_revision,
+                            "content": {"content_type": "text", "parts": ["Stale prompt"]}
+                        }
+                    },
+                    "recovered": {
+                        "message": {
+                            "id": "native-recovered",
+                            "author": {"role": "user"},
+                            "create_time": 0.5,
+                            "content": {
+                                "content_type": "multimodal_text",
+                                "parts": [{"content_type": "audio_transcription", "text": "Old voice"}]
+                            }
+                        }
+                    }
+                }
+            });
+            assert_eq!(
+                store_chatgpt_import_conversation(&path, &incoming).unwrap(),
+                ChatGptImportChange::Updated
+            );
+            let refreshed = read_snapshot(&path);
+            assert_eq!(refreshed["title"], original["title"]);
+            assert_eq!(refreshed["update_time"], original["update_time"]);
+            assert_eq!(refreshed["mapping"].as_object().unwrap().len(), 3);
+            assert_eq!(refreshed["mapping"]["early"], original["mapping"]["early"]);
+            assert_eq!(refreshed["mapping"]["later"], original["mapping"]["later"]);
+            assert_eq!(
+                refreshed["mapping"]["recovered"],
+                incoming["mapping"]["recovered"]
+            );
+            assert_eq!(
+                store_chatgpt_import_conversation(&path, &incoming).unwrap(),
+                ChatGptImportChange::Unchanged
+            );
+        }
+    }
+
+    #[test]
+    fn gh552_partial_nodes_and_message_revision_times_preserve_current_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growing-chat.json");
+        let original = snapshot();
+        store_chatgpt_import_conversation(&path, &original).unwrap();
+        let incoming = json!({
+            "id": "growing-chat",
+            "update_time": 30,
+            "mapping": {
+                "early": {
+                    "message": {
+                        "id": "native-early",
+                        "update_time": 19,
+                        "content": {"content_type": "text", "parts": ["Stale prompt"]}
+                    }
+                },
+                "later": {
+                    "message": {
+                        "id": "native-later",
+                        "metadata": {"model_slug": "test-model"}
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &incoming).unwrap(),
+            ChatGptImportChange::Updated
+        );
+        let refreshed = read_snapshot(&path);
+        assert_eq!(refreshed["mapping"]["early"], original["mapping"]["early"]);
+        assert_eq!(
+            refreshed["mapping"]["later"]["message"]["content"],
+            original["mapping"]["later"]["message"]["content"]
+        );
+        assert_eq!(
+            refreshed["mapping"]["later"]["message"]["metadata"]["model_slug"],
+            "test-model"
+        );
+        let omitted = json!({
+            "id": "growing-chat",
+            "update_time": 30,
+            "mapping": {"early": {"message": null}, "later": {}}
+        });
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &omitted).unwrap(),
+            ChatGptImportChange::Unchanged
+        );
+        assert_eq!(read_snapshot(&path), refreshed);
+    }
+
+    #[test]
+    fn gh552_missing_native_ids_and_older_null_node_recovery_keep_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growing-chat.json");
+        let mut original = snapshot();
+        original["mapping"]["pending"] = json!({"message": null});
+        store_chatgpt_import_conversation(&path, &original).unwrap();
+        let older = json!({
+            "id": "growing-chat",
+            "update_time": 10,
+            "mapping": {
+                "pending": {
+                    "message": {
+                        "id": "native-pending",
+                        "author": {"role": "user"},
+                        "create_time": 2,
+                        "content": {"content_type": "text", "parts": ["Recovered placeholder"]}
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &older).unwrap(),
+            ChatGptImportChange::Updated
+        );
+        let refreshed = read_snapshot(&path);
+        assert_eq!(refreshed["update_time"], 20);
+        assert_eq!(refreshed["mapping"]["pending"], older["mapping"]["pending"]);
+        assert_eq!(refreshed["mapping"]["early"], original["mapping"]["early"]);
+        for absent_id in [Value::Null, json!("  ")] {
+            let partial = json!({
+                "id": "growing-chat",
+                "update_time": null,
+                "mapping": {
+                    "early": {"message": {"id": absent_id, "update_time": null}}
+                }
+            });
+            assert_eq!(
+                store_chatgpt_import_conversation(&path, &partial).unwrap(),
+                ChatGptImportChange::Unchanged
+            );
+            assert_eq!(read_snapshot(&path), refreshed);
+        }
+    }
+
+    #[test]
+    fn gh552_malformed_existing_json_and_ambiguous_refreshes_preserve_original_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growing-chat.json");
+        let malformed = b"{not valid json";
+        std::fs::write(&path, malformed).unwrap();
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &snapshot())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), malformed.to_vec());
+
+        let original = snapshot();
+        let bytes = serde_json::to_vec_pretty(&original).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut wrong_conversation = original.clone();
+        wrong_conversation["id"] = json!("different-conversation");
+        let wrong_shape = json!({"id": "growing-chat", "messages": []});
+        let mut wrong_message = original.clone();
+        wrong_message["mapping"]["early"]["message"]["id"] = json!("different-message");
+        let mut malformed_message = original.clone();
+        malformed_message["mapping"]["early"]["message"] = json!(["invalid message"]);
+        for incoming in [
+            wrong_conversation,
+            wrong_shape,
+            wrong_message,
+            malformed_message,
+        ] {
+            assert_eq!(
+                store_chatgpt_import_conversation(&path, &incoming)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+
+        let unsupported = json!({"id": "growing-chat", "messages": [{"content": "Legacy"}]});
+        let bytes = serde_json::to_vec(&unsupported).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            store_chatgpt_import_conversation(&path, &unsupported).unwrap(),
+            ChatGptImportChange::Unchanged
+        );
+        let changed = json!({"id": "growing-chat", "messages": [{"content": "Changed"}]});
+        assert!(store_chatgpt_import_conversation(&path, &changed).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn gh552_staging_failure_and_new_file_collision_never_truncate_published_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growing-chat.json");
+        let original = serde_json::to_vec(&snapshot()).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let failure = publish_chatgpt_import_snapshot(&path, true, |file| {
+            file.write_all(b"partial replacement")?;
+            Err(io::Error::other("injected staging failure"))
+        });
+        assert!(failure.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+
+        let collision = publish_chatgpt_import_snapshot(&path, false, |file| {
+            file.write_all(b"new file must not replace existing")
+        });
+        assert!(collision.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh552_import_refuses_symlink_without_mutating_the_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.json");
+        let link = tmp.path().join("growing-chat.json");
+        let original = serde_json::to_vec(&snapshot()).unwrap();
+        std::fs::write(&target, &original).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(
+            store_chatgpt_import_conversation(&link, &snapshot())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }
 

@@ -3299,11 +3299,13 @@ Other subcommands (all present in the `Commands` enum in `src/lib.rs`):
 | `forget --list` / `forget --reinclude` | Inspect recorded exclusions or explicitly release matching records. Use literal `--source-path`, `--source-glob`, or exact `--source-id`, `--agent`, and `--external-id` selectors; supplied selectors are ANDed. Re-inclusion requires a selector and previews by default; add `--apply`, then run `cass index`. Other exclusions and current workspace/path policies remain in force. Historical exclusion records cannot be selected by workspace or age. |
 | `fleet upgrade-rehearsal` | Fleet-safe upgrade rehearsal (dry run) with bounded post-upgrade verification; `--live` opts in to SSH probes of configured remotes |
 | `lessons list\|search` | Mine and query durable, redacted lessons from local evidence (commits, closed beads, proof manifests) |
-| `import chatgpt` | Split a ChatGPT web export (`conversations.json`) into files the ChatGPT connector can index |
+| `import chatgpt` | Import or refresh a ChatGPT web export (`conversations.json`) as files the ChatGPT connector can index |
 | `release-verify` | Verify release distribution channels (GitHub, Homebrew, Scoop, crates.io, installer) from a recorded observation (`--from`) or live (`--live`) |
 | `sources discover` | Auto-discover SSH hosts from `~/.ssh/config` |
 | `sources reingest` | Re-ingest an already-synced mirror into the canonical archive without re-running rsync |
 | `sources artifact-manifest` | Build or verify a lexical-artifact evidence manifest for remote exchange |
+
+`cass import chatgpt` refreshes changed mapping-based conversations by stable node key and retains messages omitted from a partial export. Older dated snapshots cannot roll back newer messages; unchanged imports preserve file bytes and modification times. The JSON result distinguishes newly `imported`, `updated`, and unchanged `skipped` conversations. Changed unsupported export shapes or conflicting identities return an error while preserving the existing file. Run `cass index` after importing.
 
 `cass guide repair-assets --apply` can rebuild the lexical index from the selected canonical database after the plan's step confirmation, cost acceptance, resource checks and stop-condition acknowledgement. It uses the existing bounded rebuild path and refuses missing or empty archives before source discovery. A successful receipt requires a fresh, complete lexical generation with unchanged canonical identity and conversation/message counts. Already-current assets are reported as `already-ready`; semantic enrichment remains a separate operation. Inspect the dry-run plan first for the exact confirmation flags and step number.
 
