@@ -258,6 +258,183 @@ fn seed_active_rebuild_runtime(data_dir: &Path) -> std::fs::File {
 }
 
 #[test]
+fn status_and_health_json_original_codex_full_plain_append_and_noop() {
+    use serde_json::Value;
+
+    let mut builder = tempfile::Builder::new();
+    builder
+        .prefix("cass-original-codex-health-")
+        .disable_cleanup(true);
+    #[cfg(unix)]
+    let tmp = builder.tempdir_in("/tmp").unwrap();
+    #[cfg(not(unix))]
+    let tmp = builder.tempdir().unwrap();
+    let home = tmp.path();
+    // Keep dotenv inside the private HOME even when a caller sets TMPDIR.
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(home.join(".env"))
+        .unwrap();
+    let data = home.join("data");
+    let source = home.join(".codex/sessions/2025/11/25/rollout-test.jsonl");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(
+        &source,
+        include_str!("fixtures/codex_real/sessions/2025/11/25/rollout-test.jsonl"),
+    )
+    .unwrap();
+    let cass = || {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_SEMANTIC_DOWNLOAD_POLICY", "opt_in")
+            .env("FRANKENSEARCH_MODEL_DIR", "")
+            .env("RUST_MIN_STACK", "134217728")
+            .timeout(Duration::from_secs(30));
+        cmd
+    };
+    let cold = cass().args(["health", "--json"]).output().unwrap();
+    assert_eq!(cold.status.code(), Some(1), "{cold:?}");
+    let cold: Value = serde_json::from_slice(&cold.stdout).unwrap();
+    assert_eq!(cold["healthy"], false, "{cold}");
+    assert_eq!(cold["status"], "not_initialized", "{cold}");
+
+    let mut append_manifest = None;
+    for phase in [
+        "full",
+        "plain-append",
+        "plain-noop",
+        "plain-new-session",
+        "plain-new-session-noop",
+    ] {
+        if phase == "plain-append" {
+            writeln!(
+                OpenOptions::new().append(true).open(&source).unwrap(),
+                "{}",
+                json!({
+                    "timestamp": "2026-11-12T08:00:00.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "zzordinarycodexhealth new persisted provider message"
+                        }]
+                    }
+                })
+            )
+            .unwrap();
+        }
+        if phase == "plain-new-session" {
+            let mut session: Value = serde_json::from_str(
+                include_str!("fixtures/codex_real/sessions/2025/11/25/rollout-test.jsonl")
+                    .lines()
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+            session["payload"]["id"] = json!("second-codex-health-session");
+            let mut second = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(source.with_file_name("rollout-second.jsonl"))
+                .unwrap();
+            writeln!(second, "{session}").unwrap();
+            writeln!(
+                second,
+                "{}",
+                json!({
+                    "timestamp": "2026-11-12T08:01:00.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "zznewcodexsessionhealth new persisted provider session"
+                        }]
+                    }
+                })
+            )
+            .unwrap();
+        }
+        let mut index = cass();
+        index.args(["index", "--json", "--no-progress-events"]);
+        if phase == "full" {
+            index.arg("--full");
+        }
+        let indexed = index.output().unwrap();
+        assert!(indexed.status.success(), "{phase}: {indexed:?}");
+        let health = cass().args(["health", "--json"]).output().unwrap();
+        assert!(health.status.success(), "{phase}: {health:?}");
+        let health: Value = serde_json::from_slice(&health.stdout).unwrap();
+        assert_eq!(health["healthy"], true, "{phase}: {health}");
+        let status = cass().args(["status", "--json"]).output().unwrap();
+        assert!(status.status.success(), "{phase}: {status:?}");
+        let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(status["index"]["status"], "ready", "{phase}: {status}");
+        assert_eq!(status["index"]["fresh"], true, "{phase}: {status}");
+        let query = if phase == "full" {
+            "soldier"
+        } else if matches!(phase, "plain-new-session" | "plain-new-session-noop") {
+            "zznewcodexsessionhealth"
+        } else {
+            "zzordinarycodexhealth"
+        };
+        let hits = cass()
+            .args([
+                "search",
+                query,
+                "--json",
+                "--mode",
+                "lexical",
+                "--fields",
+                "content",
+                "--no-maintenance",
+                "--no-daemon",
+                "--limit",
+                "3",
+            ])
+            .output()
+            .unwrap();
+        assert!(hits.status.success(), "{phase}: {hits:?}");
+        let hits: Value = serde_json::from_slice(&hits.stdout).unwrap();
+        assert!(
+            hits["hits"].as_array().unwrap().iter().any(|hit| {
+                hit.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.contains(query))
+            }),
+            "{phase}: {hits}"
+        );
+        let manifest = fs::read(expected_index_dir(&data).join("MANIFEST")).unwrap();
+        if matches!(phase, "plain-append" | "plain-new-session") {
+            append_manifest = Some(manifest);
+        } else if matches!(phase, "plain-noop" | "plain-new-session-noop") {
+            assert_eq!(Some(&manifest), append_manifest.as_ref());
+        }
+    }
+}
+
+#[test]
 fn watch_once_publishes_settled_source_proof_and_respects_audit_budget() {
     use coding_agent_search::storage::sqlite::FrankenStorage;
     use serde_json::Value;
