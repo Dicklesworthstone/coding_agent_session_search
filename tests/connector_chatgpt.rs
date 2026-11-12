@@ -491,6 +491,128 @@ fn scan_preserves_string_parts_and_drops_object_only_structured_parts_from_real_
     );
 }
 
+#[test]
+fn gh552_scan_retains_voice_only_and_ordered_mixed_transcriptions() {
+    // Exercise CASS's re-export of the upstream connector. This also catches a
+    // dependency pin that still selects the older, string-parts-only parser.
+    let tmp = TempDir::new().unwrap();
+    let conv_dir = tmp.path().join("conversations-gh552");
+    let voice = serde_json::json!({
+        "id": "gh552-voice-only",
+        "mapping": {
+            "voice-user": {"message": {
+                "author": {"role": "user"},
+                "create_time": 1700000000,
+                "content": {"parts": [
+                    {"content_type": "real_time_user_audio_video_asset_pointer",
+                     "asset_pointer": "sediment://input", "text": "Ignore asset metadata."},
+                    {"content_type": "audio_transcription", "text": "Spoken question.",
+                     "direction": "in"}
+                ]}
+            }},
+            "voice-assistant": {"message": {
+                "id": "assistant-native-id",
+                "author": {"role": "assistant"},
+                "create_time": 1700000001,
+                "content": {"parts": [
+                    {"content_type": "audio_transcription", "text": "Spoken answer.",
+                     "direction": "out"},
+                    {"content_type": "audio_asset_pointer", "asset_pointer": "sediment://output",
+                     "text": "Ignore output asset metadata."}
+                ]}
+            }}
+        }
+    });
+    let mixed = serde_json::json!({
+        "id": "gh552-mixed",
+        "mapping": {
+            "mixed-node": {"message": {
+                "id": "mixed-native-id",
+                "author": {"role": "user"},
+                "create_time": 1700000002,
+                "content": {"parts": [
+                    "Typed prefix.",
+                    {"content_type": "image_asset_pointer", "asset_pointer": "sediment://image",
+                     "text": "Ignore image metadata."},
+                    {"content_type": "audio_transcription", "text": "Spoken middle."},
+                    {"content_type": "audio_transcription", "text": null},
+                    {"content_type": "audio_transcription", "text": 17},
+                    {"content_type": "unsupported", "text": "Ignore unknown structured parts."},
+                    "Typed suffix."
+                ]}
+            }}
+        }
+    });
+    let assets = serde_json::json!({
+        "id": "gh552-assets-only",
+        "mapping": {
+            "asset-node": {"message": {
+                "author": {"role": "user"},
+                "create_time": 1700000003,
+                "content": {"parts": [
+                    {"content_type": "audio_asset_pointer", "asset_pointer": "sediment://asset",
+                     "text": "Asset text is not a transcript."}
+                ]}
+            }}
+        }
+    });
+    for (name, value) in [("voice", voice), ("mixed", mixed), ("assets", assets)] {
+        write_json(&conv_dir, &format!("{name}.json"), &value.to_string());
+    }
+
+    let connector = ChatGptConnector::with_encryption_key(CHATGPT_TEST_KEY);
+    let context = ScanContext::local_default(tmp.path().to_path_buf(), None);
+    let conversations = connector.scan(&context).unwrap();
+    assert_eq!(conversations.len(), 2, "asset-only input has no transcript");
+    let voice = conversations
+        .iter()
+        .find(|conversation| conversation.external_id.as_deref() == Some("gh552-voice-only"))
+        .unwrap();
+    assert_eq!(voice.started_at, Some(1_700_000_000_000));
+    assert_eq!(voice.ended_at, Some(1_700_000_001_000));
+    assert_eq!(voice.messages.len(), 2);
+    for (message, idx, role, content, native_id, created_at) in [
+        (
+            &voice.messages[0],
+            0,
+            "user",
+            "Spoken question.",
+            "voice-user",
+            1_700_000_000_000,
+        ),
+        (
+            &voice.messages[1],
+            1,
+            "assistant",
+            "Spoken answer.",
+            "assistant-native-id",
+            1_700_000_001_000,
+        ),
+    ] {
+        assert_eq!(message.idx, idx);
+        assert_eq!(message.role, role);
+        assert_eq!(message.content, content);
+        assert_eq!(message.created_at, Some(created_at));
+        assert_eq!(message.extra["chatgpt_message_id"], native_id);
+    }
+    let mixed = conversations
+        .iter()
+        .find(|conversation| conversation.external_id.as_deref() == Some("gh552-mixed"))
+        .unwrap();
+    assert_eq!(mixed.messages.len(), 1);
+    assert_eq!(mixed.messages[0].idx, 0);
+    assert_eq!(mixed.messages[0].role, "user");
+    assert_eq!(mixed.messages[0].created_at, Some(1_700_000_002_000));
+    assert_eq!(
+        mixed.messages[0].extra["chatgpt_message_id"],
+        "mixed-native-id"
+    );
+    assert_eq!(
+        mixed.messages[0].content,
+        "Typed prefix.\nSpoken middle.\nTyped suffix."
+    );
+}
+
 // ============================================================================
 // Incremental scanning (since_ts)
 // ============================================================================

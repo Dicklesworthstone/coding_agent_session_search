@@ -170,7 +170,7 @@ frankensearch = { version = "=0.7.1", git = "https://github.com/Dicklesworthston
 # GH#520 needs remote-mirror source identity, added after crates.io 0.3.10.
 # Keep the narrow OpenClaw file-scope, historical-session, mirror discovery,
 # and physical-store migration fixes until a registry release includes them.
-franken-agent-detection = { version = "=0.3.10", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "0ea083ea4c470a6b7e7607cdeff335cb14690cdc", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot", "openclaw-sqlite", "copilot-vscdb", "codebuff", "codex-zstd", "pi-durable", "pi-sqlite"] }
+franken-agent-detection = { version = "=0.3.10", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "55c7c703d1ae4f03aa2dcf2a2e283f3c346f9c06", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot", "openclaw-sqlite", "copilot-vscdb", "codebuff", "codex-zstd", "pi-durable", "pi-sqlite"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache

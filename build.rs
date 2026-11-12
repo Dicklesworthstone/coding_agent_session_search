@@ -193,9 +193,11 @@ const CONTRACTS: &[DependencyContract] = &[
         // GH#520 needs the post-0.3.10 mirror-root metadata API. Narrow
         // OpenClaw backports preserve explicit-file scope (#350/#543),
         // historical sessions, opaque mirrors, and physical-store deduplication.
+        // GH#552 adds structured ChatGPT voice transcripts and stable native
+        // message identity without taking unrelated newer connector changes.
         // Keep the source contract exact until a registry release carries them.
         expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "0ea083ea4c470a6b7e7607cdeff335cb14690cdc",
+        expected_rev: "55c7c703d1ae4f03aa2dcf2a2e283f3c346f9c06",
         expected_version: "0.3.10",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.
