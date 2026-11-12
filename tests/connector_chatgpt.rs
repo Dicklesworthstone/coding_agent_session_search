@@ -54,7 +54,7 @@ fn encrypt_chatgpt_payload(plaintext: &[u8], nonce_bytes: [u8; 12]) -> Vec<u8> {
 #[serial]
 fn gh552_cli_voice_reimport_matches_fresh_index_and_survives_restarts() {
     use coding_agent_search::storage::sqlite::FrankenStorage;
-    use fsqlite::compat::{ConnectionExt, RowExt};
+    use frankensqlite::compat::{ConnectionExt, RowExt};
     use serde_json::{Value, json};
     use std::time::Duration;
 
