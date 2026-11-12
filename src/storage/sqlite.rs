@@ -9306,6 +9306,7 @@ fn plan_chatgpt_snapshot(
     }
     let mut messages = existing.to_vec();
     let mut native = HashMap::new();
+    let mut legacy_positions = Vec::new();
     for (position, message) in messages.iter().enumerate() {
         anyhow::ensure!(
             message.idx >= 0,
@@ -9316,6 +9317,8 @@ fn plan_chatgpt_snapshot(
                 native.insert(id.to_owned(), position).is_none(),
                 "ChatGPT canonical history has duplicate native identities"
             );
+        } else {
+            legacy_positions.push(position);
         }
     }
     for incoming in &conv.messages {
@@ -9323,19 +9326,21 @@ fn plan_chatgpt_snapshot(
             .context("ChatGPT native message identity disappeared")?;
         let position = if let Some(position) = native.get(id) {
             Some(*position)
+        } else if legacy_positions.is_empty() {
+            None
         } else {
             let envelope = chatgpt_source_envelope(&incoming.extra_json);
-            let legacy: Vec<_> = messages
+            let legacy: Vec<_> = legacy_positions
                 .iter()
-                .enumerate()
-                .filter(|(_, old)| {
+                .copied()
+                .filter(|&position| {
+                    let old = &messages[position];
                     chatgpt_message_identity(&old.extra_json).is_none()
                         && old.role == incoming.role
                         && old.author == incoming.author
                         && old.created_at == incoming.created_at
                         && chatgpt_source_envelope(&old.extra_json) == envelope
                 })
-                .map(|(position, _)| position)
                 .collect();
             anyhow::ensure!(
                 legacy.len() <= 1,
@@ -9361,7 +9366,8 @@ fn plan_chatgpt_snapshot(
                 Some(position)
             } else {
                 anyhow::ensure!(
-                    !messages.iter().any(|old| {
+                    !legacy_positions.iter().any(|&position| {
+                        let old = &messages[position];
                         chatgpt_message_identity(&old.extra_json).is_none()
                             && old.role == incoming.role
                             && old.author == incoming.author
@@ -9766,7 +9772,6 @@ fn franken_apply_message_revision_projections(
     tx: &FrankenTransaction<'_>,
     revision: &NativeMessageRevision,
     defer_lexical_updates: bool,
-    pricing_table: &PricingTable,
 ) -> Result<()> {
     let message_id = revision.fts.message_id;
     if !defer_lexical_updates
@@ -9850,17 +9855,18 @@ fn franken_apply_message_revision_projections(
         usage.tool_call_count = codebuff_tool_count(&message.extra_json);
         usage.has_tool_calls = usage.tool_call_count > 0;
     }
+    // Pinned FAD estimates both native providers without model attribution.
+    // A later extractor upgrade needs explicit model-bucket reconciliation.
+    anyhow::ensure!(
+        usage.model_name.is_none(),
+        "Native message revision has unsupported model attribution"
+    );
     let content_chars =
         i64::try_from(message.content.len()).context("message length exceeds analytics range")?;
     if let Some(old) = old {
         // Track A may have been backfilled while Track B remains deferred.
         anyhow::ensure!(
-            old.api_data_source == "estimated"
-                && if revision.agent_slug == "codebuff" {
-                    old.model_name.is_none()
-                } else {
-                    old.model_name == usage.model_name
-                },
+            old.api_data_source == "estimated" && old.model_name.is_none(),
             "Native message revision has unsupported provider-usage analytics"
         );
         let mut new = old.clone();
@@ -9907,21 +9913,8 @@ fn franken_apply_message_revision_projections(
     if let Some(old) = ledger.first() {
         anyhow::ensure!(
             old.get_typed::<String>(12)? == "estimated"
-                && if revision.agent_slug == "codebuff" {
-                    old.get_typed::<Option<String>>(13)?.is_none()
-                } else {
-                    old.get_typed::<Option<String>>(13)? == usage.model_name
-                },
+                && old.get_typed::<Option<String>>(13)?.is_none(),
             "Native message revision has unsupported provider-usage token ledger"
-        );
-        let day = old.get_typed::<i64>(0)?;
-        let cost = pricing_table.compute_cost(
-            usage.model_name.as_deref(),
-            day,
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.cache_read_tokens,
-            usage.cache_creation_tokens,
         );
         let delta = TokenStatsDelta {
             total_input_tokens: usage.input_tokens.unwrap_or(0)
@@ -9938,8 +9931,7 @@ fn franken_apply_message_revision_projections(
                 - old.get_typed::<Option<i64>>(9)?.unwrap_or(0),
             total_content_chars: content_chars - old.get_typed::<i64>(3)?,
             total_tool_calls: i64::from(usage.tool_call_count) - old.get_typed::<i64>(10)?,
-            estimated_cost_usd: cost.unwrap_or(0.0)
-                - old.get_typed::<Option<f64>>(11)?.unwrap_or(0.0),
+            estimated_cost_usd: -old.get_typed::<Option<f64>>(11)?.unwrap_or(0.0),
             ..TokenStatsDelta::default()
         };
         let mut tokens = TokenStatsAggregator::new();
@@ -9989,7 +9981,7 @@ fn franken_apply_message_revision_projections(
             "UPDATE token_usage SET content_chars = ?2, input_tokens = ?3, output_tokens = ?4,
              total_tokens = ?5, tool_call_count = ?6, has_tool_calls = ?7,
              cache_read_tokens = ?8, cache_creation_tokens = ?9, thinking_tokens = ?10,
-             estimated_cost_usd = ?11 WHERE message_id = ?1",
+             estimated_cost_usd = NULL WHERE message_id = ?1",
             fparams![
                 message_id,
                 content_chars,
@@ -10000,8 +9992,7 @@ fn franken_apply_message_revision_projections(
                 i64::from(usage.has_tool_calls),
                 usage.cache_read_tokens,
                 usage.cache_creation_tokens,
-                usage.thinking_tokens,
-                cost
+                usage.thinking_tokens
             ],
         )?;
         franken_update_conversation_token_summaries_in_tx(tx, revision.conversation_id)?;
@@ -19433,7 +19424,6 @@ impl FrankenStorage {
                     &tx,
                     revision,
                     defer_lexical_updates,
-                    &pricing_table,
                 )?;
             }
         }
@@ -39673,7 +39663,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
 
     #[test]
     #[serial]
-    fn gh552_legacy_envelope_backfill_updates_model_analytics_and_rejects_ambiguity() {
+    fn gh552_legacy_envelope_backfill_updates_estimates_and_rejects_ambiguity() {
         let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
         let dir = tempfile::Builder::new()
             .prefix("cass-gh552-legacy-")
@@ -39724,7 +39714,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
             )
             .unwrap();
-        assert_eq!(model.as_deref(), Some("gpt-4"));
+        // The pinned extractor estimates ChatGPT tokens without a model. Keep
+        // the original model metadata without inventing priced API usage.
+        assert_eq!(model, None);
+        assert_eq!(saved[0].extra_json["metadata"]["model_slug"], "gpt-4");
         assert_eq!(output, Some((current.messages[0].content.len() / 4) as i64));
         assert!(!storage.chatgpt_message_revisions_needed(&current).unwrap());
         let before = serde_json::to_value(&saved).unwrap();
