@@ -10,7 +10,7 @@
 //! of comments/strings is a violation UNLESS one of these holds:
 //!   - The invocation belongs to an `rch exec --` command (also accepting
 //!     RCH options and a quoted or unquoted `$RCH_BIN` program).
-//!   - The current command calls or defines the `run_cargo` helper.
+//!   - The current command calls the `run_cargo` helper.
 //!   - gate.sh's formatter callback is serialized into its remote command.
 //!
 //! ## Compliance rule 2: avoid `set -e + ((VAR++))`
@@ -186,7 +186,7 @@ fn is_word_byte(b: u8) -> bool {
 /// that obtain an argument through a command substitution.
 fn command_words_before(line: &str, end: usize, quote_state: (bool, bool)) -> Vec<String> {
     let (mut in_single, mut in_double) = quote_state;
-    let mut words = Vec::new();
+    let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
     let mut parents = Vec::new();
     let mut escaped = false;
@@ -217,6 +217,28 @@ fn command_words_before(line: &str, end: usize, quote_state: (bool, bool)) -> Ve
                 words.clear();
                 word.clear();
             }
+            '{' if !in_single && !in_double && word.is_empty() => {
+                // A function body cannot borrow its declaration's name as
+                // a wrapper. Elsewhere an unquoted brace can be an ordinary
+                // argument, so preserve the enclosing command's words.
+                let command = words.iter().find(|word| {
+                    !matches!(
+                        word.as_str(),
+                        "!" | "time"
+                            | "-p"
+                            | "if"
+                            | "then"
+                            | "elif"
+                            | "else"
+                            | "while"
+                            | "until"
+                            | "do"
+                    )
+                });
+                if command.is_some_and(|word| word == "function") {
+                    words.clear();
+                }
+            }
             ch if !in_single && !in_double && ch.is_ascii_whitespace() => {
                 if !word.is_empty() {
                     words.push(std::mem::take(&mut word).to_ascii_lowercase());
@@ -233,7 +255,7 @@ fn command_words_before(line: &str, end: usize, quote_state: (bool, bool)) -> Ve
 
 fn cargo_has_remote_wrapper(words: &[String]) -> bool {
     words.iter().enumerate().any(|(index, word)| {
-        if matches!(word.as_str(), "run_cargo" | "run_cargo()") {
+        if word == "run_cargo" {
             return true;
         }
         if !matches!(word.as_str(), "rch" | "$rch_bin" | "${rch_bin}") {
@@ -943,6 +965,7 @@ fn scanner_does_not_flag_run_cargo_calls() {
         "function rch { command rch exec -- cargo check; }",
         "rch exec -- env -u '{' cargo test",
         r"rch exec -- env -u \{ cargo test",
+        "rch exec -- env -u { cargo test",
     ] {
         let findings = scan_shell_body_for_bare_cargo(Path::new("wrapped.sh"), body);
         if !findings.is_empty() {
