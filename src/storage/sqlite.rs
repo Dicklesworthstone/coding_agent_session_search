@@ -9226,6 +9226,36 @@ fn chatgpt_payload_matches(old: &Message, new: &Message) -> bool {
         })
 }
 
+// FAD exposes ChatGPT metadata.model_slug as Message.author. Model
+// attribution may arrive after the content or be corrected in a later export;
+// a partial snapshot without it must not erase already-known attribution.
+fn preserve_chatgpt_model_attribution(old: &Message, replacement: &mut Message) {
+    if replacement.author.is_some() {
+        return;
+    }
+    replacement.author.clone_from(&old.author);
+    let Some(model_slug) = old
+        .extra_json
+        .get("metadata")
+        .and_then(|metadata| metadata.get("model_slug"))
+        .filter(|value| value.is_string())
+    else {
+        return;
+    };
+    let Some(message) = replacement.extra_json.as_object_mut() else {
+        return;
+    };
+    let metadata = message
+        .entry("metadata")
+        .or_insert_with(|| serde_json::json!({}));
+    if metadata.is_null() {
+        *metadata = serde_json::json!({});
+    }
+    if let Some(metadata) = metadata.as_object_mut() {
+        metadata.insert("model_slug".into(), model_slug.clone());
+    }
+}
+
 fn chatgpt_canonical_messages(
     rows: Vec<FrankenRow>,
     snippet_rows: Vec<FrankenRow>,
@@ -9382,10 +9412,8 @@ fn plan_chatgpt_snapshot(
         if let Some(position) = position {
             let old = &messages[position];
             anyhow::ensure!(
-                old.role == incoming.role
-                    && old.author == incoming.author
-                    && old.created_at == incoming.created_at,
-                "ChatGPT native identity changed immutable role, author or timestamp"
+                old.role == incoming.role && old.created_at == incoming.created_at,
+                "ChatGPT native identity changed immutable role or timestamp"
             );
             if let (Some(old_time), Some(new_time)) = (
                 old.extra_json
@@ -9399,6 +9427,7 @@ fn plan_chatgpt_snapshot(
             {
                 continue;
             }
+            preserve_chatgpt_model_attribution(old, &mut replacement);
             if let Some(marker) = old.extra_json.get("chatgpt_message_id")
                 && let Some(object) = replacement.extra_json.as_object_mut()
             {
@@ -9514,8 +9543,17 @@ fn franken_reconcile_chatgpt_messages<'a>(
             continue;
         }
         let (json, bin) = franken_message_insert_payload(message)?;
-        tx.execute_compat("UPDATE messages SET idx = ?2, content = ?3, extra_json = ?4, extra_bin = ?5 WHERE id = ?1",
-            fparams![id, message.idx, message.content.as_str(), json.as_deref(), bin.as_deref()])?;
+        tx.execute_compat(
+            "UPDATE messages SET idx = ?2, content = ?3, extra_json = ?4, extra_bin = ?5, author = ?6 WHERE id = ?1",
+            fparams![
+                id,
+                message.idx,
+                message.content.as_str(),
+                json.as_deref(),
+                bin.as_deref(),
+                message.author.as_deref()
+            ],
+        )?;
         tx.execute_compat("DELETE FROM snippets WHERE message_id = ?1", fparams![id])?;
         franken_insert_snippets(tx, id, &message.snippets)?;
         let mut before = (**old).clone();
@@ -39640,11 +39678,65 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 serde_json::to_value(&after).unwrap(),
                 "older partial exports preserve newer content and omitted history"
             );
+            // Import can enrich or correct metadata.model_slug on the same
+            // message; FAD maps it to author. Every storage route must persist
+            // that attribution without allocating a new message or losing text.
+            let mut attributed = revised.clone();
+            for (model, revision) in [("gpt-4o", 40), ("gpt-4.1", 50)] {
+                attributed.messages[2].author = Some(model.into());
+                attributed.messages[2].extra_json["metadata"] =
+                    serde_json::json!({"model_slug": model});
+                attributed.messages[2].extra_json["update_time"] =
+                    serde_json::json!(revision);
+                assert!(storage.chatgpt_message_revisions_needed(&attributed).unwrap());
+                let update = gh423_persist(&storage, agent, &attributed, route).unwrap();
+                assert!(update.inserted_indices.is_empty());
+                assert_eq!(update.updated_indices, vec![2]);
+                let saved = storage.fetch_messages(first.conversation_id).unwrap();
+                assert_eq!(saved.len(), 3);
+                assert_eq!(saved[2].id, reply_id);
+                assert_eq!(saved[2].author.as_deref(), Some(model));
+                assert_eq!(saved[2].content, attributed.messages[2].content);
+                assert!(!storage.chatgpt_message_revisions_needed(&attributed).unwrap());
+                let replay = gh423_persist(&storage, agent, &attributed, route).unwrap();
+                assert!(replay.inserted_indices.is_empty() && replay.updated_indices.is_empty());
+            }
+            let stable =
+                serde_json::to_value(storage.fetch_messages(first.conversation_id).unwrap())
+                    .unwrap();
+            for metadata in [
+                None,
+                Some(serde_json::json!({})),
+                Some(serde_json::Value::Null),
+                Some(serde_json::json!({"model_slug": null})),
+            ] {
+                let mut partial = attributed.clone();
+                partial.messages[2].author = None;
+                if let Some(metadata) = metadata {
+                    partial.messages[2].extra_json["metadata"] = metadata;
+                } else {
+                    partial.messages[2]
+                        .extra_json
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("metadata");
+                }
+                assert!(!storage.chatgpt_message_revisions_needed(&partial).unwrap());
+                let replay = gh423_persist(&storage, agent, &partial, route).unwrap();
+                assert!(replay.inserted_indices.is_empty() && replay.updated_indices.is_empty());
+                assert_eq!(
+                    serde_json::to_value(
+                        storage.fetch_messages(first.conversation_id).unwrap()
+                    )
+                    .unwrap(),
+                    stable
+                );
+            }
             let mut invalid = incoming.clone();
             invalid.messages.push(invalid.messages[0].clone());
             let mut pending = revised.clone();
             pending.messages[2].content = "must roll back this revision".into();
-            pending.messages[2].extra_json["update_time"] = serde_json::json!(40);
+            pending.messages[2].extra_json["update_time"] = serde_json::json!(60);
             assert!(
                 storage
                     .insert_conversations_batched_with_analytics(
@@ -39748,6 +39840,72 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             .is_err(),
             "an incoming node cannot guess between identical legacy rows"
         );
+    }
+
+    #[test]
+    fn gh552_chatgpt_model_revisions_preserve_identity_and_missing_attribution() {
+        let mut incoming = gh423_storage_snapshot();
+        incoming.agent_slug = "chatgpt".into();
+        incoming.messages.truncate(1);
+        incoming.messages[0].author = None;
+        incoming.messages[0].extra_json = serde_json::json!({
+            "id": "native-model-message",
+            "chatgpt_message_id": "native-model-message",
+            "update_time": 20,
+            "metadata": {"other": "preserved"}
+        });
+        let mut canonical = incoming.messages.clone();
+        canonical[0].id = Some(42);
+
+        for (model, revision) in [("gpt-4o", 30), ("gpt-4.1", 40)] {
+            incoming.messages[0].author = Some(model.into());
+            incoming.messages[0].extra_json["metadata"]["model_slug"] =
+                serde_json::json!(model);
+            incoming.messages[0].extra_json["update_time"] =
+                serde_json::json!(revision);
+            canonical = plan_chatgpt_snapshot(&canonical, &incoming)
+                .unwrap()
+                .unwrap();
+            assert_eq!(canonical.len(), 1);
+            assert_eq!(canonical[0].id, Some(42));
+            assert_eq!(canonical[0].author.as_deref(), Some(model));
+            assert_eq!(canonical[0].extra_json, incoming.messages[0].extra_json);
+        }
+
+        let stable = serde_json::to_value(&canonical).unwrap();
+        for metadata in [
+            serde_json::json!({"other": "preserved"}),
+            serde_json::json!({"other": "preserved", "model_slug": null}),
+        ] {
+            let mut partial = incoming.clone();
+            partial.messages[0].author = None;
+            partial.messages[0].extra_json["metadata"] = metadata;
+            let planned = plan_chatgpt_snapshot(&canonical, &partial)
+                .unwrap()
+                .unwrap();
+            assert_eq!(serde_json::to_value(planned).unwrap(), stable);
+        }
+
+        let mut older = incoming.clone();
+        older.messages[0].author = Some("stale-model".into());
+        older.messages[0].extra_json["metadata"]["model_slug"] =
+            serde_json::json!("stale-model");
+        older.messages[0].extra_json["update_time"] = serde_json::json!(30);
+        assert_eq!(
+            serde_json::to_value(
+                plan_chatgpt_snapshot(&canonical, &older).unwrap().unwrap()
+            )
+            .unwrap(),
+            stable
+        );
+
+        let mut changed_role = incoming.clone();
+        changed_role.messages[0].role = MessageRole::User;
+        assert!(plan_chatgpt_snapshot(&canonical, &changed_role).is_err());
+        let mut changed_time = incoming.clone();
+        changed_time.messages[0].created_at =
+            changed_time.messages[0].created_at.map(|time| time + 1);
+        assert!(plan_chatgpt_snapshot(&canonical, &changed_time).is_err());
     }
 
     fn gh423_storage_snapshot() -> Conversation {
