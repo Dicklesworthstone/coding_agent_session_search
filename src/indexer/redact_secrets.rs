@@ -404,9 +404,9 @@ impl<'de> serde::de::Visitor<'de> for EmbeddedJsonKeyCheck {
 /// Redact secrets from a JSON value, recursively walking strings.
 ///
 /// - String values are redacted without changing their JSON type.
-/// - Complete objects/arrays encoded as strings with a plausible JSON first
-///   token use the same field policy. Unchanged valid strings retain their
-///   exact bytes. Duplicate keys, parser refusals, and structured payloads
+/// - Objects/arrays encoded as strings with a plausible JSON first token use
+///   the same field policy. Unchanged valid strings retain their exact bytes.
+///   Truncated payloads, duplicate keys, parser refusals, and structured payloads
 ///   beyond eight encoded layers cause the payload to be replaced in full.
 /// - Values under credential-bearing object keys are replaced in full.
 /// - Arrays and objects are walked recursively.
@@ -458,9 +458,10 @@ fn redact_json_string(
     embedded_layers: usize,
 ) -> String {
     let trimmed = input.trim();
-    let has_container = (trimmed.starts_with('{') && trimmed.ends_with('}'))
-        || (trimmed.starts_with('[') && trimmed.ends_with(']'));
-    if !has_container {
+    // Truncated tool output can retain credentials before its missing suffix.
+    // Let the parser below establish completeness and reject it safely.
+    let has_container_prefix = trimmed.starts_with('{') || trimmed.starts_with('[');
+    if !has_container_prefix {
         return redact_plain_text(input);
     }
 
@@ -1416,6 +1417,9 @@ mod tests {
         for (input, expected) in [
             (r#"{"note": DB_PASSWORD=synthetic-assignment }"#, REDACTED),
             (r#"[null, {"registration_token":"tiny"}, ]"#, REDACTED),
+            (r#"{"registration_token":"tiny""#, REDACTED),
+            (r#"[{"passphrase":"tiny"}"#, REDACTED),
+            (r#"{"registration_token":"tiny"#, REDACTED),
             ("{not valid JSON}", "{not valid JSON}"),
             ("[not valid JSON]", "[not valid JSON]"),
             ("[unfinished", "[unfinished"),

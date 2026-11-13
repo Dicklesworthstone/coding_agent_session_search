@@ -480,6 +480,99 @@ fn gh551_export_redaction_covers_embedded_json_tool_results()
 }
 
 #[test]
+fn gh551_truncated_json_tool_results_keep_export_privacy() -> Result<(), Box<dyn std::error::Error>>
+{
+    let root = tempfile::Builder::new()
+        .prefix("cass-gh551-truncated-json-")
+        .disable_cleanup(true)
+        .tempdir()?;
+    let session = root.path().join("truncated-json-tool-session.jsonl");
+    let complete = serde_json::json!({"registration_token": EXPORT_PRIVACY_SECRET}).to_string();
+    let payloads = [
+        complete
+            .strip_suffix('}')
+            .ok_or("object terminator missing")?
+            .to_owned(),
+        format!("[{complete}"),
+        format!(r#"{{"registration_token":"{EXPORT_PRIVACY_SECRET}"#),
+    ];
+    for payload in payloads {
+        // The physical JSONL records are intact. Only the JSON encoded inside
+        // the tool-result string is truncated, as with bounded tool output.
+        let events = [
+            serde_json::json!({"type":"user","message":{"role":"user","content":"truncated-json-context-kept café 界"}}),
+            serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[
+                {"type":"tool_use","id":"call-551-truncated","name":"register_agent","input":{"agent":"DemoAgent"}}
+            ]}}),
+            serde_json::json!({"type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"call-551-truncated","content":payload}
+            ]}}),
+        ];
+        let mut bytes = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut bytes, &event)?;
+            bytes.push(b'\n');
+        }
+        fs::write(&session, &bytes)?;
+
+        for include_secrets in [false, true] {
+            for format in ["markdown", "text", "json", "html"] {
+                let mut cmd = export_privacy_command(root.path());
+                cmd.arg("export")
+                    .arg(&session)
+                    .args(["--format", format, "--include-tools"]);
+                if include_secrets {
+                    cmd.arg("--include-secrets");
+                }
+                let output = cmd.output()?;
+                assert!(output.status.success(), "{format}: {output:?}");
+                let exported = String::from_utf8(output.stdout)?;
+                assert_eq!(
+                    exported.contains(EXPORT_PRIVACY_SECRET),
+                    include_secrets,
+                    "{format}, include_secrets={include_secrets}, payload={payload:?}"
+                );
+                assert!(exported.contains("truncated-json-context-kept"));
+                let stderr = String::from_utf8(output.stderr)?;
+                let announcement = stderr
+                    .lines()
+                    .find_map(|line| line.strip_prefix("note: export privacy: "))
+                    .ok_or("export privacy announcement missing")?;
+                let privacy: Value = serde_json::from_str(announcement)?;
+                assert_eq!(privacy["redaction_applied"], !include_secrets);
+                assert_eq!(privacy["sensitive_output"], include_secrets);
+                if format == "json" {
+                    let messages: Value = serde_json::from_str(&exported)?;
+                    assert_eq!(
+                        messages[1]["message"]["content"][0]["id"],
+                        "call-551-truncated"
+                    );
+                    assert_eq!(
+                        messages[2]["message"]["content"][0]["content"].as_str(),
+                        Some(if include_secrets {
+                            payload.as_str()
+                        } else {
+                            "[REDACTED]"
+                        })
+                    );
+                }
+            }
+            let (receipt, html) =
+                export_privacy_html(root.path(), &session, None, include_secrets, false)?;
+            assert_eq!(html.contains(EXPORT_PRIVACY_SECRET), include_secrets);
+            assert!(html.contains("truncated-json-context-kept"));
+            assert_eq!(receipt["privacy"]["redaction_applied"], !include_secrets);
+        }
+        assert_eq!(
+            fs::read(&session)?,
+            bytes,
+            "export changed the source session"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn export_redaction_covers_unredacted_archive_with_never_created_source()
 -> Result<(), Box<dyn std::error::Error>> {
     use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
