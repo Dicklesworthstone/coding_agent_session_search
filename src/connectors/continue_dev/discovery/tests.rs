@@ -286,11 +286,34 @@ fn excluded_derived_store_errors_do_not_block_the_other_store() {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].external_id.as_deref(), Some("public"));
         assert_eq!(rows[0].messages[0].content, "retained question");
+
+        // With only the excluded opaque store left, do not broaden into
+        // parent.json. Keep the healthy store's fixture rather than delete it.
+        let retained = temp.path().join("public-store.retained");
+        fs::rename(public.parent().unwrap(), &retained).unwrap();
+        assert!(retained.join("public.json").is_file());
+        assert!(
+            connector
+                .discover_allowed(&ctx, &excludes)
+                .unwrap()
+                .is_empty()
+        );
+        connector
+            .scan_allowed(
+                &ctx,
+                &mut SourceScanHooks {
+                    should_scan_source: Some(&mut |_| panic!("parent source admitted")),
+                    on_source_complete: Some(&mut |_| panic!("parent source completed")),
+                },
+                &mut |_| panic!("excluded opaque store broadened to parent JSON"),
+                &excludes,
+            )
+            .unwrap();
     }
 }
 
 #[test]
-fn excluded_potential_layouts_do_not_broaden_to_parent_json_files() {
+fn absent_excluded_layouts_preserve_parent_json_discovery() {
     for relative in [".continue/sessions", "sessions"] {
         let temp = tempfile::Builder::new()
             .prefix("cass-continue-absent-exclusion-")
@@ -307,23 +330,41 @@ fn excluded_potential_layouts_do_not_broaden_to_parent_json_files() {
         assert!(!excluded.exists());
         let excludes = |path: &Path| path.starts_with(&excluded);
         let connector = ContinueConnector::new();
-        assert!(
-            connector
-                .discover_allowed(&ctx, &excludes)
-                .unwrap()
-                .is_empty()
+        let sources = connector.discover_allowed(&ctx, &excludes).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources[0].source_path,
+            fs::canonicalize(profile.join("parent.json")).unwrap()
         );
+        let mut admitted = Vec::new();
+        let mut completed = Vec::new();
+        let mut rows = Vec::new();
         connector
             .scan_allowed(
                 &ctx,
                 &mut SourceScanHooks {
-                    should_scan_source: Some(&mut |_| panic!("parent source admitted")),
-                    on_source_complete: Some(&mut |_| panic!("parent source completed")),
+                    should_scan_source: Some(&mut |source| {
+                        admitted.push(source.clone());
+                        true
+                    }),
+                    on_source_complete: Some(&mut |completion| {
+                        assert_eq!(completion.conversations_emitted, 1);
+                        completed.push(completion.source.clone());
+                        Ok(())
+                    }),
                 },
-                &mut |_| panic!("excluded layout broadened to parent or implicit home"),
+                &mut |row| {
+                    rows.push(row);
+                    Ok(())
+                },
                 &excludes,
             )
             .unwrap();
+        assert_eq!(admitted, sources);
+        assert_eq!(completed, sources);
+        assert_eq!(rows.len(), 1, "implicit home must remain outside the scope");
+        assert_eq!(rows[0].external_id.as_deref(), Some("parent"));
+        assert_eq!(rows[0].messages[0].content, "retained question");
     }
 }
 

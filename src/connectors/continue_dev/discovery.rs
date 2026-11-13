@@ -152,11 +152,19 @@ fn roots(ctx: &ScanContext, excludes: &dyn Fn(&Path) -> bool) -> Result<Vec<Scan
             base.path.join(".continue/sessions"),
             base.path.join("sessions"),
         ] {
-            if optional_directory(&path)? {
-                // An existing excluded store still determines the layout.
+            let excluded = excludes(&path);
+            // An excluded store with unavailable metadata must not block
+            // healthy stores or broaden discovery into its parent. A store
+            // confirmed absent still permits the existing parent layout.
+            let is_directory = match optional_directory(&path) {
+                Err(_) if excluded => true,
+                result => result?,
+            };
+            if is_directory {
+                // An existing or opaque excluded store determines the layout.
                 // Do not fall back to reading JSON files in its parent.
                 found = true;
-                if !excludes(&path) {
+                if !excluded {
                     expanded.push(base.with_path(path));
                 }
             }
