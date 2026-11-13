@@ -32795,6 +32795,7 @@
                 "index_over_automatic_limit",
                 "automatic_retry_disabled",
                 "long_query_term",
+                "query_normalization",
                 "query_fuel_exhausted",
                 null
               ]

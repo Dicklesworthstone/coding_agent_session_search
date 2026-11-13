@@ -1463,6 +1463,14 @@ fn batch_forget_unions_exact_and_overlapping_selectors_once_across_all_surfaces(
     write_codex_rollout(&codex_home, "keep-b", KEPT_MARKER)?;
     let archive = Archive { home, data_dir };
     archive.index(&["--full", "--semantic", "--embedder", "hash"])?;
+    // Routine indexing defers analytics. Populate the derived surfaces through
+    // their public repair command before testing the batch's erasure behavior.
+    let rebuilt = archive.succeed(
+        "prepare analytics before the selector-union probe",
+        &["analytics", "rebuild", "--track", "a", "--json"],
+    )?;
+    let rebuilt: Value = serde_json::from_slice(&rebuilt.stdout)?;
+    assert_eq!(rebuilt["data"]["track_a"]["message_metrics_rows"], 6);
     assert_archive_counts(&archive, 3, 6)?;
     let first_str = first.to_str().ok_or("non-utf8 fixture path")?;
     let second_str = second.to_str().ok_or("non-utf8 fixture path")?;

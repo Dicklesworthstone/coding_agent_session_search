@@ -64,7 +64,14 @@ fn assert_golden(name: &str, actual: &str) {
     });
 
     if actual != expected {
-        let actual_path = golden_path.with_extension("actual");
+        // Preserve strict comparisons without changing RCH's source inputs.
+        let actual_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/artifacts/golden")
+            .join(std::process::id().to_string())
+            .join(name)
+            .with_extension("actual");
+        std::fs::create_dir_all(actual_path.parent().expect("golden diagnostic parent"))
+            .expect("create golden diagnostic directory");
         std::fs::write(&actual_path, actual).expect("write .actual");
         panic!(
             "GOLDEN MISMATCH: {name}\nExpected: {}\nActual:   {}",

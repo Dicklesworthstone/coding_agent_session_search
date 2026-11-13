@@ -20464,6 +20464,26 @@ fn run_analytics_rebuild(
             result.elapsed_ms,
             result.messages_per_sec
         );
+        // Routine indexing defers this materialization too. Only an explicit
+        // full message-level rebuild may add its complete canonical scan;
+        // windowed Track A and Track-B-only work retain their existing scope.
+        // The legacy all-track repair above already completed this phase.
+        if since_ms.is_none() && legacy_omp_rebuild.is_none() {
+            eprintln!("Rebuilding daily session statistics...");
+            let daily_stats = storage.rebuild_daily_stats().map_err(|error| CliError {
+                code: 9,
+                kind: CliErrorKind::ArchiveDailyStatsRebuild.kind_str(),
+                message: format!("Daily statistics rebuild failed: {error:#}"),
+                hint: Some(
+                    "Inspect the archive and retry the same full analytics rebuild command.".into(),
+                ),
+                retryable: true,
+            })?;
+            eprintln!(
+                "Daily statistics complete: {} rows for {} sessions",
+                daily_stats.rows_created, daily_stats.total_sessions
+            );
+        }
         tracks_rebuilt.push("a");
         payload.insert(
             "track_a".into(),
@@ -20772,6 +20792,65 @@ mod analytics_filter_validation_tests {
             wal_len <= 32,
             "analytics rebuild must not leave WAL frames behind (wal_len={wal_len})"
         );
+    }
+
+    #[test]
+    fn analytics_rebuild_repairs_daily_cache_only_for_full_track_a() -> anyhow::Result<()> {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let dir = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+        let db_path = dir.path().join("agent_search.db");
+        let seed_stale_cache = || -> anyhow::Result<()> {
+            let storage = FrankenStorage::open(&db_path)?;
+            storage.raw().execute(
+                "INSERT INTO daily_stats (
+                    day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
+                 ) VALUES (42, 'all', 'all', 7, 13, 17, 19)",
+            )?;
+            Ok(())
+        };
+        let snapshot = || -> anyhow::Result<Vec<String>> {
+            let storage = FrankenStorage::open_readonly(&db_path)?;
+            Ok(storage
+                .raw()
+                .query("SELECT * FROM daily_stats ORDER BY day_id, agent_slug, source_id")?
+                .into_iter()
+                .map(|row| format!("{:?}", row.values()))
+                .collect())
+        };
+        seed_stale_cache()?;
+        let before = snapshot()?;
+        assert_eq!(before.len(), 1);
+
+        // Windowed maintenance must not grow into an unrequested full scan;
+        // Track B owns the token ledger, not this conversation-count cache.
+        for (track, days) in [
+            (AnalyticsTrack::A, Some(2)),
+            (AnalyticsTrack::All, Some(2)),
+            (AnalyticsTrack::B, None),
+        ] {
+            let mut options = common();
+            options.days = days;
+            run_analytics_rebuild(&options, track, Some(&db_path))
+                .unwrap_or_else(|error| panic!("{track:?}: {}", error.message));
+            assert_eq!(snapshot()?, before, "{track:?}, days={days:?}");
+        }
+
+        // The canonical archive is empty: a full message-level rebuild must
+        // replace the stale cache with no rows, rather than report success
+        // while its cached counts still describe seven absent sessions.
+        for track in [AnalyticsTrack::A, AnalyticsTrack::All] {
+            run_analytics_rebuild(&common(), track, Some(&db_path))
+                .unwrap_or_else(|error| panic!("{track:?}: {}", error.message));
+            assert!(
+                snapshot()?.is_empty(),
+                "{track:?}: stale daily cache survived"
+            );
+            if track == AnalyticsTrack::A {
+                seed_stale_cache()?;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -1205,8 +1205,15 @@ fn assert_golden(name: &str, actual: &str) {
     let comparable_actual = strip_one_final_line_ending(actual);
     if comparable_actual != comparable_expected {
         let first_difference = first_golden_difference(comparable_expected, comparable_actual);
-        // Dump actual next to golden for easy diffing.
-        let actual_path = golden_path.with_extension("actual");
+        // Keep diagnostics in the existing artifacts area, outside the source
+        // inputs verified by RCH. Each test process retains its own failures.
+        let actual_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/artifacts/golden")
+            .join(std::process::id().to_string())
+            .join(name)
+            .with_extension("actual");
+        std::fs::create_dir_all(actual_path.parent().expect("golden diagnostic parent"))
+            .expect("create golden diagnostic directory");
         std::fs::write(&actual_path, actual).expect("write .actual file");
         panic!(
             "GOLDEN MISMATCH: {name}\n\n\

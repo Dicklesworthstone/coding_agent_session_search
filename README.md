@@ -3021,8 +3021,15 @@ cass analytics rebuild --track a
 
 `cass analytics rebuild` re-derives the Track A rollups (`message_metrics`,
 `usage_hourly`, `usage_daily`, `usage_models_daily`) from messages already in
-the archive; it never re-parses raw session files. On a large archive a full
-rebuild is a long single-core job, so daily refreshes should be windowed:
+the archive; it never re-parses raw session files.
+
+An unwindowed Track A rebuild (including unwindowed `--track all`) also
+refreshes the `daily_stats` session-count cache from canonical conversations
+and messages. This adds a complete, paginated pass over those rows. Windowed
+rebuilds and Track-B-only rebuilds leave this cache unchanged.
+
+On a large archive a full rebuild is a long single-core job, so daily
+refreshes should be windowed:
 
 ```bash
 # Full rebuild (every rollup row dropped and recomputed)
