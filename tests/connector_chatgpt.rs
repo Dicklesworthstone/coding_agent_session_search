@@ -186,6 +186,58 @@ fn gh552_cli_voice_reimport_matches_fresh_index_and_survives_restarts() {
         }
     }
     import(&home, "skipped");
+
+    // A same-ID revision through the targeted watch path must also finish
+    // publication before a read-only search, preserving the canonical row.
+    let source_path: String = {
+        let storage = FrankenStorage::open_readonly(&home.join("data/agent_search.db")).unwrap();
+        storage
+            .raw()
+            .query_row_map(
+                "SELECT source_path FROM conversations WHERE external_id = 'gh552-cli-chat'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+    };
+    snapshot[0]["mapping"]["reply-node"]["message"]["content"]["parts"] =
+        json!(["zzgh552replyneedle zzgh552revisedneedle"]);
+    snapshot[0]["mapping"]["reply-node"]["message"]["update_time"] = json!(1700000004.0);
+    snapshot[0]["update_time"] = json!(1700000004.0);
+    fs::write(&export, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    import(&home, "updated");
+    let result = command(&home)
+        .args(["index", "--json", "--no-progress-events", "--watch-once"])
+        .arg(&source_path)
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    let revised = rows(&home);
+    assert_eq!(revised.len(), 2);
+    assert_eq!(revised[1].id, reply_id);
+    assert!(revised[1].content.contains("zzgh552revisedneedle"));
+    let result = command(&home)
+        .args([
+            "search",
+            "zzgh552revisedneedle",
+            "--json",
+            "--mode",
+            "lexical",
+            "--no-maintenance",
+            "--no-daemon",
+        ])
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    let hits: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(hits["hits"].as_array().unwrap().len(), 1, "{hits}");
+    assert!(
+        hits["hits"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("zzgh552revisedneedle")
+    );
+
     let fresh = prepare("fresh");
     import(&fresh, "imported");
     index(&fresh, true);

@@ -7,7 +7,7 @@
 
 mod discovery;
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
@@ -195,6 +195,14 @@ impl ContinueConnector {
         // Explicit roots do not depend on valid global configuration. When it
         // is available, preserve ownership of custom Continue directories too.
         let global = discovery::global_dir().ok().flatten();
+        // Resolve aliases only after source admission, and never probe an
+        // excluded global store while classifying an untyped candidate.
+        let global_identity = OnceCell::new();
+        let matches_global_root = |root: &Path, global: &Path| {
+            root == global
+                || root.starts_with(global.join("sessions"))
+                || root.parent() == Some(global)
+        };
         let progress = RefCell::new(SourceProgress::default());
         for selected in sources {
             progress.borrow_mut().finish_pending();
@@ -216,9 +224,13 @@ impl ContinueConnector {
                     .ancestors()
                     .any(|path| path.file_name().is_some_and(|name| name == ".continue"))
                 || global.as_ref().is_some_and(|global| {
-                    selected.root.path == *global
-                        || selected.root.path.starts_with(global.join("sessions"))
-                        || selected.root.path.parent() == Some(global.as_path())
+                    matches_global_root(&selected.root.path, global)
+                        || (!excludes(global)
+                            && matches_global_root(
+                                &crate::normalize_path_identity(&selected.root.path),
+                                global_identity
+                                    .get_or_init(|| crate::normalize_path_identity(global)),
+                            ))
                 });
             if !native_root && positively_foreign_snapshot(source) {
                 tracing::debug!(path = %source.source_path.display(), "untyped JSON candidate is not a Continue snapshot");

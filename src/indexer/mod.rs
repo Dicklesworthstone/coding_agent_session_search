@@ -36911,8 +36911,11 @@ fn reindex_paths_with_semantic_delta(
                 || chunk_outcome.batch_outcome.inserted_messages > 0
                 || chunk_outcome.batch_outcome.updated_messages > 0
                 || chunk_outcome.batch_outcome.workspace_changes > 0;
-            if chunk_outcome.batch_outcome.workspace_changes > 0 {
-                // Do not leave a live watcher serving old workspace filters.
+            if chunk_outcome.batch_outcome.workspace_changes > 0
+                || chunk_outcome.batch_outcome.updated_messages > 0
+            {
+                // Do not leave a live watcher serving old workspace filters
+                // or an incomplete native-message repair checkpoint.
                 // The pre-mutation checkpoint remains pending if this fails.
                 *t_index_guard = None;
                 rebuild_tantivy_from_db_deferred_startup_with_options(
@@ -40345,6 +40348,18 @@ pub mod persist {
             self.updated_messages = self
                 .updated_messages
                 .saturating_add(outcome.updated_indices.len());
+            if !outcome.updated_indices.is_empty() {
+                // Inline upserts do not certify the pre-mutation repair
+                // checkpoint. Tell every ingest caller to finish the existing
+                // authoritative rebuild before reporting lexical readiness.
+                self.lexical_update_deferred = true;
+                if self.lexical_update_error.is_none() {
+                    self.lexical_update_error = Some(
+                        "canonical native messages revised; verified lexical publication required"
+                            .to_string(),
+                    );
+                }
+            }
             if outcome.workspace_changed {
                 self.workspace_changes = self.workspace_changes.saturating_add(1);
                 self.lexical_update_deferred = true;
@@ -44206,6 +44221,7 @@ pub mod persist {
             )
             .unwrap();
             assert_eq!(changed.updated_messages, 1);
+            assert!(changed.lexical_update_deferred);
             assert_eq!(hits(&index, "durableneedle"), 0);
             let replay = persist_conversations_batched_inner(
                 &storage,
@@ -44220,6 +44236,7 @@ pub mod persist {
             )
             .unwrap();
             assert_eq!(replay.updated_messages, 0);
+            assert!(!replay.lexical_update_deferred);
             let pending = super::super::load_lexical_rebuild_state(&index_path)
                 .unwrap()
                 .unwrap();

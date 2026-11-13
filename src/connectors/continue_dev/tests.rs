@@ -226,24 +226,35 @@ fn gh552_custom_continue_store_does_not_disclaim_invalid_snapshot() {
         br#"{"title":"invalid Continue snapshot"}"#,
     )
     .unwrap();
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "connectors::continue_dev::tests::gh552_custom_continue_store_does_not_disclaim_invalid_snapshot",
-            "--nocapture",
-        ])
-        .current_dir(temp.path())
-        .env("CONTINUE_GLOBAL_DIR", &root)
-        .env(CHILD_ROOT, &root)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    fs::create_dir(temp.path().join("unused")).unwrap();
+    let configurations = vec![root.clone(), PathBuf::from("unused/../custom-store")];
+    #[cfg(unix)]
+    let configurations = {
+        std::os::unix::fs::symlink(&root, temp.path().join("store-alias")).unwrap();
+        let mut paths = configurations;
+        paths.push(PathBuf::from("store-alias"));
+        paths
+    };
+    for configured in configurations {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "connectors::continue_dev::tests::gh552_custom_continue_store_does_not_disclaim_invalid_snapshot",
+                "--nocapture",
+            ])
+            .current_dir(temp.path())
+            .env("CONTINUE_GLOBAL_DIR", &configured)
+            .env(CHILD_ROOT, &root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{configured:?}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    }
 }
 
 #[test]
