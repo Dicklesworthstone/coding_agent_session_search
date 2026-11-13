@@ -11,7 +11,7 @@
 //! See also: `pages::secret_scan` (post-hoc scanning of existing data).
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -161,7 +161,7 @@ pub(crate) const PRIVATE_KEY_BLOCK_PATTERN: &str = concat!(
 );
 pub(crate) const DATABASE_URL_PATTERN: &str =
     r#"(?i)(?-u:\b)(postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s'"]{8,}"#;
-pub(crate) const GENERIC_SECRET_ASSIGNMENT_PATTERN: &str = r#"(?i)(?-u:\b)(?:api[ _-]?(?:key|secret|token)|auth[ _-]?token|access[ _-]?(?:token|key)|secret[ _-]?key|session[ _-]?token|password|passwd|passphrase|token|secret|authorization)\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){4,}"|'(?:\\.|[^'\\\r\n]){4,}'|[^\s,;}\]]{8,})"#;
+pub(crate) const GENERIC_SECRET_ASSIGNMENT_PATTERN: &str = r#"(?i)(?-u:\b)(?:[A-Za-z0-9]*[_-])*(?:api[ _-]?(?:key|secret|token)|auth[ _-]?token|access[ _-]?(?:token|key)|secret[ _-]?key|session[ _-]?token|password|passwd|passphrase|token|secret|authorization)\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){4,}"|'(?:\\.|[^'\\\r\n]){4,}'|[^\s,;}\]]{8,})"#;
 pub(crate) const SLACK_TOKEN_PATTERN: &str = r"(?-u:\b)xox[bpsaor]-[A-Za-z0-9\-]{10,}";
 pub(crate) const STRIPE_KEY_PATTERN: &str = r"(?-u:\b)[spr]k_live_[A-Za-z0-9]{20,}";
 
@@ -306,27 +306,139 @@ pub(crate) fn insert_redacted_json_entry(
     }
 }
 
+// Bound recursively JSON-encoded strings separately from serde_json's own
+// container nesting limit. At the boundary, hide the remaining structured
+// payload rather than returning credential fields that were never inspected.
+const MAX_EMBEDDED_JSON_LAYERS: usize = 8;
+
+/// Whether a complete embedded JSON value contains duplicate object keys.
+///
+/// Check before constructing a Value: its map keeps only the last duplicate,
+/// which could hide a credential-bearing value and incorrectly leave the
+/// original string unchanged. This visitor retains only the keys of active
+/// objects; the subsequent ordinary Value parser keeps its number semantics.
+struct EmbeddedJsonKeyCheck(bool);
+
+impl<'de> serde::Deserialize<'de> for EmbeddedJsonKeyCheck {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(Self(false))
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for EmbeddedJsonKeyCheck {
+    type Value = Self;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Self(false))
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Self(false))
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Self(false))
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Self(false))
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Self(false))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Self(false))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut has_duplicates = false;
+        while let Some(child) = sequence.next_element::<Self>()? {
+            has_duplicates |= child.0;
+        }
+        Ok(Self(has_duplicates))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut keys = HashSet::new();
+        let mut has_duplicates = false;
+        while let Some((key, child)) = object.next_entry::<String, Self>()? {
+            has_duplicates |= !keys.insert(key) || child.0;
+        }
+        Ok(Self(has_duplicates))
+    }
+}
+
 /// Redact secrets from a JSON value, recursively walking strings.
 ///
-/// - String values are redacted in-place.
+/// - String values are redacted without changing their JSON type.
+/// - Complete objects/arrays encoded as strings with a plausible JSON first
+///   token use the same field policy. Unchanged valid strings retain their
+///   exact bytes. Duplicate keys, parser refusals, and structured payloads
+///   beyond eight encoded layers cause the payload to be replaced in full.
 /// - Values under credential-bearing object keys are replaced in full.
 /// - Arrays and objects are walked recursively.
 /// - Numbers, booleans, and null are left untouched.
 pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
+    redact_json_with(value, &mut |input| redact_text(input).into_owned(), 0)
+}
+
+fn redact_json_with(
+    value: &serde_json::Value,
+    redact_plain_text: &mut impl FnMut(&str) -> String,
+    embedded_layers: usize,
+) -> serde_json::Value {
     match value {
-        serde_json::Value::String(s) => {
-            let redacted = redact_text(s).into_owned();
-            serde_json::Value::String(redacted)
-        }
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(redact_json).collect())
-        }
+        serde_json::Value::String(input) => serde_json::Value::String(redact_json_string(
+            input,
+            redact_plain_text,
+            embedded_layers,
+        )),
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.iter()
+                .map(|value| redact_json_with(value, redact_plain_text, embedded_layers))
+                .collect(),
+        ),
         serde_json::Value::Object(obj) => {
             let mut new_obj = serde_json::Map::with_capacity(obj.len());
             let mut next_suffixes = HashMap::new();
-            for (k, v) in obj {
-                let redacted_key = redact_text(k).into_owned();
-                let redacted_value = redact_sensitive_json_value(k, v, || redact_json(v));
+            for (key, value) in obj {
+                let redacted_key = redact_plain_text(key);
+                let redacted_value = redact_sensitive_json_value(key, value, || {
+                    redact_json_with(value, redact_plain_text, embedded_layers)
+                });
                 insert_redacted_json_entry(
                     &mut new_obj,
                     &mut next_suffixes,
@@ -338,6 +450,62 @@ pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
         }
         other => other.clone(),
     }
+}
+
+fn redact_json_string(
+    input: &str,
+    redact_plain_text: &mut impl FnMut(&str) -> String,
+    embedded_layers: usize,
+) -> String {
+    let trimmed = input.trim();
+    let has_container = (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'));
+    if !has_container {
+        return redact_plain_text(input);
+    }
+
+    // Inspect only the first token, peeling leading arrays in linear time.
+    // An object still needs a quoted first key (or to be empty), so ordinary
+    // code such as [{ id: 1 }] keeps the existing text rules.
+    let mut prefix = trimmed;
+    while let Some(rest) = prefix.strip_prefix('[') {
+        prefix = rest.trim_start();
+    }
+    let plausible_first_token = if let Some(rest) = prefix.strip_prefix('{') {
+        matches!(
+            rest.trim_start().as_bytes().first().copied(),
+            Some(b'"' | b'}')
+        )
+    } else {
+        matches!(
+            prefix.as_bytes().first().copied(),
+            Some(b'"' | b']' | b'-' | b'0'..=b'9')
+        ) || prefix.starts_with("true")
+            || prefix.starts_with("false")
+            || prefix.starts_with("null")
+    };
+    if !plausible_first_token {
+        return redact_plain_text(input);
+    }
+
+    // serde_json classifies depth and number/Unicode representation failures
+    // as syntax errors too. Once a string advertises JSON, a failed inspection
+    // must hide the payload rather than expose unexamined credential fields.
+    let Ok(keys) = serde_json::from_str::<EmbeddedJsonKeyCheck>(trimmed) else {
+        return REDACTED.to_owned();
+    };
+    if keys.0 || embedded_layers >= MAX_EMBEDDED_JSON_LAYERS {
+        return REDACTED.to_owned();
+    }
+    let Ok(embedded) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return REDACTED.to_owned();
+    };
+    let redacted = redact_json_with(&embedded, redact_plain_text, embedded_layers + 1);
+    if redacted != embedded {
+        return redacted.to_string();
+    }
+    // Do not reformat clean tool output or falsely report that it changed.
+    input.to_owned()
 }
 
 #[doc(hidden)]
@@ -706,34 +874,12 @@ impl MemoizingRedactor {
         }
     }
 
-    /// Memoized counterpart to [`redact_json`]. Recurses through the
-    /// JSON value, memoizing each string scalar (and each object key)
-    /// independently — JSON arrays / objects themselves are not
-    /// cached because their structural identity dominates compared to
-    /// per-string regex cost.
+    /// Memoized counterpart to the shared JSON redactor. Field semantics and
+    /// bounded embedded-JSON handling stay identical while plain-text string
+    /// values and object keys are memoized independently.
+    /// Arrays and objects themselves are not cached.
     pub(crate) fn redact_json(&mut self, value: &serde_json::Value) -> serde_json::Value {
-        match value {
-            serde_json::Value::String(s) => serde_json::Value::String(self.redact_text(s)),
-            serde_json::Value::Array(arr) => {
-                serde_json::Value::Array(arr.iter().map(|v| self.redact_json(v)).collect())
-            }
-            serde_json::Value::Object(obj) => {
-                let mut new_obj = serde_json::Map::with_capacity(obj.len());
-                let mut next_suffixes = HashMap::new();
-                for (k, v) in obj {
-                    let redacted_key = self.redact_text(k);
-                    let redacted_value = redact_sensitive_json_value(k, v, || self.redact_json(v));
-                    insert_redacted_json_entry(
-                        &mut new_obj,
-                        &mut next_suffixes,
-                        redacted_key,
-                        redacted_value,
-                    );
-                }
-                serde_json::Value::Object(new_obj)
-            }
-            other => other.clone(),
-        }
+        redact_json_with(value, &mut |input| self.redact_text(input), 0)
     }
 
     fn key_for(&self, input: &str) -> crate::indexer::memoization::MemoKey {
@@ -1134,6 +1280,234 @@ mod tests {
         ] {
             if plain.pointer(pointer) != input.pointer(pointer) {
                 return Err(format!("safe near-miss field changed: {pointer}"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gh547_prefixed_secret_assignments_redact_across_text_paths() {
+        let mut memo = MemoizingRedactor::with_capacity(16);
+        for input in [
+            "DB_PASSWORD=plainvalue222",
+            "GITHUB_TOKEN=plainvalue333",
+            "STRIPE_SECRET=plainvalue444",
+            "MY_API_KEY=plainvalue555",
+            "_TOKEN=plainvalue777",
+            "SERVICE__ACCESS_TOKEN=\"opaque value\"",
+            "deploy-client-secret='opaque value'",
+        ] {
+            assert_eq!(redact_text(input), REDACTED, "{input}");
+            assert_eq!(redact_text_reference(input), REDACTED, "{input}");
+            assert_eq!(memo.redact_text(input), REDACTED, "{input}");
+            assert_eq!(memo.redact_text(input), REDACTED, "{input}");
+        }
+        assert_eq!(memo.stats().misses, 7);
+        assert_eq!(memo.stats().hits, 7);
+    }
+
+    #[test]
+    fn gh547_assignment_prefixes_do_not_match_nonsecret_suffixes() {
+        let mut memo = MemoizingRedactor::with_capacity(8);
+        for input in [
+            "TOKEN_COUNT=1234567890",
+            "DB_PASSWORD_LENGTH=1234567890",
+            "SECRETARY=ordinaryvalue",
+            "MONKEY=ordinaryvalue",
+            "TOKENIZER=ordinaryvalue",
+            "GITHUB_TOKEN=short",
+        ] {
+            assert_eq!(redact_text(input), input);
+            assert_eq!(redact_text_reference(input), input);
+            assert_eq!(memo.redact_text(input), input);
+            assert_eq!(memo.redact_text(input), input);
+        }
+        assert_eq!(memo.stats().misses, 0);
+        assert_eq!(memo.stats().hits, 0);
+    }
+
+    #[test]
+    fn gh551_embedded_json_uses_sensitive_field_policy() -> Result<(), Box<dyn std::error::Error>> {
+        let embedded = r#" {
+            "ok": true,
+            "registration_token": "synthetic-short",
+            "nested": [{"passphrase": "tiny", "token_count": 42}],
+            "null_token": null,
+            "safe": "kept café 界"
+        } "#;
+        let input = json!({"message_index": 7, "content": embedded});
+        let output = redact_json(&input);
+        let decoded: serde_json::Value = serde_json::from_str(
+            output["content"]
+                .as_str()
+                .ok_or("content changed JSON type")?,
+        )?;
+        assert_eq!(
+            decoded,
+            json!({
+                "ok": true,
+                "registration_token": REDACTED,
+                "nested": [{"passphrase": REDACTED, "token_count": 42}],
+                "null_token": null,
+                "safe": "kept café 界"
+            })
+        );
+        assert_eq!(output["message_index"], 7);
+        assert_eq!(redact_json(&output), output);
+        let mut memo = MemoizingRedactor::with_capacity(16);
+        assert_eq!(memo.redact_json(&input), output);
+        assert_eq!(memo.redact_json(&input), output);
+        Ok(())
+    }
+
+    #[test]
+    fn gh551_nested_embedded_json_redacts_and_preserves_memo_hits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let details = json!([
+            {"registration_token": "opaque-short-value", "detail": "DB_PASSWORD=synthetic-assignment"},
+            {"detail": "DB_PASSWORD=synthetic-assignment"}
+        ]);
+        let input = json!({"content": json!({"output": details.to_string()}).to_string()});
+        let output = redact_json(&input);
+        let outer: serde_json::Value =
+            serde_json::from_str(output["content"].as_str().ok_or("outer string missing")?)?;
+        let decoded: serde_json::Value =
+            serde_json::from_str(outer["output"].as_str().ok_or("inner string missing")?)?;
+        assert_eq!(
+            decoded,
+            json!([
+                {"registration_token": REDACTED, "detail": REDACTED},
+                {"detail": REDACTED}
+            ])
+        );
+        let mut memo = MemoizingRedactor::with_capacity(16);
+        assert_eq!(memo.redact_json(&input), output);
+        assert_eq!(memo.stats().misses, 1);
+        assert_eq!(memo.stats().hits, 1);
+        assert_eq!(memo.redact_json(&input), output);
+        assert_eq!(memo.stats().misses, 1);
+        assert_eq!(memo.stats().hits, 3);
+        assert_eq!(redact_json(&output), output);
+        Ok(())
+    }
+
+    #[test]
+    fn gh551_clean_embedded_json_preserves_exact_bytes() {
+        let mut memo = MemoizingRedactor::with_capacity(8);
+        for input in [
+            " \n { \"token_count\": 2048, \"safe\": [1, true, null, \"café 界\"] } \t ",
+            "[\n {\"public_key\": \"public material\"} \n]",
+            r#"{"large":18446744073709551615,"small":-9223372036854775808,"decimal":1.25}"#,
+            "{}",
+            "[]",
+        ] {
+            let value = json!(input);
+            assert_eq!(redact_json(&value), value);
+            assert_eq!(memo.redact_json(&value), value);
+            assert_eq!(memo.redact_json(&value), value);
+        }
+        assert_eq!(memo.stats().misses, 0);
+        assert_eq!(memo.stats().hits, 0);
+    }
+
+    #[test]
+    fn gh551_json_prefix_admission_separates_structured_data_from_prose() {
+        let mut memo = MemoizingRedactor::with_capacity(8);
+        for (input, expected) in [
+            (r#"{"note": DB_PASSWORD=synthetic-assignment }"#, REDACTED),
+            (r#"[null, {"registration_token":"tiny"}, ]"#, REDACTED),
+            ("{not valid JSON}", "{not valid JSON}"),
+            ("[not valid JSON]", "[not valid JSON]"),
+            ("[unfinished", "[unfinished"),
+            ("[{ id: 1 }]", "[{ id: 1 }]"),
+            ("[ [{ id: 1 }] ]", "[ [{ id: 1 }] ]"),
+            ("{ DB_PASSWORD=synthetic-assignment }", "{ [REDACTED] }"),
+        ] {
+            let value = json!(input);
+            let expected = json!(expected);
+            assert_eq!(redact_json(&value), expected);
+            assert_eq!(memo.redact_json(&value), expected);
+            assert_eq!(memo.redact_json(&value), expected);
+        }
+    }
+
+    #[test]
+    fn gh551_structured_parser_failures_cannot_expose_credentials() {
+        let deep = format!(
+            "{}{}{}",
+            "[".repeat(130),
+            r#"{"registration_token":"tiny"}"#,
+            "]".repeat(130)
+        );
+        let mut memo = MemoizingRedactor::with_capacity(8);
+        for input in [
+            deep,
+            r#"{"registration_token":"tiny","number":1e400}"#.to_owned(),
+            r#"{"registration_token":"tiny","text":"\uD800"}"#.to_owned(),
+            r#"{"registration_token":"tiny","text":"\x41"}"#.to_owned(),
+            r#"{"registration_token":"tiny","broken":[}"#.to_owned(),
+        ] {
+            let value = json!(input);
+            let expected = json!(REDACTED);
+            assert_eq!(redact_json(&value), expected);
+            assert_eq!(memo.redact_json(&value), expected);
+            assert_eq!(memo.redact_json(&value), expected);
+            assert_eq!(redact_json(&expected), expected);
+        }
+    }
+
+    #[test]
+    fn gh551_duplicate_keys_fail_closed_at_every_object_depth() {
+        let mut memo = MemoizingRedactor::with_capacity(8);
+        for input in [
+            r#"{"registration_token":"synthetic-hidden","registration_token":null}"#,
+            r#"{"outer":{"authorization":"synthetic-hidden"},"outer":{}}"#,
+            r#"[{"nested":{"passphrase":"synthetic-hidden"},"nested":"safe"}]"#,
+            r#"{"registration_token":"synthetic-hidden","\u0072egistration_token":null}"#,
+            r#"{"safe":1,"safe":2}"#,
+        ] {
+            let value = json!(input);
+            let expected = json!(REDACTED);
+            assert_eq!(redact_json(&value), expected);
+            assert_eq!(memo.redact_json(&value), expected);
+            assert_eq!(memo.redact_json(&value), expected);
+            assert_eq!(redact_json(&expected), expected);
+        }
+    }
+
+    #[test]
+    fn gh551_embedded_json_depth_is_bounded_and_idempotent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for wrappers in [MAX_EMBEDDED_JSON_LAYERS - 1, MAX_EMBEDDED_JSON_LAYERS] {
+            let mut encoded = r#"{"registration_token":"synthetic-deep-secret"}"#.to_owned();
+            for _ in 0..wrappers {
+                encoded = json!({"payload": encoded}).to_string();
+            }
+            let input = json!(encoded);
+            let output = redact_json(&input);
+            assert!(!output.to_string().contains("synthetic-deep-secret"));
+            assert_eq!(redact_json(&output), output);
+            let mut memo = MemoizingRedactor::with_capacity(8);
+            assert_eq!(memo.redact_json(&input), output);
+            assert_eq!(memo.redact_json(&input), output);
+            let mut decoded = output
+                .as_str()
+                .ok_or("top-level string missing")?
+                .to_owned();
+            for _ in 0..wrappers {
+                let object: serde_json::Value = serde_json::from_str(&decoded)?;
+                decoded = object["payload"]
+                    .as_str()
+                    .ok_or("encoded child missing")?
+                    .to_owned();
+            }
+            if wrappers == MAX_EMBEDDED_JSON_LAYERS {
+                assert_eq!(decoded, REDACTED, "over-depth payload must be hidden");
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&decoded)?,
+                    json!({"registration_token": REDACTED})
+                );
             }
         }
         Ok(())
