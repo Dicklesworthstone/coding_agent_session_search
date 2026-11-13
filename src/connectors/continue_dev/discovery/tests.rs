@@ -224,6 +224,109 @@ fn excluded_derived_stores_do_not_fall_back_to_parent_json_files() {
         .unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn excluded_derived_store_errors_do_not_block_the_other_store() {
+    use std::os::unix::fs::symlink;
+
+    for (private, public) in [
+        (".continue/sessions", "sessions"),
+        ("sessions", ".continue/sessions"),
+    ] {
+        let temp = tempfile::Builder::new()
+            .prefix("cass-continue-derived-exclusion-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let profile = temp.path().join("profile");
+        let private = profile.join(private);
+        let public = profile.join(public).join("public.json");
+        seed(&public);
+        seed(&profile.join("parent.json"));
+        fs::create_dir_all(private.parent().unwrap()).unwrap();
+        symlink(private.file_name().unwrap(), &private).unwrap();
+        let ctx = context(ScanRoot::local(profile), &temp.path().join("cass"));
+        let connector = ContinueConnector::new();
+
+        // Without exclusion, actual metadata damage must remain an error.
+        let error = connector.discover_allowed(&ctx, &|_| false).unwrap_err();
+        assert!(error.downcast_ref::<io::Error>().is_some());
+        assert!(error.to_string().contains(&private.display().to_string()));
+        let excludes = |path: &Path| path.starts_with(&private);
+        let sources = connector.discover_allowed(&ctx, &excludes).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_path, fs::canonicalize(&public).unwrap());
+
+        let mut admitted = Vec::new();
+        let mut completed = Vec::new();
+        let mut rows = Vec::new();
+        connector
+            .scan_allowed(
+                &ctx,
+                &mut SourceScanHooks {
+                    should_scan_source: Some(&mut |source| {
+                        admitted.push(source.clone());
+                        true
+                    }),
+                    on_source_complete: Some(&mut |completion| {
+                        assert_eq!(completion.conversations_emitted, 1);
+                        completed.push(completion.source.clone());
+                        Ok(())
+                    }),
+                },
+                &mut |row| {
+                    rows.push(row);
+                    Ok(())
+                },
+                &excludes,
+            )
+            .unwrap();
+        assert_eq!(admitted, sources);
+        assert_eq!(completed, sources);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].external_id.as_deref(), Some("public"));
+        assert_eq!(rows[0].messages[0].content, "retained question");
+    }
+}
+
+#[test]
+fn excluded_potential_layouts_do_not_broaden_to_parent_json_files() {
+    for relative in [".continue/sessions", "sessions"] {
+        let temp = tempfile::Builder::new()
+            .prefix("cass-continue-absent-exclusion-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let profile = temp.path().join("profile");
+        seed(&profile.join("parent.json"));
+        let data = temp.path().join(".continue");
+        seed(&data.join("sessions/implicit.json"));
+        let ctx = context(ScanRoot::local(profile.clone()), &data);
+        assert_eq!(exercise(&ctx).len(), 1);
+        let excluded = profile.join(relative);
+        assert!(!excluded.exists());
+        let excludes = |path: &Path| path.starts_with(&excluded);
+        let connector = ContinueConnector::new();
+        assert!(
+            connector
+                .discover_allowed(&ctx, &excludes)
+                .unwrap()
+                .is_empty()
+        );
+        connector
+            .scan_allowed(
+                &ctx,
+                &mut SourceScanHooks {
+                    should_scan_source: Some(&mut |_| panic!("parent source admitted")),
+                    on_source_complete: Some(&mut |_| panic!("parent source completed")),
+                },
+                &mut |_| panic!("excluded layout broadened to parent or implicit home"),
+                &excludes,
+            )
+            .unwrap();
+    }
+}
+
 #[test]
 fn missing_explicit_roots_fail_without_scanning_the_default_home() {
     let temp = tempfile::tempdir().unwrap();
