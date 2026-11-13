@@ -1,7 +1,7 @@
 //! A caller-owned, persistent lexical search session over standard I/O.
 //!
-//! The reader is loaded lazily and retained until explicit reload, shutdown, or
-//! EOF. Search is index-only unless --lexical-fallback is explicitly enabled.
+//! The reader is loaded lazily and retained until explicit reload, shutdown,
+//! EOF, or privacy invalidation. Search is index-only unless --lexical-fallback is explicitly enabled.
 //! That recovery lane admits only small archives after a Quill fuel refusal.
 //! Canonical follow-up requires an explicit --db
 //! and exact source/conversation/message coordinates; it never opens raw files.
@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
+use coding_agent_search::search::privacy::{PrivacyError, PrivacySnapshot};
 use coding_agent_search::search::query::{
     FieldMask, SearchClient, SearchClientOptions, SearchFilters, SearchHit,
 };
@@ -363,6 +364,7 @@ struct Session {
     canonical_read_attempts: u64,
     canonical_reads_completed: u64,
     client: Option<SearchClient>,
+    privacy: Option<Vec<PrivacySnapshot>>,
     // Declaration/drop order matters: reader destruction precedes lease release.
     reader_lease: Option<admission::Lease>,
     admission_pool: Option<admission::Pool>,
@@ -388,6 +390,7 @@ impl Session {
             canonical_read_attempts: 0,
             canonical_reads_completed: 0,
             client: None,
+            privacy: None,
             reader_lease: None,
             admission_pool: None,
             open_attempts: 0,
@@ -399,6 +402,7 @@ impl Session {
 
     fn ensure_loaded(&mut self) -> Result<()> {
         if self.client.is_none() {
+            let privacy = self.admit_privacy()?;
             let lease = if self.reader_lease.is_none() {
                 self.acquire_reader_lease()?
             } else {
@@ -406,6 +410,13 @@ impl Session {
             };
             self.open_attempts = self.open_attempts.saturating_add(1);
             let client = open_snapshot(&self.index)?;
+            Self::validate_privacy(&privacy)?;
+            if self.capture_privacy()? != privacy {
+                return Err(PrivacyError::SnapshotInvalidated {
+                    path: self.index.clone(),
+                }
+                .into());
+            }
             self.successful_opens = self.successful_opens.saturating_add(1);
             self.client = Some(client);
             self.manifest_source =
@@ -415,6 +426,75 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    fn admit_privacy(&mut self) -> Result<Vec<PrivacySnapshot>> {
+        // A failed open or a canonical-only request retains no snapshot to
+        // protect. Recapture aliases before a later attempt opens assets.
+        if self.client.is_none() && !self.semantic.loaded() && !self.refiner.loaded() {
+            self.privacy = None;
+        }
+        if self.privacy.is_none() {
+            self.privacy = Some(self.capture_privacy()?);
+        }
+        let privacy = self
+            .privacy
+            .as_ref()
+            .context("privacy admission is unavailable")?;
+        Self::validate_privacy(privacy)?;
+        Ok(privacy.clone())
+    }
+
+    fn capture_privacy(&self) -> Result<Vec<PrivacySnapshot>> {
+        let mut privacy = vec![PrivacySnapshot::for_index(&self.index)?];
+        if let Some(database) = &self.archive {
+            privacy.push(PrivacySnapshot::for_database(database)?);
+        }
+        Self::validate_privacy(&privacy)?;
+        Ok(privacy)
+    }
+
+    fn validate_privacy(privacy: &[PrivacySnapshot]) -> Result<()> {
+        for snapshot in privacy {
+            snapshot.validate()?;
+        }
+        Ok(())
+    }
+
+    fn privacy_failure(&mut self, id: Option<u64>, error: anyhow::Error) -> (Reply, bool) {
+        self.unload();
+        (
+            Reply::failure(
+                id,
+                admission_error_kind(&error, "privacy-state-unavailable"),
+                format!("{error:#}"),
+            ),
+            false,
+        )
+    }
+
+    fn admit_reply(
+        &mut self,
+        privacy: &[PrivacySnapshot],
+        reply: Reply,
+        shutdown: bool,
+    ) -> (Reply, bool) {
+        if reply.error.as_ref().is_some_and(|error| {
+            matches!(
+                error.kind,
+                "forget-repair-pending"
+                    | "privacy-snapshot-invalidated"
+                    | "privacy-state-unavailable"
+            )
+        }) {
+            self.unload();
+        }
+        // This is the result-admission boundary: discard the whole computed
+        // response if forgetting began while any retrieval lane was running.
+        if let Err(error) = Self::validate_privacy(privacy) {
+            return self.privacy_failure(reply.id, error);
+        }
+        (reply, shutdown)
     }
 
     fn acquire_reader_lease(&self) -> Result<Option<admission::Lease>> {
@@ -432,6 +512,7 @@ impl Session {
         drop(self.client.take());
         drop(self.reader_lease.take());
         self.manifest_source = None;
+        self.privacy = None;
     }
 
     fn status(&self) -> Value {
@@ -462,7 +543,7 @@ impl Session {
             "open_attempts": self.open_attempts,
             "successful_opens": self.successful_opens,
             "queries_completed": self.queries_completed,
-            "snapshot_policy": "pinned_until_reload",
+            "snapshot_policy": "pinned_until_reload_or_forget",
             "freshness": "not_checked",
             "manifest_source": self.manifest_source.map(QuillManifestSource::as_str),
             "canonical_view_enabled": self.archive.is_some(),
@@ -603,6 +684,26 @@ impl Session {
     }
 
     fn handle(&mut self, request: Request) -> (Reply, bool) {
+        let id = match &request {
+            Request::Search { id, .. }
+            | Request::SemanticSearch { id, .. }
+            | Request::Refine { id, .. }
+            | Request::View { id, .. }
+            | Request::ViewBatch { id, .. }
+            | Request::Transcript { id, .. } => *id,
+            // Status remains lazy and teardown remains possible during repair.
+            // Reload drops the prior owners before ensure_loaded admits anew.
+            _ => return self.handle_admitted(request),
+        };
+        let privacy = match self.admit_privacy() {
+            Ok(privacy) => privacy,
+            Err(error) => return self.privacy_failure(Some(id), error),
+        };
+        let (reply, shutdown) = self.handle_admitted(request);
+        self.admit_reply(&privacy, reply, shutdown)
+    }
+
+    fn handle_admitted(&mut self, request: Request) -> (Reply, bool) {
         match request {
             Request::Transcript {
                 id,
@@ -915,6 +1016,9 @@ impl Session {
 }
 
 fn admission_error_kind(error: &anyhow::Error, fallback: &'static str) -> &'static str {
+    if let Some(error) = error.downcast_ref::<PrivacyError>() {
+        return error.kind();
+    }
     error
         .downcast_ref::<admission::Refusal>()
         .map_or(fallback, admission::Refusal::kind)

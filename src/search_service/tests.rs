@@ -587,6 +587,194 @@ fn repeated_queries_reuse_one_real_reader_and_preserve_canonical_followup_identi
 }
 
 #[test]
+fn fenc7_explicit_archive_fence_is_checked_for_a_detached_index() -> Result<()> {
+    use coding_agent_search::search::privacy;
+
+    let temp = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+    let path = temp.path().join("detached-index");
+    let database = temp.path().join("archive/agent_search.db");
+    let _writer = index(&path, &[document(41, "forgottenneedle", "local")])?;
+    let mut session = Session::new(path);
+    session.archive = Some(database.clone());
+    assert_eq!(search(&mut session, 1, "forgottenneedle")["count"], 1);
+    privacy::begin_forget(&database)?;
+    let before = tree(temp.path())?;
+    let (reply, _) = session.handle(request(json!({
+        "op":"search", "id":2, "query":"forgottenneedle"
+    })));
+    assert!(!reply.ok);
+    assert!(reply.result.is_none());
+    assert_eq!(reply.error.unwrap().kind, "forget-repair-pending");
+    assert!(session.client.is_none());
+    assert_eq!(session.status()["canonical_database_accessed"], false);
+    assert!(
+        !database.exists(),
+        "fence checks must not create an archive"
+    );
+    assert_eq!(tree(temp.path())?, before);
+    Ok(())
+}
+
+#[test]
+fn fenc7_completed_forget_invalidates_a_retained_hash_semantic_reader() -> Result<()> {
+    use coding_agent_search::search::privacy;
+
+    let (root, mut session, conversation) = semantic_service_fixture()?;
+    let _retained_fixture = root.keep();
+    let query = json!({
+        "op":"semantic_search", "id":1, "query":"semanticneedle", "mode":"semantic"
+    });
+    let (before, _) = session.handle(request(query.clone()));
+    assert!(before.ok, "{before:?}");
+    let before = before.result.unwrap();
+    // Semantic retrieval ranks both fixture vectors; it is not a term filter.
+    assert_eq!(before["count"], 2);
+    assert_eq!(before["hits"][0]["conversation_id"], conversation);
+    assert_eq!(before["hits"][0]["message_index"], 8);
+    assert_eq!(before["hits"][1]["conversation_id"], conversation);
+    assert_eq!(before["hits"][1]["message_index"], 13);
+    assert!(session.client.is_none());
+    assert!(session.semantic.loaded());
+    assert!(
+        !session.semantic.model_loaded(),
+        "hash owns no neural model"
+    );
+    let database = session.archive.as_ref().unwrap();
+    // An epoch revocation without querying during pending must still discard
+    // the semantic owner; this is not a canonical deletion/repair probe.
+    privacy::begin_forget(database)?;
+    privacy::complete_forget(database)?;
+    let (reply, _) = session.handle(request(query.clone()));
+    assert!(!reply.ok);
+    assert!(reply.result.is_none());
+    assert_eq!(reply.error.unwrap().kind, "privacy-snapshot-invalidated");
+    assert!(!session.semantic.loaded());
+    let (reopened, _) = session.handle(request(query));
+    assert!(reopened.ok, "{reopened:?}");
+    let reopened = reopened.result.unwrap();
+    assert_eq!(reopened["count"], 2);
+    assert_eq!(reopened["hits"], before["hits"]);
+    Ok(())
+}
+
+#[test]
+fn fenc7_pending_forget_refuses_warm_and_cold_readers_and_repair_recovers() -> Result<()> {
+    use coding_agent_search::search::{privacy, tantivy::expected_index_dir};
+
+    let temp = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+    let path = expected_index_dir(temp.path());
+    let database = temp.path().join("agent_search.db");
+    let mut writer = index(
+        &path,
+        &[
+            document(41, "forgottenneedle", "local"),
+            document(42, "retainedneedle", "local"),
+        ],
+    )?;
+    let mut warm = Session::new(path.clone());
+    let mut cold = Session::new(path);
+    assert_eq!(search(&mut warm, 1, "forgottenneedle")["count"], 1);
+    assert_eq!(search(&mut warm, 2, "retainedneedle")["count"], 1);
+    privacy::begin_forget(&database)?;
+    let fenced = tree(temp.path())?;
+    for session in [&mut warm, &mut cold] {
+        let (reply, stopped) = session.handle(request(json!({
+            "op":"search", "id":3, "query":"forgottenneedle"
+        })));
+        assert!(!stopped);
+        assert!(!reply.ok);
+        assert!(reply.result.is_none());
+        assert_eq!(reply.error.unwrap().kind, "forget-repair-pending");
+        assert!(!session.status()["loaded"].as_bool().unwrap());
+        assert_eq!(session.status()["canonical_database_accessed"], false);
+        let (reload, _) = session.handle(Request::Reload { id: 4 });
+        assert!(!reload.ok);
+        assert_eq!(reload.error.unwrap().kind, "forget-repair-pending");
+        let (status, _) = session.handle(Request::Status { id: 5 });
+        assert!(status.ok, "status remains available during repair");
+    }
+    assert_eq!(
+        tree(temp.path())?,
+        fenced,
+        "readers rewrote the fence or index"
+    );
+
+    writer.delete_all()?;
+    writer.add_prebuilt_documents_slice(&[document(42, "retainedneedle", "local")])?;
+    writer.commit()?;
+    privacy::complete_forget(&database)?;
+    let repaired = tree(temp.path())?;
+    for session in [&mut warm, &mut cold] {
+        let (reload, _) = session.handle(Request::Reload { id: 6 });
+        assert!(reload.ok, "{reload:?}");
+        assert_eq!(search(session, 7, "forgottenneedle")["count"], 0);
+        let kept = search(session, 8, "retainedneedle");
+        assert_eq!(kept["count"], 1);
+        assert_eq!(kept["hits"][0]["conversation_id"], 42);
+    }
+    assert_eq!(tree(temp.path())?, repaired);
+    Ok(())
+}
+
+#[test]
+fn fenc7_completed_forget_invalidates_an_unqueried_pinned_reader() -> Result<()> {
+    use coding_agent_search::search::{privacy, tantivy::expected_index_dir};
+
+    let temp = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+    let path = expected_index_dir(temp.path());
+    let database = temp.path().join("agent_search.db");
+    let mut writer = index(&path, &[document(41, "forgottenneedle", "local")])?;
+    let mut session = Session::new(path);
+    assert_eq!(search(&mut session, 1, "forgottenneedle")["count"], 1);
+    privacy::begin_forget(&database)?;
+    writer.delete_all()?;
+    writer.add_prebuilt_documents_slice(&[document(42, "retainedneedle", "local")])?;
+    writer.commit()?;
+    privacy::complete_forget(&database)?;
+    let repaired = tree(temp.path())?;
+    let (reply, _) = session.handle(request(json!({
+        "op":"search", "id":2, "query":"forgottenneedle"
+    })));
+    assert!(!reply.ok);
+    assert!(reply.result.is_none());
+    assert_eq!(reply.error.unwrap().kind, "privacy-snapshot-invalidated");
+    assert!(session.client.is_none());
+    assert_eq!(search(&mut session, 3, "forgottenneedle")["count"], 0);
+    assert_eq!(search(&mut session, 4, "retainedneedle")["count"], 1);
+    assert_eq!(session.successful_opens, 2);
+    assert_eq!(tree(temp.path())?, repaired);
+    Ok(())
+}
+
+#[test]
+fn fenc7_final_admission_discards_an_already_computed_search_reply() -> Result<()> {
+    use coding_agent_search::search::{privacy, tantivy::expected_index_dir};
+
+    let temp = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+    let path = expected_index_dir(temp.path());
+    let database = temp.path().join("agent_search.db");
+    let _writer = index(&path, &[document(41, "forgottenneedle", "local")])?;
+    let mut session = Session::new(path);
+    let admitted = session.admit_privacy()?;
+    // Exercise the production computation and final-admission phases separately
+    // to place a real fence publication between them without timing races.
+    let (computed, stopped) = session.handle_admitted(request(json!({
+        "op":"search", "id":7, "query":"forgottenneedle"
+    })));
+    assert!(computed.ok);
+    assert_eq!(computed.result.as_ref().unwrap()["count"], 1);
+    privacy::begin_forget(&database)?;
+    let (reply, stopped) = session.admit_reply(&admitted, computed, stopped);
+    assert!(!stopped);
+    assert_eq!(reply.id, Some(7));
+    assert!(!reply.ok);
+    assert!(reply.result.is_none());
+    assert_eq!(reply.error.unwrap().kind, "forget-repair-pending");
+    assert!(session.client.is_none());
+    Ok(())
+}
+
+#[test]
 fn publication_is_invisible_until_reload_and_new_snapshot_replaces_old() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("index");

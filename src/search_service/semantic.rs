@@ -354,8 +354,12 @@ impl Semantic {
             .is_some_and(|config| matches!(config.embedder, EmbedderChoice::External))
     }
 
-    pub(super) fn model_loaded(&self) -> bool {
+    pub(super) fn loaded(&self) -> bool {
         self.client.is_some()
+    }
+
+    pub(super) fn model_loaded(&self) -> bool {
+        self.loaded()
             && self
                 .config
                 .as_ref()

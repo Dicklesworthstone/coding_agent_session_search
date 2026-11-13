@@ -41,9 +41,25 @@ are no detached children or network listeners.
 
 `reader_epoch` is a monotonically increasing **session-local** successful-open
 counter, not a canonical database generation, checksum, or freshness proof.
-Responses explicitly report `snapshot_policy: "pinned_until_reload"` and
+Responses explicitly report `snapshot_policy: "pinned_until_reload_or_forget"` and
 `freshness: "not_checked"`. Status means only whether this process has a loaded
 reader, not whether the archive is complete, current, or healthy.
+
+Privacy revocation overrides the ordinary pinned snapshot. Every data request
+checks the durable forget fence beside the index and, when configured, beside
+the explicit archive. The service reads these bounded files without opening
+SQLite for lexical-only requests. It checks again after computation before
+admitting the complete reply. A request admitted before a concurrent forget
+publishes its fence may finish delivering that reply; a request that observes
+the fence discards its entire result.
+
+Pending repair returns `forget-repair-pending`. An epoch change invalidates an
+already retained reader with `privacy-snapshot-invalidated`; an unreadable or
+invalid fence returns `privacy-state-unavailable`. These errors unload the
+retained lexical, semantic and reranking owners rather than falling back to
+their old content. Status, unload and shutdown remain available. Finish any
+interrupted forget separately, then reload or submit another valid request to
+open fresh assets. Reload during pending repair fails and leaves no old reader.
 
 Search returns **index previews**, not canonical message bodies. It
 never supplies a database path to `SearchClient`, loads semantic models,

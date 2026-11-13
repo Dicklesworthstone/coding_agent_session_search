@@ -2271,8 +2271,8 @@ fn every_search_surface_recovers_after_dedup_apply() -> TestResult {
 /// The TUI and `cass serve --stdio` keep one lexical reader open across many
 /// searches. A forget run while one is open must not leave the forgotten text
 /// reachable through it: the TUI's reloading client drops it on its next
-/// search, and a serve session, pinned until `reload` by contract
-/// (docs/SEARCH_SERVICE.md), drops it on reload.
+/// search, and a serve session refuses its invalidated snapshot before reload
+/// (docs/SEARCH_SERVICE.md), then serves only retained content after reload.
 #[test]
 fn search_readers_open_across_a_forget_stop_returning_forgotten_text() -> TestResult {
     use coding_agent_search::search::query::{
@@ -2322,33 +2322,42 @@ fn search_readers_open_across_a_forget_stop_returning_forgotten_text() -> TestRe
     let mut serve_in = serve.stdin.take().ok_or("no serve stdin")?;
     let mut serve_out = BufReader::new(serve.stdout.take().ok_or("no serve stdout")?);
     let mut next_id = 0_u64;
-    let mut serve_request = |op: &str, query: Option<&str>| -> TestResult<Vec<String>> {
-        next_id += 1;
-        let mut request = json!({"op": op, "id": next_id});
-        if let Some(query) = query {
-            request["query"] = json!(query);
-            request["limit"] = json!(10);
-        }
-        writeln!(serve_in, "{request}")?;
-        serve_in.flush()?;
-        let mut line = String::new();
-        serve_out.read_line(&mut line)?;
-        let reply: Value = serde_json::from_str(&line)?;
-        if reply["ok"] != true {
-            return Err(format!("serve {request} failed: {reply}").into());
-        }
-        let hits: Vec<String> = reply["result"]["hits"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|hit| hit["source_path"].as_str().unwrap_or_default().to_string())
-            .collect();
-        eprintln!(
-            "{}",
-            json!({"test": "cli_forget", "step": "serve", "request": request, "hits": hits})
-        );
-        Ok(hits)
-    };
+    let mut serve_request =
+        |op: &str, query: Option<&str>, privacy_invalidated: bool| -> TestResult<Vec<String>> {
+            next_id += 1;
+            let mut request = json!({"op": op, "id": next_id});
+            if let Some(query) = query {
+                request["query"] = json!(query);
+                request["limit"] = json!(10);
+            }
+            writeln!(serve_in, "{request}")?;
+            serve_in.flush()?;
+            let mut line = String::new();
+            serve_out.read_line(&mut line)?;
+            let reply: Value = serde_json::from_str(&line)?;
+            if privacy_invalidated {
+                assert_eq!(reply["id"], next_id);
+                assert_eq!(reply["ok"], false, "{reply}");
+                assert_eq!(reply["error"]["kind"], "privacy-snapshot-invalidated");
+                assert!(reply.get("result").is_none(), "{reply}");
+                assert!(!line.contains(FORGOTTEN_MARKER));
+                return Ok(Vec::new());
+            }
+            if reply["ok"] != true {
+                return Err(format!("serve {request} failed: {reply}").into());
+            }
+            let hits: Vec<String> = reply["result"]["hits"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|hit| hit["source_path"].as_str().unwrap_or_default().to_string())
+                .collect();
+            eprintln!(
+                "{}",
+                json!({"test": "cli_forget", "step": "serve", "request": request, "hits": hits})
+            );
+            Ok(hits)
+        };
 
     // Negative control: both readers find the marker before the forget.
     if !client_hits(FORGOTTEN_MARKER)?
@@ -2357,7 +2366,7 @@ fn search_readers_open_across_a_forget_stop_returning_forgotten_text() -> TestRe
     {
         return Err("control: the TUI client did not find the marker before forget".into());
     }
-    if !serve_request("search", Some(FORGOTTEN_MARKER))?
+    if !serve_request("search", Some(FORGOTTEN_MARKER), false)?
         .iter()
         .any(|path| path == forgotten_str)
     {
@@ -2378,17 +2387,17 @@ fn search_readers_open_across_a_forget_stop_returning_forgotten_text() -> TestRe
         return Err("the open TUI client lost the unrelated conversation".into());
     }
 
-    // The pinned session is logged, not judged; reload is the contract.
-    serve_request("search", Some(FORGOTTEN_MARKER))?;
-    serve_request("reload", None)?;
-    let after = serve_request("search", Some(FORGOTTEN_MARKER))?;
+    // Privacy revocation supersedes the pinned snapshot even without reload.
+    serve_request("search", Some(FORGOTTEN_MARKER), true)?;
+    serve_request("reload", None, false)?;
+    let after = serve_request("search", Some(FORGOTTEN_MARKER), false)?;
     if !after.is_empty() {
         return Err(format!("a reloaded serve session returns forgotten text: {after:?}").into());
     }
-    if serve_request("search", Some(KEPT_MARKER))?.is_empty() {
+    if serve_request("search", Some(KEPT_MARKER), false)?.is_empty() {
         return Err("the reloaded serve session lost the unrelated conversation".into());
     }
-    serve_request("shutdown", None)?;
+    serve_request("shutdown", None, false)?;
     if !serve.wait()?.success() {
         return Err("cass serve did not shut down cleanly".into());
     }
