@@ -26,7 +26,7 @@ const MAX_STATE_BYTES: u64 = 1024;
 #[derive(Debug, thiserror::Error)]
 pub enum PrivacyError {
     #[error(
-        "forget-repair-pending: forgotten history is being removed from derived assets; retry the same forget command with --apply or run cass index --full before reading {}",
+        "forget-repair-pending: forgotten history is being removed from derived assets; retry the same forget command with --apply to finish repair before reading history; fence: {}",
         path.display()
     )]
     RepairPending { path: PathBuf },
