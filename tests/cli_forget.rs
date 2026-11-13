@@ -2268,6 +2268,102 @@ fn every_search_surface_recovers_after_dedup_apply() -> TestResult {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn serve_database_alias_refuses_interrupted_forget_and_recovers_after_repair() -> TestResult {
+    use coding_agent_search::search::privacy;
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use std::os::unix::fs::symlink;
+
+    let (archive, forgotten) = indexed_archive(&[])?;
+    let forgotten_str = forgotten.to_str().ok_or("non-utf8 fixture path")?;
+    let database = archive.data_dir.join("agent_search.db");
+    let database_alias = archive.home.path().join("database-alias.db");
+    symlink(&database, &database_alias)?;
+    let original_source = fs::read(&forgotten)?;
+    let index_path = coding_agent_search::search::tantivy::index_dir(&archive.data_dir)?;
+    let detached = archive.home.path().join("detached-index");
+    let copy_index = || -> TestResult {
+        for entry in WalkDir::new(&index_path) {
+            let entry = entry?;
+            let destination = detached.join(entry.path().strip_prefix(&index_path)?);
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(&destination)?;
+            } else if entry.file_type().is_file() {
+                fs::copy(entry.path(), &destination)?;
+            } else {
+                return Err(format!("unexpected fixture index entry: {:?}", entry.path()).into());
+            }
+        }
+        Ok(())
+    };
+    copy_index()?;
+    let detached_arg = detached.to_str().ok_or("non-utf8 index path")?;
+    let alias_arg = database_alias.to_str().ok_or("non-utf8 alias path")?;
+    let serve = |query: &str| {
+        archive.run_step(
+            "one-shot serve through explicit database alias",
+            archive.cmd(),
+            &["serve", "--query", query, "--index", detached_arg, "--db", alias_arg],
+        )
+    };
+    let before = serve(FORGOTTEN_MARKER)?;
+    assert!(before.status.success(), "{}", String::from_utf8_lossy(&before.stderr));
+    let before: Value = serde_json::from_slice(&before.stdout)?;
+    assert_eq!(before["ok"], true);
+    assert!(before["result"]["hits"].as_array().ok_or("missing hits")?.iter()
+        .any(|hit| hit["source_path"] == forgotten_str));
+
+    let mut failing = archive.cmd();
+    failing.env("CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE", "1");
+    let failure = archive.run_step(
+        "forget commits canonical deletion before injected lexical failure",
+        failing,
+        &["forget", "--source-path", forgotten_str, "--apply", "--json"],
+    )?;
+    assert_eq!(failure.status.code(), Some(5));
+    let storage = FrankenStorage::open_readonly(&database)?;
+    assert_eq!(storage.total_conversation_count()?, 1);
+    assert_eq!(storage.total_message_count()?, 2);
+    assert!(storage.forget_derived_rebuild_pending()?);
+    drop(storage);
+    let database_bytes = fs::read(&database)?;
+    let fence_path = privacy::state_path_for_database(&database);
+    let fence_bytes = fs::read(&fence_path)?;
+
+    let blocked = serve(FORGOTTEN_MARKER)?;
+    assert!(!blocked.status.success());
+    assert!(blocked.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    let blocked: Value = serde_json::from_str(
+        stderr.lines().rev().find(|line| !line.trim().is_empty()).ok_or("missing refusal")?,
+    )?;
+    assert_eq!(blocked["ok"], false);
+    assert_eq!(blocked["error"]["kind"], "forget-repair-pending");
+    assert!(blocked.get("result").is_none());
+    assert!(!stderr.contains(FORGOTTEN_MARKER));
+    assert_eq!(fs::read(&database)?, database_bytes);
+    assert_eq!(fs::read(&fence_path)?, fence_bytes);
+    assert!(!privacy::state_path_for_database(&database_alias).exists());
+
+    let repaired = archive.forget(forgotten_str, true)?;
+    assert_eq!(repaired["conversations_matched"], 0);
+    assert_eq!(repaired["conversations_deleted"], 0);
+    assert_eq!(repaired["derived_rebuilt"], true);
+    // This explicit index is caller-owned: publish the repaired generation
+    // into the detached copy before admitting a fresh one-shot reader.
+    copy_index()?;
+    for (query, count) in [(FORGOTTEN_MARKER, 0), (KEPT_MARKER, 1)] {
+        let output = serve(query)?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let reply: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["result"]["count"], count);
+    }
+    assert_eq!(fs::read(&forgotten)?, original_source);
+    Ok(())
+}
+
 /// The TUI and `cass serve --stdio` keep one lexical reader open across many
 /// searches. A forget run while one is open must not leave the forgotten text
 /// reachable through it: the TUI's reloading client drops it on its next
