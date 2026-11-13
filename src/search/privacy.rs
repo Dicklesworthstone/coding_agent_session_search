@@ -257,10 +257,10 @@ impl PrivacySnapshot {
         if let Some((alias, epoch)) = &self.alias_fence {
             Self::validate_fence(alias, *epoch)?;
         }
-        if let Some((bound_path, admitted)) = &self.path_binding {
-            if resolve_if_present(bound_path, path)? != *admitted {
-                return Err(PrivacyError::SnapshotInvalidated { path: path.clone() }.into());
-            }
+        if let Some((bound_path, admitted)) = &self.path_binding
+            && resolve_if_present(bound_path, path)? != *admitted
+        {
+            return Err(PrivacyError::SnapshotInvalidated { path: path.clone() }.into());
         }
         Ok(())
     }
