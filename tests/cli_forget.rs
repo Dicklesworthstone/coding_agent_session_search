@@ -2270,7 +2270,7 @@ fn every_search_surface_recovers_after_dedup_apply() -> TestResult {
 
 #[cfg(unix)]
 #[test]
-fn serve_database_alias_refuses_interrupted_forget_and_recovers_after_repair() -> TestResult {
+fn serve_aliases_refuse_interrupted_forget_and_recover_after_repair() -> TestResult {
     use coding_agent_search::search::privacy;
     use coding_agent_search::storage::sqlite::FrankenStorage;
     use std::os::unix::fs::symlink;
@@ -2298,38 +2298,38 @@ fn serve_database_alias_refuses_interrupted_forget_and_recovers_after_repair() -
         Ok(())
     };
     copy_index()?;
+    // A database-free reader can reach detached assets through an index
+    // symlink beside the archive's fence instead of through --db.
+    let index_alias = archive.data_dir.join("index/explicit-alias");
+    symlink(&detached, &index_alias)?;
     let detached_arg = detached.to_str().ok_or("non-utf8 index path")?;
     let alias_arg = database_alias.to_str().ok_or("non-utf8 alias path")?;
-    let serve = |query: &str| {
+    let index_alias_arg = index_alias.to_str().ok_or("non-utf8 index alias")?;
+    let serve = |query: &str, with_database: bool| {
+        let mut args = vec![
+            "serve",
+            "--query",
+            query,
+            "--index",
+            if with_database {
+                detached_arg
+            } else {
+                index_alias_arg
+            },
+        ];
+        if with_database {
+            args.extend(["--db", alias_arg]);
+        }
         archive.run_step(
-            "one-shot serve through explicit database alias",
+            if with_database {
+                "one-shot serve through explicit database alias"
+            } else {
+                "database-free one-shot serve through index alias"
+            },
             archive.cmd(),
-            &[
-                "serve",
-                "--query",
-                query,
-                "--index",
-                detached_arg,
-                "--db",
-                alias_arg,
-            ],
+            &args,
         )
     };
-    let before = serve(FORGOTTEN_MARKER)?;
-    assert!(
-        before.status.success(),
-        "{}",
-        String::from_utf8_lossy(&before.stderr)
-    );
-    let before: Value = serde_json::from_slice(&before.stdout)?;
-    assert_eq!(before["ok"], true);
-    assert!(
-        before["result"]["hits"]
-            .as_array()
-            .ok_or("missing hits")?
-            .iter()
-            .any(|hit| hit["source_path"] == forgotten_str)
-    );
     let identities = |reply: &Value| -> TestResult<BTreeSet<(String, i64, u64)>> {
         reply["result"]["hits"]
             .as_array()
@@ -2351,16 +2351,35 @@ fn serve_database_alias_refuses_interrupted_forget_and_recovers_after_repair() -
             })
             .collect()
     };
-    let kept = serve(KEPT_MARKER)?;
-    assert!(
-        kept.status.success(),
-        "{}",
-        String::from_utf8_lossy(&kept.stderr)
-    );
-    let kept: Value = serde_json::from_slice(&kept.stdout)?;
-    assert_eq!(kept["ok"], true);
-    let kept_before = identities(&kept)?;
-    assert!(!kept_before.is_empty());
+    let mut kept_before = BTreeMap::new();
+    for with_database in [true, false] {
+        let before = serve(FORGOTTEN_MARKER, with_database)?;
+        assert!(
+            before.status.success(),
+            "{}",
+            String::from_utf8_lossy(&before.stderr)
+        );
+        let before: Value = serde_json::from_slice(&before.stdout)?;
+        assert_eq!(before["ok"], true);
+        assert!(
+            before["result"]["hits"]
+                .as_array()
+                .ok_or("missing hits")?
+                .iter()
+                .any(|hit| hit["source_path"] == forgotten_str)
+        );
+        let kept = serve(KEPT_MARKER, with_database)?;
+        assert!(
+            kept.status.success(),
+            "{}",
+            String::from_utf8_lossy(&kept.stderr)
+        );
+        let kept: Value = serde_json::from_slice(&kept.stdout)?;
+        assert_eq!(kept["ok"], true);
+        let retained = identities(&kept)?;
+        assert!(!retained.is_empty());
+        kept_before.insert(with_database, retained);
+    }
 
     let mut failing = archive.cmd();
     failing.env("CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE", "1");
@@ -2385,24 +2404,26 @@ fn serve_database_alias_refuses_interrupted_forget_and_recovers_after_repair() -
     let fence_path = privacy::state_path_for_database(&database);
     let fence_bytes = fs::read(&fence_path)?;
 
-    let blocked = serve(FORGOTTEN_MARKER)?;
-    assert!(!blocked.status.success());
-    assert!(blocked.stdout.is_empty());
-    let stderr = String::from_utf8_lossy(&blocked.stderr);
-    let blocked: Value = serde_json::from_str(
-        stderr
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .ok_or("missing refusal")?,
-    )?;
-    assert_eq!(blocked["ok"], false);
-    assert_eq!(blocked["error"]["kind"], "forget-repair-pending");
-    assert!(blocked.get("result").is_none());
-    assert!(!stderr.contains(FORGOTTEN_MARKER));
-    assert_eq!(fs::read(&database)?, database_bytes);
-    assert_eq!(fs::read(&fence_path)?, fence_bytes);
-    assert!(!privacy::state_path_for_database(&database_alias).exists());
+    for with_database in [true, false] {
+        let blocked = serve(FORGOTTEN_MARKER, with_database)?;
+        assert!(!blocked.status.success(), "with_database={with_database}");
+        assert!(blocked.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&blocked.stderr);
+        let blocked: Value = serde_json::from_str(
+            stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .ok_or("missing refusal")?,
+        )?;
+        assert_eq!(blocked["ok"], false);
+        assert_eq!(blocked["error"]["kind"], "forget-repair-pending");
+        assert!(blocked.get("result").is_none());
+        assert!(!stderr.contains(FORGOTTEN_MARKER));
+        assert_eq!(fs::read(&database)?, database_bytes);
+        assert_eq!(fs::read(&fence_path)?, fence_bytes);
+        assert!(!privacy::state_path_for_database(&database_alias).exists());
+    }
 
     let repaired = archive.forget(forgotten_str, true)?;
     assert_eq!(repaired["conversations_matched"], 0);
@@ -2411,20 +2432,22 @@ fn serve_database_alias_refuses_interrupted_forget_and_recovers_after_repair() -
     // This explicit index is caller-owned: publish the repaired generation
     // into the detached copy before admitting a fresh one-shot reader.
     copy_index()?;
-    for query in [FORGOTTEN_MARKER, KEPT_MARKER] {
-        let output = serve(query)?;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let reply: Value = serde_json::from_slice(&output.stdout)?;
-        assert_eq!(reply["ok"], true);
-        if query == FORGOTTEN_MARKER {
-            assert_eq!(reply["result"]["count"], 0);
-            assert!(identities(&reply)?.is_empty());
-        } else {
-            assert_eq!(identities(&reply)?, kept_before);
+    for with_database in [true, false] {
+        for query in [FORGOTTEN_MARKER, KEPT_MARKER] {
+            let output = serve(query, with_database)?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let reply: Value = serde_json::from_slice(&output.stdout)?;
+            assert_eq!(reply["ok"], true);
+            if query == FORGOTTEN_MARKER {
+                assert_eq!(reply["result"]["count"], 0);
+                assert!(identities(&reply)?.is_empty());
+            } else {
+                assert_eq!(identities(&reply)?, kept_before[&with_database]);
+            }
         }
     }
     assert_eq!(fs::read(&forgotten)?, original_source);

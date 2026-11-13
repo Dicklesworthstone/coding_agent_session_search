@@ -185,8 +185,8 @@ fn write_state(path: &Path, state: State) -> Result<()> {
 pub struct PrivacySnapshot {
     path: Option<PathBuf>,
     epoch: u64,
-    /// An explicit database alias must observe both its configured archive
-    /// fence and the target archive's fence. Writers may use either address.
+    /// An aliased asset must observe both its configured archive's fence and
+    /// the target archive's fence. Writers may publish beside either address.
     alias_fence: Option<(PathBuf, u64)>,
     /// Bind aliases before opening retained assets and detect a retargeted alias
     /// before releasing results from the retained reader.
@@ -222,8 +222,14 @@ impl PrivacySnapshot {
         let fence = state_path_for_index(index);
         match resolve_if_present(index, &fence)? {
             Some(resolved) => {
-                let mut snapshot = Self::at(state_path_for_index(&resolved))?;
+                let target_fence = state_path_for_index(&resolved);
+                let mut snapshot = Self::at(target_fence.clone())?;
+                if fence != target_fence {
+                    let configured = Self::at(fence.clone())?;
+                    snapshot.alias_fence = Some((fence, configured.epoch));
+                }
                 snapshot.path_binding = Some((index.to_path_buf(), Some(resolved)));
+                snapshot.validate()?;
                 Ok(snapshot)
             }
             None => {
@@ -536,6 +542,47 @@ mod tests {
             "privacy-snapshot-invalidated",
             "an alias change during reader admission must not bless another archive"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forget_index_alias_observes_its_configured_archive_fence() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+        let database = root.path().join("configured/agent_search.db");
+        let alias = root.path().join("configured/index/v9-quill");
+        let target = root.path().join("detached/index/v9-quill");
+        fs::create_dir_all(parent_directory(&alias))?;
+        fs::create_dir_all(&target)?;
+        symlink(&target, &alias)?;
+        let before = PrivacySnapshot::for_index(&alias)?;
+        before.validate()?;
+        assert!(!state_path_for_index(&alias).exists());
+        assert!(!state_path_for_index(&target).exists());
+
+        begin_forget(&database)?;
+        let pending = fs::read(state_path_for_index(&alias))?;
+        assert_eq!(
+            kind(&before.validate().unwrap_err()),
+            "forget-repair-pending"
+        );
+        assert_eq!(
+            kind(&PrivacySnapshot::for_index(&alias).unwrap_err()),
+            "forget-repair-pending"
+        );
+        assert_eq!(fs::read(state_path_for_index(&alias))?, pending);
+        complete_forget(&database)?;
+        assert_eq!(
+            kind(&before.validate().unwrap_err()),
+            "privacy-snapshot-invalidated"
+        );
+        let repaired = fs::read(state_path_for_index(&alias))?;
+        PrivacySnapshot::for_index(&alias)?.validate()?;
+        assert_eq!(fs::read(state_path_for_index(&alias))?, repaired);
+        assert!(!state_path_for_index(&target).exists());
+        assert_eq!(fs::canonicalize(&alias)?, fs::canonicalize(&target)?);
         Ok(())
     }
 

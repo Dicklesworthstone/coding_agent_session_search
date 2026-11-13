@@ -47,14 +47,14 @@ reader, not whether the archive is complete, current, or healthy.
 
 Privacy revocation overrides the ordinary pinned snapshot. Every data request
 checks the durable forget fence beside the index and, when configured, beside
-the explicit archive. A database symlink checks both the configured path's
-fence and the resolved target's fence. A change in an admitted path's presence
+the explicit archive. A database or index symlink checks both the configured
+path's fence and the resolved target's fence. A change in an admitted path's presence
 or resolved target invalidates the reader; a dangling alias is unavailable.
-The service reads these bounded files
-without opening SQLite for lexical-only requests. It checks again after
-computation before admitting the complete reply. A request admitted before a concurrent forget
-publishes its fence may finish delivering that reply; a request that observes
-the fence discards its entire result.
+The service reads these bounded files without opening SQLite for lexical-only
+requests. It checks again after computation before admitting the complete
+reply. A request admitted before a concurrent forget publishes its fence may
+finish delivering that reply; a request that observes the fence discards its
+entire result.
 
 Pending repair returns `forget-repair-pending`. An epoch change invalidates an
 already retained reader with `privacy-snapshot-invalidated`; an unreadable or
