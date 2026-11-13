@@ -32,6 +32,221 @@ fn context(root: &Path) -> ScanContext {
 }
 
 #[test]
+fn gh552_shared_root_foreign_json_does_not_claim_continue_completion() {
+    let temp = tempfile::Builder::new()
+        .prefix("cass-gh552-continue-")
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    seed(&temp.path().join("native.json"));
+    fs::write(
+        temp.path().join("foreign.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "id": "other-provider", "title": "Foreign snapshot", "mapping": {},
+            "payload": "x".repeat(128 * 1024)
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let connector = ContinueConnector::new();
+    let ctx = context(temp.path());
+    assert_eq!(
+        connector.discover_allowed(&ctx, &|_| false).unwrap().len(),
+        2
+    );
+    let mut admitted = Vec::new();
+    let mut completed = Vec::new();
+    let mut conversations = Vec::new();
+    connector
+        .scan_allowed(
+            &ctx,
+            &mut SourceScanHooks {
+                should_scan_source: Some(&mut |source| {
+                    admitted.push(source.source_path.clone());
+                    true
+                }),
+                on_source_complete: Some(&mut |completion| {
+                    completed.push(completion.source.source_path.clone());
+                    Ok(())
+                }),
+            },
+            &mut |conversation| {
+                conversations.push(conversation);
+                Ok(())
+            },
+            &|_| false,
+        )
+        .unwrap();
+    assert_eq!(
+        admitted.len(),
+        2,
+        "both candidates receive ledger read admission"
+    );
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].external_id.as_deref(), Some("native"));
+    assert_eq!(
+        completed,
+        vec![fs::canonicalize(temp.path().join("native.json")).unwrap()]
+    );
+}
+
+#[test]
+fn gh552_continue_fields_and_invalid_json_still_fail_closed() {
+    for payload in [
+        "{invalid",
+        "{}",
+        r#"{"sessionId":null}"#,
+        r#"{"history":null}"#,
+        r#"{"workspaceDirectory":null}"#,
+    ] {
+        let temp = tempfile::Builder::new()
+            .prefix("cass-gh552-invalid-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        fs::write(temp.path().join("bad.json"), payload).unwrap();
+        let mut completed = 0;
+        let mut delivered = 0;
+        let error = ContinueConnector::new()
+            .scan_allowed(
+                &context(temp.path()),
+                &mut SourceScanHooks {
+                    should_scan_source: Some(&mut |_| true),
+                    on_source_complete: Some(&mut |_| {
+                        completed += 1;
+                        Ok(())
+                    }),
+                },
+                &mut |_| {
+                    delivered += 1;
+                    Ok(())
+                },
+                &|_| false,
+            )
+            .unwrap_err();
+        assert_eq!(completed, 0);
+        assert_eq!(delivered, 0);
+        assert!(
+            error
+                .to_string()
+                .contains("1 admitted snapshot(s) did not complete")
+        );
+        assert!(error.to_string().contains("bad.json"));
+    }
+}
+
+#[test]
+fn gh552_known_continue_store_does_not_disclaim_invalid_snapshot() {
+    let temp = tempfile::Builder::new()
+        .prefix("cass-gh552-native-")
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let root = temp.path().join(".continue/sessions");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("bad.json"), br#"{"id":"foreign","mapping":{}}"#).unwrap();
+    let mut completed = 0;
+    let mut delivered = 0;
+    let error = ContinueConnector::new()
+        .scan_allowed(
+            &context(&root),
+            &mut SourceScanHooks {
+                should_scan_source: Some(&mut |_| true),
+                on_source_complete: Some(&mut |_| {
+                    completed += 1;
+                    Ok(())
+                }),
+            },
+            &mut |_| {
+                delivered += 1;
+                Ok(())
+            },
+            &|_| false,
+        )
+        .unwrap_err();
+    assert_eq!(completed, 0);
+    assert_eq!(delivered, 0);
+    assert!(
+        error
+            .to_string()
+            .contains("1 admitted snapshot(s) did not complete")
+    );
+}
+
+#[test]
+fn gh552_custom_continue_store_does_not_disclaim_invalid_snapshot() {
+    const CHILD_ROOT: &str = "CASS_TEST_GH552_CONTINUE_ROOT";
+    if let Ok(root) = dotenvy::var(CHILD_ROOT) {
+        let root = PathBuf::from(root);
+        for selected in [
+            &root,
+            &root.join("sessions"),
+            &root.join("sessions/bad.json"),
+        ] {
+            let mut completed = 0;
+            let mut delivered = 0;
+            let error = ContinueConnector::new()
+                .scan_allowed(
+                    &context(selected),
+                    &mut SourceScanHooks {
+                        should_scan_source: Some(&mut |_| true),
+                        on_source_complete: Some(&mut |_| {
+                            completed += 1;
+                            Ok(())
+                        }),
+                    },
+                    &mut |_| {
+                        delivered += 1;
+                        Ok(())
+                    },
+                    &|_| false,
+                )
+                .unwrap_err();
+            assert_eq!(completed, 0);
+            assert_eq!(delivered, 0);
+            assert!(
+                error
+                    .to_string()
+                    .contains("1 admitted snapshot(s) did not complete")
+            );
+        }
+        return;
+    }
+    // Isolate configuration in a subprocess instead of changing the shared
+    // test process's environment while other connector tests are running.
+    let temp = tempfile::Builder::new()
+        .prefix("cass-gh552-configured-")
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let root = temp.path().join("custom-store");
+    fs::create_dir_all(root.join("sessions")).unwrap();
+    fs::write(
+        root.join("sessions/bad.json"),
+        br#"{"title":"invalid Continue snapshot"}"#,
+    )
+    .unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "connectors::continue_dev::tests::gh552_custom_continue_store_does_not_disclaim_invalid_snapshot",
+            "--nocapture",
+        ])
+        .current_dir(temp.path())
+        .env("CONTINUE_GLOBAL_DIR", &root)
+        .env(CHILD_ROOT, &root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+}
+
+#[test]
 fn excluded_sources_never_reach_discovery_admission_or_completion() {
     let temp = tempfile::tempdir().unwrap();
     let private = temp.path().join("private.json");

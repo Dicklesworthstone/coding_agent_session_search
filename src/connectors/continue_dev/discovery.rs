@@ -24,7 +24,7 @@ pub(super) struct Source {
 
 /// Continue treats spaces and '~' literally in this override; relative values
 /// are resolved against CWD. Do not apply the trimming/tilde rules of Codex.
-fn global_dir() -> Result<Option<PathBuf>> {
+pub(super) fn global_dir() -> Result<Option<PathBuf>> {
     let configured = match dotenvy::var("CONTINUE_GLOBAL_DIR") {
         Ok(value) if !value.is_empty() => Some(PathBuf::from(value)),
         Ok(_) | Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => None,

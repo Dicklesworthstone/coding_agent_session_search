@@ -8,6 +8,7 @@
 mod discovery;
 
 use std::cell::RefCell;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, ensure};
@@ -85,6 +86,72 @@ fn same_observation(left: &DiscoveredSourceFile, right: &DiscoveredSourceFile) -
         && left.modified_at_ms == right.modified_at_ms
 }
 
+#[derive(serde::Deserialize)]
+#[serde(field_identifier, rename_all = "camelCase")]
+enum SnapshotKey {
+    SessionId,
+    WorkspaceDirectory,
+    History,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Default)]
+struct SnapshotFields {
+    native: bool,
+    other: bool,
+}
+
+impl<'de> serde::Deserialize<'de> for SnapshotFields {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct FieldsVisitor;
+        impl<'input> serde::de::Visitor<'input> for FieldsVisitor {
+            type Value = SnapshotFields;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a snapshot object")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'input>>(
+                self,
+                mut map: M,
+            ) -> std::result::Result<Self::Value, M::Error> {
+                let mut fields = SnapshotFields::default();
+                while let Some(key) = map.next_key::<SnapshotKey>()? {
+                    match key {
+                        SnapshotKey::Other => fields.other = true,
+                        _ => fields.native = true,
+                    }
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+                Ok(fields)
+            }
+        }
+        deserializer.deserialize_map(FieldsVisitor)
+    }
+}
+
+/// An untyped explicit root may contain other providers' JSON. Recognize only
+/// a complete foreign object with unchanged discovery metadata. Invalid JSON,
+/// an empty object, or any Continue field (even null) still reaches the parser
+/// and its failure gate.
+/// Ignored values are streamed rather than retaining a second transcript.
+fn positively_foreign_snapshot(source: &DiscoveredSourceFile) -> bool {
+    let Some(limit) = source.size_bytes.and_then(|bytes| bytes.checked_add(1)) else {
+        return false;
+    };
+    let Ok(file) = std::fs::File::open(&source.source_path) else {
+        return false;
+    };
+    let Ok(fields) = serde_json::from_reader::<_, SnapshotFields>(BufReader::new(file.take(limit)))
+    else {
+        return false;
+    };
+    fields.other && !fields.native && !source.fs_metadata_changed()
+}
+
 impl ContinueConnector {
     #[must_use]
     pub fn new() -> Self {
@@ -125,6 +192,9 @@ impl ContinueConnector {
         // errors and scanning it again could silently lose a removed source.
         // Each inventory member now gets its own observed completion outcome.
         let sources = discovery::discover(&scope, excludes)?;
+        // Explicit roots do not depend on valid global configuration. When it
+        // is available, preserve ownership of custom Continue directories too.
+        let global = discovery::global_dir().ok().flatten();
         let progress = RefCell::new(SourceProgress::default());
         for selected in sources {
             progress.borrow_mut().finish_pending();
@@ -133,6 +203,26 @@ impl ContinueConnector {
                 continue;
             }
             if source_excluded(source, excludes) {
+                continue;
+            }
+            // Discovery is a metadata-only candidate inventory. Check content
+            // ownership only after the operator/ledger permits a read. Native
+            // stores and declared Continue mirrors retain strict admission.
+            let native_root = scope.use_default_detection()
+                || selected.root.mirrored_source_path.is_some()
+                || selected
+                    .root
+                    .path
+                    .ancestors()
+                    .any(|path| path.file_name().is_some_and(|name| name == ".continue"))
+                || global.as_ref().is_some_and(|global| {
+                    selected.root.path == *global
+                        || selected.root.path.starts_with(global.join("sessions"))
+                        || selected.root.path.parent() == Some(global.as_path())
+                });
+            if !native_root && positively_foreign_snapshot(source) {
+                tracing::debug!(path = %source.source_path.display(), "untyped JSON candidate is not a Continue snapshot");
+                // No Continue parse or completion is certified for this file.
                 continue;
             }
             progress.borrow_mut().pending = Some(source.clone());
