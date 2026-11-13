@@ -200,6 +200,16 @@ fn gh552_cli_voice_reimport_matches_fresh_index_and_survives_restarts() {
             )
             .unwrap()
     };
+    // The native reader's explicit scan unit is a conversations-* directory.
+    let watch_root = Path::new(&source_path).parent().unwrap();
+    assert!(
+        watch_root
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("conversations-")
+    );
     snapshot[0]["mapping"]["reply-node"]["message"]["content"]["parts"] =
         json!(["zzgh552replyneedle zzgh552revisedneedle"]);
     snapshot[0]["mapping"]["reply-node"]["message"]["update_time"] = json!(1700000004.0);
@@ -208,7 +218,7 @@ fn gh552_cli_voice_reimport_matches_fresh_index_and_survives_restarts() {
     import(&home, "updated");
     let result = command(&home)
         .args(["index", "--json", "--no-progress-events", "--watch-once"])
-        .arg(&source_path)
+        .arg(watch_root)
         .output()
         .unwrap();
     assert!(result.status.success(), "{result:?}");
