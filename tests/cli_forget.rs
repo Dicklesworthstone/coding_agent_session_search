@@ -2304,22 +2304,76 @@ fn serve_database_alias_refuses_interrupted_forget_and_recovers_after_repair() -
         archive.run_step(
             "one-shot serve through explicit database alias",
             archive.cmd(),
-            &["serve", "--query", query, "--index", detached_arg, "--db", alias_arg],
+            &[
+                "serve",
+                "--query",
+                query,
+                "--index",
+                detached_arg,
+                "--db",
+                alias_arg,
+            ],
         )
     };
     let before = serve(FORGOTTEN_MARKER)?;
-    assert!(before.status.success(), "{}", String::from_utf8_lossy(&before.stderr));
+    assert!(
+        before.status.success(),
+        "{}",
+        String::from_utf8_lossy(&before.stderr)
+    );
     let before: Value = serde_json::from_slice(&before.stdout)?;
     assert_eq!(before["ok"], true);
-    assert!(before["result"]["hits"].as_array().ok_or("missing hits")?.iter()
-        .any(|hit| hit["source_path"] == forgotten_str));
+    assert!(
+        before["result"]["hits"]
+            .as_array()
+            .ok_or("missing hits")?
+            .iter()
+            .any(|hit| hit["source_path"] == forgotten_str)
+    );
+    let identities = |reply: &Value| -> TestResult<BTreeSet<(String, i64, u64)>> {
+        reply["result"]["hits"]
+            .as_array()
+            .ok_or("missing hits")?
+            .iter()
+            .map(|hit| -> TestResult<_> {
+                Ok((
+                    hit["source_path"]
+                        .as_str()
+                        .ok_or("missing source path")?
+                        .to_owned(),
+                    hit["conversation_id"]
+                        .as_i64()
+                        .ok_or("missing conversation id")?,
+                    hit["message_index"]
+                        .as_u64()
+                        .ok_or("missing message index")?,
+                ))
+            })
+            .collect()
+    };
+    let kept = serve(KEPT_MARKER)?;
+    assert!(
+        kept.status.success(),
+        "{}",
+        String::from_utf8_lossy(&kept.stderr)
+    );
+    let kept: Value = serde_json::from_slice(&kept.stdout)?;
+    assert_eq!(kept["ok"], true);
+    let kept_before = identities(&kept)?;
+    assert!(!kept_before.is_empty());
 
     let mut failing = archive.cmd();
     failing.env("CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE", "1");
     let failure = archive.run_step(
         "forget commits canonical deletion before injected lexical failure",
         failing,
-        &["forget", "--source-path", forgotten_str, "--apply", "--json"],
+        &[
+            "forget",
+            "--source-path",
+            forgotten_str,
+            "--apply",
+            "--json",
+        ],
     )?;
     assert_eq!(failure.status.code(), Some(5));
     let storage = FrankenStorage::open_readonly(&database)?;
@@ -2336,7 +2390,11 @@ fn serve_database_alias_refuses_interrupted_forget_and_recovers_after_repair() -
     assert!(blocked.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&blocked.stderr);
     let blocked: Value = serde_json::from_str(
-        stderr.lines().rev().find(|line| !line.trim().is_empty()).ok_or("missing refusal")?,
+        stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .ok_or("missing refusal")?,
     )?;
     assert_eq!(blocked["ok"], false);
     assert_eq!(blocked["error"]["kind"], "forget-repair-pending");
@@ -2353,12 +2411,21 @@ fn serve_database_alias_refuses_interrupted_forget_and_recovers_after_repair() -
     // This explicit index is caller-owned: publish the repaired generation
     // into the detached copy before admitting a fresh one-shot reader.
     copy_index()?;
-    for (query, count) in [(FORGOTTEN_MARKER, 0), (KEPT_MARKER, 1)] {
+    for query in [FORGOTTEN_MARKER, KEPT_MARKER] {
         let output = serve(query)?;
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let reply: Value = serde_json::from_slice(&output.stdout)?;
         assert_eq!(reply["ok"], true);
-        assert_eq!(reply["result"]["count"], count);
+        if query == FORGOTTEN_MARKER {
+            assert_eq!(reply["result"]["count"], 0);
+            assert!(identities(&reply)?.is_empty());
+        } else {
+            assert_eq!(identities(&reply)?, kept_before);
+        }
     }
     assert_eq!(fs::read(&forgotten)?, original_source);
     Ok(())
