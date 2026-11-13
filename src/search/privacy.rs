@@ -190,7 +190,7 @@ pub struct PrivacySnapshot {
     alias_fence: Option<(PathBuf, u64)>,
     /// Bind aliases before opening retained assets and detect a retargeted alias
     /// before releasing results from the retained reader.
-    path_binding: Option<(PathBuf, PathBuf)>,
+    path_binding: Option<(PathBuf, Option<PathBuf>)>,
 }
 
 impl PrivacySnapshot {
@@ -205,16 +205,15 @@ impl PrivacySnapshot {
         }
         let logical_fence = state_path_for_database(database);
         let mut snapshot = Self::at(logical_fence.clone())?;
-        if let Some(resolved) = resolve_if_present(database, &logical_fence)?
-            && resolved != database
-        {
-            let target_fence = state_path_for_database(&resolved);
+        let resolved = resolve_if_present(database, &logical_fence)?;
+        if let Some(target) = &resolved {
+            let target_fence = state_path_for_database(target);
             if target_fence != logical_fence {
                 let target = Self::at(target_fence.clone())?;
                 snapshot.alias_fence = Some((target_fence, target.epoch));
             }
-            snapshot.path_binding = Some((database.to_path_buf(), resolved));
         }
+        snapshot.path_binding = Some((database.to_path_buf(), resolved));
         snapshot.validate()?;
         Ok(snapshot)
     }
@@ -224,13 +223,15 @@ impl PrivacySnapshot {
         match resolve_if_present(index, &fence)? {
             Some(resolved) => {
                 let mut snapshot = Self::at(state_path_for_index(&resolved))?;
-                snapshot.path_binding = Some((index.to_path_buf(), resolved));
+                snapshot.path_binding = Some((index.to_path_buf(), Some(resolved)));
                 Ok(snapshot)
             }
             None => {
                 // A missing index remains the caller's normal missing-index
                 // case. Its existing parent can still hold a pending fence.
-                Self::at(fence)
+                let mut snapshot = Self::at(fence)?;
+                snapshot.path_binding = Some((index.to_path_buf(), None));
+                Ok(snapshot)
             }
         }
     }
@@ -257,15 +258,8 @@ impl PrivacySnapshot {
             Self::validate_fence(alias, *epoch)?;
         }
         if let Some((bound_path, admitted)) = &self.path_binding {
-            match fs::canonicalize(bound_path) {
-                Ok(current) if current == *admitted => {}
-                Ok(_) => {
-                    return Err(PrivacyError::SnapshotInvalidated { path: path.clone() }.into());
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(PrivacyError::SnapshotInvalidated { path: path.clone() }.into());
-                }
-                Err(error) => return Err(unavailable(path, error)),
+            if resolve_if_present(bound_path, path)? != *admitted {
+                return Err(PrivacyError::SnapshotInvalidated { path: path.clone() }.into());
             }
         }
         Ok(())
@@ -274,10 +268,16 @@ impl PrivacySnapshot {
     fn validate_fence(path: &Path, epoch: u64) -> Result<()> {
         let current = read_state(path)?;
         if current.pending {
-            return Err(PrivacyError::RepairPending { path: path.to_path_buf() }.into());
+            return Err(PrivacyError::RepairPending {
+                path: path.to_path_buf(),
+            }
+            .into());
         }
         if current.epoch != epoch {
-            return Err(PrivacyError::SnapshotInvalidated { path: path.to_path_buf() }.into());
+            return Err(PrivacyError::SnapshotInvalidated {
+                path: path.to_path_buf(),
+            }
+            .into());
         }
         Ok(())
     }
@@ -347,13 +347,25 @@ mod tests {
         let root = tempfile::tempdir()?;
         let db = root.path().join("agent_search.db");
         let index = root.path().join("index/v9-quill");
-        assert_eq!(
-            PrivacySnapshot::for_database(&db)?,
-            PrivacySnapshot::for_index(&index)?
-        );
+        let database = PrivacySnapshot::for_database(&db)?;
+        let lexical = PrivacySnapshot::for_index(&index)?;
+        // The fence is shared, while each snapshot binds its own asset path.
+        assert_eq!(database.path, lexical.path);
+        assert_eq!(database.epoch, lexical.epoch);
+        database.validate()?;
+        lexical.validate()?;
         assert!(!repair_pending(&db)?);
         complete_forget(&db)?;
         assert_eq!(fs::read_dir(root.path())?.count(), 0);
+        begin_forget(&db)?;
+        let fence = fs::read(state_path_for_database(&db))?;
+        for snapshot in [database, lexical] {
+            assert_eq!(
+                kind(&snapshot.validate().unwrap_err()),
+                "forget-repair-pending"
+            );
+        }
+        assert_eq!(fs::read(state_path_for_database(&db))?, fence);
         Ok(())
     }
 
@@ -547,13 +559,19 @@ mod tests {
         assert!(!state_path_for_database(&db).exists());
 
         begin_forget(&db)?;
-        assert_eq!(kind(&before.validate().unwrap_err()), "forget-repair-pending");
+        assert_eq!(
+            kind(&before.validate().unwrap_err()),
+            "forget-repair-pending"
+        );
         assert_eq!(
             kind(&PrivacySnapshot::for_database(&alias).unwrap_err()),
             "forget-repair-pending"
         );
         complete_forget(&db)?;
-        assert_eq!(kind(&before.validate().unwrap_err()), "privacy-snapshot-invalidated");
+        assert_eq!(
+            kind(&before.validate().unwrap_err()),
+            "privacy-snapshot-invalidated"
+        );
         let target_repaired = PrivacySnapshot::for_database(&alias)?;
         let target_bytes = fs::read(state_path_for_database(&db))?;
         target_repaired.validate()?;
@@ -562,13 +580,19 @@ mod tests {
         // Resolving the alias must not discard the configured-path fence:
         // the existing writer protocol can publish through that address too.
         begin_forget(&alias)?;
-        assert_eq!(kind(&target_repaired.validate().unwrap_err()), "forget-repair-pending");
+        assert_eq!(
+            kind(&target_repaired.validate().unwrap_err()),
+            "forget-repair-pending"
+        );
         assert_eq!(
             kind(&PrivacySnapshot::for_database(&alias).unwrap_err()),
             "forget-repair-pending"
         );
         complete_forget(&alias)?;
-        assert_eq!(kind(&target_repaired.validate().unwrap_err()), "privacy-snapshot-invalidated");
+        assert_eq!(
+            kind(&target_repaired.validate().unwrap_err()),
+            "privacy-snapshot-invalidated"
+        );
         let repaired = PrivacySnapshot::for_database(&alias)?;
         let logical_bytes = fs::read(state_path_for_database(&alias))?;
         repaired.validate()?;
@@ -598,7 +622,10 @@ mod tests {
         let replacement = root.path().join("links/replacement");
         symlink("../second/archive.db", &replacement)?;
         fs::rename(&replacement, &alias)?;
-        assert_eq!(kind(&before.validate().unwrap_err()), "privacy-snapshot-invalidated");
+        assert_eq!(
+            kind(&before.validate().unwrap_err()),
+            "privacy-snapshot-invalidated"
+        );
 
         let fresh = PrivacySnapshot::for_database(&alias)?;
         fresh.validate()?;
@@ -620,11 +647,51 @@ mod tests {
         let alias = root.path().join("alias");
         symlink(&absent, &alias)?;
         for capture in [PrivacySnapshot::for_database, PrivacySnapshot::for_index] {
-            assert_eq!(kind(&capture(&alias).unwrap_err()), "privacy-state-unavailable");
+            assert_eq!(
+                kind(&capture(&alias).unwrap_err()),
+                "privacy-state-unavailable"
+            );
             capture(&absent)?.validate()?;
         }
         assert_eq!(fs::read_link(&alias)?, absent);
         assert_eq!(fs::read_dir(root.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forget_path_binding_refuses_alias_introduction_after_admission() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+        let database = root.path().join("database.db");
+        let target = root.path().join("target/archive.db");
+        fs::create_dir_all(parent_directory(&target))?;
+        fs::write(&database, b"original identity")?;
+        fs::write(&target, b"other identity")?;
+        let original = PrivacySnapshot::for_database(&database)?;
+        fs::rename(&database, root.path().join("retained-original.db"))?;
+        symlink(&target, &database)?;
+        assert_eq!(
+            kind(&original.validate().unwrap_err()),
+            "privacy-snapshot-invalidated"
+        );
+        PrivacySnapshot::for_database(&database)?.validate()?;
+
+        let missing = root.path().join("missing");
+        let database = PrivacySnapshot::for_database(&missing)?;
+        let index = PrivacySnapshot::for_index(&missing)?;
+        symlink(&target, &missing)?;
+        for snapshot in [database, index] {
+            assert_eq!(
+                kind(&snapshot.validate().unwrap_err()),
+                "privacy-snapshot-invalidated"
+            );
+        }
+        PrivacySnapshot::for_database(&missing)?.validate()?;
+        PrivacySnapshot::for_index(&missing)?.validate()?;
+        assert!(!state_path_for_database(&missing).exists());
+        assert!(!state_path_for_index(&missing).exists());
         Ok(())
     }
 }
