@@ -404,10 +404,11 @@ impl<'de> serde::de::Visitor<'de> for EmbeddedJsonKeyCheck {
 /// Redact secrets from a JSON value, recursively walking strings.
 ///
 /// - String values are redacted without changing their JSON type.
-/// - Objects/arrays encoded as strings with a plausible JSON first token use
-///   the same field policy. Unchanged valid strings retain their exact bytes.
-///   Truncated payloads, duplicate keys, parser refusals, and structured payloads
-///   beyond eight encoded layers cause the payload to be replaced in full.
+/// - Objects/arrays and quoted JSON strings encoded as strings use the same
+///   field policy. Unchanged valid strings retain their exact bytes.
+///   Truncated containers, duplicate keys, container parser refusals, and JSON
+///   payloads beyond eight encoded layers are replaced in full. Malformed
+///   quoted prose retains the plain-text policy.
 /// - Values under credential-bearing object keys are replaced in full.
 /// - Arrays and objects are walked recursively.
 /// - Numbers, booleans, and null are left untouched.
@@ -460,8 +461,9 @@ fn redact_json_string(
     let trimmed = input.trim();
     // Truncated tool output can retain credentials before its missing suffix.
     // Let the parser below establish completeness and reject it safely.
-    let has_container_prefix = trimmed.starts_with('{') || trimmed.starts_with('[');
-    if !has_container_prefix {
+    let quoted_string = trimmed.starts_with('"');
+    let has_json_prefix = trimmed.starts_with('{') || trimmed.starts_with('[') || quoted_string;
+    if !has_json_prefix {
         return redact_plain_text(input);
     }
 
@@ -472,7 +474,9 @@ fn redact_json_string(
     while let Some(rest) = prefix.strip_prefix('[') {
         prefix = rest.trim_start();
     }
-    let plausible_first_token = if let Some(rest) = prefix.strip_prefix('{') {
+    let plausible_first_token = if quoted_string {
+        true
+    } else if let Some(rest) = prefix.strip_prefix('{') {
         matches!(
             rest.trim_start().as_bytes().first().copied(),
             Some(b'"' | b'}')
@@ -490,9 +494,15 @@ fn redact_json_string(
     }
 
     // serde_json classifies depth and number/Unicode representation failures
-    // as syntax errors too. Once a string advertises JSON, a failed inspection
-    // must hide the payload rather than expose unexamined credential fields.
+    // as syntax errors too. An advertised container that fails inspection must
+    // be hidden rather than expose unexamined credential fields.
     let Ok(keys) = serde_json::from_str::<EmbeddedJsonKeyCheck>(trimmed) else {
+        // Ordinary quoted prose need not be a complete JSON string literal.
+        // Keep its existing text policy; a valid literal is decoded below and
+        // any structured payload inside it still receives strict inspection.
+        if quoted_string {
+            return redact_plain_text(input);
+        }
         return REDACTED.to_owned();
     };
     if keys.0 || embedded_layers >= MAX_EMBEDDED_JSON_LAYERS {
@@ -1389,6 +1399,59 @@ mod tests {
         assert_eq!(memo.stats().misses, 1);
         assert_eq!(memo.stats().hits, 3);
         assert_eq!(redact_json(&output), output);
+        Ok(())
+    }
+
+    #[test]
+    fn gh551_quoted_json_strings_preserve_layers_and_redact_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut memo = MemoizingRedactor::with_capacity(8);
+        for container in [
+            json!({"registration_token": "tiny", "safe": "kept café 界"}),
+            json!([{"passphrase": "tiny", "token_count": 42}]),
+        ] {
+            let mut expected = container.clone();
+            if expected.is_array() {
+                expected[0]["passphrase"] = json!(REDACTED);
+            } else {
+                expected["registration_token"] = json!(REDACTED);
+            }
+            for wrappers in [1, 3] {
+                let mut input = container.to_string();
+                let mut expected = expected.to_string();
+                for _ in 0..wrappers {
+                    input = serde_json::to_string(&input)?;
+                    expected = serde_json::to_string(&expected)?;
+                }
+                let input = json!(input);
+                let expected = json!(expected);
+                assert_eq!(redact_json(&input), expected);
+                assert_eq!(memo.redact_json(&input), expected);
+                assert_eq!(memo.redact_json(&input), expected);
+                assert_eq!(redact_json(&expected), expected);
+            }
+        }
+        for input in [
+            r#""ordinary quoted café 界""#,
+            r#""{\"safe\":\"kept café 界\"}""#,
+            r#""an unfinished quoted phrase"#,
+            r#""ordinary prose" with a suffix"#,
+        ] {
+            let input = json!(input);
+            assert_eq!(redact_json(&input), input);
+            assert_eq!(memo.redact_json(&input), input);
+        }
+        for wrappers in [MAX_EMBEDDED_JSON_LAYERS, MAX_EMBEDDED_JSON_LAYERS + 1] {
+            let mut encoded = json!({"registration_token": "synthetic-deep-secret"}).to_string();
+            for _ in 0..wrappers {
+                encoded = serde_json::to_string(&encoded)?;
+            }
+            let input = json!(encoded);
+            let output = redact_json(&input);
+            assert!(!output.to_string().contains("synthetic-deep-secret"));
+            assert_eq!(redact_json(&output), output);
+            assert_eq!(memo.redact_json(&input), output);
+        }
         Ok(())
     }
 

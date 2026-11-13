@@ -378,7 +378,10 @@ fn export_redaction_covers_tool_arguments_results_and_nested_metadata()
 #[test]
 fn gh551_export_redaction_covers_embedded_json_tool_results()
 -> Result<(), Box<dyn std::error::Error>> {
-    let root = TempDir::new()?;
+    let root = tempfile::Builder::new()
+        .prefix("cass-gh551-quoted-json-")
+        .disable_cleanup(true)
+        .tempdir()?;
     let session = root.path().join("embedded-json-tool-session.jsonl");
     // The only credentials are fields inside this JSON-encoded string. Plain
     // assignment redaction elsewhere must not make the privacy receipt pass.
@@ -390,92 +393,103 @@ fn gh551_export_redaction_covers_embedded_json_tool_results()
         "records": [{"passphrase": "tiny", "enabled": true}]
     })
     .to_string();
-    let events = [
-        serde_json::json!({"type":"user","message":{"role":"user","content":"Register this agent"}}),
-        serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[
-            {"type":"tool_use","id":"call-551","name":"register_agent","input":{"agent":"DemoAgent"}}
-        ]}}),
-        serde_json::json!({"type":"user","message":{"role":"user","content":[
-            {"type":"tool_result","tool_use_id":"call-551","content":tool_result}
-        ]}}),
-    ];
-    let mut bytes = Vec::new();
-    for event in events {
-        serde_json::to_writer(&mut bytes, &event)?;
-        bytes.push(b'\n');
-    }
-    fs::write(&session, &bytes)?;
-
-    for include_secrets in [false, true] {
-        for format in ["markdown", "text", "json", "html"] {
-            let mut cmd = export_privacy_command(root.path());
-            cmd.arg("export")
-                .arg(&session)
-                .args(["--format", format, "--include-tools"]);
-            if include_secrets {
-                cmd.arg("--include-secrets");
-            }
-            let output = cmd.output()?;
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let exported = String::from_utf8(output.stdout)?;
-            assert_eq!(
-                exported.contains(EXPORT_PRIVACY_SECRET),
-                include_secrets,
-                "{format}, include_secrets={include_secrets}"
-            );
-            assert!(exported.contains("tool-json-kept"));
-            let stderr = String::from_utf8(output.stderr)?;
-            let announcement = stderr
-                .lines()
-                .find_map(|line| line.strip_prefix("note: export privacy: "))
-                .ok_or("export privacy announcement missing")?;
-            let privacy: Value = serde_json::from_str(announcement)?;
-            assert_eq!(privacy["redaction_applied"], !include_secrets);
-            assert_eq!(privacy["sensitive_output"], include_secrets);
-
-            if format == "json" {
-                let messages: Value = serde_json::from_str(&exported)?;
-                assert_eq!(messages[1]["message"]["content"][0]["id"], "call-551");
-                let embedded = messages[2]["message"]["content"][0]["content"]
-                    .as_str()
-                    .ok_or("tool result changed JSON type")?;
-                let result: Value = serde_json::from_str(embedded)?;
-                assert_eq!(result["ok"], true);
-                assert_eq!(result["token_count"], 42);
-                assert_eq!(result["records"][0]["enabled"], true);
-                assert_eq!(
-                    result["registration_token"],
-                    if include_secrets {
-                        EXPORT_PRIVACY_SECRET
-                    } else {
-                        "[REDACTED]"
-                    }
-                );
-                assert_eq!(
-                    result["records"][0]["passphrase"],
-                    if include_secrets {
-                        "tiny"
-                    } else {
-                        "[REDACTED]"
-                    }
-                );
-            }
+    for wrappers in 0..=2 {
+        let mut payload = tool_result.clone();
+        for _ in 0..wrappers {
+            payload = serde_json::to_string(&payload)?;
         }
-        let (receipt, html) =
-            export_privacy_html(root.path(), &session, None, include_secrets, false)?;
-        assert_eq!(html.contains(EXPORT_PRIVACY_SECRET), include_secrets);
-        assert!(html.contains("tool-json-kept"));
-        assert_eq!(receipt["privacy"]["redaction_applied"], !include_secrets);
+        let events = [
+            serde_json::json!({"type":"user","message":{"role":"user","content":"Register this agent"}}),
+            serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[
+                {"type":"tool_use","id":"call-551","name":"register_agent","input":{"agent":"DemoAgent"}}
+            ]}}),
+            serde_json::json!({"type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"call-551","content":payload}
+            ]}}),
+        ];
+        let mut bytes = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut bytes, &event)?;
+            bytes.push(b'\n');
+        }
+        fs::write(&session, &bytes)?;
+
+        for include_secrets in [false, true] {
+            for format in ["markdown", "text", "json", "html"] {
+                let mut cmd = export_privacy_command(root.path());
+                cmd.arg("export")
+                    .arg(&session)
+                    .args(["--format", format, "--include-tools"]);
+                if include_secrets {
+                    cmd.arg("--include-secrets");
+                }
+                let output = cmd.output()?;
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let exported = String::from_utf8(output.stdout)?;
+                assert_eq!(
+                    exported.contains(EXPORT_PRIVACY_SECRET),
+                    include_secrets,
+                    "{format}, include_secrets={include_secrets}"
+                );
+                assert!(exported.contains("tool-json-kept"));
+                let stderr = String::from_utf8(output.stderr)?;
+                let announcement = stderr
+                    .lines()
+                    .find_map(|line| line.strip_prefix("note: export privacy: "))
+                    .ok_or("export privacy announcement missing")?;
+                let privacy: Value = serde_json::from_str(announcement)?;
+                assert_eq!(privacy["redaction_applied"], !include_secrets);
+                assert_eq!(privacy["sensitive_output"], include_secrets);
+
+                if format == "json" {
+                    let messages: Value = serde_json::from_str(&exported)?;
+                    assert_eq!(messages[1]["message"]["content"][0]["id"], "call-551");
+                    let embedded = messages[2]["message"]["content"][0]["content"]
+                        .as_str()
+                        .ok_or("tool result changed JSON type")?;
+                    let mut decoded = embedded.to_owned();
+                    for _ in 0..wrappers {
+                        decoded = serde_json::from_str::<String>(&decoded)?;
+                    }
+                    let result: Value = serde_json::from_str(&decoded)?;
+                    assert_eq!(result["ok"], true);
+                    assert_eq!(result["note"], "tool-json-kept café 界");
+                    assert_eq!(result["token_count"], 42);
+                    assert_eq!(result["records"][0]["enabled"], true);
+                    assert_eq!(
+                        result["registration_token"],
+                        if include_secrets {
+                            EXPORT_PRIVACY_SECRET
+                        } else {
+                            "[REDACTED]"
+                        }
+                    );
+                    assert_eq!(
+                        result["records"][0]["passphrase"],
+                        if include_secrets {
+                            "tiny"
+                        } else {
+                            "[REDACTED]"
+                        }
+                    );
+                }
+            }
+            let (receipt, html) =
+                export_privacy_html(root.path(), &session, None, include_secrets, false)?;
+            assert_eq!(html.contains(EXPORT_PRIVACY_SECRET), include_secrets);
+            assert!(html.contains("tool-json-kept"));
+            assert_eq!(receipt["privacy"]["redaction_applied"], !include_secrets);
+        }
+        assert_eq!(
+            fs::read(&session)?,
+            bytes,
+            "export changed the source session"
+        );
     }
-    assert_eq!(
-        fs::read(&session)?,
-        bytes,
-        "export changed the source session"
-    );
     Ok(())
 }
 
