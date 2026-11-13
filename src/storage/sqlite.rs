@@ -39686,9 +39686,12 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 attributed.messages[2].author = Some(model.into());
                 attributed.messages[2].extra_json["metadata"] =
                     serde_json::json!({"model_slug": model});
-                attributed.messages[2].extra_json["update_time"] =
-                    serde_json::json!(revision);
-                assert!(storage.chatgpt_message_revisions_needed(&attributed).unwrap());
+                attributed.messages[2].extra_json["update_time"] = serde_json::json!(revision);
+                assert!(
+                    storage
+                        .chatgpt_message_revisions_needed(&attributed)
+                        .unwrap()
+                );
                 let update = gh423_persist(&storage, agent, &attributed, route).unwrap();
                 assert!(update.inserted_indices.is_empty());
                 assert_eq!(update.updated_indices, vec![2]);
@@ -39697,7 +39700,11 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 assert_eq!(saved[2].id, reply_id);
                 assert_eq!(saved[2].author.as_deref(), Some(model));
                 assert_eq!(saved[2].content, attributed.messages[2].content);
-                assert!(!storage.chatgpt_message_revisions_needed(&attributed).unwrap());
+                assert!(
+                    !storage
+                        .chatgpt_message_revisions_needed(&attributed)
+                        .unwrap()
+                );
                 let replay = gh423_persist(&storage, agent, &attributed, route).unwrap();
                 assert!(replay.inserted_indices.is_empty() && replay.updated_indices.is_empty());
             }
@@ -39725,10 +39732,8 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 let replay = gh423_persist(&storage, agent, &partial, route).unwrap();
                 assert!(replay.inserted_indices.is_empty() && replay.updated_indices.is_empty());
                 assert_eq!(
-                    serde_json::to_value(
-                        storage.fetch_messages(first.conversation_id).unwrap()
-                    )
-                    .unwrap(),
+                    serde_json::to_value(storage.fetch_messages(first.conversation_id).unwrap())
+                        .unwrap(),
                     stable
                 );
             }
@@ -39859,10 +39864,8 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
 
         for (model, revision) in [("gpt-4o", 30), ("gpt-4.1", 40)] {
             incoming.messages[0].author = Some(model.into());
-            incoming.messages[0].extra_json["metadata"]["model_slug"] =
-                serde_json::json!(model);
-            incoming.messages[0].extra_json["update_time"] =
-                serde_json::json!(revision);
+            incoming.messages[0].extra_json["metadata"]["model_slug"] = serde_json::json!(model);
+            incoming.messages[0].extra_json["update_time"] = serde_json::json!(revision);
             canonical = plan_chatgpt_snapshot(&canonical, &incoming)
                 .unwrap()
                 .unwrap();
@@ -39888,14 +39891,11 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
 
         let mut older = incoming.clone();
         older.messages[0].author = Some("stale-model".into());
-        older.messages[0].extra_json["metadata"]["model_slug"] =
-            serde_json::json!("stale-model");
+        older.messages[0].extra_json["metadata"]["model_slug"] = serde_json::json!("stale-model");
         older.messages[0].extra_json["update_time"] = serde_json::json!(30);
         assert_eq!(
-            serde_json::to_value(
-                plan_chatgpt_snapshot(&canonical, &older).unwrap().unwrap()
-            )
-            .unwrap(),
+            serde_json::to_value(plan_chatgpt_snapshot(&canonical, &older).unwrap().unwrap())
+                .unwrap(),
             stable
         );
 

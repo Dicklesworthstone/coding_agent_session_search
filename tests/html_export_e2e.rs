@@ -107,7 +107,7 @@ fn export_privacy_session(root: &Path) -> Result<std::path::PathBuf, Box<dyn std
     let session = mirror.join("rollout-export-privacy.jsonl");
     let records = [
         serde_json::json!({"timestamp":"2026-10-27T12:00:00Z","type":"session_meta","payload":{"id":"export-privacy-84","cwd":"/synthetic/export-privacy","originator":"codex_cli_rs"}}),
-        serde_json::json!({"timestamp":"2026-10-27T12:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("exportprivacycanary café 界 password={EXPORT_PRIVACY_SECRET}")}]}}),
+        serde_json::json!({"timestamp":"2026-10-27T12:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("exportprivacycanary café 界 password={EXPORT_PRIVACY_SECRET}\nDB_PASSWORD={EXPORT_PRIVACY_SECRET}\nGITHUB_TOKEN={EXPORT_PRIVACY_SECRET}\nSTRIPE_SECRET={EXPORT_PRIVACY_SECRET}\nMY_API_KEY={EXPORT_PRIVACY_SECRET}")}]}}),
         serde_json::json!({"timestamp":"2026-10-27T12:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"exportprivacycanary ordinary-kept-marker; discuss password rotation"}]}}),
     ];
     let mut bytes = Vec::new();
@@ -222,6 +222,30 @@ fn export_redaction_parity_for_live_and_archived_sources() -> Result<(), Box<dyn
     let hits: Value = serde_json::from_slice(&query.stdout)?;
     assert!(hits["hits"].as_array().is_some_and(|hits| !hits.is_empty()));
     assert!(!String::from_utf8_lossy(&query.stdout).contains(EXPORT_PRIVACY_SECRET));
+
+    // Searching the credential itself catches a leak even if a positive
+    // search's bounded content preview would omit the assignment's tail.
+    let secret_phrase = format!("\"{EXPORT_PRIVACY_SECRET}\"");
+    let secret_query = export_privacy_command(root.path())
+        .args([
+            "search",
+            secret_phrase.as_str(),
+            "--mode",
+            "lexical",
+            "--no-maintenance",
+            "--robot",
+        ])
+        .output()?;
+    assert!(
+        secret_query.status.success(),
+        "{}",
+        String::from_utf8_lossy(&secret_query.stderr)
+    );
+    let secret_hits: Value = serde_json::from_slice(&secret_query.stdout)?;
+    assert!(
+        secret_hits["hits"].as_array().is_some_and(Vec::is_empty),
+        "prefixed credential assignments remained searchable: {secret_hits}"
+    );
 
     let db_path = root.path().join("data/agent_search.db");
     let db_before = fs::read(&db_path)?;

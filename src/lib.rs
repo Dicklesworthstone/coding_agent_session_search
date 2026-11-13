@@ -21787,7 +21787,10 @@ mod chatgpt_import_refresh_tests {
             ChatGptImportChange::Unchanged
         );
         assert_eq!(std::fs::read(&path).unwrap(), pretty);
-        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
     }
 
     #[test]
@@ -21835,10 +21838,9 @@ mod chatgpt_import_refresh_tests {
 
         // Ordered content arrays are indivisible; do not concatenate revisions.
         incoming["update_time"] = json!(40);
-        incoming["mapping"]["voice"]["message"]["content"]["parts"] =
-            json!(["Replacement preface", {
-                "content_type": "audio_transcription", "text": "Replacement voice"
-            }]);
+        incoming["mapping"]["voice"]["message"]["content"]["parts"] = json!(["Replacement preface", {
+            "content_type": "audio_transcription", "text": "Replacement voice"
+        }]);
         assert_eq!(
             store_chatgpt_import_conversation(&path, &incoming).unwrap(),
             ChatGptImportChange::Updated
@@ -109092,12 +109094,9 @@ fn is_recoverable_followup_record(value: &serde_json::Value) -> bool {
         return true;
     }
     match value.get("type").and_then(serde_json::Value::as_str) {
-        Some("message") => {
-            has_id(value) && value.get("message").is_some_and(message)
-        }
+        Some("message") => has_id(value) && value.get("message").is_some_and(message),
         Some(role @ ("user" | "assistant")) => value.get("message").is_some_and(|inner| {
-            message(inner)
-                && inner.get("role").and_then(serde_json::Value::as_str) == Some(role)
+            message(inner) && inner.get("role").and_then(serde_json::Value::as_str) == Some(role)
         }),
         Some("session") => has_id(value),
         Some("session_meta" | "response_item" | "event_msg" | "turn_context") => {
@@ -109167,8 +109166,7 @@ fn recover_followup_jsonl_suffix(line: &str) -> FollowupJsonlRecovery {
         {
             continue;
         }
-        if attempts >= MAX_FOLLOWUP_JSONL_RECOVERY_ATTEMPTS
-            || suffix.len() > remaining_parse_bytes
+        if attempts >= MAX_FOLLOWUP_JSONL_RECOVERY_ATTEMPTS || suffix.len() > remaining_parse_bytes
         {
             unrecovered.limited = true;
             return unrecovered;
@@ -109449,7 +109447,10 @@ mod gh427_tolerant_jsonl_tests {
         assert_eq!(messages[0]["id"], "a0000001");
         assert_eq!(messages[1]["id"], "a0000003");
         assert_eq!(messages[1]["message"]["role"], "toolResult");
-        assert_eq!(messages[1]["message"]["content"][0]["text"], "bravo marker two");
+        assert_eq!(
+            messages[1]["message"]["content"][0]["text"],
+            "bravo marker two"
+        );
         assert_eq!(messages[2]["id"], "a0000004");
         assert_eq!(start, Some(1767225601000));
         assert_eq!(end, Some(1767225604000));
@@ -109485,7 +109486,10 @@ mod gh427_tolerant_jsonl_tests {
         assert_eq!(exported.len(), 3);
         assert_eq!(exported[0]["id"], "a0000001");
         assert_eq!(exported[1]["id"], "a0000003");
-        assert_eq!(exported[1]["message"]["content"][0]["text"], "bravo marker two");
+        assert_eq!(
+            exported[1]["message"]["content"][0]["text"],
+            "bravo marker two"
+        );
         assert_eq!(exported[2]["id"], "a0000004");
 
         let text_output = dir.path().join("recovered.txt");
@@ -109505,7 +109509,10 @@ mod gh427_tolerant_jsonl_tests {
         assert!(text.contains("alpha marker one"));
         assert!(text.contains("bravo marker two"));
         assert!(text.contains("charlie marker three"));
-        assert!(!db_path.exists(), "direct JSONL export must not create an archive");
+        assert!(
+            !db_path.exists(),
+            "direct JSONL export must not create an archive"
+        );
         assert_eq!(std::fs::read_to_string(path).unwrap(), body);
     }
 
@@ -109513,8 +109520,10 @@ mod gh427_tolerant_jsonl_tests {
     fn gh553_recovers_multiple_records_in_source_order_and_includes_their_timestamps() {
         let dir = tempfile::tempdir().unwrap();
         let prefix = r#"{"role":"assistant","content":"cut 🦀 mid-string"#;
-        let first = r#"{"role":"assistant","content":"first appended","timestamp":"2026-01-01T00:00:04Z"}"#;
-        let second = r#"{"role":"user","content":"second appended","timestamp":"2026-01-01T00:00:02Z"}"#;
+        let first =
+            r#"{"role":"assistant","content":"first appended","timestamp":"2026-01-01T00:00:04Z"}"#;
+        let second =
+            r#"{"role":"user","content":"second appended","timestamp":"2026-01-01T00:00:02Z"}"#;
         let path = write_session(
             &dir,
             "multiple.jsonl",
@@ -109602,7 +109611,10 @@ mod gh427_tolerant_jsonl_tests {
             r#"torn{"role":"user","content":"complete"}{"unknown":1}"#,
         ] {
             let recovery = recover_followup_jsonl_suffix(line);
-            assert!(recovery.records.is_empty(), "must refuse ambiguous source: {line}");
+            assert!(
+                recovery.records.is_empty(),
+                "must refuse ambiguous source: {line}"
+            );
             assert_eq!(recovery.discarded_bytes, line.len());
             assert!(!recovery.limited);
         }
@@ -109614,7 +109626,10 @@ mod gh427_tolerant_jsonl_tests {
         let body = r#"{"wrapper":{"role":"user","content":"nested"}}"#;
         let path = write_session(&dir, "intact.jsonl", body);
         let (messages, _, _, skipped) = parse_followup_jsonl_messages_tolerant(&path).unwrap();
-        assert_eq!(messages, vec![serde_json::from_str::<serde_json::Value>(body).unwrap()]);
+        assert_eq!(
+            messages,
+            vec![serde_json::from_str::<serde_json::Value>(body).unwrap()]
+        );
         assert!(skipped.is_empty());
     }
 
@@ -109672,7 +109687,6 @@ mod gh427_tolerant_jsonl_tests {
         assert!(recovery.limited);
         assert_eq!(recovery.discarded_bytes, over_limit.len());
     }
-
 }
 
 fn infer_followup_agent_and_workspace(path: &Path) -> (Option<String>, Option<String>) {
