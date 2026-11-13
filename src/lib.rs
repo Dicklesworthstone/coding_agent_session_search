@@ -109020,12 +109020,17 @@ fn read_followup_file_lines(path: &Path) -> CliResult<Vec<String>> {
         })
 }
 
-/// One JSONL record that the direct-file export/view loader could not decode
-/// and therefore skipped (GH #427). `line_number` is 1-based.
+/// A malformed physical JSONL line encountered by the direct-file export
+/// loader (GH #427 / GH #553). Complete trailing records may still be
+/// recovered. Line numbers and discarded byte counts refer to the source;
+/// the source file is never rewritten.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SkippedJsonlLine {
     pub(crate) line_number: usize,
     pub(crate) error: String,
+    pub(crate) recovered_records: usize,
+    pub(crate) discarded_bytes: usize,
+    pub(crate) recovery_limited: bool,
 }
 
 type TolerantJsonlParse = (
@@ -109035,36 +109040,184 @@ type TolerantJsonlParse = (
     Vec<SkippedJsonlLine>,
 );
 
-/// How many skipped records are named individually on stderr before the
+/// How many affected lines are named individually on stderr before the
 /// remainder is summarised as a count.
 const MAX_REPORTED_SKIPPED_JSONL_LINES: usize = 5;
 
-/// Parse a JSONL session file for export/view, applying the same per-line
-/// policy as the indexer (GH #427): a record that fails to decode is skipped
-/// and reported instead of aborting the whole session. Only when *no* record
-/// decodes is the file rejected, so a genuinely non-JSONL path still falls
-/// back to the indexed copy exactly as before.
+// Recovery only runs after the ordinary parser rejects a physical line.
+// Bound both the input and repeated parsing, so many opening braces cannot
+// turn one malformed line into unbounded quadratic work.
+const MAX_FOLLOWUP_JSONL_RECOVERY_LINE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FOLLOWUP_JSONL_RECOVERY_PARSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FOLLOWUP_JSONL_RECOVERY_ATTEMPTS: usize = 64;
+const MAX_FOLLOWUP_JSONL_RECOVERY_RECORDS: usize = 1024;
+
+#[derive(Debug, Default)]
+struct FollowupJsonlRecovery {
+    records: Vec<serde_json::Value>,
+    discarded_bytes: usize,
+    limited: bool,
+}
+
+/// Recognise the root envelopes already consumed by the export loaders.
+/// Arbitrary JSON objects and nested text/tool blocks are not session records.
+/// This restriction applies only to recovery, not to intact JSONL lines.
+fn is_recoverable_followup_record(value: &serde_json::Value) -> bool {
+    fn message(value: &serde_json::Value) -> bool {
+        matches!(
+            value.get("role").and_then(serde_json::Value::as_str),
+            Some(
+                "user"
+                    | "assistant"
+                    | "system"
+                    | "developer"
+                    | "tool"
+                    | "toolResult"
+                    | "tool_result"
+                    | "function"
+            )
+        ) && value
+            .get("content")
+            .is_some_and(|content| content.is_string() || content.is_array())
+    }
+
+    fn has_id(value: &serde_json::Value) -> bool {
+        value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+    }
+
+    if message(value) {
+        return true;
+    }
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("message") => {
+            has_id(value) && value.get("message").is_some_and(message)
+        }
+        Some(role @ ("user" | "assistant")) => value.get("message").is_some_and(|inner| {
+            message(inner)
+                && inner.get("role").and_then(serde_json::Value::as_str) == Some(role)
+        }),
+        Some("session") => has_id(value),
+        Some("session_meta" | "response_item" | "event_msg" | "turn_context") => {
+            let timestamp = value
+                .get("timestamp")
+                .is_some_and(|timestamp| timestamp.is_string() || timestamp.is_number());
+            let Some(payload) = value.get("payload").filter(|payload| payload.is_object()) else {
+                return false;
+            };
+            timestamp
+                && match value.get("type").and_then(serde_json::Value::as_str) {
+                    Some("session_meta") => has_id(payload),
+                    Some("turn_context") => true,
+                    _ => payload
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|kind| !kind.is_empty()),
+                }
+        }
+        _ => false,
+    }
+}
+
+/// Recover a complete suffix of known session records after a torn prefix.
+///
+/// Search from the start, not the JSON error column: when a write tears inside
+/// a string, the next record's opening brace is consumed as string content and
+/// the reported error lies *after* the record's actual start. Accept only an
+/// entire suffix of object records with no trailing garbage.
+///
+/// A brace at a legal nested-value boundary is ambiguous, even if its suffix
+/// decodes: {"message":{"role":"user","content":"nested"} is a truncated
+/// outer record, not a new root message. Refuse candidates after ':', '[' or
+/// ',' (ignoring ASCII whitespace). This deliberately leaves ambiguous tears
+/// unrecovered rather than manufacturing history from nested data.
+fn recover_followup_jsonl_suffix(line: &str) -> FollowupJsonlRecovery {
+    let mut unrecovered = FollowupJsonlRecovery {
+        discarded_bytes: line.len(),
+        ..FollowupJsonlRecovery::default()
+    };
+    if line.len() > MAX_FOLLOWUP_JSONL_RECOVERY_LINE_BYTES {
+        unrecovered.limited = true;
+        return unrecovered;
+    }
+
+    let mut remaining_parse_bytes = MAX_FOLLOWUP_JSONL_RECOVERY_PARSE_BYTES;
+    let mut attempts = 0;
+    let mut previous_non_whitespace = None;
+    for (offset, byte) in line.bytes().enumerate() {
+        let previous = previous_non_whitespace;
+        if !byte.is_ascii_whitespace() {
+            previous_non_whitespace = Some(byte);
+        }
+        if byte != b'{' || matches!(previous, Some(b':' | b'[' | b',')) {
+            continue;
+        }
+
+        // An ASCII opening brace is always a UTF-8 character boundary.
+        let suffix = &line[offset..];
+        // Skip braces in prose/code before paying for another parse. An object
+        // with a recognised root envelope must start with a quoted field name.
+        if suffix[1..]
+            .trim_start_matches(|ch: char| ch.is_ascii_whitespace())
+            .as_bytes()
+            .first()
+            != Some(&b'"')
+        {
+            continue;
+        }
+        if attempts >= MAX_FOLLOWUP_JSONL_RECOVERY_ATTEMPTS
+            || suffix.len() > remaining_parse_bytes
+        {
+            unrecovered.limited = true;
+            return unrecovered;
+        }
+        attempts += 1;
+        remaining_parse_bytes -= suffix.len();
+
+        let mut records = Vec::new();
+        let mut complete = true;
+        for parsed in serde_json::Deserializer::from_str(suffix).into_iter::<serde_json::Value>() {
+            let Ok(record) = parsed else {
+                complete = false;
+                break;
+            };
+            if !is_recoverable_followup_record(&record) {
+                complete = false;
+                break;
+            }
+            if records.len() >= MAX_FOLLOWUP_JSONL_RECOVERY_RECORDS {
+                unrecovered.limited = true;
+                return unrecovered;
+            }
+            records.push(record);
+        }
+        if complete && !records.is_empty() {
+            return FollowupJsonlRecovery {
+                records,
+                discarded_bytes: offset,
+                limited: false,
+            };
+        }
+    }
+    unrecovered
+}
+
+/// Parse a JSONL session for export, retaining intact records around malformed
+/// lines (GH #427) and conservatively recovering complete records appended
+/// after a torn prefix on the same line (GH #553). Only when no record decodes
+/// is the file rejected, preserving the existing indexed-copy fallback.
+///
+/// Connector ingestion has its own parsing policy; recovered export records
+/// do not imply that the canonical archive has ingested them.
 pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<TolerantJsonlParse> {
     let lines = read_followup_file_lines(path)?;
     let mut messages = Vec::new();
     let mut session_start = None;
     let mut session_end = None;
     let mut skipped: Vec<SkippedJsonlLine> = Vec::new();
-
-    for (line_index, line) in lines.into_iter().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let msg = match serde_json::from_str::<serde_json::Value>(&line) {
-            Ok(msg) => msg,
-            Err(err) => {
-                skipped.push(SkippedJsonlLine {
-                    line_number: line_index + 1,
-                    error: err.to_string(),
-                });
-                continue;
-            }
-        };
+    let mut append_message = |msg: serde_json::Value| {
         if let Some(ts) = extract_message_timestamp(&msg) {
             if session_start.is_none_or(|start| ts < start) {
                 session_start = Some(ts);
@@ -109074,6 +109227,28 @@ pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<T
             }
         }
         messages.push(msg);
+    };
+
+    for (line_index, line) in lines.into_iter().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(msg) => append_message(msg),
+            Err(err) => {
+                let recovery = recover_followup_jsonl_suffix(&line);
+                skipped.push(SkippedJsonlLine {
+                    line_number: line_index + 1,
+                    error: err.to_string(),
+                    recovered_records: recovery.records.len(),
+                    discarded_bytes: recovery.discarded_bytes,
+                    recovery_limited: recovery.limited,
+                });
+                for msg in recovery.records {
+                    append_message(msg);
+                }
+            }
+        }
     }
 
     if messages.is_empty()
@@ -109098,8 +109273,9 @@ pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<T
     Ok((messages, session_start, session_end, skipped))
 }
 
-/// Surface skipped records on stderr (stdout stays data-only) and in the
-/// trace log, mirroring the indexer's `malformed-json-line` diagnostic.
+/// Report damaged lines and recovery on stderr; stdout remains data-only.
+/// Physical line coordinates are retained even when one line yielded several
+/// recovered records. No claim is made about connector-ingest coverage.
 fn report_skipped_jsonl_lines(path: &Path, decoded: usize, skipped: &[SkippedJsonlLine]) {
     if skipped.is_empty() {
         return;
@@ -109109,17 +109285,48 @@ fn report_skipped_jsonl_lines(path: &Path, decoded: usize, skipped: &[SkippedJso
             source_path = %path.display(),
             line_no = line.line_number,
             error = %line.error,
-            "session JSONL line failed to parse; skipping (GH #427)"
+            recovered_records = line.recovered_records,
+            discarded_bytes = line.discarded_bytes,
+            recovery_limited = line.recovery_limited,
+            "session JSONL line failed to parse; retained complete records and skipped malformed bytes (GH #427 / GH #553)"
         );
     }
-    eprintln!(
-        "warning: skipped {} malformed JSONL record(s) in {}; rendered the remaining {} record(s) (cass index applies the same per-line policy)",
-        skipped.len(),
-        path.display(),
-        decoded
-    );
+    let recovered = skipped.iter().fold(0usize, |count, line| {
+        count.saturating_add(line.recovered_records)
+    });
+    let discarded = skipped.iter().fold(0usize, |count, line| {
+        count.saturating_add(line.discarded_bytes)
+    });
+    if recovered == 0 {
+        eprintln!(
+            "warning: skipped {} malformed JSONL record(s) in {}; rendered the remaining {} record(s)",
+            skipped.len(),
+            path.display(),
+            decoded
+        );
+    } else {
+        eprintln!(
+            "warning: recovered {} complete JSONL record(s) from {} malformed line(s) in {}; skipped {} byte(s) and rendered {} record(s)",
+            recovered,
+            skipped.len(),
+            path.display(),
+            discarded,
+            decoded
+        );
+    }
     for line in skipped.iter().take(MAX_REPORTED_SKIPPED_JSONL_LINES) {
-        eprintln!("warning:   line {}: {}", line.line_number, line.error);
+        eprintln!(
+            "warning:   line {}: {}; recovered {} record(s), skipped {} byte(s){}",
+            line.line_number,
+            line.error,
+            line.recovered_records,
+            line.discarded_bytes,
+            if line.recovery_limited {
+                "; bounded recovery limit reached"
+            } else {
+                ""
+            }
+        );
     }
     if skipped.len() > MAX_REPORTED_SKIPPED_JSONL_LINES {
         eprintln!(
@@ -109216,6 +109423,256 @@ mod gh427_tolerant_jsonl_tests {
         assert_eq!(messages.len(), 2);
         assert!(skipped.is_empty());
     }
+    fn gh553_torn_pi_session() -> (String, usize) {
+        let first = r#"{"type":"message","id":"a0000001","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"alpha marker one"}],"timestamp":1767225601000}}"#;
+        let prefix = r#"{"type":"message","id":"a0000002","parentId":"a0000001","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"delta marker thinking","thinkingSignature":"sigsigsigsig"#;
+        let tool = r#"{"type":"message","id":"a0000003","parentId":"a0000002","timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"toolResult","toolCallId":"call_1","toolName":"bash","content":[{"type":"text","text":"bravo marker two"}],"details":{},"isError":false,"timestamp":1767225603000}}"#;
+        let last = r#"{"type":"message","id":"a0000004","parentId":"a0000003","timestamp":"2026-01-01T00:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"charlie marker three"}],"timestamp":1767225604000}}"#;
+        (format!("{first}\n{prefix}{tool}\n{last}\n"), prefix.len())
+    }
+
+    #[test]
+    fn gh553_recovers_a_complete_pi_tool_result_after_a_torn_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let (body, prefix_bytes) = gh553_torn_pi_session();
+        let path = write_session(&dir, "torn.jsonl", &body);
+        let torn_line = body.lines().nth(1).unwrap();
+        let error = serde_json::from_str::<serde_json::Value>(torn_line).unwrap_err();
+        assert!(
+            error.column() > prefix_bytes,
+            "the error column lies after the recoverable record's start"
+        );
+
+        let (messages, start, end, skipped) =
+            parse_followup_jsonl_messages_tolerant(&path).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["id"], "a0000001");
+        assert_eq!(messages[1]["id"], "a0000003");
+        assert_eq!(messages[1]["message"]["role"], "toolResult");
+        assert_eq!(messages[1]["message"]["content"][0]["text"], "bravo marker two");
+        assert_eq!(messages[2]["id"], "a0000004");
+        assert_eq!(start, Some(1767225601000));
+        assert_eq!(end, Some(1767225604000));
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].line_number, 2);
+        assert_eq!(skipped[0].recovered_records, 1);
+        assert_eq!(skipped[0].discarded_bytes, prefix_bytes);
+        assert!(!skipped[0].recovery_limited);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), body);
+    }
+
+    #[test]
+    fn gh553_json_and_text_exports_recover_the_complete_tool_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let (body, _) = gh553_torn_pi_session();
+        let path = write_session(&dir, "torn.jsonl", &body);
+        let db_path = dir.path().join("unused.db");
+        let json_output = dir.path().join("recovered.json");
+        run_export(
+            &path,
+            Some(db_path.clone()),
+            None,
+            ConvExportFormat::Json,
+            Some(&json_output),
+            false,
+            true,
+            true,
+            false,
+        )
+        .expect("JSON export must retain the recovered complete tool result");
+        let exported: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(json_output).unwrap()).unwrap();
+        assert_eq!(exported.len(), 3);
+        assert_eq!(exported[0]["id"], "a0000001");
+        assert_eq!(exported[1]["id"], "a0000003");
+        assert_eq!(exported[1]["message"]["content"][0]["text"], "bravo marker two");
+        assert_eq!(exported[2]["id"], "a0000004");
+
+        let text_output = dir.path().join("recovered.txt");
+        run_export(
+            &path,
+            Some(db_path.clone()),
+            None,
+            ConvExportFormat::Text,
+            Some(&text_output),
+            false,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(text_output).unwrap();
+        assert!(text.contains("alpha marker one"));
+        assert!(text.contains("bravo marker two"));
+        assert!(text.contains("charlie marker three"));
+        assert!(!db_path.exists(), "direct JSONL export must not create an archive");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), body);
+    }
+
+    #[test]
+    fn gh553_recovers_multiple_records_in_source_order_and_includes_their_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = r#"{"role":"assistant","content":"cut 🦀 mid-string"#;
+        let first = r#"{"role":"assistant","content":"first appended","timestamp":"2026-01-01T00:00:04Z"}"#;
+        let second = r#"{"role":"user","content":"second appended","timestamp":"2026-01-01T00:00:02Z"}"#;
+        let path = write_session(
+            &dir,
+            "multiple.jsonl",
+            &format!("{prefix}{first} \t{second}\r\n"),
+        );
+        let (messages, start, end, skipped) =
+            parse_followup_jsonl_messages_tolerant(&path).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "first appended");
+        assert_eq!(messages[1]["content"], "second appended");
+        assert_eq!(start, Some(1767225602000));
+        assert_eq!(end, Some(1767225604000));
+        assert_eq!(skipped[0].line_number, 1);
+        assert_eq!(skipped[0].recovered_records, 2);
+        assert_eq!(skipped[0].discarded_bytes, prefix.len());
+        assert!(!skipped[0].recovery_limited);
+    }
+
+    #[test]
+    fn gh553_concatenated_records_do_not_discard_a_complete_first_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = r#"{"role":"user","content":"one"}"#;
+        let second = r#"{"role":"assistant","content":"two"}"#;
+        let path = write_session(&dir, "concatenated.jsonl", &format!("{first}{second}\n"));
+        let (messages, _, _, skipped) = parse_followup_jsonl_messages_tolerant(&path).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "one");
+        assert_eq!(messages[1]["content"], "two");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].recovered_records, 2);
+        assert_eq!(skipped[0].discarded_bytes, 0);
+    }
+
+    #[test]
+    fn gh553_recovery_recognises_native_envelopes_without_assuming_field_order() {
+        let examples = [
+            serde_json::json!({"type": "session", "id": "session-1"}),
+            serde_json::json!({
+                "type": "message", "id": "pi-1",
+                "message": {"role": "toolResult", "content": [{"type": "text", "text": "result"}]}
+            }),
+            serde_json::json!({
+                "type": "assistant", "uuid": "claude-1",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "reply"}]}
+            }),
+            serde_json::json!({
+                "type": "session_meta", "timestamp": "2026-01-01T00:00:00Z",
+                "payload": {"id": "codex-1", "cwd": "/tmp/repro"}
+            }),
+            serde_json::json!({
+                "type": "response_item", "timestamp": "2026-01-01T00:00:01Z",
+                "payload": {"type": "message", "role": "user", "content": []}
+            }),
+            serde_json::json!({
+                "type": "event_msg", "timestamp": "2026-01-01T00:00:02Z",
+                "payload": {"type": "agent_message", "message": "reply"}
+            }),
+            serde_json::json!({
+                "type": "turn_context", "timestamp": "2026-01-01T00:00:03Z",
+                "payload": {"cwd": "/tmp/repro"}
+            }),
+            serde_json::json!({"role": "user", "content": "plain message"}),
+        ];
+        for expected in examples {
+            let line = format!("torn-prefix{expected}");
+            let recovery = recover_followup_jsonl_suffix(&line);
+            assert_eq!(recovery.records, vec![expected]);
+            assert_eq!(recovery.discarded_bytes, "torn-prefix".len());
+            assert!(!recovery.limited);
+        }
+    }
+
+    #[test]
+    fn gh553_never_promotes_nested_values_or_accepts_an_incomplete_suffix() {
+        for line in [
+            r#"{"message":{"role":"user","content":"nested"}"#,
+            r#"{"message":   {"role":"user","content":"nested"}"#,
+            r#"[{"role":"user","content":"nested"}"#,
+            r#"[null, {"role":"user","content":"nested"}"#,
+            r#"torn{"type":"text","text":"not a session record"}"#,
+            r#"torn{"type":"toolCall","name":"bash","arguments":{}}"#,
+            r#"torn{"role":"user","content":"complete"}trailing garbage"#,
+            r#"torn{"role":"user","content":"complete"}42"#,
+            r#"torn{"role":"user","content":"complete"}[]"#,
+            r#"torn{"role":"user","content":"complete"}{"unknown":1}"#,
+        ] {
+            let recovery = recover_followup_jsonl_suffix(line);
+            assert!(recovery.records.is_empty(), "must refuse ambiguous source: {line}");
+            assert_eq!(recovery.discarded_bytes, line.len());
+            assert!(!recovery.limited);
+        }
+    }
+
+    #[test]
+    fn gh553_intact_nested_objects_keep_the_original_parser_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"wrapper":{"role":"user","content":"nested"}}"#;
+        let path = write_session(&dir, "intact.jsonl", body);
+        let (messages, _, _, skipped) = parse_followup_jsonl_messages_tolerant(&path).unwrap();
+        assert_eq!(messages, vec![serde_json::from_str::<serde_json::Value>(body).unwrap()]);
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn gh553_recovery_bounds_input_size_candidate_attempts_and_total_parse_bytes() {
+        let record = r#"{"role":"user","content":"complete"}"#;
+        let oversized = format!(
+            "{}{record}",
+            "x".repeat(MAX_FOLLOWUP_JSONL_RECOVERY_LINE_BYTES)
+        );
+        let recovery = recover_followup_jsonl_suffix(&oversized);
+        assert!(recovery.records.is_empty());
+        assert!(recovery.limited);
+        assert_eq!(recovery.discarded_bytes, oversized.len());
+
+        // Each object is complete but is not a session record. The last one
+        // is admissible only when it falls within the candidate-attempt cap.
+        let unknown = r#"{"unknown":true}"#;
+        let within_limit = format!(
+            "{}{record}",
+            unknown.repeat(MAX_FOLLOWUP_JSONL_RECOVERY_ATTEMPTS - 1)
+        );
+        let recovery = recover_followup_jsonl_suffix(&within_limit);
+        assert_eq!(recovery.records.len(), 1);
+        assert!(!recovery.limited);
+        let over_limit = format!(
+            "{}{record}",
+            unknown.repeat(MAX_FOLLOWUP_JSONL_RECOVERY_ATTEMPTS)
+        );
+        let recovery = recover_followup_jsonl_suffix(&over_limit);
+        assert!(recovery.records.is_empty());
+        assert!(recovery.limited);
+
+        // Stay below the line and attempt caps, but make the sum of suffixes
+        // exceed the independent parsing-work budget.
+        let parse_budget = format!("{}{}{record}", unknown.repeat(17), "x".repeat(1024 * 1024));
+        assert!(parse_budget.len() < MAX_FOLLOWUP_JSONL_RECOVERY_LINE_BYTES);
+        let recovery = recover_followup_jsonl_suffix(&parse_budget);
+        assert!(recovery.records.is_empty());
+        assert!(recovery.limited);
+    }
+
+    #[test]
+    fn gh553_recovery_bounds_the_number_of_concatenated_records() {
+        let record = r#"{"role":"user","content":"complete"}"#;
+        let within_limit = record.repeat(MAX_FOLLOWUP_JSONL_RECOVERY_RECORDS);
+        let recovery = recover_followup_jsonl_suffix(&within_limit);
+        assert_eq!(recovery.records.len(), MAX_FOLLOWUP_JSONL_RECOVERY_RECORDS);
+        assert_eq!(recovery.discarded_bytes, 0);
+        assert!(!recovery.limited);
+
+        let over_limit = record.repeat(MAX_FOLLOWUP_JSONL_RECOVERY_RECORDS + 1);
+        let recovery = recover_followup_jsonl_suffix(&over_limit);
+        assert!(recovery.records.is_empty());
+        assert!(recovery.limited);
+        assert_eq!(recovery.discarded_bytes, over_limit.len());
+    }
+
 }
 
 fn infer_followup_agent_and_workspace(path: &Path) -> (Option<String>, Option<String>) {
