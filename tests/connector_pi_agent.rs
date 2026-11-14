@@ -7,6 +7,41 @@ use coding_agent_search::connectors::{
 };
 
 #[test]
+fn gh553_pi_agent_recovers_complete_records_without_inventing_nested_messages() {
+    let header = r#"{"type":"session","id":"gh553","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/synthetic/gh553"}"#;
+    let first = r#"{"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":"alpha marker one"}}"#;
+    let prefix = r#"{"type":"message","id":"cut","message":{"role":"assistant","content":[{"type":"thinking","thinkingSignature":"署名"#;
+    let tool = r#"{"type":"message","id":"t1","parentId":"u1","message":{"role":"toolResult","toolCallId":"call_1","toolName":"bash","content":"bravo marker two"}}"#;
+    let last = r#"{"type":"message","id":"u2","parentId":"t1","message":{"role":"user","content":"charlie marker three"}}"#;
+    for ending in ["\n", "\r\n", ""] {
+        for damaged in [false, true] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let sessions = root.join("sessions");
+            fs::create_dir(&sessions).unwrap();
+            let path = sessions.join("2026-01-01T00-00-00_gh553.jsonl");
+            let body = format!(
+                "{header}\n{first}\n{}{tool}\n{{\"payload\":{{\"role\":\"user\",\"content\":\"phantom marker\"}}\n{last}{ending}",
+                if damaged { prefix } else { "" }
+            );
+            fs::write(&path, &body).unwrap();
+            let context = ScanContext::with_roots(root.clone(), vec![ScanRoot::local(root)], None);
+            let conversations = PiAgentConnector::new().scan(&context).unwrap();
+            assert_eq!(conversations.len(), 1);
+            let messages = &conversations[0].messages;
+            assert_eq!(messages.len(), 3, "damaged={damaged} ending={ending:?}");
+            assert_eq!(messages[0].content, "alpha marker one");
+            assert_eq!(messages[1].content, "bravo marker two");
+            assert_eq!(messages[1].role, "tool");
+            assert_eq!(messages[1].extra["id"], "t1");
+            assert_eq!(messages[1].extra["cass"]["source_line"], 3);
+            assert_eq!(messages[2].content, "charlie marker three");
+            assert_eq!(messages[2].extra["cass"]["source_line"], 5);
+            assert_eq!(fs::read_to_string(&path).unwrap(), body);
+        }
+    }
+}
+
+#[test]
 fn pi_agent_connector_reads_session_jsonl() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/--test-project--");

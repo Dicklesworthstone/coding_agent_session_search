@@ -161,6 +161,63 @@ mod gh472 {
         }
     }
 
+    #[test]
+    fn gh553_torn_pi_tool_result_is_indexed_and_searchable_like_the_control() {
+        for damaged in [false, true] {
+            let fixture = Fixture::new(
+                if damaged {
+                    "gh553-torn"
+                } else {
+                    "gh553-control"
+                },
+                "1",
+            );
+            let pi_home = fixture.home.join(".pi/agent");
+            let sessions = pi_home.join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let path = sessions.join("2026-01-01T00-00-00_gh553.jsonl");
+            let header = r#"{"type":"session","version":3,"id":"gh553","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/synthetic/gh553"}"#;
+            let first = r#"{"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":"alpha marker one"}}"#;
+            let prefix = r#"{"type":"message","id":"cut","message":{"role":"assistant","content":[{"type":"thinking","thinkingSignature":"署名"#;
+            let tool = r#"{"type":"message","id":"t1","parentId":"u1","message":{"role":"toolResult","toolCallId":"call_1","toolName":"bash","content":"bravo marker two"}}"#;
+            let last = r#"{"type":"message","id":"u2","parentId":"t1","message":{"role":"user","content":"charlie marker three"}}"#;
+            let body = format!(
+                "{header}\n{first}\n{}{tool}\n{last}\n",
+                if damaged { prefix } else { "" }
+            );
+            fs::write(&path, &body).unwrap();
+            let data = fixture.data();
+            let data = data.to_str().unwrap();
+            let overrides = [("PI_CODING_AGENT_DIR", pi_home.to_str().unwrap())];
+            let indexed = fixture.run(
+                &["index", "--full", "--json", "--data-dir", data],
+                &overrides,
+            );
+            indexed.assert_totals(1, 3);
+            assert_eq!(count_messages(&fixture.data().join("agent_search.db")), 3);
+            let search = fixture.run(
+                &[
+                    "search",
+                    "bravo",
+                    "--json",
+                    "--mode",
+                    "lexical",
+                    "--no-maintenance",
+                    "--no-daemon",
+                    "--data-dir",
+                    data,
+                ],
+                &overrides,
+            );
+            let hits = search.report["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0]["agent"], "pi_agent");
+            assert_eq!(hits[0]["content"], "bravo marker two");
+            assert_eq!(fs::read_to_string(&path).unwrap(), body);
+            fixture.tracker.complete();
+        }
+    }
+
     impl Fixture {
         fn new(name: &str, streaming: &'static str) -> Self {
             let temp = tempfile::TempDir::new().expect("create isolated GH472 home");

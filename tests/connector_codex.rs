@@ -10,6 +10,31 @@ fn codex_real_fixture_home() -> PathBuf {
 }
 
 #[test]
+fn gh553_codex_recovers_a_complete_turn_after_a_torn_prefix() {
+    let root = tempfile::tempdir().unwrap().keep();
+    let sessions = root.join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let path = sessions.join("rollout-gh553.jsonl");
+    let body = concat!(
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"payload\":{\"id\":\"gh553\",\"cwd\":\"/synthetic/gh553\"}}\n",
+        "{\"payload\":\"torn",
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"bravo recovered codex\"}]}}\n",
+        "{\"payload\":{\"role\":\"user\",\"content\":\"phantom marker\"}\n",
+    );
+    fs::write(&path, body).unwrap();
+    let context = ScanContext::with_roots(root.clone(), vec![ScanRoot::local(root)], None);
+    let conversations = CodexConnector::new().scan(&context).unwrap();
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].messages.len(), 1);
+    assert_eq!(
+        conversations[0].messages[0].content,
+        "bravo recovered codex"
+    );
+    assert_eq!(conversations[0].messages[0].role, "user");
+    assert_eq!(fs::read_to_string(path).unwrap(), body);
+}
+
+#[test]
 fn codex_connector_reads_modern_envelope_jsonl() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/11/21");

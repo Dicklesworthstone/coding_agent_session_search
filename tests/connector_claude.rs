@@ -1,11 +1,35 @@
 use coding_agent_search::connectors::claude_code::ClaudeCodeConnector;
-use coding_agent_search::connectors::{Connector, ScanContext};
+use coding_agent_search::connectors::{Connector, ScanContext, ScanRoot};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
 // Migration note: Using "fixture-claude" naming instead of legacy "mock-claude".
 // See tests/fixtures/connectors/MANIFEST.json for provenance tracking.
+
+#[test]
+fn gh553_claude_recovers_complete_turns_after_a_torn_prefix() {
+    let root = tempfile::tempdir().unwrap().keep();
+    let project = root.join("projects/synthetic");
+    std::fs::create_dir_all(&project).unwrap();
+    let path = project.join("gh553.jsonl");
+    let body = concat!(
+        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"signature\":\"torn",
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\",\"content\":\"bravo recovered claude\"}]}}\n",
+        "{\"message\":{\"role\":\"user\",\"content\":\"phantom marker\"}\n",
+    );
+    std::fs::write(&path, body).unwrap();
+    let context = ScanContext::with_roots(root.clone(), vec![ScanRoot::local(root)], None);
+    let conversations = ClaudeCodeConnector::new().scan(&context).unwrap();
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].messages.len(), 1);
+    assert_eq!(
+        conversations[0].messages[0].content,
+        "bravo recovered claude"
+    );
+    assert_eq!(conversations[0].messages[0].role, "tool");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), body);
+}
 
 #[test]
 fn claude_parses_project_fixture() {

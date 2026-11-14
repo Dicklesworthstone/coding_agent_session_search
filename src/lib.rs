@@ -109128,166 +109128,22 @@ const MAX_REPORTED_SKIPPED_JSONL_LINES: usize = 5;
 // Recovery only runs after the ordinary parser rejects a physical line.
 // Bound both the input and repeated parsing, so many opening braces cannot
 // turn one malformed line into unbounded quadratic work.
-const MAX_FOLLOWUP_JSONL_RECOVERY_LINE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_FOLLOWUP_JSONL_RECOVERY_PARSE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_FOLLOWUP_JSONL_RECOVERY_ATTEMPTS: usize = 64;
-const MAX_FOLLOWUP_JSONL_RECOVERY_RECORDS: usize = 1024;
-
-#[derive(Debug, Default)]
-struct FollowupJsonlRecovery {
-    records: Vec<serde_json::Value>,
-    discarded_bytes: usize,
-    limited: bool,
-}
-
-/// Recognise the root envelopes already consumed by the export loaders.
-/// Arbitrary JSON objects and nested text/tool blocks are not session records.
-/// This restriction applies only to recovery, not to intact JSONL lines.
-fn is_recoverable_followup_record(value: &serde_json::Value) -> bool {
-    fn message(value: &serde_json::Value) -> bool {
-        matches!(
-            value.get("role").and_then(serde_json::Value::as_str),
-            Some(
-                "user"
-                    | "assistant"
-                    | "system"
-                    | "developer"
-                    | "tool"
-                    | "toolResult"
-                    | "tool_result"
-                    | "function"
-            )
-        ) && value
-            .get("content")
-            .is_some_and(|content| content.is_string() || content.is_array())
-    }
-
-    fn has_id(value: &serde_json::Value) -> bool {
-        value
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|id| !id.is_empty())
-    }
-
-    if message(value) {
-        return true;
-    }
-    match value.get("type").and_then(serde_json::Value::as_str) {
-        Some("message") => has_id(value) && value.get("message").is_some_and(message),
-        Some(role @ ("user" | "assistant")) => value.get("message").is_some_and(|inner| {
-            message(inner) && inner.get("role").and_then(serde_json::Value::as_str) == Some(role)
-        }),
-        Some("session") => has_id(value),
-        Some("session_meta" | "response_item" | "event_msg" | "turn_context") => {
-            let timestamp = value
-                .get("timestamp")
-                .is_some_and(|timestamp| timestamp.is_string() || timestamp.is_number());
-            let Some(payload) = value.get("payload").filter(|payload| payload.is_object()) else {
-                return false;
-            };
-            timestamp
-                && match value.get("type").and_then(serde_json::Value::as_str) {
-                    Some("session_meta") => has_id(payload),
-                    Some("turn_context") => true,
-                    _ => payload
-                        .get("type")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|kind| !kind.is_empty()),
-                }
-        }
-        _ => false,
-    }
-}
-
-/// Recover a complete suffix of known session records after a torn prefix.
-///
-/// Search from the start, not the JSON error column: when a write tears inside
-/// a string, the next record's opening brace is consumed as string content and
-/// the reported error lies *after* the record's actual start. Accept only an
-/// entire suffix of object records with no trailing garbage.
-///
-/// A brace at a legal nested-value boundary is ambiguous, even if its suffix
-/// decodes: {"message":{"role":"user","content":"nested"} is a truncated
-/// outer record, not a new root message. Refuse candidates after ':', '[' or
-/// ',' (ignoring ASCII whitespace). This deliberately leaves ambiguous tears
-/// unrecovered rather than manufacturing history from nested data.
-fn recover_followup_jsonl_suffix(line: &str) -> FollowupJsonlRecovery {
-    let mut unrecovered = FollowupJsonlRecovery {
-        discarded_bytes: line.len(),
-        ..FollowupJsonlRecovery::default()
-    };
-    if line.len() > MAX_FOLLOWUP_JSONL_RECOVERY_LINE_BYTES {
-        unrecovered.limited = true;
-        return unrecovered;
-    }
-
-    let mut remaining_parse_bytes = MAX_FOLLOWUP_JSONL_RECOVERY_PARSE_BYTES;
-    let mut attempts = 0;
-    let mut previous_non_whitespace = None;
-    for (offset, byte) in line.bytes().enumerate() {
-        let previous = previous_non_whitespace;
-        if !byte.is_ascii_whitespace() {
-            previous_non_whitespace = Some(byte);
-        }
-        if byte != b'{' || matches!(previous, Some(b':' | b'[' | b',')) {
-            continue;
-        }
-
-        // An ASCII opening brace is always a UTF-8 character boundary.
-        let suffix = &line[offset..];
-        // Skip braces in prose/code before paying for another parse. An object
-        // with a recognised root envelope must start with a quoted field name.
-        if suffix[1..]
-            .trim_start_matches(|ch: char| ch.is_ascii_whitespace())
-            .as_bytes()
-            .first()
-            != Some(&b'"')
-        {
-            continue;
-        }
-        if attempts >= MAX_FOLLOWUP_JSONL_RECOVERY_ATTEMPTS || suffix.len() > remaining_parse_bytes
-        {
-            unrecovered.limited = true;
-            return unrecovered;
-        }
-        attempts += 1;
-        remaining_parse_bytes -= suffix.len();
-
-        let mut records = Vec::new();
-        let mut complete = true;
-        for parsed in serde_json::Deserializer::from_str(suffix).into_iter::<serde_json::Value>() {
-            let Ok(record) = parsed else {
-                complete = false;
-                break;
-            };
-            if !is_recoverable_followup_record(&record) {
-                complete = false;
-                break;
-            }
-            if records.len() >= MAX_FOLLOWUP_JSONL_RECOVERY_RECORDS {
-                unrecovered.limited = true;
-                return unrecovered;
-            }
-            records.push(record);
-        }
-        if complete && !records.is_empty() {
-            return FollowupJsonlRecovery {
-                records,
-                discarded_bytes: offset,
-                limited: false,
-            };
-        }
-    }
-    unrecovered
-}
+use franken_agent_detection::connectors::jsonl::recover_jsonl_suffix as recover_followup_jsonl_suffix;
+#[cfg(test)]
+use franken_agent_detection::connectors::jsonl::{
+    MAX_JSONL_RECOVERY_ATTEMPTS as MAX_FOLLOWUP_JSONL_RECOVERY_ATTEMPTS,
+    MAX_JSONL_RECOVERY_LINE_BYTES as MAX_FOLLOWUP_JSONL_RECOVERY_LINE_BYTES,
+    MAX_JSONL_RECOVERY_RECORDS as MAX_FOLLOWUP_JSONL_RECOVERY_RECORDS,
+};
 
 /// Parse a JSONL session for export, retaining intact records around malformed
 /// lines (GH #427) and conservatively recovering complete records appended
 /// after a torn prefix on the same line (GH #553). Only when no record decodes
 /// is the file rejected, preserving the existing indexed-copy fallback.
 ///
-/// Connector ingestion has its own parsing policy; recovered export records
-/// do not imply that the canonical archive has ingested them.
+/// Connector ingestion and export share FAD's bounded suffix decoder; each
+/// interprets the resulting records for its own output. Export recovery alone
+/// does not prove that an archive has ingested those records.
 pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<TolerantJsonlParse> {
     let lines = read_followup_file_lines(path)?;
     let mut messages = Vec::new();
@@ -109538,6 +109394,44 @@ mod gh427_tolerant_jsonl_tests {
         assert_eq!(skipped[0].recovered_records, 1);
         assert_eq!(skipped[0].discarded_bytes, prefix_bytes);
         assert!(!skipped[0].recovery_limited);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), body);
+    }
+
+    #[test]
+    fn gh553_exports_keep_tool_results_followed_by_pi_control_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let (original, prefix_bytes) = gh553_torn_pi_session();
+        let lines = original.lines().collect::<Vec<_>>();
+        let control = r#"{"type":"model_change","id":"model","modelId":"synthetic"}"#;
+        let body = format!("{}\n{}{control}\n{}\n", lines[0], lines[1], lines[2]);
+        let path = write_session(&dir, "control-after-torn.jsonl", &body);
+        let (records, _, _, skipped) = parse_followup_jsonl_messages_tolerant(&path).unwrap();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[1]["id"], "a0000003");
+        assert_eq!(records[2]["id"], "model");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].recovered_records, 2);
+        assert_eq!(skipped[0].discarded_bytes, prefix_bytes);
+        let output = dir.path().join("recovered.json");
+        run_export(
+            &path,
+            Some(dir.path().join("unused.db")),
+            None,
+            ConvExportFormat::Json,
+            Some(&output),
+            false,
+            true,
+            true,
+            false,
+        )
+        .expect("export must retain tool results before Pi control records");
+        let exported: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(exported.len(), 4);
+        assert_eq!(
+            exported[1]["message"]["content"][0]["text"],
+            "bravo marker two"
+        );
         assert_eq!(std::fs::read_to_string(path).unwrap(), body);
     }
 

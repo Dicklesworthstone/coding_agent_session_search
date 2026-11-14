@@ -195,9 +195,10 @@ const CONTRACTS: &[DependencyContract] = &[
         // historical sessions, opaque mirrors, and physical-store deduplication.
         // GH#552 adds structured ChatGPT voice transcripts and stable native
         // message identity without taking unrelated newer connector changes.
+        // GH#553 adds bounded complete-record recovery after torn JSONL prefixes.
         // Keep the source contract exact until a registry release carries them.
         expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "55c7c703d1ae4f03aa2dcf2a2e283f3c346f9c06",
+        expected_rev: "2437e719dee7770de93eeb7931342bfa8b404e92",
         expected_version: "0.3.10",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.
