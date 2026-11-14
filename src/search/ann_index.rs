@@ -26,9 +26,13 @@ pub enum AnnExactFallbackReason {
     /// Durable updates extend or supersede the main slab covered by HNSW.
     /// A main-only native page cannot certify the complete retained snapshot.
     WalDeltaRequiresExact,
+    /// Equal-score chunks from different native passes or partitions lack
+    /// enough row provenance to preserve the incumbent exact tie order.
+    ChunkTieRequiresExact,
 }
 
-/// Work done by the complete exact cohort after native underfill or failure.
+/// Work done by the complete exact cohort after native underfill, failure,
+/// or an ambiguous chunk tie.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AnnExactFallbackStats {
     pub reason: AnnExactFallbackReason,

@@ -67,8 +67,9 @@ impl SemanticAnnShardSet {
     /// Refill underfilled native windows before paying for a complete exact scan.
     /// Every pass reuses one scored WAL overlay and the same retained cohort,
     /// query and filter. The graph-call/window budget is shared across shards.
-    /// Native failure, oversized WAL deltas or unresolved underfill still recover
-    /// the entire exact cohort; incomplete native results never escape recovery.
+    /// Native failure, ambiguous chunk ties, oversized WAL deltas or unresolved
+    /// underfill recover the entire exact cohort; incomplete native results
+    /// never escape recovery.
     /// Invalid queries and mismatched context owners remain errors, not fallbacks.
     pub(in super::super) fn search_with_exact_fallback(
         &self,
@@ -98,9 +99,10 @@ impl SemanticAnnShardSet {
                     let exact =
                         self.prepare_exact_partition(context, embedding, fetch_limit, filter)?;
                     partial_exact = exact.as_ref().map(|exact| exact.receipt.clone());
-                    loop {
+                    'native_passes: loop {
                         match self.search_prepared(embedding, native_window, filter, &overlay) {
                             Ok((hits, mut retry, measured)) => {
+                                let native_messages = hits.len();
                                 if let Some(measured) = measured {
                                     match stats.as_mut() {
                                         Some(total) => accumulate_native_stats(total, &measured),
@@ -111,13 +113,22 @@ impl SemanticAnnShardSet {
                                 // earlier winners. All passes apply the same WAL
                                 // shadow set, so retaining these scores is safe.
                                 for hit in hits {
+                                    if best_by_message.get(&hit.message_id).is_some_and(|best| {
+                                        hit.score.total_cmp(&best.score).is_eq()
+                                            && hit.identity != best.identity
+                                    }) {
+                                        // Chunk numbers do not encode physical
+                                        // row order. Recover through the same
+                                        // retained exact owners to settle ties.
+                                        break 'native_passes (
+                                            native_messages,
+                                            AnnExactFallbackReason::ChunkTieRequiresExact,
+                                        );
+                                    }
                                     best_by_message
                                         .entry(hit.message_id)
                                         .and_modify(|best| {
-                                            if hit.score.total_cmp(&best.score).is_gt()
-                                                || (hit.score.total_cmp(&best.score).is_eq()
-                                                    && hit.chunk_idx < best.chunk_idx)
-                                            {
+                                            if hit.score.total_cmp(&best.score).is_gt() {
                                                 best.score = hit.score;
                                                 best.chunk_idx = hit.chunk_idx;
                                                 best.identity = hit.identity;
@@ -140,16 +151,21 @@ impl SemanticAnnShardSet {
                                     if let Some(exact) = &exact {
                                         retry.has_more_candidates |= exact.has_more_candidates;
                                         for hit in &exact.hits {
+                                            if combined.get(&hit.message_id).is_some_and(|best| {
+                                                hit.score.total_cmp(&best.score).is_eq()
+                                                    && hit.identity != best.identity
+                                            }) {
+                                                // Native/exact partition order
+                                                // is not original cohort order.
+                                                break 'native_passes (
+                                                    native_messages,
+                                                    AnnExactFallbackReason::ChunkTieRequiresExact,
+                                                );
+                                            }
                                             combined
                                                 .entry(hit.message_id)
                                                 .and_modify(|best| {
-                                                    if hit.score.total_cmp(&best.score).is_gt()
-                                                        || (hit
-                                                            .score
-                                                            .total_cmp(&best.score)
-                                                            .is_eq()
-                                                            && hit.chunk_idx < best.chunk_idx)
-                                                    {
+                                                    if hit.score.total_cmp(&best.score).is_gt() {
                                                         *best = hit.clone();
                                                     }
                                                 })

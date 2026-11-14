@@ -133,12 +133,14 @@ fn files(directory: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 }
 
 #[test]
-fn native_and_wal_chunk_ties_are_independent_of_physical_order() {
+fn native_chunk_ties_follow_the_retained_exact_row_order() {
     #[derive(Debug, Clone, Copy)]
     enum Placement {
         Wal,
         MainWal,
         Shards,
+        NativeThenExact,
+        ExactThenNative,
     }
 
     let temp = tempfile::Builder::new()
@@ -160,8 +162,14 @@ fn native_and_wal_chunk_ties_are_independent_of_physical_order() {
         ("lower_chunk_better", [[1.0, 0.0], [0.0, 1.0]], 0),
         ("higher_chunk_better", [[0.0, 1.0], [1.0, 0.0]], 1),
     ] {
-        for reverse in [false, true] {
-            for placement in [Placement::Wal, Placement::MainWal, Placement::Shards] {
+        for reverse in [true, false] {
+            for placement in [
+                Placement::Wal,
+                Placement::MainWal,
+                Placement::Shards,
+                Placement::NativeThenExact,
+                Placement::ExactThenNative,
+            ] {
                 let directory = temp.path().join(format!("{case}-{reverse}-{placement:?}"));
                 std::fs::create_dir_all(&directory).unwrap();
                 let mut chunks = [
@@ -180,37 +188,100 @@ fn native_and_wal_chunk_ties_are_independent_of_physical_order() {
                         &[chunks[0].clone(), filler],
                         &chunks[1..],
                     )],
-                    Placement::Shards => vec![
-                        shard(&directory, "a", &[chunks[0].clone(), filler], &[]),
-                        shard(&directory, "b", &chunks[1..], &[]),
-                    ],
+                    Placement::Shards | Placement::NativeThenExact | Placement::ExactThenNative => {
+                        let first = shard(&directory, "a", &[chunks[0].clone(), filler], &[]);
+                        let second = shard(&directory, "b", &chunks[1..], &[]);
+                        match placement {
+                            Placement::NativeThenExact => vec![
+                                first,
+                                SemanticIndexArtifact::open(second.fsvi_path(), None).unwrap(),
+                            ],
+                            Placement::ExactThenNative => vec![
+                                SemanticIndexArtifact::open(first.fsvi_path(), None).unwrap(),
+                                second,
+                            ],
+                            _ => vec![first, second],
+                        }
+                    }
                 };
                 let ctx = context(artifacts);
                 let set = SemanticAnnShardSet::open(Arc::clone(&ctx.artifacts)).unwrap();
                 let before = files(&directory);
-                let expected = vec![(7, expected_chunk, 1.0_f32.to_bits())];
+                // Independent fixture oracle: exhaust the real backend, then
+                // order by score, cohort ordinal and physical row. This keeps
+                // the incumbent exact rule, not a new lowest-chunk policy.
+                let mut exhaustive = Vec::new();
+                for (ordinal, artifact) in ctx.artifacts.iter().enumerate() {
+                    let index = artifact.index();
+                    for hit in index
+                        .search_top_k(
+                            &[1.0, 0.0],
+                            index.record_count() + index.wal_record_count(),
+                            None,
+                        )
+                        .unwrap()
+                    {
+                        exhaustive.push((ordinal, hit));
+                    }
+                }
+                exhaustive.sort_by(|(left_shard, left), (right_shard, right)| {
+                    right
+                        .score
+                        .total_cmp(&left.score)
+                        .then_with(|| left_shard.cmp(right_shard))
+                        .then_with(|| left.index.cmp(&right.index))
+                });
+                let winner = parse_semantic_doc_id(&exhaustive[0].1.doc_id).unwrap();
+                assert_eq!(winner.message_id, 7);
+                if case != "equal" {
+                    assert_eq!(winner.chunk_idx, expected_chunk, "score beats chunk order");
+                }
+                let expected = vec![(7, winner.chunk_idx, 1.0_f32.to_bits())];
                 let (exact, _) =
                     SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0], 1, None)
                         .unwrap();
+                assert!(!exact.is_empty(), "the exact fixture has a winner");
                 assert_eq!(
-                    signature(&exact),
+                    signature(&exact[..1]),
                     expected,
                     "{case}, reverse={reverse}, {placement:?}: exact"
                 );
-                assert_eq!(exact[0].identity, Some(identity(expected_chunk)));
+                assert_eq!(exact[0].identity, Some(winner));
                 let (actual, _, stats) = set
                     .search_with_exact_fallback(&ctx, &[1.0, 0.0], 1, None)
                     .unwrap();
+                assert!(!actual.is_empty(), "the native fixture has a winner");
                 assert_eq!(
-                    signature(&actual),
+                    signature(&actual[..1]),
                     expected,
                     "{case}, reverse={reverse}, {placement:?}: native"
                 );
-                assert_eq!(actual[0].identity, Some(identity(expected_chunk)));
+                assert_eq!(actual[0].identity, Some(winner));
                 let stats = stats.unwrap();
                 assert!(stats.k_requested > 0, "a real native graph must execute");
-                assert!(stats.exact_fallback.is_none(), "no full exact recovery");
-                assert_eq!(files(&directory), before, "query must not rewrite artifacts");
+                let mixed = matches!(
+                    placement,
+                    Placement::NativeThenExact | Placement::ExactThenNative
+                );
+                if case == "equal" && mixed {
+                    assert_eq!(signature(&actual), signature(&exact));
+                    let fallback = stats.exact_fallback.as_ref().unwrap();
+                    assert_eq!(
+                        serde_json::to_value(fallback).unwrap()["reason"],
+                        "chunk_tie_requires_exact"
+                    );
+                    assert_eq!(fallback.shard_count, ctx.artifacts.len());
+                    assert_eq!(fallback.returned_messages, exact.len());
+                    assert!(!stats.is_approximate);
+                } else {
+                    assert_eq!(actual.len(), 1, "the native page keeps its limit");
+                    assert!(stats.exact_fallback.is_none(), "unambiguous native page");
+                }
+                assert_eq!(
+                    files(&directory),
+                    before,
+                    "query must not rewrite artifacts"
+                );
             }
         }
     }
