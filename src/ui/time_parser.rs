@@ -7,7 +7,7 @@ use chrono::{Duration, Local, LocalResult, NaiveDate, TimeZone, Utc};
 /// - Keywords: "now", "today", "yesterday"
 /// - ISO dates: "2024-11-25", "2024-11-25T14:30:00Z"
 /// - Date formats: "YYYY-MM-DD", "YYYY/MM/DD", "MM/DD/YYYY", "MM-DD-YYYY"
-/// - Unix timestamp: seconds (if < 10^11) or milliseconds
+/// - Signed Unix timestamp: seconds (if absolute value < 10^11) or milliseconds
 pub fn parse_time_input(input: &str) -> Option<i64> {
     let input = input.trim().to_lowercase();
     if input.is_empty() {
@@ -22,8 +22,9 @@ pub fn parse_time_input(input: &str) -> Option<i64> {
         let val_str: String = stripped.chars().take_while(|c| c.is_numeric()).collect();
         if let Ok(val) = val_str.parse::<i64>() {
             let unit = stripped.trim_start_matches(&val_str).trim();
-            let duration = relative_duration(unit, val)?;
-            return subtract_duration_ms(now_utc, duration);
+            if let Some(duration) = relative_duration(unit, val) {
+                return subtract_duration_ms(now_utc, duration);
+            }
         }
     }
 
@@ -103,8 +104,9 @@ pub fn parse_time_input(input: &str) -> Option<i64> {
     }
     // Numeric fallback (ms or seconds)
     if let Ok(n) = input.parse::<i64>() {
-        // Heuristic: timestamps < 10^11 (year 5138) are likely seconds.
-        if n < 100_000_000_000 {
+        // Apply the same unit heuristic before and after the Unix epoch.
+        // unsigned_abs also admits i64::MIN without overflowing.
+        if n.unsigned_abs() < 100_000_000_000 {
             return n.checked_mul(1000);
         }
         return Some(n);
@@ -232,6 +234,39 @@ mod tests {
         let ms = 1700000000000;
         assert_eq!(parse_time_input("1700000000").unwrap(), ms);
         assert_eq!(parse_time_input("1700000000000").unwrap(), ms);
-        assert_eq!(parse_time_input(&i64::MIN.to_string()), None);
+        assert_eq!(parse_time_input(&i64::MIN.to_string()), Some(i64::MIN));
+    }
+
+    #[test]
+    fn test_negative_unix_timestamps() {
+        for (input, expected) in [
+            ("-1", -1000),
+            ("  -1700000000  ", -1_700_000_000_000),
+            ("-99999999999", -99_999_999_999_000),
+            ("-100000000000", -100_000_000_000),
+            ("-1700000000000", -1_700_000_000_000),
+            ("-9223372036854775808", i64::MIN),
+            ("0", 0),
+            ("99999999999", 99_999_999_999_000),
+            ("100000000000", 100_000_000_000),
+            ("9223372036854775807", i64::MAX),
+        ] {
+            assert_eq!(parse_time_input(input), Some(expected), "{input}");
+        }
+    }
+
+    #[test]
+    fn test_invalid_numeric_time_input() {
+        for input in [
+            "-9223372036854775809",
+            "9223372036854775808",
+            "-9223372036854775808d",
+            "-1fortnight",
+            "1fortnight",
+            "--1",
+            "-",
+        ] {
+            assert_eq!(parse_time_input(input), None, "{input}");
+        }
     }
 }

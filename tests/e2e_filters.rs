@@ -147,6 +147,123 @@ fn filter_by_agent_codex() {
     );
 }
 
+/// Signed Unix bounds must reach the indexed messages on both sides of the epoch.
+#[test]
+fn filter_by_negative_unix_timestamps() {
+    use std::collections::BTreeMap;
+
+    let tracker = tracker_for("filter_by_negative_unix_timestamps");
+    let tmp = tempfile::Builder::new()
+        .prefix("cass-signed-time-")
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("cass_data");
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(home.join(".codex"));
+
+    let ps = tracker.start("setup_and_index", Some("Index signed timestamp fixtures"));
+    for (project, timestamp) in [
+        ("ancient", "1960-01-01T00:00:00Z"),
+        ("before", "1969-12-31T23:59:58Z"),
+        ("boundary", "1969-12-31T23:59:59Z"),
+        ("after", "1970-01-01T00:00:01Z"),
+    ] {
+        make_claude_session_at(
+            &home.join(".claude"),
+            project,
+            &format!("{project} epochfilter"),
+            timestamp,
+        );
+    }
+    command_env
+        .cass_assert_command()
+        .args(["index", "--full", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+    tracker.end(
+        "setup_and_index",
+        Some("Index signed timestamp fixtures"),
+        ps,
+    );
+
+    let ps = tracker.start("verify_bounds", Some("Verify exact signed time selections"));
+    for (bounds, expected) in [
+        (vec![], vec![-315_619_200_000, -2000, -1000, 1000]),
+        (vec!["--since=-2", "--until=-1"], vec![-2000, -1000]),
+        (
+            vec!["--since=-315619200000", "--until=-315619200000"],
+            vec![-315_619_200_000],
+        ),
+        (vec!["--since=-1", "--until=1"], vec![-1000, 1000]),
+        (
+            vec![
+                "--since=-9223372036854775808",
+                "--until=9223372036854775807",
+            ],
+            vec![-315_619_200_000, -2000, -1000, 1000],
+        ),
+    ] {
+        let output = command_env
+            .cass_assert_command()
+            .args([
+                "search",
+                "epochfilter",
+                "--mode",
+                "lexical",
+                "--robot",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .args(&bounds)
+            .output()
+            .expect("search command");
+        assert!(
+            output.status.success(),
+            "{bounds:?}: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let hits = json["hits"].as_array().expect("hits array");
+        let mut actual = BTreeMap::new();
+        for hit in hits {
+            let timestamp = hit["created_at"].as_i64().expect("signed timestamp");
+            *actual.entry(timestamp).or_insert(0_usize) += 1;
+        }
+        let expected: BTreeMap<_, _> = expected
+            .into_iter()
+            .map(|timestamp| (timestamp, 2))
+            .collect();
+        assert_eq!(actual, expected, "{bounds:?}: both messages per session");
+    }
+    for bounds in [
+        ["--since=-1", "--until=-2"],
+        ["--since=-9223372036854775809", "--until=1"],
+        ["--since=-1fortnight", "--until=1"],
+    ] {
+        let output = command_env
+            .cass_assert_command()
+            .args(["search", "epochfilter", "--robot", "--data-dir"])
+            .arg(&data_dir)
+            .args(bounds)
+            .output()
+            .expect("invalid search command");
+        assert_eq!(output.status.code(), Some(2), "{bounds:?}");
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "usage", "{bounds:?}: {error}");
+    }
+    tracker.end(
+        "verify_bounds",
+        Some("Verify exact signed time selections"),
+        ps,
+    );
+}
+
 /// Test: Time filter --since correctly limits results
 #[test]
 fn filter_by_time_since() {

@@ -1938,11 +1938,11 @@ cass search "authentication" --agent codex --workspace myproject --week
 | **Keywords** | `now`, `today`, `yesterday` | Named reference points |
 | **ISO 8601** | `2024-11-25`, `2024-11-25T14:30:00Z` | Standard datetime |
 | **US Dates** | `11/25/2024`, `11-25-2024` | Month/Day/Year |
-| **Unix Timestamp** | `1732579200` | Seconds since epoch |
-| **Unix Millis** | `1732579200000` | Milliseconds (auto-detected) |
+| **Unix Timestamp** | `1732579200`, `-1` | Seconds since epoch (negative before 1970) |
+| **Unix Millis** | `1732579200000`, `-315619200000` | Milliseconds (auto-detected) |
 
 **Intelligent Heuristics**:
-- Numbers of 100,000,000,000 (10^11) or more are milliseconds; smaller numbers are seconds
+- Numbers whose absolute value is 100,000,000,000 (10^11) or more are milliseconds; smaller magnitudes are seconds
 - Years are written in full (`2024`, not `24`)
 - A value that names a whole day (a date without a time, `today`, `yesterday`) starts at local midnight as `--since` and runs through the day's last millisecond as `--until`, so `--until 2024-01-31` includes January 31
 - For `search` and `pack`, a `--since`/`--until` value that cannot be parsed, or a `--since` later than `--until`, is a usage error (exit 2, kind `usage`); it is never silently ignored
