@@ -11083,16 +11083,22 @@ impl FrankenStorage {
         (secs - EPOCH_2020_SECS).div_euclid(3600)
     }
 
-    /// Convert a day ID back to milliseconds (start of day).
+    /// Convert a day ID back to milliseconds (start of day), clamping an
+    /// unrepresentable boundary to the nearest `i64` timestamp.
     pub fn millis_from_day_id(day_id: i64) -> i64 {
         const EPOCH_2020_SECS: i64 = 1_577_836_800;
-        (EPOCH_2020_SECS + day_id * 86400) * 1000
+        // Keep the epoch offset in the exact calculation; saturating an
+        // intermediate product can shift otherwise representable timestamps.
+        let millis = (i128::from(EPOCH_2020_SECS) + i128::from(day_id) * 86_400) * 1000;
+        i64::try_from(millis).unwrap_or(if millis < 0 { i64::MIN } else { i64::MAX })
     }
 
-    /// Convert an hour ID back to milliseconds (start of hour).
+    /// Convert an hour ID back to milliseconds (start of hour), clamping an
+    /// unrepresentable boundary to the nearest `i64` timestamp.
     pub fn millis_from_hour_id(hour_id: i64) -> i64 {
         const EPOCH_2020_SECS: i64 = 1_577_836_800;
-        (EPOCH_2020_SECS + hour_id * 3600) * 1000
+        let millis = (i128::from(EPOCH_2020_SECS) + i128::from(hour_id) * 3_600) * 1000;
+        i64::try_from(millis).unwrap_or(if millis < 0 { i64::MIN } else { i64::MAX })
     }
 
     /// Get the timestamp of the last successful scan.
@@ -30745,6 +30751,38 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             SqliteStorage::hour_id_from_millis(ts_ms),
             (expected_secs - epoch_2020_secs).div_euclid(3_600)
         );
+    }
+
+    #[test]
+    fn timestamp_bucket_starts_clamp_unrepresentable_ids() {
+        assert_eq!(SqliteStorage::millis_from_day_id(i64::MIN), i64::MIN);
+        assert_eq!(SqliteStorage::millis_from_day_id(i64::MAX), i64::MAX);
+        assert_eq!(SqliteStorage::millis_from_hour_id(i64::MIN), i64::MIN);
+        assert_eq!(SqliteStorage::millis_from_hour_id(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn timestamp_bucket_starts_stay_within_input_buckets() {
+        for timestamp_ms in [
+            i64::MIN,
+            i64::MIN + 86_400_000,
+            -1,
+            0,
+            1_577_836_800_000,
+            i64::MAX - 86_400_000,
+            i64::MAX,
+        ] {
+            let day = SqliteStorage::day_id_from_millis(timestamp_ms);
+            let hour = SqliteStorage::hour_id_from_millis(timestamp_ms);
+            let day_start = SqliteStorage::millis_from_day_id(day);
+            let hour_start = SqliteStorage::millis_from_hour_id(hour);
+            assert!(day_start <= timestamp_ms);
+            assert!(hour_start <= timestamp_ms);
+            assert!(i128::from(timestamp_ms) - i128::from(day_start) < 86_400_000);
+            assert!(i128::from(timestamp_ms) - i128::from(hour_start) < 3_600_000);
+            assert_eq!(SqliteStorage::day_id_from_millis(day_start), day);
+            assert_eq!(SqliteStorage::hour_id_from_millis(hour_start), hour);
+        }
     }
 
     #[test]

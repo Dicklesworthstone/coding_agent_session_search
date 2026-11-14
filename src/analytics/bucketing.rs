@@ -135,4 +135,64 @@ mod tests {
         assert!(min.is_some());
         assert!(max.is_none());
     }
+
+    #[test]
+    fn unrepresentable_bucket_ids_use_fallback_labels() {
+        for id in [i64::MIN, i64::MAX] {
+            let day_label = format!("day:{id}");
+            assert_eq!(day_id_to_iso(id), day_label);
+            assert_eq!(day_id_to_iso_week(id), day_label);
+            assert_eq!(day_id_to_month(id), day_label);
+            assert_eq!(hour_id_to_iso(id), format!("hour:{id}"));
+        }
+    }
+
+    #[test]
+    fn out_of_range_rollups_preserve_timeseries_values() -> anyhow::Result<()> {
+        use crate::analytics::{query::query_tokens_timeseries, types::GroupBy};
+        use crate::franken_sync::compat::ConnectionExt;
+
+        let storage = FrankenStorage::open(std::path::Path::new(":memory:"))?;
+        for id in [i64::MIN, 0, i64::MAX] {
+            storage.raw().execute_compat(
+                "INSERT INTO usage_daily (
+                    day_id, agent_slug, source_id, message_count, content_tokens_est_total
+                 ) VALUES (?1, 'codex', 'local', 1, 7)",
+                &[id.into()],
+            )?;
+            storage.raw().execute_compat(
+                "INSERT INTO usage_hourly (
+                    hour_id, agent_slug, source_id, message_count, content_tokens_est_total
+                 ) VALUES (?1, 'codex', 'local', 1, 7)",
+                &[id.into()],
+            )?;
+        }
+
+        for (group_by, prefix, ordinary_label) in [
+            (GroupBy::Hour, "hour", "2020-01-01T00:00Z"),
+            (GroupBy::Day, "day", "2020-01-01"),
+            (GroupBy::Week, "day", "2020-W01"),
+            (GroupBy::Month, "day", "2020-01"),
+        ] {
+            let result =
+                query_tokens_timeseries(storage.raw(), &AnalyticsFilter::default(), group_by)?;
+            assert_eq!(result.path, "rollup");
+            assert_eq!(result.buckets.len(), 3, "{group_by:?}");
+            assert_eq!(result.totals.message_count, 3, "{group_by:?}");
+            assert_eq!(result.totals.content_tokens_est_total, 21, "{group_by:?}");
+            for label in [
+                format!("{prefix}:{}", i64::MIN),
+                ordinary_label.to_string(),
+                format!("{prefix}:{}", i64::MAX),
+            ] {
+                assert!(
+                    result.buckets.iter().any(|(key, bucket)| key == &label
+                        && bucket.message_count == 1
+                        && bucket.content_tokens_est_total == 7),
+                    "{group_by:?}: missing or altered bucket {label}"
+                );
+            }
+        }
+        Ok(())
+    }
 }
