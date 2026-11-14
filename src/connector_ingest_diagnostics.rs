@@ -650,6 +650,23 @@ impl ConnectorIngestRun {
         }
     }
 
+    /// Account for a parsed source rejected by the operator's path policy.
+    /// Virtual database/session handles are distinct source identities here,
+    /// just as they are in `observe_conversation`. Repeated callbacks must not
+    /// inflate the count or erase content or a failure already observed.
+    pub fn observe_excluded_source(&mut self, path: &Path) {
+        let source = self
+            .sources
+            .entry(path.to_path_buf())
+            .or_insert(ObservedSource {
+                disposition: SourceIngestDisposition::Discovered,
+                malformed: false,
+            });
+        if source.disposition == SourceIngestDisposition::Discovered {
+            source.disposition = SourceIngestDisposition::Skipped;
+        }
+    }
+
     /// Record and harden one successfully parsed conversation.
     pub fn observe_conversation(&mut self, conversation: &mut NormalizedConversation) {
         let state = self
@@ -1654,6 +1671,72 @@ mod tests {
         verify_ne!(a.external_id, b.external_id);
         verify_eq!(first.finish().diagnostics.len(), 1);
         verify_eq!(second.finish().summary.indexed, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn gh554_excluded_virtual_sources_are_counted_once_without_payloads() -> TestResult {
+        let temp = tempdir()?;
+        let database = temp.path().join("opencode.db");
+        let root = ScanRoot::local(temp.path().to_path_buf());
+        let source = DiscoveredSourceFile::new(
+            "opencode",
+            &root,
+            database.clone(),
+            DiscoveredSourceRole::SqliteDatabase,
+            true,
+        );
+        let ctx = ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+        let mut run = ConnectorIngestRun::begin("opencode", temp.path(), &ctx, &[source]);
+        let first = database.join("ses_first");
+        let second = database.join("ses_second");
+        run.observe_excluded_source(&first);
+        run.observe_excluded_source(&first);
+        run.observe_excluded_source(&second);
+        let report = run.finish();
+        verify_eq!(report.summary.discovered, 1);
+        verify_eq!(report.summary.skipped, 2);
+        verify_eq!(report.summary.with_content(), 0);
+        verify!(report.diagnostics.is_empty());
+        let json = serde_json::to_value(report)?;
+        verify_eq!(json["summary"]["skipped"], json!(2));
+        verify!(!json.to_string().contains("ses_first"));
+        Ok(())
+    }
+
+    #[test]
+    fn gh554_exclusion_observations_preserve_content_and_failure_evidence() -> TestResult {
+        let temp = tempdir()?;
+        let ctx = ScanContext::local_default(temp.path().to_path_buf(), None);
+        let mut run = ConnectorIngestRun::begin("opencode", temp.path(), &ctx, &[]);
+        let mut conversation = NormalizedConversation {
+            agent_slug: "opencode".into(),
+            external_id: Some("ses_indexed".into()),
+            title: None,
+            workspace: None,
+            source_path: temp.path().join("opencode.db/ses_indexed"),
+            started_at: None,
+            ended_at: None,
+            metadata: json!({}),
+            messages: Vec::new(),
+        };
+        // Later content supersedes a prior exclusion observation, while a
+        // repeated exclusion must not erase an already observed success.
+        run.observe_excluded_source(&conversation.source_path);
+        run.observe_conversation(&mut conversation);
+        run.observe_excluded_source(&conversation.source_path);
+        let locked = temp.path().join("locked.db");
+        run.observe_scan_error(&locked, "database is locked (SQLITE_BUSY)");
+        run.observe_excluded_source(&locked);
+        let report = run.finish();
+        verify_eq!(report.summary.indexed, 1);
+        verify_eq!(report.summary.locked, 1);
+        verify_eq!(report.summary.skipped, 0);
+        verify_eq!(report.diagnostics.len(), 1);
+        verify_eq!(
+            report.diagnostics[0].failure_kind,
+            IngestFailureKind::SourceLocked
+        );
         Ok(())
     }
 

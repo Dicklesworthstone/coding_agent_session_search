@@ -3,7 +3,8 @@
 //! Compare path components, not string prefixes. Relative names use the working
 //! directory captured with the policy; existing filesystem aliases are resolved
 //! at each admission (never cached across symlink changes). Missing final names
-//! are compared through their nearest existing ancestor. Resolution reads only
+//! and virtual sessions beneath a database file are compared through their
+//! nearest existing ancestor. Resolution reads only
 //! filesystem metadata, never source contents, and never creates directories.
 //!
 //! This is an admission policy, not a filesystem sandbox: a hostile concurrent
@@ -88,6 +89,58 @@ impl ScanExclusions {
         // An unresolved namespace cannot establish that the source is outside
         // the excluded scope. Discovery uses the fallible entry point below.
         self.try_excludes(path).unwrap_or(true)
+    }
+
+    /// Raw capture copies an entire physical file. Excluding a logical session
+    /// beneath a shared store therefore also excludes that store from capture,
+    /// while ordinary source admission may still index its permitted sessions.
+    pub(crate) fn excludes_raw_capture(&self, path: &Path) -> bool {
+        self.try_excludes_raw_capture(path).unwrap_or(true)
+    }
+
+    fn try_excludes_raw_capture(&self, path: &Path) -> io::Result<bool> {
+        if self.try_excludes(path)? {
+            return Ok(true);
+        }
+        if self.paths.is_empty() {
+            return Ok(false);
+        }
+        let absolute = self.absolute(path).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "unresolvable source path")
+        })?;
+        match std::fs::metadata(&absolute) {
+            Ok(metadata) if metadata.is_file() => {}
+            // Reverse containment applies only to whole-file capture. Do not
+            // turn one excluded child into an exclusion of its parent directory.
+            Ok(_) => return Ok(false),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        }
+        let physical = resolve_existing_ancestor(&absolute)?;
+        let sidecar_container = sqlite_sidecar_container(&physical)?;
+        for excluded in &self.paths {
+            let excluded = self.absolute(excluded).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "unresolvable exclusion path")
+            })?;
+            let excluded = resolve_existing_ancestor(&excluded)?;
+            if excluded != physical && excluded.starts_with(&physical) {
+                return Ok(true);
+            }
+            if sidecar_container
+                .as_ref()
+                .is_some_and(|container| excluded.starts_with(container))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn try_excludes(&self, path: &Path) -> io::Result<bool> {
@@ -186,6 +239,36 @@ impl ScanExclusions {
     }
 }
 
+/// Interpret sidecar names only after resolving source aliases. A symlink
+/// called `public-wal` can point to an unrelated public file. The companion
+/// container must be an existing regular file and its aliases are resolved too.
+fn sqlite_sidecar_container(physical: &Path) -> io::Result<Option<PathBuf>> {
+    let Some(name) = physical.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    let Some(base) = ["-wal", "-shm", "-journal"]
+        .into_iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .filter(|base| !base.is_empty())
+    else {
+        return Ok(None);
+    };
+    let container = physical.with_file_name(base);
+    match std::fs::metadata(&container) {
+        Ok(metadata) if metadata.is_file() => resolve_existing_ancestor(&container).map(Some),
+        Ok(_) => Ok(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn codex_logical_path(path: &Path) -> Option<PathBuf> {
     if franken_agent_detection::connectors::codex::is_compressed_rollout(path) {
         Some(path.with_extension(""))
@@ -226,7 +309,17 @@ fn resolve_existing_ancestor(path: &Path) -> io::Result<PathBuf> {
                 }
                 return Ok(resolved);
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            // Shared-store connectors identify a conversation as
+            // `database_file/session_id`. The suffix is a logical identifier,
+            // so canonicalizing it reports ENOTDIR even though the database
+            // itself is resolvable. Retain that suffix after resolving the
+            // physical file, just as for a not-yet-created descendant. Other
+            // namespace errors still fail closed.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
             Err(error) => return Err(error),
         }
     }
@@ -299,6 +392,146 @@ mod tests {
         let exclusions = policy(root.path(), "sessions/public/../private");
         assert!(exclusions.excludes(&root.path().join("sessions/private/missing.jsonl")));
         assert!(!exclusions.excludes(&root.path().join("sessions/public/allowed.jsonl")));
+        Ok(())
+    }
+
+    #[test]
+    fn virtual_database_sources_are_not_excluded_by_unrelated_paths() -> io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let database = root.path().join("opencode.db");
+        fs::write(&database, b"shared-store fixture")?;
+        fs::create_dir(root.path().join("private"))?;
+        let source = database.join("ses-allowed");
+        let expected = database.canonicalize()?.join("ses-allowed");
+        assert_eq!(resolve_existing_ancestor(&source)?, expected);
+
+        for excluded in ["private", "missing/private", "opencode.db-copy"] {
+            let exclusions = policy(root.path(), excluded);
+            assert!(!exclusions.try_excludes(&source)?, "{excluded}");
+            assert!(
+                !exclusions.try_excludes(Path::new("opencode.db/ses-allowed"))?,
+                "{excluded}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn virtual_database_exclusions_keep_file_and_session_scopes() -> io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let database = root.path().join("opencode.db");
+        fs::write(&database, b"shared-store fixture")?;
+        let private = database.join("ses-private");
+        let public = database.join("ses-public");
+        let whole_store = policy(root.path(), "opencode.db");
+        assert!(whole_store.try_excludes(&database)?);
+        assert!(whole_store.try_excludes(&private)?);
+        assert!(whole_store.try_excludes(&public)?);
+        assert!(!whole_store.try_excludes(&root.path().join("opencode.db-copy/ses-private"))?);
+
+        let session = policy(root.path(), "opencode.db/ses-private");
+        session.validate_codex()?;
+        assert!(session.try_excludes(&private)?);
+        assert!(!session.try_excludes(&database)?);
+        assert!(!session.try_excludes(&public)?);
+        assert!(!session.try_excludes(&database.join("ses-private-copy"))?);
+        assert!(session.try_excludes(&database.join("ses-public/../ses-private"))?);
+        assert!(session.excludes_raw_capture(&database));
+        assert!(!session.excludes_raw_capture(root.path()));
+        let sibling = root.path().join("opencode.db-copy");
+        fs::write(&sibling, b"public sibling store")?;
+        assert!(!session.excludes_raw_capture(&sibling));
+        assert!(!policy(root.path(), "missing/private").excludes_raw_capture(&database));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_virtual_exclusions_cover_sqlite_sidecars_without_expanding_directory_scope()
+    -> io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let database = root.path().join("opencode.db");
+        let sibling = root.path().join("opencode.db-copy");
+        fs::write(&database, b"shared store")?;
+        fs::write(&sibling, b"sibling store")?;
+        let exclusions = policy(root.path(), "opencode.db/ses-private");
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let private_sidecar = root.path().join(format!("opencode.db{suffix}"));
+            let public_sidecar = root.path().join(format!("opencode.db-copy{suffix}"));
+            fs::write(&private_sidecar, b"private raw bytes")?;
+            fs::write(&public_sidecar, b"public raw bytes")?;
+            assert!(exclusions.excludes_raw_capture(&private_sidecar));
+            assert!(!exclusions.excludes_raw_capture(&public_sidecar));
+            assert!(policy(root.path(), "opencode.db").excludes_raw_capture(&private_sidecar));
+        }
+        assert!(!exclusions.excludes_raw_capture(root.path()));
+        assert!(!exclusions.try_excludes(&database.join("ses-public"))?);
+        let ordinary = root.path().join("missing-wal");
+        fs::write(&ordinary, b"not a companion of any physical container")?;
+        assert!(!policy(root.path(), "missing/session").excludes_raw_capture(&ordinary));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_sidecars_resolve_source_and_container_aliases_before_suffix_matching() -> io::Result<()>
+    {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir()?;
+        let database = root.path().join("opencode.db");
+        let wal = root.path().join("opencode.db-wal");
+        let public = root.path().join("public");
+        fs::write(&database, b"shared store")?;
+        fs::write(&wal, b"private wal")?;
+        fs::write(&public, b"public data")?;
+        symlink(&database, root.path().join("database-alias"))?;
+        symlink(&wal, root.path().join("wal-alias"))?;
+        symlink(&public, root.path().join("database-alias-wal"))?;
+        let exclusions = policy(root.path(), "database-alias/private");
+        assert!(exclusions.excludes_raw_capture(&wal));
+        assert!(exclusions.excludes_raw_capture(&root.path().join("wal-alias")));
+        assert!(!exclusions.excludes_raw_capture(&root.path().join("database-alias-wal")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn virtual_database_sources_resolve_file_and_directory_aliases_before_comparison()
+    -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir()?;
+        let store_dir = root.path().join("private/store");
+        fs::create_dir_all(&store_dir)?;
+        let database = store_dir.join("opencode.db");
+        fs::write(&database, b"shared-store fixture")?;
+        symlink(&database, root.path().join("database-alias"))?;
+        symlink(&store_dir, root.path().join("directory-alias"))?;
+        let direct = database.join("ses-private");
+        let file_alias = root.path().join("database-alias/ses-private");
+        let directory_alias = root.path().join("directory-alias/opencode.db/ses-private");
+        for excluded in [
+            "private/store/opencode.db/ses-private",
+            "database-alias/ses-private",
+            "directory-alias/opencode.db/ses-private",
+            "directory-alias/../store/opencode.db/ses-private",
+        ] {
+            let exclusions = policy(root.path(), excluded);
+            exclusions.validate_codex()?;
+            for source in [&direct, &file_alias, &directory_alias] {
+                assert!(exclusions.try_excludes(source)?, "{excluded}: {source:?}");
+                assert!(
+                    !exclusions.try_excludes(&source.with_file_name("ses-public"))?,
+                    "{excluded}: {source:?}"
+                );
+                assert!(
+                    exclusions.excludes_raw_capture(source.parent().unwrap()),
+                    "a private virtual session must prevent capture of its physical store"
+                );
+            }
+        }
+        assert!(policy(root.path(), "private").try_excludes(&file_alias)?);
+        assert!(!policy(root.path(), "unrelated").try_excludes(&file_alias)?);
         Ok(())
     }
 
