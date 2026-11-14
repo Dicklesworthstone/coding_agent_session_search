@@ -133,6 +133,90 @@ fn files(directory: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 }
 
 #[test]
+fn native_and_wal_chunk_ties_are_independent_of_physical_order() {
+    #[derive(Debug, Clone, Copy)]
+    enum Placement {
+        Wal,
+        MainWal,
+        Shards,
+    }
+
+    let temp = tempfile::Builder::new()
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let identity = |chunk_idx| SemanticDocId {
+        message_id: 7,
+        chunk_idx,
+        agent_id: 1,
+        workspace_id: 2,
+        source_id: 3,
+        role: 1,
+        created_at_ms: 100,
+        content_hash: None,
+    };
+    for (case, vectors, expected_chunk) in [
+        ("equal", [[1.0, 0.0], [1.0, 0.0]], 0),
+        ("lower_chunk_better", [[1.0, 0.0], [0.0, 1.0]], 0),
+        ("higher_chunk_better", [[0.0, 1.0], [1.0, 0.0]], 1),
+    ] {
+        for reverse in [false, true] {
+            for placement in [Placement::Wal, Placement::MainWal, Placement::Shards] {
+                let directory = temp.path().join(format!("{case}-{reverse}-{placement:?}"));
+                std::fs::create_dir_all(&directory).unwrap();
+                let mut chunks = [
+                    (identity(0).to_doc_id_string(), vectors[0]),
+                    (identity(1).to_doc_id_string(), vectors[1]),
+                ];
+                if reverse {
+                    chunks.swap(0, 1);
+                }
+                let filler = (doc(99, 3), [-1.0, 0.0]);
+                let artifacts = match placement {
+                    Placement::Wal => vec![shard(&directory, "a", &[filler], &chunks)],
+                    Placement::MainWal => vec![shard(
+                        &directory,
+                        "a",
+                        &[chunks[0].clone(), filler],
+                        &chunks[1..],
+                    )],
+                    Placement::Shards => vec![
+                        shard(&directory, "a", &[chunks[0].clone(), filler], &[]),
+                        shard(&directory, "b", &chunks[1..], &[]),
+                    ],
+                };
+                let ctx = context(artifacts);
+                let set = SemanticAnnShardSet::open(Arc::clone(&ctx.artifacts)).unwrap();
+                let before = files(&directory);
+                let expected = vec![(7, expected_chunk, 1.0_f32.to_bits())];
+                let (exact, _) =
+                    SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0], 1, None)
+                        .unwrap();
+                assert_eq!(
+                    signature(&exact),
+                    expected,
+                    "{case}, reverse={reverse}, {placement:?}: exact"
+                );
+                assert_eq!(exact[0].identity, Some(identity(expected_chunk)));
+                let (actual, _, stats) = set
+                    .search_with_exact_fallback(&ctx, &[1.0, 0.0], 1, None)
+                    .unwrap();
+                assert_eq!(
+                    signature(&actual),
+                    expected,
+                    "{case}, reverse={reverse}, {placement:?}: native"
+                );
+                assert_eq!(actual[0].identity, Some(identity(expected_chunk)));
+                let stats = stats.unwrap();
+                assert!(stats.k_requested > 0, "a real native graph must execute");
+                assert!(stats.exact_fallback.is_none(), "no full exact recovery");
+                assert_eq!(files(&directory), before, "query must not rewrite artifacts");
+            }
+        }
+    }
+}
+
+#[test]
 fn a_full_native_page_cannot_hide_a_new_durable_wal_winner() {
     let temp = tempfile::tempdir().unwrap();
     let ctx = context(vec![shard(
