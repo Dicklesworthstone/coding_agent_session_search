@@ -65,10 +65,10 @@ pub const MINILM_VECTOR_SPACE_REVISION: &str =
 /// and the CASS input contract, not merely the shared 384-dimensional geometry.
 pub const MULTILINGUAL_MINILM_VECTOR_SPACE_REVISION: &str = "native-multilingual-minilm-v1:59160d9e43d396d05b4139c99f9feb7922da14868587fca7e33d379821a41405:passages-v2";
 
-// Safetensors model file names: prefer an explicit f32 export, fall back to the
-// standard HuggingFace `model.safetensors`. The native embedder also needs
-// `tokenizer.json`; `config.json` and the other tokenizer side-files are not
-// consulted (the embedder reads the tokenizer + weights directly).
+// The registered native bundle contains safetensors weights, tokenizer.json,
+// config.json, special_tokens_map.json and tokenizer_config.json.
+// NativeEmbedder verifies every file before admitting the producer; the
+// filename helpers below perform only an initial presence check.
 pub const MODEL_SAFETENSORS_PRIMARY: &str = "model_f32.safetensors";
 pub const MODEL_SAFETENSORS: &str = "model.safetensors";
 const TOKENIZER_JSON: &str = "tokenizer.json";
@@ -220,8 +220,9 @@ impl FastEmbedder {
         MINILM_MODEL_ID
     }
 
-    /// Required non-model files for the native embedder. The safetensors weight
-    /// file is located separately via [`select_model_file`].
+    /// Tokenizer file required by the initial presence check.
+    /// Complete producer admission also verifies every configuration and
+    /// tokenizer artifact in the frozen native model manifest.
     pub fn required_model_files() -> &'static [&'static str] {
         &[TOKENIZER_JSON]
     }
