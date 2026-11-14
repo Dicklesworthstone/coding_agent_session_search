@@ -7,6 +7,7 @@
 //! this module never downloads, discovers, or substitutes a model.
 //!
 //! These synchronous calls do not preempt a running embedder or vector scan.
+//! An installed caller context is checked before and after query inference.
 //! The caller remains responsible for process deadlines and total memory limits.
 
 use frankensearch::core::generation::{EmbeddingIdentityBundleV1, EmbeddingSpaceKindV1};
@@ -97,11 +98,18 @@ impl<'model> CheckedProducer<'model> {
     }
 
     fn embed(&self, text: &str) -> SemanticReaderResult<BoundQueryEmbedding> {
+        let cx = frankensearch::Cx::current();
         self.check_current()?;
+        if let Some(cx) = &cx {
+            ann::check_query_context(cx)?;
+        }
         // Use the production identity-bearing boundary, including overrides
         // such as attested daemon producers. Never stamp expected metadata on
         // an unbound vector, or accept a new identity after the call returns.
         let bound = self.producer.embed_bound_sync(text)?;
+        if let Some(cx) = &cx {
+            ann::check_query_context(cx)?;
+        }
         bound.validate()?;
         self.check_current()?;
         if bound.identity != self.identity {

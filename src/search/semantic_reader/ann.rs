@@ -648,7 +648,7 @@ pub(super) fn search_shard(
     Ok((hits, report))
 }
 
-fn check_query_context(cx: &frankensearch::Cx) -> SemanticReaderResult<()> {
+pub(super) fn check_query_context(cx: &frankensearch::Cx) -> SemanticReaderResult<()> {
     if cx.checkpoint().is_err() || cx.is_cancel_requested() {
         return Err(SearchError::Cancelled {
             phase: "cass.semantic_reader.search".to_owned(),

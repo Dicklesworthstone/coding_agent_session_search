@@ -172,6 +172,107 @@ fn signature(batch: &SemanticSearchBatch) -> Vec<(String, u64)> {
 }
 
 #[test]
+fn text_cancelled_requests_do_not_run_inference() -> TestResult {
+    let temp = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+    let fast = ObservedHash::new(HashAlgorithm::FnvModular);
+    let quality = ObservedHash::new(HashAlgorithm::JLProjection { seed: 9 });
+    let f = [shard(temp.path(), "fast.fsvi", &fast, &[(1, 3, "alpha")])];
+    let q = [shard(
+        temp.path(),
+        "quality.fsvi",
+        &quality,
+        &[(2, 3, "alpha")],
+    )];
+    let reader = SemanticGenerationReader::open(Some(&f), Some(&q))?;
+    for producers in [
+        TextQueryProducers::Fast(&fast),
+        TextQueryProducers::Quality(&quality),
+        TextQueryProducers::Progressive {
+            fast: &fast,
+            quality: &quality,
+        },
+    ] {
+        let request = reader.activate_text("alpha", producers)?;
+        let live = request.search(1, None)?;
+        assert!(
+            !live.hits().is_empty(),
+            "the real inference control must work"
+        );
+        for ann in [false, true] {
+            let before = (fast.calls(), quality.calls());
+            let cx = frankensearch::Cx::for_request();
+            cx.cancel_with(asupersync::types::CancelKind::User, None);
+            let _current = frankensearch::Cx::set_current(Some(cx));
+            let result = if ann {
+                request.search_with_ann(1, None, AnnSearchPolicy::default())
+            } else {
+                request.search(1, None)
+            };
+            assert!(matches!(
+                result,
+                Err(SemanticReaderError::Search(SearchError::Cancelled { .. }))
+            ));
+            assert_eq!(
+                (fast.calls(), quality.calls()),
+                before,
+                "{producers:?}, ann={ann}: cancellation must precede inference"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn text_cancelled_progressive_phase_does_not_run_quality_inference() -> TestResult {
+    let temp = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+    let fast = ObservedHash::new(HashAlgorithm::FnvModular);
+    let quality = ObservedHash::new(HashAlgorithm::JLProjection { seed: 9 });
+    let f = [shard(temp.path(), "fast.fsvi", &fast, &[(1, 3, "alpha")])];
+    let q = [shard(
+        temp.path(),
+        "quality.fsvi",
+        &quality,
+        &[(2, 3, "alpha")],
+    )];
+    let reader = SemanticGenerationReader::open(Some(&f), Some(&q))?;
+    let request = reader.activate_text(
+        "alpha",
+        TextQueryProducers::Progressive {
+            fast: &fast,
+            quality: &quality,
+        },
+    )?;
+    for ann in [false, true] {
+        let before = (fast.calls(), quality.calls());
+        let cx = frankensearch::Cx::for_request();
+        let _current = frankensearch::Cx::set_current(Some(cx.clone()));
+        let mut phases = if ann {
+            request.progressive_with_ann(1, None, AnnSearchPolicy::default())?
+        } else {
+            request.progressive(1, None)?
+        };
+        let first = phases.next().unwrap()?;
+        assert_eq!(ids(&first), [1]);
+        let after_fast = (before.0 + 1, before.1);
+        assert_eq!((fast.calls(), quality.calls()), after_fast);
+        cx.cancel_with(asupersync::types::CancelKind::User, None);
+        let result = phases.next().unwrap();
+        assert!(matches!(
+            result,
+            Err(SemanticReaderError::Search(SearchError::Cancelled { .. }))
+        ));
+        assert_eq!(
+            (fast.calls(), quality.calls()),
+            after_fast,
+            "ann={ann}: cancelled refinement must not run quality inference"
+        );
+        assert!(phases.next().is_none());
+        assert!(phases.next().is_none());
+    }
+    Ok(())
+}
+
+#[test]
 fn text_quality_only_uses_real_inference_and_its_own_shards() -> TestResult {
     let temp = tempfile::tempdir()?;
     let quality = ObservedHash::new(HashAlgorithm::JLProjection { seed: 9 });
