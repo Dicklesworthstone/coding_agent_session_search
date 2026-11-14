@@ -259,6 +259,167 @@ fn mixed_ann_rescoring_preserves_exact_tail_scores() -> TestResult {
 }
 
 #[test]
+fn request_cancellation_prevents_native_and_exact_shard_work() -> TestResult {
+    struct Visits(AtomicUsize);
+    impl SearchFilter for Visits {
+        fn matches(&self, _: &str, _: Option<&serde_json::Value>) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        fn name(&self) -> &str {
+            "cancelled_request_visits"
+        }
+    }
+
+    let temp = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let space = binding(118, QuantizationFormat::F32);
+    let selected = [shard(&root, "source.fsvi", &space, &[(1, 1.0), (2, 0.5)])];
+    let sidecar = graph(&selected[0], &root.join("source.fshnsw"), 24);
+    let base = SemanticGenerationReader::open(Some(&selected), None)?;
+    let queries = TieredQueryEmbeddings::fast_only(query(&space));
+    for attach in [false, true] {
+        let reader = if attach {
+            base.clone()
+                .with_ann(Some(&[Some(sidecar.clone())]), None)?
+        } else {
+            base.clone()
+        };
+        let active = reader.activate(&queries)?;
+        let live = active.search_with_ann(2, None, full_width())?;
+        assert_eq!(ids(&live), [1, 2]);
+        assert_eq!(
+            live.execution()[0].engine,
+            if attach {
+                SemanticShardEngine::NativeAnn
+            } else {
+                SemanticShardEngine::ExactFallback
+            }
+        );
+        for policy in [
+            None,
+            Some(full_width()),
+            Some(AnnSearchPolicy {
+                initial_candidates: 1,
+                max_candidates: 1,
+            }),
+        ] {
+            let visits = Visits(AtomicUsize::new(0));
+            let cx = frankensearch::Cx::for_request();
+            cx.cancel_with(asupersync::types::CancelKind::User, None);
+            let _current = frankensearch::Cx::set_current(Some(cx));
+            let result = match policy {
+                Some(policy) => active.search_with_ann(2, Some(&visits), policy),
+                None => active.search(2, Some(&visits)),
+            };
+            assert!(
+                matches!(
+                    result,
+                    Err(SemanticReaderError::Search(
+                        frankensearch::SearchError::Cancelled { .. }
+                    ))
+                ),
+                "attach={attach}, policy={policy:?}: {result:?}"
+            );
+            assert_eq!(visits.0.load(Ordering::Relaxed), 0);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn request_cancellation_during_native_filtering_never_falls_back() -> TestResult {
+    struct CancelOnVisit {
+        cx: frankensearch::Cx,
+        visits: AtomicUsize,
+        accept: bool,
+    }
+    impl SearchFilter for CancelOnVisit {
+        fn matches(&self, _: &str, _: Option<&serde_json::Value>) -> bool {
+            self.visits.fetch_add(1, Ordering::Relaxed);
+            self.cx
+                .cancel_with(asupersync::types::CancelKind::User, None);
+            self.accept
+        }
+        fn name(&self) -> &str {
+            "cancel_during_native_filter"
+        }
+    }
+
+    let temp = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let space = binding(119, QuantizationFormat::F32);
+    let selected = [shard(&root, "source.fsvi", &space, &[(1, 1.0), (2, 0.5)])];
+    let sidecar = graph(&selected[0], &root.join("source.fshnsw"), 25);
+    let reader = SemanticGenerationReader::open(Some(&selected), None)?
+        .with_ann(Some(&[Some(sidecar)]), None)?;
+    let queries = TieredQueryEmbeddings::fast_only(query(&space));
+    let active = reader.activate(&queries)?;
+    for accept in [false, true] {
+        let cx = frankensearch::Cx::for_request();
+        let filter = CancelOnVisit {
+            cx: cx.clone(),
+            visits: AtomicUsize::new(0),
+            accept,
+        };
+        let _current = frankensearch::Cx::set_current(Some(cx));
+        let result = active.search_with_ann(1, Some(&filter), full_width());
+        assert!(
+            matches!(
+                result,
+                Err(SemanticReaderError::Search(
+                    frankensearch::SearchError::Cancelled { .. }
+                ))
+            ),
+            "accept={accept}: {result:?}"
+        );
+        assert_eq!(
+            filter.visits.load(Ordering::Relaxed),
+            1,
+            "cancelled filtering must not continue, refill, or scan exact"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn request_cancellation_between_progressive_tiers_is_terminal() -> TestResult {
+    let temp = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let space = binding(120, QuantizationFormat::F32);
+    let fast = [shard(&root, "fast.fsvi", &space, &[(10, 1.0)])];
+    let quality = [shard(&root, "quality.fsvi", &space, &[(20, 1.0)])];
+    let a = graph(&fast[0], &root.join("fast.fshnsw"), 26);
+    let b = graph(&quality[0], &root.join("quality.fshnsw"), 27);
+    let reader = SemanticGenerationReader::open(Some(&fast), Some(&quality))?
+        .with_ann(Some(&[Some(a)]), Some(&[Some(b)]))?;
+    let queries = TieredQueryEmbeddings::progressive(query(&space), query(&space));
+    let active = reader.activate(&queries)?;
+    let filter = CountQuality(AtomicUsize::new(0));
+    let cx = frankensearch::Cx::for_request();
+    let _current = frankensearch::Cx::set_current(Some(cx.clone()));
+    let mut stream = active.progressive_with_ann(1, Some(&filter), full_width())?;
+    let initial = stream.next().unwrap()?;
+    assert_eq!(ids(&initial), [10]);
+    assert_eq!(
+        initial.execution()[0].engine,
+        SemanticShardEngine::NativeAnn
+    );
+    cx.cancel_with(asupersync::types::CancelKind::User, None);
+    let result = stream.next().unwrap();
+    assert!(matches!(
+        result,
+        Err(SemanticReaderError::Search(
+            frankensearch::SearchError::Cancelled { .. }
+        ))
+    ));
+    assert_eq!(filter.0.load(Ordering::Relaxed), 0);
+    assert!(stream.next().is_none());
+    assert!(stream.next().is_none());
+    Ok(())
+}
+
+#[test]
 fn attaching_graphs_does_not_change_the_default_exact_route() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
