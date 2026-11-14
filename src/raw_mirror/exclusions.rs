@@ -114,12 +114,39 @@ mod virtual_store_tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn private_virtual_session_blocks_non_utf8_sidecars_through_a_utf8_policy_alias()
+    -> anyhow::Result<()> {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir()?;
+        let database = root
+            .path()
+            .join(OsString::from_vec(b"sessions-\xff.db".to_vec()));
+        fs::write(&database, b"shared database")?;
+        symlink(&database, root.path().join("store-alias"))?;
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut name = database.as_os_str().to_owned();
+            name.push(suffix);
+            let source = PathBuf::from(name);
+            fs::write(&source, b"private-session-body in a native-name sidecar")?;
+            run_child(root.path(), &source, Path::new("store-alias/private"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn child() -> anyhow::Result<()> {
-        let Ok(root) = dotenvy::var(CHILD_ROOT) else {
+        let Some(root) = std::env::var_os(CHILD_ROOT) else {
             return Ok(());
         };
         let root = PathBuf::from(root);
-        let source = PathBuf::from(dotenvy::var(CHILD_SOURCE)?);
+        let source = PathBuf::from(
+            std::env::var_os(CHILD_SOURCE)
+                .ok_or_else(|| anyhow::anyhow!("missing child source"))?,
+        );
         let before = fs::read(&source)?;
         let data = root.join("mirror");
         let input = || RawMirrorCaptureInput {

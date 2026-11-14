@@ -30036,6 +30036,186 @@
             }
           }
         },
+        "raw_mirror_capture": {
+          "type": "object",
+          "description": "Bounded raw-capture receipt. Current configuration is separate from the last observed index run; this does not scan raw coverage or prove that a new capture would be admitted.",
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "capture_disabled",
+                "configuration_invalid",
+                "unknown",
+                "last_run_paused",
+                "last_run_no_pause_observed",
+                "last_run_incomplete"
+              ]
+            },
+            "capture_enabled": {
+              "type": "boolean"
+            },
+            "configuration": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "valid",
+                    "invalid"
+                  ]
+                },
+                "max_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "min_free_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "status",
+                "max_bytes",
+                "min_free_bytes"
+              ]
+            },
+            "receipt_status": {
+              "type": "string",
+              "enum": [
+                "recorded",
+                "missing",
+                "invalid",
+                "unreadable"
+              ]
+            },
+            "last_run": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "schema_version": {
+                  "type": "integer",
+                  "const": 1
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "started_at_ms": {
+                  "type": "integer"
+                },
+                "updated_at_ms": {
+                  "type": "integer"
+                },
+                "finished_at_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "completed": {
+                  "type": "boolean",
+                  "description": "Capture accounting finalized; this is not a verdict on index success. False can describe an active or interrupted run."
+                },
+                "capture_enabled": {
+                  "type": "boolean"
+                },
+                "capture_paused": {
+                  "type": "boolean"
+                },
+                "max_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "min_free_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "pause_attempts": {
+                  "type": "integer"
+                },
+                "skipped_sources": {
+                  "type": "integer",
+                  "description": "Distinct source identities with at least one refused capture attempt in this run; later retries may have succeeded."
+                },
+                "skipped_sources_exact": {
+                  "type": "boolean"
+                },
+                "requested_reservation_bytes": {
+                  "type": "integer",
+                  "description": "Sum of denied storage reservations, including retries and overhead; not a count of unique source-content bytes."
+                },
+                "counters_exact": {
+                  "type": "boolean"
+                },
+                "last_pause": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "Budget and filesystem values observed at the last capture refusal, not a live disk probe.",
+                  "properties": {
+                    "used_bytes": {
+                      "type": "integer"
+                    },
+                    "max_bytes": {
+                      "type": "integer"
+                    },
+                    "available_bytes": {
+                      "type": "integer"
+                    },
+                    "min_free_bytes": {
+                      "type": "integer"
+                    },
+                    "requested_bytes": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "used_bytes",
+                    "max_bytes",
+                    "available_bytes",
+                    "min_free_bytes",
+                    "requested_bytes"
+                  ]
+                }
+              },
+              "required": [
+                "schema_version",
+                "run_id",
+                "started_at_ms",
+                "updated_at_ms",
+                "finished_at_ms",
+                "completed",
+                "capture_enabled",
+                "capture_paused",
+                "max_bytes",
+                "min_free_bytes",
+                "pause_attempts",
+                "skipped_sources",
+                "skipped_sources_exact",
+                "requested_reservation_bytes",
+                "counters_exact",
+                "last_pause"
+              ]
+            }
+          },
+          "required": [
+            "status",
+            "capture_enabled",
+            "configuration",
+            "receipt_status",
+            "last_run"
+          ]
+        },
         "policy_registry": {
           "type": "object",
           "description": "Data-only registry of active runtime controller policies, their deterministic inputs, and fallback state.",
@@ -36717,6 +36897,186 @@
             }
           }
         },
+        "raw_mirror_capture": {
+          "type": "object",
+          "description": "Bounded raw-capture receipt. Current configuration is separate from the last observed index run; this does not scan raw coverage or prove that a new capture would be admitted.",
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "capture_disabled",
+                "configuration_invalid",
+                "unknown",
+                "last_run_paused",
+                "last_run_no_pause_observed",
+                "last_run_incomplete"
+              ]
+            },
+            "capture_enabled": {
+              "type": "boolean"
+            },
+            "configuration": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "valid",
+                    "invalid"
+                  ]
+                },
+                "max_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "min_free_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "status",
+                "max_bytes",
+                "min_free_bytes"
+              ]
+            },
+            "receipt_status": {
+              "type": "string",
+              "enum": [
+                "recorded",
+                "missing",
+                "invalid",
+                "unreadable"
+              ]
+            },
+            "last_run": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "schema_version": {
+                  "type": "integer",
+                  "const": 1
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "started_at_ms": {
+                  "type": "integer"
+                },
+                "updated_at_ms": {
+                  "type": "integer"
+                },
+                "finished_at_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "completed": {
+                  "type": "boolean",
+                  "description": "Capture accounting finalized; this is not a verdict on index success. False can describe an active or interrupted run."
+                },
+                "capture_enabled": {
+                  "type": "boolean"
+                },
+                "capture_paused": {
+                  "type": "boolean"
+                },
+                "max_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "min_free_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "pause_attempts": {
+                  "type": "integer"
+                },
+                "skipped_sources": {
+                  "type": "integer",
+                  "description": "Distinct source identities with at least one refused capture attempt in this run; later retries may have succeeded."
+                },
+                "skipped_sources_exact": {
+                  "type": "boolean"
+                },
+                "requested_reservation_bytes": {
+                  "type": "integer",
+                  "description": "Sum of denied storage reservations, including retries and overhead; not a count of unique source-content bytes."
+                },
+                "counters_exact": {
+                  "type": "boolean"
+                },
+                "last_pause": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "Budget and filesystem values observed at the last capture refusal, not a live disk probe.",
+                  "properties": {
+                    "used_bytes": {
+                      "type": "integer"
+                    },
+                    "max_bytes": {
+                      "type": "integer"
+                    },
+                    "available_bytes": {
+                      "type": "integer"
+                    },
+                    "min_free_bytes": {
+                      "type": "integer"
+                    },
+                    "requested_bytes": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "used_bytes",
+                    "max_bytes",
+                    "available_bytes",
+                    "min_free_bytes",
+                    "requested_bytes"
+                  ]
+                }
+              },
+              "required": [
+                "schema_version",
+                "run_id",
+                "started_at_ms",
+                "updated_at_ms",
+                "finished_at_ms",
+                "completed",
+                "capture_enabled",
+                "capture_paused",
+                "max_bytes",
+                "min_free_bytes",
+                "pause_attempts",
+                "skipped_sources",
+                "skipped_sources_exact",
+                "requested_reservation_bytes",
+                "counters_exact",
+                "last_pause"
+              ]
+            }
+          },
+          "required": [
+            "status",
+            "capture_enabled",
+            "configuration",
+            "receipt_status",
+            "last_run"
+          ]
+        },
         "quarantine": {
           "type": "object",
           "additionalProperties": true
@@ -39003,6 +39363,186 @@
               "type": "string"
             }
           }
+        },
+        "raw_mirror_capture": {
+          "type": "object",
+          "description": "Bounded raw-capture receipt. Current configuration is separate from the last observed index run; this does not scan raw coverage or prove that a new capture would be admitted.",
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "capture_disabled",
+                "configuration_invalid",
+                "unknown",
+                "last_run_paused",
+                "last_run_no_pause_observed",
+                "last_run_incomplete"
+              ]
+            },
+            "capture_enabled": {
+              "type": "boolean"
+            },
+            "configuration": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "valid",
+                    "invalid"
+                  ]
+                },
+                "max_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "min_free_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "status",
+                "max_bytes",
+                "min_free_bytes"
+              ]
+            },
+            "receipt_status": {
+              "type": "string",
+              "enum": [
+                "recorded",
+                "missing",
+                "invalid",
+                "unreadable"
+              ]
+            },
+            "last_run": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "schema_version": {
+                  "type": "integer",
+                  "const": 1
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "started_at_ms": {
+                  "type": "integer"
+                },
+                "updated_at_ms": {
+                  "type": "integer"
+                },
+                "finished_at_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "completed": {
+                  "type": "boolean",
+                  "description": "Capture accounting finalized; this is not a verdict on index success. False can describe an active or interrupted run."
+                },
+                "capture_enabled": {
+                  "type": "boolean"
+                },
+                "capture_paused": {
+                  "type": "boolean"
+                },
+                "max_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "min_free_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "pause_attempts": {
+                  "type": "integer"
+                },
+                "skipped_sources": {
+                  "type": "integer",
+                  "description": "Distinct source identities with at least one refused capture attempt in this run; later retries may have succeeded."
+                },
+                "skipped_sources_exact": {
+                  "type": "boolean"
+                },
+                "requested_reservation_bytes": {
+                  "type": "integer",
+                  "description": "Sum of denied storage reservations, including retries and overhead; not a count of unique source-content bytes."
+                },
+                "counters_exact": {
+                  "type": "boolean"
+                },
+                "last_pause": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "Budget and filesystem values observed at the last capture refusal, not a live disk probe.",
+                  "properties": {
+                    "used_bytes": {
+                      "type": "integer"
+                    },
+                    "max_bytes": {
+                      "type": "integer"
+                    },
+                    "available_bytes": {
+                      "type": "integer"
+                    },
+                    "min_free_bytes": {
+                      "type": "integer"
+                    },
+                    "requested_bytes": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "used_bytes",
+                    "max_bytes",
+                    "available_bytes",
+                    "min_free_bytes",
+                    "requested_bytes"
+                  ]
+                }
+              },
+              "required": [
+                "schema_version",
+                "run_id",
+                "started_at_ms",
+                "updated_at_ms",
+                "finished_at_ms",
+                "completed",
+                "capture_enabled",
+                "capture_paused",
+                "max_bytes",
+                "min_free_bytes",
+                "pause_attempts",
+                "skipped_sources",
+                "skipped_sources_exact",
+                "requested_reservation_bytes",
+                "counters_exact",
+                "last_pause"
+              ]
+            }
+          },
+          "required": [
+            "status",
+            "capture_enabled",
+            "configuration",
+            "receipt_status",
+            "last_run"
+          ]
         },
         "quarantine": {
           "type": "object",

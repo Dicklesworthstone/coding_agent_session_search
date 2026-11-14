@@ -88985,6 +88985,10 @@ fn run_status(
     // a parseable partial result (with timed_out + skipped_sections) instead of
     // blocking on a slow filesystem/coverage scan.
     let status_budget = crate::robot_budget_envelope::RobotBudget::new(status_budget_ms());
+    // GH #542: a small last-run receipt keeps capture-budget failures visible
+    // without traversing the mirror or delaying the fast readiness surfaces.
+    let raw_mirror_capture = crate::raw_mirror::capture_status(&data_dir);
+    let raw_mirror_warning = crate::raw_mirror::capture_status_warning(&raw_mirror_capture);
     let mut state = state_meta_json_for_status(&data_dir, &db_path, stale_threshold);
     refresh_state_database_counts_if_needed(&mut state, &db_path, "status");
     maybe_test_status_delay();
@@ -89150,6 +89154,10 @@ fn run_status(
         .unwrap_or(0);
     if deferred_conversations > 0 {
         warnings.push(watch_nomem_deferral_warning(deferred_conversations));
+    }
+
+    if let Some(warning) = &raw_mirror_warning {
+        warnings.push(warning.clone());
     }
 
     let db_available = db_opened || (db_exists && db_open_retryable);
@@ -89392,6 +89400,7 @@ fn run_status(
             "doctor_summary": doctor_summary_value,
             "remote_source_sync": remote_sync_value,
             "coverage_risk": coverage_value,
+            "raw_mirror_capture": raw_mirror_capture,
             "quarantine": quarantine_value,
             // uojcg.3.3: compact "is search missing known conversations?" verdict,
             // derived from the cheap ingest-quarantine counts above so health and
@@ -89561,6 +89570,11 @@ fn run_status(
     println!("  Summary: {semantic_summary}");
     if let Some(hint) = semantic_hint {
         println!("  Hint: {hint}");
+    }
+
+    if let Some(warning) = &raw_mirror_warning {
+        println!();
+        println!("Raw capture: {warning}");
     }
 
     if pending_sessions > 0 {
@@ -90520,6 +90534,8 @@ fn run_health(
     let start = Instant::now();
     let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    let raw_mirror_capture = crate::raw_mirror::capture_status(&data_dir);
+    let raw_mirror_warning = crate::raw_mirror::capture_status_warning(&raw_mirror_capture);
     // [coding_agent_session_search-d0rmo + gi4oy] health is the
     // documented <50ms fast surface; force-skip BOTH the canonical-DB
     // COUNT(*) (d0rmo) AND the FrankenStorage open (gi4oy). The
@@ -90625,6 +90641,10 @@ fn run_health(
         .unwrap_or(0);
     if deferred_conversations > 0 {
         warnings.push(watch_nomem_deferral_warning(deferred_conversations));
+    }
+
+    if let Some(warning) = &raw_mirror_warning {
+        warnings.push(warning.clone());
     }
 
     let db_degraded = db_exists && !db_opened;
@@ -90843,6 +90863,7 @@ fn run_health(
             "doctor_summary": doctor_summary,
             "remote_source_sync": remote_source_sync_summary,
             "coverage_risk": coverage_risk,
+            "raw_mirror_capture": raw_mirror_capture,
             "policy_registry": policy_registry,
             "ingest_quarantine": state.get("ingest_quarantine").cloned().unwrap_or(serde_json::Value::Null),
             // uojcg.3.3: same compact search-completeness verdict as `cass status`
@@ -90929,6 +90950,9 @@ fn run_health(
     // Health surface renders a compact partial — the projection is pure over
     // the snapshot already built above, so health stays the <50ms fast surface.
     if structured_format.is_none() {
+        if let Some(warning) = &raw_mirror_warning {
+            println!("  Raw capture: {warning}");
+        }
         print_human_readiness_section(
             &state,
             crate::search::readiness_projection::SurfaceKind::Health,
@@ -104323,6 +104347,76 @@ fn response_schema_doctor_coverage_summary() -> serde_json::Value {
     })
 }
 
+fn response_schema_raw_mirror_capture() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Bounded raw-capture receipt. Current configuration is separate from the last observed index run; this does not scan raw coverage or prove that a new capture would be admitted.",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["capture_disabled", "configuration_invalid", "unknown", "last_run_paused", "last_run_no_pause_observed", "last_run_incomplete"]
+            },
+            "capture_enabled": { "type": "boolean" },
+            "configuration": {
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string", "enum": ["valid", "invalid"] },
+                    "max_bytes": { "type": ["integer", "null"] },
+                    "min_free_bytes": { "type": ["integer", "null"] }
+                },
+                "required": ["status", "max_bytes", "min_free_bytes"]
+            },
+            "receipt_status": {
+                "type": "string",
+                "enum": ["recorded", "missing", "invalid", "unreadable"]
+            },
+            "last_run": {
+                "type": ["object", "null"],
+                "properties": {
+                    "schema_version": { "type": "integer", "const": 1 },
+                    "run_id": { "type": "string" },
+                    "started_at_ms": { "type": "integer" },
+                    "updated_at_ms": { "type": "integer" },
+                    "finished_at_ms": { "type": ["integer", "null"] },
+                    "completed": {
+                        "type": "boolean",
+                        "description": "Capture accounting finalized; this is not a verdict on index success. False can describe an active or interrupted run."
+                    },
+                    "capture_enabled": { "type": "boolean" },
+                    "capture_paused": { "type": "boolean" },
+                    "max_bytes": { "type": ["integer", "null"] },
+                    "min_free_bytes": { "type": ["integer", "null"] },
+                    "pause_attempts": { "type": "integer" },
+                    "skipped_sources": {
+                        "type": "integer",
+                        "description": "Distinct source identities with at least one refused capture attempt in this run; later retries may have succeeded."
+                    },
+                    "skipped_sources_exact": { "type": "boolean" },
+                    "requested_reservation_bytes": {
+                        "type": "integer",
+                        "description": "Sum of denied storage reservations, including retries and overhead; not a count of unique source-content bytes."
+                    },
+                    "counters_exact": { "type": "boolean" },
+                    "last_pause": {
+                        "type": ["object", "null"],
+                        "description": "Budget and filesystem values observed at the last capture refusal, not a live disk probe.",
+                        "properties": {
+                            "used_bytes": { "type": "integer" },
+                            "max_bytes": { "type": "integer" },
+                            "available_bytes": { "type": "integer" },
+                            "min_free_bytes": { "type": "integer" },
+                            "requested_bytes": { "type": "integer" }
+                        },
+                        "required": ["used_bytes", "max_bytes", "available_bytes", "min_free_bytes", "requested_bytes"]
+                    }
+                },
+                "required": ["schema_version", "run_id", "started_at_ms", "updated_at_ms", "finished_at_ms", "completed", "capture_enabled", "capture_paused", "max_bytes", "min_free_bytes", "pause_attempts", "skipped_sources", "skipped_sources_exact", "requested_reservation_bytes", "counters_exact", "last_pause"]
+            }
+        },
+        "required": ["status", "capture_enabled", "configuration", "receipt_status", "last_run"]
+    })
+}
+
 fn response_schema_doctor_coverage_risk() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -105980,6 +106074,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "doctor_summary": response_schema_doctor_v2_summary("status-summary"),
                 "remote_source_sync": response_schema_doctor_remote_source_sync_runtime_summary(),
                 "coverage_risk": response_schema_doctor_coverage_risk(),
+                "raw_mirror_capture": response_schema_raw_mirror_capture(),
                 "quarantine": response_schema_opaque_object(),
                 "search_completeness": response_schema_search_completeness(),
                 "root_cause": response_schema_root_cause_attribution(),
@@ -106132,6 +106227,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "doctor_summary": response_schema_doctor_v2_summary("status-summary"),
                 "remote_source_sync": response_schema_doctor_remote_source_sync_runtime_summary(),
                 "coverage_risk": response_schema_doctor_coverage_risk(),
+                "raw_mirror_capture": response_schema_raw_mirror_capture(),
                 "quarantine": response_schema_opaque_object(),
                 "daemon_runtime": response_schema_opaque_object(),
                 "budget": response_schema_budget_block(),
@@ -106633,6 +106729,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "doctor_summary": response_schema_doctor_v2_summary("health-summary"),
                 "remote_source_sync": response_schema_doctor_remote_source_sync_runtime_summary(),
                 "coverage_risk": response_schema_doctor_coverage_risk(),
+                "raw_mirror_capture": response_schema_raw_mirror_capture(),
                 "policy_registry": response_schema_policy_registry(),
                 "ingest_quarantine": response_schema_ingest_quarantine(),
                 "search_completeness": response_schema_search_completeness(),

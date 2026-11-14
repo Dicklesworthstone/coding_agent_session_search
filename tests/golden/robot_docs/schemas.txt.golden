@@ -2919,6 +2919,31 @@ schemas: (auto-generated from contract)
     - policy_registry: object
       - controllers: array
       - schema_version: string
+    - raw_mirror_capture: object
+      - capture_enabled: boolean
+      - configuration: object
+        - max_bytes: ?
+        - min_free_bytes: ?
+        - status: string
+      - last_run: ?
+        - capture_enabled: boolean
+        - capture_paused: boolean
+        - completed: boolean
+        - counters_exact: boolean
+        - finished_at_ms: ?
+        - last_pause: ?
+        - max_bytes: ?
+        - min_free_bytes: ?
+        - pause_attempts: integer
+        - requested_reservation_bytes: integer
+        - run_id: string
+        - schema_version: integer
+        - skipped_sources: integer
+        - skipped_sources_exact: boolean
+        - started_at_ms: integer
+        - updated_at_ms: integer
+      - receipt_status: string
+      - status: string
     - rebuild_progress: object
       - active: boolean
       - completion_ratio: ?
@@ -3614,6 +3639,31 @@ schemas: (auto-generated from contract)
       - controllers: array
       - schema_version: string
     - quarantine: object
+    - raw_mirror_capture: object
+      - capture_enabled: boolean
+      - configuration: object
+        - max_bytes: ?
+        - min_free_bytes: ?
+        - status: string
+      - last_run: ?
+        - capture_enabled: boolean
+        - capture_paused: boolean
+        - completed: boolean
+        - counters_exact: boolean
+        - finished_at_ms: ?
+        - last_pause: ?
+        - max_bytes: ?
+        - min_free_bytes: ?
+        - pause_attempts: integer
+        - requested_reservation_bytes: integer
+        - run_id: string
+        - schema_version: integer
+        - skipped_sources: integer
+        - skipped_sources_exact: boolean
+        - started_at_ms: integer
+        - updated_at_ms: integer
+      - receipt_status: string
+      - status: string
     - rebuild: object
       - active: boolean
       - engine_incompatible: boolean
@@ -4022,6 +4072,31 @@ schemas: (auto-generated from contract)
       - controllers: array
       - schema_version: string
     - quarantine: object
+    - raw_mirror_capture: object
+      - capture_enabled: boolean
+      - configuration: object
+        - max_bytes: ?
+        - min_free_bytes: ?
+        - status: string
+      - last_run: ?
+        - capture_enabled: boolean
+        - capture_paused: boolean
+        - completed: boolean
+        - counters_exact: boolean
+        - finished_at_ms: ?
+        - last_pause: ?
+        - max_bytes: ?
+        - min_free_bytes: ?
+        - pause_attempts: integer
+        - requested_reservation_bytes: integer
+        - run_id: string
+        - schema_version: integer
+        - skipped_sources: integer
+        - skipped_sources_exact: boolean
+        - started_at_ms: integer
+        - updated_at_ms: integer
+      - receipt_status: string
+      - status: string
     - rebuild: object
       - active: boolean
       - engine_incompatible: boolean

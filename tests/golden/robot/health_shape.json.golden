@@ -554,6 +554,37 @@
         }
       }
     },
+    "raw_mirror_capture": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string"
+        },
+        "capture_enabled": {
+          "type": "boolean"
+        },
+        "configuration": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string"
+            },
+            "max_bytes": {
+              "type": "integer"
+            },
+            "min_free_bytes": {
+              "type": "integer"
+            }
+          }
+        },
+        "receipt_status": {
+          "type": "string"
+        },
+        "last_run": {
+          "type": "null"
+        }
+      }
+    },
     "policy_registry": {
       "type": "object",
       "properties": {

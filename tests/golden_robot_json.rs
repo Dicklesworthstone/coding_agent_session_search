@@ -86,6 +86,11 @@ fn cass_cmd(test_home: &std::path::Path) -> Command {
         // must observe only its synthetic HOME.
         .env("CASS_DAEMON_SOCKET", test_home.join("cass-daemon.sock"))
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        // GH #542: status/health report the current raw-capture configuration.
+        // Keep that contract independent of the host's watcher budget.
+        .env("CASS_RAW_MIRROR", "1")
+        .env("CASS_RAW_MIRROR_MAX_BYTES", "8589934592")
+        .env("CASS_RAW_MIRROR_MIN_FREE_BYTES", "2147483648")
         // Keep resource-policy goldens stable across hosts; dynamic default
         // scaling is covered by responsiveness unit tests.
         .env("CASS_RESPONSIVENESS_MAX_INFLIGHT_BYTES", "536870912");
