@@ -174,6 +174,91 @@ fn mixed_ann_and_exact_shards_merge_without_losing_a_global_winner() -> TestResu
 }
 
 #[test]
+fn mixed_ann_rescoring_preserves_exact_tail_scores() -> TestResult {
+    let temp = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+    // The fourth zero keeps the existing four-dimensional identity fixture.
+    // At this width, decode-then-dot and the stored-byte tail can disagree.
+    let vector = [0x3f4b_c89b, 0x3f18_d674, 0x3dcb_c89b, 0].map(f32::from_bits);
+    let query_vector = [0x3eeb_43ec, 0xbf1d_b22a, 0x3f23_cce1, 0].map(f32::from_bits);
+    for storage in [QuantizationFormat::F32, QuantizationFormat::F16] {
+        for exact_first in [true, false] {
+            let root = temp.path().join(format!("{storage:?}-{exact_first}"));
+            fs::create_dir_all(&root)?;
+            let root = root.canonicalize()?;
+            let space = binding(117, storage);
+            let mut selected = Vec::new();
+            for id in [1, 2] {
+                let path = root.join(format!("{id}.fsvi"));
+                let mut writer = VectorIndex::create_v2(&path, space.clone())?;
+                writer.write_record(&document(id), &vector)?;
+                writer.finish()?;
+                let witness = ValidatedFsviBytes::open_published(&path, &space)?
+                    .witness()
+                    .clone();
+                selected.push(SemanticShardExpectation {
+                    path,
+                    binding: space.clone(),
+                    witness,
+                });
+            }
+            if exact_first {
+                selected.reverse();
+            }
+            let native = usize::from(exact_first);
+            let graph_path = root.join("native.fshnsw");
+            let sidecar = graph(&selected[native], &graph_path, 23);
+            let paths = [
+                selected[0].path.clone(),
+                selected[1].path.clone(),
+                graph_path.clone(),
+                native_hnsw_generation_receipt_path(&graph_path)?,
+            ];
+            let before = paths.iter().map(fs::read).collect::<Result<Vec<_>, _>>()?;
+            let mut graphs = vec![None, None];
+            graphs[native] = Some(sidecar);
+            let reader = SemanticGenerationReader::open(Some(&selected), None)?
+                .with_ann(Some(&graphs), None)?;
+            let bound =
+                BoundQueryEmbedding::new(query_vector.to_vec(), query(&space).identity().clone())?;
+            let queries = TieredQueryEmbeddings::fast_only(bound);
+            let active = reader.activate(&queries)?;
+            let exact = active.search(2, None)?;
+            assert_eq!(ids(&exact), if exact_first { [2, 1] } else { [1, 2] });
+            if storage == QuantizationFormat::F32 {
+                assert!(
+                    exact
+                        .hits()
+                        .iter()
+                        .all(|hit| { hit.fast.as_ref().unwrap().score.to_bits() == 0x3d7c_a32e })
+                );
+            }
+            let actual = active.search_with_ann(2, None, full_width())?;
+            let report = &actual.execution()[native];
+            assert_eq!(report.engine, SemanticShardEngine::NativeAnn);
+            assert_eq!(report.ann_windows, 1);
+            assert_eq!(report.candidate_rows, 1);
+            assert_eq!(report.returned_candidates, 1);
+            assert!(report.fallback_reason.is_none());
+            assert!(report.graph_sha256.is_some());
+            assert_eq!(
+                actual.execution()[1 - native].engine,
+                SemanticShardEngine::ExactFallback
+            );
+            assert_eq!(actual.score_kind(), SemanticScoreKind::AnnRescored);
+            assert_eq!(
+                actual.hits(),
+                exact.hits(),
+                "storage={storage:?}, exact_first={exact_first}"
+            );
+            for (path, bytes) in paths.iter().zip(before) {
+                assert_eq!(fs::read(path)?, bytes);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn attaching_graphs_does_not_change_the_default_exact_route() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;

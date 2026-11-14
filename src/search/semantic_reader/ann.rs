@@ -13,7 +13,9 @@ use frankensearch::core::{BoundQueryEmbedding, VectorHit};
 use frankensearch::index::native_hnsw::{
     NativeHnswGenerationReceiptV2, ValidatedNativeHnsw, native_hnsw_generation_receipt_path,
 };
-use frankensearch::index::{ValidatedFsviBytes, dot_product_f32_f32};
+use frankensearch::index::{
+    Quantization, ValidatedFsviBytes, dot_product_f16_bytes_f32, dot_product_f32_bytes_f32,
+};
 use serde::Serialize;
 
 use crate::search::semantic_manifest::{
@@ -666,9 +668,13 @@ fn native_window(
         if filter.is_some_and(|filter| !filter.matches(candidate.doc_id(), None)) {
             continue;
         }
-        // 1.0 - distance loses small scores to rounding. Recompute from the
-        // exact retained source at its declared storage precision instead.
-        let score = dot_product_f32_f32(&owner.vector_at_f32(row)?, query.vector())?;
+        // Use the exact backend's stored-byte kernel. Decode-then-dot has a
+        // different scalar-tail reduction and can reorder mixed shard scores.
+        let stored = owner.row(row)?;
+        let score = match owner.quantization() {
+            Quantization::F16 => dot_product_f16_bytes_f32(stored.vector_bytes(), query.vector())?,
+            Quantization::F32 => dot_product_f32_bytes_f32(stored.vector_bytes(), query.vector())?,
+        };
         if !score.is_finite() {
             return Err(SemanticReaderError::InvalidCandidate);
         }

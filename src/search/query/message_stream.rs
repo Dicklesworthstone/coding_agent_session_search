@@ -15,6 +15,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 mod retained_wal;
+pub(super) use retained_wal::RowScorer;
 
 #[cfg(test)]
 mod tests;

@@ -19,19 +19,19 @@ fn doc(message: u64, source: u32) -> String {
     .to_doc_id_string()
 }
 
-fn shard(
+fn shard<const N: usize>(
     directory: &Path,
     name: &str,
-    base: &[(String, [f32; 2])],
-    updates: &[(String, [f32; 2])],
+    base: &[(String, [f32; N])],
+    updates: &[(String, [f32; N])],
 ) -> SemanticIndexArtifact {
     let path = directory.join(format!("{name}.fsvi"));
     let ann = directory.join(format!("{name}.chsw"));
     let mut writer = FsVectorIndex::create_with_revision(
         &path,
-        "fnv1a-2",
+        &format!("fnv1a-{N}"),
         "wal-overlay-regression",
-        2,
+        N,
         Quantization::F32,
     )
     .unwrap();
@@ -285,6 +285,148 @@ fn native_chunk_ties_follow_the_retained_exact_row_order() {
             }
         }
     }
+}
+
+#[test]
+fn native_rescoring_preserves_exact_tail_scores_across_partitions() {
+    let temp = tempfile::Builder::new()
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    // Normalized vectors whose separate-mul/add and fused byte-tail scores
+    // differ. Identical stored vectors must still tie across both partitions.
+    let vector = [0x3f4b_c89b, 0x3f18_d674, 0x3dcb_c89b].map(f32::from_bits);
+    let query = [0x3eeb_43ec, 0xbf1d_b22a, 0x3f23_cce1].map(f32::from_bits);
+    for exact_first in [true, false] {
+        let directory = temp.path().join(format!("tail-{exact_first}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let native = shard(&directory, "native", &[(doc(1, 3), vector)], &[]);
+        let exact = shard(&directory, "exact", &[(doc(2, 3), vector)], &[]);
+        let exact = SemanticIndexArtifact::open(exact.fsvi_path(), None).unwrap();
+        let ctx = context(if exact_first {
+            vec![exact, native]
+        } else {
+            vec![native, exact]
+        });
+        let set = SemanticAnnShardSet::open(Arc::clone(&ctx.artifacts)).unwrap();
+        let before = files(&directory);
+        let (expected, _) =
+            SearchClient::search_exact_semantic_indexes(&ctx, &query, 2, None).unwrap();
+        assert_eq!(
+            expected
+                .iter()
+                .map(|hit| hit.message_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(
+            expected
+                .iter()
+                .all(|hit| hit.score.to_bits() == 0x3d7c_a32e)
+        );
+        let (actual, _, stats) = set
+            .search_with_exact_fallback(&ctx, &query, 2, None)
+            .unwrap();
+        let stats = stats.unwrap();
+        assert_eq!(stats.k_requested, 1, "the real native graph must execute");
+        assert!(stats.is_approximate);
+        assert!(stats.exact_fallback.is_none());
+        assert_eq!(stats.candidate_rescore.unwrap().candidates, 1);
+        assert_eq!(
+            signature(&actual),
+            signature(&expected),
+            "exact_first={exact_first}: native and exact scores must agree"
+        );
+        assert_eq!(files(&directory), before);
+    }
+}
+
+#[test]
+fn native_rescoring_preserves_physical_chunk_ties() {
+    let temp = tempfile::Builder::new()
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let identity = |chunk_idx| SemanticDocId {
+        message_id: 7,
+        chunk_idx,
+        agent_id: 1,
+        workspace_id: 2,
+        source_id: 3,
+        role: 1,
+        created_at_ms: 100,
+        content_hash: None,
+    };
+    let mut saw_native_order_change = false;
+    for wal in [true, false] {
+        for reverse in [true, false] {
+            let directory = temp.path().join(format!("row-tie-{wal}-{reverse}"));
+            std::fs::create_dir_all(&directory).unwrap();
+            // Quantized forms of two unit vectors: equal stored first
+            // components, slightly different norms. Native cosine order can
+            // differ from the exact dot kernel's first-physical-row tie rule.
+            let mut vectors = [[0.70703125, 0.5, 0.5], [0.70703125, 0.70703125, 0.0]];
+            if reverse {
+                vectors.swap(0, 1);
+            }
+            let chunks = [
+                (identity(0).to_doc_id_string(), vectors[0]),
+                (identity(1).to_doc_id_string(), vectors[1]),
+            ];
+            let filler = (doc(99, 3), [-1.0, 0.0, 0.0]);
+            let native = shard(
+                &directory,
+                "native",
+                &chunks,
+                if wal {
+                    std::slice::from_ref(&filler)
+                } else {
+                    &[]
+                },
+            );
+            let mut artifacts = vec![native];
+            if !wal {
+                let exact = shard(&directory, "exact", std::slice::from_ref(&filler), &[]);
+                artifacts.push(SemanticIndexArtifact::open(exact.fsvi_path(), None).unwrap());
+            }
+            let ctx = context(artifacts);
+            let set = SemanticAnnShardSet::open(Arc::clone(&ctx.artifacts)).unwrap();
+            let before = files(&directory);
+            let (raw, measured) = set.graphs[0]
+                .knn_search_with_stats_against(ctx.artifacts[0].index(), &[1.0, 0.0, 0.0], 2, 100)
+                .unwrap();
+            assert_eq!(raw.len(), 2);
+            assert!(
+                measured.is_approximate,
+                "the control must execute native HNSW"
+            );
+            let (expected, _) =
+                SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0, 0.0], 1, None)
+                    .unwrap();
+            let winner = expected[0].identity.unwrap();
+            assert_eq!(winner.message_id, 7);
+            saw_native_order_change |= parse_semantic_doc_id(&raw[0].doc_id) != Some(winner);
+            let (actual, _, stats) = set
+                .search_with_exact_fallback(&ctx, &[1.0, 0.0, 0.0], 1, None)
+                .unwrap();
+            let stats = stats.unwrap();
+            assert_eq!(stats.k_requested, 2);
+            assert!(stats.is_approximate);
+            assert!(stats.exact_fallback.is_none());
+            assert_eq!(stats.candidate_rescore.unwrap().candidates, 2);
+            assert_eq!(
+                signature(&actual),
+                signature(&expected[..1]),
+                "wal={wal}, reverse={reverse}: retain the exact winning passage"
+            );
+            assert_eq!(actual[0].identity, Some(winner));
+            assert_eq!(files(&directory), before);
+        }
+    }
+    assert!(
+        saw_native_order_change,
+        "the fixture must reorder a real native window"
+    );
 }
 
 #[test]

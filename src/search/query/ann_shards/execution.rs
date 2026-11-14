@@ -451,6 +451,7 @@ impl SemanticAnnShardSet {
         };
         let mut best_by_message = HashMap::new();
         let mut has_more_candidates = false;
+        let mut scorer = super::super::message_stream::RowScorer::new();
         // Exact shards and retained WAL deltas are scored with the exact FSVI
         // kernel, and every hit of a message competes for its best score. When
         // either is present, native hits are rescored with the same kernel.
@@ -462,7 +463,7 @@ impl SemanticAnnShardSet {
             // The native call also checks source extent and returned row IDs.
             let source = self.artifacts[ordinal].index();
             let delta = overlay.get(&ordinal);
-            let (hits, measured) = graph
+            let (mut hits, measured) = graph
                 .knn_search_with_stats_against(source, embedding, candidate, ef)
                 .map_err(|_| NativeAnnSearchFailure::new(ordinal, stats.clone()))?;
             if measured.dimension != dimension || hits.len() > candidate {
@@ -477,6 +478,17 @@ impl SemanticAnnShardSet {
             stats.search_time_us = stats.search_time_us.saturating_add(measured.search_time_us);
             stats.estimated_recall = stats.estimated_recall.min(measured.estimated_recall as f32);
             stats.is_approximate |= measured.is_approximate;
+            if native_scores_compete_with_exact {
+                // Native cosine order can differ from canonical dot order.
+                // Visit physical rows first so equal rescored chunks retain
+                // the exact backend's winning passage within this shard.
+                let started = std::time::Instant::now();
+                hits.sort_unstable_by_key(|hit| hit.index);
+                let receipt = stats.candidate_rescore.get_or_insert_with(Default::default);
+                receipt.search_time_us = receipt.search_time_us.saturating_add(
+                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                );
+            }
             for hit in &hits {
                 if delta.is_some_and(|delta| delta.shadowed.contains(hit.doc_id.as_str())) {
                     continue;
@@ -487,7 +499,8 @@ impl SemanticAnnShardSet {
                     } else {
                         // Distance-to-score restoration can differ by an ULP
                         // from exact FSVI scoring. Reuse the canonical row's
-                        // exact kernel before comparing native and exact hits.
+                        // exact byte kernel, including its scalar tails, before
+                        // comparing native and exact hits.
                         // This remains bounded by the admitted native windows.
                         let started = std::time::Instant::now();
                         let row = hit.index as usize;
@@ -496,8 +509,8 @@ impl SemanticAnnShardSet {
                         {
                             return Err(NativeAnnSearchFailure::new(ordinal, stats).into());
                         }
-                        let score = source
-                            .dot_query_at(row, embedding)
+                        let score = scorer
+                            .score(source, row, embedding)
                             .map_err(|_| NativeAnnSearchFailure::new(ordinal, stats.clone()))?;
                         if !score.is_finite() {
                             return Err(NativeAnnSearchFailure::new(ordinal, stats).into());

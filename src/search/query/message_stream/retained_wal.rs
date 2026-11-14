@@ -66,16 +66,21 @@ impl<'a> ShadowIds<'a> {
 /// Every finite F16 value has an exact F32 representation; converting it back
 /// preserves the stored half (including subnormals and signed zero). F32 bytes
 /// are restored directly. One decoded row and one reusable byte row are live.
-struct RowScorer {
+pub(in super::super) struct RowScorer {
     wire: Vec<u8>,
 }
 
 impl RowScorer {
-    fn new() -> Self {
+    pub(in super::super) fn new() -> Self {
         Self { wire: Vec::new() }
     }
 
-    fn score(&mut self, index: &FsVectorIndex, row: usize, query: &[f32]) -> Result<f32> {
+    pub(in super::super) fn score(
+        &mut self,
+        index: &FsVectorIndex,
+        row: usize,
+        query: &[f32],
+    ) -> Result<f32> {
         if index.dimension().is_multiple_of(32) {
             return Ok(index.dot_query_at(row, query)?);
         }

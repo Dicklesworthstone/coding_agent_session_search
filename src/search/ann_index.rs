@@ -110,6 +110,7 @@ pub struct AnnSearchStats {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AnnCandidateRescoreStats {
     pub candidates: usize,
+    /// Includes physical-row ordering before canonical scoring and collapse.
     pub search_time_us: u64,
 }
 
