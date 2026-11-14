@@ -180,11 +180,15 @@ mod gh472 {
             let first = r#"{"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":"alpha marker one"}}"#;
             let prefix = r#"{"type":"message","id":"cut","message":{"role":"assistant","content":[{"type":"thinking","thinkingSignature":"署名"#;
             let tool = r#"{"type":"message","id":"t1","parentId":"u1","message":{"role":"toolResult","toolCallId":"call_1","toolName":"bash","content":"bravo marker two"}}"#;
-            let last = r#"{"type":"message","id":"u2","parentId":"t1","message":{"role":"user","content":"charlie marker three"}}"#;
-            let body = format!(
-                "{header}\n{first}\n{}{tool}\n{last}\n",
-                if damaged { prefix } else { "" }
-            );
+            let control =
+                r#"{"type":"model_change","id":"model","parentId":"t1","modelId":"synthetic"}"#;
+            let last = r#"{"type":"message","id":"u2","parentId":"model","message":{"role":"user","content":"charlie marker three"}}"#;
+            let middle = if damaged {
+                format!("{prefix}{tool}{control}")
+            } else {
+                format!("{tool}\n{control}")
+            };
+            let body = format!("{header}\n{first}\n{middle}\n{last}\n");
             fs::write(&path, &body).unwrap();
             let data = fixture.data();
             let data = data.to_str().unwrap();
@@ -213,6 +217,46 @@ mod gh472 {
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0]["agent"], "pi_agent");
             assert_eq!(hits[0]["content"], "bravo marker two");
+            let exported = fixture.run(
+                &[
+                    "export",
+                    path.to_str().unwrap(),
+                    "--format",
+                    "json",
+                    "--include-tools",
+                    "--data-dir",
+                    data,
+                ],
+                &overrides,
+            );
+            let records = exported.report.as_array().unwrap();
+            let messages = records
+                .iter()
+                .filter(|record| record["type"] == "message")
+                .collect::<Vec<_>>();
+            assert_eq!(messages.len(), 3);
+            assert_eq!(messages[1]["id"], "t1");
+            assert_eq!(messages[1]["message"]["content"], "bravo marker two");
+            assert!(records.iter().any(|record| record["id"] == "model"));
+            if damaged {
+                let quarantine: Value = serde_json::from_slice(
+                    &fs::read(
+                        fixture
+                            .data()
+                            .join("quarantine/connector_ingest_lines.json"),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                let entries = quarantine["entries"].as_object().unwrap();
+                assert_eq!(entries.len(), 1);
+                let entry = entries.values().next().unwrap();
+                assert_eq!(entry["payload_bytes"], prefix.len());
+                assert_eq!(
+                    entry["payload_blake3"],
+                    blake3::hash(prefix.as_bytes()).to_hex().to_string()
+                );
+            }
             assert_eq!(fs::read_to_string(&path).unwrap(), body);
             fixture.tracker.complete();
         }

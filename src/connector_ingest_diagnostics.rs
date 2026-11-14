@@ -918,7 +918,7 @@ impl ConnectorIngestRun {
             // connectors retain their existing whole-line quarantine policy.
             let recovery = matches!(
                 self.provider.as_str(),
-                "pi_agent" | "pi_agent_rust" | "oh_my_pi" | "codex" | "claude_code"
+                "pi_agent" | "pi_agent_rust" | "omp" | "codex" | "claude_code"
             )
             .then(|| std::str::from_utf8(line).ok())
             .flatten()
@@ -1534,54 +1534,56 @@ mod tests {
 
     #[test]
     fn gh553_quarantine_hashes_only_the_unrecovered_prefix() -> TestResult {
-        let root = tempdir()?.keep();
-        let path = root.join("torn.jsonl");
-        let prefix = "{\"type\":\"message\",\"message\":{\"content\":\"署名";
-        let record = r#"{"type":"message","id":"tool","message":{"role":"toolResult","content":"recovered marker"}}"#;
-        std::fs::write(&path, format!("{prefix}{record}\r\n"))?;
-        let scan_root = ScanRoot::local(root.clone());
-        let source = DiscoveredSourceFile::new(
-            "pi_agent",
-            &scan_root,
-            path.clone(),
-            DiscoveredSourceRole::PrimarySessionLog,
-            true,
-        );
-        let context = ScanContext::with_roots(root.clone(), vec![scan_root], None);
-        let run = ConnectorIngestRun::begin("pi_agent", &root, &context, &[source]);
-        let report = run.finish();
-        verify_eq!(report.diagnostics.len(), 1);
-        let diagnostic = &report.diagnostics[0];
-        verify_eq!(diagnostic.line_or_row, Some(1));
-        verify_eq!(
-            diagnostic.failure_kind,
-            IngestFailureKind::MalformedJsonLine
-        );
-        let expected_detail = format!(
-            "recovered complete records: 1; quarantined prefix bytes: {}",
-            prefix.len()
-        );
-        verify_eq!(diagnostic.detail.as_deref(), Some(expected_detail.as_str()));
-        let state: serde_json::Value = serde_json::from_slice(&std::fs::read(
-            root.join("quarantine/connector_ingest_lines.json"),
-        )?)?;
-        let entries = state["entries"]
-            .as_object()
-            .ok_or("missing quarantine entries")?;
-        verify_eq!(entries.len(), 1);
-        let entry = entries
-            .values()
-            .next()
-            .ok_or("missing quarantined prefix")?;
-        verify_eq!(entry["payload_bytes"], json!(prefix.len()));
-        verify_eq!(
-            entry["payload_blake3"],
-            json!(blake3::hash(prefix.as_bytes()).to_hex().to_string())
-        );
-        verify_eq!(
-            std::fs::read_to_string(path)?,
-            format!("{prefix}{record}\r\n")
-        );
+        for provider in ["pi_agent", "omp"] {
+            let root = tempdir()?.keep();
+            let path = root.join("torn.jsonl");
+            let prefix = "{\"type\":\"message\",\"message\":{\"content\":\"署名";
+            let record = r#"{"type":"message","id":"tool","message":{"role":"toolResult","content":"recovered marker"}}"#;
+            std::fs::write(&path, format!("{prefix}{record}\r\n"))?;
+            let scan_root = ScanRoot::local(root.clone());
+            let source = DiscoveredSourceFile::new(
+                provider,
+                &scan_root,
+                path.clone(),
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            );
+            let context = ScanContext::with_roots(root.clone(), vec![scan_root], None);
+            let run = ConnectorIngestRun::begin(provider, &root, &context, &[source]);
+            let report = run.finish();
+            verify_eq!(report.diagnostics.len(), 1);
+            let diagnostic = &report.diagnostics[0];
+            verify_eq!(diagnostic.line_or_row, Some(1));
+            verify_eq!(
+                diagnostic.failure_kind,
+                IngestFailureKind::MalformedJsonLine
+            );
+            let expected_detail = format!(
+                "recovered complete records: 1; quarantined prefix bytes: {}",
+                prefix.len()
+            );
+            verify_eq!(diagnostic.detail.as_deref(), Some(expected_detail.as_str()));
+            let state: serde_json::Value = serde_json::from_slice(&std::fs::read(
+                root.join("quarantine/connector_ingest_lines.json"),
+            )?)?;
+            let entries = state["entries"]
+                .as_object()
+                .ok_or("missing quarantine entries")?;
+            verify_eq!(entries.len(), 1);
+            let entry = entries
+                .values()
+                .next()
+                .ok_or("missing quarantined prefix")?;
+            verify_eq!(entry["payload_bytes"], json!(prefix.len()));
+            verify_eq!(
+                entry["payload_blake3"],
+                json!(blake3::hash(prefix.as_bytes()).to_hex().to_string())
+            );
+            verify_eq!(
+                std::fs::read_to_string(path)?,
+                format!("{prefix}{record}\r\n")
+            );
+        }
         Ok(())
     }
 
