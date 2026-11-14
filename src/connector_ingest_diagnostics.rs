@@ -899,10 +899,22 @@ impl ConnectorIngestRun {
         let mut raw_line = Vec::new();
         let mut line_number = 0u64;
         let source_path = path.display().to_string();
-        let uses_shared_jsonl_policy = matches!(
+        let supports_suffix_recovery = matches!(
             self.provider.as_str(),
             "pi_agent" | "pi_agent_rust" | "omp" | "codex" | "claude_code"
         );
+        let accepts_leading_bom = supports_suffix_recovery
+            || matches!(
+                self.provider.as_str(),
+                "clawdbot"
+                    | "factory"
+                    | "gemini"
+                    | "kimi"
+                    | "pi_durable"
+                    | "prime_agent"
+                    | "qwen"
+                    | "vibe"
+            );
         loop {
             raw_line.clear();
             let bytes_read = match reader.read_until(b'\n', &mut raw_line) {
@@ -928,7 +940,9 @@ impl ConnectorIngestRun {
             // Match FAD's ordinary BOM handling without changing the raw
             // recovery budget or the bytes retained as quarantine evidence.
             let ordinary_text = text.map(|text| {
-                if uses_shared_jsonl_policy {
+                if self.provider == "gemini" {
+                    text.trim().trim_start_matches('\u{feff}')
+                } else if accepts_leading_bom {
                     text.trim_start_matches('\u{feff}')
                 } else {
                     text
@@ -948,7 +962,7 @@ impl ConnectorIngestRun {
             // These providers use FAD's shared suffix recovery. Other JSONL
             // connectors retain their existing whole-line quarantine policy.
             let recovery = text
-                .filter(|_| uses_shared_jsonl_policy)
+                .filter(|_| supports_suffix_recovery)
                 .map(franken_agent_detection::connectors::jsonl::recover_jsonl_suffix)
                 .filter(|recovery| !recovery.records.is_empty());
             let mut diagnostic =
@@ -1508,7 +1522,21 @@ mod tests {
 
     #[test]
     fn gh553_intact_bom_lines_do_not_create_quarantine_evidence() -> TestResult {
-        for provider in ["pi_agent", "pi_agent_rust", "omp", "codex", "claude_code"] {
+        for provider in [
+            "pi_agent",
+            "pi_agent_rust",
+            "omp",
+            "codex",
+            "claude_code",
+            "clawdbot",
+            "factory",
+            "gemini",
+            "kimi",
+            "pi_durable",
+            "prime_agent",
+            "qwen",
+            "vibe",
+        ] {
             let root = tempdir()?.keep();
             let path = root.join("intact-bom.jsonl");
             let body = concat!(
@@ -1516,7 +1544,12 @@ mod tests {
                 "\u{feff}\u{feff}{\"wrapper\":{\"role\":\"user\",\"content\":\"nested\"}}\n",
                 "\u{feff} \t\r\n",
             );
-            std::fs::write(&path, body)?;
+            let body = if provider == "gemini" {
+                format!("{body} \t\u{feff}{{\"type\":\"session\",\"id\":\"spaced-bom\"}}\n")
+            } else {
+                body.to_string()
+            };
+            std::fs::write(&path, &body)?;
             let scan_root = ScanRoot::local(root.clone());
             let source = DiscoveredSourceFile::new(
                 provider,
@@ -1551,7 +1584,7 @@ mod tests {
                 br#"torn{"role":"user","content":"complete"}trailing"#,
             ),
             ("vibe", br#"torn{"role":"user","content":"complete"}"#),
-            ("vibe", b"\xef\xbb\xbf{\"intact\":true}"),
+            ("unknown_provider", b"\xef\xbb\xbf{\"intact\":true}"),
             (
                 "pi_agent",
                 b"invalid\xff{\"role\":\"user\",\"content\":\"complete\"}",
