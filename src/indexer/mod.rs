@@ -16069,9 +16069,11 @@ where
                         active_source_skipped = true;
                         return Ok(None);
                     }
-                    if should_skip_subagent(&conversation)
-                        || should_skip_excluded_source(&conversation.source_path)
-                    {
+                    if should_skip_subagent(&conversation) {
+                        return Ok(None);
+                    }
+                    if should_skip_excluded_source(&conversation.source_path) {
+                        ingest_diagnostics.observe_excluded_source(&conversation.source_path);
                         return Ok(None);
                     }
                     ingest_diagnostics.observe_conversation(&mut conversation);
@@ -16195,9 +16197,11 @@ where
                         active_source_skipped = true;
                         return Ok(None);
                     }
-                    if should_skip_subagent(&conversation)
-                        || should_skip_excluded_source(&conversation.source_path)
-                    {
+                    if should_skip_subagent(&conversation) {
+                        return Ok(None);
+                    }
+                    if should_skip_excluded_source(&conversation.source_path) {
+                        ingest_diagnostics.observe_excluded_source(&conversation.source_path);
                         return Ok(None);
                     }
                     ingest_diagnostics.observe_conversation(&mut conversation);
@@ -17580,9 +17584,11 @@ where
                             active_source_skipped = true;
                             return Ok(());
                         }
-                        if should_skip_subagent(&conversation)
-                            || should_skip_excluded_source(&conversation.source_path)
-                        {
+                        if should_skip_subagent(&conversation) {
+                            return Ok(());
+                        }
+                        if should_skip_excluded_source(&conversation.source_path) {
+                            ingest_diagnostics.observe_excluded_source(&conversation.source_path);
                             return Ok(());
                         }
                         ingest_diagnostics.observe_conversation(&mut conversation);
@@ -17660,9 +17666,11 @@ where
                                 active_source_skipped = true;
                                 return Ok(());
                             }
-                            if should_skip_subagent(&conversation)
-                                || should_skip_excluded_source(&conversation.source_path)
-                            {
+                            if should_skip_subagent(&conversation) {
+                                return Ok(());
+                            }
+                            if should_skip_excluded_source(&conversation.source_path) {
+                                ingest_diagnostics.observe_excluded_source(&conversation.source_path);
                                 return Ok(());
                             }
                             ingest_diagnostics.observe_conversation(&mut conversation);
@@ -36491,9 +36499,11 @@ fn reindex_paths_with_semantic_delta(
                     active_sources_skipped = active_sources_skipped.saturating_add(1);
                     return Ok(false);
                 }
-                if should_skip_subagent(&conversation)
-                    || should_skip_excluded_source(&conversation.source_path)
-                {
+                if should_skip_subagent(&conversation) {
+                    return Ok(false);
+                }
+                if should_skip_excluded_source(&conversation.source_path) {
+                    ingest_diagnostics.observe_excluded_source(&conversation.source_path);
                     return Ok(false);
                 }
                 ingest_diagnostics.observe_conversation(&mut conversation);
