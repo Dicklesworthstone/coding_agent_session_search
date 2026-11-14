@@ -109260,10 +109260,13 @@ pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<T
     };
 
     for (line_index, line) in lines.into_iter().enumerate() {
-        if line.trim().is_empty() {
+        // FAD accepts an optional leading BOM on intact JSONL records. Keep
+        // the original line for malformed-suffix limits and byte offsets.
+        let ordinary_line = line.trim_start_matches('\u{feff}');
+        if ordinary_line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<serde_json::Value>(&line) {
+        match serde_json::from_str::<serde_json::Value>(ordinary_line) {
             Ok(msg) => append_message(msg),
             Err(err) => {
                 let recovery = recover_followup_jsonl_suffix(&line);
@@ -109704,6 +109707,27 @@ mod gh427_tolerant_jsonl_tests {
     }
 
     #[test]
+    fn gh553_intact_bom_records_keep_ordinary_json_parser_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = concat!(
+            "\u{feff}{\"type\":\"context_edit\",\"id\":\"ce\",\"replacement\":null}\r\n",
+            "\u{feff}\u{feff}{\"wrapper\":{\"role\":\"user\",\"content\":\"nested\"}}\n",
+            "\u{feff} \t\r\n",
+        );
+        let path = write_session(&dir, "intact-bom.jsonl", body);
+        let (messages, _, _, skipped) = parse_followup_jsonl_messages_tolerant(&path).unwrap();
+        assert_eq!(
+            messages,
+            vec![
+                serde_json::json!({"type":"context_edit","id":"ce","replacement":null}),
+                serde_json::json!({"wrapper":{"role":"user","content":"nested"}}),
+            ]
+        );
+        assert!(skipped.is_empty());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), body);
+    }
+
+    #[test]
     fn gh553_recovery_bounds_input_size_candidate_attempts_and_total_parse_bytes() {
         let record = r#"{"role":"user","content":"complete"}"#;
         let oversized = format!(
@@ -109740,6 +109764,27 @@ mod gh427_tolerant_jsonl_tests {
         let recovery = recover_followup_jsonl_suffix(&parse_budget);
         assert!(recovery.records.is_empty());
         assert!(recovery.limited);
+
+        // Ordinary BOM normalization must not admit an oversized damaged
+        // physical line by removing its BOM before the recovery byte check.
+        let dir = tempfile::tempdir().unwrap();
+        let damaged = format!(
+            "\u{feff}{}{record}",
+            "x".repeat(MAX_FOLLOWUP_JSONL_RECOVERY_LINE_BYTES - record.len())
+        );
+        let body = format!("{{\"type\":\"session\",\"id\":\"control\"}}\n{damaged}\n");
+        let path = write_session(&dir, "oversized-bom.jsonl", &body);
+        let (messages, _, _, skipped) = parse_followup_jsonl_messages_tolerant(&path).unwrap();
+        assert_eq!(
+            messages,
+            vec![serde_json::json!({"type":"session","id":"control"})]
+        );
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].line_number, 2);
+        assert_eq!(skipped[0].recovered_records, 0);
+        assert_eq!(skipped[0].discarded_bytes, damaged.len());
+        assert!(skipped[0].recovery_limited);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), body);
     }
 
     #[test]

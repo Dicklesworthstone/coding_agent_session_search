@@ -899,6 +899,10 @@ impl ConnectorIngestRun {
         let mut raw_line = Vec::new();
         let mut line_number = 0u64;
         let source_path = path.display().to_string();
+        let uses_shared_jsonl_policy = matches!(
+            self.provider.as_str(),
+            "pi_agent" | "pi_agent_rust" | "omp" | "codex" | "claude_code"
+        );
         loop {
             raw_line.clear();
             let bytes_read = match reader.read_until(b'\n', &mut raw_line) {
@@ -920,10 +924,20 @@ impl ConnectorIngestRun {
                 }
             }
             let line = raw_line.as_slice();
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            if serde_json::from_slice::<serde_json::Value>(line).is_ok() {
+            let text = std::str::from_utf8(line).ok();
+            // Match FAD's ordinary BOM handling without changing the raw
+            // recovery budget or the bytes retained as quarantine evidence.
+            let ordinary_text = text.map(|text| {
+                if uses_shared_jsonl_policy {
+                    text.trim_start_matches('\u{feff}')
+                } else {
+                    text
+                }
+            });
+            if ordinary_text.is_some_and(|text| {
+                text.as_bytes().iter().all(u8::is_ascii_whitespace)
+                    || serde_json::from_str::<serde_json::Value>(text).is_ok()
+            }) {
                 continue;
             }
             let kind = if !had_newline {
@@ -933,14 +947,10 @@ impl ConnectorIngestRun {
             };
             // These providers use FAD's shared suffix recovery. Other JSONL
             // connectors retain their existing whole-line quarantine policy.
-            let recovery = matches!(
-                self.provider.as_str(),
-                "pi_agent" | "pi_agent_rust" | "omp" | "codex" | "claude_code"
-            )
-            .then(|| std::str::from_utf8(line).ok())
-            .flatten()
-            .map(franken_agent_detection::connectors::jsonl::recover_jsonl_suffix)
-            .filter(|recovery| !recovery.records.is_empty());
+            let recovery = text
+                .filter(|_| uses_shared_jsonl_policy)
+                .map(franken_agent_detection::connectors::jsonl::recover_jsonl_suffix)
+                .filter(|recovery| !recovery.records.is_empty());
             let mut diagnostic =
                 classify(&self.provider, &source_path, kind).with_line(line_number);
             let quarantined = if let Some(recovery) = recovery {
@@ -1497,8 +1507,41 @@ mod tests {
     }
 
     #[test]
+    fn gh553_intact_bom_lines_do_not_create_quarantine_evidence() -> TestResult {
+        for provider in ["pi_agent", "pi_agent_rust", "omp", "codex", "claude_code"] {
+            let root = tempdir()?.keep();
+            let path = root.join("intact-bom.jsonl");
+            let body = concat!(
+                "\u{feff}{\"type\":\"session\",\"id\":\"bom\"}\r\n",
+                "\u{feff}\u{feff}{\"wrapper\":{\"role\":\"user\",\"content\":\"nested\"}}\n",
+                "\u{feff} \t\r\n",
+            );
+            std::fs::write(&path, body)?;
+            let scan_root = ScanRoot::local(root.clone());
+            let source = DiscoveredSourceFile::new(
+                provider,
+                &scan_root,
+                path.clone(),
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            );
+            let context = ScanContext::with_roots(root.clone(), vec![scan_root], None);
+            let run = ConnectorIngestRun::begin(provider, &root, &context, &[source]);
+            verify!(run.diagnostics.is_empty());
+            let observed = run.sources.get(&path).ok_or("missing inspected source")?;
+            verify!(!observed.malformed);
+            let error = std::fs::metadata(root.join("quarantine/connector_ingest_lines.json"))
+                .err()
+                .ok_or("intact records created quarantine evidence")?;
+            verify_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            verify_eq!(std::fs::read_to_string(path)?, body);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn gh553_unrecoverable_lines_keep_complete_quarantine_evidence() -> TestResult {
-        let cases: [(&str, &[u8]); 4] = [
+        let cases: [(&str, &[u8]); 5] = [
             (
                 "pi_agent",
                 br#"{"payload":{"role":"user","content":"nested"}"#,
@@ -1508,6 +1551,7 @@ mod tests {
                 br#"torn{"role":"user","content":"complete"}trailing"#,
             ),
             ("vibe", br#"torn{"role":"user","content":"complete"}"#),
+            ("vibe", b"\xef\xbb\xbf{\"intact\":true}"),
             (
                 "pi_agent",
                 b"invalid\xff{\"role\":\"user\",\"content\":\"complete\"}",
