@@ -506,6 +506,17 @@
     "raw_mirror_capture_disabled": false,
     "recommended_action": "Run 'cass index --full' once before coverage can be assessed."
   },
+  "raw_mirror_capture": {
+    "status": "unknown",
+    "capture_enabled": true,
+    "configuration": {
+      "status": "valid",
+      "max_bytes": 8589934592,
+      "min_free_bytes": 2147483648
+    },
+    "receipt_status": "missing",
+    "last_run": null
+  },
   "quarantine": {
     "summary": {
       "failed_seed_bundle_count": 2,

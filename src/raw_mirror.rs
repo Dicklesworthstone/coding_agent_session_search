@@ -7,7 +7,10 @@
 mod exclusions;
 #[path = "raw_mirror_cli.rs"]
 mod index_maintenance;
-pub(crate) use index_maintenance::maintain_for_index;
+pub(crate) use index_maintenance::{
+    begin_capture_run, capture_pause_is_summarized, capture_status, capture_status_warning,
+    maintain_for_index,
+};
 // Keep the policy next to the store's private validation/publication helpers.
 // The v1 codec and its existing test module remain byte-for-byte unchanged.
 mod store {
@@ -84,16 +87,18 @@ pub fn capture_source_file(
     }
     exclusions::ensure_allowed(input.source_path)?;
     let policy = RawMirrorRetentionPolicy::from_env()?;
-    if is_append_transcript(input.source_path) {
+    let result = if is_append_transcript(input.source_path) {
         store::policy::capture(
-            input,
+            input.clone(),
             TRANSCRIPT_CHUNK_BYTES as u64,
             TRANSCRIPT_CHUNK_BYTES,
             policy,
         )
     } else {
-        store::policy::capture_default(input, policy)
-    }
+        store::policy::capture_default(input.clone(), policy)
+    };
+    index_maintenance::observe_capture_result(&input, &result);
+    result
 }
 
 #[cfg(test)]
@@ -106,12 +111,14 @@ pub(crate) fn capture_source_file_with_chunk_policy(
         return Err(RawMirrorCaptureDisabled.into());
     }
     exclusions::ensure_allowed(input.source_path)?;
-    store::policy::capture(
-        input,
+    let result = store::policy::capture(
+        input.clone(),
         chunk_threshold_bytes,
         chunk_size_bytes,
         RawMirrorRetentionPolicy::from_env()?,
-    )
+    );
+    index_maintenance::observe_capture_result(&input, &result);
+    result
 }
 
 #[cfg(test)]

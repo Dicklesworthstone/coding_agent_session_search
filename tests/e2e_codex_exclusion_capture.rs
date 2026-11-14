@@ -3,6 +3,7 @@
 //! Bead 0f1k0: an exclusion covers every connector (Gemini included) and every
 //! spelling of the directory (`..`, relative, symlink alias).
 //! GH #554: unrelated exclusions preserve virtual sessions in a shared database.
+//! GH #542: raw-capture budget pauses are summarized and visible in status/health.
 //! Run with `cargo test --test e2e_codex_exclusion_capture` in a full CASS build.
 
 use coding_agent_search::raw_mirror::storage_summary;
@@ -546,6 +547,121 @@ fn raw_mirror_switch_indexes_without_raw_copies_and_doctor_discloses_it() {
             control.all_sources(),
             "streaming={streaming}"
         );
+    }
+}
+
+#[test]
+fn gh542_capture_budget_pause_is_bounded_visible_and_recovers_without_losing_search() {
+    for streaming in ["0", "1"] {
+        let fixture = Fixture::new();
+        let mut index = fixture.command(streaming, "");
+        index
+            .env("CASS_RAW_MIRROR_MAX_BYTES", "0")
+            .env("CASS_RAW_MIRROR_MIN_FREE_BYTES", "0")
+            .args(["index", "--json", "--full"]);
+        let output = assert_cmd::Command::from_std(index)
+            .timeout(Duration::from_secs(180))
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(summary["success"], true, "{summary}");
+        fixture.assert_sources(&[&fixture.hidden, &fixture.archived, &fixture.public]);
+        fixture.assert_hits("casspublicproof7z", 1);
+        assert!(fixture.captured_sources().is_empty());
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let events: Vec<Value> = stderr
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        for event in ["raw_mirror_capture_paused", "raw_mirror_capture_summary"] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|value| value["event"] == event)
+                    .count(),
+                1,
+                "one bounded {event} event expected: {stderr}"
+            );
+        }
+        assert!(
+            !stderr.contains("failed to capture discovered provider source")
+                && !stderr.contains("failed to capture explicit scan-root source")
+                && !stderr.contains("failed to capture parsed conversation source"),
+            "budget refusals must not produce a warning per source: {stderr}"
+        );
+
+        let receipt_path = fixture.home.path().join("data/raw-mirror-capture.json");
+        let receipt_before = fs::read(&receipt_path).unwrap();
+        let mut observed_run_id = None;
+        for surface in ["status", "health"] {
+            let mut probe = fixture.command(streaming, "");
+            probe
+                // Current configuration must not relabel the historical pause
+                // as a live probe or a successful resume.
+                .env("CASS_RAW_MIRROR_MAX_BYTES", "1048576")
+                .env("CASS_RAW_MIRROR_MIN_FREE_BYTES", "0")
+                .args([surface, "--json"]);
+            let output = assert_cmd::Command::from_std(probe)
+                .timeout(Duration::from_secs(30))
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let report: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(report["healthy"], true, "{surface}: {report}");
+            let capture = &report["raw_mirror_capture"];
+            assert_eq!(capture["status"], "last_run_paused", "{capture}");
+            assert_eq!(capture["receipt_status"], "recorded", "{capture}");
+            assert_eq!(capture["configuration"]["max_bytes"], 1_048_576);
+            let run = &capture["last_run"];
+            assert_eq!(run["max_bytes"], 0);
+            assert_eq!(run["completed"], true);
+            assert_eq!(run["capture_paused"], true);
+            assert_eq!(run["skipped_sources"], 3, "{run}");
+            assert_eq!(run["skipped_sources_exact"], true);
+            assert_eq!(run["counters_exact"], true);
+            assert!(run["pause_attempts"].as_u64().unwrap() >= 3);
+            assert!(run["requested_reservation_bytes"].as_u64().unwrap() > 0);
+            assert_eq!(run["last_pause"]["max_bytes"], 0);
+            assert!(run["finished_at_ms"].is_i64());
+            if let Some(run_id) = &observed_run_id {
+                assert_eq!(&run["run_id"], run_id);
+            } else {
+                observed_run_id = Some(run["run_id"].clone());
+            }
+            assert!(
+                report["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|warning| warning.as_str().is_some_and(|text| {
+                        text.to_ascii_lowercase().contains("raw") && text.contains("3")
+                    })),
+                "{surface} must explain the missing raw protection: {report}"
+            );
+        }
+        assert_eq!(
+            fs::read(&receipt_path).unwrap(),
+            receipt_before,
+            "status and health must not rewrite the receipt"
+        );
+
+        // The original sources remain unchanged. A full scan with the normal
+        // budget can preserve them and replace the last-run observation.
+        fixture.index(streaming, "", true);
+        assert_eq!(fixture.captured_sources(), fixture.all_sources());
+        let receipt: Value = serde_json::from_slice(&fs::read(receipt_path).unwrap()).unwrap();
+        assert_eq!(receipt["completed"], true);
+        assert_eq!(receipt["capture_paused"], false);
+        assert_eq!(receipt["skipped_sources"], 0);
+        assert_eq!(receipt["pause_attempts"], 0);
+        assert!(receipt["last_pause"].is_null());
+        assert_ne!(Some(receipt["run_id"].clone()), observed_run_id);
+        fixture.assert_hits("cassprivateproof9z", 1);
     }
 }
 

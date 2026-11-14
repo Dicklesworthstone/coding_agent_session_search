@@ -18307,6 +18307,9 @@ fn run_index_with_storage_ownership(
         job_kind,
         archive_admission,
     )?;
+    // Record optional raw-capture admission separately from canonical indexing.
+    // Only the archive's admitted writer may replace its last-run receipt.
+    let _raw_mirror_capture_run = crate::raw_mirror::begin_capture_run(&opts.data_dir);
     let require_canonical_rebuild = canonical_rebuild_required_from_env()?;
     validate_canonical_rebuild_scope(&opts, require_canonical_rebuild)?;
     let _index_run_lock_heartbeat = IndexRunLockHeartbeat::start(
@@ -39552,6 +39555,7 @@ fn capture_discovered_source_file_before_parse(
                 "captured discovered provider source into raw mirror before connector parse"
             );
         }
+        Err(error) if crate::raw_mirror::capture_pause_is_summarized(data_dir, &error) => {}
         Err(error) => {
             tracing::warn!(
                 provider,
@@ -39729,6 +39733,7 @@ fn capture_scan_root_file_before_parse(
             "captured explicit scan-root source into raw mirror before connector parse"
             );
         }
+        Err(error) if crate::raw_mirror::capture_pause_is_summarized(data_dir, &error) => {}
         Err(error) => {
             tracing::warn!(
                 provider,
@@ -39788,6 +39793,7 @@ fn attach_raw_mirror_capture(
                 "captured parsed conversation source into raw mirror before archive upsert"
             );
         }
+        Err(error) if crate::raw_mirror::capture_pause_is_summarized(data_dir, &error) => {}
         Err(error) => {
             tracing::warn!(
                 agent = %conv.agent_slug,

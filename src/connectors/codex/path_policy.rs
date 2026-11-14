@@ -243,15 +243,48 @@ impl ScanExclusions {
 /// called `public-wal` can point to an unrelated public file. The companion
 /// container must be an existing regular file and its aliases are resolved too.
 fn sqlite_sidecar_container(physical: &Path) -> io::Result<Option<PathBuf>> {
-    let Some(name) = physical.file_name().and_then(|name| name.to_str()) else {
+    let Some(name) = physical.file_name() else {
         return Ok(None);
     };
-    let Some(base) = ["-wal", "-shm", "-journal"]
+    let Some(suffix) = ["-wal", "-shm", "-journal"]
         .into_iter()
-        .find_map(|suffix| name.strip_suffix(suffix))
-        .filter(|base| !base.is_empty())
+        .find(|suffix| {
+            let tail = &name.as_encoded_bytes()[name.len().saturating_sub(suffix.len())..];
+            #[cfg(windows)]
+            {
+                tail.eq_ignore_ascii_case(suffix.as_bytes())
+            }
+            #[cfg(not(windows))]
+            {
+                tail == suffix.as_bytes()
+            }
+        })
+        .filter(|suffix| name.len() > suffix.len())
     else {
         return Ok(None);
+    };
+    // A UTF-8 policy alias can resolve to a native filename that is not UTF-8.
+    // Remove only the ASCII sidecar suffix; lossy conversion would change the
+    // container identity and could let an excluded session's bytes through.
+    #[cfg(unix)]
+    let base = {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let bytes = name.as_bytes();
+        std::ffi::OsString::from_vec(bytes[..bytes.len() - suffix.len()].to_vec())
+    };
+    #[cfg(windows)]
+    let base = {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut units: Vec<u16> = name.encode_wide().collect();
+        units.truncate(units.len() - suffix.len());
+        std::ffi::OsString::from_wide(&units)
+    };
+    #[cfg(not(any(unix, windows)))]
+    let base = {
+        let name = name.to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "unresolvable sidecar filename")
+        })?;
+        std::ffi::OsString::from(&name[..name.len() - suffix.len()])
     };
     let container = physical.with_file_name(base);
     match std::fs::metadata(&container) {
@@ -491,6 +524,56 @@ mod tests {
         assert!(exclusions.excludes_raw_capture(&wal));
         assert!(exclusions.excludes_raw_capture(&root.path().join("wal-alias")));
         assert!(!exclusions.excludes_raw_capture(&root.path().join("database-alias-wal")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_sidecar_exclusions_preserve_non_utf8_physical_names() -> io::Result<()> {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir()?;
+        let database = root
+            .path()
+            .join(OsString::from_vec(b"private-\xff.db".to_vec()));
+        let public = root
+            .path()
+            .join(OsString::from_vec(b"public-\xfe.db".to_vec()));
+        fs::write(&database, b"shared store")?;
+        fs::write(&public, b"public store")?;
+        symlink(&database, root.path().join("database-alias"))?;
+        let exclusions = policy(root.path(), "database-alias/private");
+        assert!(exclusions.excludes_raw_capture(&database));
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut private_name = database.as_os_str().to_owned();
+            private_name.push(suffix);
+            let private_sidecar = PathBuf::from(private_name);
+            let mut public_name = public.as_os_str().to_owned();
+            public_name.push(suffix);
+            let public_sidecar = PathBuf::from(public_name);
+            fs::write(&private_sidecar, b"private raw bytes")?;
+            fs::write(&public_sidecar, b"public raw bytes")?;
+            assert!(exclusions.excludes_raw_capture(&private_sidecar));
+            assert!(!exclusions.excludes_raw_capture(&public_sidecar));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_sidecar_exclusions_preserve_windows_case_aliases() -> io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let database = root.path().join("sessions.db");
+        fs::write(&database, b"shared store")?;
+        let exclusions = policy(root.path(), "sessions.db/private");
+        for suffix in ["-WAL", "-sHm", "-JoUrNaL"] {
+            let sidecar = root.path().join(format!("sessions.db{suffix}"));
+            fs::write(&sidecar, b"private raw bytes")?;
+            assert!(exclusions.excludes_raw_capture(&sidecar));
+        }
+        assert!(!exclusions.try_excludes(&database.join("public"))?);
         Ok(())
     }
 
