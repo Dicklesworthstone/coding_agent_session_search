@@ -21,6 +21,7 @@
 #   scripts/gate.sh --no-bin        # skip the cass bin's own unit tests (stage bin-cass)
 #   scripts/gate.sh --local         # run stages locally (only where rch is not required)
 #   scripts/gate.sh --print-remote-script  # inspect the batch without admitting or executing it
+#   GATE_RCH=/path/to/qualified/rch scripts/gate.sh  # select a client without replacing the shared installation
 #   GATE_RETRIES=40 GATE_RETRY_SLEEP=90 scripts/gate.sh   # keep retrying fleet refusals
 #
 # Exit code: 0 when every stage exited 0, 1 otherwise, 103 if the fleet refused
@@ -631,7 +632,7 @@ run_once() {
         env CARGO_TARGET_DIR="$TARGET_DIR" RUST_MIN_STACK=134217728 UBS_MODULE_TIMEOUT="$UBS_TIMEOUT" bash -c "$REMOTE_SCRIPT"
         return $?
     fi
-    RCH_REQUIRE_REMOTE=1 rch exec --job --result-dir tests/golden -- env CARGO_TARGET_DIR="$TARGET_DIR" RUST_MIN_STACK=134217728 UBS_MODULE_TIMEOUT="$UBS_TIMEOUT" bash -c "$REMOTE_SCRIPT"
+    RCH_REQUIRE_REMOTE=1 "${GATE_RCH:-rch}" exec --job --result-dir tests/golden -- env CARGO_TARGET_DIR="$TARGET_DIR" RUST_MIN_STACK=134217728 UBS_MODULE_TIMEOUT="$UBS_TIMEOUT" bash -c "$REMOTE_SCRIPT"
 }
 
 # The receipt survives a RED run for post-mortem (GATE_RECEIPT_FILE overrides).

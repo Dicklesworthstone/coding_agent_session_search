@@ -12,7 +12,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # These cases exercise the production batched-gate parsers directly. Inputs are
 # terminal-output fixtures, not substitute cargo/ubs executables or live proof.
-if [ "${1:-}" = --batched-only ] || [ "${1:-}" = --formatter-only ] || [ "${1:-}" = --scanner-engine-only ]; then
+if [ "${1:-}" = --batched-only ] || [ "${1:-}" = --formatter-only ] || [ "${1:-}" = --scanner-engine-only ] || [ "${1:-}" = --dispatcher-only ]; then
     proof_dir="$(mktemp -d -t cass-gate-parser.XXXXXX)"
     gate="$PROJECT_ROOT/scripts/gate.sh"
     pass=0
@@ -30,6 +30,39 @@ if [ "${1:-}" = --batched-only ] || [ "${1:-}" = --formatter-only ] || [ "${1:-}
             fail=$((fail + 1))
         fi
     }
+    if [ "${1:-}" = --dispatcher-only ]; then
+        # These real Unix executables supply no remote-stage receipts. They
+        # exercise client selection and rejection, never compilation proof.
+        ln -s /bin/true "$proof_dir/client with spaces"
+        for entry in \
+            'dispatcher-empty|/bin/true|none' \
+            'dispatcher-error|/bin/false|1' \
+            "dispatcher-spaces|$proof_dir/client with spaces|none" \
+            'dispatcher-literal-value|/bin/true --version|127'; do
+            IFS='|' read -r label client remote_rc <<< "$entry"
+            check_exit "$label" 1 env GATE_RCH="$client" GATE_RETRIES=1 \
+                GATE_RECEIPT_FILE="$proof_dir/$label.receipt" \
+                bash "$gate" --lib-filter semantic_reader --integration semantic_reader_ann
+            if [ "$remote_rc" = none ]; then
+                if rg -q '^STAGE=rch ' "$proof_dir/$label.log"; then
+                    echo "FAIL $label selected client did not exit successfully"
+                    fail=$((fail + 1))
+                fi
+            elif ! rg -q "^STAGE=rch EXIT=$remote_rc " "$proof_dir/$label.log"; then
+                echo "FAIL $label did not preserve client exit $remote_rc"
+                fail=$((fail + 1))
+            fi
+            for stage in source-identity clippy lib-tests test-semantic_reader_ann ubs job-complete; do
+                if ! rg -q "^STAGE=$stage EXIT=missing " "$proof_dir/$label.log"; then
+                    echo "FAIL $label accepted a missing $stage receipt"
+                    fail=$((fail + 1))
+                fi
+            done
+        done
+        echo "Dispatcher controls: PASS=$pass FAIL=$fail fixtures=$proof_dir"
+        [ "$fail" -eq 0 ]
+        exit $?
+    fi
     if [ "${1:-}" = --scanner-engine-only ]; then
         # Real tools only: the absent path and ordinary system executables
         # cannot satisfy the parser protocol. Never replace the scanner.
