@@ -194,7 +194,7 @@ mod gh472 {
             } else {
                 format!("{bom}{tool}\n{bom}{control}")
             };
-            let body = format!("{bom}{header}\n{first}\n{middle}\n{last}\n");
+            let body = format!("{bom}{header}\n{first}\n{middle}\n{last}\n\u{2003}\n");
             fs::write(&path, &body).unwrap();
             let data = fixture.data();
             let data = data.to_str().unwrap();
@@ -223,7 +223,35 @@ mod gh472 {
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0]["agent"], "pi_agent");
             assert_eq!(hits[0]["content"], "bravo marker two");
+            assert_eq!(hits[0]["line_number"], 2);
+            assert_eq!(hits[0]["source_id"], "local");
             let database = fixture.data().join("agent_search.db");
+            let conversation_id = hits[0]["conversation_id"].as_i64().unwrap().to_string();
+            let message_index = hits[0]["line_number"].as_u64().unwrap().to_string();
+            let canonical = fixture.run(
+                &[
+                    "view",
+                    hits[0]["source_path"].as_str().unwrap(),
+                    "--message-index",
+                    &message_index,
+                    "--conversation-id",
+                    &conversation_id,
+                    "--source",
+                    hits[0]["source_id"].as_str().unwrap(),
+                    "-C",
+                    "0",
+                    "--json",
+                    "--db",
+                    database.to_str().unwrap(),
+                ],
+                &overrides,
+            );
+            assert_eq!(canonical.report["coordinate_space"], "message_index");
+            let messages = canonical.report["lines"].as_array().unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["message_index"], 2);
+            assert_eq!(messages[0]["is_target"], true);
+            assert_eq!(messages[0]["content"], "bravo marker two");
             let viewed = fixture.run(
                 &[
                     "view",

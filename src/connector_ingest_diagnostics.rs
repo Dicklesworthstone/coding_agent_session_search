@@ -954,7 +954,7 @@ impl ConnectorIngestRun {
                 }
             });
             if ordinary_text.is_some_and(|text| {
-                text.as_bytes().iter().all(u8::is_ascii_whitespace)
+                text.trim().is_empty()
                     || serde_json::from_str::<serde_json::Value>(text).is_ok()
             }) {
                 continue;
@@ -1548,6 +1548,7 @@ mod tests {
                 "\u{feff}{\"type\":\"session\",\"id\":\"bom\"}\r\n",
                 "\u{feff}\u{feff}{\"wrapper\":{\"role\":\"user\",\"content\":\"nested\"}}\n",
                 "\u{feff} \t\r\n",
+                "\u{2003}\r\n",
             );
             let body = if provider == "gemini" {
                 format!("{body} \t\u{feff}{{\"type\":\"session\",\"id\":\"spaced-bom\"}}\n")
