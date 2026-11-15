@@ -130,6 +130,45 @@ fn dropping_a_refilled_initial_page_never_starts_quality() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn current_progressive_keeps_original_cancellation_after_context_replacement() -> TestResult {
+    let (_directory, conn, reader, fast, quality) = two_tiers()?;
+    let mut transaction = conn.transaction()?;
+    for ann in [None, Some(AnnSearchPolicy::default())] {
+        fast.reset();
+        quality.reset();
+        let cx = frankensearch::Cx::for_request();
+        let _original = frankensearch::Cx::set_current(Some(cx.clone()));
+        let mut request = query(&fast, &quality, 2);
+        request.ann = ann;
+        let mut phases = reader.progressive_current_text_in_transaction(request, &transaction)?;
+        let initial = phases.next().unwrap()?;
+        assert_eq!(initial.verified().passages().len(), 2);
+        assert_eq!((fast.calls(), quality.calls()), (1, 0));
+        let next_request = frankensearch::Cx::for_request();
+        let _replacement = frankensearch::Cx::set_current(Some(next_request.clone()));
+        cx.cancel_with(asupersync::types::CancelKind::User, None);
+        assert!(matches!(
+            phases.next(),
+            Some(Err(CurrentSearchError::Hydration(
+                HydrationError::Cancelled
+            )))
+        ));
+        assert_eq!((fast.calls(), quality.calls()), (1, 0));
+        assert_eq!(
+            initial.verified().source().coverage().phase,
+            SemanticResultPhase::Initial
+        );
+        assert_eq!(phases.size_hint(), (0, Some(0)));
+        assert!(phases.next().is_none());
+        assert!(phases.next().is_none());
+        assert!(!next_request.is_cancel_requested());
+    }
+    transaction.query("SELECT 1")?;
+    transaction.rollback()?;
+    Ok(())
+}
+
 // A partially populated fast tier cannot vouch for a quality-only document.
 // Both tiers are independently written using their actual hash producer.
 fn partial_tiers() -> TestResult<(

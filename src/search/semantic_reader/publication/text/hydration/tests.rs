@@ -194,6 +194,7 @@ fn budget_overflows_and_elapsed_requests_are_not_accepted() {
     let mut work = Work {
         start: Instant::now(),
         budget: HydrationBudget::default(),
+        cx: None,
         source_bytes: usize::MAX,
         output_bytes: usize::MAX,
     };
@@ -527,6 +528,74 @@ mod retained {
         );
         conn.execute("BEGIN")?;
         conn.execute("ROLLBACK")?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_hydration_refuses_before_opening_or_adopting_a_transaction() -> TestResult {
+        let (directory, mut conn, batch) = fixture(&[(7, "authentication middleware")])?;
+        let before = fs::read(directory.path().join("passages.fsvi"))?;
+        assert_eq!(
+            batch
+                .hydrate_from_connection(
+                    &mut conn,
+                    PassageProjection::RawPassagesV2,
+                    HydrationBudget::default(),
+                )?
+                .passages()
+                .len(),
+            1
+        );
+
+        // An existing transaction would make a second BEGIN fail. Cancellation
+        // must win before that attempt, and leave the caller's transaction alone.
+        conn.execute("BEGIN")?;
+        {
+            let cx = frankensearch::Cx::for_request();
+            cx.cancel_with(asupersync::types::CancelKind::User, None);
+            let _current = frankensearch::Cx::set_current(Some(cx));
+            assert_eq!(
+                batch
+                    .hydrate_from_connection(
+                        &mut conn,
+                        PassageProjection::RawPassagesV2,
+                        HydrationBudget::default(),
+                    )
+                    .unwrap_err(),
+                HydrationError::Cancelled
+            );
+        }
+        conn.execute("ROLLBACK")?;
+
+        let mut transaction = conn.transaction()?;
+        {
+            let cx = frankensearch::Cx::for_request();
+            cx.cancel_with(asupersync::types::CancelKind::User, None);
+            let _current = frankensearch::Cx::set_current(Some(cx));
+            assert_eq!(
+                batch
+                    .hydrate_in_transaction(
+                        &transaction,
+                        PassageProjection::RawPassagesV2,
+                        HydrationBudget::default(),
+                    )
+                    .unwrap_err(),
+                HydrationError::Cancelled
+            );
+        }
+        assert_eq!(
+            batch
+                .hydrate_in_transaction(
+                    &transaction,
+                    PassageProjection::RawPassagesV2,
+                    HydrationBudget::default(),
+                )?
+                .passages()[0]
+                .canonical_text(),
+            "authentication middleware"
+        );
+        transaction.rollback()?;
+        assert_eq!(before, fs::read(directory.path().join("passages.fsvi"))?);
         Ok(())
     }
 }

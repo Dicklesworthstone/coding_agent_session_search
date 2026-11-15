@@ -9,6 +9,8 @@
 //! This is deliberately separate from ordinary SearchClient hydration. It is
 //! callable on both retained and publication-selected batches, including each
 //! progressive phase. It is not a whole-archive generation certificate.
+//! The caller's installed cancellation context is retained with the work account;
+//! a later thread-local context cannot restart a cancelled request.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -95,6 +97,8 @@ pub enum HydrationError {
     BudgetExceeded,
     #[error("semantic hydration request deadline expired")]
     DeadlineExceeded,
+    #[error("semantic hydration request was cancelled")]
+    Cancelled,
     #[error("semantic result does not match its retained passage owner")]
     InvalidCandidate,
     #[error("semantic passage lacks a verifiable content fingerprint")]
@@ -225,20 +229,16 @@ impl SemanticSearchBatch {
     ) -> Result<HydratedSemanticBatch<Self>, HydrationError> {
         let started = Instant::now();
         budget.validate(self.hits().len())?;
-        if budget.timeout.is_zero() {
-            return Err(HydrationError::DeadlineExceeded);
-        }
+        let mut work = Work::new(budget, started)?;
         let mut transaction = connection
             .transaction()
             .map_err(|_| HydrationError::Database)?;
-        let result = hydrate(self, &transaction, projection, budget, started);
+        let result = hydrate_with_work(self, &transaction, projection, &mut work);
         transaction
             .rollback()
             .map_err(|_| HydrationError::Rollback)?;
         let passages = result?;
-        if started.elapsed() >= budget.timeout {
-            return Err(HydrationError::DeadlineExceeded);
-        }
+        work.check()?;
         Ok(HydratedSemanticBatch {
             source: self.clone(),
             passages,
@@ -273,20 +273,16 @@ impl SelectedSemanticBatch {
     ) -> Result<HydratedSemanticBatch<Self>, HydrationError> {
         let started = Instant::now();
         budget.validate(self.batch.hits().len())?;
-        if budget.timeout.is_zero() {
-            return Err(HydrationError::DeadlineExceeded);
-        }
+        let mut work = Work::new(budget, started)?;
         let mut transaction = connection
             .transaction()
             .map_err(|_| HydrationError::Database)?;
-        let result = hydrate(&self.batch, &transaction, projection, budget, started);
+        let result = hydrate_with_work(&self.batch, &transaction, projection, &mut work);
         transaction
             .rollback()
             .map_err(|_| HydrationError::Rollback)?;
         let passages = result?;
-        if started.elapsed() >= budget.timeout {
-            return Err(HydrationError::DeadlineExceeded);
-        }
+        work.check()?;
         Ok(HydratedSemanticBatch {
             source: SelectedSemanticBatch {
                 batch: self.batch.clone(),
@@ -301,6 +297,7 @@ impl SelectedSemanticBatch {
 struct Work {
     start: Instant,
     budget: HydrationBudget,
+    cx: Option<frankensearch::Cx>,
     source_bytes: usize,
     output_bytes: usize,
 }
@@ -311,6 +308,7 @@ impl Work {
         let work = Self {
             start,
             budget,
+            cx: frankensearch::Cx::current(),
             source_bytes: 0,
             output_bytes: 0,
         };
@@ -329,10 +327,16 @@ impl Work {
 
     fn check(&self) -> Result<(), HydrationError> {
         if self.start.elapsed() >= self.budget.timeout {
-            Err(HydrationError::DeadlineExceeded)
-        } else {
-            Ok(())
+            return Err(HydrationError::DeadlineExceeded);
         }
+        if self
+            .cx
+            .as_ref()
+            .is_some_and(|cx| cx.checkpoint().is_err() || cx.is_cancel_requested())
+        {
+            return Err(HydrationError::Cancelled);
+        }
+        Ok(())
     }
     fn source(&mut self, bytes: usize) -> Result<(), HydrationError> {
         self.source_bytes = self
@@ -488,6 +492,7 @@ fn read_message(
     id: u64,
     work: &mut Work,
 ) -> Result<SourceMessage, HydrationError> {
+    work.check()?;
     let id = i64::try_from(id).map_err(|_| HydrationError::InvalidCandidate)?;
     // Probe UTF-8 bytes, not SQLite character counts (embedded NUL included).
     // This bounds transferred source bodies, not the engine's internal work.
