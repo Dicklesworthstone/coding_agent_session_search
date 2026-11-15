@@ -99,9 +99,12 @@ pub(crate) fn command_is_safe(command: Option<&str>) -> bool {
     }
     // Must be a recognised, sub-commanded `cass` invocation — never a bare
     // `cass` (which would launch the interactive TUI).
-    SAFE_COMMAND_PREFIXES
-        .iter()
-        .any(|prefix| lower.starts_with(prefix))
+    // The critical ingest-breaker projection uses this read-only command.
+    // Admit it exactly: a broad quarantine prefix would also admit clear/apply.
+    lower == "cass quarantine list --json"
+        || SAFE_COMMAND_PREFIXES
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
 }
 
 /// Whether free-form copy contains any destructive command fragment. Used to
@@ -705,6 +708,19 @@ mod tests {
         // The surfaced command, if any, is the read-only backup-first review.
         if let Some(cmd) = &human.safe_command {
             assert!(cmd.starts_with("cass doctor"), "got: {cmd}");
+        }
+    }
+
+    #[test]
+    fn bridge_quarantine_list_allowance_keeps_mutations_and_chains_blocked() {
+        assert!(command_is_safe(Some("cass quarantine list --json")));
+        for rejected in [
+            "cass quarantine clear --json",
+            "cass quarantine retry --apply --json",
+            "cass quarantine list --json; cass quarantine clear --json",
+            "cass quarantine list --json && cass quarantine retry --apply",
+        ] {
+            assert!(!command_is_safe(Some(rejected)), "{rejected}");
         }
     }
 

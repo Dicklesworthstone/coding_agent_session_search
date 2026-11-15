@@ -367,19 +367,27 @@ pub(crate) struct LexicalMetadata {
 }
 
 /// Summary of assets excluded from search because they were quarantined.
-/// Advisory: quarantine never makes search incorrect, it only excludes
-/// the failing artifact. Causes are stable snake_case codes grouped for
-/// status surfaces.
+/// Isolated exclusions are advisory; a recent ingest burst requires inspection
+/// before more indexing. Causes are stable snake_case codes grouped for status
+/// surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub(crate) struct QuarantineSummary {
     /// Number of quarantined artifacts currently excluded.
     pub quarantined_count: usize,
     /// Total on-disk bytes held by quarantined artifacts.
     pub total_quarantined_bytes: u64,
+    /// A recent ingest burst requires inspection before more indexing.
+    /// Ordinary isolated quarantines remain advisory.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub circuit_breaker_active: bool,
     /// Distinct quarantine causes (snake_case codes), e.g.
     /// `schema_drift`, `validation_failed`, `ingest_oom`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub causes: Vec<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl QuarantineSummary {
@@ -610,6 +618,16 @@ impl DerivedAssetTruthTable {
             // SemanticBackfill does not block lexical guidance; handled at
             // the semantic axis below.
             _ => {}
+        }
+
+        // A burst of ingest failures is stronger evidence than stale/missing
+        // derived assets. Keep archive safety and active maintenance above it.
+        if self.quarantine.circuit_breaker_active {
+            return SafeNextCommand::new(
+                A::InspectQuarantine,
+                Some("cass quarantine list --json"),
+                "ingest quarantine circuit breaker active; inspect excluded conversations before indexing",
+            );
         }
 
         // 5. Source coverage gaps.
@@ -877,6 +895,8 @@ pub(crate) fn truth_table_from_state(
         .unwrap_or(0);
     let quarantine = QuarantineSummary {
         quarantined_count,
+        circuit_breaker_active: as_bool("/ingest_quarantine/circuit_breaker_active")
+            .unwrap_or(false),
         // Byte accounting lives in `cass diag --quarantine`, not the
         // readiness snapshot; report 0 rather than guessing.
         total_quarantined_bytes: 0,
@@ -967,6 +987,7 @@ pub(crate) fn fleet_fixtures() -> Vec<(&'static str, DerivedAssetTruthTable)> {
                     // quarantines (issue #258 class).
                     quarantined_count: 133,
                     total_quarantined_bytes: 139_460_608,
+                    circuit_breaker_active: false,
                     causes: vec!["ingest_oom".to_string()],
                 },
                 maintenance: MaintenanceActivity::Idle,
@@ -1813,6 +1834,7 @@ mod tests {
             quarantine: QuarantineSummary {
                 quarantined_count: 1,
                 total_quarantined_bytes: 1024,
+                circuit_breaker_active: false,
                 causes: vec!["ingest_oom".to_string()],
             },
             maintenance: MaintenanceActivity::Idle,
@@ -1927,6 +1949,66 @@ mod tests {
                     assert_eq!(table.db, CanonicalDbAvailability::OpenFailed);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn bridge_quarantine_breaker_precedes_lexical_repairs() {
+        for lexical in [
+            LexicalReadinessState::Ready,
+            LexicalReadinessState::Missing,
+            LexicalReadinessState::StaleButSearchable,
+        ] {
+            let mut state = serde_json::json!({
+                "database": { "exists": true, "opened": true },
+                "index": { "exists": lexical != LexicalReadinessState::Missing },
+                "ingest_quarantine": { "quarantined_conversations": 3, "circuit_breaker_active": true },
+                "rebuild": { "active": false },
+            });
+            let readiness = ReadinessSnapshot::new(lexical, SemanticReadinessState::Absent);
+            let table = truth_table_from_state(&state, readiness.clone());
+            assert!(table.quarantine.circuit_breaker_active);
+            assert_eq!(
+                table.safe_next_command().action,
+                SafeNextAction::InspectQuarantine
+            );
+            assert_eq!(
+                table.safe_next_command().command.as_deref(),
+                Some("cass quarantine list --json")
+            );
+            assert!(!table.safe_next_command().action.is_mutating());
+            let serialized = serde_json::to_value(&table.quarantine).unwrap();
+            assert_eq!(serialized["circuit_breaker_active"], true);
+            let decoded: QuarantineSummary = serde_json::from_value(serialized).unwrap();
+            assert!(decoded.circuit_breaker_active);
+            state["ingest_quarantine"]["circuit_breaker_active"] = serde_json::json!(false);
+            let table = truth_table_from_state(&state, readiness.clone());
+            assert!(!table.quarantine.circuit_breaker_active);
+            let serialized = serde_json::to_value(&table.quarantine).unwrap();
+            assert!(serialized.get("circuit_breaker_active").is_none());
+            let decoded: QuarantineSummary = serde_json::from_value(serialized).unwrap();
+            assert!(!decoded.circuit_breaker_active);
+            if lexical == LexicalReadinessState::Missing {
+                assert_eq!(
+                    table.safe_next_command().action,
+                    SafeNextAction::RepairLexical
+                );
+            }
+            state["ingest_quarantine"]["circuit_breaker_active"] = serde_json::json!(true);
+            state["rebuild"]["active"] = serde_json::json!(true);
+            assert_eq!(
+                truth_table_from_state(&state, readiness.clone())
+                    .safe_next_command()
+                    .action,
+                SafeNextAction::WaitForMaintenance
+            );
+            state["database"]["integrity"] = serde_json::json!("corrupt");
+            assert_eq!(
+                truth_table_from_state(&state, readiness)
+                    .safe_next_command()
+                    .action,
+                SafeNextAction::InspectCanonicalDb
+            );
         }
     }
 

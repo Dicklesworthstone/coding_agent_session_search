@@ -1445,11 +1445,56 @@ fn status_triage_doctor_emit_root_cause_attribution() {
 
 #[test]
 fn status_and_health_json_escalate_recent_ingest_quarantine_bursts() {
-    let test_home = tempfile::tempdir().expect("tempdir");
+    let test_home = tempfile::Builder::new()
+        .prefix("cass quarantine burst-")
+        .disable_cleanup(true)
+        .tempdir()
+        .expect("tempdir");
     let data_dir = test_home.path().join("cass-data");
     fs::create_dir_all(&data_dir).expect("create data dir");
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(test_home.path().join(".env"))
+        .unwrap();
+    let source = test_home
+        .path()
+        .join(".codex/sessions/2025/11/25/rollout-test.jsonl");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(
+        &source,
+        include_str!("fixtures/codex_real/sessions/2025/11/25/rollout-test.jsonl"),
+    )
+    .unwrap();
+    let cass = || {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(test_home.path())
+            .env("HOME", test_home.path())
+            .env("USERPROFILE", test_home.path())
+            .env("XDG_DATA_HOME", test_home.path().join(".local/share"))
+            .env("XDG_CONFIG_HOME", test_home.path().join(".config"))
+            .env("CODEX_HOME", test_home.path().join(".codex"))
+            .env("CLAUDE_CONFIG_DIR", test_home.path().join(".claude"))
+            .env("CASS_DATA_DIR", &data_dir)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_SEMANTIC_DOWNLOAD_POLICY", "opt_in")
+            .env("FRANKENSEARCH_MODEL_DIR", "")
+            .env("CASS_INGEST_QUARANTINE_CIRCUIT_LIMIT", "3")
+            .env("CASS_INGEST_QUARANTINE_CIRCUIT_WINDOW_SECS", "3600")
+            .env("RUST_MIN_STACK", "134217728")
+            .timeout(Duration::from_secs(30));
+        cmd
+    };
 
-    let index_out = isolated_cass_cmd(test_home.path())
+    let index_out = cass()
         .args([
             "index",
             "--data-dir",
@@ -1466,9 +1511,41 @@ fn status_and_health_json_escalate_recent_ingest_quarantine_bursts() {
         String::from_utf8_lossy(&index_out.stderr)
     );
 
+    let ready = cass().args(["triage", "--json"]).output().unwrap();
+    assert!(ready.status.success(), "{ready:?}");
+    let ready: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+    assert_eq!(ready["healthy"], true, "{ready}");
+    assert_eq!(ready["readiness"]["index"]["fresh"], true, "{ready}");
+    let search = cass()
+        .args([
+            "search",
+            "soldier",
+            "--json",
+            "--mode",
+            "lexical",
+            "--fields",
+            "content",
+            "--no-maintenance",
+            "--no-daemon",
+        ])
+        .output()
+        .unwrap();
+    assert!(search.status.success(), "{search:?}");
+    let search: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert!(
+        search["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("soldier"))),
+        "{search}"
+    );
+
     write_ingest_quarantine_records(&data_dir, 3);
 
-    let status_out = isolated_cass_cmd(test_home.path())
+    let status_out = cass()
         .args([
             "status",
             "--data-dir",
@@ -1494,7 +1571,7 @@ fn status_and_health_json_escalate_recent_ingest_quarantine_bursts() {
         Some(true)
     );
 
-    let health_out = isolated_cass_cmd(test_home.path())
+    let health_out = cass()
         .args([
             "health",
             "--data-dir",
@@ -1523,6 +1600,120 @@ fn status_and_health_json_escalate_recent_ingest_quarantine_bursts() {
                 .is_some_and(|msg| msg.contains("quarantine circuit breaker")))),
         "health should expose the circuit breaker as an error: {health_payload}"
     );
+
+    // These records exercise persisted-policy consumption, not a real OOM.
+    // Every readiness consumer must inspect them before proposing more writes.
+    let assert_critical = |label: &str| {
+        for surface in ["status", "health", "triage"] {
+            let output = cass().args([surface, "--json"]).output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if surface == "health" { 1 } else { 0 }),
+                "{label} {surface}: {output:?}"
+            );
+            let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(payload["healthy"], false, "{label} {surface}: {payload}");
+            assert_eq!(
+                payload["search_completeness"]["coverage_suspect"], true,
+                "{payload}"
+            );
+            let commands = payload["recommended_commands"].as_array().unwrap();
+            assert_eq!(commands.len(), 1, "{label} {surface}: {payload}");
+            assert_eq!(commands[0]["id"], "inspect-ingest-quarantine", "{payload}");
+            assert_eq!(commands[0]["safety"], "read-only");
+            assert_eq!(
+                commands[0]["command"],
+                format!(
+                    "cass quarantine list --json --data-dir '{}'",
+                    data_dir.display()
+                )
+            );
+            assert!(
+                !payload["recommended_action"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cass index --full"),
+                "{payload}"
+            );
+            if surface == "triage" {
+                assert_eq!(payload["next_command"], commands[0]["command"]);
+            }
+            let output = cass().args(["--color", "never", surface]).output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if surface == "health" { 1 } else { 0 }),
+                "{output:?}"
+            );
+            let human = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                human.contains("cass quarantine list --json"),
+                "{label} {surface}: {human}"
+            );
+            assert!(
+                !human.contains("cass index --full"),
+                "{label} {surface}: {human}"
+            );
+        }
+    };
+    assert_critical("ready");
+    let listing = cass()
+        .args([
+            "quarantine",
+            "list",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(listing.status.success(), "{listing:?}");
+    let listing: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
+    assert_eq!(listing["circuit_breaker_active"], true, "{listing}");
+    assert_eq!(listing["entries"].as_array().unwrap().len(), 3, "{listing}");
+    for limit in ["4", "0"] {
+        for surface in ["status", "health", "triage"] {
+            let output = cass()
+                .env("CASS_INGEST_QUARANTINE_CIRCUIT_LIMIT", limit)
+                .args([surface, "--json"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "limit={limit} {surface}: {output:?}"
+            );
+            let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                payload["healthy"], true,
+                "limit={limit} {surface}: {payload}"
+            );
+            assert_eq!(
+                payload["search_completeness"]["coverage_suspect"], false,
+                "{payload}"
+            );
+        }
+    }
+    coding_agent_search::storage::sqlite::FrankenStorage::open(&data_dir.join("agent_search.db"))
+        .unwrap()
+        .set_last_scan_ts(1)
+        .unwrap();
+    let stale = cass().args(["status", "--json"]).output().unwrap();
+    let stale: serde_json::Value = serde_json::from_slice(&stale.stdout).unwrap();
+    assert_eq!(stale["index"]["fresh"], false, "{stale}");
+    assert_critical("stale canonical epoch");
+    let index_path = expected_index_dir(&data_dir);
+    let retained = test_home.path().join("retained-real-index");
+    fs::rename(&index_path, &retained).unwrap();
+    assert_critical("missing index");
+    // This marker deliberately selects the legacy-layout detection branch;
+    // it is not proof of querying or rebuilding a historical Tantivy index.
+    fs::create_dir_all(&index_path).unwrap();
+    fs::write(index_path.join("meta.json"), b"{}").unwrap();
+    let legacy = cass().args(["status", "--json"]).output().unwrap();
+    let legacy: serde_json::Value = serde_json::from_slice(&legacy.stdout).unwrap();
+    assert_eq!(legacy["index"]["engine_incompatible"], true, "{legacy}");
+    assert_critical("legacy marker");
+    fs::rename(&index_path, test_home.path().join("retained-legacy-marker")).unwrap();
+    fs::rename(&retained, &index_path).unwrap();
 }
 
 #[test]

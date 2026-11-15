@@ -25699,6 +25699,26 @@ fn readiness_recommended_commands(
         return commands;
     }
 
+    if state
+        .pointer("/ingest_quarantine/circuit_breaker_active")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        commands.push(readiness_command_recommendation(
+            ReadinessCommandRecommendation {
+                id: "inspect-ingest-quarantine",
+                command: cass_dataset_command(data_dir, db_path, &["quarantine", "list", "--json"]),
+                purpose: "Inspect excluded conversations and retry eligibility before indexing again.",
+                safety: "read-only",
+                run_when: "Run when ingest_quarantine.circuit_breaker_active=true.",
+                success_signal: "quarantine JSON identifies excluded conversations and their retry eligibility",
+                parse_fields: &["circuit_breaker_active", "quarantined_conversations", "entries", "status"],
+                retry_after_ms: None,
+            },
+        ));
+        return commands;
+    }
+
     if index_engine_incompatible && !not_initialized && db_exists {
         // Repair derived assets only after the canonical-archive health guards.
         // Incremental indexing cannot repair an unreadable legacy index.
@@ -26187,6 +26207,78 @@ mod readiness_projection_tests {
                 assert_eq!(commands[0]["safety"], "read-only");
             }
         }
+    }
+
+    #[test]
+    fn bridge_quarantine_commands_preserve_archive_and_rebuild_priorities() {
+        let data_dir = std::path::Path::new("/archive with spaces");
+        let db_path = data_dir.join("custom.sqlite");
+        let mut state = json!({
+            "database": { "exists": true, "opened": true },
+            "ingest_quarantine": { "circuit_breaker_active": true },
+            "rebuild": { "active": false },
+            "pending": { "sessions": 3 },
+        });
+        for (exists, legacy, fresh) in [
+            (true, false, true),
+            (true, false, false),
+            (true, true, false),
+            (false, false, false),
+        ] {
+            state["index"] =
+                json!({ "exists": exists, "engine_incompatible": legacy, "fresh": fresh });
+            let commands = super::readiness_recommended_commands(
+                data_dir,
+                &db_path,
+                &state,
+                "unhealthy",
+                false,
+                false,
+                Some("Inspect quarantine before indexing"),
+            );
+            assert_eq!(commands.len(), 1, "{state}");
+            assert_eq!(commands[0]["id"], "inspect-ingest-quarantine", "{state}");
+            assert_eq!(commands[0]["safety"], "read-only");
+            assert_eq!(
+                commands[0]["command"],
+                "cass --db '/archive with spaces/custom.sqlite' quarantine list --json --data-dir '/archive with spaces'"
+            );
+        }
+        state["database"]["integrity"] = json!("corrupt");
+        let commands = super::readiness_recommended_commands(
+            data_dir,
+            &db_path,
+            &state,
+            "unhealthy",
+            false,
+            false,
+            None,
+        );
+        assert_eq!(commands[0]["id"], "inspect-archive-health");
+        state["rebuild"]["active"] = json!(true);
+        let commands = super::readiness_recommended_commands(
+            data_dir,
+            &db_path,
+            &state,
+            "rebuilding",
+            false,
+            false,
+            None,
+        );
+        assert_eq!(commands[0]["id"], "poll-active-rebuild");
+        state["rebuild"]["active"] = json!(false);
+        state["database"]["integrity"] = json!("ok");
+        state["ingest_quarantine"]["circuit_breaker_active"] = json!(false);
+        let commands = super::readiness_recommended_commands(
+            data_dir,
+            &db_path,
+            &state,
+            "unhealthy",
+            false,
+            false,
+            None,
+        );
+        assert_eq!(commands[0]["id"], "rebuild-lexical-index");
     }
 
     #[test]
@@ -89439,6 +89531,8 @@ fn run_status(
         Some("Run 'cass index --full' to create the database".to_string())
     } else if !db_available {
         Some("Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database".to_string())
+    } else if ingest_quarantine_critical {
+        ingest_quarantine_recommended_action
     } else if !index_exists {
         Some("Run 'cass index --full' to rebuild the search index".to_string())
     } else if index_engine_incompatible {
@@ -89455,8 +89549,6 @@ fn run_status(
         Some(CORRUPT_MANIFEST_RECOMMENDED_ACTION.to_string())
     } else if index_empty_with_messages {
         Some("Run 'cass index --full' to populate the empty search index".to_string())
-    } else if ingest_quarantine_critical {
-        ingest_quarantine_recommended_action
     } else if is_stale || pending_sessions > 0 {
         let pending_msg = if pending_sessions > 0 {
             format!(" ({pending_sessions} sessions pending)")
@@ -89715,13 +89807,13 @@ fn run_status(
         }
         if index_empty_with_messages {
             println!("  Warning: index has 0 documents but database has messages");
-            if !canonical_archive_corrupt {
+            if !canonical_archive_corrupt && !ingest_quarantine_critical {
                 println!("  Run 'cass index --full' to populate the search index");
             }
         }
     } else if not_initialized {
         println!("  Not created yet - run 'cass index --full' once");
-    } else if canonical_archive_corrupt {
+    } else if canonical_archive_corrupt || ingest_quarantine_critical {
         println!("  Not found");
     } else {
         println!("  Not found - run 'cass index --full'");
@@ -90281,6 +90373,7 @@ fn run_triage(
         && index_fresh
         && !rebuild_active
         && !index_empty_with_messages
+        && !ingest_quarantine_critical
         && !canonical_archive_corrupt;
     let observed_status = if rebuild_stalled {
         "stalled"
@@ -90315,6 +90408,11 @@ fn run_triage(
         Some("Run 'cass index --full' to create the database".to_string())
     } else if !db_available {
         Some("Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database".to_string())
+    } else if ingest_quarantine_critical {
+        state
+            .pointer("/ingest_quarantine/recommended_action")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
     } else if !index_exists {
         Some("Run 'cass index --full' to rebuild the search index".to_string())
     } else if index_engine_incompatible {
@@ -90989,6 +91087,8 @@ fn run_health(
         Some(cass_not_initialized_recommended_action())
     } else if db_degraded {
         Some("Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database.".to_string())
+    } else if ingest_quarantine_critical {
+        ingest_quarantine_recommended_action
     } else if index_engine_incompatible {
         // b4uax: mirror run_status — a legacy Tantivy generation needs the
         // one-time full rebuild, and an incremental refresh cannot help.
@@ -90999,9 +91099,7 @@ fn run_health(
         Some(HOLLOW_INDEX_RECOMMENDED_ACTION.to_string())
     } else if state_index_manifest_corrupt(&state) {
         Some(CORRUPT_MANIFEST_RECOMMENDED_ACTION.to_string())
-    } else if ingest_quarantine_critical
-        || (healthy && (quarantined_conversations > 0 || deferred_conversations > 0))
-    {
+    } else if healthy && (quarantined_conversations > 0 || deferred_conversations > 0) {
         ingest_quarantine_recommended_action
     } else if !healthy {
         Some("Run 'cass status --json' for the exact readiness gap; run 'cass index --full' only for missing or stale derived search assets.".to_string())
@@ -91051,6 +91149,8 @@ fn run_health(
     if index_empty_with_messages {
         errors.push(if canonical_archive_corrupt {
             "index empty but database has messages — inspect the canonical archive before rebuilding".to_string()
+        } else if ingest_quarantine_critical {
+            "index empty but database has messages — inspect ingest quarantine before rebuilding".to_string()
         } else {
             "index empty but database has messages — run 'cass index --full'".to_string()
         });
