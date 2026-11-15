@@ -391,6 +391,80 @@ mod linux {
     }
 
     #[test]
+    fn remote_non_session_successors_preserve_only_known_writer_identities() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        for filesystem in ["fuse.sshfs", "nfs4", "cifs"] {
+            let fixture = Fixture::new()?;
+            let process = remote_process(&fixture, filesystem)?;
+            let identity = (61, 987_654_321);
+            symlink(
+                fixture.root.join("unrelated-writer.data"),
+                process.join("fd/9"),
+            )?;
+            fs::write(
+                process.join("fdinfo/9"),
+                "flags:\t02100001\nmnt_id:\t412\nino:\t123\n",
+            )?;
+            let initial = collect_writers_in(&fixture.root, session_source, &HashMap::new());
+            assert_eq!(initial.writers.len(), 1);
+            assert!(initial.writers.contains_key(&identity));
+            assert!(initial.complete && initial.visibility_gaps.is_empty());
+            let probe = SourceWriterProbe {
+                state: Mutex::new(ProbeState {
+                    initial_visibility_gaps: initial.visibility_gaps.clone(),
+                    census: initial,
+                    ..ProbeState::default()
+                }),
+                is_session_source: Some(session_source),
+                proc_root: Some(fixture.root.clone()),
+            };
+
+            // The original descriptor becomes read-only while a new alias
+            // retains its writable inode. Neither dangling target can supply
+            // metadata: identity must come from the owner's procfs records.
+            fs::write(
+                process.join("fdinfo/7"),
+                "flags:\t02100000\nmnt_id:\t412\nino:\t987654321\n",
+            )?;
+            symlink(
+                fixture.root.join("writer-handle.data"),
+                process.join("fd/8"),
+            )?;
+            fs::write(
+                process.join("fdinfo/8"),
+                "flags:\t02100001\nmnt_id:\t412\nino:\t987654321\n",
+            )?;
+            assert!(
+                probe.should_defer(identity),
+                "{filesystem}: a remote alias must preserve the known writable inode"
+            );
+            assert_eq!(refresh_count(&probe), 1);
+            {
+                let state = probe.state.lock().unwrap();
+                assert_eq!(state.census.writers.len(), 1);
+                assert!(!state.census.writers.contains_key(&(61, 123)));
+                assert!(state.census.followed.is_empty());
+                assert!(!state.refresh_blocked);
+            }
+
+            // Reuse of the alias for a different inode must release the old
+            // positive despite other writable remote files remaining open.
+            fs::write(
+                process.join("fdinfo/8"),
+                "flags:\t02100001\nmnt_id:\t412\nino:\t987654322\n",
+            )?;
+            assert!(!probe.should_defer(identity));
+            assert_eq!(refresh_count(&probe), 2);
+            let state = probe.state.lock().unwrap();
+            assert!(state.census.writers.is_empty());
+            assert!(state.census.followed.is_empty());
+            assert!(!state.refresh_blocked);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn incomplete_remote_identity_never_stats_or_revokes_a_prior_positive() -> io::Result<()> {
         let fixture = Fixture::new()?;
         let process = remote_process(&fixture, "fuse.sshfs")?;

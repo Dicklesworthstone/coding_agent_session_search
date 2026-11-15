@@ -591,10 +591,10 @@ fn collect_writers_in(
             // A known positive can have a writable successor reached through
             // a hardlink with a non-session suffix, so while positives are
             // cached a non-session descriptor is followed and matched against
-            // their inodes. Only a local one: a session source on a network
-            // or FUSE mount is still found under its session name, but not
-            // through such a hardlink.
-            if !session_named && mount.is_none_or(|mount| mount.remote) {
+            // their inodes. Remote aliases can be matched through procfs
+            // identity alone, without following their targets. An unknown
+            // mount still never authorizes target metadata access.
+            if !session_named && mount.is_none() {
                 continue;
             }
             #[cfg(test)]
