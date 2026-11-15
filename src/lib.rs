@@ -109211,15 +109211,38 @@ pub(crate) struct SkippedJsonlLine {
     pub(crate) recovery_limited: bool,
 }
 
+/// Full damage totals with a bounded sample of physical-line diagnostics.
+/// Recovered messages are retained separately; sampling never drops records.
+#[derive(Debug, Default)]
+pub(crate) struct JsonlParseDiagnostics {
+    malformed_lines: usize,
+    recovered_records: usize,
+    discarded_bytes: usize,
+    details: Vec<SkippedJsonlLine>,
+}
+
+impl JsonlParseDiagnostics {
+    fn record(&mut self, line: SkippedJsonlLine) {
+        self.malformed_lines = self.malformed_lines.saturating_add(1);
+        self.recovered_records = self
+            .recovered_records
+            .saturating_add(line.recovered_records);
+        self.discarded_bytes = self.discarded_bytes.saturating_add(line.discarded_bytes);
+        if self.details.len() < MAX_REPORTED_SKIPPED_JSONL_LINES {
+            self.details.push(line);
+        }
+    }
+}
+
 type TolerantJsonlParse = (
     Vec<serde_json::Value>,
     Option<i64>,
     Option<i64>,
-    Vec<SkippedJsonlLine>,
+    JsonlParseDiagnostics,
 );
 
-/// How many affected lines are named individually on stderr before the
-/// remainder is summarised as a count.
+/// How many affected-line details are retained and named individually before
+/// the remainder is summarised as a count.
 const MAX_REPORTED_SKIPPED_JSONL_LINES: usize = 5;
 
 // Recovery only runs after the ordinary parser rejects a physical line.
@@ -109236,8 +109259,8 @@ use franken_agent_detection::connectors::jsonl::{
 /// Parse a JSONL session for export, retaining intact records around malformed
 /// lines, including invalid UTF-8 (GH #427), and conservatively recovering
 /// complete records appended after a torn prefix on the same line (GH #553).
-/// Only when no record decodes
-/// is the file rejected, preserving the existing indexed-copy fallback.
+/// Only when no record decodes is the file rejected, preserving the existing
+/// indexed-copy fallback.
 ///
 /// Connector ingestion and export share FAD's bounded suffix decoder; each
 /// interprets the resulting records for its own output. Export recovery alone
@@ -109258,7 +109281,7 @@ pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<T
     let mut messages = Vec::new();
     let mut session_start = None;
     let mut session_end = None;
-    let mut skipped: Vec<SkippedJsonlLine> = Vec::new();
+    let mut skipped = JsonlParseDiagnostics::default();
     let mut append_message = |msg: serde_json::Value| {
         if let Some(ts) = extract_message_timestamp(&msg) {
             if session_start.is_none_or(|start| ts < start) {
@@ -109297,7 +109320,7 @@ pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<T
         let line = match std::str::from_utf8(&raw_line) {
             Ok(line) => line,
             Err(error) => {
-                skipped.push(SkippedJsonlLine {
+                skipped.record(SkippedJsonlLine {
                     line_number,
                     error: error.to_string(),
                     recovered_records: 0,
@@ -109317,7 +109340,7 @@ pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<T
             Ok(msg) => append_message(msg),
             Err(err) => {
                 let recovery = recover_followup_jsonl_suffix(line);
-                skipped.push(SkippedJsonlLine {
+                skipped.record(SkippedJsonlLine {
                     line_number,
                     error: err.to_string(),
                     recovered_records: recovery.records.len(),
@@ -109332,7 +109355,7 @@ pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<T
     }
 
     if messages.is_empty()
-        && let Some(first) = skipped.first()
+        && let Some(first) = skipped.details.first()
     {
         return Err(CliError {
             code: 9,
@@ -109343,7 +109366,7 @@ pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<T
             ),
             hint: Some(format!(
                 "None of the {} non-empty line(s) in {} decoded as JSON; use the indexed copy or repair the session file.",
-                skipped.len(),
+                skipped.malformed_lines,
                 path.display()
             )),
             retryable: false,
@@ -109356,17 +109379,17 @@ pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<T
 /// Report damaged lines and recovery on stderr; stdout remains data-only.
 /// Physical line coordinates are retained even when one line yielded several
 /// recovered records. No claim is made about connector-ingest coverage.
-fn report_skipped_jsonl_lines(path: &Path, decoded: usize, skipped: &[SkippedJsonlLine]) {
-    if skipped.is_empty() {
+fn report_skipped_jsonl_lines(path: &Path, decoded: usize, skipped: &JsonlParseDiagnostics) {
+    if skipped.malformed_lines == 0 {
         return;
     }
-    let recovered = skipped.iter().fold(0usize, |count, line| {
-        count.saturating_add(line.recovered_records)
-    });
-    let discarded = skipped.iter().fold(0usize, |count, line| {
-        count.saturating_add(line.discarded_bytes)
-    });
-    for line in skipped.iter().take(MAX_REPORTED_SKIPPED_JSONL_LINES) {
+    let recovered = skipped.recovered_records;
+    let discarded = skipped.discarded_bytes;
+    for line in skipped
+        .details
+        .iter()
+        .take(MAX_REPORTED_SKIPPED_JSONL_LINES)
+    {
         tracing::warn!(
             source_path = %path.display(),
             line_no = line.line_number,
@@ -109374,17 +109397,17 @@ fn report_skipped_jsonl_lines(path: &Path, decoded: usize, skipped: &[SkippedJso
             recovered_records = line.recovered_records,
             discarded_bytes = line.discarded_bytes,
             recovery_limited = line.recovery_limited,
-            total_malformed_lines = skipped.len(),
+            total_malformed_lines = skipped.malformed_lines,
             total_recovered_records = recovered,
             total_discarded_bytes = discarded,
-            omitted_line_diagnostics = skipped.len().saturating_sub(MAX_REPORTED_SKIPPED_JSONL_LINES),
+            omitted_line_diagnostics = skipped.malformed_lines.saturating_sub(MAX_REPORTED_SKIPPED_JSONL_LINES),
             "session JSONL line failed to parse; retained complete records and skipped malformed bytes (GH #427 / GH #553)"
         );
     }
     if recovered == 0 {
         eprintln!(
             "warning: skipped {} malformed JSONL record(s) in {}; rendered the remaining {} record(s)",
-            skipped.len(),
+            skipped.malformed_lines,
             path.display(),
             decoded
         );
@@ -109392,13 +109415,17 @@ fn report_skipped_jsonl_lines(path: &Path, decoded: usize, skipped: &[SkippedJso
         eprintln!(
             "warning: recovered {} complete JSONL record(s) from {} malformed line(s) in {}; skipped {} byte(s) and rendered {} record(s)",
             recovered,
-            skipped.len(),
+            skipped.malformed_lines,
             path.display(),
             discarded,
             decoded
         );
     }
-    for line in skipped.iter().take(MAX_REPORTED_SKIPPED_JSONL_LINES) {
+    for line in skipped
+        .details
+        .iter()
+        .take(MAX_REPORTED_SKIPPED_JSONL_LINES)
+    {
         eprintln!(
             "warning:   line {}: {}; recovered {} record(s), skipped {} byte(s){}",
             line.line_number,
@@ -109412,10 +109439,10 @@ fn report_skipped_jsonl_lines(path: &Path, decoded: usize, skipped: &[SkippedJso
             }
         );
     }
-    if skipped.len() > MAX_REPORTED_SKIPPED_JSONL_LINES {
+    if skipped.malformed_lines > MAX_REPORTED_SKIPPED_JSONL_LINES {
         eprintln!(
             "warning:   ... and {} more",
-            skipped.len() - MAX_REPORTED_SKIPPED_JSONL_LINES
+            skipped.malformed_lines - MAX_REPORTED_SKIPPED_JSONL_LINES
         );
     }
 }
@@ -109459,10 +109486,13 @@ mod gh427_tolerant_jsonl_tests {
         assert_eq!(messages.len(), 2, "the surrounding valid records are kept");
         assert_eq!(messages[0]["content"], "first");
         assert_eq!(messages[1]["content"], "third");
-        assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].line_number, 2, "line numbers are 1-based");
+        assert_eq!(skipped.malformed_lines, 1);
+        assert_eq!(
+            skipped.details[0].line_number, 2,
+            "line numbers are 1-based"
+        );
         assert!(
-            !skipped[0].error.is_empty(),
+            !skipped.details[0].error.is_empty(),
             "the decode error is preserved for the warning"
         );
         assert!(start.is_some() && end.is_some() && start <= end);
@@ -109511,7 +109541,7 @@ mod gh427_tolerant_jsonl_tests {
         let empty = write_session(&dir, "empty.jsonl", "");
         let (messages, start, end, skipped) =
             parse_followup_jsonl_messages_tolerant(&empty).unwrap();
-        assert!(messages.is_empty() && skipped.is_empty());
+        assert!(messages.is_empty() && skipped.malformed_lines == 0);
         assert_eq!((start, end), (None, None));
 
         let missing =
@@ -109538,8 +109568,56 @@ mod gh427_tolerant_jsonl_tests {
         );
         let (messages, _, _, skipped) = parse_followup_jsonl_messages_tolerant(&path).unwrap();
         assert_eq!(messages.len(), 2);
-        assert!(skipped.is_empty());
+        assert_eq!(skipped.malformed_lines, 0);
     }
+
+    #[test]
+    fn gh553_diagnostic_retention_is_bounded_after_mixed_damage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many-damaged-lines.jsonl");
+        let mut body = b"{\"id\":\"kept\",\"role\":\"user\",\"content\":\"intact\"}\n".to_vec();
+        for index in 0..4_000 {
+            body.extend_from_slice(b"\xff\nnot json\ntorn");
+            let record = serde_json::json!({
+                "id": format!("recovered-{index}"), "role": "tool", "content": "recovered"
+            });
+            body.extend_from_slice(format!("{record}\n").as_bytes());
+        }
+        std::fs::write(&path, &body).unwrap();
+        let (messages, start, end, skipped) =
+            parse_followup_jsonl_messages_tolerant(&path).unwrap();
+        assert_eq!(messages.len(), 4_001);
+        assert_eq!(messages[0]["id"], "kept");
+        for (index, record) in messages.iter().skip(1).enumerate() {
+            assert_eq!(record["id"], format!("recovered-{index}"));
+            assert_eq!(record["content"], "recovered");
+        }
+        assert_eq!((start, end), (None, None));
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        assert_eq!(
+            skipped.details.len(),
+            5,
+            "only the diagnostic sample may remain resident after parsing"
+        );
+        assert_eq!(skipped.malformed_lines, 12_000);
+        assert_eq!(skipped.recovered_records, 4_000);
+        assert_eq!(skipped.discarded_bytes, 52_000);
+        for (index, (discarded, recovered)) in [(1, 0), (8, 0), (4, 1), (1, 0), (8, 0)]
+            .into_iter()
+            .enumerate()
+        {
+            let detail = &skipped.details[index];
+            assert_eq!(detail.line_number, index + 2);
+            assert_eq!(detail.discarded_bytes, discarded);
+            assert_eq!(detail.recovered_records, recovered);
+            assert!(!detail.recovery_limited);
+        }
+        let only_bad = write_session(&dir, "only-damaged.jsonl", &"not json\n".repeat(17));
+        let error = parse_followup_jsonl_messages_tolerant(&only_bad).unwrap_err();
+        assert_eq!(error.kind, CliErrorKind::SessionParse.kind_str());
+        assert!(error.hint.unwrap().contains("None of the 17"));
+    }
+
     fn gh553_torn_pi_session() -> (String, usize) {
         let first = r#"{"type":"message","id":"a0000001","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"alpha marker one"}],"timestamp":1767225601000}}"#;
         let prefix = r#"{"type":"message","id":"a0000002","parentId":"a0000001","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"delta marker thinking","thinkingSignature":"sigsigsigsig"#;
@@ -109573,11 +109651,11 @@ mod gh427_tolerant_jsonl_tests {
         assert_eq!(messages[2]["id"], "a0000004");
         assert_eq!(start, Some(1767225601000));
         assert_eq!(end, Some(1767225604000));
-        assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].line_number, 2);
-        assert_eq!(skipped[0].recovered_records, 1);
-        assert_eq!(skipped[0].discarded_bytes, prefix_bytes);
-        assert!(!skipped[0].recovery_limited);
+        assert_eq!(skipped.malformed_lines, 1);
+        assert_eq!(skipped.details[0].line_number, 2);
+        assert_eq!(skipped.details[0].recovered_records, 1);
+        assert_eq!(skipped.details[0].discarded_bytes, prefix_bytes);
+        assert!(!skipped.details[0].recovery_limited);
         assert_eq!(std::fs::read_to_string(path).unwrap(), body);
     }
 
@@ -109593,9 +109671,9 @@ mod gh427_tolerant_jsonl_tests {
         assert_eq!(records.len(), 4);
         assert_eq!(records[1]["id"], "a0000003");
         assert_eq!(records[2]["id"], "model");
-        assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].recovered_records, 2);
-        assert_eq!(skipped[0].discarded_bytes, prefix_bytes);
+        assert_eq!(skipped.malformed_lines, 1);
+        assert_eq!(skipped.details[0].recovered_records, 2);
+        assert_eq!(skipped.details[0].discarded_bytes, prefix_bytes);
         let output = dir.path().join("recovered.json");
         run_export(
             &path,
@@ -109693,10 +109771,10 @@ mod gh427_tolerant_jsonl_tests {
         assert_eq!(messages[1]["content"], "second appended");
         assert_eq!(start, Some(1767225602000));
         assert_eq!(end, Some(1767225604000));
-        assert_eq!(skipped[0].line_number, 1);
-        assert_eq!(skipped[0].recovered_records, 2);
-        assert_eq!(skipped[0].discarded_bytes, prefix.len());
-        assert!(!skipped[0].recovery_limited);
+        assert_eq!(skipped.details[0].line_number, 1);
+        assert_eq!(skipped.details[0].recovered_records, 2);
+        assert_eq!(skipped.details[0].discarded_bytes, prefix.len());
+        assert!(!skipped.details[0].recovery_limited);
     }
 
     #[test]
@@ -109709,9 +109787,9 @@ mod gh427_tolerant_jsonl_tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["content"], "one");
         assert_eq!(messages[1]["content"], "two");
-        assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].recovered_records, 2);
-        assert_eq!(skipped[0].discarded_bytes, 0);
+        assert_eq!(skipped.malformed_lines, 1);
+        assert_eq!(skipped.details[0].recovered_records, 2);
+        assert_eq!(skipped.details[0].discarded_bytes, 0);
     }
 
     #[test]
@@ -109787,7 +109865,7 @@ mod gh427_tolerant_jsonl_tests {
             messages,
             vec![serde_json::from_str::<serde_json::Value>(body).unwrap()]
         );
-        assert!(skipped.is_empty());
+        assert_eq!(skipped.malformed_lines, 0);
     }
 
     #[test]
@@ -109807,7 +109885,7 @@ mod gh427_tolerant_jsonl_tests {
                 serde_json::json!({"wrapper":{"role":"user","content":"nested"}}),
             ]
         );
-        assert!(skipped.is_empty());
+        assert_eq!(skipped.malformed_lines, 0);
         assert_eq!(std::fs::read_to_string(path).unwrap(), body);
     }
 
@@ -109863,11 +109941,11 @@ mod gh427_tolerant_jsonl_tests {
             messages,
             vec![serde_json::json!({"type":"session","id":"control"})]
         );
-        assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].line_number, 2);
-        assert_eq!(skipped[0].recovered_records, 0);
-        assert_eq!(skipped[0].discarded_bytes, damaged.len());
-        assert!(skipped[0].recovery_limited);
+        assert_eq!(skipped.malformed_lines, 1);
+        assert_eq!(skipped.details[0].line_number, 2);
+        assert_eq!(skipped.details[0].recovered_records, 0);
+        assert_eq!(skipped.details[0].discarded_bytes, damaged.len());
+        assert!(skipped.details[0].recovery_limited);
         assert_eq!(std::fs::read_to_string(path).unwrap(), body);
     }
 

@@ -529,6 +529,69 @@ mod gh472 {
         }
     }
 
+    #[test]
+    fn gh553_mixed_damage_keeps_totals_and_recovery_beyond_the_diagnostic_sample() {
+        let fixture = Fixture::new("gh553-retention", "1");
+        let path = fixture.home.join("mixed-damage.jsonl");
+        let first = json!({"type":"message","id":"kept","message":{"role":"user","content":"retained start"}});
+        let tool = json!({"type":"message","id":"tail-tool","message":{"role":"toolResult","content":"recovered tool"}});
+        let user = json!({"type":"message","id":"tail-user","message":{"role":"user","content":"recovered user"}});
+        let last = json!({"type":"message","id":"last","message":{"role":"assistant","content":"retained end"}});
+        let mut body = format!("{first}\n{}", "not json\n".repeat(64)).into_bytes();
+        body.extend_from_slice(b"\xff\xfe\ntorn");
+        body.extend_from_slice(format!("{tool}{user}\n{last}\n").as_bytes());
+        fs::write(&path, &body).unwrap();
+        let run = fixture.run(
+            &[
+                "export",
+                path.to_str().unwrap(),
+                "--format",
+                "json",
+                "--include-tools",
+            ],
+            &[],
+        );
+        let records = run.report.as_array().unwrap();
+        assert_eq!(records.len(), 4);
+        for (record, (id, content)) in records.iter().zip([
+            ("kept", "retained start"),
+            ("tail-tool", "recovered tool"),
+            ("tail-user", "recovered user"),
+            ("last", "retained end"),
+        ]) {
+            assert_eq!(record["id"], id);
+            assert_eq!(record["message"]["content"], content);
+        }
+        let warnings = run.events.iter().filter(|event| {
+            event["fields"]["message"] == "session JSONL line failed to parse; retained complete records and skipped malformed bytes (GH #427 / GH #553)"
+        }).collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 5);
+        for (index, warning) in warnings.iter().enumerate() {
+            let fields = &warning["fields"];
+            assert_eq!(fields["line_no"], index + 2);
+            assert_eq!(fields["recovered_records"], 0);
+            assert_eq!(fields["discarded_bytes"], 8);
+            assert_eq!(fields["total_malformed_lines"], 66);
+            assert_eq!(fields["total_recovered_records"], 2);
+            assert_eq!(fields["total_discarded_bytes"], 518);
+            assert_eq!(fields["omitted_line_diagnostics"], 61);
+            let source = fields["source_path"].as_str().unwrap();
+            assert!(source.contains("[REDACTED_PATH]"), "{source}");
+            assert!(!source.contains("mixed-damage.jsonl"), "{source}");
+        }
+        assert!(
+            run.stderr
+                .contains("recovered 2 complete JSONL record(s) from 66 malformed line(s)")
+        );
+        assert!(
+            run.stderr
+                .contains("skipped 518 byte(s) and rendered 4 record(s)")
+        );
+        assert!(run.stderr.contains("warning:   ... and 61 more"));
+        assert_eq!(fs::read(&path).unwrap(), body);
+        fixture.tracker.complete();
+    }
+
     impl Fixture {
         fn new(name: &str, streaming: &'static str) -> Self {
             let temp = tempfile::TempDir::new().expect("create isolated GH472 home");
