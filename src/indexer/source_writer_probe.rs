@@ -43,6 +43,10 @@ type SourcePredicate = fn(&Path) -> bool;
 pub(crate) struct SourceWriterProbe {
     state: Mutex<ProbeState>,
     is_session_source: Option<SourcePredicate>,
+    /// Live tests limit the process inventory to their own processes. The
+    /// descriptor, mount and process-identity reads still come from procfs.
+    #[cfg(test)]
+    proc_root: Option<PathBuf>,
 }
 
 #[cfg(target_os = "macos")]
@@ -97,19 +101,6 @@ struct ProbeState {
     refresh_blocked: bool,
     #[cfg(test)]
     refresh_count: usize,
-    /// Why the last refresh kept the prior evidence. Live tests use it to
-    /// tell an unrelated process turning opaque mid-census (routine for a
-    /// non-root user on a busy host) from a probe defect (z6ycn).
-    #[cfg(test)]
-    last_refresh_block: Option<RefreshBlock>,
-}
-
-#[cfg(all(test, target_os = "linux"))]
-#[derive(Debug)]
-struct RefreshBlock {
-    complete: bool,
-    owners_visible: bool,
-    new_gap_pids: Vec<u32>,
 }
 
 #[cfg(target_os = "linux")]
@@ -153,6 +144,8 @@ impl SourceWriterProbe {
                 ..ProbeState::default()
             }),
             is_session_source: Some(is_session_source),
+            #[cfg(test)]
+            proc_root: None,
         }
     }
 
@@ -186,7 +179,11 @@ impl SourceWriterProbe {
         {
             state.refresh_count += 1;
         }
-        let fresh = collect_writers(is_session_source, &state.census.writers);
+        #[cfg(test)]
+        let proc_root = self.proc_root.as_deref().unwrap_or(Path::new("/proc"));
+        #[cfg(not(test))]
+        let proc_root = Path::new("/proc");
+        let fresh = collect_writers_in(proc_root, is_session_source, &state.census.writers);
         state.apply_refresh(fresh);
         state.census.writers.contains_key(&identity)
     }
@@ -210,18 +207,6 @@ impl ProbeState {
         } else {
             // Do not repeat an unreadable process-tree walk for every source,
             // and do not turn partial visibility into evidence of absence.
-            #[cfg(test)]
-            {
-                self.last_refresh_block = Some(RefreshBlock {
-                    complete: fresh.complete,
-                    owners_visible: all_owners_visible,
-                    new_gap_pids: fresh
-                        .visibility_gaps
-                        .difference(&self.initial_visibility_gaps)
-                        .map(|gap| gap.process.pid)
-                        .collect(),
-                });
-            }
             self.refresh_blocked = true;
             self.census.writers.extend(fresh.writers);
         }
