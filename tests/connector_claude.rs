@@ -9,26 +9,108 @@ use tempfile::TempDir;
 
 #[test]
 fn gh553_claude_recovers_complete_turns_after_a_torn_prefix() {
-    let root = tempfile::tempdir().unwrap().keep();
-    let project = root.join("projects/synthetic");
-    std::fs::create_dir_all(&project).unwrap();
-    let path = project.join("gh553.jsonl");
-    let body = concat!(
-        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"signature\":\"torn",
-        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\",\"content\":\"bravo recovered claude\"}]}}\n",
-        "{\"message\":{\"role\":\"user\",\"content\":\"phantom marker\"}\n",
-    );
-    std::fs::write(&path, body).unwrap();
-    let context = ScanContext::with_roots(root.clone(), vec![ScanRoot::local(root)], None);
-    let conversations = ClaudeCodeConnector::new().scan(&context).unwrap();
-    assert_eq!(conversations.len(), 1);
-    assert_eq!(conversations[0].messages.len(), 1);
-    assert_eq!(
-        conversations[0].messages[0].content,
-        "bravo recovered claude"
-    );
-    assert_eq!(conversations[0].messages[0].role, "tool");
-    assert_eq!(std::fs::read_to_string(path).unwrap(), body);
+    use coding_agent_search::connector_ingest_diagnostics::{
+        ConnectorIngestRun, IngestFailureKind,
+    };
+    use serde_json::{Value, json};
+
+    let prefix =
+        r#"{"type":"assistant","message":{"content":[{"type":"thinking","signature":"torn"#;
+    let record = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"bravo recovered claude"}]}}"#;
+    let nested = r#"{"message":{"role":"user","content":"phantom marker"}"#;
+    for damaged in [false, true] {
+        for bom in ["", "\u{feff}"] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let project = root.join("projects/synthetic");
+            std::fs::create_dir_all(&project).unwrap();
+            let path = project.join("gh553.jsonl");
+            let discarded = if damaged {
+                format!("{bom}{prefix}")
+            } else {
+                bom.to_owned()
+            };
+            let body = format!("{discarded}{record}\n{nested}\n");
+            std::fs::write(&path, &body).unwrap();
+            let context = ScanContext::with_roots(root.clone(), vec![ScanRoot::local(root)], None);
+            let (provider, factory) = coding_agent_search::connectors::get_connector_factories()
+                .into_iter()
+                .find(|(name, _)| *name == "claude")
+                .expect("registered Claude connector");
+            let connector = factory();
+            let sources = connector.discover_source_files(&context).unwrap();
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].provider_slug, "claude_code");
+            let data_dir = context.data_dir.join("cass-data");
+            let mut diagnostics =
+                ConnectorIngestRun::begin(provider, &data_dir, &context, &sources);
+            let mut conversations = connector.scan(&context).unwrap();
+            assert_eq!(conversations.len(), 1);
+            assert_eq!(conversations[0].messages.len(), 1);
+            assert_eq!(
+                conversations[0].messages[0].content,
+                "bravo recovered claude"
+            );
+            assert_eq!(conversations[0].messages[0].role, "tool");
+            assert_eq!(conversations[0].agent_slug, "claude_code");
+            for conversation in &mut conversations {
+                diagnostics.observe_conversation(conversation);
+            }
+            let report = diagnostics.finish();
+            assert_eq!(report.provider, "claude");
+            assert_eq!(report.summary.partially_indexed, 1);
+            assert_eq!(report.diagnostics.len(), if damaged { 2 } else { 1 });
+            let first = report
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.line_or_row == Some(1));
+            if damaged {
+                assert_eq!(
+                    first.expect("torn prefix diagnostic").detail,
+                    Some(format!(
+                        "recovered complete records: 1; quarantined prefix bytes: {}",
+                        discarded.len()
+                    ))
+                );
+            } else {
+                assert!(first.is_none(), "intact record was quarantined");
+            }
+            let negative = report
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.line_or_row == Some(2))
+                .expect("nested incomplete record remains quarantined");
+            assert_eq!(negative.detail, None);
+            for diagnostic in &report.diagnostics {
+                assert_eq!(diagnostic.provider, "claude");
+                assert_eq!(
+                    diagnostic.failure_kind,
+                    IngestFailureKind::MalformedJsonLine
+                );
+            }
+            let state: Value = serde_json::from_slice(
+                &std::fs::read(data_dir.join("quarantine/connector_ingest_lines.json")).unwrap(),
+            )
+            .unwrap();
+            let entries = state["entries"].as_object().expect("quarantine entries");
+            assert_eq!(entries.len(), if damaged { 2 } else { 1 });
+            for entry in entries.values() {
+                assert_eq!(entry["provider"], "claude");
+                let expected = if entry["line_number"] == 1 {
+                    assert!(damaged);
+                    discarded.as_str()
+                } else {
+                    assert_eq!(entry["line_number"], 2);
+                    nested
+                };
+                assert_eq!(entry["payload_bytes"], json!(expected.len()));
+                assert_eq!(
+                    entry["payload_blake3"],
+                    json!(blake3::hash(expected.as_bytes()).to_hex().to_string())
+                );
+            }
+            assert_eq!(std::fs::read_to_string(path).unwrap(), body);
+        }
+    }
 }
 
 #[test]

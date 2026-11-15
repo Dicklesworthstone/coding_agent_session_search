@@ -618,8 +618,11 @@ impl ConnectorIngestRun {
             scan_data_dir: ctx.data_dir.clone(),
             durable_stores,
         };
+        // Reports retain registry names (Claude registers as `claude`), while
+        // parsing policy follows the conversations' provider (`claude_code`).
+        let parser_provider = crate::connectors::archive_provider_slug(provider);
         for source in sources {
-            run.inspect_jsonl(data_dir, &source.source_path);
+            run.inspect_jsonl(data_dir, &source.source_path, parser_provider);
             if provider == "cursor" {
                 run.inspect_cursor_database(&source.source_path);
             }
@@ -880,7 +883,7 @@ impl ConnectorIngestRun {
         }
     }
 
-    fn inspect_jsonl(&mut self, data_dir: &Path, path: &Path) {
+    fn inspect_jsonl(&mut self, data_dir: &Path, path: &Path, parser_provider: &str) {
         let is_jsonl = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -895,7 +898,7 @@ impl ConnectorIngestRun {
                 return;
             }
         };
-        let read_bytes = if self.provider == "codex" {
+        let read_bytes = if parser_provider == "codex" {
             // Diagnostics run before source admission. Do not read or allocate
             // a body the connector will reject, or invent corruption evidence
             // when its admission policy is invalid. Its scan reports the cause.
@@ -923,12 +926,12 @@ impl ConnectorIngestRun {
         let mut line_number = 0u64;
         let source_path = path.display().to_string();
         let supports_suffix_recovery = matches!(
-            self.provider.as_str(),
+            parser_provider,
             "pi_agent" | "pi_agent_rust" | "omp" | "codex" | "claude_code"
         );
         let accepts_leading_bom = supports_suffix_recovery
             || matches!(
-                self.provider.as_str(),
+                parser_provider,
                 "clawdbot"
                     | "factory"
                     | "gemini"
@@ -963,12 +966,9 @@ impl ConnectorIngestRun {
             // Match FAD's ordinary JSONL normalization without changing the raw
             // recovery budget or the bytes retained as quarantine evidence.
             let ordinary_text = text.map(|text| {
-                if self.provider == "gemini" {
+                if parser_provider == "gemini" {
                     text.trim().trim_start_matches('\u{feff}')
-                } else if matches!(
-                    self.provider.as_str(),
-                    "codex" | "pi_durable" | "prime_agent"
-                ) {
+                } else if matches!(parser_provider, "codex" | "pi_durable" | "prime_agent") {
                     text.trim_start_matches('\u{feff}').trim()
                 } else if accepts_leading_bom {
                     text.trim_start_matches('\u{feff}')
@@ -1554,6 +1554,7 @@ mod tests {
             "pi_agent_rust",
             "omp",
             "codex",
+            "claude",
             "claude_code",
             "clawdbot",
             "factory",
