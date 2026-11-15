@@ -102,6 +102,12 @@ impl ScanLimits {
     }
 }
 
+/// Let pre-parse diagnostics obey the same format-specific admission policy.
+/// The connector still owns rejection reporting and source completion.
+pub(crate) fn source_read_budget(path: &Path) -> Result<u64> {
+    Ok(ScanLimits::from_env()?.for_path(path))
+}
+
 struct ScanAdmission {
     exclusions: ScanExclusions,
     limits: ScanLimits,

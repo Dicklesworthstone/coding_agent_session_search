@@ -34,7 +34,7 @@
 //! valid records continue through normal ingest.
 
 use std::collections::BTreeMap;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 
 use crate::franken_sync::compat::{ConnectionExt, OpenFlags, open_with_flags};
@@ -895,7 +895,30 @@ impl ConnectorIngestRun {
                 return;
             }
         };
-        let mut reader = std::io::BufReader::new(file);
+        let read_bytes = if self.provider == "codex" {
+            // Diagnostics run before source admission. Do not read or allocate
+            // a body the connector will reject, or invent corruption evidence
+            // when its admission policy is invalid. Its scan reports the cause.
+            let Ok(limit) = crate::connectors::codex::source_read_budget(path) else {
+                return;
+            };
+            let metadata = match file.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    self.observe_scan_error(path, error);
+                    return;
+                }
+            };
+            if !metadata.is_file() || metadata.len() > limit {
+                return;
+            }
+            // Do not follow an active writer past the admitted opened prefix.
+            // The connector separately checks source stability across parsing.
+            metadata.len()
+        } else {
+            u64::MAX
+        };
+        let mut reader = std::io::BufReader::new(file.take(read_bytes));
         let mut raw_line = Vec::new();
         let mut line_number = 0u64;
         let source_path = path.display().to_string();

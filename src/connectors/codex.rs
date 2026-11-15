@@ -28,7 +28,7 @@ pub(crate) use implementation::modern_codex_message;
 #[allow(unused_imports)]
 pub(crate) use implementation::over_budget_scan_error;
 #[allow(unused_imports)]
-pub(crate) use implementation::over_budget_sources;
+pub(crate) use implementation::{over_budget_sources, source_read_budget};
 
 /// Archive-aware public surface; parsing and enrichment live in implementation.
 #[derive(Default)]

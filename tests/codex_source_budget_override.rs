@@ -231,6 +231,110 @@ mod budget_override {
         Ok(())
     }
 
+    /// Diagnostic pre-scanning must not allocate a rejected rollout body or
+    /// turn admission failure into malformed-line quarantine. Admitted lines
+    /// retain their exact quarantine bytes, including at the policy boundary.
+    #[test]
+    fn gh553_diagnostics_respect_codex_read_budget() -> Result<()> {
+        use coding_agent_search::connector_ingest_diagnostics::{
+            ConnectorIngestRun, IngestFailureKind,
+        };
+        use coding_agent_search::connectors::{DiscoveredSourceFile, DiscoveredSourceRole};
+
+        if let Ok(root) = dotenvy::var(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let path = paths(&root)[1].clone();
+            let before = fs::metadata(&path)?;
+            let scan_root = ScanRoot::local(path.clone());
+            let source = DiscoveredSourceFile::new(
+                "codex",
+                &scan_root,
+                path.clone(),
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            );
+            let ctx = ScanContext::with_roots(root.join("archive"), vec![scan_root], None);
+            let mut run = ConnectorIngestRun::begin("codex", &ctx.data_dir, &ctx, &[source]);
+            let quarantine = root.join("archive/quarantine/connector_ingest_lines.json");
+            let case = dotenvy::var(CHILD_CASE)?;
+            if case == "exact" || case == "raised" {
+                let report = run.finish();
+                let [diagnostic] = report.diagnostics.as_slice() else {
+                    anyhow::bail!("admitted malformed line must produce one diagnostic");
+                };
+                anyhow::ensure!(diagnostic.failure_kind == IngestFailureKind::MalformedJsonLine);
+                anyhow::ensure!(diagnostic.line_or_row == Some(1));
+                let state: Value = serde_json::from_slice(&fs::read(quarantine)?)?;
+                let entries = state["entries"]
+                    .as_object()
+                    .ok_or_else(|| anyhow::anyhow!("missing admitted-line quarantine entries"))?;
+                anyhow::ensure!(entries.len() == 1);
+                let entry = entries
+                    .values()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("missing admitted-line quarantine evidence"))?;
+                let bytes = fs::read(&path)?;
+                anyhow::ensure!(entry["payload_bytes"] == bytes.len() - 1);
+                anyhow::ensure!(
+                    entry["payload_blake3"]
+                        == blake3::hash(&bytes[..bytes.len() - 1]).to_hex().as_str()
+                );
+            } else {
+                anyhow::ensure!(!quarantine.exists(), "rejected input created quarantine");
+                let error = CodexConnector::new().scan(&ctx).err().ok_or_else(|| {
+                    anyhow::anyhow!("connector unexpectedly admitted rejected input")
+                })?;
+                run.observe_connector_scan_error(&ctx.data_dir, &error);
+                let report = run.finish();
+                let [diagnostic] = report.diagnostics.as_slice() else {
+                    anyhow::bail!("connector rejection must produce one diagnostic");
+                };
+                if case == "invalid" {
+                    anyhow::ensure!(error.to_string().contains(POLICY));
+                } else {
+                    anyhow::ensure!(
+                        diagnostic.failure_kind == IngestFailureKind::SourceOverReadBudget
+                    );
+                    anyhow::ensure!(diagnostic.source_path == path.to_string_lossy().as_ref());
+                    anyhow::ensure!(report.summary.skipped == 1);
+                }
+                anyhow::ensure!(!quarantine.exists(), "rejection created quarantine");
+            }
+            let after = fs::metadata(&path)?;
+            anyhow::ensure!(before.len() == after.len());
+            anyhow::ensure!(before.modified()? == after.modified()?);
+            return Ok(());
+        }
+
+        let root = tempfile::tempdir()?;
+        let (_, paths) = fixture(root.path())?;
+        let test = "gh553_diagnostics_respect_codex_read_budget";
+        // A sparse, over-default-limit source must be refused before its body
+        // is read. No enormous fixture allocation is needed to exercise it.
+        let file = fs::File::create(&paths[1])?;
+        file.set_len(LIMIT + 1)?;
+        drop(file);
+        run_child(root.path(), test, "default", None)?;
+
+        let bytes = format!("{}\n", "x".repeat(4095));
+        for (case, limit) in [
+            ("over", "4095"),
+            ("exact", "4096"),
+            ("raised", "8192"),
+            ("invalid", "not-a-byte-count"),
+        ] {
+            // Each child needs an independent archive: admitted cases retain
+            // quarantine evidence, which rejected cases must never create.
+            let case_root = tempfile::tempdir()?;
+            let (_, case_paths) = fixture(case_root.path())?;
+            fs::write(&case_paths[1], &bytes)?;
+            let before = receipt(&case_paths[1])?;
+            run_child(case_root.path(), test, case, Some(limit))?;
+            anyhow::ensure!(receipt(&case_paths[1])? == before);
+        }
+        Ok(())
+    }
+
     /// GH #533: valid metadata-only zstd is a successful empty source, including
     /// on an ordinary incremental index; its neighbors still reach real search.
     #[test]
