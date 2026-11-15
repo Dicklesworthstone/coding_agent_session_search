@@ -336,11 +336,132 @@ fn status_source_scan_currency_reports_overdue_disabled_unknown_and_noop() {
     );
 
     let database = data.join("agent_search.db");
+    // Exercise consumption of a cached structural failure on a real readable,
+    // populated archive. Derive its wire shape and fingerprint from the actual
+    // full-index writer; this is not a physical-corruption detection fixture.
+    let attestation_path = data.join("integrity_attestation.json");
+    let original_attestation = fs::read(&attestation_path).unwrap();
+    let mut failed_attestation: Value = serde_json::from_slice(&original_attestation).unwrap();
+    assert_eq!(failed_attestation["version"], 1);
+    assert_eq!(failed_attestation["verdict"], "pass");
+    failed_attestation["verdict"] = json!("fail");
+    failed_attestation["detail"] = json!("fixture structural failure from a completed probe");
+    fs::write(
+        &attestation_path,
+        serde_json::to_vec(&failed_attestation).unwrap(),
+    )
+    .unwrap();
+    let failed = cass().args(["status", "--json"]).output().unwrap();
+    assert!(failed.status.success(), "{failed:?}");
+    let failed: Value = serde_json::from_slice(&failed.stdout).unwrap();
+    assert_eq!(failed["healthy"], false, "{failed}");
+    assert_eq!(failed["database"]["opened"], true, "{failed}");
+    assert_ne!(failed["database"]["integrity"], "corrupt", "{failed}");
+    assert_eq!(failed["storage_integrity"]["attestation_source"], "cached");
+    assert_eq!(
+        failed["storage_integrity"]["storage_state"],
+        "integrity_failed"
+    );
+    assert!(
+        failed["recommended_action"]
+            .as_str()
+            .unwrap()
+            .contains("do NOT run 'cass index'"),
+        "{failed}"
+    );
+    assert_eq!(failed["recommended_commands"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        failed["recommended_commands"][0]["id"],
+        "inspect-archive-health"
+    );
+    assert_eq!(failed["recommended_commands"][0]["safety"], "read-only");
+    let human = cass()
+        .args(["--color", "never", "status"])
+        .output()
+        .unwrap();
+    assert!(human.status.success(), "{human:?}");
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        human.contains("MALFORMED (cached structural integrity probe)"),
+        "{human}"
+    );
+    assert!(human.contains("Do NOT run 'cass index'"), "{human}");
+
+    // Preserve the real derived asset while testing the tempting full-rebuild
+    // branch. An absent lexical index must never override known archive damage.
+    let index_path = expected_index_dir(&data);
+    let retained_index = home.join("retained-lexical-index");
+    fs::rename(&index_path, &retained_index).unwrap();
+    let missing = cass().args(["status", "--json"]).output().unwrap();
+    assert!(missing.status.success(), "{missing:?}");
+    let missing: Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(missing["index"]["exists"], false);
+    assert_eq!(missing["healthy"], false);
+    assert_eq!(
+        missing["storage_integrity"]["storage_state"],
+        "integrity_failed"
+    );
+    assert_eq!(missing["recommended_commands"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        missing["recommended_commands"][0]["id"],
+        "inspect-archive-health"
+    );
+    let human = cass()
+        .args(["--color", "never", "status"])
+        .output()
+        .unwrap();
+    assert!(human.status.success(), "{human:?}");
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("Do NOT run 'cass index'"), "{human}");
+    assert!(!human.contains("run 'cass index --full'"), "{human}");
+    assert!(!human.contains("Run 'cass index --full'"), "{human}");
+    fs::rename(&retained_index, &index_path).unwrap();
+
+    for invalidation in ["expired", "fingerprint-mismatch"] {
+        let mut ignored = failed_attestation.clone();
+        if invalidation == "expired" {
+            ignored["checked_at_ms"] =
+                json!(chrono::Utc::now().timestamp_millis() - 8 * 86_400_000);
+        } else {
+            ignored["db_size_bytes"] = json!(fs::metadata(&database).unwrap().len() + 1);
+        }
+        fs::write(&attestation_path, serde_json::to_vec(&ignored).unwrap()).unwrap();
+        let output = cass().args(["status", "--json"]).output().unwrap();
+        assert!(output.status.success(), "{invalidation}: {output:?}");
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["healthy"], true, "{invalidation}: {payload}");
+        assert_eq!(payload["storage_integrity"]["attestation_source"], "none");
+        assert!(
+            payload["recommended_commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|command| command["id"] != "inspect-archive-health"),
+            "{invalidation}: {payload}"
+        );
+    }
+    fs::write(&attestation_path, original_attestation).unwrap();
+
     let overdue_at = chrono::Utc::now().timestamp_millis() - 84 * 86_400_000;
     FrankenStorage::open(&database)
         .unwrap()
         .set_last_scan_ts(overdue_at)
         .unwrap();
+    // Backdating canonical metadata invalidates the lexical source-epoch
+    // proof. Rebuild only the derived asset so the archive is genuinely fresh
+    // against SQLite while its last completed source scan stays overdue.
+    cass()
+        .args(["index", "--force-rebuild", "--json", "--no-progress-events"])
+        .assert()
+        .success();
+    assert_eq!(
+        FrankenStorage::open_readonly(&database)
+            .unwrap()
+            .get_last_scan_ts()
+            .unwrap(),
+        Some(overdue_at),
+        "canonical-only repair must preserve the source-scan watermark"
+    );
     let old = cass().args(["status", "--json"]).output().unwrap();
     assert!(old.status.success(), "{old:?}");
     let old: Value = serde_json::from_slice(&old.stdout).unwrap();
@@ -350,6 +471,17 @@ fn status_source_scan_currency_reports_overdue_disabled_unknown_and_noop() {
     assert!(old["source_scan"]["age_seconds"].as_u64().unwrap() >= 84 * 86_400);
     assert_eq!(old["source_scan"]["interval_seconds"], 300);
     assert_eq!(old["source_scan"]["overdue"], true);
+    let triage = cass()
+        .args(["triage", "--json", "--timeout", "10000"])
+        .output()
+        .unwrap();
+    assert!(triage.status.success(), "{triage:?}");
+    let triage: Value = serde_json::from_slice(&triage.stdout).unwrap();
+    let scan = &triage["readiness"]["source_scan"];
+    assert_eq!(scan["last_completed_at_ms"], overdue_at, "{triage}");
+    assert_eq!(scan["interval_seconds"], 300, "{triage}");
+    assert_eq!(scan["overdue"], true, "{triage}");
+    assert!(scan["age_seconds"].as_u64().unwrap() >= 84 * 86_400);
     assert!(
         old["recommended_action"]
             .as_str()

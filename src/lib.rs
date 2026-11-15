@@ -25543,6 +25543,7 @@ fn readiness_command_recommendation(
 
 const SOURCE_SCAN_OVERDUE_RECOMMENDED_ACTION: &str =
     "Run 'cass index' to scan sources for new or changed sessions";
+const CANONICAL_ARCHIVE_CORRUPT_RECOMMENDED_ACTION: &str = "The canonical archive is malformed; do NOT run 'cass index'. Run 'cass doctor check --json', then recover the database (sqlite3 agent_search.db '.recover') before reindexing";
 
 fn readiness_recommended_commands(
     data_dir: &Path,
@@ -25663,6 +25664,9 @@ fn readiness_recommended_commands(
 
     if status == "degraded"
         || (db_exists && !db_opened && !db_open_retryable)
+        // The caller also selects this action for a fingerprint-matched failed
+        // structural attestation, even when the bounded live probe succeeds.
+        || recommended_action == Some(CANONICAL_ARCHIVE_CORRUPT_RECOMMENDED_ACTION)
         || state
             .pointer("/database/integrity")
             .and_then(serde_json::Value::as_str)
@@ -26154,6 +26158,28 @@ mod readiness_projection_tests {
             assert_eq!(commands.len(), 1);
             assert_eq!(commands[0]["id"], "inspect-archive-health");
             assert_eq!(commands[0]["safety"], "read-only");
+        }
+
+        // A cached structural failure is stronger evidence than the bounded
+        // live projection. It must also win when no lexical index exists.
+        for live_integrity in ["ok", "unknown"] {
+            state["database"]["integrity"] = json!(live_integrity);
+            for (exists, legacy) in [(true, false), (true, true), (false, false)] {
+                state["index"]["exists"] = json!(exists);
+                state["index"]["engine_incompatible"] = json!(legacy);
+                let commands = super::readiness_recommended_commands(
+                    data_dir,
+                    &db_path,
+                    &state,
+                    "unhealthy",
+                    false,
+                    false,
+                    Some(super::CANONICAL_ARCHIVE_CORRUPT_RECOMMENDED_ACTION),
+                );
+                assert_eq!(commands.len(), 1, "{state}");
+                assert_eq!(commands[0]["id"], "inspect-archive-health", "{state}");
+                assert_eq!(commands[0]["safety"], "read-only");
+            }
         }
     }
 
@@ -89358,6 +89384,7 @@ fn run_status(
                 .to_string(),
         );
     }
+    let canonical_archive_corrupt = live_integrity_corrupt || attested_integrity_failure;
     let healthy = db_exists
         && db_available
         && index_exists
@@ -89365,8 +89392,7 @@ fn run_status(
         && !rebuild_active
         && !index_empty_with_messages
         && !ingest_quarantine_critical
-        && !attested_integrity_failure
-        && !live_integrity_corrupt;
+        && !canonical_archive_corrupt;
     // Stalled rebuilds are reported as a distinct status so operators
     // can tell a wedged indexer apart from a slow-but-progressing one
     // (issue #258). `stalled` implies `rebuild_active=true`, but it
@@ -89376,7 +89402,7 @@ fn run_status(
         "stalled"
     } else if rebuild_active {
         "rebuilding"
-    } else if ingest_quarantine_critical || live_integrity_corrupt {
+    } else if ingest_quarantine_critical || canonical_archive_corrupt {
         "unhealthy"
     } else if healthy {
         "healthy"
@@ -89397,10 +89423,10 @@ fn run_status(
         Some("Index rebuild is wedged; see `cass status --json | jq .rebuild` for the stall age and capture a stack trace with `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` for a bug report".to_string())
     } else if rebuild_active {
         Some("Index rebuild is already in progress".to_string())
-    } else if live_integrity_corrupt {
+    } else if canonical_archive_corrupt {
         // i6upe: staleness advice ('run cass index') is the WORST action on a
-        // malformed archive — recovery must come first.
-        Some("The canonical archive is malformed; do NOT run 'cass index'. Run 'cass doctor check --json', then recover the database (sqlite3 agent_search.db '.recover') before reindexing".to_string())
+        // malformed archive — live and still-valid cached failures both win.
+        Some(CANONICAL_ARCHIVE_CORRUPT_RECOMMENDED_ACTION.to_string())
     } else if not_initialized {
         Some(cass_not_initialized_recommended_action())
     } else if !db_exists {
@@ -89683,10 +89709,14 @@ fn run_status(
         }
         if index_empty_with_messages {
             println!("  Warning: index has 0 documents but database has messages");
-            println!("  Run 'cass index --full' to populate the search index");
+            if !canonical_archive_corrupt {
+                println!("  Run 'cass index --full' to populate the search index");
+            }
         }
     } else if not_initialized {
         println!("  Not created yet - run 'cass index --full' once");
+    } else if canonical_archive_corrupt {
+        println!("  Not found");
     } else {
         println!("  Not found - run 'cass index --full'");
     }
@@ -89730,6 +89760,11 @@ fn run_status(
         {
             println!("  Detail: {detail}");
         }
+        println!(
+            "  Do NOT run 'cass index' — run 'cass doctor check --json' and recover the database first"
+        );
+    } else if attested_integrity_failure {
+        println!("  Integrity: MALFORMED (cached structural integrity probe)");
         println!(
             "  Do NOT run 'cass index' — run 'cass doctor check --json' and recover the database first"
         );
@@ -89894,6 +89929,11 @@ fn triage_budget_fallback_state(
             "counts_skipped": true,
             "open_skipped": true,
         },
+        "source_scan": crate::indexer::background_refresh::source_scan_currency_at(
+            None,
+            chrono::Utc::now().timestamp_millis(),
+            crate::indexer::background_refresh::source_scan_interval_from_env(),
+        ),
         "pending": { "inspected": false },
         "rebuild": { "inspected": false },
         "semantic": {
@@ -90072,6 +90112,7 @@ fn run_triage(
                 "readiness_state",
                 "index_readiness",
                 "database_readiness",
+                "source_scan_currency",
                 "pending_readiness",
                 "rebuild_readiness",
                 "semantic_readiness",
@@ -90356,6 +90397,7 @@ fn run_triage(
         "root_cause": root_cause,
         "readiness": {
             "index": state.get("index").cloned().unwrap_or(serde_json::Value::Null),
+            "source_scan": state.get("source_scan").cloned().unwrap_or(serde_json::Value::Null),
             "database": state.get("database").cloned().unwrap_or(serde_json::Value::Null),
             "pending": state.get("pending").cloned().unwrap_or(serde_json::Value::Null),
             "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
@@ -105541,6 +105583,7 @@ fn response_schema_triage_readiness() -> serde_json::Value {
     database["properties"]["exists"]["type"] = serde_json::json!(["boolean", "null"]);
     response_schema_object([
         ("index", index),
+        ("source_scan", response_schema_source_scan()),
         ("database", database),
         (
             "pending",

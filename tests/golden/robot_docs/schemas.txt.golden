@@ -3122,6 +3122,11 @@ schemas: (auto-generated from contract)
         - status: string
         - summary: string
         - vector_index_path: ?
+      - source_scan: object
+        - age_seconds: ?
+        - interval_seconds: integer
+        - last_completed_at_ms: ?
+        - overdue: ?
     - status: string
     - warnings: array
   index:
@@ -3401,6 +3406,7 @@ schemas: (auto-generated from contract)
         - policy_registry: object
         - rebuild: object
         - semantic: object
+        - source_scan: object
       - storage_integrity: object
         - archive_readability: string
         - attestation_check_depth: string
@@ -3811,6 +3817,11 @@ schemas: (auto-generated from contract)
       - status: string
       - summary: string
       - vector_index_path: ?
+    - source_scan: object
+      - age_seconds: ?
+      - interval_seconds: integer
+      - last_completed_at_ms: ?
+      - overdue: ?
     - status: string
     - storage_integrity: object
       - archive_readability: string
@@ -4244,6 +4255,11 @@ schemas: (auto-generated from contract)
       - status: string
       - summary: string
       - vector_index_path: ?
+    - source_scan: object
+      - age_seconds: ?
+      - interval_seconds: integer
+      - last_completed_at_ms: ?
+      - overdue: ?
     - status: string
     - storage_integrity: object
       - archive_readability: string
@@ -4447,6 +4463,11 @@ schemas: (auto-generated from contract)
         - status: string
         - summary: string
         - vector_index_path: ?
+      - source_scan: object
+        - age_seconds: ?
+        - interval_seconds: integer
+        - last_completed_at_ms: ?
+        - overdue: ?
     - recommended_action: ?
     - recommended_commands: array
     - root_cause: object

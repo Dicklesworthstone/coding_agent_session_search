@@ -233,6 +233,7 @@ fn triage_timeout_hard_bounds_an_actually_slow_readiness_probe() -> Result<(), S
     let output = triage_cmd(&data_dir)
         .args(["--stale-threshold", "7", "--timeout", "150"])
         .env("CASS_TEST_TRIAGE_STATE_DB_SLOW_MS", "2500")
+        .env("CASS_AUTO_REFRESH_SOURCE_SCAN_SECS", "300")
         .output()
         .map_err(|error| error.to_string())?;
     let wall_clock = started.elapsed();
@@ -252,6 +253,7 @@ fn triage_timeout_hard_bounds_an_actually_slow_readiness_probe() -> Result<(), S
         "readiness_state",
         "index_readiness",
         "database_readiness",
+        "source_scan_currency",
         "pending_readiness",
         "rebuild_readiness",
         "semantic_readiness",
@@ -323,6 +325,16 @@ fn triage_timeout_hard_bounds_an_actually_slow_readiness_probe() -> Result<(), S
         "uninspected triage fabricated zero/false pending, rebuild, or quarantine observations",
     )?;
     require(
+        json["readiness"]["source_scan"]
+            == serde_json::json!({
+                "last_completed_at_ms": null,
+                "age_seconds": null,
+                "interval_seconds": 300,
+                "overdue": null,
+            }),
+        "uninspected triage fabricated source-scan currency",
+    )?;
+    require(
         !json["recommended_action"]
             .as_str()
             .is_some_and(|action| action.contains("doctor")),
@@ -340,6 +352,7 @@ fn triage_timeout_hard_bounds_core_filesystem_probe() -> Result<(), String> {
     let output = triage_cmd(&data_dir)
         .args(["--timeout", "150"])
         .env("CASS_TEST_TRIAGE_CORE_SLOW_MS", "2500")
+        .env("CASS_AUTO_REFRESH_SOURCE_SCAN_SECS", "300")
         .output()
         .map_err(|error| error.to_string())?;
     let wall_clock = started.elapsed();
@@ -368,7 +381,14 @@ fn triage_timeout_hard_bounds_core_filesystem_probe() -> Result<(), String> {
             && json["readiness"]["database"]["exists"].is_null()
             && json["readiness"]["index"]["exists"].is_null()
             && json["readiness"]["database"]["inspected"] == false
-            && json["readiness"]["index"]["inspected"] == false,
+            && json["readiness"]["index"]["inspected"] == false
+            && json["readiness"]["source_scan"]
+                == serde_json::json!({
+                    "last_completed_at_ms": null,
+                    "age_seconds": null,
+                    "interval_seconds": 300,
+                    "overdue": null,
+                }),
         "triage fabricated filesystem readiness facts after the bounded core probe timed out",
     )
 }
