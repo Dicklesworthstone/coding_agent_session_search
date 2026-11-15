@@ -954,8 +954,7 @@ impl ConnectorIngestRun {
                 }
             });
             if ordinary_text.is_some_and(|text| {
-                text.trim().is_empty()
-                    || serde_json::from_str::<serde_json::Value>(text).is_ok()
+                text.trim().is_empty() || serde_json::from_str::<serde_json::Value>(text).is_ok()
             }) {
                 continue;
             }
