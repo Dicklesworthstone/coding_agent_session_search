@@ -227,6 +227,55 @@ fn initial_source_failure_never_starts_quality_and_never_resumes() -> TestResult
 }
 
 #[test]
+fn hydrated_progressive_keeps_original_cancellation_after_context_replacement() -> TestResult {
+    let (_directory, conn, reader, fast, quality) = two_tiers()?;
+    let request = reader.activate_text(
+        "authentication middleware",
+        TextQueryProducers::Progressive {
+            fast: &fast,
+            quality: &quality,
+        },
+    )?;
+    let mut transaction = conn.transaction()?;
+    let cx = frankensearch::Cx::for_request();
+    let _original = frankensearch::Cx::set_current(Some(cx.clone()));
+    let mut phases = request.progressive_hydrated_in_transaction(
+        2,
+        None,
+        &transaction,
+        PassageProjection::RawPassagesV2,
+        HydrationBudget::default(),
+    )?;
+    let initial = phases.next().unwrap()?;
+    assert_eq!(initial.passages().len(), 2);
+    assert_eq!((fast.calls(), quality.calls()), (1, 0));
+
+    // A different live task on this thread cannot replace this stream's owner.
+    let next_request = frankensearch::Cx::for_request();
+    let _replacement = frankensearch::Cx::set_current(Some(next_request.clone()));
+    cx.cancel_with(asupersync::types::CancelKind::User, None);
+    assert!(matches!(
+        phases.next(),
+        Some(Err(HydratedSearchError::Hydration(
+            HydrationError::Cancelled
+        )))
+    ));
+    assert_eq!((fast.calls(), quality.calls()), (1, 0));
+    assert_eq!(
+        initial.source().coverage().phase,
+        SemanticResultPhase::Initial
+    );
+    assert_eq!(phases.size_hint(), (0, Some(0)));
+    assert!(phases.next().is_none());
+    assert!(phases.next().is_none());
+    assert!(!next_request.is_cancel_requested());
+    drop(phases);
+    transaction.query("SELECT 1")?;
+    transaction.rollback()?;
+    Ok(())
+}
+
+#[test]
 fn quality_inference_failure_cannot_relabel_initial_as_refined() -> TestResult {
     let (_directory, conn, reader, fast, quality) = two_tiers()?;
     quality.fail.store(true, Ordering::SeqCst);
