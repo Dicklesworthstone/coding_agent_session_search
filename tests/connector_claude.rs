@@ -40,7 +40,7 @@ fn gh553_claude_recovers_complete_turns_after_a_torn_prefix() {
             let sources = connector.discover_source_files(&context).unwrap();
             assert_eq!(sources.len(), 1);
             assert_eq!(sources[0].provider_slug, "claude_code");
-            let data_dir = context.data_dir.join("cass-data");
+            let data_dir = tempfile::tempdir().unwrap().keep();
             let mut diagnostics =
                 ConnectorIngestRun::begin(provider, &data_dir, &context, &sources);
             let mut conversations = connector.scan(&context).unwrap();
