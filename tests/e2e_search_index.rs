@@ -223,6 +223,30 @@ mod gh472 {
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0]["agent"], "pi_agent");
             assert_eq!(hits[0]["content"], "bravo marker two");
+            let database = fixture.data().join("agent_search.db");
+            let viewed = fixture.run(
+                &[
+                    "view",
+                    path.to_str().unwrap(),
+                    "-n",
+                    "3",
+                    "-C",
+                    "0",
+                    "--json",
+                    "--db",
+                    database.to_str().unwrap(),
+                ],
+                &overrides,
+            );
+            let lines = viewed.report["lines"].as_array().unwrap();
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0]["line"], 3);
+            let physical_line = if damaged {
+                middle.clone()
+            } else {
+                format!("{bom}{tool}")
+            };
+            assert_eq!(lines[0]["content"], physical_line);
             let exported = fixture.run(
                 &[
                     "export",

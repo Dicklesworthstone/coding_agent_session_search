@@ -937,11 +937,16 @@ impl ConnectorIngestRun {
             }
             let line = raw_line.as_slice();
             let text = std::str::from_utf8(line).ok();
-            // Match FAD's ordinary BOM handling without changing the raw
+            // Match FAD's ordinary JSONL normalization without changing the raw
             // recovery budget or the bytes retained as quarantine evidence.
             let ordinary_text = text.map(|text| {
                 if self.provider == "gemini" {
                     text.trim().trim_start_matches('\u{feff}')
+                } else if matches!(
+                    self.provider.as_str(),
+                    "codex" | "pi_durable" | "prime_agent"
+                ) {
+                    text.trim_start_matches('\u{feff}').trim()
                 } else if accepts_leading_bom {
                     text.trim_start_matches('\u{feff}')
                 } else {
@@ -1546,6 +1551,10 @@ mod tests {
             );
             let body = if provider == "gemini" {
                 format!("{body} \t\u{feff}{{\"type\":\"session\",\"id\":\"spaced-bom\"}}\n")
+            } else if matches!(provider, "codex" | "pi_durable" | "prime_agent") {
+                format!(
+                    "{body}\u{feff}\u{2003}{{\"type\":\"session\",\"id\":\"unicode-space\"}}\u{2003}\n\u{feff}\u{2003}\n"
+                )
             } else {
                 body.to_string()
             };
@@ -1574,7 +1583,7 @@ mod tests {
 
     #[test]
     fn gh553_unrecoverable_lines_keep_complete_quarantine_evidence() -> TestResult {
-        let cases: [(&str, &[u8]); 5] = [
+        let cases: [(&str, &[u8]); 6] = [
             (
                 "pi_agent",
                 br#"{"payload":{"role":"user","content":"nested"}"#,
@@ -1585,6 +1594,10 @@ mod tests {
             ),
             ("vibe", br#"torn{"role":"user","content":"complete"}"#),
             ("unknown_provider", b"\xef\xbb\xbf{\"intact\":true}"),
+            (
+                "vibe",
+                "\u{feff}\u{2003}{\"intact\":true}\u{2003}".as_bytes(),
+            ),
             (
                 "pi_agent",
                 b"invalid\xff{\"role\":\"user\",\"content\":\"complete\"}",
