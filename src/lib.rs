@@ -109313,7 +109313,7 @@ fn report_skipped_jsonl_lines(path: &Path, decoded: usize, skipped: &[SkippedJso
     if skipped.is_empty() {
         return;
     }
-    for line in skipped {
+    for line in skipped.iter().take(MAX_REPORTED_SKIPPED_JSONL_LINES) {
         tracing::warn!(
             source_path = %path.display(),
             line_no = line.line_number,

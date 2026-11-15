@@ -58,6 +58,7 @@ mod gh472 {
     struct Run {
         report: Value,
         events: Vec<Value>,
+        stderr: String,
     }
 
     impl Run {
@@ -329,6 +330,116 @@ mod gh472 {
         }
     }
 
+    #[test]
+    fn gh553_recovery_diagnostics_are_bounded_without_losing_records_or_totals() {
+        let prefix = r#"{"type":"message","message":{"content":[{"type":"thinking","thinkingSignature":"torn"#;
+        let invalid = "not json";
+        for recover in [false, true] {
+            for damaged_lines in [0_usize, 1, 5, 6, 64] {
+                let fixture = Fixture::new("gh553-warning-cap", "1");
+                let path = fixture.home.join("warning-cap.jsonl");
+                let mut body = String::from(
+                    "{\"type\":\"message\",\"id\":\"kept\",\"message\":{\"role\":\"user\",\"content\":\"intact warning control\"}}\n",
+                );
+                for index in 0..damaged_lines {
+                    if recover {
+                        let record = json!({"type":"message","id":format!("recovered-{index}"),
+                            "message":{"role":"toolResult","content":"recovered warning control"}});
+                        body.push_str(&format!("{prefix}{record}\n"));
+                    } else {
+                        body.push_str(invalid);
+                        body.push('\n');
+                    }
+                }
+                fs::write(&path, &body).unwrap();
+                let run = fixture.run(
+                    &[
+                        "export",
+                        path.to_str().unwrap(),
+                        "--format",
+                        "json",
+                        "--include-tools",
+                    ],
+                    &[],
+                );
+                let records = run.report.as_array().expect("actual JSON export");
+                assert_eq!(records.len(), 1 + if recover { damaged_lines } else { 0 });
+                assert_eq!(records[0]["id"], "kept");
+                if recover {
+                    for (index, record) in records.iter().skip(1).enumerate() {
+                        assert_eq!(record["id"], format!("recovered-{index}"));
+                        assert_eq!(record["message"]["content"], "recovered warning control");
+                    }
+                }
+                let warnings = run.events.iter().filter(|event| {
+                    event["fields"]["message"] == "session JSONL line failed to parse; retained complete records and skipped malformed bytes (GH #427 / GH #553)"
+                }).collect::<Vec<_>>();
+                assert_eq!(warnings.len(), damaged_lines.min(5), "{:?}", run.events);
+                for (index, warning) in warnings.iter().enumerate() {
+                    assert_eq!(warning["fields"]["line_no"], index + 2);
+                    assert_eq!(warning["fields"]["source_path"], path.to_str().unwrap());
+                    assert_eq!(warning["fields"]["recovered_records"], usize::from(recover));
+                    assert_eq!(
+                        warning["fields"]["discarded_bytes"],
+                        if recover { prefix.len() } else { invalid.len() }
+                    );
+                    assert_eq!(warning["fields"]["recovery_limited"], false);
+                }
+                assert_eq!(
+                    run.stderr
+                        .lines()
+                        .filter(|line| line.starts_with("warning:   line "))
+                        .count(),
+                    damaged_lines.min(5),
+                    "{}",
+                    run.stderr
+                );
+                if damaged_lines == 0 {
+                    assert!(!run.stderr.contains("warning: skipped"), "{}", run.stderr);
+                    assert!(!run.stderr.contains("warning: recovered"), "{}", run.stderr);
+                } else if recover {
+                    assert!(run.stderr.contains(&format!(
+                        "warning: recovered {damaged_lines} complete JSONL record(s) from {damaged_lines} malformed line(s)"
+                    )), "{}", run.stderr);
+                    assert!(
+                        run.stderr.contains(&format!(
+                            "skipped {} byte(s) and rendered {} record(s)",
+                            prefix.len() * damaged_lines,
+                            damaged_lines + 1
+                        )),
+                        "{}",
+                        run.stderr
+                    );
+                } else {
+                    assert!(
+                        run.stderr.contains(&format!(
+                            "warning: skipped {damaged_lines} malformed JSONL record(s)"
+                        )),
+                        "{}",
+                        run.stderr
+                    );
+                    assert!(
+                        run.stderr.contains("rendered the remaining 1 record(s)"),
+                        "{}",
+                        run.stderr
+                    );
+                }
+                if damaged_lines > 5 {
+                    assert!(
+                        run.stderr
+                            .contains(&format!("warning:   ... and {} more", damaged_lines - 5)),
+                        "{}",
+                        run.stderr
+                    );
+                } else {
+                    assert!(!run.stderr.contains("warning:   ... and"), "{}", run.stderr);
+                }
+                assert_eq!(fs::read_to_string(&path).unwrap(), body);
+                fixture.tracker.complete();
+            }
+        }
+    }
+
     impl Fixture {
         fn new(name: &str, streaming: &'static str) -> Self {
             let temp = tempfile::TempDir::new().expect("create isolated GH472 home");
@@ -472,7 +583,11 @@ mod gh472 {
                 })
                 .collect::<Vec<_>>();
             assert!(!events.is_empty(), "trace must contain real child events");
-            Run { report, events }
+            Run {
+                report,
+                events,
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            }
         }
 
         fn nightly(&self, overrides: &[(&str, &str)]) -> Run {
