@@ -377,13 +377,32 @@ mod gh472 {
                 assert_eq!(warnings.len(), damaged_lines.min(5), "{:?}", run.events);
                 for (index, warning) in warnings.iter().enumerate() {
                     assert_eq!(warning["fields"]["line_no"], index + 2);
-                    assert_eq!(warning["fields"]["source_path"], path.to_str().unwrap());
+                    let source = warning["fields"]["source_path"].as_str().unwrap();
+                    assert!(source.contains("[REDACTED_PATH]"), "{source}");
+                    assert!(!source.contains("warning-cap.jsonl"), "{source}");
+                    assert!(
+                        !source.contains(fixture.home.file_name().unwrap().to_str().unwrap()),
+                        "{source}"
+                    );
                     assert_eq!(warning["fields"]["recovered_records"], usize::from(recover));
                     assert_eq!(
                         warning["fields"]["discarded_bytes"],
                         if recover { prefix.len() } else { invalid.len() }
                     );
                     assert_eq!(warning["fields"]["recovery_limited"], false);
+                    assert_eq!(warning["fields"]["total_malformed_lines"], damaged_lines);
+                    assert_eq!(
+                        warning["fields"]["total_recovered_records"],
+                        if recover { damaged_lines } else { 0 }
+                    );
+                    assert_eq!(
+                        warning["fields"]["total_discarded_bytes"],
+                        (if recover { prefix.len() } else { invalid.len() }) * damaged_lines
+                    );
+                    assert_eq!(
+                        warning["fields"]["omitted_line_diagnostics"],
+                        damaged_lines.saturating_sub(5)
+                    );
                 }
                 assert_eq!(
                     run.stderr

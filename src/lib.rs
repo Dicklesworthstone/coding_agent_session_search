@@ -109313,6 +109313,12 @@ fn report_skipped_jsonl_lines(path: &Path, decoded: usize, skipped: &[SkippedJso
     if skipped.is_empty() {
         return;
     }
+    let recovered = skipped.iter().fold(0usize, |count, line| {
+        count.saturating_add(line.recovered_records)
+    });
+    let discarded = skipped.iter().fold(0usize, |count, line| {
+        count.saturating_add(line.discarded_bytes)
+    });
     for line in skipped.iter().take(MAX_REPORTED_SKIPPED_JSONL_LINES) {
         tracing::warn!(
             source_path = %path.display(),
@@ -109321,15 +109327,13 @@ fn report_skipped_jsonl_lines(path: &Path, decoded: usize, skipped: &[SkippedJso
             recovered_records = line.recovered_records,
             discarded_bytes = line.discarded_bytes,
             recovery_limited = line.recovery_limited,
+            total_malformed_lines = skipped.len(),
+            total_recovered_records = recovered,
+            total_discarded_bytes = discarded,
+            omitted_line_diagnostics = skipped.len().saturating_sub(MAX_REPORTED_SKIPPED_JSONL_LINES),
             "session JSONL line failed to parse; retained complete records and skipped malformed bytes (GH #427 / GH #553)"
         );
     }
-    let recovered = skipped.iter().fold(0usize, |count, line| {
-        count.saturating_add(line.recovered_records)
-    });
-    let discarded = skipped.iter().fold(0usize, |count, line| {
-        count.saturating_add(line.discarded_bytes)
-    });
     if recovered == 0 {
         eprintln!(
             "warning: skipped {} malformed JSONL record(s) in {}; rendered the remaining {} record(s)",
