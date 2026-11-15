@@ -109234,15 +109234,27 @@ use franken_agent_detection::connectors::jsonl::{
 };
 
 /// Parse a JSONL session for export, retaining intact records around malformed
-/// lines (GH #427) and conservatively recovering complete records appended
-/// after a torn prefix on the same line (GH #553). Only when no record decodes
+/// lines, including invalid UTF-8 (GH #427), and conservatively recovering
+/// complete records appended after a torn prefix on the same line (GH #553).
+/// Only when no record decodes
 /// is the file rejected, preserving the existing indexed-copy fallback.
 ///
 /// Connector ingestion and export share FAD's bounded suffix decoder; each
 /// interprets the resulting records for its own output. Export recovery alone
 /// does not prove that an archive has ingested those records.
 pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<TolerantJsonlParse> {
-    let lines = read_followup_file_lines(path)?;
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(path).map_err(|error| CliError {
+        code: 9,
+        kind: CliErrorKind::FileOpen.kind_str(),
+        message: format!("Failed to open file: {error}"),
+        hint: None,
+        retryable: false,
+    })?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut raw_line = Vec::new();
+    let mut line_number = 0;
     let mut messages = Vec::new();
     let mut session_start = None;
     let mut session_end = None;
@@ -109259,7 +109271,42 @@ pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<T
         messages.push(msg);
     };
 
-    for (line_index, line) in lines.into_iter().enumerate() {
+    loop {
+        raw_line.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut raw_line)
+            .map_err(|error| CliError {
+                code: 9,
+                kind: CliErrorKind::FileRead.kind_str(),
+                message: format!("Failed to read session file: {error}"),
+                hint: None,
+                retryable: false,
+            })?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_number += 1;
+        // Match std::io::Lines without conflating malformed UTF-8 with a
+        // genuine reader failure. Preserve a standalone CR on the final line.
+        if raw_line.last() == Some(&b'\n') {
+            raw_line.pop();
+            if raw_line.last() == Some(&b'\r') {
+                raw_line.pop();
+            }
+        }
+        let line = match std::str::from_utf8(&raw_line) {
+            Ok(line) => line,
+            Err(error) => {
+                skipped.push(SkippedJsonlLine {
+                    line_number,
+                    error: error.to_string(),
+                    recovered_records: 0,
+                    discarded_bytes: raw_line.len(),
+                    recovery_limited: false,
+                });
+                continue;
+            }
+        };
         // FAD accepts an optional leading BOM on intact JSONL records. Keep
         // the original line for malformed-suffix limits and byte offsets.
         let ordinary_line = line.trim_start_matches('\u{feff}');
@@ -109269,9 +109316,9 @@ pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<T
         match serde_json::from_str::<serde_json::Value>(ordinary_line) {
             Ok(msg) => append_message(msg),
             Err(err) => {
-                let recovery = recover_followup_jsonl_suffix(&line);
+                let recovery = recover_followup_jsonl_suffix(line);
                 skipped.push(SkippedJsonlLine {
-                    line_number: line_index + 1,
+                    line_number,
                     error: err.to_string(),
                     recovered_records: recovery.records.len(),
                     discarded_bytes: recovery.discarded_bytes,
@@ -109445,6 +109492,39 @@ mod gh427_tolerant_jsonl_tests {
                 .is_some_and(|h| h.contains("None of the 2")),
             "hint counts the undecodable lines: {:?}",
             err.hint
+        );
+    }
+
+    #[test]
+    fn gh553_invalid_utf8_only_is_rejected_without_masking_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid-utf8.jsonl");
+        let bytes = b"\xff\r\n\xfe\r";
+        std::fs::write(&path, bytes).unwrap();
+        let error = parse_followup_jsonl_messages_tolerant(&path).unwrap_err();
+        assert_eq!(error.code, 9);
+        assert_eq!(error.kind, CliErrorKind::SessionParse.kind_str());
+        assert!(error.message.contains("at line 1"));
+        assert!(error.hint.unwrap().contains("None of the 2"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        let empty = write_session(&dir, "empty.jsonl", "");
+        let (messages, start, end, skipped) =
+            parse_followup_jsonl_messages_tolerant(&empty).unwrap();
+        assert!(messages.is_empty() && skipped.is_empty());
+        assert_eq!((start, end), (None, None));
+
+        let missing =
+            parse_followup_jsonl_messages_tolerant(&dir.path().join("missing.jsonl")).unwrap_err();
+        assert_eq!(missing.kind, CliErrorKind::FileOpen.kind_str());
+        let unreadable = parse_followup_jsonl_messages_tolerant(dir.path()).unwrap_err();
+        assert_eq!(unreadable.code, 9);
+        assert!(
+            [
+                CliErrorKind::FileOpen.kind_str(),
+                CliErrorKind::FileRead.kind_str()
+            ]
+            .contains(&unreadable.kind)
         );
     }
 

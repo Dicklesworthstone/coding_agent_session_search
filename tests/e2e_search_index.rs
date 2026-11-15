@@ -459,6 +459,76 @@ mod gh472 {
         }
     }
 
+    #[test]
+    fn gh553_export_keeps_valid_records_around_invalid_utf8_physical_lines() {
+        let corrupt = b"\xff{\"role\":\"user\",\"content\":\"phantom corrupt record\"}";
+        let first = "\u{feff}{\"type\":\"message\",\"id\":\"first\",\"message\":{\"role\":\"user\",\"content\":\"intact caf\u{e9}\"}}";
+        let last = "{\"type\":\"message\",\"id\":\"last\",\"message\":{\"role\":\"assistant\",\"content\":\"intact \u{6771}\u{4eac}\"}}";
+        for (ending, final_ending) in [("\n", "\n"), ("\r\n", "\r\n"), ("\r\n", ""), ("\n", "\r")] {
+            for position in 0..3 {
+                let fixture = Fixture::new("gh553-invalid-utf8", "1");
+                let path = fixture.home.join("invalid-utf8.jsonl");
+                // The empty first physical line must still count in warnings.
+                let mut body = ending.as_bytes().to_vec();
+                let mut valid = [first, last].into_iter();
+                for index in 0..3 {
+                    if index == position {
+                        body.extend_from_slice(corrupt);
+                    } else {
+                        body.extend_from_slice(valid.next().unwrap().as_bytes());
+                    }
+                    body.extend_from_slice(
+                        if index == 2 { final_ending } else { ending }.as_bytes(),
+                    );
+                }
+                fs::write(&path, &body).unwrap();
+                let run = fixture.run(
+                    &[
+                        "export",
+                        path.to_str().unwrap(),
+                        "--format",
+                        "json",
+                        "--include-tools",
+                    ],
+                    &[],
+                );
+                let records = run.report.as_array().expect("actual JSON export");
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[0]["id"], "first");
+                assert_eq!(records[0]["message"]["content"], "intact caf\u{e9}");
+                assert_eq!(records[1]["id"], "last");
+                assert_eq!(records[1]["message"]["content"], "intact \u{6771}\u{4eac}");
+                assert!(!run.report.to_string().contains("phantom corrupt record"));
+                let warnings = run.events.iter().filter(|event| {
+                    event["fields"]["message"] == "session JSONL line failed to parse; retained complete records and skipped malformed bytes (GH #427 / GH #553)"
+                }).collect::<Vec<_>>();
+                assert_eq!(warnings.len(), 1, "{:?}", run.events);
+                let fields = &warnings[0]["fields"];
+                let discarded = corrupt.len() + usize::from(position == 2 && final_ending == "\r");
+                assert_eq!(fields["line_no"], position + 2);
+                assert!(fields["error"].as_str().unwrap().contains("utf-8"));
+                assert_eq!(fields["recovered_records"], 0);
+                assert_eq!(fields["discarded_bytes"], discarded);
+                assert_eq!(fields["recovery_limited"], false);
+                assert_eq!(fields["total_malformed_lines"], 1);
+                assert_eq!(fields["total_recovered_records"], 0);
+                assert_eq!(fields["total_discarded_bytes"], discarded);
+                assert_eq!(fields["omitted_line_diagnostics"], 0);
+                assert!(!warnings[0].to_string().contains("phantom corrupt record"));
+                let source = fields["source_path"].as_str().unwrap();
+                assert!(source.contains("[REDACTED_PATH]"), "{source}");
+                assert!(!source.contains("invalid-utf8.jsonl"), "{source}");
+                assert!(run.stderr.contains("rendered the remaining 2 record(s)"));
+                assert!(
+                    run.stderr
+                        .contains(&format!("warning:   line {}:", position + 2))
+                );
+                assert_eq!(fs::read(&path).unwrap(), body);
+                fixture.tracker.complete();
+            }
+        }
+    }
+
     impl Fixture {
         fn new(name: &str, streaming: &'static str) -> Self {
             let temp = tempfile::TempDir::new().expect("create isolated GH472 home");
