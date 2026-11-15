@@ -843,6 +843,10 @@ pub(crate) fn truth_table_from_state(
     let db = if !db_exists {
         // No canonical DB file yet — a fresh install, safe to build.
         CanonicalDbAvailability::Missing
+    } else if as_str("/database/integrity").as_deref() == Some("corrupt") {
+        // A successful open does not override a failed real-column probe.
+        // Preserve the probe's verdict instead of suggesting an index repair.
+        CanonicalDbAvailability::Corrupt
     } else if db_opened || db_open_skipped {
         // Opened for real, or the open was deliberately elided (health's fast
         // path) on a present file: treat the present DB as available.
@@ -1882,6 +1886,48 @@ mod tests {
         assert_eq!(table.binary, BinaryCompatibility::Current);
         assert!(table.is_searchable());
         assert_eq!(table.safe_next_command().action, SafeNextAction::None);
+    }
+
+    #[test]
+    fn bridge_live_corruption_overrides_successful_or_skipped_open() {
+        for (opened, skipped) in [(true, false), (false, true), (false, false)] {
+            for integrity in ["corrupt", "ok", "unknown"] {
+                let state = serde_json::json!({
+                    "database": {
+                        "exists": true,
+                        "opened": opened,
+                        "open_skipped": skipped,
+                        "integrity": integrity,
+                    },
+                    "index": { "exists": false },
+                    "rebuild": { "active": false },
+                });
+                let table = truth_table_from_state(
+                    &state,
+                    ReadinessSnapshot::new(
+                        LexicalReadinessState::Missing,
+                        SemanticReadinessState::Absent,
+                    ),
+                );
+                if integrity == "corrupt" {
+                    assert_eq!(table.db, CanonicalDbAvailability::Corrupt);
+                    assert_eq!(
+                        table.safe_next_command().action,
+                        SafeNextAction::InspectCanonicalDb
+                    );
+                    assert!(!table.safe_next_command().action.is_mutating());
+                    assert!(!table.is_searchable());
+                } else if opened || skipped {
+                    assert_eq!(table.db, CanonicalDbAvailability::Available);
+                    assert_eq!(
+                        table.safe_next_command().action,
+                        SafeNextAction::RepairLexical
+                    );
+                } else {
+                    assert_eq!(table.db, CanonicalDbAvailability::OpenFailed);
+                }
+            }
+        }
     }
 
     #[test]

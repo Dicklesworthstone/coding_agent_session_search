@@ -25310,8 +25310,14 @@ pub(crate) fn build_truth_table_from_state(
 fn print_human_readiness_section(
     state: &serde_json::Value,
     surface: crate::search::readiness_projection::SurfaceKind,
+    canonical_archive_corrupt: bool,
 ) {
-    let table = build_truth_table_from_state(state);
+    let mut table = build_truth_table_from_state(state);
+    if canonical_archive_corrupt {
+        // A matching structural failure can coexist with a successful bounded
+        // live probe. Gate advice without rewriting that probe's provenance.
+        table.db = crate::search::readiness::CanonicalDbAvailability::Corrupt;
+    }
     let summary = crate::search::human_readiness_summary::project_human_summary(&table, surface);
     if !summary.is_safe(table.archive_risk) {
         return;
@@ -89854,6 +89860,7 @@ fn run_status(
     print_human_readiness_section(
         &state,
         crate::search::readiness_projection::SurfaceKind::Status,
+        canonical_archive_corrupt,
     );
 
     Ok(())
@@ -89901,7 +89908,7 @@ struct TriageCoreReadiness {
 
 enum TriageReadinessWorkerMessage {
     Core(TriageCoreReadiness),
-    Complete(serde_json::Value),
+    Complete(serde_json::Value, bool),
 }
 
 fn triage_budget_fallback_state(
@@ -89959,9 +89966,13 @@ fn triage_readiness_state_with_hard_timeout(
     db_path: &Path,
     stale_threshold: u64,
     budget: &crate::robot_budget_envelope::RobotBudget,
-) -> (serde_json::Value, bool) {
+) -> (serde_json::Value, bool, bool) {
     let Some(timeout) = triage_remaining_operation_timeout(budget) else {
-        return (triage_budget_fallback_state(data_dir, db_path, None), true);
+        return (
+            triage_budget_fallback_state(data_dir, db_path, None),
+            true,
+            false,
+        );
     };
 
     let worker_data_dir = data_dir.to_path_buf();
@@ -89982,25 +89993,46 @@ fn triage_readiness_state_with_hard_timeout(
             maybe_test_triage_worker_delay("CASS_TEST_TRIAGE_STATE_DB_SLOW_MS");
             let state =
                 state_meta_json_for_status(&worker_data_dir, &worker_db_path, stale_threshold);
-            let _ = tx.send(TriageReadinessWorkerMessage::Complete(state));
+            // Keep filesystem-backed cached evidence inside the same hard
+            // deadline as the readiness probe; never load it on the caller.
+            let attested_integrity_failure = core.db_exists
+                && crate::search::storage_integrity::load_matching_integrity_attestation(
+                    &worker_data_dir,
+                    &worker_db_path,
+                )
+                .is_some_and(|attestation| {
+                    attestation.verdict
+                        == crate::search::storage_integrity::IntegrityAttestationVerdict::Fail
+                });
+            let _ = tx.send(TriageReadinessWorkerMessage::Complete(
+                state,
+                attested_integrity_failure,
+            ));
         })
     else {
-        return (triage_budget_fallback_state(data_dir, db_path, None), true);
+        return (
+            triage_budget_fallback_state(data_dir, db_path, None),
+            true,
+            false,
+        );
     };
 
     let wait_start = std::time::Instant::now();
     match rx.recv_timeout(timeout) {
-        Ok(TriageReadinessWorkerMessage::Complete(state)) => (state, false),
+        Ok(TriageReadinessWorkerMessage::Complete(state, failed)) => (state, false, failed),
         Ok(TriageReadinessWorkerMessage::Core(core)) => {
             let remaining = timeout.saturating_sub(wait_start.elapsed());
             if remaining.is_zero() {
                 (
                     triage_budget_fallback_state(data_dir, db_path, Some(core)),
                     true,
+                    false,
                 )
             } else {
                 match rx.recv_timeout(remaining) {
-                    Ok(TriageReadinessWorkerMessage::Complete(state)) => (state, false),
+                    Ok(TriageReadinessWorkerMessage::Complete(state, failed)) => {
+                        (state, false, failed)
+                    }
                     Ok(TriageReadinessWorkerMessage::Core(_))
                     | Err(
                         std::sync::mpsc::RecvTimeoutError::Timeout
@@ -90008,6 +90040,7 @@ fn triage_readiness_state_with_hard_timeout(
                     ) => (
                         triage_budget_fallback_state(data_dir, db_path, Some(core)),
                         true,
+                        false,
                     ),
                 }
             }
@@ -90015,7 +90048,11 @@ fn triage_readiness_state_with_hard_timeout(
         Err(
             std::sync::mpsc::RecvTimeoutError::Timeout
             | std::sync::mpsc::RecvTimeoutError::Disconnected,
-        ) => (triage_budget_fallback_state(data_dir, db_path, None), true),
+        ) => (
+            triage_budget_fallback_state(data_dir, db_path, None),
+            true,
+            false,
+        ),
     }
 }
 
@@ -90098,12 +90135,13 @@ fn run_triage(
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let triage_budget =
         crate::robot_budget_envelope::RobotBudget::new(triage_budget_ms(timeout_ms));
-    let (mut state, readiness_state_skipped) = triage_readiness_state_with_hard_timeout(
-        &data_dir,
-        &db_path,
-        stale_threshold,
-        &triage_budget,
-    );
+    let (mut state, readiness_state_skipped, attested_integrity_failure) =
+        triage_readiness_state_with_hard_timeout(
+            &data_dir,
+            &db_path,
+            stale_threshold,
+            &triage_budget,
+        );
     let mut hard_probe_timed_out = readiness_state_skipped;
     let mut skipped_sections = Vec::<String>::new();
     if readiness_state_skipped {
@@ -90232,12 +90270,18 @@ fn run_triage(
     let lexical_index_initialized = index_exists;
     let not_initialized =
         cass_not_initialized(db_exists, lexical_index_initialized, rebuild_active);
+    let canonical_archive_corrupt = attested_integrity_failure
+        || state
+            .pointer("/database/integrity")
+            .and_then(serde_json::Value::as_str)
+            == Some("corrupt");
     let observed_healthy = db_exists
         && db_available
         && index_exists
         && index_fresh
         && !rebuild_active
-        && !index_empty_with_messages;
+        && !index_empty_with_messages
+        && !canonical_archive_corrupt;
     let observed_status = if rebuild_stalled {
         "stalled"
     } else if rebuild_active {
@@ -90263,6 +90307,8 @@ fn run_triage(
         )
     } else if rebuild_active {
         Some("Index rebuild is already in progress".to_string())
+    } else if canonical_archive_corrupt {
+        Some(CANONICAL_ARCHIVE_CORRUPT_RECOMMENDED_ACTION.to_string())
     } else if not_initialized {
         Some(cass_not_initialized_recommended_action())
     } else if !db_exists {
@@ -90463,6 +90509,7 @@ fn run_triage(
         print_human_readiness_section(
             &state,
             crate::search::readiness_projection::SurfaceKind::Triage,
+            canonical_archive_corrupt,
         );
     }
 
@@ -90902,13 +90949,26 @@ fn run_health(
     let lexical_index_initialized = cass_lexical_index_initialized(&data_dir);
     let not_initialized =
         cass_not_initialized(db_exists, lexical_index_initialized, rebuild_active);
+    let canonical_archive_corrupt = state
+        .pointer("/database/integrity")
+        .and_then(serde_json::Value::as_str)
+        == Some("corrupt")
+        || (db_exists
+            && crate::search::storage_integrity::load_matching_integrity_attestation(
+                &data_dir, &db_path,
+            )
+            .is_some_and(|attestation| {
+                attestation.verdict
+                    == crate::search::storage_integrity::IntegrityAttestationVerdict::Fail
+            }));
     let healthy = db_exists
         && db_opened
         && index_exists
         && index_fresh
         && !rebuild_active
         && !index_empty_with_messages
-        && !ingest_quarantine_critical;
+        && !ingest_quarantine_critical
+        && !canonical_archive_corrupt;
     let explanation = if not_initialized {
         Some(cass_not_initialized_explanation(&data_dir))
     } else {
@@ -90923,6 +90983,8 @@ fn run_health(
         // recommendation text (src/lib.rs::run_status) so cass health and cass
         // status agree on the same operator-facing advice.
         Some("Index rebuild is already in progress".to_string())
+    } else if canonical_archive_corrupt {
+        Some(CANONICAL_ARCHIVE_CORRUPT_RECOMMENDED_ACTION.to_string())
     } else if not_initialized {
         Some(cass_not_initialized_recommended_action())
     } else if db_degraded {
@@ -90987,7 +91049,16 @@ fn run_health(
         errors.push("index rebuild in progress".to_string());
     }
     if index_empty_with_messages {
-        errors.push("index empty but database has messages — run 'cass index --full'".to_string());
+        errors.push(if canonical_archive_corrupt {
+            "index empty but database has messages — inspect the canonical archive before rebuilding".to_string()
+        } else {
+            "index empty but database has messages — run 'cass index --full'".to_string()
+        });
+    }
+    if canonical_archive_corrupt {
+        errors.push(
+            "canonical archive failed integrity validation; inspect before any repair".to_string(),
+        );
     }
     if ingest_quarantine_critical {
         errors.push("ingest quarantine circuit breaker active".to_string());
@@ -90998,7 +91069,7 @@ fn run_health(
         "stalled"
     } else if rebuild_active {
         "rebuilding"
-    } else if ingest_quarantine_critical {
+    } else if ingest_quarantine_critical || canonical_archive_corrupt {
         "unhealthy"
     } else if healthy {
         "healthy"
@@ -91207,6 +91278,7 @@ fn run_health(
         print_human_readiness_section(
             &state,
             crate::search::readiness_projection::SurfaceKind::Health,
+            canonical_archive_corrupt,
         );
     }
 

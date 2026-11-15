@@ -386,6 +386,57 @@ fn status_source_scan_currency_reports_overdue_disabled_unknown_and_noop() {
         "{human}"
     );
     assert!(human.contains("Do NOT run 'cass index'"), "{human}");
+    assert!(human.contains("db=corrupt"), "{human}");
+    assert!(!human.contains("cass index --full"), "{human}");
+
+    let assert_corruption_advice = |surface: &str| {
+        let output = cass().args([surface, "--json"]).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if surface == "health" { 1 } else { 0 }),
+            "{output:?}"
+        );
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["status"], "unhealthy", "{surface}: {payload}");
+        assert_eq!(payload["healthy"], false, "{surface}: {payload}");
+        assert!(
+            payload["recommended_action"]
+                .as_str()
+                .unwrap()
+                .contains("do NOT run 'cass index'"),
+            "{surface}: {payload}"
+        );
+        let commands = payload["recommended_commands"].as_array().unwrap();
+        assert_eq!(commands.len(), 1, "{surface}: {payload}");
+        assert_eq!(
+            commands[0]["id"], "inspect-archive-health",
+            "{surface}: {payload}"
+        );
+        assert_eq!(commands[0]["safety"], "read-only");
+        if surface == "triage" {
+            assert_eq!(payload["next_command"], commands[0]["command"]);
+            assert_ne!(
+                payload["readiness"]["database"]["integrity"], "corrupt",
+                "cached evidence must not relabel the live probe"
+            );
+        }
+        let human = cass().args(["--color", "never", surface]).output().unwrap();
+        assert_eq!(human.status.code(), output.status.code(), "{human:?}");
+        let human = String::from_utf8(human.stdout).unwrap();
+        assert!(human.contains("db=corrupt"), "{surface}: {human}");
+        assert!(!human.contains("cass index --full"), "{surface}: {human}");
+    };
+    for surface in ["health", "triage"] {
+        assert_corruption_advice(surface);
+    }
+    let binary_only = cass()
+        .args(["health", "--binary-only", "--json"])
+        .output()
+        .unwrap();
+    assert!(binary_only.status.success(), "{binary_only:?}");
+    let binary_only: Value = serde_json::from_slice(&binary_only.stdout).unwrap();
+    assert_eq!(binary_only["healthy"], false, "{binary_only}");
+    assert_eq!(binary_only["exit_policy"], "binary-only");
 
     // Preserve the real derived asset while testing the tempting full-rebuild
     // branch. An absent lexical index must never override known archive damage.
@@ -415,6 +466,9 @@ fn status_source_scan_currency_reports_overdue_disabled_unknown_and_noop() {
     assert!(human.contains("Do NOT run 'cass index'"), "{human}");
     assert!(!human.contains("run 'cass index --full'"), "{human}");
     assert!(!human.contains("Run 'cass index --full'"), "{human}");
+    for surface in ["status", "health", "triage"] {
+        assert_corruption_advice(surface);
+    }
     fs::rename(&retained_index, &index_path).unwrap();
 
     for invalidation in ["expired", "fingerprint-mismatch"] {
@@ -439,6 +493,26 @@ fn status_source_scan_currency_reports_overdue_disabled_unknown_and_noop() {
                 .all(|command| command["id"] != "inspect-archive-health"),
             "{invalidation}: {payload}"
         );
+        for surface in ["health", "triage"] {
+            let output = cass().args([surface, "--json"]).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{invalidation} {surface}: {output:?}"
+            );
+            let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                payload["healthy"], true,
+                "{invalidation} {surface}: {payload}"
+            );
+            assert!(
+                payload["recommended_commands"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|command| command["id"] != "inspect-archive-health"),
+                "{invalidation} {surface}: {payload}"
+            );
+        }
     }
     fs::write(&attestation_path, original_attestation).unwrap();
 
