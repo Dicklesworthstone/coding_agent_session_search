@@ -254,8 +254,6 @@ mod gh472 {
                     "--format",
                     "json",
                     "--include-tools",
-                    "--data-dir",
-                    data,
                 ],
                 &overrides,
             );
