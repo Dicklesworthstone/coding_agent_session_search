@@ -549,6 +549,12 @@
         "saved_at": null
       }
     },
+    "source_scan": {
+      "last_completed_at_ms": null,
+      "age_seconds": "[AGE_SECONDS]",
+      "interval_seconds": 300,
+      "overdue": null
+    },
     "ingest_quarantine": {
       "schema_version": 1,
       "status": "ok",

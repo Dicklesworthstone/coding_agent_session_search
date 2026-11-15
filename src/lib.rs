@@ -24794,6 +24794,11 @@ fn state_meta_json_inner(
                     .and_then(format_timestamp_millis_rfc3339),
             },
         },
+        "source_scan": crate::indexer::background_refresh::source_scan_currency_at(
+            last_scan_ts,
+            chrono::Utc::now().timestamp_millis(),
+            crate::indexer::background_refresh::source_scan_interval_from_env(),
+        ),
         "ingest_quarantine": ingest_quarantine_json,
         "policy_registry": policy_registry,
         "_meta": {
@@ -25536,6 +25541,9 @@ fn readiness_command_recommendation(
     })
 }
 
+const SOURCE_SCAN_OVERDUE_RECOMMENDED_ACTION: &str =
+    "Run 'cass index' to scan sources for new or changed sessions";
+
 fn readiness_recommended_commands(
     data_dir: &Path,
     db_path: &Path,
@@ -25653,10 +25661,37 @@ fn readiness_recommended_commands(
         return commands;
     }
 
+    if status == "degraded"
+        || (db_exists && !db_opened && !db_open_retryable)
+        || state
+            .pointer("/database/integrity")
+            .and_then(serde_json::Value::as_str)
+            == Some("corrupt")
+    {
+        commands.push(readiness_command_recommendation(
+            ReadinessCommandRecommendation {
+                id: "inspect-archive-health",
+                command: cass_dataset_command(data_dir, db_path, &["doctor", "--json"]),
+                purpose: "Inspect database/index health before choosing a repair path.",
+                safety: "read-only",
+                run_when: "Run when the database is unreadable or its integrity probe reports corruption.",
+                success_signal: "doctor JSON identifies repair-safe next actions",
+                parse_fields: &[
+                    "status",
+                    "health_class",
+                    "recommended_action",
+                    "checks",
+                    "operation_state",
+                ],
+                retry_after_ms: None,
+            },
+        ));
+        return commands;
+    }
+
     if index_engine_incompatible && !not_initialized && db_exists {
-        // Deterministic, known fix: no doctor inspection needed first, and an
-        // incremental `cass index` cannot help (it would refresh an index the
-        // engine cannot open).
+        // Repair derived assets only after the canonical-archive health guards.
+        // Incremental indexing cannot repair an unreadable legacy index.
         commands.push(readiness_command_recommendation(
             ReadinessCommandRecommendation {
                 id: "rebuild-lexical-index-for-current-engine",
@@ -25682,28 +25717,6 @@ fn readiness_recommended_commands(
                 run_when: "Run after rebuild-lexical-index-for-current-engine finishes.",
                 success_signal: "healthy=true or status changes to the next blocker",
                 parse_fields: &["status", "healthy", "index", "recommended_commands"],
-                retry_after_ms: None,
-            },
-        ));
-        return commands;
-    }
-
-    if status == "degraded" || (db_exists && !db_opened && !db_open_retryable) {
-        commands.push(readiness_command_recommendation(
-            ReadinessCommandRecommendation {
-                id: "inspect-archive-health",
-                command: cass_dataset_command(data_dir, db_path, &["doctor", "--json"]),
-                purpose: "Inspect database/index health before choosing a repair path.",
-                safety: "read-only",
-                run_when: "Run when the database exists but health/status cannot open it.",
-                success_signal: "doctor JSON identifies repair-safe next actions",
-                parse_fields: &[
-                    "status",
-                    "health_class",
-                    "recommended_action",
-                    "checks",
-                    "operation_state",
-                ],
                 retry_after_ms: None,
             },
         ));
@@ -25745,32 +25758,87 @@ fn readiness_recommended_commands(
         return commands;
     }
 
-    if (!index_fresh && state_index_status(state) != Some("unverified")) || pending_sessions > 0 {
+    // Only project the source-scan advice actually selected by the caller.
+    // Quarantine and corruption advice must keep priority even when a scan is old.
+    let source_scan_overdue = healthy
+        && recommended_action == Some(SOURCE_SCAN_OVERDUE_RECOMMENDED_ACTION)
+        && state
+            .pointer("/source_scan/overdue")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    if (!index_fresh && state_index_status(state) != Some("unverified"))
+        || pending_sessions > 0
+        || source_scan_overdue
+    {
         commands.push(readiness_command_recommendation(
             ReadinessCommandRecommendation {
-                id: "refresh-lexical-index",
+                id: if source_scan_overdue {
+                    "scan-sources"
+                } else {
+                    "refresh-lexical-index"
+                },
                 command: cass_dataset_command(
                     data_dir,
                     db_path,
                     &["index", "--json", "--no-progress-events"],
                 ),
-                purpose: "Index newly discovered sessions without a full rebuild.",
+                purpose: if source_scan_overdue {
+                    "Scan sources for new or changed sessions without a full rebuild."
+                } else {
+                    "Index newly discovered sessions without a full rebuild."
+                },
                 safety: "writes-cass-archive-and-derived-index",
-                run_when: "Run when the index is stale or pending.sessions is nonzero.",
-                success_signal: "success=true, then pending.sessions=0 and index.fresh=true",
+                run_when: if source_scan_overdue {
+                    "Run when source_scan.overdue=true and the archive is otherwise healthy."
+                } else {
+                    "Run when the index is stale or pending.sessions is nonzero."
+                },
+                success_signal: if source_scan_overdue {
+                    "success=true, then status reports source_scan.overdue=false"
+                } else {
+                    "success=true, then pending.sessions=0 and index.fresh=true"
+                },
                 parse_fields: &["success", "conversations", "messages", "error"],
                 retry_after_ms: None,
             },
         ));
         commands.push(readiness_command_recommendation(
             ReadinessCommandRecommendation {
-                id: "verify-refresh",
-                command: cass_dataset_command(data_dir, db_path, &["health", "--json"]),
-                purpose: "Confirm the refresh cleared the readiness blocker.",
+                id: if source_scan_overdue {
+                    "verify-source-scan"
+                } else {
+                    "verify-refresh"
+                },
+                command: cass_dataset_command(
+                    data_dir,
+                    db_path,
+                    if source_scan_overdue {
+                        &["status", "--json"]
+                    } else {
+                        &["health", "--json"]
+                    },
+                ),
+                purpose: if source_scan_overdue {
+                    "Read the completed source-scan watermark after the incremental index run."
+                } else {
+                    "Confirm the refresh cleared the readiness blocker."
+                },
                 safety: "read-only",
-                run_when: "Run after refresh-lexical-index finishes.",
-                success_signal: "healthy=true or recommended_commands changes to the next blocker",
-                parse_fields: &["status", "healthy", "state.index", "recommended_commands"],
+                run_when: if source_scan_overdue {
+                    "Run after scan-sources finishes."
+                } else {
+                    "Run after refresh-lexical-index finishes."
+                },
+                success_signal: if source_scan_overdue {
+                    "source_scan.overdue=false with a recorded last_completed_at_ms"
+                } else {
+                    "healthy=true or recommended_commands changes to the next blocker"
+                },
+                parse_fields: if source_scan_overdue {
+                    &["healthy", "source_scan", "index", "recommended_commands"]
+                } else {
+                    &["status", "healthy", "state.index", "recommended_commands"]
+                },
                 retry_after_ms: None,
             },
         ));
@@ -25995,6 +26063,98 @@ mod readiness_projection_tests {
             lexical_readiness_from_state(&ready, false),
             LexicalReadinessState::Ready
         );
+    }
+
+    #[test]
+    fn source_scan_currency_commands_preserve_higher_priority_advice() {
+        let data_dir = std::path::Path::new("/archive with spaces");
+        let db_path = data_dir.join("agent_search.db");
+        let mut state = json!({
+            "index": { "exists": true, "status": "ready", "fresh": true },
+            "database": { "exists": true, "opened": true },
+            "pending": { "sessions": 0 },
+            "source_scan": { "overdue": true },
+            "rebuild": { "active": false }
+        });
+        let advice = Some(super::SOURCE_SCAN_OVERDUE_RECOMMENDED_ACTION);
+        let commands = super::readiness_recommended_commands(
+            data_dir, &db_path, &state, "healthy", true, false, advice,
+        );
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0]["id"], "scan-sources");
+        assert_eq!(
+            commands[0]["command"],
+            "cass index --json --no-progress-events --data-dir '/archive with spaces'"
+        );
+        assert_eq!(commands[1]["id"], "verify-source-scan");
+        assert_eq!(
+            commands[1]["command"],
+            "cass status --json --data-dir '/archive with spaces'"
+        );
+        for other_advice in [
+            None,
+            Some("Inspect quarantined conversations before indexing"),
+        ] {
+            let commands = super::readiness_recommended_commands(
+                data_dir,
+                &db_path,
+                &state,
+                "healthy",
+                true,
+                false,
+                other_advice,
+            );
+            assert!(
+                commands
+                    .iter()
+                    .all(|command| command["id"] != "scan-sources")
+            );
+        }
+        state["rebuild"]["active"] = json!(true);
+        let commands = super::readiness_recommended_commands(
+            data_dir,
+            &db_path,
+            &state,
+            "rebuilding",
+            false,
+            false,
+            advice,
+        );
+        assert_eq!(commands[0]["id"], "poll-active-rebuild");
+        state["rebuild"]["active"] = json!(false);
+        state["database"]["opened"] = json!(false);
+        let commands = super::readiness_recommended_commands(
+            data_dir, &db_path, &state, "degraded", false, false, advice,
+        );
+        assert_eq!(commands[0]["id"], "inspect-archive-health");
+
+        state["index"]["engine_incompatible"] = json!(true);
+        let commands = super::readiness_recommended_commands(
+            data_dir, &db_path, &state, "degraded", false, false, advice,
+        );
+        assert_eq!(commands[0]["id"], "inspect-archive-health");
+
+        // An open connection can still discover corrupt table pages. Known
+        // corruption must beat both stale-index and legacy-engine repairs.
+        state["database"]["opened"] = json!(true);
+        state["database"]["integrity"] = json!("corrupt");
+        state["index"]["fresh"] = json!(false);
+        state["pending"]["sessions"] = json!(3);
+        for legacy in [false, true] {
+            state["index"]["engine_incompatible"] = json!(legacy);
+            let commands = super::readiness_recommended_commands(
+                data_dir,
+                &db_path,
+                &state,
+                "unhealthy",
+                false,
+                false,
+                Some("Recover the malformed archive before indexing"),
+            );
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0]["id"], "inspect-archive-health");
+            assert_eq!(commands[0]["safety"], "read-only");
+        }
     }
 
     #[test]
@@ -28811,6 +28971,10 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    One-shot agent preflight: readiness, next_command, recommended_commands, docs, schemas, workflows, and recoveries.".to_string(),
             "    Aliases: ready, preflight.".to_string(),
             "  cass status [--json] [--stale-threshold N] [--data-dir DIR]".to_string(),
+            "    healthy and index.fresh describe archive/index readiness, not source currency.".to_string(),
+            "    source_scan reports last_completed_at_ms, age_seconds, interval_seconds and overdue (null when unknown).".to_string(),
+            "    last_completed_at_ms is the start watermark of the last successfully completed scan; age is measured from that start.".to_string(),
+            "    An overdue scan recommends cass index on an otherwise healthy archive; CASS_AUTO_REFRESH_SOURCE_SCAN_SECS defaults to 300, and 0 disables the age check.".to_string(),
             "  cass diag [--json] [--verbose] [--data-dir DIR]".to_string(),
             "  cass sessions [--workspace DIR] [--current] [--limit N] [--since WHEN] [--json]"
                 .to_string(),
@@ -29078,6 +29242,8 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  Retrieval refusal: maintenance-required ends this attempt; do not rebuild, install models, or run broad aggregates to answer a quick history question. Check older-version help; never silently drop --no-maintenance.".to_string(),
             "  Evidence: expand useful source_path/line_number hits with `cass view PATH --message-index LINE_NUMBER --source SOURCE_ID --conversation-id CONVERSATION_ID -C 3 --json --timeout 2000`; preserve citations. Broaden scope or choose semantic refinement deliberately.".to_string(),
             "  Readiness: use `cass triage --json` for diagnosis, not as a prerequisite to every query. Review recommended mutations separately; cass health/status JSON remains the narrower readiness truth surface.".to_string(),
+            "  Source currency: check source_scan.overdue separately from healthy/index.fresh before concluding that recent sessions were scanned.".to_string(),
+            "  Source currency unknown: source_scan.overdue=null means unknown; interval_seconds=0 disables the age check. Status itself scans no sources.".to_string(),
             "  Doctor outcomes: branch on doctor.operation_outcome.kind (kebab-case) before prose; exit_code_kind says whether the outcome is success, health-failure, usage-error, lock-busy, or repair-failure.".to_string(),
             "  Doctor v2 schemas: use introspect.response_schemas doctor-* keys. First branch on err.kind/status/operation_outcome.kind/outcome_kind/asset_class/risk_level/fallback_mode; never scrape diagnostic prose.".to_string(),
             "  Doctor repairs: start with `cass doctor check --json`; use repair dry-run fingerprints for apply; support bundles and failure contexts report artifact_manifest_path/event_log_path instead of putting logs in stdout.".to_string(),
@@ -89021,6 +89187,11 @@ fn run_status(
         .and_then(|i| i.get("age_seconds"))
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    let source_scan = state.get("source_scan").cloned().unwrap_or_default();
+    let source_scan_overdue = source_scan
+        .get("overdue")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
     let is_stale = state
         .get("index")
         .and_then(|i| i.get("stale"))
@@ -89133,6 +89304,11 @@ fn run_status(
         .map(str::to_string);
     let live_integrity_corrupt = db_integrity == "corrupt";
     let mut warnings = Vec::<String>::new();
+    if source_scan_overdue {
+        warnings.push(
+            "Source scan is overdue; index.fresh describes the searchable index against the database, not whether source files have been checked recently".to_string(),
+        );
+    }
     if live_integrity_corrupt {
         warnings.push(db_integrity_hint.clone().unwrap_or_else(|| {
             "the canonical archive's stored pages are malformed (bounded real-column probe); do NOT run 'cass index' — run 'cass doctor --check' and recover first".to_string()
@@ -89260,6 +89436,8 @@ fn run_status(
         ))
     } else if quarantined_conversations > 0 || deferred_conversations > 0 {
         ingest_quarantine_recommended_action
+    } else if healthy && source_scan_overdue {
+        Some(SOURCE_SCAN_OVERDUE_RECOMMENDED_ACTION.to_string())
     } else {
         semantic_recommended_action(&state, not_initialized)
     };
@@ -89389,6 +89567,7 @@ fn run_status(
                 "integrity_detail": state.get("database").and_then(|d| d.get("integrity_detail")).cloned().unwrap_or(serde_json::Value::Null),
                 "integrity_hint": db_integrity_hint,
             }),
+            "source_scan": source_scan,
             "pending": state.get("pending").cloned().unwrap_or(serde_json::Value::Null),
             "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
             "rebuild_progress": rebuild_progress_summary_json(&state),
@@ -89452,6 +89631,8 @@ fn run_status(
     };
     let status_word = if rebuild_active {
         "Rebuilding"
+    } else if healthy && source_scan_overdue {
+        "Healthy (source scan overdue)"
     } else if healthy {
         "Healthy"
     } else if not_initialized {
@@ -89510,6 +89691,34 @@ fn run_status(
         println!("  Not found - run 'cass index --full'");
     }
 
+    println!();
+    println!("Source scan:");
+    if let Some(age) = source_scan
+        .get("age_seconds")
+        .and_then(serde_json::Value::as_u64)
+    {
+        println!("  Last completed scan started: {age} seconds ago");
+    } else {
+        println!("  Last completed: unknown");
+    }
+    match source_scan
+        .get("interval_seconds")
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(0) => println!("  Age check: disabled"),
+        Some(interval) if source_scan_overdue => {
+            println!("  Currency: OVERDUE (scan interval: {interval} seconds)");
+        }
+        Some(interval)
+            if source_scan
+                .get("overdue")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false) =>
+        {
+            println!("  Currency: within {interval}-second scan interval");
+        }
+        _ => println!("  Currency: unknown"),
+    }
     println!();
     println!("Database:");
     if live_integrity_corrupt {
@@ -102099,6 +102308,23 @@ fn response_schema_index_state() -> serde_json::Value {
     })
 }
 
+fn response_schema_source_scan() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Source discovery currency, independent of lexical index freshness and archive health. A null overdue value means no completed scan is known; interval_seconds=0 disables the age check.",
+        "required": ["last_completed_at_ms", "age_seconds", "interval_seconds", "overdue"],
+        "properties": {
+            "last_completed_at_ms": {
+                "type": ["integer", "null"], "minimum": 1,
+                "description": "Canonical last_scan_ts watermark in Unix milliseconds: the start time of the last successfully completed source scan, not its finish time."
+            },
+            "age_seconds": { "type": ["integer", "null"], "minimum": 0 },
+            "interval_seconds": { "type": "integer", "minimum": 0 },
+            "overdue": { "type": ["boolean", "null"] }
+        }
+    })
+}
+
 fn response_schema_ingest_quarantine() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -102551,6 +102777,7 @@ fn response_schema_state_meta() -> serde_json::Value {
         "type": "object",
         "properties": {
             "index": response_schema_index_state(),
+            "source_scan": response_schema_source_scan(),
             "database": response_schema_state_database(),
             "pending": response_schema_pending_state(),
             "rebuild": response_schema_rebuild_state(),
@@ -106063,6 +106290,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "recommended_commands": response_schema_recommended_commands(),
                 "index": response_schema_index_state(),
                 "database": response_schema_status_database(),
+                "source_scan": response_schema_source_scan(),
                 "pending": response_schema_pending_state(),
                 "rebuild": response_schema_rebuild_state(),
                 "rebuild_progress": response_schema_rebuild_progress(),
@@ -106217,6 +106445,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "recommended_commands": response_schema_recommended_commands(),
                 "index": response_schema_index_state(),
                 "database": response_schema_status_database(),
+                "source_scan": response_schema_source_scan(),
                 "pending": response_schema_pending_state(),
                 "rebuild": response_schema_rebuild_state(),
                 "rebuild_progress": response_schema_rebuild_progress(),

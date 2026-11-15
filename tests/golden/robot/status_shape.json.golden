@@ -180,6 +180,23 @@
         }
       }
     },
+    "source_scan": {
+      "type": "object",
+      "properties": {
+        "last_completed_at_ms": {
+          "type": "null"
+        },
+        "age_seconds": {
+          "type": "null"
+        },
+        "interval_seconds": {
+          "type": "integer"
+        },
+        "overdue": {
+          "type": "null"
+        }
+      }
+    },
     "pending": {
       "type": "object",
       "properties": {

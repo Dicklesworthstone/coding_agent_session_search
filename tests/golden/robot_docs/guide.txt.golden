@@ -15,6 +15,8 @@ guide:
   Retrieval refusal: maintenance-required ends this attempt; do not rebuild, install models, or run broad aggregates to answer a quick history question. Check older-version help; never silently drop --no-maintenance.
   Evidence: expand useful source_path/line_number hits with `cass view PATH --message-index LINE_NUMBER --source SOURCE_ID --conversation-id CONVERSATION_ID -C 3 --json --timeout 2000`; preserve citations. Broaden scope or choose semantic refinement deliberately.
   Readiness: use `cass triage --json` for diagnosis, not as a prerequisite to every query. Review recommended mutations separately; cass health/status JSON remains the narrower readiness truth surface.
+  Source currency: check source_scan.overdue separately from healthy/index.fresh before concluding that recent sessions were scanned.
+  Source currency unknown: source_scan.overdue=null means unknown; interval_seconds=0 disables the age check. Status itself scans no sources.
   Doctor outcomes: branch on doctor.operation_outcome.kind (kebab-case) before prose; exit_code_kind says whether the outcome is success, health-failure, usage-error, lock-busy, or repair-failure.
   Doctor v2 schemas: use introspect.response_schemas doctor-* keys. First branch on err.kind/status/operation_outcome.kind/outcome_kind/asset_class/risk_level/fallback_mode; never scrape diagnostic prose.
   Doctor repairs: start with `cass doctor check --json`; use repair dry-run fingerprints for apply; support bundles and failure contexts report artifact_manifest_path/event_log_path instead of putting logs in stdout.

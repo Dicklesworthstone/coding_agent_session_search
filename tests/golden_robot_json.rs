@@ -81,6 +81,9 @@ fn cass_cmd(test_home: &std::path::Path) -> Command {
         // fixture in place before these tests copied it; both writers are now
         // off.) Goldens observe a fixture, never a live refresh.
         .env("CASS_AUTO_REFRESH", "0")
+        // Source currency is public status metadata. Keep the fixture cadence
+        // independent of the host; cli_status exercises the actual default.
+        .env("CASS_AUTO_REFRESH_SOURCE_SCAN_SECS", "300")
         // Never probe or connect to a daemon owned by the host running the
         // golden suite. The default socket is user-global, while each golden
         // must observe only its synthetic HOME.
@@ -1220,6 +1223,12 @@ fn assert_golden(name: &str, actual: &str) {
         std::fs::create_dir_all(actual_path.parent().expect("golden diagnostic parent"))
             .expect("create golden diagnostic directory");
         std::fs::write(&actual_path, actual).expect("write .actual file");
+        // RCH retires source trees after returning. Opt in to retaining the
+        // scrubbed payload in its full log when reviewing fixture changes.
+        let dump_actual = std::env::var_os("CASS_GOLDEN_DUMP_ACTUAL");
+        if dump_actual.as_deref() == Some(std::ffi::OsStr::new("1")) {
+            eprintln!("[GOLDEN-ACTUAL-BEGIN:{name}]\n{actual}\n[GOLDEN-ACTUAL-END:{name}]");
+        }
         panic!(
             "GOLDEN MISMATCH: {name}\n\n\
              Expected: {}\n\

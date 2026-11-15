@@ -55996,6 +55996,81 @@
                             }
                           }
                         },
+                        "source_scan": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "description": {
+                              "type": "string"
+                            },
+                            "required": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "properties": {
+                              "type": "object",
+                              "properties": {
+                                "last_completed_at_ms": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "age_seconds": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "interval_seconds": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "overdue": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        },
                         "database": {
                           "type": "object",
                           "properties": {
@@ -63199,6 +63274,81 @@
                                     }
                                   }
                                 },
+                                "source_scan": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    },
+                                    "required": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "last_completed_at_ms": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            },
+                                            "description": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "age_seconds": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "interval_seconds": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "minimum": {
+                                              "type": "integer"
+                                            }
+                                          }
+                                        },
+                                        "overdue": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                },
                                 "database": {
                                   "type": "object",
                                   "properties": {
@@ -66423,6 +66573,81 @@
                           "properties": {
                             "type": {
                               "type": "string"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "source_scan": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "required": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "properties": {
+                      "type": "object",
+                      "properties": {
+                        "last_completed_at_ms": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "minimum": {
+                              "type": "integer"
+                            },
+                            "description": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "age_seconds": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "minimum": {
+                              "type": "integer"
+                            }
+                          }
+                        },
+                        "interval_seconds": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "minimum": {
+                              "type": "integer"
+                            }
+                          }
+                        },
+                        "overdue": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         }
@@ -71701,6 +71926,81 @@
                     }
                   }
                 },
+                "source_scan": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "required": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "properties": {
+                      "type": "object",
+                      "properties": {
+                        "last_completed_at_ms": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "minimum": {
+                              "type": "integer"
+                            },
+                            "description": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "age_seconds": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "minimum": {
+                              "type": "integer"
+                            }
+                          }
+                        },
+                        "interval_seconds": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "minimum": {
+                              "type": "integer"
+                            }
+                          }
+                        },
+                        "overdue": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
                 "pending": {
                   "type": "object",
                   "properties": {
@@ -76780,6 +77080,81 @@
                                   "properties": {
                                     "type": {
                                       "type": "string"
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "source_scan": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "description": {
+                              "type": "string"
+                            },
+                            "required": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "properties": {
+                              "type": "object",
+                              "properties": {
+                                "last_completed_at_ms": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "age_seconds": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "interval_seconds": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "overdue": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
                                     }
                                   }
                                 }

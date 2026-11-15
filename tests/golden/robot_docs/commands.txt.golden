@@ -54,6 +54,10 @@ commands:
     One-shot agent preflight: readiness, next_command, recommended_commands, docs, schemas, workflows, and recoveries.
     Aliases: ready, preflight.
   cass status [--json] [--stale-threshold N] [--data-dir DIR]
+    healthy and index.fresh describe archive/index readiness, not source currency.
+    source_scan reports last_completed_at_ms, age_seconds, interval_seconds and overdue (null when unknown).
+    last_completed_at_ms is the start watermark of the last successfully completed scan; age is measured from that start.
+    An overdue scan recommends cass index on an otherwise healthy archive; CASS_AUTO_REFRESH_SOURCE_SCAN_SECS defaults to 300, and 0 disables the age check.
   cass diag [--json] [--verbose] [--data-dir DIR]
   cass sessions [--workspace DIR] [--current] [--limit N] [--since WHEN] [--json]
   cass view <path> [-n LINE] [-C CONTEXT] [--json]

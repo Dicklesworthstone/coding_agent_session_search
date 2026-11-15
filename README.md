@@ -3257,6 +3257,19 @@ cass completions bash > ~/.bash_completion.d/cass
 
 ### Core Commands
 
+`status` separates archive readiness from source currency. `healthy` and
+`index.fresh` describe the archive and its searchable index; they do not prove
+that session files have been checked recently. The JSON `source_scan` block
+reports `last_completed_at_ms`, `age_seconds`, `interval_seconds`, and `overdue`.
+The timestamp is the canonical watermark: the start time of the last successfully
+completed source scan. Age is measured from that start, rather than its finish.
+An overdue scan appears in human output and recommends `cass index` when the
+archive is otherwise healthy. The interval follows
+`CASS_AUTO_REFRESH_SOURCE_SCAN_SECS` (default 300 seconds; `0` disables the age
+check). A missing or invalid completed-scan watermark is unknown (`null`), not
+proof of a recent scan. Status reads the recorded metadata without scanning
+session files or starting maintenance.
+
 | Command | Purpose |
 |---------|---------|
 | `cass` (default) | Start TUI (a stale index triggers a detached low-priority catch-up; see *Keeping the Index Fresh*) |
@@ -3269,7 +3282,7 @@ cass completions bash > ~/.bash_completion.d/cass
 | `pack --robot` | Deterministic cited answer packs for agent/human handoffs; reports health, freshness, privacy, and warnings |
 | `triage` / `ready` / `preflight` | One-shot agent preflight: readiness, exact next command, docs, schemas, workflows, and recoveries |
 | `guide [INTENT]` | Intent-to-command planner (fix-ci, investigate-search-miss, prepare-release, repair-assets, export-session, onboard-source, support-capsule); dry-run by default. With `--apply`, read-only operations evaluate proofs, and guarded adapters can create a support bundle, repair the lexical index or incrementally index staged configured sources. Unsupported operations are reported without being executed |
-| `status` / `state` | Health snapshot: index freshness, DB stats, recommended action |
+| `status` / `state` | Health snapshot: index freshness, completed source-scan age and overdue state, DB stats, recommended action |
 | `health` | Minimal health check (<50ms on a healthy archive; the strict, mutation-free owner-thread probe shared with `status` has a 30 s hard deadline and never checkpoints a dirty WAL), exit 0=healthy, 1=unhealthy |
 | `selftest` | Archive-independent executable probe for installers and binary-promotion gates; exercises an in-memory FrankenSQLite write/read round-trip |
 | `capabilities` | First-stop agent self-description: workflow recipes, mistake recoveries, commands, global flags, exit codes, env vars, and limits |

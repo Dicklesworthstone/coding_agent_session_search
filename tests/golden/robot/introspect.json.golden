@@ -30631,6 +30631,43 @@
                 }
               }
             },
+            "source_scan": {
+              "type": "object",
+              "description": "Source discovery currency, independent of lexical index freshness and archive health. A null overdue value means no completed scan is known; interval_seconds=0 disables the age check.",
+              "required": [
+                "last_completed_at_ms",
+                "age_seconds",
+                "interval_seconds",
+                "overdue"
+              ],
+              "properties": {
+                "last_completed_at_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1,
+                  "description": "Canonical last_scan_ts watermark in Unix milliseconds: the start time of the last successfully completed source scan, not its finish time."
+                },
+                "age_seconds": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0
+                },
+                "interval_seconds": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "overdue": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                }
+              }
+            },
             "database": {
               "type": "object",
               "properties": {
@@ -33780,6 +33817,43 @@
                     }
                   }
                 },
+                "source_scan": {
+                  "type": "object",
+                  "description": "Source discovery currency, independent of lexical index freshness and archive health. A null overdue value means no completed scan is known; interval_seconds=0 disables the age check.",
+                  "required": [
+                    "last_completed_at_ms",
+                    "age_seconds",
+                    "interval_seconds",
+                    "overdue"
+                  ],
+                  "properties": {
+                    "last_completed_at_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "minimum": 1,
+                      "description": "Canonical last_scan_ts watermark in Unix milliseconds: the start time of the last successfully completed source scan, not its finish time."
+                    },
+                    "age_seconds": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "minimum": 0
+                    },
+                    "interval_seconds": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "overdue": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    }
+                  }
+                },
                 "database": {
                   "type": "object",
                   "properties": {
@@ -35272,6 +35346,43 @@
             },
             "path": {
               "type": "string"
+            }
+          }
+        },
+        "source_scan": {
+          "type": "object",
+          "description": "Source discovery currency, independent of lexical index freshness and archive health. A null overdue value means no completed scan is known; interval_seconds=0 disables the age check.",
+          "required": [
+            "last_completed_at_ms",
+            "age_seconds",
+            "interval_seconds",
+            "overdue"
+          ],
+          "properties": {
+            "last_completed_at_ms": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1,
+              "description": "Canonical last_scan_ts watermark in Unix milliseconds: the start time of the last successfully completed source scan, not its finish time."
+            },
+            "age_seconds": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "interval_seconds": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "overdue": {
+              "type": [
+                "boolean",
+                "null"
+              ]
             }
           }
         },
@@ -37738,6 +37849,43 @@
             }
           }
         },
+        "source_scan": {
+          "type": "object",
+          "description": "Source discovery currency, independent of lexical index freshness and archive health. A null overdue value means no completed scan is known; interval_seconds=0 disables the age check.",
+          "required": [
+            "last_completed_at_ms",
+            "age_seconds",
+            "interval_seconds",
+            "overdue"
+          ],
+          "properties": {
+            "last_completed_at_ms": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1,
+              "description": "Canonical last_scan_ts watermark in Unix milliseconds: the start time of the last successfully completed source scan, not its finish time."
+            },
+            "age_seconds": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "interval_seconds": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "overdue": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          }
+        },
         "pending": {
           "type": "object",
           "properties": {
@@ -40137,6 +40285,43 @@
                 },
                 "inspected": {
                   "type": "boolean"
+                }
+              }
+            },
+            "source_scan": {
+              "type": "object",
+              "description": "Source discovery currency, independent of lexical index freshness and archive health. A null overdue value means no completed scan is known; interval_seconds=0 disables the age check.",
+              "required": [
+                "last_completed_at_ms",
+                "age_seconds",
+                "interval_seconds",
+                "overdue"
+              ],
+              "properties": {
+                "last_completed_at_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1,
+                  "description": "Canonical last_scan_ts watermark in Unix milliseconds: the start time of the last successfully completed source scan, not its finish time."
+                },
+                "age_seconds": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0
+                },
+                "interval_seconds": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "overdue": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
                 }
               }
             },

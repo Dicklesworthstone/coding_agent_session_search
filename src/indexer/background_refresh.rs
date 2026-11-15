@@ -298,6 +298,29 @@ pub fn source_scan_is_due(completed_at_ms: Option<i64>, now_ms: i64, threshold: 
     Duration::from_millis(u64::try_from(elapsed_ms).unwrap_or(u64::MAX)) >= threshold
 }
 
+/// Report source currency independently of lexical publication freshness.
+/// Missing or sentinel watermarks remain unknown; an explicitly disabled age
+/// trigger is never overdue. This uses metadata already read by status.
+pub(crate) fn source_scan_currency_at(
+    completed_at_ms: Option<i64>,
+    now_ms: i64,
+    interval: Duration,
+) -> serde_json::Value {
+    let completed_at_ms = completed_at_ms.filter(|value| *value > 0);
+    let age_seconds = completed_at_ms.map(|value| now_ms.saturating_sub(value).max(0) / 1_000);
+    let overdue = if interval.is_zero() {
+        Some(false)
+    } else {
+        completed_at_ms.map(|value| source_scan_is_due(Some(value), now_ms, interval))
+    };
+    serde_json::json!({
+        "last_completed_at_ms": completed_at_ms,
+        "age_seconds": age_seconds,
+        "interval_seconds": interval.as_secs(),
+        "overdue": overdue,
+    })
+}
+
 /// How recent another source scan must be for the resident daemon to skip a
 /// periodic index tick. The read-path cadence caps it, but the daemon's own
 /// `CASS_DAEMON_INDEX_INTERVAL_SECS` bounds it too: a 60 s interval must not
@@ -432,7 +455,7 @@ fn parse_source_scan_interval(value: &str) -> Option<Duration> {
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
-fn source_scan_interval_from_env() -> Duration {
+pub(crate) fn source_scan_interval_from_env() -> Duration {
     let default = Duration::from_secs(DEFAULT_SOURCE_SCAN_SECS);
     let Ok(value) = dotenvy::var("CASS_AUTO_REFRESH_SOURCE_SCAN_SECS") else {
         return default;
@@ -1256,6 +1279,55 @@ mod tests {
         assert_eq!(catch_up_reason(&missing), None);
         let rebuilding = serde_json::json!({"exists": true, "rebuilding": true, "stale": true});
         assert_eq!(catch_up_reason(&rebuilding), None);
+    }
+
+    #[test]
+    fn source_scan_currency_keeps_publication_age_and_unknown_watermarks_separate() {
+        for (completed, now, interval, expected_completed, age, overdue) in [
+            (
+                Some(1_000),
+                300_999,
+                300,
+                Some(1_000),
+                Some(299),
+                Some(false),
+            ),
+            (
+                Some(1_000),
+                301_000,
+                300,
+                Some(1_000),
+                Some(300),
+                Some(true),
+            ),
+            (
+                Some(301_001),
+                301_000,
+                300,
+                Some(301_001),
+                Some(0),
+                Some(false),
+            ),
+            (None, 301_000, 300, None, None, None),
+            (Some(0), 301_000, 300, None, None, None),
+            (Some(-1), 301_000, 300, None, None, None),
+            (None, 301_000, 0, None, None, Some(false)),
+            (Some(1_000), 301_000, 0, Some(1_000), Some(300), Some(false)),
+        ] {
+            assert_eq!(
+                source_scan_currency_at(completed, now, Duration::from_secs(interval)),
+                serde_json::json!({
+                    "last_completed_at_ms": expected_completed,
+                    "age_seconds": age,
+                    "interval_seconds": interval,
+                    "overdue": overdue,
+                }),
+                "completed={completed:?}, now={now}, interval={interval}"
+            );
+        }
+        let future = source_scan_currency_at(Some(i64::MAX), i64::MIN, Duration::from_secs(300));
+        assert_eq!(future["age_seconds"], 0);
+        assert_eq!(future["overdue"], false);
     }
 
     #[test]

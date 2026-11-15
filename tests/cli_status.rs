@@ -258,6 +258,220 @@ fn seed_active_rebuild_runtime(data_dir: &Path) -> std::fs::File {
 }
 
 #[test]
+fn status_source_scan_currency_reports_overdue_disabled_unknown_and_noop() {
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use serde_json::Value;
+
+    let mut builder = tempfile::Builder::new();
+    builder
+        .prefix("cass-source-currency-")
+        .disable_cleanup(true);
+    let tmp = builder.tempdir().unwrap();
+    let home = tmp.path();
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(home.join(".env"))
+        .unwrap();
+    let data = home.join("data");
+    let source = home.join(".codex/sessions/2025/11/25/rollout-test.jsonl");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    let original = include_str!("fixtures/codex_real/sessions/2025/11/25/rollout-test.jsonl");
+    fs::write(&source, original).unwrap();
+    let cass = || {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_SEMANTIC_DOWNLOAD_POLICY", "opt_in")
+            .env("FRANKENSEARCH_MODEL_DIR", "")
+            .env("RUST_MIN_STACK", "134217728")
+            .timeout(Duration::from_secs(30));
+        cmd
+    };
+    cass()
+        .args(["index", "--full", "--json", "--no-progress-events"])
+        .assert()
+        .success();
+    let hits = cass()
+        .args([
+            "search",
+            "soldier",
+            "--json",
+            "--mode",
+            "lexical",
+            "--fields",
+            "content",
+            "--no-maintenance",
+            "--no-daemon",
+            "--limit",
+            "3",
+        ])
+        .output()
+        .unwrap();
+    assert!(hits.status.success(), "{hits:?}");
+    let hits: Value = serde_json::from_slice(&hits.stdout).unwrap();
+    assert!(
+        hits["hits"].as_array().unwrap().iter().any(|hit| {
+            hit["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("soldier"))
+        }),
+        "populated archive control: {hits}"
+    );
+
+    let database = data.join("agent_search.db");
+    let overdue_at = chrono::Utc::now().timestamp_millis() - 84 * 86_400_000;
+    FrankenStorage::open(&database)
+        .unwrap()
+        .set_last_scan_ts(overdue_at)
+        .unwrap();
+    let old = cass().args(["status", "--json"]).output().unwrap();
+    assert!(old.status.success(), "{old:?}");
+    let old: Value = serde_json::from_slice(&old.stdout).unwrap();
+    assert_eq!(old["healthy"], true, "{old}");
+    assert_eq!(old["index"]["fresh"], true, "{old}");
+    assert_eq!(old["source_scan"]["last_completed_at_ms"], overdue_at);
+    assert!(old["source_scan"]["age_seconds"].as_u64().unwrap() >= 84 * 86_400);
+    assert_eq!(old["source_scan"]["interval_seconds"], 300);
+    assert_eq!(old["source_scan"]["overdue"], true);
+    assert!(
+        old["recommended_action"]
+            .as_str()
+            .unwrap()
+            .contains("scan sources"),
+        "{old}"
+    );
+    assert_eq!(old["recommended_commands"][0]["id"], "scan-sources");
+    assert!(
+        old["recommended_commands"][0]["command"]
+            .as_str()
+            .unwrap()
+            .starts_with("cass index --json --no-progress-events --data-dir ")
+    );
+    assert_eq!(old["recommended_commands"][1]["id"], "verify-source-scan");
+    assert!(
+        old["recommended_commands"][1]["command"]
+            .as_str()
+            .unwrap()
+            .starts_with("cass status --json --data-dir ")
+    );
+    let human = cass()
+        .args(["--color", "never", "status"])
+        .output()
+        .unwrap();
+    assert!(human.status.success(), "{human:?}");
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("Healthy (source scan overdue)"), "{human}");
+    assert!(human.contains("Currency: OVERDUE"), "{human}");
+    assert!(human.contains("scan sources"), "{human}");
+    assert_eq!(
+        FrankenStorage::open_readonly(&database)
+            .unwrap()
+            .get_last_scan_ts()
+            .unwrap(),
+        Some(overdue_at),
+        "status must not update the scan clock or start indexing"
+    );
+
+    for interval in ["0", "10000000"] {
+        let output = cass()
+            .env("CASS_AUTO_REFRESH_SOURCE_SCAN_SECS", interval)
+            .args(["status", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["source_scan"]["last_completed_at_ms"], overdue_at);
+        assert_eq!(
+            payload["source_scan"]["interval_seconds"],
+            interval.parse::<u64>().unwrap()
+        );
+        assert_eq!(payload["source_scan"]["overdue"], false);
+        assert!(
+            payload["recommended_commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|command| command["id"] != "scan-sources")
+        );
+        assert!(
+            !payload["recommended_action"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("scan sources")
+        );
+    }
+
+    FrankenStorage::open(&database)
+        .unwrap()
+        .set_last_scan_ts(0)
+        .unwrap();
+    let unknown = cass().args(["status", "--json"]).output().unwrap();
+    assert!(unknown.status.success(), "{unknown:?}");
+    let unknown: Value = serde_json::from_slice(&unknown.stdout).unwrap();
+    assert!(unknown["source_scan"]["last_completed_at_ms"].is_null());
+    assert!(unknown["source_scan"]["age_seconds"].is_null());
+    assert!(unknown["source_scan"]["overdue"].is_null());
+    assert!(
+        unknown["recommended_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|command| command["id"] != "scan-sources")
+    );
+
+    cass()
+        .args(["index", "--json", "--no-progress-events"])
+        .assert()
+        .success();
+    let recent = cass().args(["status", "--json"]).output().unwrap();
+    assert!(recent.status.success(), "{recent:?}");
+    let recent: Value = serde_json::from_slice(&recent.stdout).unwrap();
+    assert_eq!(recent["healthy"], true, "{recent}");
+    assert_eq!(recent["index"]["fresh"], true, "{recent}");
+    assert_eq!(recent["source_scan"]["overdue"], false);
+    assert!(recent["source_scan"]["age_seconds"].as_u64().unwrap() < 300);
+    assert!(
+        recent["recommended_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|command| command["id"] != "scan-sources")
+    );
+    assert!(
+        !recent["recommended_action"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("scan sources")
+    );
+    assert_eq!(fs::read_to_string(source).unwrap(), original);
+
+    let guide = cass().args(["robot-docs", "guide"]).output().unwrap();
+    assert!(guide.status.success(), "{guide:?}");
+    assert!(
+        String::from_utf8(guide.stdout)
+            .unwrap()
+            .contains("source_scan.overdue")
+    );
+}
+
+#[test]
 fn status_and_health_json_original_codex_full_plain_append_and_noop() {
     use serde_json::Value;
 

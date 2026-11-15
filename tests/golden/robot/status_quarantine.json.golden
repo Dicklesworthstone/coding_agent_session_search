@@ -59,6 +59,12 @@
     "integrity_detail": null,
     "integrity_hint": null
   },
+  "source_scan": {
+    "last_completed_at_ms": null,
+    "age_seconds": "[AGE_SECONDS]",
+    "interval_seconds": 300,
+    "overdue": null
+  },
   "pending": {
     "sessions": 0,
     "lexical_replay": null,
