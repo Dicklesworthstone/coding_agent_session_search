@@ -1026,3 +1026,332 @@ fn gh512_real_sidecar_appearance_before_admission_cannot_certify_an_untracked_fi
     assert_eq!(entries.len(), 1);
     Ok(())
 }
+
+struct DiagnosticLedgerScan {
+    conversations: Vec<NormalizedConversation>,
+    entries: Vec<crate::storage::sqlite::SourceIngestLedgerEntry>,
+    reused_sources: Vec<PathBuf>,
+    report: ConnectorIngestReport,
+    scan_error: Option<anyhow::Error>,
+}
+
+fn diagnostic_ledger_config(data_dir: PathBuf) -> StreamingProducerConfig {
+    StreamingProducerConfig {
+        source_ledger: Arc::new(HashMap::new()),
+        raw_source_exclusions: Arc::new(RawSourceExclusions::default()),
+        flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+        data_dir,
+        additional_scan_roots: Vec::new(),
+        local_connector_roots: None,
+        since_ts: None,
+        local_since_ts_by_connector: Arc::new(HashMap::new()),
+        progress: None,
+        active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
+    }
+}
+
+/// Exercise the production capture, source-admission, and diagnostic paths
+/// together. The callback injects a real file change after preparse discovery,
+/// without replacing the connector, ledger matcher, or source-completion hooks.
+fn collect_diagnostic_ledger_scan(
+    connector: &(dyn Connector + Send),
+    ctx: &ScanContext,
+    config: &StreamingProducerConfig,
+    name: &'static str,
+    before_scan: impl FnOnce() -> Result<()>,
+) -> Result<DiagnosticLedgerScan> {
+    let (mut diagnostics, active_skipped) = capture_connector_sources_before_parse(
+        connector,
+        ctx,
+        &config.data_dir,
+        name,
+        &ctx.scan_roots,
+        ctx.since_ts,
+        config.active_source_filter.as_ref(),
+        &config.raw_source_exclusions,
+    );
+    assert!(!active_skipped);
+    before_scan()?;
+    let limiter = Arc::clone(&config.flow_limiter);
+    let (tx, rx) = bounded(8);
+    let mut sender = StreamingBatchSender::new(&tx, Arc::clone(&limiter), name, true);
+    let scan_error =
+        scan_with_durable_source_boundaries(connector, ctx, config, &mut sender, |mut conv| {
+            diagnostics.observe_conversation(&mut conv);
+            Ok(Some(conv))
+        })
+        .err();
+    if let Some(error) = &scan_error {
+        let fallback = ctx
+            .scan_roots
+            .first()
+            .map_or(ctx.data_dir.as_path(), |root| root.path.as_path());
+        diagnostics.observe_connector_scan_error(fallback, error);
+    }
+    sender.flush()?;
+    let reused_sources = std::mem::take(&mut sender.reused_sources);
+    diagnostics.observe_reused_sources(reused_sources.iter().cloned());
+    let mut conversations = Vec::new();
+    let mut entries = Vec::new();
+    for message in rx.try_iter() {
+        match message {
+            IndexMessage::Batch {
+                conversations: batch,
+                byte_reservation,
+                ..
+            } => {
+                conversations.extend(batch);
+                limiter.release(byte_reservation);
+            }
+            IndexMessage::SourceComplete {
+                conversations: batch,
+                completion,
+                byte_reservation,
+                ..
+            } => {
+                conversations.extend(batch);
+                entries.push(completion);
+                limiter.release(byte_reservation);
+            }
+            _ => panic!("unexpected source producer message"),
+        }
+    }
+    Ok(DiagnosticLedgerScan {
+        conversations,
+        entries,
+        reused_sources,
+        report: diagnostics.finish(),
+        scan_error,
+    })
+}
+
+#[test]
+fn gh555_real_source_reuse_skips_repeated_jsonl_diagnostics() -> Result<()> {
+    use crate::connector_ingest_diagnostics::IngestFailureKind;
+
+    let temp = TempDir::new()?;
+    let path = temp.path().join("claude/projects/gh555/session.jsonl");
+    fs::create_dir_all(path.parent().unwrap())?;
+    // The real parser preserves this message and certifies the source despite
+    // the quarantined line. An eager diagnostic reread necessarily finds that
+    // line again, making duplicate inspection observable without timing tests.
+    let transcript = concat!(
+        "not-json\n",
+        "{\"type\":\"user\",\"sessionId\":\"gh555\",\"uuid\":\"message-1\",",
+        "\"timestamp\":\"2026-08-01T10:00:00Z\",\"cwd\":\"/work/gh555\",",
+        "\"message\":{\"role\":\"user\",\"content\":\"retained transcript\"}}\n",
+    );
+    fs::write(&path, transcript)?;
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir)?;
+    let ctx = ScanContext::with_roots(
+        data_dir.clone(),
+        vec![ScanRoot::local(path.clone())],
+        None,
+    );
+    let mut config = diagnostic_ledger_config(data_dir);
+    let connector = crate::connectors::claude_code::ClaudeCodeConnector::new();
+    let first = collect_diagnostic_ledger_scan(&connector, &ctx, &config, "claude", || Ok(()))?;
+    assert!(first.scan_error.is_none());
+    assert_eq!(first.conversations.len(), 1);
+    assert_eq!(first.entries.len(), 1);
+    assert_eq!(first.report.summary.partially_indexed, 1);
+    assert_eq!(first.report.diagnostics.len(), 1);
+    assert_eq!(
+        first.report.diagnostics[0].failure_kind,
+        IngestFailureKind::MalformedJsonLine
+    );
+    let messages = serde_json::to_value(&first.conversations[0].messages)?;
+    config.source_ledger = Arc::new(
+        first
+            .entries
+            .into_iter()
+            .map(|entry| (entry.key, entry.observation))
+            .collect(),
+    );
+
+    let next = collect_diagnostic_ledger_scan(&connector, &ctx, &config, "claude", || Ok(()))?;
+    assert!(next.scan_error.is_none());
+    if env!("CASS_SOURCE_INGEST_REUSE") == "true" {
+        assert_eq!(next.reused_sources, vec![path.clone()]);
+        assert!(next.conversations.is_empty());
+        assert!(next.entries.is_empty());
+        assert_eq!(next.report.summary.indexed, 1);
+        assert!(
+            next.report.diagnostics.is_empty(),
+            "an actually reused source must not be opened for duplicate JSONL diagnostics"
+        );
+    } else {
+        assert!(next.reused_sources.is_empty());
+        assert_eq!(next.conversations.len(), 1);
+        assert_eq!(next.report.summary.partially_indexed, 1);
+        assert_eq!(next.report.diagnostics.len(), 1);
+    }
+
+    // Matching file identity is insufficient after producer-contract drift:
+    // the real admission hook must reparse and diagnose the source again.
+    for observation in Arc::make_mut(&mut config.source_ledger).values_mut() {
+        let mut saved: serde_json::Value = serde_json::from_str(observation)?;
+        saved["producer_contract"] = serde_json::json!("gh555-obsolete-producer");
+        *observation = saved.to_string();
+    }
+    let replay = collect_diagnostic_ledger_scan(&connector, &ctx, &config, "claude", || Ok(()))?;
+    assert!(replay.scan_error.is_none());
+    assert!(replay.reused_sources.is_empty());
+    assert_eq!(replay.conversations.len(), 1);
+    assert_eq!(replay.entries.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&replay.conversations[0].messages)?,
+        messages
+    );
+    assert_eq!(replay.report.summary.partially_indexed, 1);
+    assert_eq!(replay.report.diagnostics.len(), 1);
+    assert_eq!(
+        replay.report.diagnostics[0].failure_kind,
+        IngestFailureKind::MalformedJsonLine
+    );
+    assert_eq!(fs::read_to_string(path)?, transcript);
+    Ok(())
+}
+
+#[test]
+fn gh555_primary_changed_after_capture_still_receives_diagnostics() -> Result<()> {
+    use crate::connector_ingest_diagnostics::IngestFailureKind;
+
+    let temp = TempDir::new()?;
+    let path = temp.path().join("claude/projects/gh555/session.jsonl");
+    fs::create_dir_all(path.parent().unwrap())?;
+    let transcript = concat!(
+        "{\"type\":\"user\",\"sessionId\":\"gh555\",\"uuid\":\"message-1\",",
+        "\"timestamp\":\"2026-08-01T10:00:00Z\",\"cwd\":\"/work/gh555\",",
+        "\"message\":{\"role\":\"user\",\"content\":\"retained transcript\"}}\n",
+    );
+    fs::write(&path, transcript)?;
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir)?;
+    let ctx = ScanContext::with_roots(
+        data_dir.clone(),
+        vec![ScanRoot::local(path.clone())],
+        None,
+    );
+    let mut config = diagnostic_ledger_config(data_dir);
+    let connector = crate::connectors::claude_code::ClaudeCodeConnector::new();
+    let first = collect_diagnostic_ledger_scan(&connector, &ctx, &config, "claude", || Ok(()))?;
+    assert!(first.scan_error.is_none());
+    assert_eq!(first.entries.len(), 1);
+    assert!(first.report.diagnostics.is_empty());
+    config.source_ledger = Arc::new(
+        first
+            .entries
+            .into_iter()
+            .map(|entry| (entry.key, entry.observation))
+            .collect(),
+    );
+
+    let changed = format!("not-json\n{transcript}");
+    let next = collect_diagnostic_ledger_scan(&connector, &ctx, &config, "claude", || {
+        fs::write(&path, &changed)?;
+        Ok(())
+    })?;
+    assert!(next.scan_error.is_none());
+    assert!(next.reused_sources.is_empty());
+    assert_eq!(next.conversations.len(), 1);
+    assert_eq!(next.entries.len(), 1);
+    assert_eq!(
+        next.conversations[0].messages[0].content,
+        "retained transcript"
+    );
+    assert_eq!(next.report.summary.partially_indexed, 1);
+    assert_eq!(next.report.diagnostics.len(), 1);
+    assert_eq!(
+        next.report.diagnostics[0].failure_kind,
+        IngestFailureKind::MalformedJsonLine
+    );
+    assert_eq!(next.report.diagnostics[0].line_or_row, Some(1));
+    assert_eq!(fs::read_to_string(path)?, changed);
+    Ok(())
+}
+
+#[test]
+fn gh555_failed_sibling_preserves_reuse_and_later_source_diagnostics() -> Result<()> {
+    use crate::connector_ingest_diagnostics::IngestFailureKind;
+
+    let temp = TempDir::new()?;
+    let paths = [
+        temp.path().join("rollout-a-unchanged.jsonl"),
+        temp.path().join("rollout-b-failing.jsonl"),
+        temp.path().join("rollout-c-changed.jsonl"),
+    ];
+    let message = |text: &str| {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {"role": "user", "content": text}
+            })
+        )
+    };
+    fs::write(&paths[0], format!("not-json\n{}", message("retained")))?;
+    fs::write(&paths[1], message("before failure"))?;
+    fs::write(&paths[2], message("before change"))?;
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir)?;
+    let ctx = ScanContext::with_roots(
+        data_dir.clone(),
+        paths.iter().cloned().map(ScanRoot::local).collect(),
+        None,
+    );
+    let mut config = diagnostic_ledger_config(data_dir);
+    let connector = crate::connectors::codex::CodexConnector::new();
+    let first = collect_diagnostic_ledger_scan(&connector, &ctx, &config, "codex", || Ok(()))?;
+    assert!(first.scan_error.is_none());
+    assert_eq!(first.conversations.len(), 3);
+    assert_eq!(first.entries.len(), 3);
+    assert_eq!(first.report.diagnostics.len(), 1);
+    config.source_ledger = Arc::new(
+        first
+            .entries
+            .into_iter()
+            .map(|entry| (entry.key, entry.observation))
+            .collect(),
+    );
+
+    // The real Codex adapter reports invalid UTF-8 as a typed source failure,
+    // continues to the following rollout, and withholds the failed receipt.
+    fs::write(&paths[1], b"\xff\n")?;
+    fs::write(&paths[2], message("new contribution"))?;
+    let next = collect_diagnostic_ledger_scan(&connector, &ctx, &config, "codex", || Ok(()))?;
+    assert!(next.scan_error.is_some());
+    let reuse_enabled = env!("CASS_SOURCE_INGEST_REUSE") == "true";
+    assert_eq!(next.conversations.len(), if reuse_enabled { 1 } else { 2 });
+    assert_eq!(next.entries.len(), next.conversations.len());
+    assert!(
+        next.conversations.iter().any(|conversation| {
+            conversation.source_path == paths[2]
+                && conversation.messages[0].content == "new contribution"
+        }),
+        "a failed source must not starve the later admitted rollout"
+    );
+    assert_eq!(next.report.summary.total(), 3);
+    assert_eq!(next.report.summary.with_content(), 2);
+    assert_eq!(next.report.summary.skipped, 1);
+    let failed_path = paths[1].display().to_string();
+    assert!(next.report.diagnostics.iter().any(|diagnostic| {
+        diagnostic.source_path == failed_path
+            && diagnostic.failure_kind == IngestFailureKind::UnparseableSource
+    }));
+    if reuse_enabled {
+        assert_eq!(next.reused_sources, vec![paths[0].clone()]);
+        assert!(
+            next.report
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.source_path == failed_path),
+            "the failed sibling must not trigger a diagnostic reread of a reused rollout"
+        );
+    } else {
+        assert!(next.reused_sources.is_empty());
+    }
+    assert_eq!(fs::read(&paths[1])?, b"\xff\n");
+    Ok(())
+}

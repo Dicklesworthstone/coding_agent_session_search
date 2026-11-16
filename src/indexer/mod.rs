@@ -39375,7 +39375,15 @@ fn capture_connector_sources_before_parse(
             (Vec::new(), Some(error))
         }
     };
-    let mut run = ConnectorIngestRun::begin(provider, data_dir, ctx, &observed_sources);
+    // GH #555: source-boundary scans decide reuse after this inventory. Wait
+    // for that actual decision before reading JSONL bodies for diagnostics.
+    // This shares the ledger's dependency/contract/exclusion checks instead
+    // of inventing a second freshness predicate ahead of source admission.
+    let mut run = if connector.supports_source_boundaries() {
+        ConnectorIngestRun::begin_deferred_jsonl(provider, data_dir, ctx, &observed_sources)
+    } else {
+        ConnectorIngestRun::begin(provider, data_dir, ctx, &observed_sources)
+    };
     if let Some(error) = discovery_error {
         // GH #511: discovery can fail before any transcript is returned. Keep
         // its I/O cause and the failed directory instead of blaming CASS's own

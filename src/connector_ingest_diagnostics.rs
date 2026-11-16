@@ -587,10 +587,18 @@ pub struct ConnectorIngestReport {
     pub diagnostics: Vec<ConnectorIngestDiagnostic>,
 }
 
+fn is_jsonl_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ObservedSource {
     disposition: SourceIngestDisposition,
     malformed: bool,
+    /// Cleared only by inspection or an actual source-ledger reuse event.
+    pending_jsonl: bool,
 }
 
 /// Mutable observation of one connector scan scope. It consumes the same
@@ -600,6 +608,9 @@ pub struct ConnectorIngestRun {
     provider: String,
     sources: BTreeMap<PathBuf, ObservedSource>,
     diagnostics: Vec<ConnectorIngestDiagnostic>,
+    /// Quarantine output belongs to CASS, even when the scan data dir is a
+    /// remote mirror or an explicit source root.
+    quarantine_data_dir: PathBuf,
     /// The scan context's data dir, for the single-store contexts below.
     scan_data_dir: PathBuf,
     /// Each discovered Pi durable store as a single-store scan root carrying
@@ -618,6 +629,29 @@ impl ConnectorIngestRun {
         data_dir: &Path,
         ctx: &ScanContext,
         sources: &[DiscoveredSourceFile],
+    ) -> Self {
+        Self::begin_with_jsonl_policy(provider, data_dir, ctx, sources, false)
+    }
+
+    /// Defer JSONL body reads until the connector's actual source decision.
+    /// An admitted or unresolved source is inspected; a ledger-reused source
+    /// is not read again. These diagnostics describe this run, not historical
+    /// findings from a source that the connector did not reread (GH #555).
+    pub fn begin_deferred_jsonl(
+        provider: &str,
+        data_dir: &Path,
+        ctx: &ScanContext,
+        sources: &[DiscoveredSourceFile],
+    ) -> Self {
+        Self::begin_with_jsonl_policy(provider, data_dir, ctx, sources, true)
+    }
+
+    fn begin_with_jsonl_policy(
+        provider: &str,
+        data_dir: &Path,
+        ctx: &ScanContext,
+        sources: &[DiscoveredSourceFile],
+        defer_jsonl: bool,
     ) -> Self {
         let durable_stores = if provider == "pi_durable" {
             sources
@@ -649,11 +683,13 @@ impl ConnectorIngestRun {
                         ObservedSource {
                             disposition: SourceIngestDisposition::Discovered,
                             malformed: false,
+                            pending_jsonl: defer_jsonl && is_jsonl_path(&source.source_path),
                         },
                     )
                 })
                 .collect(),
             diagnostics: Vec::new(),
+            quarantine_data_dir: data_dir.to_path_buf(),
             scan_data_dir: ctx.data_dir.clone(),
             durable_stores,
         };
@@ -661,7 +697,9 @@ impl ConnectorIngestRun {
         // parsing policy follows the conversations' provider (`claude_code`).
         let parser_provider = crate::connectors::archive_provider_slug(provider);
         for source in sources {
-            run.inspect_jsonl(data_dir, &source.source_path, parser_provider);
+            if !defer_jsonl {
+                run.inspect_jsonl(data_dir, &source.source_path, parser_provider);
+            }
             if provider == "cursor" {
                 run.inspect_cursor_database(&source.source_path);
             }
@@ -675,6 +713,21 @@ impl ConnectorIngestRun {
         run
     }
 
+    fn inspect_pending_jsonl_source(&mut self, path: &Path) {
+        let pending = self
+            .sources
+            .get_mut(path)
+            .is_some_and(|source| std::mem::take(&mut source.pending_jsonl));
+        if !pending {
+            return;
+        }
+        // Clear the flag before reading: an I/O failure calls observe_scan_error
+        // below, which must not recursively inspect the same source.
+        let data_dir = self.quarantine_data_dir.clone();
+        let parser_provider = crate::connectors::archive_provider_slug(&self.provider).to_owned();
+        self.inspect_jsonl(&data_dir, path, &parser_provider);
+    }
+
     /// Sources the scan skipped because the source ledger shows them
     /// unchanged since they were indexed. They count as indexed, and
     /// [`Self::finish`] does not re-read them.
@@ -685,7 +738,9 @@ impl ConnectorIngestRun {
             let source = self.sources.entry(path).or_insert(ObservedSource {
                 disposition: SourceIngestDisposition::Discovered,
                 malformed: false,
+                pending_jsonl: false,
             });
+            source.pending_jsonl = false;
             if source.disposition == SourceIngestDisposition::Discovered {
                 source.disposition = SourceIngestDisposition::Indexed;
             }
@@ -697,12 +752,14 @@ impl ConnectorIngestRun {
     /// just as they are in `observe_conversation`. Repeated callbacks must not
     /// inflate the count or erase content or a failure already observed.
     pub fn observe_excluded_source(&mut self, path: &Path) {
+        self.inspect_pending_jsonl_source(path);
         let source = self
             .sources
             .entry(path.to_path_buf())
             .or_insert(ObservedSource {
                 disposition: SourceIngestDisposition::Discovered,
                 malformed: false,
+                pending_jsonl: false,
             });
         if source.disposition == SourceIngestDisposition::Discovered {
             source.disposition = SourceIngestDisposition::Skipped;
@@ -711,12 +768,14 @@ impl ConnectorIngestRun {
 
     /// Record and harden one successfully parsed conversation.
     pub fn observe_conversation(&mut self, conversation: &mut NormalizedConversation) {
+        self.inspect_pending_jsonl_source(&conversation.source_path);
         let state = self
             .sources
             .entry(conversation.source_path.clone())
             .or_insert(ObservedSource {
                 disposition: SourceIngestDisposition::Discovered,
                 malformed: false,
+                pending_jsonl: false,
             });
         state.disposition = if state.malformed {
             SourceIngestDisposition::PartiallyIndexed
@@ -750,6 +809,7 @@ impl ConnectorIngestRun {
 
     /// Attach a scan-level error without converting it into a fake success.
     pub fn observe_scan_error(&mut self, source_path: &Path, error: impl std::fmt::Display) {
+        self.inspect_pending_jsonl_source(source_path);
         let kind = if is_database_lock_message(&error.to_string()) {
             IngestFailureKind::SourceLocked
         } else {
@@ -761,6 +821,7 @@ impl ConnectorIngestRun {
             ObservedSource {
                 disposition: diagnostic.disposition,
                 malformed: false,
+                pending_jsonl: false,
             },
         );
         self.diagnostics.push(diagnostic);
@@ -818,6 +879,9 @@ impl ConnectorIngestRun {
     }
 
     fn observe_source_failure(&mut self, path: &Path, kind: IngestFailureKind) {
+        // Keep the eager ordering: line findings precede the connector's final
+        // typed failure, so a late inspection cannot overwrite that failure.
+        self.inspect_pending_jsonl_source(path);
         let mut diagnostic = classify_path(&self.provider, path, kind);
         let state = self
             .sources
@@ -825,6 +889,7 @@ impl ConnectorIngestRun {
             .or_insert(ObservedSource {
                 disposition: SourceIngestDisposition::Discovered,
                 malformed: false,
+                pending_jsonl: false,
             });
         // A post-delivery observation error cannot erase content already
         // retained from this source. Nor can a failure at one path replace a
@@ -845,6 +910,17 @@ impl ConnectorIngestRun {
     /// Stores that yielded conversations are not read again.
     #[must_use]
     pub fn finish(mut self) -> ConnectorIngestReport {
+        // Sources yielding no conversation or failure still need diagnostics.
+        // Reuse clears the flag only after the real ledger admission decided.
+        let pending: Vec<_> = self
+            .sources
+            .iter()
+            .filter(|(_, source)| source.pending_jsonl)
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in pending {
+            self.inspect_pending_jsonl_source(&path);
+        }
         self.inspect_unproductive_durable_stores();
         let mut summary = ProviderIngestSummary::default();
         for source in self.sources.values() {
@@ -916,6 +992,7 @@ impl ConnectorIngestRun {
                 ObservedSource {
                     disposition: diagnostic.disposition,
                     malformed: false,
+                    pending_jsonl: false,
                 },
             );
             self.diagnostics.push(diagnostic);
@@ -923,11 +1000,7 @@ impl ConnectorIngestRun {
     }
 
     fn inspect_jsonl(&mut self, data_dir: &Path, path: &Path, parser_provider: &str) {
-        let is_jsonl = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"));
-        if !is_jsonl {
+        if !is_jsonl_path(path) {
             return;
         }
         let file = match std::fs::File::open(path) {
@@ -938,9 +1011,9 @@ impl ConnectorIngestRun {
             }
         };
         let read_bytes = if parser_provider == "codex" {
-            // Diagnostics run before source admission. Do not read or allocate
-            // a body the connector will reject, or invent corruption evidence
-            // when its admission policy is invalid. Its scan reports the cause.
+            // Diagnostics may run before or after source admission. Do not
+            // read a body beyond the connector budget or invent corruption
+            // evidence when its policy is invalid. Its scan reports the cause.
             let Ok(limit) = crate::connectors::codex::source_read_budget(path) else {
                 return;
             };
@@ -1131,6 +1204,7 @@ impl ConnectorIngestRun {
                         ObservedSource {
                             disposition: diagnostic.disposition,
                             malformed: false,
+                            pending_jsonl: false,
                         },
                     );
                     self.diagnostics.push(diagnostic);
@@ -1805,6 +1879,177 @@ mod tests {
             std::fs::read_to_string(temp.path().join("quarantine/connector_ingest_lines.json"))?;
         verify!(!quarantine.contains("{broken}"), "payload must never leak");
         verify!(quarantine.contains("payload_blake3"));
+        Ok(())
+    }
+
+    #[test]
+    fn gh555_reused_jsonl_is_not_opened_but_unresolved_siblings_are_inspected() -> TestResult {
+        let temp = tempdir()?;
+        let reused = temp.path().join("not-opened.jsonl");
+        let unresolved = temp.path().join("unresolved.jsonl");
+        std::fs::write(&unresolved, b"{broken}\n")?;
+        let root = ScanRoot::local(temp.path().to_path_buf());
+        let sources: Vec<_> = [&reused, &unresolved]
+            .into_iter()
+            .map(|path| {
+                DiscoveredSourceFile::new(
+                    "claude_code",
+                    &root,
+                    path.to_path_buf(),
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    true,
+                )
+            })
+            .collect();
+        let ctx = ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+        let mut run = ConnectorIngestRun::begin_deferred_jsonl(
+            "claude",
+            temp.path(),
+            &ctx,
+            &sources,
+        );
+        // The absent path is an I/O sentinel for this observer test. The
+        // indexer integration tests separately exercise actual ledger reuse.
+        run.observe_reused_sources([reused.clone(), reused.clone()]);
+        let report = run.finish();
+        verify_eq!(report.summary.total(), 2);
+        verify_eq!(report.summary.indexed, 1);
+        verify_eq!(report.summary.quarantined, 1);
+        verify_eq!(report.diagnostics.len(), 1);
+        verify_eq!(
+            report.diagnostics[0].source_path,
+            unresolved.display().to_string()
+        );
+        verify_eq!(
+            report.diagnostics[0].failure_kind,
+            IngestFailureKind::MalformedJsonLine
+        );
+        let control =
+            ConnectorIngestRun::begin("claude", temp.path(), &ctx, &sources[..1]).finish();
+        verify_eq!(control.summary.skipped, 1);
+        verify_eq!(control.diagnostics.len(), 1);
+        verify_eq!(
+            control.diagnostics[0].failure_kind,
+            IngestFailureKind::UnreadableSource
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gh555_deferred_diagnostics_preserve_unreused_outcome_precedence() -> TestResult {
+        for outcome in [
+            "unproductive",
+            "productive",
+            "source_changed",
+            "scan_error",
+            "excluded",
+            "productive_then_failure",
+        ] {
+            let temp = tempdir()?;
+            let path = temp.path().join("mixed.jsonl");
+            std::fs::write(&path, b"{\"ok\":1}\n{broken}\n{\"ok\":2}\n")?;
+            let root = ScanRoot::local(temp.path().to_path_buf());
+            let source = DiscoveredSourceFile::new(
+                "claude_code",
+                &root,
+                path.clone(),
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            );
+            let ctx = ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+            let mut reports = Vec::new();
+            for deferred in [false, true] {
+                let mut run = if deferred {
+                    ConnectorIngestRun::begin_deferred_jsonl(
+                        "claude",
+                        temp.path(),
+                        &ctx,
+                        std::slice::from_ref(&source),
+                    )
+                } else {
+                    ConnectorIngestRun::begin(
+                        "claude",
+                        temp.path(),
+                        &ctx,
+                        std::slice::from_ref(&source),
+                    )
+                };
+                if matches!(outcome, "productive" | "productive_then_failure") {
+                    let mut conversation = NormalizedConversation {
+                        agent_slug: "claude_code".into(),
+                        external_id: Some("mixed".into()),
+                        title: None,
+                        workspace: None,
+                        source_path: path.clone(),
+                        started_at: None,
+                        ended_at: None,
+                        metadata: json!({}),
+                        messages: Vec::new(),
+                    };
+                    run.observe_conversation(&mut conversation);
+                }
+                match outcome {
+                    "source_changed" | "productive_then_failure" => {
+                        run.observe_source_failure(&path, IngestFailureKind::SourceChanged);
+                    }
+                    "scan_error" => run.observe_scan_error(&path, "source read failed"),
+                    "excluded" => run.observe_excluded_source(&path),
+                    _ => {}
+                }
+                reports.push(run.finish());
+            }
+            verify_eq!(
+                serde_json::to_value(&reports[0])?,
+                serde_json::to_value(&reports[1])?,
+                "deferred inspection changed the {outcome} report"
+            );
+            verify_eq!(reports[1].diagnostics[0].line_or_row, Some(2));
+            verify_eq!(
+                reports[1].diagnostics[0].failure_kind,
+                IngestFailureKind::MalformedJsonLine
+            );
+            let expected_findings =
+                if matches!(outcome, "source_changed" | "scan_error" | "productive_then_failure") {
+                    2
+                } else {
+                    1
+                };
+            verify_eq!(reports[1].diagnostics.len(), expected_findings);
+            if matches!(outcome, "productive" | "productive_then_failure") {
+                verify_eq!(reports[1].summary.partially_indexed, 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gh555_deferred_read_errors_do_not_recurse_or_replace_connector_failure() -> TestResult {
+        let temp = tempdir()?;
+        let path = temp.path().join("missing.jsonl");
+        let root = ScanRoot::local(temp.path().to_path_buf());
+        let source = DiscoveredSourceFile::new(
+            "codex",
+            &root,
+            path.clone(),
+            DiscoveredSourceRole::PrimarySessionLog,
+            true,
+        );
+        let ctx = ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+        let mut run =
+            ConnectorIngestRun::begin_deferred_jsonl("codex", temp.path(), &ctx, &[source]);
+        run.observe_source_failure(&path, IngestFailureKind::SourceMissing);
+        let report = run.finish();
+        verify_eq!(report.summary.total(), 1);
+        verify_eq!(report.summary.skipped, 1);
+        verify_eq!(report.diagnostics.len(), 2);
+        verify_eq!(
+            report.diagnostics[0].failure_kind,
+            IngestFailureKind::UnreadableSource
+        );
+        verify_eq!(
+            report.diagnostics[1].failure_kind,
+            IngestFailureKind::SourceMissing
+        );
         Ok(())
     }
 
