@@ -26,7 +26,8 @@ pub fn covered_semantic_record(
 struct CoveredSemanticSelection {
     record: ArtifactRecord,
     certificate: SemanticCoverageCertificate,
-    ann_path: Option<PathBuf>,
+    declared_ann_path: Option<PathBuf>,
+    ann_declared_ready: bool,
 }
 
 fn select_covered_semantic_record(
@@ -59,15 +60,19 @@ fn select_covered_semantic_record(
     // The optional accelerator must come from the SAME ledger read and tier
     // as the certified vector owner. Never rediscover a conventional filename.
     // Its native graph/source binding is still admitted by SearchClient.
-    let ann_path = manifest
+    let ann = manifest
         .hnsw
         .as_ref()
-        .filter(|ann| ann.ready && ann.base_tier == record.tier && ann.embedder_id == embedder_id)
-        .and_then(|ann| semantic_sidecar_path(data_dir, &ann.index_path));
+        .filter(|ann| ann.base_tier == record.tier && ann.embedder_id == embedder_id);
+    // Revocation prevents serving, but does not remove the declared entry.
+    // Diagnostics must retain presence without advertising native readiness.
+    let declared_ann_path = ann.and_then(|ann| semantic_sidecar_path(data_dir, &ann.index_path));
+    let ann_declared_ready = ann.is_some_and(|ann| ann.ready);
     Ok(Some(CoveredSemanticSelection {
         record: record.clone(),
         certificate: certificate.clone(),
-        ann_path,
+        declared_ann_path,
+        ann_declared_ready,
     }))
 }
 
@@ -200,7 +205,8 @@ pub(super) fn load_context(
     let CoveredSemanticSelection {
         record,
         certificate,
-        ann_path,
+        declared_ann_path,
+        ann_declared_ready,
     } = selected;
     let storage = if strict_read_only {
         FrankenStorage::open_strict_readonly(db_path)
@@ -209,9 +215,13 @@ pub(super) fn load_context(
     }
     .map_err(|error| format!("semantic archive: {error}"))?;
     let snapshot = archive_snapshot(&storage, &certificate)?;
-    let ann_path = ann_path.filter(|path| {
-        crate::search::semantic_manifest::selection::optional_ann_path_is_safe(data_dir, path)
-    });
+    let ann_path = if ann_declared_ready {
+        declared_ann_path.filter(|path| {
+            crate::search::semantic_manifest::selection::optional_ann_path_is_safe(data_dir, path)
+        })
+    } else {
+        None
+    };
     let artifact = authenticate_artifact(
         data_dir,
         &record,
@@ -264,7 +274,8 @@ pub(crate) fn observe_covered_semantic_artifact(
     let CoveredSemanticSelection {
         record,
         certificate,
-        ann_path,
+        declared_ann_path,
+        ..
     } = selected;
     let snapshot = archive_snapshot(storage, &certificate)?;
     authenticate_artifact(
@@ -279,6 +290,6 @@ pub(crate) fn observe_covered_semantic_artifact(
     Ok(Some(CoveredSemanticObservation {
         record,
         coverage: snapshot,
-        ann_path,
+        ann_path: declared_ann_path,
     }))
 }

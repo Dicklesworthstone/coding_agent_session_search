@@ -134,6 +134,11 @@ fn certified_semantic_cli_uses_manifest_ann_and_rejects_invalid_pairing()
 
     let manifest_path = data.join("vector_index/semantic_manifest.json");
     let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let conventional_path = data.join(
+        manifest["hnsw"]["index_path"]
+            .as_str()
+            .ok_or("missing conventional graph path")?,
+    );
     let vector_path = data.join(
         manifest["fast_tier"]["index_path"]
             .as_str()
@@ -203,17 +208,40 @@ fn certified_semantic_cli_uses_manifest_ann_and_rejects_invalid_pairing()
     assert!(HnswIndex::try_load_native(&outside, &vectors)?.is_some());
     let parent_alias = data.join("vector_index/aliased-parent");
     std::os::unix::fs::symlink(root, &parent_alias)?;
-    for (field, value) in [
-        ("ready", json!(false)),
-        ("base_tier", json!("quality")),
-        ("embedder_id", json!("minilm-384")),
-        ("index_path", json!("vector_index/missing-native.chsw")),
-        ("index_path", json!("../outside-native.chsw")),
-        ("index_path", json!(selected_path.to_string_lossy())),
-        ("index_path", json!("vector_index/aliased-native.chsw")),
+    for (field, value, declared, present) in [
+        ("ready", json!(false), Some(selected_path.clone()), true),
+        ("base_tier", json!("quality"), None, false),
+        ("embedder_id", json!("minilm-384"), None, false),
+        (
+            "index_path",
+            json!("vector_index/missing-native.chsw"),
+            Some(data.join("vector_index/missing-native.chsw")),
+            false,
+        ),
+        ("index_path", json!("../outside-native.chsw"), None, false),
+        (
+            "index_path",
+            json!(selected_path.to_string_lossy()),
+            None,
+            false,
+        ),
+        (
+            "index_path",
+            json!("vector_index/aliased-native.chsw"),
+            Some(alias),
+            true,
+        ),
         (
             "index_path",
             json!("vector_index/aliased-parent/outside-native.chsw"),
+            Some(parent_alias.join("outside-native.chsw")),
+            true,
+        ),
+        (
+            "index_path",
+            manifest["fast_tier"]["index_path"].clone(),
+            Some(vector_path.clone()),
+            true,
         ),
     ] {
         let mut refused = manifest.clone();
@@ -231,8 +259,10 @@ fn certified_semantic_cli_uses_manifest_ann_and_rejects_invalid_pairing()
             recovered["_meta"]["ann_stats"].is_null(),
             "{field}: {recovered}"
         );
+        check_status(declared.as_deref(), present)?;
     }
     fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    assert!(HnswIndex::try_load_native(&conventional_path, &vectors)?.is_some());
     fs::write(
         &selected_path,
         b"deliberately invalid selected native metadata",
