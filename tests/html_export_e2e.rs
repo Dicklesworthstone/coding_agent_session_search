@@ -1163,6 +1163,181 @@ fn test_color_contrast_indicators() {
 // ============================================================================
 
 #[test]
+fn nd6pc_html_skill_blocks_require_explicit_opt_in() -> Result<(), Box<dyn std::error::Error>> {
+    let root = TempDir::new()?;
+    let body = "Base directory for this skill: /synthetic/private\nPROPRIETARYSKILLBODY café 界";
+    let variants = [
+        serde_json::json!({"type":"user","message":{"role":"user","content":[
+            {"type":"text","text":"WHOLEMESSAGEBYSTANDER"},
+            {"type":"tool_result","tool_use_id":"skill-load","content":body}
+        ]}}),
+        serde_json::json!({"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"skill-load","content":[{"type":"text","text":body}]}
+        ]}}),
+        serde_json::json!({"type":"message","message":{"role":"toolResult","toolCallId":"skill-load","toolName":"Skill","content":[{"type":"text","text":body}]}}),
+        serde_json::json!({"type":"tool","message":{"role":"tool","tool_name":"Skill","tool_output":body,"tool_call_id":"skill-load"}}),
+        serde_json::json!({"type":"message","message":{"role":"assistant","content":[
+            {"type":"text","text":"WHOLEMESSAGEBYSTANDER"},
+            {"type":"toolCall","id":"private-input","name":"Skill","arguments":{"body":body}}
+        ]}}),
+    ];
+    for (variant, injection) in variants.into_iter().enumerate() {
+        let case_root = root.path().join(variant.to_string());
+        fs::create_dir_all(&case_root)?;
+        let session = case_root.join("session.jsonl");
+        let records = [
+            serde_json::json!({"role":"user","content":"PRIVATETITLESENTINEL\nBase directory for this skill: /synthetic/private"}),
+            serde_json::json!({"role":"user","content":"ORDINARYPROMPT café 界"}),
+            serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[
+                {"type":"text","text":"ORDINARYNARRATIVE"},
+                {"type":"tool_use","id":"ordinary","name":"Read","input":{"path":"ordinary.txt"}}
+            ]}}),
+            serde_json::json!({"type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"ordinary","content":"ORDINARYRESULT: discuss skills; matchedSkills is a field name."}
+            ]}}),
+            injection,
+            serde_json::json!({"role":"assistant","content":"ORDINARYFINAL"}),
+        ];
+        let mut bytes = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut bytes, &record)?;
+            bytes.push(b'\n');
+        }
+        fs::write(&session, &bytes)?;
+        let before = fs::metadata(&session)?;
+        for (include_skills, include_tools) in
+            [(false, true), (true, true), (false, false), (true, false)]
+        {
+            let mut cmd = export_privacy_command(&case_root);
+            cmd.arg("export-html")
+                .arg(&session)
+                .arg("--output-dir")
+                .arg(case_root.join(format!("export-{include_skills}-{include_tools}")))
+                .arg("--json");
+            if include_skills {
+                cmd.arg("--include-skills");
+            }
+            if !include_tools {
+                cmd.arg("--include-tools=false");
+            }
+            let output = cmd.output()?;
+            assert!(
+                output.status.success(),
+                "variant {variant}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let receipt: Value = serde_json::from_slice(&output.stdout)?;
+            let output_path = receipt["exported"]["output_path"]
+                .as_str()
+                .ok_or("output path")?;
+            let html = fs::read_to_string(output_path)?;
+            assert!(
+                html.contains("ORDINARYPROMPT")
+                    && html.contains("ORDINARYNARRATIVE")
+                    && html.contains("ORDINARYFINAL")
+            );
+            assert!(html.contains("café") && html.contains('界'));
+            assert_eq!(
+                html.contains("ORDINARYRESULT"),
+                include_tools,
+                "variant {variant}"
+            );
+            assert_eq!(
+                html.contains("PROPRIETARYSKILLBODY"),
+                include_skills && include_tools,
+                "variant {variant}"
+            );
+            assert_eq!(html.contains("PRIVATETITLESENTINEL"), include_skills);
+            if !include_skills {
+                assert!(
+                    !output_path
+                        .to_ascii_lowercase()
+                        .contains("privatetitlesentinel")
+                );
+                assert!(html.contains("<title>ORDINARYPROMPT"));
+                assert!(
+                    !html.contains("WHOLEMESSAGEBYSTANDER"),
+                    "whole skill message retained in variant {variant}"
+                );
+            }
+            assert_eq!(receipt["privacy"]["sensitive_output"], false);
+        }
+        assert_eq!(fs::read(&session)?, bytes);
+        let after = fs::metadata(&session)?;
+        assert_eq!(before.modified()?, after.modified()?);
+        assert_eq!(before.permissions(), after.permissions());
+        assert!(!case_root.join("data/agent_search.db").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn test_claude_tool_result_error_status_survives_html_grouping()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TempDir::new()?;
+    let session = root.path().join("session.jsonl");
+    let records = [
+        serde_json::json!({"role":"user","content":"STATUSPROMPT"}),
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[
+            {"type":"text","text":"STATUSNARRATIVE"},
+            {"type":"tool_use","id":"failed","name":"Bash","input":{"command":"false"}},
+            {"type":"tool_use","id":"ok","name":"Read","input":{"path":"ok.txt"}},
+            {"type":"tool_use","id":"unspecified","name":"Write","input":{"path":"written.txt"}},
+            {"type":"tool_use","id":"invalid","name":"Glob","input":{"pattern":"*.rs"}}
+        ]}}),
+        serde_json::json!({"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"failed","content":"FAILEDOUTPUT (text says success)","is_error":true},
+            {"type":"tool_result","tool_use_id":"ok","content":"SUCCESSOUTPUT (text discusses an error)","is_error":false},
+            {"type":"tool_result","tool_use_id":"unspecified","content":"UNSPECIFIEDOUTPUT"},
+            {"type":"tool_result","tool_use_id":"invalid","content":"INVALIDSTATUSOUTPUT","is_error":"true"}
+        ]}}),
+        serde_json::json!({"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"orphan","content":"ORPHANFAILEDOUTPUT","is_error":true}
+        ]}}),
+        serde_json::json!({"role":"assistant","content":"STATUSFINAL"}),
+    ];
+    let mut bytes = Vec::new();
+    for record in records {
+        serde_json::to_writer(&mut bytes, &record)?;
+        bytes.push(b'\n');
+    }
+    fs::write(&session, &bytes)?;
+    let (_, html) = export_privacy_html(root.path(), &session, None, false, false)?;
+    let badges = Regex::new(r#"<button class="tool-badge ([^"]*)"\s+aria-label="([^"]*)""#)?;
+    let actual: Vec<_> = badges
+        .captures_iter(&html)
+        .map(|c| (c[1].to_owned(), c[2].to_owned()))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            ("tool-status-error".to_owned(), "Bash: error".to_owned()),
+            ("tool-status-success".to_owned(), "Read: success".to_owned()),
+            (
+                "tool-status-success".to_owned(),
+                "Write: success".to_owned()
+            ),
+            ("tool-status-success".to_owned(), "Glob: success".to_owned()),
+        ]
+    );
+    for retained in [
+        "STATUSPROMPT",
+        "STATUSNARRATIVE",
+        "STATUSFINAL",
+        "FAILEDOUTPUT",
+        "SUCCESSOUTPUT",
+        "UNSPECIFIEDOUTPUT",
+        "INVALIDSTATUSOUTPUT",
+        "ORPHANFAILEDOUTPUT",
+        "tool_result error",
+    ] {
+        assert!(html.contains(retained), "missing {retained}");
+    }
+    assert_eq!(fs::read(session)?, bytes);
+    Ok(())
+}
+
+#[test]
 fn test_claude_format_export() {
     let html = export_fixture("claude_session.jsonl");
 

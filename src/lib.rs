@@ -118272,21 +118272,6 @@ fn run_export_html(
     privacy.redact_optional_text(&mut workspace);
     privacy.redact_optional_text(&mut agent_name);
 
-    // Find title from first user message
-    if session_title.is_none() {
-        for msg in &raw_messages {
-            let role = extract_role(msg);
-            if role == "user" {
-                let content = extract_text_content(msg);
-                if !content.is_empty() {
-                    let first_line = content.lines().next().unwrap_or("Untitled Session");
-                    session_title = Some(smart_truncate(first_line, 80));
-                    break;
-                }
-            }
-        }
-    }
-
     let pi_family_export = matches!(agent_name.as_deref(), Some("pi_agent" | "omp"));
 
     let messages: Vec<Message> = crate::export::html_messages_from_raw(
@@ -118295,6 +118280,18 @@ fn run_export_html(
         include_skills,
         pi_family_export,
     );
+
+    // Derive the title from retained narrative so an omitted skill or tool
+    // result cannot reappear in the document title or generated filename.
+    if session_title.is_none() {
+        for msg in &messages {
+            if msg.role == "user" && !msg.content.is_empty() {
+                let first_line = msg.content.lines().next().unwrap_or("Untitled Session");
+                session_title = Some(smart_truncate(first_line, 80));
+                break;
+            }
+        }
+    }
 
     // Count message types from RAW messages for accuracy.
     // Must distinguish human-typed prompts from tool results, which both have role "user".
@@ -118754,11 +118751,20 @@ fn extract_tool_calls(msg: &serde_json::Value) -> Vec<html_export::ToolCall> {
                     }
                     "tool_result" => {
                         let content = block.get("content").map(stringify_tool_value);
+                        let status = if block
+                            .get("is_error")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            html_export::ToolStatus::Error
+                        } else {
+                            html_export::ToolStatus::Success
+                        };
                         tool_calls.push(html_export::ToolCall {
                             name: "tool_result".to_string(),
                             input: String::new(),
                             output: content,
-                            status: Some(html_export::ToolStatus::Success),
+                            status: Some(status),
                             correlation_id: extract_tool_correlation_id(block),
                         });
                     }
