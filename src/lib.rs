@@ -118289,111 +118289,12 @@ fn run_export_html(
 
     let pi_family_export = matches!(agent_name.as_deref(), Some("pi_agent" | "omp"));
 
-    // --- Convert to renderer::Message format (filtering empty messages) ---
-    let messages: Vec<Message> = raw_messages
-        .iter()
-        .enumerate()
-        .flat_map(|(i, msg)| {
-            let role = extract_role(msg);
-            if !include_tools && role == "tool" {
-                // Several providers encode tool results as standalone
-                // messages. Honor `--include-tools=false` from the message
-                // role itself even when the provider cannot be inferred from
-                // an arbitrary direct path.
-                return Vec::new();
-            }
-            let ts = extract_message_timestamp(msg);
-            let timestamp = ts
-                .and_then(|ts| chrono::Utc.timestamp_millis_opt(ts).single())
-                .map(|dt| dt.to_rfc3339());
-
-            // Extract all structured tool blocks if present. A single Claude
-            // message can contain multiple tool_use blocks; preserve each one
-            // as its own renderer message so grouping can attach all results.
-            let tool_calls = if include_tools {
-                extract_tool_calls(msg)
-            } else {
-                Vec::new()
-            };
-
-            let content = if include_tools {
-                if !tool_calls.is_empty() {
-                    strip_tool_marker(&extract_text_content_without_tool_blocks(msg))
-                } else {
-                    extract_text_content(msg)
-                }
-            } else {
-                let content = extract_text_content_without_tool_blocks(msg);
-                if pi_family_export && role == "assistant" {
-                    // Older/incomplete indexed Pi-family rows may lack a
-                    // recoverable source envelope. Their normalized assistant
-                    // text contains one flattened `[Tool: ...] ...` line per
-                    // invocation, so fail closed on those lines when tools
-                    // were explicitly excluded.
-                    strip_flattened_tool_call_lines(&content)
-                } else {
-                    content
-                }
-            };
-
-            // --- Drop entire messages that are skill injections (unless opted in) ---
-            // When Claude Code/Codex/Gemini load a skill, the FULL SKILL.md body is
-            // injected as a user message starting with "Base directory for this skill:".
-            // These are often highly proprietary. DROP THE ENTIRE MESSAGE — don't try
-            // to parse, redact, or pattern-match the content. Just skip it.
-            if !include_skills && crate::export::is_skill_injection(&content) {
-                return Vec::new();
-            }
-
-            // Skip non-message records (queue-operation, summary, etc.)
-            // These are internal bookkeeping entries, not actual conversation messages.
-            // Only user, assistant, system, tool, and unknown are valid message roles.
-            match role.as_str() {
-                "user" | "assistant" | "system" | "tool" | "unknown" => {}
-                _ => return Vec::new(),
-            }
-
-            // Skip empty messages: no content AND no tool call AND unknown role
-            // This filters out malformed/empty entries that would look broken
-            if content.is_empty() && tool_calls.is_empty() && role == "unknown" {
-                return Vec::new();
-            }
-
-            // Also skip messages that are completely empty (no content, no tool call)
-            // but keep tool calls even if content is empty (shows the tool interaction)
-            if content.is_empty() && tool_calls.is_empty() {
-                return Vec::new();
-            }
-
-            if tool_calls.is_empty() {
-                return vec![Message {
-                    role,
-                    content,
-                    timestamp,
-                    tool_call: None,
-                    index: Some(i),
-                    author: None,
-                }];
-            }
-
-            tool_calls
-                .into_iter()
-                .enumerate()
-                .map(|(tool_index, tool_call)| Message {
-                    role: role.clone(),
-                    content: if tool_index == 0 {
-                        content.clone()
-                    } else {
-                        String::new()
-                    },
-                    timestamp: timestamp.clone(),
-                    tool_call: Some(tool_call),
-                    index: Some(i),
-                    author: None,
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    let messages: Vec<Message> = crate::export::html_messages_from_raw(
+        raw_messages.iter().enumerate(),
+        include_tools,
+        include_skills,
+        pi_family_export,
+    );
 
     // Count message types from RAW messages for accuracy.
     // Must distinguish human-typed prompts from tool results, which both have role "user".

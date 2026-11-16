@@ -81,6 +81,86 @@ pub(crate) fn is_skill_injection(content: &str) -> bool {
         || content.contains("<!-- skillInjection:")
 }
 
+/// Convert complete, already-redacted source messages for HTML rendering.
+/// Keep tool extraction and exclusion identical for CLI and TUI exports.
+pub(crate) fn html_messages_from_raw<'a>(
+    raw_messages: impl IntoIterator<Item = (usize, &'a Value)>,
+    include_tools: bool,
+    include_skills: bool,
+    pi_family_export: bool,
+) -> Vec<crate::html_export::Message> {
+    use crate::html_export::Message;
+    use chrono::TimeZone;
+
+    raw_messages
+        .into_iter()
+        .flat_map(|(i, msg)| {
+            let role = crate::extract_role(msg);
+            if !include_tools && role == "tool" {
+                return Vec::new();
+            }
+            let timestamp = crate::extract_message_timestamp(msg)
+                .and_then(|ts| chrono::Utc.timestamp_millis_opt(ts).single())
+                .map(|dt| dt.to_rfc3339());
+            let tool_calls = if include_tools {
+                crate::extract_tool_calls(msg)
+            } else {
+                Vec::new()
+            };
+            let content = if include_tools {
+                if !tool_calls.is_empty() {
+                    crate::strip_tool_marker(&crate::extract_text_content_without_tool_blocks(msg))
+                } else {
+                    crate::extract_text_content(msg)
+                }
+            } else {
+                let content = crate::extract_text_content_without_tool_blocks(msg);
+                if pi_family_export && role == "assistant" {
+                    crate::strip_flattened_tool_call_lines(&content)
+                } else {
+                    content
+                }
+            };
+            if !include_skills && is_skill_injection(&content) {
+                return Vec::new();
+            }
+            match role.as_str() {
+                "user" | "assistant" | "system" | "tool" | "unknown" => {}
+                _ => return Vec::new(),
+            }
+            if content.is_empty() && tool_calls.is_empty() {
+                return Vec::new();
+            }
+            if tool_calls.is_empty() {
+                return vec![Message {
+                    role,
+                    content,
+                    timestamp,
+                    tool_call: None,
+                    index: Some(i),
+                    author: None,
+                }];
+            }
+            tool_calls
+                .into_iter()
+                .enumerate()
+                .map(|(tool_index, tool_call)| Message {
+                    role: role.clone(),
+                    content: if tool_index == 0 {
+                        content.clone()
+                    } else {
+                        String::new()
+                    },
+                    timestamp: timestamp.clone(),
+                    tool_call: Some(tool_call),
+                    index: Some(i),
+                    author: None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// Supported export formats
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExportFormat {

@@ -23237,44 +23237,55 @@ fn export_session_task(
     use crate::html_export::{
         ExportOptions as HtmlExportOptions, HtmlExporter, Message as HtmlMessage, TemplateMetadata,
     };
-    use chrono::DateTime;
 
     let session_path = std::path::Path::new(&hit.source_path);
     let allow_direct_file = hit_is_local_source(hit);
     let prefer_direct_file = tui_prefers_direct_followup_file(hit);
 
+    let convert_raw = |raw: &mut [serde_json::Value], pi_family_export| {
+        for message in raw.iter_mut() {
+            let explicit_role = message
+                .get("role")
+                .or_else(|| message.get("message").and_then(|inner| inner.get("role")))
+                .or_else(|| message.get("payload").and_then(|inner| inner.get("role")))
+                .and_then(serde_json::Value::as_str);
+            if explicit_role.is_some() {
+                let role = crate::extract_role(message);
+                let normalized = match role.as_str() {
+                    "user" | "assistant" | "system" | "tool" | "unknown" => continue,
+                    "agent" => "assistant",
+                    "function" => "tool",
+                    _ => "unknown",
+                };
+                // The TUI already retained canonical custom-role messages.
+                // Keep those as unknown without admitting bookkeeping types.
+                message["role"] = serde_json::json!(normalized);
+            }
+        }
+        crate::export::ExportPrivacy::new(false).redact_messages(raw);
+        crate::export::html_messages_from_raw(
+            raw.iter().enumerate(),
+            include_tools,
+            false,
+            pi_family_export,
+        )
+    };
+
     let html_messages_from_view = |view: crate::ui::data::ConversationView| {
-        view.messages
-            .into_iter()
-            .filter_map(|msg| {
-                let content = msg.content;
-                if content.is_empty() && !include_tools {
-                    return None;
-                }
-
-                let role = match msg.role {
-                    crate::model::types::MessageRole::User => "user",
-                    crate::model::types::MessageRole::Agent => "assistant",
-                    crate::model::types::MessageRole::System => "system",
-                    crate::model::types::MessageRole::Tool => "tool",
-                    crate::model::types::MessageRole::Other(_) => "unknown",
-                }
-                .to_string();
-
-                let timestamp = msg
-                    .created_at
-                    .and_then(|ts| DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339()));
-
-                Some(HtmlMessage {
-                    role,
-                    content,
-                    timestamp,
-                    tool_call: None,
-                    index: Some(msg.idx.max(0) as usize),
-                    author: msg.author,
-                })
-            })
-            .collect::<Vec<HtmlMessage>>()
+        let mut raw = crate::conversation_view_to_html_raw_messages(&view);
+        let mut messages = convert_raw(
+            &mut raw,
+            matches!(view.convo.agent_slug.as_str(), "pi_agent" | "omp"),
+        );
+        // A source record can expand into several correlated tool messages.
+        // Retain its canonical index and author on every expanded message.
+        for message in &mut messages {
+            if let Some(archived) = message.index.and_then(|i| view.messages.get(i)) {
+                message.index = Some(archived.idx.max(0) as usize);
+                message.author.clone_from(&archived.author);
+            }
+        }
+        messages
     };
 
     let indexed_view = if !prefer_direct_file {
@@ -23297,35 +23308,19 @@ fn export_session_task(
     } else if allow_direct_file && session_path.exists() {
         match load_local_export_raw_messages(session_path) {
             Ok((mut raw_messages, _, _)) => {
-                crate::export::ExportPrivacy::new(false).redact_messages(&mut raw_messages);
-                raw_messages
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(idx, msg)| {
-                        let role = crate::extract_role(&msg);
-                        let content = crate::extract_text_content(&msg);
-                        if content.is_empty() && !include_tools {
-                            return None;
-                        }
-
-                        let timestamp = crate::extract_message_timestamp(&msg).and_then(|ts| {
-                            DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
-                        });
-                        let author = msg
-                            .get("author")
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string);
-
-                        Some(HtmlMessage {
-                            role,
-                            content,
-                            timestamp,
-                            tool_call: None,
-                            index: Some(idx),
-                            author,
-                        })
-                    })
-                    .collect()
+                let mut messages = convert_raw(
+                    &mut raw_messages,
+                    matches!(hit.agent.as_str(), "pi_agent" | "omp"),
+                );
+                for message in &mut messages {
+                    message.author = message
+                        .index
+                        .and_then(|i| raw_messages.get(i))
+                        .and_then(|raw| raw.get("author"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                }
+                messages
             }
             Err(local_err) => match load_indexed_export_view(db_path, hit) {
                 Ok(Some(view)) => html_messages_from_view(view),
@@ -31718,6 +31713,196 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(&session).unwrap(), bytes);
         assert!(!db.exists());
+    }
+
+    #[test]
+    fn export_redaction_tui_html_preserves_structured_tools_and_honors_exclusion()
+    -> anyhow::Result<()> {
+        let root = tempfile::Builder::new()
+            .prefix("cass-tui-structured-tools-")
+            .disable_cleanup(true)
+            .tempdir()?;
+        let session = root.path().join("tools.jsonl");
+        let events = [
+            serde_json::json!({"role":"user","content":"prompt-kept café 界"}),
+            serde_json::json!({"role":"assistant","content":[
+                {"type":"text","text":"narrative-kept café 界"},
+                {"type":"tool_use","id":"call-alpha","name":"ToolAlpha",
+                 "input":{"note":"input-alpha-kept","registration_token":"synthetic-tools-551"}},
+                {"type":"tool_use","id":"call-beta","name":"ToolBeta",
+                 "input":{"note":"input-beta-kept"}}
+            ]}),
+            serde_json::json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"call-alpha","content":"result-alpha-kept"},
+                {"type":"tool_result","tool_use_id":"call-beta","content":"result-beta-kept"}
+            ]}),
+            serde_json::json!({"role":"tool","content":"standalone-tool-kept"}),
+            serde_json::json!({"role":"user","content":"Base directory for this skill: private-skill-omitted"}),
+            serde_json::json!({"role":"custom-role","content":"custom-role-kept café 界"}),
+            serde_json::json!({"role":"function","content":"function-tool-kept"}),
+            serde_json::json!({"role":"agent","content":"agent-alias-kept"}),
+            serde_json::json!({"type":"queue-operation","content":"bookkeeping-omitted"}),
+        ];
+        let bytes = events
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect::<String>();
+        std::fs::write(&session, &bytes)?;
+        let metadata = std::fs::metadata(&session)?;
+        let db = root.path().join("absent.db");
+        let hit = make_exact_hit(&session.display().to_string(), "local", 1, "fixture");
+        for include_tools in [true, false] {
+            let result = export_session_task(
+                &db,
+                &hit,
+                &root.path().join(format!("tools-{include_tools}.html")),
+                false,
+                None,
+                true,
+                include_tools,
+                "Tool transcript",
+                "Claude Code",
+            );
+            let CassMsg::ExportCompleted { output_path, .. } = result else {
+                anyhow::bail!("HTML export did not complete: {result:?}");
+            };
+            let html = std::fs::read_to_string(output_path)?;
+            for marker in [
+                "prompt-kept",
+                "narrative-kept",
+                "custom-role-kept",
+                "agent-alias-kept",
+                "café 界",
+            ] {
+                assert!(html.contains(marker), "lost {marker}");
+            }
+            for marker in [
+                "input-alpha-kept",
+                "input-beta-kept",
+                "result-alpha-kept",
+                "result-beta-kept",
+                "standalone-tool-kept",
+                "function-tool-kept",
+            ] {
+                assert_eq!(html.contains(marker), include_tools, "{marker}");
+            }
+            for name in ["ToolAlpha", "ToolBeta"] {
+                assert_eq!(
+                    html.contains(&format!("data-tool-name=\"{name}\"")),
+                    include_tools
+                );
+            }
+            assert!(!html.contains("synthetic-tools-551"));
+            assert!(!html.contains("private-skill-omitted"));
+            assert!(!html.contains("bookkeeping-omitted"));
+            if include_tools {
+                assert!(html.contains("[REDACTED]"));
+            }
+        }
+        assert_eq!(std::fs::read(&session)?, bytes.as_bytes());
+        let after = std::fs::metadata(&session)?;
+        assert_eq!(after.modified()?, metadata.modified()?);
+        assert_eq!(after.permissions(), metadata.permissions());
+        assert!(!db.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn export_redaction_tui_html_uses_indexed_pi_tool_envelopes() -> anyhow::Result<()> {
+        use crate::franken_sync::{SqliteValue, compat::RowExt};
+        use crate::storage::sqlite::FrankenStorage;
+
+        let root = tempfile::Builder::new()
+            .prefix("cass-tui-indexed-tools-")
+            .disable_cleanup(true)
+            .tempdir()?;
+        let db = root.path().join("archive.db");
+        let source = root.path().join("missing.jsonl");
+        let storage = FrankenStorage::open(&db)?;
+        let conn = storage.raw();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'pi_agent', 'Pi', 'local', 0, 0)")?;
+        conn.execute_with_params(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'indexed-tools', 'Indexed tools', ?1, 'local', 10)",
+            &[SqliteValue::Text(source.display().to_string().into())],
+        )?;
+        conn.execute("INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 3, 'user', 'indexed-prompt-kept')")?;
+        conn.execute("INSERT INTO messages (conversation_id, idx, role, content) VALUES (1, 12, 'custom-role', 'indexed-custom-role-kept')")?;
+        let events = [
+            (
+                7,
+                "assistant",
+                "indexed-narrative-kept",
+                serde_json::json!({
+                    "type":"message", "message":{"role":"assistant", "content":[
+                        {"type":"text","text":"indexed-narrative-kept café 界"},
+                        {"type":"toolCall","id":"indexed-call","name":"IndexedTool",
+                         "arguments":{"note":"indexed-input-kept","registration_token":"synthetic-indexed-551"}}
+                    ]}
+                }),
+            ),
+            (
+                9,
+                "tool",
+                "indexed-result-kept",
+                serde_json::json!({
+                    "type":"message", "message":{"role":"toolResult", "toolName":"IndexedTool",
+                        "toolCallId":"indexed-call", "content":[{"type":"text","text":"indexed-result-kept"}], "isError":false}
+                }),
+            ),
+        ];
+        for (idx, role, content, event) in &events {
+            conn.execute_with_params(
+                "INSERT INTO messages (conversation_id, idx, role, author, content, extra_json) VALUES (1, ?1, ?2, 'named-scribe', ?3, ?4)",
+                &[SqliteValue::Integer(*idx), SqliteValue::Text((*role).into()),
+                  SqliteValue::Text((*content).into()), SqliteValue::Text(event.to_string().into())],
+            )?;
+        }
+        let hit = make_exact_hit(
+            &source.display().to_string(),
+            "local",
+            4,
+            "indexed-prompt-kept",
+        );
+        for include_tools in [true, false] {
+            let result = export_session_task(
+                &db,
+                &hit,
+                &root.path().join(format!("indexed-{include_tools}.html")),
+                false,
+                None,
+                true,
+                include_tools,
+                "Indexed tools",
+                "Pi",
+            );
+            let CassMsg::ExportCompleted { output_path, .. } = result else {
+                anyhow::bail!("indexed HTML export failed: {result:?}");
+            };
+            let html = std::fs::read_to_string(output_path)?;
+            assert!(html.contains("indexed-prompt-kept"));
+            assert!(html.contains("indexed-narrative-kept"));
+            assert!(html.contains("indexed-custom-role-kept"));
+            assert!(html.contains("café 界"));
+            assert!(html.contains("id=\"msg-7\""));
+            assert!(html.contains("named-scribe"));
+            for marker in [
+                "indexed-input-kept",
+                "indexed-result-kept",
+                "data-tool-name=\"IndexedTool\"",
+            ] {
+                assert_eq!(html.contains(marker), include_tools, "{marker}");
+            }
+            assert!(!html.contains("synthetic-indexed-551"));
+        }
+        let extra: String = conn
+            .query_row("SELECT extra_json FROM messages WHERE idx = 7")?
+            .get_typed(0)?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&extra)?,
+            events[0].3
+        );
+        assert!(!source.exists());
+        Ok(())
     }
 
     #[test]
