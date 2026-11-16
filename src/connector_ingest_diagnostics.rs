@@ -597,6 +597,8 @@ fn is_jsonl_path(path: &Path) -> bool {
 struct ObservedSource {
     disposition: SourceIngestDisposition,
     malformed: bool,
+    /// A read or scan failure remains relevant after later content delivery.
+    failed: bool,
     /// Cleared only by inspection or an actual source-ledger reuse event.
     pending_jsonl: bool,
 }
@@ -683,6 +685,7 @@ impl ConnectorIngestRun {
                         ObservedSource {
                             disposition: SourceIngestDisposition::Discovered,
                             malformed: false,
+                            failed: false,
                             pending_jsonl: defer_jsonl && is_jsonl_path(&source.source_path),
                         },
                     )
@@ -738,6 +741,7 @@ impl ConnectorIngestRun {
             let source = self.sources.entry(path).or_insert(ObservedSource {
                 disposition: SourceIngestDisposition::Discovered,
                 malformed: false,
+                failed: false,
                 pending_jsonl: false,
             });
             source.pending_jsonl = false;
@@ -759,6 +763,7 @@ impl ConnectorIngestRun {
             .or_insert(ObservedSource {
                 disposition: SourceIngestDisposition::Discovered,
                 malformed: false,
+                failed: false,
                 pending_jsonl: false,
             });
         if source.disposition == SourceIngestDisposition::Discovered {
@@ -775,9 +780,10 @@ impl ConnectorIngestRun {
             .or_insert(ObservedSource {
                 disposition: SourceIngestDisposition::Discovered,
                 malformed: false,
+                failed: false,
                 pending_jsonl: false,
             });
-        state.disposition = if state.malformed {
+        state.disposition = if state.malformed || state.failed {
             SourceIngestDisposition::PartiallyIndexed
         } else {
             SourceIngestDisposition::Indexed
@@ -809,22 +815,12 @@ impl ConnectorIngestRun {
 
     /// Attach a scan-level error without converting it into a fake success.
     pub fn observe_scan_error(&mut self, source_path: &Path, error: impl std::fmt::Display) {
-        self.inspect_pending_jsonl_source(source_path);
         let kind = if is_database_lock_message(&error.to_string()) {
             IngestFailureKind::SourceLocked
         } else {
             IngestFailureKind::UnreadableSource
         };
-        let diagnostic = classify_path(&self.provider, source_path, kind);
-        self.sources.insert(
-            source_path.to_path_buf(),
-            ObservedSource {
-                disposition: diagnostic.disposition,
-                malformed: false,
-                pending_jsonl: false,
-            },
-        );
-        self.diagnostics.push(diagnostic);
+        self.observe_source_failure(source_path, kind);
     }
 
     /// Record a failed connector scan using typed per-source evidence when
@@ -889,6 +885,7 @@ impl ConnectorIngestRun {
             .or_insert(ObservedSource {
                 disposition: SourceIngestDisposition::Discovered,
                 malformed: false,
+                failed: false,
                 pending_jsonl: false,
             });
         // A post-delivery observation error cannot erase content already
@@ -900,6 +897,7 @@ impl ConnectorIngestRun {
         ) {
             diagnostic.disposition = SourceIngestDisposition::PartiallyIndexed;
         }
+        state.failed = true;
         state.disposition = diagnostic.disposition;
         self.diagnostics.push(diagnostic);
     }
@@ -992,6 +990,7 @@ impl ConnectorIngestRun {
                 ObservedSource {
                     disposition: diagnostic.disposition,
                     malformed: false,
+                    failed: false,
                     pending_jsonl: false,
                 },
             );
@@ -1204,6 +1203,7 @@ impl ConnectorIngestRun {
                         ObservedSource {
                             disposition: diagnostic.disposition,
                             malformed: false,
+                            failed: false,
                             pending_jsonl: false,
                         },
                     );
@@ -2050,6 +2050,124 @@ mod tests {
             report.diagnostics[1].failure_kind,
             IngestFailureKind::SourceMissing
         );
+        Ok(())
+    }
+
+    #[test]
+    fn gh555_deferred_read_failure_keeps_delivered_batches_partial() -> TestResult {
+        let temp = tempdir()?;
+        let path = temp.path().join("disappeared.jsonl");
+        std::fs::write(&path, b"{\"ok\":1}\n")?;
+        let root = ScanRoot::local(temp.path().to_path_buf());
+        let source = DiscoveredSourceFile::new(
+            "codex",
+            &root,
+            path.clone(),
+            DiscoveredSourceRole::PrimarySessionLog,
+            true,
+        );
+        let ctx = ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+        let mut run =
+            ConnectorIngestRun::begin_deferred_jsonl("codex", temp.path(), &ctx, &[source]);
+        // The connector can have decoded content before diagnostics opens the
+        // file. Keep the original bytes while making that later open fail.
+        std::fs::rename(&path, temp.path().join("retained.jsonl"))?;
+        let mut conversation = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: Some("delivered-before-diagnostic-read".into()),
+            title: None,
+            workspace: None,
+            source_path: path,
+            started_at: None,
+            ended_at: None,
+            metadata: json!({}),
+            messages: Vec::new(),
+        };
+        run.observe_conversation(&mut conversation);
+        run.observe_conversation(&mut conversation);
+        let report = run.finish();
+        verify_eq!(report.summary.total(), 1);
+        verify_eq!(report.summary.partially_indexed, 1);
+        verify_eq!(report.summary.indexed, 0);
+        verify_eq!(report.summary.skipped, 0);
+        verify_eq!(report.diagnostics.len(), 1);
+        verify_eq!(
+            report.diagnostics[0].failure_kind,
+            IngestFailureKind::UnreadableSource
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gh555_scan_failure_keeps_coverage_partial_across_delivery_order() -> TestResult {
+        for typed in [false, true] {
+            for failure_before_delivery in [false, true] {
+                let temp = tempdir()?;
+                let path = temp.path().join("delivered.jsonl");
+                std::fs::write(&path, b"{\"ok\":1}\n")?;
+                let root = ScanRoot::local(temp.path().to_path_buf());
+                let source = DiscoveredSourceFile::new(
+                    "codex",
+                    &root,
+                    path.clone(),
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    true,
+                );
+                let ctx = ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+                let mut run = ConnectorIngestRun::begin_deferred_jsonl(
+                    "codex",
+                    temp.path(),
+                    &ctx,
+                    &[source],
+                );
+                let mut conversation = NormalizedConversation {
+                    agent_slug: "codex".into(),
+                    external_id: Some("delivered-with-scan-failure".into()),
+                    title: None,
+                    workspace: None,
+                    source_path: path.clone(),
+                    started_at: None,
+                    ended_at: None,
+                    metadata: json!({}),
+                    messages: Vec::new(),
+                };
+                let record_failure = |run: &mut ConnectorIngestRun| {
+                    if typed {
+                        run.observe_source_failure(&path, IngestFailureKind::SourceChanged);
+                    } else {
+                        run.observe_scan_error(&path, "source read failed");
+                    }
+                };
+                if failure_before_delivery {
+                    record_failure(&mut run);
+                }
+                run.observe_conversation(&mut conversation);
+                if !failure_before_delivery {
+                    record_failure(&mut run);
+                }
+                run.observe_conversation(&mut conversation);
+                let report = run.finish();
+                verify_eq!(report.summary.total(), 1);
+                verify_eq!(report.summary.partially_indexed, 1);
+                verify_eq!(report.summary.indexed, 0);
+                verify_eq!(report.summary.skipped, 0);
+                verify_eq!(report.diagnostics.len(), 1);
+                verify_eq!(
+                    report.diagnostics[0].failure_kind,
+                    if typed {
+                        IngestFailureKind::SourceChanged
+                    } else {
+                        IngestFailureKind::UnreadableSource
+                    }
+                );
+                if !failure_before_delivery {
+                    verify_eq!(
+                        report.diagnostics[0].disposition,
+                        SourceIngestDisposition::PartiallyIndexed
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
