@@ -122,7 +122,7 @@ def main() -> None:
         "anyhow", "blake3", "chrono", "dirs", "dotenvy", "franken-agent-detection", "libc", "walkdir",
         "serde", "serde_json", "tempfile", "thiserror", "tracing", "zstd",
     )
-    tests = ("connector_codex_exclusions", "codex_source_containment")
+    tests = ("connector_codex", "connector_codex_exclusions", "codex_source_containment")
     refuse_full_crate_tests(root, tests)
     lines = [
         "[package]", 'name = "cass-codex-contract"', 'version = "0.0.0"',
@@ -173,6 +173,11 @@ pub mod connectors {
         indexer_dir / "source_writer_probe.rs",
         *sorted((indexer_dir / "source_writer_probe").rglob("*.rs")),
     ]
+    fixture_files = sorted(
+        path for path in (root / "tests/fixtures/codex_real").rglob("*") if path.is_file()
+    )
+    if not fixture_files:
+        raise RuntimeError("Codex real-session fixtures are required for connector_codex tests")
     with tempfile.TemporaryDirectory(prefix="cass-codex-contract-") as directory:
         work = Path(directory)
         project = work / "Cargo.toml"
@@ -193,6 +198,16 @@ pub mod connectors {
             staged.write_bytes(source)
             if staged.read_bytes() != source:
                 raise RuntimeError(f"staged source differs from {original}")
+        # connector_codex resolves real rollouts from CARGO_MANIFEST_DIR,
+        # which names this temporary crate. Keep those inputs byte-identical
+        # too, so the public scan-route regressions run with their real fixtures.
+        for original in fixture_files:
+            staged = work / original.relative_to(root)
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            source = original.read_bytes()
+            staged.write_bytes(source)
+            if staged.read_bytes() != source:
+                raise RuntimeError(f"staged fixture differs from {original}")
         for name in ("Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", ".rustfmt.toml"):
             original = root / name
             if original.is_file():
@@ -210,7 +225,9 @@ pub mod connectors {
         ))
         verify_fad_selection(metadata, lockfile, fad_checkout)
         commands = [
-            [cargo, "test", "--locked", "--manifest-path", str(project), "--all-targets"],
+            # A failing unit-test binary must not prevent the public connector
+            # regressions from executing; any failure still fails this command.
+            [cargo, "test", "--locked", "--manifest-path", str(project), "--all-targets", "--no-fail-fast"],
             [cargo, "clippy", "--locked", "--manifest-path", str(project), "--all-targets", "--", "-D", "warnings"],
         ]
         for command in commands:

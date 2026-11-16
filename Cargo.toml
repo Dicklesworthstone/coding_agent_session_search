@@ -171,7 +171,8 @@ frankensearch = { version = "=0.7.1", git = "https://github.com/Dicklesworthston
 # Keep the narrow OpenClaw file-scope, historical-session, mirror discovery,
 # and physical-store migration fixes until a registry release includes them.
 # GH#553 backports bounded torn-line recovery for Pi/OMP, Codex and Claude.
-franken-agent-detection = { version = "=0.3.10", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "2437e719dee7770de93eeb7931342bfa8b404e92", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot", "openclaw-sqlite", "copilot-vscdb", "codebuff", "codex-zstd", "pi-durable", "pi-sqlite"] }
+# GH#560 lets CASS approve inactive-tail recovery in the primary Codex parser.
+franken-agent-detection = { version = "=0.3.10", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "830d9720d71372a2002a42d10431f2d75a0b16d0", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot", "openclaw-sqlite", "copilot-vscdb", "codebuff", "codex-zstd", "pi-durable", "pi-sqlite"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache

@@ -36,7 +36,10 @@ class HarnessTests(unittest.TestCase):
         self.harness = load_harness()
         # Keep test artifacts for inspection; never touch a real checkout.
         self.root = Path(tempfile.mkdtemp(prefix="cass-harness-proof-")) / "repo with spaces 🔑"
-        for directory in ("scripts", "tests", "src/connectors/codex", "src/indexer/source_writer_probe"):
+        for directory in (
+            "scripts", "tests", "src/connectors/codex", "src/indexer/source_writer_probe",
+            "tests/fixtures/codex_real/sessions/2025/11/26",
+        ):
             (self.root / directory).mkdir(parents=True, exist_ok=True)
         dependencies = ["anyhow", "blake3", "chrono", "dirs", "dotenvy", "libc", "serde_json", "tempfile", "thiserror", "tracing", "walkdir"]
         manifest = '[package]\nname="fixture"\nversion="0.0.0"\n[dependencies]\n'
@@ -46,8 +49,10 @@ class HarnessTests(unittest.TestCase):
         manifest += '[dev-dependencies]\nzstd={version="0.13",default-features=false}\n'
         (self.root / "Cargo.toml").write_text(manifest, encoding="utf-8")
         (self.root / "Cargo.lock").write_text(f'version=4\n[[package]]\nname="{FAD}"\nversion="0.3.10"\nsource="{SOURCE}"\n', encoding="utf-8")
-        for test in ("connector_codex_exclusions", "codex_source_containment"):
+        for test in ("connector_codex", "connector_codex_exclusions", "codex_source_containment"):
             (self.root / f"tests/{test}.rs").write_text('// unchanged integration fixture\n', encoding="utf-8")
+        self.real_fixture = self.root / "tests/fixtures/codex_real/sessions/2025/11/26/rollout-tool-call.jsonl"
+        self.real_fixture.write_text('{"role":"user","content":"fixture 🔑"}\n', encoding="utf-8")
         (self.root / "src/connectors/codex.rs").write_text('mod nested;\n', encoding="utf-8")
         (self.root / "src/connectors/codex/nested.rs").write_text('// byte-identical source 🔑\n', encoding="utf-8")
         (self.root / "src/indexer/source_writer_probe.rs").write_text('// real activity policy fixture\n', encoding="utf-8")
@@ -56,6 +61,7 @@ class HarnessTests(unittest.TestCase):
         self.calls = []
         self.generated = None
         self.library = None
+        self.staged_fixtures = None
 
     def run_harness(self, checkout=None, metadata_override=None):
         def capture(command, **kwargs):
@@ -68,6 +74,11 @@ class HarnessTests(unittest.TestCase):
                     self.assertEqual((project.parent / original.relative_to(self.root / "src/connectors")).read_bytes(), original.read_bytes())
                 for original in (self.root / "src/indexer").rglob("*.rs"):
                     self.assertEqual((project.parent / "indexer" / original.relative_to(self.root / "src/indexer")).read_bytes(), original.read_bytes())
+                self.staged_fixtures = {
+                    path.relative_to(project.parent).as_posix(): path.read_bytes()
+                    for path in (project.parent / "tests/fixtures/codex_real").rglob("*")
+                    if path.is_file()
+                }
             if len(command) > 1 and command[1] == "metadata":
                 if metadata_override is not None:
                     return json.dumps(metadata_override)
@@ -105,6 +116,15 @@ class HarnessTests(unittest.TestCase):
             self.assertIn(identity, self.library.split("pub mod connectors")[0])
             self.assertIn(identity, self.library.split("pub mod connectors")[1])
 
+    def test_public_codex_routes_run_with_byte_identical_real_fixtures(self):
+        self.run_harness()
+        targets = {target["name"]: target["path"] for target in self.generated["test"]}
+        self.assertEqual(set(targets), {"connector_codex", "connector_codex_exclusions", "codex_source_containment"})
+        self.assertEqual(targets["connector_codex"], str(self.root / "tests/connector_codex.rs"))
+        self.assertEqual(self.staged_fixtures, {
+            self.real_fixture.relative_to(self.root).as_posix(): self.real_fixture.read_bytes(),
+        })
+
     def test_tail_recovery_stages_the_real_writer_classifier(self):
         self.run_harness()
         self.assertIn("mod source_writer_probe;", self.library)
@@ -117,6 +137,8 @@ class HarnessTests(unittest.TestCase):
     def test_metadata_precedes_locked_native_test_and_clippy_commands(self):
         self.run_harness()
         self.assertEqual([command[1] for command in self.calls[:3]], ["metadata", "test", "clippy"])
+        self.assertIn("--all-targets", self.calls[1])
+        self.assertIn("--no-fail-fast", self.calls[1])
         for command in self.calls[1:3]:
             self.assertIn("--locked", command)
         self.assertIn("--check", self.calls[-1])

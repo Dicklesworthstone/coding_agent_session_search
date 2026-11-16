@@ -63,7 +63,7 @@ pub(super) fn validate_with_limit(
     if codex_rollouts::is_compressed_rollout(path) {
         // The decoder validates complete frames and bounds decoded bytes.
         let mut reader = codex_rollouts::decompressed_rollout((&file).take(before.len()), limit)?;
-        validate_jsonl(&mut reader, progress_tick)?;
+        validate_jsonl(&mut reader, progress_tick, None)?;
     } else {
         let mut reader = BufReader::new((&file).take(before.len()));
         let legacy = path
@@ -76,7 +76,7 @@ pub(super) fn validate_with_limit(
             // unread bytes remain in BufReader after a complete legacy document.
             before.len() - reader.get_ref().limit()
         } else {
-            validate_jsonl(&mut reader, progress_tick)?
+            validate_jsonl(&mut reader, progress_tick, Some(path))?
         };
         if consumed != before.len() {
             return Err(io::Error::new(
@@ -129,6 +129,7 @@ fn validate_legacy(reader: &mut impl BufRead) -> Result<()> {
 fn validate_jsonl(
     reader: &mut impl BufRead,
     progress_tick: Option<&(dyn Fn() + Send + Sync)>,
+    recovery_source: Option<&Path>,
 ) -> Result<u64> {
     let mut consumed = 0_u64;
     let mut line_no = 0_usize;
@@ -160,10 +161,26 @@ fn validate_jsonl(
             && !terminated
             && error.is_eof()
         {
+            // GH #560: a rollout may contain only metadata before its writer
+            // dies. No conversation reaches enrichment, so apply the same
+            // inactive-tail policy here. Only plain JSONL supplies a recovery
+            // source; compressed input remains strict. Reader failures and the
+            // enclosing byte-count/snapshot checks still reject incomplete reads.
+            if let Some(path) = recovery_source
+                && crate::indexer::source_can_recover_incomplete_tail(path)
+            {
+                tracing::warn!(
+                    source_path = %path.display(),
+                    line_no,
+                    reason = "inactive_incomplete_tail",
+                    "codex rollout has an inactive incomplete final record; skipping that record",
+                );
+                continue;
+            }
             return Err(invalid_json(&error).into());
         }
         // Match primary parsing/enrichment: malformed historical JSONL lines
-        // are tolerated; a genuinely unfinished tail is retryable instead.
+        // are tolerated; a possibly active unfinished tail is retryable instead.
     }
 }
 

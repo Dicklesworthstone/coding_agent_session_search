@@ -37,7 +37,11 @@ impl CodexConnector {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: franken_agent_detection::CodexConnector::new(),
+            // Both parsers must agree: FAD reads the rollout before CASS can
+            // enrich it, so recovering only in the second pass still withholds
+            // every complete message behind an abandoned final record.
+            inner: franken_agent_detection::CodexConnector::new()
+                .with_incomplete_tail_recovery(crate::indexer::source_can_recover_incomplete_tail),
         }
     }
 }

@@ -136,6 +136,179 @@ fn valid_empty_sources_and_historical_jsonl_tolerance_are_preserved() -> Result<
     Ok(())
 }
 
+fn age_source(path: &Path) -> Result<()> {
+    File::open(path)?
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7_200))?;
+    Ok(())
+}
+
+#[test]
+fn inactive_zero_output_tail_keeps_neighbors_and_accepts_later_completion() -> Result<()> {
+    use std::io::Write;
+
+    for prefix in ["", "{\"type\":\"session_meta\",\"payload\":{}}\n"] {
+        let tail = message("completed first message");
+        let split = tail.len() / 2;
+        let bytes = format!("{prefix}{}", &tail[..split]);
+        let (_temp, paths, mut ctx) = fixture("jsonl", bytes.as_bytes())?;
+        age_source(&paths[1])?;
+        let modified = fs::metadata(&paths[1])?.modified()?;
+
+        // Exercise the fallback independently: otherwise the primary parser
+        // could mask a zero-output validator that still rejects inactive tails.
+        validate(&paths[1], None)?;
+        for since in [None, Some(0)] {
+            ctx.since_ts = since;
+            let mut delivered = Vec::new();
+            let mut completed = Vec::new();
+            let mut complete = |done: &SourceCompletion| {
+                // ubs:ignore[rust.collections.clone-in-loop] -- Retain owned completion evidence from each healthy fixture.
+                completed.push((done.source.source_path.clone(), done.conversations_emitted));
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut complete),
+            };
+            CodexConnector::new().scan_with_source_boundaries(
+                &ctx,
+                &mut hooks,
+                &mut |conversation| {
+                    delivered.push(conversation);
+                    Ok(())
+                },
+            )?;
+            // ubs:ignore[rust.panic.assert-macros] -- An incomplete first message must not fabricate a conversation.
+            assert_eq!(delivered.len(), 2);
+            // ubs:ignore[rust.panic.assert-macros] -- Preserve the preceding healthy source and its message.
+            assert_eq!(delivered[0].source_path, paths[0]);
+            // ubs:ignore[rust.panic.assert-macros] -- Preserve the following healthy source and its message.
+            assert_eq!(delivered[1].source_path, paths[2]);
+            // ubs:ignore[rust.panic.assert-macros] -- Recovery must retain the actual neighboring messages.
+            assert_eq!(delivered[0].messages[0].content, "before");
+            // ubs:ignore[rust.panic.assert-macros] -- Recovery must retain the actual neighboring messages.
+            assert_eq!(delivered[1].messages[0].content, "after");
+            // Empty sources retain FAD's boundary contract: no fabricated
+            // conversation or completion, while the whole scan succeeds.
+            // ubs:ignore[rust.panic.assert-macros,rust.collections.clone-in-loop] -- Require only the healthy neighbors' source completions.
+            assert_eq!(completed, [(paths[0].clone(), 1), (paths[2].clone(), 1)]);
+            // ubs:ignore[rust.panic.assert-macros] -- Collected scans must also recover without inventing empty history.
+            assert_eq!(CodexConnector::new().scan(&ctx)?.len(), 2);
+            // ubs:ignore[rust.panic.assert-macros] -- Recovery must preserve the source bytes and modification time.
+            assert_eq!(fs::read(&paths[1])?, bytes.as_bytes());
+            // ubs:ignore[rust.panic.assert-macros] -- Recovery must preserve the source bytes and modification time.
+            assert_eq!(fs::metadata(&paths[1])?.modified()?, modified);
+        }
+
+        let mut writer = fs::OpenOptions::new().append(true).open(&paths[1])?;
+        writer.write_all(&tail.as_bytes()[split..])?;
+        drop(writer);
+        let completed = fs::read(&paths[1])?;
+        validate(&paths[1], None)?;
+        let conversations = CodexConnector::new().scan(&ctx)?;
+        // ubs:ignore[rust.panic.assert-macros] -- Completing the original tail must make its first conversation available.
+        assert_eq!(conversations.len(), 3);
+        // ubs:ignore[rust.panic.assert-macros] -- Preserve the completed source's identity.
+        assert_eq!(conversations[1].source_path, paths[1]);
+        // ubs:ignore[rust.panic.assert-macros] -- The completed tail must become exactly one real message.
+        assert_eq!(conversations[1].messages.len(), 1);
+        // ubs:ignore[rust.panic.assert-macros] -- Compare the completed first message with the actual fixture text.
+        assert_eq!(
+            conversations[1].messages[0].content,
+            "completed first message"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Parsing a completed tail must leave the source untouched.
+        assert_eq!(fs::read(&paths[1])?, completed);
+    }
+    Ok(())
+}
+
+#[test]
+fn recent_or_locked_zero_output_tail_remains_retryable() -> Result<()> {
+    let (_temp, paths, ctx) = fixture("jsonl", b"{\"type\":\"session_meta\"}\n{\"type\":")?;
+    let recent = validate(&paths[1], None).unwrap_err();
+    // ubs:ignore[rust.panic.assert-macros] -- A recently modified incomplete tail must retain its retryable failure.
+    assert_eq!(
+        recent.downcast_ref::<io::Error>().unwrap().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    age_source(&paths[1])?;
+    // Read-only distinguishes advisory-lock protection from writable-FD detection.
+    let locked = File::open(&paths[1])?;
+    locked.try_lock()?;
+    let error = validate(&paths[1], None).unwrap_err();
+    // ubs:ignore[rust.panic.assert-macros] -- An old source with an active lock is still unfinished.
+    assert_eq!(
+        error.downcast_ref::<io::Error>().unwrap().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    // ubs:ignore[rust.panic.assert-macros] -- The public connector must honor the active lock too.
+    assert!(CodexConnector::new().scan(&ctx).is_err());
+    locked.unlock()?;
+    validate(&paths[1], None)?;
+    // ubs:ignore[rust.panic.assert-macros] -- Releasing the lock permits empty-tail recovery and retains both neighbors.
+    assert_eq!(CodexConnector::new().scan(&ctx)?.len(), 2);
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn held_open_zero_output_tail_remains_retryable() -> Result<()> {
+    let (_temp, paths, ctx) = fixture("jsonl", b"{\"type\":")?;
+    let writer = fs::OpenOptions::new().append(true).open(&paths[1])?;
+    age_source(&paths[1])?;
+    let error = validate(&paths[1], None).unwrap_err();
+    // ubs:ignore[rust.panic.assert-macros] -- A writable descriptor keeps an old incomplete tail retryable.
+    assert_eq!(
+        error.downcast_ref::<io::Error>().unwrap().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    // ubs:ignore[rust.panic.assert-macros] -- The public connector must not bypass the held writer.
+    assert!(CodexConnector::new().scan(&ctx).is_err());
+    drop(writer);
+    validate(&paths[1], None)?;
+    // ubs:ignore[rust.panic.assert-macros] -- Once the writer closes, recovery succeeds without a fabricated message.
+    assert_eq!(CodexConnector::new().scan(&ctx)?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn inactive_zero_output_tail_recovery_still_rejects_encoding_and_other_formats() -> Result<()> {
+    let compressed = zstd::stream::encode_all(b"{\"type\":".as_slice(), 0)?;
+    for (extension, bytes, expected) in [
+        (
+            "jsonl",
+            b"{\"type\":\xff".as_slice(),
+            io::ErrorKind::InvalidData,
+        ),
+        (
+            "json",
+            b"{\"items\":[".as_slice(),
+            io::ErrorKind::UnexpectedEof,
+        ),
+        (
+            "jsonl.zst",
+            compressed.as_slice(),
+            io::ErrorKind::UnexpectedEof,
+        ),
+    ] {
+        let (_temp, paths, ctx) = fixture(extension, bytes)?;
+        age_source(&paths[1])?;
+        let error = validate(&paths[1], None).unwrap_err();
+        // ubs:ignore[rust.panic.assert-macros] -- Age must not turn corrupt encoding, legacy JSON, or compressed text into success.
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            expected,
+            "{extension}: {error:#}"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Primary parsing must preserve the same strict failure policy.
+        assert!(CodexConnector::new().scan(&ctx).is_err(), "{extension}");
+        // ubs:ignore[rust.panic.assert-macros] -- Rejected source fixtures must remain byte-identical.
+        assert_eq!(fs::read(&paths[1])?, bytes);
+    }
+    Ok(())
+}
+
 #[test]
 fn compressed_zero_message_sources_validate_decoded_text_and_refuse_damage() -> Result<()> {
     let text = b"{\"type\":\"session_meta\",\"payload\":{}}\n";

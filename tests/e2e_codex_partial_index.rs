@@ -402,8 +402,8 @@ fn batch_compressed_empty_rollout_preserves_coverage_and_neighbors() {
     compressed_empty_rollout_cli("0");
 }
 
-/// GH #560: two ordinary index runs must converge without editing a crashed
-/// writer's source, then ingest its completed final turn exactly once.
+/// GH #560: ordinary index runs must converge without editing crashed writers'
+/// sources, including one with no complete messages, then ingest completed tails once.
 fn inactive_cut_tail_indexes_complete_history(streaming: &str) {
     let dir = tempfile::tempdir().expect("isolated archive");
     let home = dir.path();
@@ -427,6 +427,24 @@ fn inactive_cut_tail_indexes_complete_history(streaming: &str) {
     };
     age_source();
     let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let empty_path = sessions.join("rollout-inactive-empty.jsonl");
+    let empty_meta =
+        json!({"type":"session_meta","payload":{"id":"inactive-empty","cwd":home.join("project")}});
+    let empty_tail = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"staletailfirstmessagesentinel"}]}}).to_string();
+    let empty_split = empty_tail.len() / 2;
+    let empty_bytes = format!("{empty_meta}\n{}", &empty_tail[..empty_split]);
+    std::fs::write(&empty_path, &empty_bytes).unwrap();
+    std::fs::File::open(&empty_path)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let assert_empty_unchanged = || {
+        assert_eq!(std::fs::read_to_string(&empty_path).unwrap(), empty_bytes);
+        assert_eq!(
+            std::fs::metadata(&empty_path).unwrap().modified().unwrap(),
+            modified
+        );
+    };
     let run_index = || {
         cass(home, streaming)
             .args(["index", "--json", "--data-dir"])
@@ -468,6 +486,7 @@ fn inactive_cut_tail_indexes_complete_history(streaming: &str) {
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             modified
         );
+        assert_empty_unchanged();
     }
     let mut writer = std::fs::OpenOptions::new()
         .append(true)
@@ -488,6 +507,65 @@ fn inactive_cut_tail_indexes_complete_history(streaming: &str) {
         );
         assert_history(3);
         assert_searchable(home, streaming, "staletailfinishsentinel", &path);
+        assert_eq!(std::fs::read(&path).unwrap(), completed);
+        assert_empty_unchanged();
+    }
+
+    // A source that yielded zero conversations must still be revisited when
+    // its first message becomes complete, without duplicating either history.
+    let mut writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&empty_path)
+        .unwrap();
+    writer
+        .write_all(&empty_tail.as_bytes()[empty_split..])
+        .unwrap();
+    writer.write_all(b"\n").unwrap();
+    drop(writer);
+    let empty_completed = std::fs::read(&empty_path).unwrap();
+    let empty_modified = std::fs::metadata(&empty_path).unwrap().modified().unwrap();
+    for _ in 0..2 {
+        let output = run_index();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let storage = SqliteStorage::open_readonly(&home.join("archive/agent_search.db")).unwrap();
+        let conversations = storage.list_conversations(10, 0).unwrap();
+        assert_eq!(conversations.len(), 2);
+        assert!(
+            conversations
+                .iter()
+                .any(|conversation| conversation.source_path == path)
+        );
+        assert!(
+            conversations
+                .iter()
+                .any(|conversation| conversation.source_path == empty_path)
+        );
+        for conversation in &conversations {
+            let messages = storage.fetch_messages(conversation.id.unwrap()).unwrap();
+            if conversation.source_path == empty_path {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].content, "staletailfirstmessagesentinel");
+            } else {
+                assert_eq!(conversation.source_path, path);
+                assert_eq!(messages.len(), 3);
+            }
+        }
+        assert_searchable(
+            home,
+            streaming,
+            "staletailfirstmessagesentinel",
+            &empty_path,
+        );
+        assert_eq!(std::fs::read(&empty_path).unwrap(), empty_completed);
+        assert_eq!(
+            std::fs::metadata(&empty_path).unwrap().modified().unwrap(),
+            empty_modified
+        );
         assert_eq!(std::fs::read(&path).unwrap(), completed);
     }
 }
