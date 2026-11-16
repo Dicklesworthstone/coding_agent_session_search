@@ -1002,7 +1002,7 @@ pub(crate) fn open_validated_lexical_index(index_path: &Path) -> Result<OpenedLe
 /// the snapshot open below performs the same segment validation as a reader.
 pub(crate) fn open_validated_lexical_snapshot(
     index_path: &Path,
-) -> Result<Arc<frankensearch::quill::KeeperSnapshot>> {
+) -> Result<std::sync::Arc<frankensearch::quill::KeeperSnapshot>> {
     if federated_search_manifest_path(index_path).exists() {
         anyhow::bail!("a federated lexical bundle cannot be audited as a single native snapshot");
     }

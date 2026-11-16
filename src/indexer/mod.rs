@@ -37,8 +37,8 @@ pub(crate) use self::source_writer_probe::source_can_recover_incomplete_tail;
 #[cfg(test)]
 use self::source_writer_probe::source_file_has_active_advisory_lock;
 use self::source_writer_probe::{
-    ActiveSessionSourceReason, SourceWriterProbe, active_session_recent_write_window,
-    is_session_log_source_candidate,
+    ActiveSessionSourceReason, SourceFileId, SourceWriterProbe, active_session_recent_write_window,
+    is_session_log_source_candidate, source_file_id,
 };
 
 use std::any::Any;

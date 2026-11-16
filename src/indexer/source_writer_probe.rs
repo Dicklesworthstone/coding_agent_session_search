@@ -41,7 +41,7 @@ type FileIdentity = (u64, u64);
 type SourcePredicate = fn(&Path) -> bool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct SourceFileId {
+pub(super) struct SourceFileId {
     dev: u64,
     ino: u64,
 }
@@ -180,7 +180,7 @@ fn test_active_session_source_path_matches(_path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn source_file_id(path: &Path) -> Option<SourceFileId> {
+pub(super) fn source_file_id(path: &Path) -> Option<SourceFileId> {
     use std::os::unix::fs::MetadataExt;
 
     fs::metadata(path).ok().map(|metadata| SourceFileId {
@@ -190,7 +190,7 @@ fn source_file_id(path: &Path) -> Option<SourceFileId> {
 }
 
 #[cfg(not(unix))]
-fn source_file_id(_path: &Path) -> Option<SourceFileId> {
+pub(super) fn source_file_id(_path: &Path) -> Option<SourceFileId> {
     None
 }
 
