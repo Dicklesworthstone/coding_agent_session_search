@@ -769,7 +769,18 @@ fn collect_writers_in(
             // identity alone, without following their targets. An unknown
             // mount still never authorizes target metadata access.
             if !session_named && mount.is_none() {
-                continue;
+                // An absolute path may still be a known source: let the
+                // identity error record an inspection gap. Kernel pseudo
+                // handles and explicitly different inodes cannot be that file.
+                if !target.is_absolute() {
+                    continue;
+                }
+                if observed
+                    .inode
+                    .is_some_and(|inode| known_writers.keys().all(|identity| identity.1 != inode))
+                {
+                    continue;
+                }
             }
             #[cfg(test)]
             if mount.is_some_and(|mount| !mount.remote) {
