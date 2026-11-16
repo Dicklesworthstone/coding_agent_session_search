@@ -190,7 +190,8 @@ impl ExportModalState {
 
         // Prefer stable session metadata over first-message text so export titles and
         // filenames do not drift when the indexed conversation already has a real title.
-        let mut title_preview = view
+        let mut privacy = crate::export::ExportPrivacy::new(false);
+        let title_preview = view
             .convo
             .title
             .as_deref()
@@ -201,10 +202,17 @@ impl ExportModalState {
                 let hit_title = hit.title.trim();
                 (!hit_title.is_empty()).then(|| hit_title.to_string())
             })
+            .map(|mut title| {
+                privacy.redact_text(&mut title);
+                title
+            })
             .or_else(|| {
                 view.messages.first().map(|m| {
-                    let content = crate::indexer::redact_secrets::redact_text(m.content.trim());
-                    // Use char_indices to safely truncate at UTF-8 boundary (57 chars + "...")
+                    let mut content = m.content.trim().to_string();
+                    // Preserve the complete encoded JSON while inspecting it;
+                    // truncation can otherwise conceal its credential fields.
+                    privacy.redact_text(&mut content);
+                    // Use char_indices to truncate at a UTF-8 boundary (56 chars + "...").
                     if content.chars().count() > 60 {
                         let end_idx = content
                             .char_indices()
@@ -213,15 +221,13 @@ impl ExportModalState {
                             .unwrap_or(content.len());
                         format!("{}...", &content[..end_idx])
                     } else {
-                        content.to_string()
+                        content
                     }
                 })
             })
             .filter(|title| !title.trim().is_empty())
             .unwrap_or_else(|| "Untitled Session".to_string());
 
-        let mut privacy = crate::export::ExportPrivacy::new(false);
-        privacy.redact_text(&mut title_preview);
         privacy.redact_text(&mut agent);
         privacy.redact_text(&mut workspace);
 
@@ -569,6 +575,62 @@ mod tests {
                 .content
                 .contains("synthetic-export-body-84")
         );
+    }
+
+    #[test]
+    fn export_redaction_tui_modal_redacts_json_message_before_truncation() -> anyhow::Result<()> {
+        let mut hit = make_hit(None);
+        hit.title.clear();
+        let mut view = make_view(None, Some(1_700_000_000));
+        view.convo.title = None;
+        let payload = serde_json::json!({
+            "registration_token":"tiny-title-551", "zz_note":"界".repeat(90)
+        })
+        .to_string();
+        let clean = serde_json::json!({
+            "registration_token":"[REDACTED]", "zz_note":"界".repeat(90)
+        })
+        .to_string();
+        for quoted in [false, true] {
+            let (text, expected) = if quoted {
+                (
+                    serde_json::to_string(&payload)?,
+                    serde_json::to_string(&clean)?,
+                )
+            } else {
+                (payload.clone(), clean.clone())
+            };
+            for field in ["conversation", "hit", "message"] {
+                view.convo.title = (field == "conversation").then(|| text.clone());
+                hit.title = if field == "hit" {
+                    text.clone()
+                } else {
+                    String::new()
+                };
+                view.messages[0].content.clone_from(&text);
+                let state = ExportModalState::from_hit(&hit, &view);
+                let expected = if field == "message" {
+                    format!("{}...", expected.chars().take(56).collect::<String>())
+                } else {
+                    expected.clone()
+                };
+                assert_eq!(state.title_preview, expected, "{field}");
+                assert!(
+                    !state.filename_preview.contains("tiny-title-551"),
+                    "{field}"
+                );
+                assert_eq!(view.messages[0].content, text);
+                assert_eq!(
+                    view.convo.title.as_deref(),
+                    (field == "conversation").then_some(text.as_str())
+                );
+                assert_eq!(hit.title, if field == "hit" { text.as_str() } else { "" });
+            }
+        }
+        view.messages[0].content = "{ \"note\": \"café 界\", \"token_count\": 42 }".into();
+        let state = ExportModalState::from_hit(&hit, &view);
+        assert_eq!(state.title_preview, view.messages[0].content);
+        Ok(())
     }
 
     #[test]

@@ -11106,13 +11106,15 @@ impl CassApp {
         }
 
         let downloads = get_downloads_dir();
-        let fallback_title = if let Some(title) = hit_title_display(hit) {
-            smart_truncate(&crate::indexer::redact_secrets::redact_text(title), 60)
-        } else {
-            search_hit_snippet_fallback_text_opt(hit)
-                .map(|text| smart_truncate(&crate::indexer::redact_secrets::redact_text(text), 60))
-                .unwrap_or_else(|| "Untitled Session".to_string())
-        };
+        let mut fallback_title = hit_title_display(hit)
+            .or_else(|| search_hit_snippet_fallback_text_opt(hit))
+            .unwrap_or("Untitled Session")
+            .to_string();
+        // Inspect the complete JSON payload before truncation can turn a
+        // quoted credential object into ordinary, unparseable prose.
+        let mut privacy = crate::export::ExportPrivacy::new(false);
+        privacy.redact_text(&mut fallback_title);
+        let fallback_title = smart_truncate(&fallback_title, 60);
         let created_date = hit
             .created_at
             .and_then(smart_timestamp)
@@ -11125,7 +11127,6 @@ impl CassApp {
 
         let mut agent_name = hit.agent.trim().to_string();
         let mut workspace = hit.workspace.trim().to_string();
-        let mut privacy = crate::export::ExportPrivacy::new(false);
         privacy.redact_text(&mut agent_name);
         privacy.redact_text(&mut workspace);
 
@@ -34043,6 +34044,54 @@ not jsonl",
         }
         assert_eq!(hit.title, before.title);
         assert_eq!(hit.workspace, before.workspace);
+    }
+
+    #[test]
+    fn export_redaction_tui_fallback_redacts_json_before_truncation() -> anyhow::Result<()> {
+        let app = CassApp::default();
+        let secret = "tiny-title-551";
+        let payload =
+            serde_json::json!({"registration_token":secret, "zz_note":"界".repeat(90)}).to_string();
+        let clean =
+            serde_json::json!({"registration_token":"[REDACTED]", "zz_note":"界".repeat(90)})
+                .to_string();
+        for quoted in [false, true] {
+            let (text, expected) = if quoted {
+                (
+                    serde_json::to_string(&payload)?,
+                    serde_json::to_string(&clean)?,
+                )
+            } else {
+                (payload.clone(), clean.clone())
+            };
+            for field in ["title", "snippet", "content"] {
+                let mut hit = make_test_hit();
+                hit.title.clear();
+                hit.snippet.clear();
+                hit.content.clear();
+                match field {
+                    "title" => hit.title.clone_from(&text),
+                    "snippet" => hit.snippet.clone_from(&text),
+                    _ => hit.content.clone_from(&text),
+                }
+                let before = hit.clone();
+                let state = app.detail_export_state_for_hit(&hit);
+                assert_eq!(
+                    state.title_preview,
+                    smart_truncate(&expected, 60),
+                    "{field}"
+                );
+                assert!(!state.filename_preview.contains(secret), "{field}");
+                assert_eq!(hit.title, before.title);
+                assert_eq!(hit.snippet, before.snippet);
+                assert_eq!(hit.content, before.content);
+            }
+        }
+        let mut hit = make_test_hit();
+        hit.title = "  { \"note\": \"café 界\", \"token_count\": 42 }  ".into();
+        let state = app.detail_export_state_for_hit(&hit);
+        assert_eq!(state.title_preview, hit.title.trim());
+        Ok(())
     }
 
     #[test]
