@@ -46,8 +46,12 @@ impl ExportPrivacy {
 
     pub(crate) fn redact_text(&mut self, text: &mut String) {
         if !self.include_secrets
-            && let Cow::Owned(redacted) = crate::indexer::redact_secrets::redact_text(text)
+            && let Value::String(redacted) =
+                crate::indexer::redact_secrets::redact_json(&Value::String(text.clone()))
+            && redacted != *text
         {
+            // Titles and text metadata can contain JSON-encoded credentials,
+            // just like message strings. Apply the same field-aware policy.
             *text = redacted;
             self.redaction_applied = true;
         }
@@ -523,6 +527,22 @@ mod tests {
         assert_eq!(messages[0], benign);
         assert_eq!(privacy.metadata()["redaction_applied"], false);
 
+        for original in [
+            "Discuss password rotation; café 界",
+            "  { \"note\": \"café 界\", \"token_count\": 42 }\n",
+            "\"Discuss password rotation; café 界\"",
+            "\"ordinary quoted prose without its closing quote",
+        ] {
+            let mut title = Some(original.to_owned());
+            privacy.redact_optional_text(&mut title);
+            assert_eq!(title.as_deref(), Some(original));
+            assert_eq!(privacy.metadata()["redaction_applied"], false);
+        }
+        let mut absent = None;
+        privacy.redact_optional_text(&mut absent);
+        assert_eq!(absent, None);
+        assert_eq!(privacy.metadata()["redaction_applied"], false);
+
         let raw = serde_json::json!({"content": "password=synthetic-explicit-84"});
         let mut messages = [raw.clone()];
         let mut title = Some("password=synthetic-title-84".to_string());
@@ -534,6 +554,54 @@ mod tests {
         assert_eq!(privacy.metadata()["policy"], "include-secrets");
         assert_eq!(privacy.metadata()["sensitive_output"], true);
         assert_eq!(privacy.metadata()["redaction_applied"], false);
+    }
+
+    #[test]
+    fn export_privacy_redacts_json_titles_and_text_metadata() -> Result<(), serde_json::Error> {
+        for (payload, expected) in [
+            (
+                serde_json::json!({"registration_token":"tiny-title-551", "note":"title-kept café 界", "token_count":42}),
+                serde_json::json!({"registration_token":"[REDACTED]", "note":"title-kept café 界", "token_count":42}),
+            ),
+            (
+                serde_json::json!([{"authorization":"tiny", "enabled":true}]),
+                serde_json::json!([{"authorization":"[REDACTED]", "enabled":true}]),
+            ),
+        ] {
+            for wrappers in 0..=2 {
+                let mut original = payload.to_string();
+                for _ in 0..wrappers {
+                    original = serde_json::to_string(&original)?;
+                }
+                let mut title = Some(original.clone());
+                let mut privacy = ExportPrivacy::new(false);
+                privacy.redact_optional_text(&mut title);
+                let mut decoded = title.expect("title remains text");
+                for _ in 0..wrappers {
+                    decoded = serde_json::from_str(&decoded)?;
+                }
+                assert_eq!(serde_json::from_str::<Value>(&decoded)?, expected);
+                assert_eq!(privacy.metadata()["redaction_applied"], true);
+                assert_eq!(privacy.metadata()["sensitive_output"], false);
+                let mut clean_metadata = "metadata-kept café 界".to_owned();
+                privacy.redact_text(&mut clean_metadata);
+                assert_eq!(clean_metadata, "metadata-kept café 界");
+                assert_eq!(privacy.metadata()["redaction_applied"], true);
+
+                let mut raw_title = Some(original.clone());
+                let mut raw_privacy = ExportPrivacy::new(true);
+                raw_privacy.redact_optional_text(&mut raw_title);
+                assert_eq!(raw_title.as_deref(), Some(original.as_str()));
+                assert_eq!(raw_privacy.metadata()["redaction_applied"], false);
+                assert_eq!(raw_privacy.metadata()["sensitive_output"], true);
+            }
+        }
+        let mut truncated = r#"{"registration_token":"tiny-title-551""#.to_owned();
+        let mut privacy = ExportPrivacy::new(false);
+        privacy.redact_text(&mut truncated);
+        assert_eq!(truncated, "[REDACTED]");
+        assert_eq!(privacy.metadata()["redaction_applied"], true);
+        Ok(())
     }
 
     #[test]

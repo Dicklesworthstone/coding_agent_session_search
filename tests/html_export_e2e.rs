@@ -376,6 +376,118 @@ fn export_redaction_covers_tool_arguments_results_and_nested_metadata()
 }
 
 #[test]
+fn gh551_export_redaction_covers_json_titles() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::Builder::new()
+        .prefix("cass-gh551-json-title-")
+        .disable_cleanup(true)
+        .tempdir()?;
+    let storage = root.path().join("storage");
+    let sessions = storage.join("session/project-551");
+    let messages = storage.join("message/session-title-551");
+    let parts = storage.join("part/message-551");
+    for directory in [&sessions, &messages, &parts] {
+        fs::create_dir_all(directory)?;
+    }
+    let session = sessions.join("session-title-551.json");
+    let message = messages.join("message-551.json");
+    let part = parts.join("part-551.json");
+    fs::write(
+        &message,
+        serde_json::to_vec(&serde_json::json!({
+            "id":"message-551", "sessionID":"session-title-551", "role":"user",
+            "time":{"created":1733000001000_i64}
+        }))?,
+    )?;
+    fs::write(
+        &part,
+        serde_json::to_vec(&serde_json::json!({
+            "id":"part-551", "messageID":"message-551", "type":"text",
+            "text":"export-title-clean-body café 界"
+        }))?,
+    )?;
+    // Only the title contains a credential: message redaction cannot make the
+    // receipt pass while the title still leaks. Use a real OpenCode layout.
+    let structured_title = serde_json::json!({
+        "registration_token":EXPORT_PRIVACY_SECRET,
+        "note":"title-kept café 界",
+        "token_count":42
+    })
+    .to_string();
+    for wrappers in 0..=2 {
+        let mut title = structured_title.clone();
+        for _ in 0..wrappers {
+            title = serde_json::to_string(&title)?;
+        }
+        fs::write(
+            &session,
+            serde_json::to_vec(&serde_json::json!({
+                "id":"session-title-551", "title":title,
+                "time":{"created":1733000000000_i64, "updated":1733000002000_i64}
+            }))?,
+        )?;
+        let originals = [
+            (&session, fs::read(&session)?),
+            (&message, fs::read(&message)?),
+            (&part, fs::read(&part)?),
+        ];
+        for include_secrets in [false, true] {
+            for format in ["markdown", "text", "json", "html"] {
+                let mut command = export_privacy_command(root.path());
+                command
+                    .arg("export")
+                    .arg(&session)
+                    .args(["--format", format]);
+                if include_secrets {
+                    command.arg("--include-secrets");
+                }
+                let output = command.output()?;
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let exported = String::from_utf8(output.stdout)?;
+                // Text and JSON export contain only messages; Markdown and
+                // HTML also render the session title.
+                let renders_title = matches!(format, "markdown" | "html");
+                assert_eq!(
+                    exported.contains(EXPORT_PRIVACY_SECRET),
+                    include_secrets && renders_title,
+                    "{format}, wrappers={wrappers}, include_secrets={include_secrets}"
+                );
+                assert!(exported.contains("export-title-clean-body"));
+                if renders_title {
+                    assert!(exported.contains("title-kept"));
+                }
+                let stderr = String::from_utf8(output.stderr)?;
+                let announcement = stderr
+                    .lines()
+                    .find_map(|line| line.strip_prefix("note: export privacy: "))
+                    .ok_or("export privacy announcement missing")?;
+                let privacy: Value = serde_json::from_str(announcement)?;
+                assert_eq!(privacy["redaction_applied"], !include_secrets);
+                assert_eq!(privacy["sensitive_output"], include_secrets);
+            }
+            let (receipt, html) =
+                export_privacy_html(root.path(), &session, None, include_secrets, false)?;
+            assert_eq!(html.contains(EXPORT_PRIVACY_SECRET), include_secrets);
+            assert!(html.contains("title-kept"));
+            assert!(html.contains("export-title-clean-body"));
+            assert_eq!(receipt["privacy"]["redaction_applied"], !include_secrets);
+        }
+        for (path, original) in originals {
+            assert_eq!(
+                fs::read(path)?,
+                original,
+                "export changed {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn gh551_export_redaction_covers_embedded_json_tool_results()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::Builder::new()
