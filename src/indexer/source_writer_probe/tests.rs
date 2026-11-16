@@ -473,10 +473,20 @@ mod linux {
             ("unknown-writer.data", "02100001", "ino:\t987654321\n", true),
             ("other-writer.data", "02100001", "ino:\t123\n", false),
             ("unknown-inode.data", "02100001", "", true),
-            ("unknown-reader.data", "02100000", "ino:\t987654321\n", false),
+            (
+                "unknown-reader.data",
+                "02100000",
+                "ino:\t987654321\n",
+                false,
+            ),
             ("socket:[424242]", "02100002", "ino:\t987654321\n", false),
             ("pipe:[424242]", "02100001", "ino:\t987654321\n", false),
-            ("anon_inode:[eventfd]", "02000002", "ino:\t987654321\n", false),
+            (
+                "anon_inode:[eventfd]",
+                "02000002",
+                "ino:\t987654321\n",
+                false,
+            ),
         ] {
             let fixture = Fixture::new()?;
             let process = remote_process(&fixture, "nfs4")?;
