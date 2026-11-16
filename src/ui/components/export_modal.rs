@@ -126,6 +126,10 @@ pub struct ExportModalState {
     pub timestamp: String,
     pub message_count: usize,
     pub title_preview: String,
+    /// Complete sanitized JSON title, retained before display truncation so
+    /// the exporter can inspect it again without losing safe context.
+    /// Plain-text titles use the existing display-length limit.
+    pub export_title: Option<String>,
 }
 
 impl Default for ExportModalState {
@@ -149,6 +153,7 @@ impl Default for ExportModalState {
             timestamp: String::new(),
             message_count: 0,
             title_preview: String::new(),
+            export_title: None,
         }
     }
 }
@@ -191,6 +196,7 @@ impl ExportModalState {
         // Prefer stable session metadata over first-message text so export titles and
         // filenames do not drift when the indexed conversation already has a real title.
         let mut privacy = crate::export::ExportPrivacy::new(false);
+        let mut export_title = None;
         let title_preview = view
             .convo
             .title
@@ -204,6 +210,9 @@ impl ExportModalState {
             })
             .map(|mut title| {
                 privacy.redact_text(&mut title);
+                export_title = serde_json::from_str::<serde_json::Value>(&title)
+                    .is_ok()
+                    .then(|| title.clone());
                 title
             })
             .or_else(|| {
@@ -212,6 +221,9 @@ impl ExportModalState {
                     // Preserve the complete encoded JSON while inspecting it;
                     // truncation can otherwise conceal its credential fields.
                     privacy.redact_text(&mut content);
+                    export_title = serde_json::from_str::<serde_json::Value>(&content)
+                        .is_ok()
+                        .then(|| content.clone());
                     // Use char_indices to truncate at a UTF-8 boundary (56 chars + "...").
                     if content.chars().count() > 60 {
                         let end_idx = content
@@ -285,6 +297,7 @@ impl ExportModalState {
             timestamp,
             message_count,
             title_preview,
+            export_title,
         }
     }
 
@@ -378,7 +391,10 @@ impl ExportModalState {
     /// Get export options from current state.
     pub fn to_export_options(&self) -> ExportOptions {
         ExportOptions {
-            title: Some(self.title_preview.clone()),
+            title: self
+                .export_title
+                .clone()
+                .or_else(|| Some(self.title_preview.clone())),
             include_cdn: true,
             syntax_highlighting: true,
             include_search: true,
@@ -615,6 +631,13 @@ mod tests {
                     expected.clone()
                 };
                 assert_eq!(state.title_preview, expected, "{field}");
+                let complete = if quoted {
+                    serde_json::to_string(&clean)?
+                } else {
+                    clean.clone()
+                };
+                assert_eq!(state.export_title.as_deref(), Some(complete.as_str()));
+                assert_eq!(state.to_export_options().title, Some(complete));
                 assert!(
                     !state.filename_preview.contains("tiny-title-551"),
                     "{field}"
@@ -630,6 +653,10 @@ mod tests {
         view.messages[0].content = "{ \"note\": \"café 界\", \"token_count\": 42 }".into();
         let state = ExportModalState::from_hit(&hit, &view);
         assert_eq!(state.title_preview, view.messages[0].content);
+        view.messages[0].content = "ordinary prose café 界 ".repeat(20);
+        let state = ExportModalState::from_hit(&hit, &view);
+        assert_eq!(state.export_title, None);
+        assert_eq!(state.to_export_options().title, Some(state.title_preview));
         Ok(())
     }
 
@@ -694,6 +721,10 @@ mod tests {
         let state = ExportModalState::from_hit(&hit, &view);
 
         assert_eq!(state.title_preview, "Untitled Session");
+        assert_eq!(
+            state.to_export_options().title.as_deref(),
+            Some("Untitled Session")
+        );
     }
 
     #[test]

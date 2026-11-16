@@ -11114,6 +11114,9 @@ impl CassApp {
         // quoted credential object into ordinary, unparseable prose.
         let mut privacy = crate::export::ExportPrivacy::new(false);
         privacy.redact_text(&mut fallback_title);
+        let export_title = serde_json::from_str::<serde_json::Value>(&fallback_title)
+            .is_ok()
+            .then(|| fallback_title.clone());
         let fallback_title = smart_truncate(&fallback_title, 60);
         let created_date = hit
             .created_at
@@ -11160,6 +11163,7 @@ impl CassApp {
             timestamp,
             message_count: 0,
             title_preview: fallback_title,
+            export_title,
             ..Default::default()
         }
     }
@@ -11196,6 +11200,7 @@ impl CassApp {
         state.timestamp = refreshed.timestamp;
         state.message_count = refreshed.message_count;
         state.title_preview = refreshed.title_preview;
+        state.export_title = refreshed.export_title;
     }
 
     fn detail_clipboard_width(&self) -> u16 {
@@ -19373,16 +19378,19 @@ impl super::ftui_adapter::Model for CassApp {
                     let output_dir = state.output_dir.clone();
                     let output_filename = state.filename_preview.clone();
                     let output_path = unique_filename(&output_dir, &output_filename);
-                    let encrypt = state.encrypt;
+                    let options = state.to_export_options();
+                    let encrypt = options.encrypt;
                     let password = if encrypt {
                         Some(state.password.clone())
                     } else {
                         None
                     };
-                    let show_timestamps = state.show_timestamps;
-                    let include_tools = state.include_tools;
-                    let title = state.title_preview.clone();
-                    let agent_name = state.agent_name.clone();
+                    let show_timestamps = options.show_timestamps;
+                    let include_tools = options.show_tool_calls;
+                    let title = options.title.unwrap_or_else(|| state.title_preview.clone());
+                    let agent_name = options
+                        .agent_name
+                        .unwrap_or_else(|| state.agent_name.clone());
                     let db_path = self.db_path.clone();
                     self.status = "Exporting HTML...".to_string();
 
@@ -31713,6 +31721,67 @@ mod tests {
     }
 
     #[test]
+    fn export_redaction_tui_html_preserves_complete_title_after_preview() -> anyhow::Result<()> {
+        let root = tempfile::Builder::new()
+            .prefix("cass-tui-complete-title-")
+            .disable_cleanup(true)
+            .tempdir()?;
+        let session = root.path().join("title.jsonl");
+        let bytes = b"{\"role\":\"user\",\"content\":\"clean-title-body\"}\n";
+        std::fs::write(&session, bytes)?;
+        let db = root.path().join("absent.db");
+        let app = CassApp::default();
+        let payload = serde_json::json!({
+            "registration_token":"tiny-title-551",
+            "zz_note":format!("{}title-end-kept", "café 界 ".repeat(20))
+        })
+        .to_string();
+        for wrappers in 0..=2 {
+            let mut title = payload.clone();
+            for _ in 0..wrappers {
+                title = serde_json::to_string(&title)?;
+            }
+            let mut hit = make_exact_hit(&session.display().to_string(), "local", 1, "fixture");
+            hit.title.clone_from(&title);
+            let state = app.detail_export_state_for_hit(&hit);
+            assert!(!state.title_preview.contains("title-end-kept"));
+            assert!(!state.filename_preview.contains("tiny-title-551"));
+            let options = state.to_export_options();
+            let result = export_session_task(
+                &db,
+                &hit,
+                &root.path().join(format!("safe-{wrappers}.html")),
+                options.encrypt,
+                None,
+                options.show_timestamps,
+                options.show_tool_calls,
+                options
+                    .title
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("missing export title"))?,
+                "Codex",
+            );
+            let CassMsg::ExportCompleted { output_path, .. } = result else {
+                anyhow::bail!("HTML export did not complete: {result:?}");
+            };
+            let html = std::fs::read_to_string(output_path)?;
+            let document_title = html
+                .split_once("<title>")
+                .and_then(|(_, rest)| rest.split_once("</title>"))
+                .map(|(title, _)| title)
+                .ok_or_else(|| anyhow::anyhow!("missing HTML document title"))?;
+            assert!(document_title.contains("title-end-kept"));
+            assert!(document_title.contains("[REDACTED]"));
+            assert!(!html.contains("tiny-title-551"));
+            assert!(html.contains("clean-title-body"));
+            assert_eq!(hit.title, title);
+            assert_eq!(std::fs::read(&session)?, bytes);
+            assert!(!db.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn export_session_markdown_task_prefers_local_jsonl_over_stale_index() {
         use crate::storage::sqlite::FrankenStorage;
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -34081,6 +34150,11 @@ not jsonl",
                     smart_truncate(&expected, 60),
                     "{field}"
                 );
+                assert_eq!(state.export_title.as_deref(), Some(expected.as_str()));
+                assert_eq!(
+                    state.to_export_options().title.as_deref(),
+                    Some(expected.as_str())
+                );
                 assert!(!state.filename_preview.contains(secret), "{field}");
                 assert_eq!(hit.title, before.title);
                 assert_eq!(hit.snippet, before.snippet);
@@ -34091,6 +34165,10 @@ not jsonl",
         hit.title = "  { \"note\": \"café 界\", \"token_count\": 42 }  ".into();
         let state = app.detail_export_state_for_hit(&hit);
         assert_eq!(state.title_preview, hit.title.trim());
+        hit.title = "ordinary prose café 界 ".repeat(20);
+        let state = app.detail_export_state_for_hit(&hit);
+        assert_eq!(state.export_title, None);
+        assert_eq!(state.to_export_options().title, Some(state.title_preview));
         Ok(())
     }
 
@@ -34253,6 +34331,10 @@ not jsonl",
 
         let mut loaded_view = make_test_conversation_view();
         loaded_view.convo.source_path = std::path::PathBuf::from(&hit.source_path);
+        loaded_view.convo.title = Some(
+            serde_json::json!({"registration_token":"tiny-title-551", "note":"refreshed-title-kept"})
+                .to_string(),
+        );
         loaded_view.messages = vec![
             Message {
                 id: Some(1),
@@ -34284,6 +34366,13 @@ not jsonl",
         let refreshed = app.export_modal_state.expect("refreshed export state");
         assert_eq!(refreshed.message_count, 2);
         assert_ne!(refreshed.timestamp, "Unknown date");
+        assert_eq!(
+            refreshed.export_title,
+            Some(
+                serde_json::json!({"registration_token":"[REDACTED]", "note":"refreshed-title-kept"})
+                    .to_string()
+            )
+        );
     }
 
     #[test]
