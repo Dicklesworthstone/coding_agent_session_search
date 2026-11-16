@@ -14097,6 +14097,15 @@ fn refresh_completed_lexical_rebuild_checkpoint(
     db_path: &Path,
     data_dir: &Path,
 ) -> Result<()> {
+    refresh_completed_lexical_rebuild_checkpoint_with_index(storage, db_path, data_dir, None)
+}
+
+fn refresh_completed_lexical_rebuild_checkpoint_with_index(
+    storage: &FrankenStorage,
+    db_path: &Path,
+    data_dir: &Path,
+    index: Option<&TantivyIndex>,
+) -> Result<()> {
     let total_conversations = count_total_conversations_exact(storage)?;
     let index_path = index_dir(data_dir)?;
     let total_messages = count_total_messages_exact(storage)?;
@@ -14107,13 +14116,18 @@ fn refresh_completed_lexical_rebuild_checkpoint(
         total_conversations,
         total_messages,
     )?;
+    let observed_docs = index
+        .map(TantivyIndex::doc_count)
+        .transpose()?
+        .map(usize::try_from)
+        .transpose()?;
     persist_completed_lexical_rebuild_checkpoint_from_observations(
         storage,
         &index_path,
         db_state,
         total_messages,
         max_conversation_id,
-        None,
+        observed_docs,
         true,
     )
     .map(|_| ())
@@ -14164,7 +14178,22 @@ fn refresh_completed_lexical_rebuild_checkpoint_for_final_state(
     data_dir: &Path,
     keep_storage_open: bool,
     exact_counts: Option<(usize, usize)>,
+    index: Option<&TantivyIndex>,
 ) -> Result<()> {
+    if keep_storage_open && exact_counts.is_none() {
+        return refresh_completed_lexical_rebuild_checkpoint_with_index(
+            storage, db_path, data_dir, index,
+        );
+    }
+
+    // Retain the already admitted writer through finalization. Its doc_count
+    // checks the current publication authority and falls back to a fresh reader
+    // when that authority cannot be reused; no canonical count is substituted.
+    let observed_docs = index
+        .map(TantivyIndex::doc_count)
+        .transpose()?
+        .map(usize::try_from)
+        .transpose()?;
     if let Some((total_conversations, total_messages)) = exact_counts {
         // This run already knows the exact canonical row counts, so avoid
         // re-opening or force-closing the large database during finalization.
@@ -14178,24 +14207,20 @@ fn refresh_completed_lexical_rebuild_checkpoint_for_final_state(
             total_messages,
         )?;
         let index_path = index_dir(data_dir)?;
-        // GH #435: pass no fabricated observation — read the live Tantivy doc
-        // count so the checkpoint records what the index actually holds (on
-        // noisy corpora that is legitimately below `total_messages`), and so
-        // the refresh stays fail-closed when the index is genuinely behind.
+        // GH #435: use the actual published doc count from the retained writer
+        // (or a fresh reader when absent). On noisy corpora this is legitimately
+        // below `total_messages`; the independent coverage gate still refuses
+        // a refresh when the index is genuinely behind.
         return persist_completed_lexical_rebuild_checkpoint_from_observations(
             storage,
             &index_path,
             db_state,
             total_messages,
             max_conversation_id,
-            None,
+            observed_docs,
             true,
         )
         .map(|_| ());
-    }
-
-    if keep_storage_open {
-        return refresh_completed_lexical_rebuild_checkpoint(storage, db_path, data_dir);
     }
 
     // Fallback for callers that do not already know the exact canonical row
@@ -14227,7 +14252,7 @@ fn refresh_completed_lexical_rebuild_checkpoint_for_final_state(
         db_state,
         total_messages,
         max_conversation_id,
-        None,
+        observed_docs,
         true,
     );
     settled.close_best_effort_in_place();
@@ -20747,9 +20772,12 @@ fn run_index_with_storage_ownership(
         // Tantivy is really behind, the refresh no-ops and search keeps
         // deferring; the real escalation there is a full rebuild, named below.
         grant_final_checkpoint_refresh_grace(opts.progress.as_ref());
-        if let Err(err) =
-            refresh_completed_lexical_rebuild_checkpoint(&storage, &opts.db_path, &opts.data_dir)
-        {
+        if let Err(err) = refresh_completed_lexical_rebuild_checkpoint_with_index(
+            &storage,
+            &opts.db_path,
+            &opts.data_dir,
+            t_index.as_ref(),
+        ) {
             tracing::warn!(
                 db_path = %opts.db_path.display(),
                 error = %format!("{err:#}"),
@@ -20789,6 +20817,7 @@ fn run_index_with_storage_ownership(
             &opts.data_dir,
             opts.watch || opts.watch_once_paths.is_some(),
             exact_total_counts,
+            t_index.as_ref(),
         )
         .with_context(|| {
             format!(
@@ -81995,6 +82024,7 @@ c.close()
             &data_dir,
             false,
             Some((total_conversations, total_messages)),
+            None,
         )
         .unwrap();
 
@@ -83474,6 +83504,7 @@ c.close()
             &db_path_variant,
             &data_dir,
             false,
+            None,
             None,
         )
         .unwrap();

@@ -13,13 +13,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use frankensearch::quill::cass::legacy_v9::cass_document_identity;
 use frankensearch::quill::cass::{
-    CassConversationKey, CassDerivedColumns, CassDocument, CassDocumentRef, CassFieldValues,
-    field,
+    CassConversationKey, CassDerivedColumns, CassDocument, CassDocumentRef, CassFieldValues, field,
 };
 use frankensearch::quill::quiver::NumericValue;
-use frankensearch::quill::{
-    CASS_SEMANTIC_SCHEMA, KeeperSnapshot, QuillSearchSnapshot, SnapshotPublisher,
-};
+use frankensearch::quill::{KeeperSnapshot, QuillSearchSnapshot, SnapshotPublisher};
 use xxhash_rust::xxh3::Xxh3;
 
 /// Quill 0.4.0's schema-v1 IDMAP witness encoding. Quill exposes the stored
@@ -86,9 +83,9 @@ impl PublishedSnapshot {
         // The same native Keeper admission and snapshot composition used by
         // QuillSearchIndex::open_with_schema, without binding a query parser.
         // Only committed durable segments are eligible for repair completion.
-        let keeper = KeeperSnapshot::open(path, CASS_SEMANTIC_SCHEMA)
+        let keeper = crate::search::quill_bridge::open_cass_snapshot(path)
             .context("admitting lexical repair verification snapshot")?;
-        Self::from_keeper(Arc::new(keeper))
+        Self::from_keeper(keeper)
     }
 
     /// Reuse a writer-admitted immutable generation without reopening its

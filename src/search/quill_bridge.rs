@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use asupersync::runtime::{Runtime, RuntimeBuilder};
 use frankensearch::Cx;
 use frankensearch::quill::cass::legacy_v9;
@@ -533,6 +533,24 @@ pub fn open_cass_reader(path: &Path) -> Result<QuillSearchIndex> {
         }
     })
     .map_err(|error| anyhow!("opening Quill CASS reader at {}: {error}", path.display()))
+}
+
+/// Admit and retain a native CASS snapshot for exact document verification.
+/// Like a search-reader open, this authenticates the manifest and every live
+/// segment. Keeping this owner lets callers validate and inspect one generation
+/// without opening and hashing that generation a second time.
+/// The native CASS schema is checked here; the CASS `schema_hash.json` sidecar
+/// remains part of the higher-level standard lexical contract.
+///
+/// # Errors
+///
+/// Returns an error for an unreadable manifest, native schema, or live segment.
+pub fn open_cass_snapshot(path: &Path) -> Result<Arc<KeeperSnapshot>> {
+    #[cfg(test)]
+    READER_OPEN_COUNT.with(|count| count.set(count.get() + 1));
+    KeeperSnapshot::open(path, CASS_SEMANTIC_SCHEMA)
+        .map(Arc::new)
+        .with_context(|| format!("opening Quill CASS snapshot at {}", path.display()))
 }
 
 /// [`open_cass_reader`] with its own query-fuel ceiling, for tests that need a

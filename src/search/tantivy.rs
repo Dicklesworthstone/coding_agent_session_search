@@ -34,8 +34,8 @@ use frankensearch::lexical_tantivy::{
 // Query-engine upgrades must retain the released v9 directory and identity
 // contract. Upstream's default v10 namespace is an independent migration.
 use frankensearch::quill::cass::legacy_v9::{
-    CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, cass_document_identity,
-    cass_index_dir as fs_index_dir, cass_schema_hash_matches,
+    CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, cass_document_identity, cass_index_dir as fs_index_dir,
+    cass_schema_hash_matches,
 };
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
@@ -983,6 +983,34 @@ pub(crate) fn open_validated_lexical_index(index_path: &Path) -> Result<OpenedLe
         });
     }
 
+    validate_standard_lexical_metadata(index_path)?;
+    let reader = crate::search::quill_bridge::open_cass_reader(index_path).with_context(|| {
+        format!(
+            "opening standard lexical index reader {}",
+            index_path.display()
+        )
+    })?;
+    Ok(OpenedLexicalIndex {
+        path: index_path.to_path_buf(),
+        reader: Some((reader, cass_field_handles())),
+        federated_readers: None,
+    })
+}
+
+/// Validate a standard lexical generation and retain its authenticated native
+/// owner for a content audit. Metadata checks alone never admit a generation:
+/// the snapshot open below performs the same segment validation as a reader.
+pub(crate) fn open_validated_lexical_snapshot(
+    index_path: &Path,
+) -> Result<Arc<frankensearch::quill::KeeperSnapshot>> {
+    if federated_search_manifest_path(index_path).exists() {
+        anyhow::bail!("a federated lexical bundle cannot be audited as a single native snapshot");
+    }
+    validate_standard_lexical_metadata(index_path)?;
+    crate::search::quill_bridge::open_cass_snapshot(index_path)
+}
+
+fn validate_standard_lexical_metadata(index_path: &Path) -> Result<()> {
     // No `meta.json` fallback here, unlike `searchable_index_exists` — the
     // asymmetry is deliberate. `exists` answers "is there an index generation
     // here?", so a pre-migration Tantivy directory counts (it is an index, and
@@ -1000,18 +1028,7 @@ pub(crate) fn open_validated_lexical_index(index_path: &Path) -> Result<OpenedLe
             index_path.display()
         ));
     }
-    current_schema_hash_file_matches(index_path)?;
-    let reader = crate::search::quill_bridge::open_cass_reader(index_path).with_context(|| {
-        format!(
-            "opening standard lexical index reader {}",
-            index_path.display()
-        )
-    })?;
-    Ok(OpenedLexicalIndex {
-        path: index_path.to_path_buf(),
-        reader: Some((reader, cass_field_handles())),
-        federated_readers: None,
-    })
+    current_schema_hash_file_matches(index_path)
 }
 
 pub fn searchable_index_modified_time(index_path: &Path) -> Option<SystemTime> {
@@ -2794,6 +2811,41 @@ mod tests {
             validated_searchable_index_summary(empty.path()).is_err(),
             "a directory without an index fails validation"
         );
+    }
+
+    #[test]
+    fn gh558_validated_snapshot_checks_schema_and_segment_bytes() {
+        let dir = TempDir::new().expect("temp dir");
+        {
+            let mut index = TantivyIndex::open_or_create(dir.path()).expect("create");
+            index
+                .add_messages_from_packet(&gh423_lexical_packet(3), None, Some(7), |_| Ok(()))
+                .expect("add messages");
+            index.commit().expect("commit");
+        }
+        let opens = crate::search::quill_bridge::reader_open_count();
+        let snapshot = open_validated_lexical_snapshot(dir.path()).expect("admit snapshot");
+        assert_eq!(crate::search::quill_bridge::reader_open_count() - opens, 1);
+        assert_eq!(snapshot.doc_count(), 3);
+        let segment_path = snapshot.segments()[0].path().to_path_buf();
+        drop(snapshot);
+
+        let schema_path = dir.path().join("schema_hash.json");
+        let schema = fs::read(&schema_path).expect("read schema");
+        fs::write(&schema_path, br#"{"schema_hash":"wrong-schema"}"#).expect("change schema");
+        let opens = crate::search::quill_bridge::reader_open_count();
+        assert!(open_validated_lexical_snapshot(dir.path()).is_err());
+        assert_eq!(crate::search::quill_bridge::reader_open_count(), opens);
+        fs::write(&schema_path, schema).expect("restore schema");
+
+        // Matching sidecar and MANIFEST bytes are not a substitute for native
+        // admission: a subsequent call must still authenticate segment bytes.
+        let mut bytes = fs::read(&segment_path).expect("read segment");
+        bytes[0] ^= 0xff;
+        fs::write(&segment_path, bytes).expect("corrupt segment without changing its size");
+        let opens = crate::search::quill_bridge::reader_open_count();
+        assert!(open_validated_lexical_snapshot(dir.path()).is_err());
+        assert_eq!(crate::search::quill_bridge::reader_open_count() - opens, 1);
     }
 
     fn gh423_lexical_hits(index: &TantivyIndex, term: &str) -> BTreeSet<String> {
