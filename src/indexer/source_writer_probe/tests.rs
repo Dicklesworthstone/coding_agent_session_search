@@ -465,6 +465,60 @@ mod linux {
     }
 
     #[test]
+    fn unknown_mount_aliases_cannot_clear_known_writers_but_non_file_handles_can()
+    -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        for (name, flags, uncertain) in [
+            ("unknown-writer.data", "02100001", true),
+            ("unknown-reader.data", "02100000", false),
+            ("socket:[424242]", "02100002", false),
+            ("pipe:[424242]", "02100001", false),
+            ("anon_inode:[eventfd]", "02000002", false),
+        ] {
+            let fixture = Fixture::new()?;
+            let process = remote_process(&fixture, "nfs4")?;
+            let identity = (61, 987_654_321);
+            let initial = collect_writers_in(&fixture.root, session_source, &HashMap::new());
+            assert!(initial.complete && initial.visibility_gaps.is_empty());
+            assert!(initial.writers.contains_key(&identity));
+            let owners = initial.visible_processes.clone();
+            fs::write(
+                process.join("fdinfo/7"),
+                "flags:\t02100000\nmnt_id:\t412\nino:\t987654321\n",
+            )?;
+            let target = if name.ends_with(".data") {
+                fixture.root.join(name)
+            } else {
+                PathBuf::from(name)
+            };
+            symlink(target, process.join("fd/8"))?;
+            fs::write(
+                process.join("fdinfo/8"),
+                format!("flags:\t{flags}\nmnt_id:\t999\nino:\t987654321\n"),
+            )?;
+
+            let fresh = collect_writers_in(&fixture.root, session_source, &initial.writers);
+            assert!(fresh.complete);
+            assert_eq!(fresh.visible_processes, owners);
+            assert!(fresh.followed.is_empty());
+            assert_eq!(fresh.visibility_gaps.len(), usize::from(uncertain), "{name}");
+            assert!(fresh.visibility_gaps.iter().all(|gap| {
+                gap.inspection == Inspection::Identity
+                    && gap.error_kind == io::ErrorKind::InvalidData
+            }));
+            let mut state = ProbeState {
+                census: initial,
+                ..ProbeState::default()
+            };
+            state.apply_refresh(fresh);
+            assert_eq!(state.census.writers.contains_key(&identity), uncertain, "{name}");
+            assert_eq!(state.refresh_blocked, uncertain, "{name}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn incomplete_remote_identity_never_stats_or_revokes_a_prior_positive() -> io::Result<()> {
         let fixture = Fixture::new()?;
         let process = remote_process(&fixture, "fuse.sshfs")?;
