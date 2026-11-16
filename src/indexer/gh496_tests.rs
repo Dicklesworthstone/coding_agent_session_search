@@ -867,6 +867,156 @@ fn gh496_same_length_content_rewrite_beyond_preview_is_not_append_growth() {
 
 #[test]
 #[serial_test::serial]
+fn gh558_final_checkpoint_reuses_writer_and_refuses_missing_documents() {
+    let fixture = gh496_fixture();
+    rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();
+    let index = TantivyIndex::open_or_create(&fixture.index_path).unwrap();
+
+    // Exercise known counts, a retained canonical handle, and settled-storage
+    // finalization. All three use the same verified committed lexical owner.
+    for (keep_storage_open, exact_counts) in [(false, Some((2, 4))), (true, None), (false, None)] {
+        let mut storage = FrankenStorage::open(&fixture.db_path).unwrap();
+        let opens = crate::search::quill_bridge::reader_open_count();
+        refresh_completed_lexical_rebuild_checkpoint_for_final_state(
+            &mut storage,
+            &fixture.db_path,
+            &fixture.data_dir,
+            keep_storage_open,
+            exact_counts,
+            Some(&index),
+        )
+        .unwrap();
+        assert_eq!(crate::search::quill_bridge::reader_open_count(), opens);
+        assert_eq!(
+            load_lexical_rebuild_state(&fixture.index_path)
+                .unwrap()
+                .unwrap()
+                .indexed_docs,
+            4
+        );
+    }
+
+    let mut storage = FrankenStorage::open(&fixture.db_path).unwrap();
+    let opens = crate::search::quill_bridge::reader_open_count();
+    refresh_completed_lexical_rebuild_checkpoint_with_index(
+        &storage,
+        &fixture.db_path,
+        &fixture.data_dir,
+        Some(&index),
+    )
+    .unwrap();
+    assert_eq!(crate::search::quill_bridge::reader_open_count(), opens);
+
+    // A canonical append without its lexical publication must not be hidden
+    // by substituting the known canonical count for the writer's actual count.
+    let before = load_lexical_rebuild_state(&fixture.index_path).unwrap();
+    gh496_insert_conversation(&storage, 2, 2, 32);
+    let opens = crate::search::quill_bridge::reader_open_count();
+    refresh_completed_lexical_rebuild_checkpoint_for_final_state(
+        &mut storage,
+        &fixture.db_path,
+        &fixture.data_dir,
+        false,
+        Some((3, 6)),
+        Some(&index),
+    )
+    .unwrap();
+    assert_eq!(crate::search::quill_bridge::reader_open_count(), opens);
+    assert_eq!(
+        load_lexical_rebuild_state(&fixture.index_path).unwrap(),
+        before
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn gh558_completed_audit_reuses_one_authenticated_snapshot() {
+    let fixture = gh496_fixture();
+    rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();
+    // The former contract-check-then-audit sequence admitted every segment
+    // twice. Count both real native admissions as a negative control.
+    let opens = crate::search::quill_bridge::reader_open_count();
+    crate::search::tantivy::validate_searchable_index_contract(&fixture.index_path).unwrap();
+    let baseline =
+        lexical_reconcile::canary::exact::PublishedSnapshot::open(&fixture.index_path).unwrap();
+    assert_eq!(crate::search::quill_bridge::reader_open_count() - opens, 2);
+    drop(baseline);
+
+    let completed = load_lexical_rebuild_state(&fixture.index_path)
+        .unwrap()
+        .unwrap();
+    let opens = crate::search::quill_bridge::reader_open_count();
+    let unchanged = lexical_resume::revalidate_completed(
+        &fixture.db_path,
+        &fixture.index_path,
+        completed,
+        None,
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(unchanged.indexed_docs, 4);
+    assert_eq!(crate::search::quill_bridge::reader_open_count() - opens, 1);
+
+    // Metadata changes invalidate the physical archive epoch and require a
+    // full content audit, which must share the same strict native admission.
+    let storage = FrankenStorage::open(&fixture.db_path).unwrap();
+    storage.set_last_indexed_at(42).unwrap();
+    drop(storage);
+    let completed = load_lexical_rebuild_state(&fixture.index_path)
+        .unwrap()
+        .unwrap();
+    let opens = crate::search::quill_bridge::reader_open_count();
+    let audited = lexical_resume::revalidate_completed(
+        &fixture.db_path,
+        &fixture.index_path,
+        completed,
+        None,
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(audited.exact_checkpoint_persisted);
+    assert!(audited.equivalence.is_some());
+    assert_eq!(audited.indexed_docs, 4);
+    assert_eq!(crate::search::quill_bridge::reader_open_count() - opens, 1);
+
+    let completed = load_lexical_rebuild_state(&fixture.index_path)
+        .unwrap()
+        .unwrap();
+    let storage = FrankenStorage::open(&fixture.db_path).unwrap();
+    storage
+        .raw()
+        .execute(
+            "UPDATE messages SET content = 'growthproof changedafteradmission' \
+             WHERE conversation_id = 1 AND idx = 0",
+        )
+        .unwrap();
+    drop(storage);
+    let opens = crate::search::quill_bridge::reader_open_count();
+    assert!(
+        lexical_resume::revalidate_completed(
+            &fixture.db_path,
+            &fixture.index_path,
+            completed.clone(),
+            None,
+            None,
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(crate::search::quill_bridge::reader_open_count() - opens, 1);
+    assert_eq!(
+        load_lexical_rebuild_state(&fixture.index_path)
+            .unwrap()
+            .unwrap(),
+        completed,
+        "same-count content drift must leave the old evidence unrenewed"
+    );
+}
+
+#[test]
+#[serial_test::serial]
 fn gh496_completed_recovery_cannot_certify_later_same_count_edits() {
     let fixture = gh496_fixture();
     gh496_append(&fixture);

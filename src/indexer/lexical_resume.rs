@@ -520,8 +520,6 @@ fn revalidate_completed_inner(
     {
         return Ok(None);
     }
-    crate::search::tantivy::validate_searchable_index_contract(index_path)
-        .map_err(|error| candidate_failure(error, "completed lexical contract is unreadable"))?;
     if crate::search::tantivy::searchable_index_live_docs(index_path).is_some_and(|live| {
         live.manifest_source
             == crate::search::quill_bridge::QuillManifestSource::PreviousAfterCorruptCurrent
@@ -532,7 +530,12 @@ fn revalidate_completed_inner(
     if native_fingerprint.is_none() {
         return Ok(None);
     }
-    let published = PublishedSnapshot::open(index_path)
+    // Capture the authority before admission and check it again afterwards.
+    // The strict native open both validates the contract and supplies the exact
+    // content-audit owner, avoiding a second hash of every live segment (#558).
+    let keeper = crate::search::tantivy::open_validated_lexical_snapshot(index_path)
+        .map_err(|error| candidate_failure(error, "completed lexical contract is unreadable"))?;
+    let published = PublishedSnapshot::from_keeper(keeper)
         .map_err(|error| candidate_failure(error, "completed lexical generation is unreadable"))?;
     let original_docs = usize::try_from(published.doc_count())
         .context("completed lexical document count exceeds usize")?;

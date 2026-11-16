@@ -80,6 +80,10 @@ pub use franken_agent_detection::{
     NormalizedMessage, ScanContext, ScanRoot, parse_timestamp, reindex_messages,
 };
 pub mod codex;
+pub(crate) mod indexer {
+    mod source_writer_probe;
+    pub(crate) use source_writer_probe::source_can_recover_incomplete_tail;
+}
 pub mod connectors {
     pub use super::{Connector, DiscoveredSourceFile, ScanContext, ScanRoot, codex};
 }
@@ -110,6 +114,7 @@ pub mod storage {
         (work / "lib.rs").write_text(library, encoding="utf-8")
         for source_base, module in [
             (root / "src/connectors", "codex"),
+            (root / "src", "indexer/source_writer_probe"),
             (root / "src", "raw_mirror"),
             (root / "src", "franken_sync"),
         ]:

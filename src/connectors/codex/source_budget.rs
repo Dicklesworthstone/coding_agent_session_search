@@ -15,6 +15,8 @@ mod empty_source;
 mod recovery;
 mod snapshot;
 
+pub(crate) use recovery::{SourceFailureReason, for_each_source_failure};
+
 use std::cell::RefCell;
 use std::fmt;
 use std::path::{Path, PathBuf};

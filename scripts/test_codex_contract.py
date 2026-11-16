@@ -119,7 +119,7 @@ def main() -> None:
     lockfile = tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))
     dependencies = manifest["dependencies"]
     names = (
-        "anyhow", "blake3", "chrono", "dirs", "dotenvy", "franken-agent-detection", "walkdir",
+        "anyhow", "blake3", "chrono", "dirs", "dotenvy", "franken-agent-detection", "libc", "walkdir",
         "serde", "serde_json", "tempfile", "thiserror", "tracing", "zstd",
     )
     tests = ("connector_codex_exclusions", "codex_source_containment")
@@ -138,7 +138,9 @@ def main() -> None:
     for name in names:
         spec = dependencies[name] if name in dependencies else manifest["dev-dependencies"][name]
         lines.append(dependency_for_harness(name, spec, root, fad_checkout, fad_version))
-    lines.extend(["", "[lints.rust]", 'unsafe_code = "forbid"', ""])
+    # The parser keeps its absolute ban below. The byte-identical writer probe
+    # has one existing, locally allowed libc call for bounded child cleanup.
+    lines.extend(["", "[lints.rust]", 'unsafe_code = "deny"', ""])
 
     library = '''// Re-exports only; the Codex implementation is unmodified production code.
 // Crate-internal entry points used only by unstaged CASS modules (such as
@@ -148,7 +150,12 @@ pub use franken_agent_detection::{
     Connector, DetectionResult, DiscoveredSourceFile, DiscoveredSourceRole, NormalizedConversation,
     NormalizedMessage, Origin, ScanContext, ScanRoot, SourceKind, parse_timestamp, reindex_messages,
 };
+#[forbid(unsafe_code)]
 pub mod codex;
+pub(crate) mod indexer {
+    mod source_writer_probe;
+    pub(crate) use source_writer_probe::source_can_recover_incomplete_tail;
+}
 pub mod connectors {
     pub use super::{
         Connector, DetectionResult, DiscoveredSourceFile, DiscoveredSourceRole, NormalizedConversation,
@@ -160,7 +167,12 @@ pub mod connectors {
     if cargo is None:
         raise SystemExit("cargo is required; install the repository's Rust toolchain")
     source_dir = root / "src/connectors"
-    source_files = [source_dir / "codex.rs", *sorted((source_dir / "codex").rglob("*.rs"))]
+    indexer_dir = root / "src/indexer"
+    source_files = [
+        source_dir / "codex.rs", *sorted((source_dir / "codex").rglob("*.rs")),
+        indexer_dir / "source_writer_probe.rs",
+        *sorted((indexer_dir / "source_writer_probe").rglob("*.rs")),
+    ]
     with tempfile.TemporaryDirectory(prefix="cass-codex-contract-") as directory:
         work = Path(directory)
         project = work / "Cargo.toml"
@@ -168,8 +180,14 @@ pub mod connectors {
         (work / "lib.rs").write_text(library, encoding="utf-8")
         # Normal `mod codex` preserves the nested lookup rules that #[path]
         # overrides. Check equality rather than rewriting source to fit a stub.
+        # Tail recovery uses the same real activity classifier as the indexer;
+        # include its process/lock tests instead of supplying a harness policy.
         for original in source_files:
-            staged = work / original.relative_to(source_dir)
+            relative = (
+                original.relative_to(source_dir) if original.is_relative_to(source_dir)
+                else Path("indexer") / original.relative_to(indexer_dir)
+            )
+            staged = work / relative
             staged.parent.mkdir(parents=True, exist_ok=True)
             source = original.read_bytes()
             staged.write_bytes(source)

@@ -33,7 +33,13 @@ use self::refresh_ledger::{
     EquivalenceArtifacts as RefreshEquivalenceArtifacts, PhaseRecord, RefreshLedger,
     RefreshLedgerEvidence, RefreshPhase,
 };
-use self::source_writer_probe::SourceWriterProbe;
+pub(crate) use self::source_writer_probe::source_can_recover_incomplete_tail;
+#[cfg(test)]
+use self::source_writer_probe::source_file_has_active_advisory_lock;
+use self::source_writer_probe::{
+    ActiveSessionSourceReason, SourceWriterProbe, active_session_recent_write_window,
+    is_session_log_source_candidate,
+};
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -138,20 +144,6 @@ static ROBOT_TRACE_INGEST_BATCH_N: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_SEMANTIC_DELTA_ENABLED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_SESSION_SOURCE_SKIP_OBSERVED: AtomicBool = AtomicBool::new(false);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct SourceFileId {
-    dev: u64,
-    ino: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActiveSessionSourceReason {
-    TestOverride,
-    WritableFileDescriptor,
-    AdvisoryLock,
-    RecentlyModified,
-}
-
 #[derive(Debug, Default)]
 struct ActiveSessionSourceFilter {
     writer_probe: SourceWriterProbe,
@@ -187,87 +179,9 @@ impl ActiveSessionSourceFilter {
     }
 
     fn active_writer_reason(&self, path: &Path) -> Option<ActiveSessionSourceReason> {
-        if !is_session_log_source_candidate(path) {
-            return None;
-        }
-        if test_active_session_source_path_matches(path) {
-            return Some(ActiveSessionSourceReason::TestOverride);
-        }
-        // Cheap mtime check first: a single `stat` is dramatically cheaper than
-        // walking `/proc/*/fd` (Linux) or shelling out to `lsof` (macOS), and it
-        // is the only signal that catches macOS Claude Code's buffered-append
-        // writers (which hold no writable fd advertised through lsof and do not
-        // take advisory locks). False positives just defer a just-finished file
-        // to the next watch cycle (acceptable). See #251 — the v0.5.1 data-loss
-        // regression — for the original root cause.
-        if self
-            .recent_write_window
-            .is_some_and(|window| source_file_recently_modified(path, window))
-        {
-            tracing::debug!(
-                source_path = %path.display(),
-                "active-source filter: mtime fallback fired"
-            );
-            return Some(ActiveSessionSourceReason::RecentlyModified);
-        }
-        if source_file_id(path)
-            .is_some_and(|file_id| self.writer_probe.should_defer((file_id.dev, file_id.ino)))
-        {
-            return Some(ActiveSessionSourceReason::WritableFileDescriptor);
-        }
-        if source_file_has_active_advisory_lock(path) {
-            return Some(ActiveSessionSourceReason::AdvisoryLock);
-        }
-        None
+        self.writer_probe
+            .active_writer_reason(path, self.recent_write_window)
     }
-}
-
-fn active_session_recent_write_window(enable_recent_write_window: bool) -> Option<Duration> {
-    if !enable_recent_write_window {
-        return None;
-    }
-    let seconds = dotenvy::var("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(120)
-        .min(3_600);
-    (seconds > 0).then_some(Duration::from_secs(seconds))
-}
-
-fn source_file_recently_modified(path: &Path, window: Duration) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    let Ok(modified_at) = metadata.modified() else {
-        return false;
-    };
-    match SystemTime::now().duration_since(modified_at) {
-        Ok(age) => age <= window,
-        Err(_) => true,
-    }
-}
-
-fn is_session_log_source_candidate(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| {
-            ext.eq_ignore_ascii_case("jsonl")
-                || ext.eq_ignore_ascii_case("json")
-                || ext.eq_ignore_ascii_case("claude")
-        })
-}
-
-#[cfg(test)]
-fn test_active_session_source_path_matches(path: &Path) -> bool {
-    let Ok(paths) = dotenvy::var("CASS_TEST_ACTIVE_SESSION_SOURCE_PATHS") else {
-        return false;
-    };
-    std::env::split_paths(&paths).any(|candidate| candidate == path)
-}
-
-#[cfg(not(test))]
-fn test_active_session_source_path_matches(_path: &Path) -> bool {
-    false
 }
 
 fn should_skip_active_session_source(
@@ -516,39 +430,6 @@ mod subagent_skip_tests {
         conversation.metadata["source"] = serde_json::json!("shelley");
         conversation.agent_slug = "codex".into();
         assert!(!conversation_is_subagent(&conversation));
-    }
-}
-
-#[cfg(unix)]
-fn source_file_id(path: &Path) -> Option<SourceFileId> {
-    use std::os::unix::fs::MetadataExt;
-
-    fs::metadata(path).ok().map(|metadata| SourceFileId {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-    })
-}
-
-#[cfg(not(unix))]
-fn source_file_id(_path: &Path) -> Option<SourceFileId> {
-    None
-}
-
-fn source_file_has_active_advisory_lock(path: &Path) -> bool {
-    let Ok(file) = OpenOptions::new().read(true).open(path) else {
-        return false;
-    };
-    // std's File::try_lock reports another holder as WouldBlock on every
-    // platform; with fs2, Windows contention was a raw ERROR_LOCK_VIOLATION
-    // that matched nothing here, so a file a writer held looked unlocked
-    // (2l1b0.74).
-    match file.try_lock() {
-        Ok(()) => {
-            let _ = file.unlock();
-            false
-        }
-        Err(std::fs::TryLockError::WouldBlock) => true,
-        Err(std::fs::TryLockError::Error(error)) => error.kind() == std::io::ErrorKind::Interrupted,
     }
 }
 
@@ -14216,6 +14097,15 @@ fn refresh_completed_lexical_rebuild_checkpoint(
     db_path: &Path,
     data_dir: &Path,
 ) -> Result<()> {
+    refresh_completed_lexical_rebuild_checkpoint_with_index(storage, db_path, data_dir, None)
+}
+
+fn refresh_completed_lexical_rebuild_checkpoint_with_index(
+    storage: &FrankenStorage,
+    db_path: &Path,
+    data_dir: &Path,
+    index: Option<&TantivyIndex>,
+) -> Result<()> {
     let total_conversations = count_total_conversations_exact(storage)?;
     let index_path = index_dir(data_dir)?;
     let total_messages = count_total_messages_exact(storage)?;
@@ -14226,13 +14116,18 @@ fn refresh_completed_lexical_rebuild_checkpoint(
         total_conversations,
         total_messages,
     )?;
+    let observed_docs = index
+        .map(TantivyIndex::doc_count)
+        .transpose()?
+        .map(usize::try_from)
+        .transpose()?;
     persist_completed_lexical_rebuild_checkpoint_from_observations(
         storage,
         &index_path,
         db_state,
         total_messages,
         max_conversation_id,
-        None,
+        observed_docs,
         true,
     )
     .map(|_| ())
@@ -14283,7 +14178,22 @@ fn refresh_completed_lexical_rebuild_checkpoint_for_final_state(
     data_dir: &Path,
     keep_storage_open: bool,
     exact_counts: Option<(usize, usize)>,
+    index: Option<&TantivyIndex>,
 ) -> Result<()> {
+    if keep_storage_open && exact_counts.is_none() {
+        return refresh_completed_lexical_rebuild_checkpoint_with_index(
+            storage, db_path, data_dir, index,
+        );
+    }
+
+    // Retain the already admitted writer through finalization. Its doc_count
+    // checks the current publication authority and falls back to a fresh reader
+    // when that authority cannot be reused; no canonical count is substituted.
+    let observed_docs = index
+        .map(TantivyIndex::doc_count)
+        .transpose()?
+        .map(usize::try_from)
+        .transpose()?;
     if let Some((total_conversations, total_messages)) = exact_counts {
         // This run already knows the exact canonical row counts, so avoid
         // re-opening or force-closing the large database during finalization.
@@ -14297,24 +14207,20 @@ fn refresh_completed_lexical_rebuild_checkpoint_for_final_state(
             total_messages,
         )?;
         let index_path = index_dir(data_dir)?;
-        // GH #435: pass no fabricated observation — read the live Tantivy doc
-        // count so the checkpoint records what the index actually holds (on
-        // noisy corpora that is legitimately below `total_messages`), and so
-        // the refresh stays fail-closed when the index is genuinely behind.
+        // GH #435: use the actual published doc count from the retained writer
+        // (or a fresh reader when absent). On noisy corpora this is legitimately
+        // below `total_messages`; the independent coverage gate still refuses
+        // a refresh when the index is genuinely behind.
         return persist_completed_lexical_rebuild_checkpoint_from_observations(
             storage,
             &index_path,
             db_state,
             total_messages,
             max_conversation_id,
-            None,
+            observed_docs,
             true,
         )
         .map(|_| ());
-    }
-
-    if keep_storage_open {
-        return refresh_completed_lexical_rebuild_checkpoint(storage, db_path, data_dir);
     }
 
     // Fallback for callers that do not already know the exact canonical row
@@ -14346,7 +14252,7 @@ fn refresh_completed_lexical_rebuild_checkpoint_for_final_state(
         db_state,
         total_messages,
         max_conversation_id,
-        None,
+        observed_docs,
         true,
     );
     settled.close_best_effort_in_place();
@@ -20866,9 +20772,12 @@ fn run_index_with_storage_ownership(
         // Tantivy is really behind, the refresh no-ops and search keeps
         // deferring; the real escalation there is a full rebuild, named below.
         grant_final_checkpoint_refresh_grace(opts.progress.as_ref());
-        if let Err(err) =
-            refresh_completed_lexical_rebuild_checkpoint(&storage, &opts.db_path, &opts.data_dir)
-        {
+        if let Err(err) = refresh_completed_lexical_rebuild_checkpoint_with_index(
+            &storage,
+            &opts.db_path,
+            &opts.data_dir,
+            t_index.as_ref(),
+        ) {
             tracing::warn!(
                 db_path = %opts.db_path.display(),
                 error = %format!("{err:#}"),
@@ -20908,6 +20817,7 @@ fn run_index_with_storage_ownership(
             &opts.data_dir,
             opts.watch || opts.watch_once_paths.is_some(),
             exact_total_counts,
+            t_index.as_ref(),
         )
         .with_context(|| {
             format!(
@@ -82114,6 +82024,7 @@ c.close()
             &data_dir,
             false,
             Some((total_conversations, total_messages)),
+            None,
         )
         .unwrap();
 
@@ -83593,6 +83504,7 @@ c.close()
             &db_path_variant,
             &data_dir,
             false,
+            None,
             None,
         )
         .unwrap();

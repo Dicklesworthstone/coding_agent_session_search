@@ -20,10 +20,28 @@ use super::{
 };
 use crate::connectors::codex::archives;
 
+/// Source-local causes, captured before aggregating a partial scan. Keep this
+/// typed so diagnostics never infer a path or cause from formatted error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SourceFailureReason {
+    ReadBudgetExceeded,
+    UnfinishedSource,
+    SourceChanged,
+    SourceMissing,
+    SourceUnreadable,
+    InvalidSourceData,
+    SourceReadFailed,
+}
+
 #[derive(Debug, Serialize)]
 struct FailedSource {
     source_path: String,
-    reason: &'static str,
+    reason: SourceFailureReason,
+    // Preserve the native path for host accounting, including non-UTF-8 names.
+    // Only the escaped display path belongs in the diagnostic wire summary.
+    #[serde(skip)]
+    path: std::path::PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,6 +71,22 @@ impl fmt::Display for FailureReport {
             serde_json::to_string(self).map_err(|_| fmt::Error)?
         )
     }
+}
+
+/// Borrow the bounded per-file failure evidence without losing mixed causes
+/// behind the first error's chain. The aggregate count/omissions remain in the
+/// scan error even when not every failed source fits the diagnostic sample.
+pub(crate) fn for_each_source_failure(
+    error: &anyhow::Error,
+    mut observe: impl FnMut(&Path, SourceFailureReason),
+) -> bool {
+    let Some(report) = error.downcast_ref::<FailureReport>() else {
+        return false;
+    };
+    for source in &report.failed_sources {
+        observe(&source.path, source.reason);
+    }
+    true
 }
 
 #[derive(Default)]
@@ -89,18 +123,18 @@ impl Failures {
                 .budgets
                 .rejected_source_count
                 .saturating_sub(self.budgets.rejected_sources.len());
-            "read_budget_exceeded"
+            SourceFailureReason::ReadBudgetExceeded
         } else {
             let reason = match error.downcast_ref::<io::Error>().map(io::Error::kind) {
-                Some(io::ErrorKind::UnexpectedEof) => "unfinished_source",
-                Some(io::ErrorKind::Interrupted) => "source_changed",
-                Some(io::ErrorKind::NotFound) => "source_missing",
-                Some(io::ErrorKind::PermissionDenied) => "source_unreadable",
-                Some(io::ErrorKind::InvalidData) => "invalid_source_data",
+                Some(io::ErrorKind::UnexpectedEof) => SourceFailureReason::UnfinishedSource,
+                Some(io::ErrorKind::Interrupted) => SourceFailureReason::SourceChanged,
+                Some(io::ErrorKind::NotFound) => SourceFailureReason::SourceMissing,
+                Some(io::ErrorKind::PermissionDenied) => SourceFailureReason::SourceUnreadable,
+                Some(io::ErrorKind::InvalidData) => SourceFailureReason::InvalidSourceData,
                 // A compressed rollout whose decoded text passed the budget
                 // without declaring its length up front (GH #513).
-                Some(io::ErrorKind::FileTooLarge) => "read_budget_exceeded",
-                _ => "source_read_failed",
+                Some(io::ErrorKind::FileTooLarge) => SourceFailureReason::ReadBudgetExceeded,
+                _ => SourceFailureReason::SourceReadFailed,
             };
             // Retain one original error for typed downcasts and its cause chain.
             // The bounded summary never contains session bodies or parser text.
@@ -114,6 +148,7 @@ impl Failures {
             self.report.failed_sources.push(FailedSource {
                 source_path: source.source_path.to_string_lossy().into_owned(),
                 reason,
+                path: source.source_path.clone(),
             });
         } else {
             self.report.omitted_source_count = self.report.omitted_source_count.saturating_add(1);

@@ -89,6 +89,14 @@ pub enum IngestFailureKind {
     TruncatedSession,
     /// The source is locked by the live app (Cursor `state.vscdb`); retryable.
     SourceLocked,
+    /// The source changed during its bounded read, so that observation was
+    /// withheld. A subsequent stable observation can be indexed.
+    SourceChanged,
+    /// A source read ended before a complete observation could be produced.
+    /// Unlike TruncatedSession, no partial conversation is certified here.
+    UnfinishedSource,
+    /// A discovered source disappeared before its read could complete.
+    SourceMissing,
     /// The source is encrypted and cannot be decrypted on this host
     /// (ChatGPT v2/v3 on Linux/headless); legacy unencrypted data still indexes.
     EncryptedUnsupported,
@@ -120,6 +128,9 @@ impl IngestFailureKind {
             IngestFailureKind::MalformedJsonLine => "malformed-json-line",
             IngestFailureKind::TruncatedSession => "truncated-session",
             IngestFailureKind::SourceLocked => "source-locked",
+            IngestFailureKind::SourceChanged => "source-changed",
+            IngestFailureKind::UnfinishedSource => "unfinished-source",
+            IngestFailureKind::SourceMissing => "source-missing",
             IngestFailureKind::EncryptedUnsupported => "encrypted-unsupported",
             IngestFailureKind::KeychainUnavailable => "keychain-unavailable",
             IngestFailureKind::FilenameAssumptionViolated => "filename-assumption-violated",
@@ -261,6 +272,34 @@ fn classify_kind(
                 "{provider} source is locked by the live app (e.g. an open Cursor); this is \
                  reported as lock-busy, NOT a zero-message import — retry after closing the app or \
                  on the next sync"
+            ),
+        ),
+        IngestFailureKind::SourceChanged => (
+            IngestSeverity::Warning,
+            true,
+            SourceIngestDisposition::Skipped,
+            format!(
+                "{provider} source changed while being read; this observation was withheld. \
+                 Retry after the writer settles; completed sibling sources remain indexed"
+            ),
+        ),
+        IngestFailureKind::UnfinishedSource => (
+            IngestSeverity::Warning,
+            true,
+            SourceIngestDisposition::Skipped,
+            format!(
+                "{provider} source has an unfinished record or became shorter while being read; \
+                 this observation was withheld. Retry after the writer settles; preserve the \
+                 original source if recovery is needed"
+            ),
+        ),
+        IngestFailureKind::SourceMissing => (
+            IngestSeverity::Warning,
+            true,
+            SourceIngestDisposition::Skipped,
+            format!(
+                "{provider} source disappeared after discovery; restore or resync that source, \
+                 then re-index. Completed sibling sources remain indexed"
             ),
         ),
         IngestFailureKind::EncryptedUnsupported => (
@@ -727,27 +766,36 @@ impl ConnectorIngestRun {
         self.diagnostics.push(diagnostic);
     }
 
-    /// Record a failed connector scan. A Codex scan that stopped only because
-    /// rollouts exceeded the per-source read budget is reported per rejected
-    /// file, with the setting that admits it; it used to surface as one
-    /// "unreadable, check permissions" entry naming the cass data directory.
+    /// Record a failed connector scan using typed per-source evidence when
+    /// available. A moving, missing, unfinished, or oversized Codex rollout
+    /// must not turn into a permissions error naming the whole scan root.
     pub fn observe_connector_scan_error(&mut self, fallback_path: &Path, error: &anyhow::Error) {
         if let Some(over) = crate::connectors::codex::over_budget_sources(error) {
             for path in &over.sampled_paths {
-                let diagnostic = classify_path(
-                    &self.provider,
-                    path,
-                    IngestFailureKind::SourceOverReadBudget,
-                );
-                self.sources.insert(
-                    path.clone(),
-                    ObservedSource {
-                        disposition: diagnostic.disposition,
-                        malformed: false,
-                    },
-                );
-                self.diagnostics.push(diagnostic);
+                self.observe_source_failure(path, IngestFailureKind::SourceOverReadBudget);
             }
+            return;
+        }
+        // GH #559: the first cause cannot classify an aggregate containing
+        // moving, missing, malformed and oversized rollouts. Each sample has
+        // its own typed cause and original path; never parse its Display text.
+        if self.provider == "codex"
+            && crate::connectors::codex::for_each_source_failure(error, |path, reason| {
+                use crate::connectors::codex::SourceFailureReason;
+                let kind = match reason {
+                    SourceFailureReason::ReadBudgetExceeded => {
+                        IngestFailureKind::SourceOverReadBudget
+                    }
+                    SourceFailureReason::UnfinishedSource => IngestFailureKind::UnfinishedSource,
+                    SourceFailureReason::SourceChanged => IngestFailureKind::SourceChanged,
+                    SourceFailureReason::SourceMissing => IngestFailureKind::SourceMissing,
+                    SourceFailureReason::InvalidSourceData => IngestFailureKind::UnparseableSource,
+                    SourceFailureReason::SourceUnreadable
+                    | SourceFailureReason::SourceReadFailed => IngestFailureKind::UnreadableSource,
+                };
+                self.observe_source_failure(path, kind);
+            })
+        {
             return;
         }
         // Codebuff retains bounded typed failures for independently scanned
@@ -757,26 +805,7 @@ impl ConnectorIngestRun {
             && crate::connectors::codebuff::CodebuffConnector::for_each_source_failure(
                 error,
                 |path, cause| {
-                    let mut diagnostic =
-                        classify_path(&self.provider, path, connector_scan_failure_kind(cause));
-                    let state = self
-                        .sources
-                        .entry(path.to_path_buf())
-                        .or_insert(ObservedSource {
-                            disposition: SourceIngestDisposition::Discovered,
-                            malformed: false,
-                        });
-                    // An observation can fail after delivery. Do not erase
-                    // content that this run already observed for that source.
-                    if matches!(
-                        state.disposition,
-                        SourceIngestDisposition::Indexed
-                            | SourceIngestDisposition::PartiallyIndexed
-                    ) {
-                        diagnostic.disposition = SourceIngestDisposition::PartiallyIndexed;
-                    }
-                    state.disposition = diagnostic.disposition;
-                    self.diagnostics.push(diagnostic);
+                    self.observe_source_failure(path, connector_scan_failure_kind(cause));
                 },
             )
         {
@@ -785,18 +814,28 @@ impl ConnectorIngestRun {
         // GH #511: FAD's top message includes the failing path. Classify the
         // cause, so a project called "busy" cannot turn a parse or permission
         // failure into a retryable database lock.
-        let diagnostic = classify_path(
-            &self.provider,
-            fallback_path,
-            connector_scan_failure_kind(error),
-        );
-        self.sources.insert(
-            fallback_path.to_path_buf(),
-            ObservedSource {
-                disposition: diagnostic.disposition,
+        self.observe_source_failure(fallback_path, connector_scan_failure_kind(error));
+    }
+
+    fn observe_source_failure(&mut self, path: &Path, kind: IngestFailureKind) {
+        let mut diagnostic = classify_path(&self.provider, path, kind);
+        let state = self
+            .sources
+            .entry(path.to_path_buf())
+            .or_insert(ObservedSource {
+                disposition: SourceIngestDisposition::Discovered,
                 malformed: false,
-            },
-        );
+            });
+        // A post-delivery observation error cannot erase content already
+        // retained from this source. Nor can a failure at one path replace a
+        // successfully indexed sibling with a synthetic failed root entry.
+        if matches!(
+            state.disposition,
+            SourceIngestDisposition::Indexed | SourceIngestDisposition::PartiallyIndexed
+        ) {
+            diagnostic.disposition = SourceIngestDisposition::PartiallyIndexed;
+        }
+        state.disposition = diagnostic.disposition;
         self.diagnostics.push(diagnostic);
     }
 
@@ -1453,6 +1492,9 @@ mod tests {
             IngestFailureKind::UnparseableSource,
             IngestFailureKind::TruncatedSession,
             IngestFailureKind::SourceOverReadBudget,
+            IngestFailureKind::SourceChanged,
+            IngestFailureKind::UnfinishedSource,
+            IngestFailureKind::SourceMissing,
         ];
         verify_eq!(
             serde_json::to_value(failure_kinds)?,
@@ -1466,7 +1508,10 @@ mod tests {
                 "unreadable-source",
                 "unparseable-source",
                 "truncated-session",
-                "source-over-read-budget"
+                "source-over-read-budget",
+                "source-changed",
+                "unfinished-source",
+                "source-missing"
             ])
         );
         for (k, w) in [
@@ -1491,6 +1536,9 @@ mod tests {
             (IngestFailureKind::UnreadableSource, "unreadable-source"),
             (IngestFailureKind::UnparseableSource, "unparseable-source"),
             (IngestFailureKind::TruncatedSession, "truncated-session"),
+            (IngestFailureKind::SourceChanged, "source-changed"),
+            (IngestFailureKind::UnfinishedSource, "unfinished-source"),
+            (IngestFailureKind::SourceMissing, "source-missing"),
             (
                 IngestFailureKind::SourceOverReadBudget,
                 "source-over-read-budget",
@@ -1973,6 +2021,129 @@ mod tests {
             IngestFailureKind::UnreadableSource
         );
         verify_eq!(report.diagnostics[0].source_path, "/data");
+        Ok(())
+    }
+
+    /// Exercise actual file changes through the pinned parser and snapshot
+    /// guards. The first error must not hide the other files' different causes
+    /// or turn the healthy sibling into a failure at the scan root.
+    #[test]
+    fn gh559_mixed_codex_read_failures_keep_source_identity_and_retry() -> TestResult {
+        use std::io::Write;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temp = tempdir()?;
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir(&sessions)?;
+        let moving = sessions.join("rollout-a-growing.jsonl");
+        let invalid = sessions.join("rollout-b-invalid.jsonl");
+        let missing = sessions.join("rollout-c-missing.jsonl");
+        let parked = sessions.join("retained-source.txt");
+        let healthy = sessions.join("rollout-d-healthy.jsonl");
+        let record = format!(
+            "{}\n",
+            json!({"type":"response_item","payload":{"role":"user","content":"gh559privatebody"}})
+        );
+        let appended_record = format!(
+            "{}\n",
+            json!({"type":"response_item","payload":{"role":"assistant","content":"gh559privatetail"}})
+        );
+        for path in [&moving, &missing, &healthy] {
+            std::fs::write(path, &record)?;
+        }
+        std::fs::write(&invalid, b"\xff\n")?;
+
+        let admitted = Arc::new(AtomicBool::new(false));
+        let appended = Arc::new(AtomicBool::new(false));
+        let ctx = ScanContext::with_roots(
+            temp.path().join("data"),
+            vec![ScanRoot::local(sessions.clone())],
+            None,
+        )
+        .with_progress_tick(Arc::new({
+            let admitted = Arc::clone(&admitted);
+            let appended = Arc::clone(&appended);
+            let moving = moving.clone();
+            move || {
+                // The primary reader's first progress tick runs after it has
+                // opened its bounded snapshot. No thread timing is required.
+                if admitted.swap(false, Ordering::SeqCst) {
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&moving)
+                        .expect("open growing fixture")
+                        .write_all(appended_record.as_bytes())
+                        .expect("append to admitted source");
+                    appended.store(true, Ordering::SeqCst);
+                }
+            }
+        }));
+        let connector = crate::connectors::codex::CodexConnector::new();
+        let mut run = ConnectorIngestRun::begin("codex", temp.path(), &ctx, &[]);
+        let mut should_scan = |source: &DiscoveredSourceFile| {
+            admitted.store(source.source_path == moving, Ordering::SeqCst);
+            if source.source_path == missing {
+                std::fs::rename(&missing, &parked).expect("park selected fixture");
+            }
+            true
+        };
+        let error = connector
+            .scan_with_source_boundaries(
+                &ctx,
+                &mut franken_agent_detection::SourceScanHooks {
+                    should_scan_source: Some(&mut should_scan),
+                    on_source_complete: None,
+                },
+                &mut |mut conversation| {
+                    run.observe_conversation(&mut conversation);
+                    Ok(())
+                },
+            )
+            .expect_err("moving and invalid inputs must leave incomplete coverage")
+            .context("outer caller context");
+        verify!(appended.load(Ordering::SeqCst));
+        run.observe_connector_scan_error(&sessions, &error);
+        let report = run.finish();
+        verify_eq!(report.summary.indexed, 1);
+        verify_eq!(report.summary.skipped, 3);
+        verify_eq!(report.summary.discovered, 0);
+        verify_eq!(report.summary.total(), 4);
+        verify_eq!(report.diagnostics.len(), 3);
+        for (path, kind, retryable) in [
+            (&moving, IngestFailureKind::SourceChanged, true),
+            (&invalid, IngestFailureKind::UnparseableSource, false),
+            (&missing, IngestFailureKind::SourceMissing, true),
+        ] {
+            let diagnostic = report
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.source_path == path.to_string_lossy())
+                .ok_or("missing source-specific diagnostic")?;
+            verify_eq!(diagnostic.failure_kind, kind);
+            verify_eq!(diagnostic.retryable, retryable);
+            verify!(!diagnostic.safe_next_action.contains("check permissions"));
+            verify_eq!(diagnostic.disposition, SourceIngestDisposition::Skipped);
+        }
+        verify!(!serde_json::to_string(&report)?.contains("gh559private"));
+
+        // Settling the writer and restoring the bad sources clears the next
+        // invocation, while keeping all complete records from the append.
+        std::fs::write(&invalid, &record)?;
+        std::fs::rename(&parked, &missing)?;
+        let mut settled = ctx;
+        settled.progress_tick = None;
+        let conversations = connector.scan(&settled)?;
+        verify_eq!(conversations.len(), 4);
+        verify_eq!(
+            conversations
+                .iter()
+                .find(|conversation| conversation.source_path == moving)
+                .ok_or("growing source did not recover")?
+                .messages
+                .len(),
+            2
+        );
         Ok(())
     }
 

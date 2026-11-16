@@ -10,6 +10,105 @@ fn codex_real_fixture_home() -> PathBuf {
 }
 
 #[test]
+fn gh560_inactive_cut_tail_keeps_complete_turns_and_can_later_finish() {
+    use franken_agent_detection::connectors::{SourceCompletion, SourceScanHooks};
+    use std::io::Write;
+    use std::time::{Duration, SystemTime};
+
+    let root = TempDir::new().unwrap();
+    let sessions = root.path().join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let path = sessions.join("rollout-gh560.jsonl");
+    let records = [
+        serde_json::json!({"type":"session_meta","payload":{"id":"gh560","cwd":"/synthetic/gh560"}}),
+        serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"kilo marker five"}]}}),
+        serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"lima marker six"}]}}),
+    ];
+    let tail = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"mike marker seven"}]}}).to_string();
+    let split = tail.len() / 2;
+    let bytes = format!(
+        "{}\n{}\n{}\n{}",
+        records[0],
+        records[1],
+        records[2],
+        &tail[..split]
+    );
+    fs::write(&path, &bytes).unwrap();
+    fs::File::open(&path)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(7_200))
+        .unwrap();
+    let before = fs::metadata(&path).unwrap();
+    let context = ScanContext::with_roots(
+        root.path().to_path_buf(),
+        vec![ScanRoot::local(path.clone())],
+        None,
+    );
+    let connector = CodexConnector::new();
+    // All public routes must publish the complete history and a successful
+    // boundary; a repair that only fixes collected scans is insufficient.
+    for route in 0..3 {
+        let mut conversations = Vec::new();
+        let mut completions = 0;
+        match route {
+            0 => conversations = connector.scan(&context).unwrap(),
+            1 => connector
+                .scan_with_callback(&context, &mut |conversation| {
+                    conversations.push(conversation);
+                    Ok(())
+                })
+                .unwrap(),
+            _ => {
+                let mut complete = |completion: &SourceCompletion| {
+                    assert_eq!(completion.source.source_path, path);
+                    completions += 1;
+                    Ok(())
+                };
+                let mut hooks = SourceScanHooks {
+                    should_scan_source: None,
+                    on_source_complete: Some(&mut complete),
+                };
+                connector
+                    .scan_with_source_boundaries(&context, &mut hooks, &mut |conversation| {
+                        conversations.push(conversation);
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        }
+        assert_eq!(conversations.len(), 1, "route {route}");
+        let messages = &conversations[0].messages;
+        assert_eq!(messages.len(), 2, "route {route}");
+        assert_eq!(messages[0].content, "kilo marker five");
+        assert_eq!(messages[1].content, "lima marker six");
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(conversations[0].source_path, path);
+        if route == 2 {
+            assert_eq!(completions, 1);
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+    }
+
+    // A later writer can complete that same record. Recovery never rewrites
+    // the source or fabricates a newline, and the completed turn is retained.
+    let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    writer.write_all(&tail.as_bytes()[split..]).unwrap();
+    writer.write_all(b"\n").unwrap();
+    drop(writer);
+    let completed = fs::read(&path).unwrap();
+    let conversations = connector.scan(&context).unwrap();
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].messages.len(), 3);
+    assert_eq!(conversations[0].messages[2].content, "mike marker seven");
+    assert_eq!(fs::read(&path).unwrap(), completed);
+}
+
+#[test]
 fn gh553_codex_recovers_a_complete_turn_after_a_torn_prefix() {
     let root = tempfile::tempdir().unwrap().keep();
     let sessions = root.join("sessions");
