@@ -29,14 +29,188 @@
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
 use std::path::Path;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 type FileIdentity = (u64, u64);
 type SourcePredicate = fn(&Path) -> bool;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SourceFileId {
+    dev: u64,
+    ino: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ActiveSessionSourceReason {
+    TestOverride,
+    WritableFileDescriptor,
+    AdvisoryLock,
+    RecentlyModified,
+}
+
+impl SourceWriterProbe {
+    pub(super) fn active_writer_reason(
+        &self,
+        path: &Path,
+        recent_write_window: Option<Duration>,
+    ) -> Option<ActiveSessionSourceReason> {
+        if !is_session_log_source_candidate(path) {
+            return None;
+        }
+        if test_active_session_source_path_matches(path) {
+            return Some(ActiveSessionSourceReason::TestOverride);
+        }
+        // Cheap mtime check first: a single `stat` is dramatically cheaper than
+        // walking `/proc/*/fd` (Linux) or shelling out to `lsof` (macOS), and it
+        // is the only signal that catches macOS Claude Code's buffered-append
+        // writers (which hold no writable fd advertised through lsof and do not
+        // take advisory locks). False positives just defer a just-finished file
+        // to the next watch cycle (acceptable). See #251 — the v0.5.1 data-loss
+        // regression — for the original root cause.
+        if recent_write_window.is_some_and(|window| source_file_recently_modified(path, window)) {
+            tracing::debug!(
+                source_path = %path.display(),
+                "active-source filter: mtime fallback fired"
+            );
+            return Some(ActiveSessionSourceReason::RecentlyModified);
+        }
+        if source_file_id(path).is_some_and(|file_id| self.should_defer((file_id.dev, file_id.ino)))
+        {
+            return Some(ActiveSessionSourceReason::WritableFileDescriptor);
+        }
+        if source_file_has_active_advisory_lock(path) {
+            return Some(ActiveSessionSourceReason::AdvisoryLock);
+        }
+        None
+    }
+}
+
+/// Permit recovery of complete JSONL records left by an inactive writer.
+///
+/// EOF alone says nothing about activity: a crashed writer can leave the same
+/// cut record forever. Reuse the indexer's writer/lock/recent-write classifier,
+/// but require readable, non-future metadata before treating that tail as
+/// historical. Callers still own bounded reads and snapshot-change checks;
+/// this best-effort observation is not a lock or a stable-prefix read contract.
+pub(crate) fn source_can_recover_incomplete_tail(path: &Path) -> bool {
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+    {
+        return false;
+    }
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    let Ok(modified_at) = metadata.modified() else {
+        return false;
+    };
+    let Ok(age) = SystemTime::now().duration_since(modified_at) else {
+        return false;
+    };
+    if active_session_recent_write_window(true).is_some_and(|window| age <= window) {
+        return false;
+    }
+    // Capture the process census only for a stale incomplete tail, not for
+    // every parsed line or source. It also detects a writer holding an old
+    // source open without recently appending to it.
+    SourceWriterProbe::capture(is_session_log_source_candidate)
+        .active_writer_reason(path, active_session_recent_write_window(true))
+        .is_none()
+}
+
+pub(super) fn active_session_recent_write_window(
+    enable_recent_write_window: bool,
+) -> Option<Duration> {
+    if !enable_recent_write_window {
+        return None;
+    }
+    let seconds = dotenvy::var("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(120)
+        .min(3_600);
+    (seconds > 0).then_some(Duration::from_secs(seconds))
+}
+
+fn source_file_recently_modified(path: &Path, window: Duration) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified_at) = metadata.modified() else {
+        return false;
+    };
+    match SystemTime::now().duration_since(modified_at) {
+        Ok(age) => age <= window,
+        Err(_) => true,
+    }
+}
+
+pub(super) fn is_session_log_source_candidate(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("jsonl")
+                || ext.eq_ignore_ascii_case("json")
+                || ext.eq_ignore_ascii_case("claude")
+        })
+}
+
+#[cfg(test)]
+fn test_active_session_source_path_matches(path: &Path) -> bool {
+    let Ok(paths) = dotenvy::var("CASS_TEST_ACTIVE_SESSION_SOURCE_PATHS") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|candidate| candidate == path)
+}
+
+#[cfg(not(test))]
+fn test_active_session_source_path_matches(_path: &Path) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn source_file_id(path: &Path) -> Option<SourceFileId> {
+    use std::os::unix::fs::MetadataExt;
+
+    fs::metadata(path).ok().map(|metadata| SourceFileId {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn source_file_id(_path: &Path) -> Option<SourceFileId> {
+    None
+}
+
+pub(super) fn source_file_has_active_advisory_lock(path: &Path) -> bool {
+    let Ok(file) = OpenOptions::new().read(true).open(path) else {
+        return false;
+    };
+    // std's File::try_lock reports another holder as WouldBlock on every
+    // platform; with fs2, Windows contention was a raw ERROR_LOCK_VIOLATION
+    // that matched nothing here, so a file a writer held looked unlocked
+    // (2l1b0.74).
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(error)) => error.kind() == std::io::ErrorKind::Interrupted,
+    }
+}
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Default)]

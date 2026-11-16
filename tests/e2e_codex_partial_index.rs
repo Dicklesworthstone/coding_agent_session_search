@@ -401,3 +401,103 @@ fn streaming_compressed_empty_rollout_preserves_coverage_and_neighbors() {
 fn batch_compressed_empty_rollout_preserves_coverage_and_neighbors() {
     compressed_empty_rollout_cli("0");
 }
+
+/// GH #560: two ordinary index runs must converge without editing a crashed
+/// writer's source, then ingest its completed final turn exactly once.
+fn inactive_cut_tail_indexes_complete_history(streaming: &str) {
+    let dir = tempfile::tempdir().expect("isolated archive");
+    let home = dir.path();
+    let sessions = home.join(".codex/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let path = sessions.join("rollout-inactive-tail.jsonl");
+    let rows = [
+        json!({"type":"session_meta","payload":{"id":"inactive-tail","cwd":home.join("project")}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"staletailcompleteusersentinel"}]}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"staletailcompleteassistantsentinel"}]}}),
+    ];
+    let tail = json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"staletailfinishsentinel"}]}}).to_string();
+    let split = tail.len() / 2;
+    let bytes = format!("{}\n{}\n{}\n{}", rows[0], rows[1], rows[2], &tail[..split]);
+    std::fs::write(&path, &bytes).unwrap();
+    let age_source = || {
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(7_200))
+            .unwrap();
+    };
+    age_source();
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let run_index = || {
+        cass(home, streaming)
+            .args(["index", "--json", "--data-dir"])
+            .arg(home.join("archive"))
+            .output()
+            .expect("index inactive Codex history")
+    };
+    let assert_history = |expected_count: usize| {
+        let storage = SqliteStorage::open_readonly(&home.join("archive/agent_search.db")).unwrap();
+        let conversations = storage.list_conversations(10, 0).unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].source_path, path);
+        let messages = storage
+            .fetch_messages(conversations[0].id.unwrap())
+            .unwrap();
+        assert_eq!(messages.len(), expected_count);
+        assert_eq!(messages[0].content, "staletailcompleteusersentinel");
+        assert_eq!(messages[1].content, "staletailcompleteassistantsentinel");
+        if expected_count == 3 {
+            assert_eq!(messages[2].content, "staletailfinishsentinel");
+        }
+    };
+    for pass in 0..2 {
+        let output = run_index();
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+            panic!(
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        assert!(output.status.success(), "pass {pass}: {result}");
+        assert_eq!(result["success"], true);
+        assert_eq!(result["indexing_stats"]["scan_had_errors"], false);
+        assert_history(2);
+        assert_searchable(home, streaming, "staletailcompleteassistantsentinel", &path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+    let mut writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writer.write_all(&tail.as_bytes()[split..]).unwrap();
+    writer.write_all(b"\n").unwrap();
+    drop(writer);
+    age_source();
+    let completed = std::fs::read(&path).unwrap();
+    for _ in 0..2 {
+        let output = run_index();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_history(3);
+        assert_searchable(home, streaming, "staletailfinishsentinel", &path);
+        assert_eq!(std::fs::read(&path).unwrap(), completed);
+    }
+}
+
+#[test]
+fn streaming_inactive_cut_tail_indexes_complete_history() {
+    inactive_cut_tail_indexes_complete_history("1");
+}
+
+#[test]
+fn batch_inactive_cut_tail_indexes_complete_history() {
+    inactive_cut_tail_indexes_complete_history("0");
+}

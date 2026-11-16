@@ -36,9 +36,9 @@ class HarnessTests(unittest.TestCase):
         self.harness = load_harness()
         # Keep test artifacts for inspection; never touch a real checkout.
         self.root = Path(tempfile.mkdtemp(prefix="cass-harness-proof-")) / "repo with spaces 🔑"
-        for directory in ("scripts", "tests", "src/connectors/codex"):
+        for directory in ("scripts", "tests", "src/connectors/codex", "src/indexer/source_writer_probe"):
             (self.root / directory).mkdir(parents=True, exist_ok=True)
-        dependencies = ["anyhow", "blake3", "chrono", "dirs", "dotenvy", "serde_json", "tempfile", "thiserror", "tracing", "walkdir"]
+        dependencies = ["anyhow", "blake3", "chrono", "dirs", "dotenvy", "libc", "serde_json", "tempfile", "thiserror", "tracing", "walkdir"]
         manifest = '[package]\nname="fixture"\nversion="0.0.0"\n[dependencies]\n'
         manifest += ''.join(f'{name}="1"\n' for name in dependencies)
         manifest += f'{FAD}={{version="=0.3.10",git="{GIT}",rev="{REV}",features=["connectors","cursor","codex-zstd"]}}\n'
@@ -50,6 +50,8 @@ class HarnessTests(unittest.TestCase):
             (self.root / f"tests/{test}.rs").write_text('// unchanged integration fixture\n', encoding="utf-8")
         (self.root / "src/connectors/codex.rs").write_text('mod nested;\n', encoding="utf-8")
         (self.root / "src/connectors/codex/nested.rs").write_text('// byte-identical source 🔑\n', encoding="utf-8")
+        (self.root / "src/indexer/source_writer_probe.rs").write_text('// real activity policy fixture\n', encoding="utf-8")
+        (self.root / "src/indexer/source_writer_probe/tests.rs").write_text('// real writer-probe tests fixture\n', encoding="utf-8")
         self.before = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
         self.calls = []
         self.generated = None
@@ -64,6 +66,8 @@ class HarnessTests(unittest.TestCase):
                 self.library = (project.parent / "lib.rs").read_text(encoding="utf-8")
                 for original in (self.root / "src/connectors").rglob("*.rs"):
                     self.assertEqual((project.parent / original.relative_to(self.root / "src/connectors")).read_bytes(), original.read_bytes())
+                for original in (self.root / "src/indexer").rglob("*.rs"):
+                    self.assertEqual((project.parent / "indexer" / original.relative_to(self.root / "src/indexer")).read_bytes(), original.read_bytes())
             if len(command) > 1 and command[1] == "metadata":
                 if metadata_override is not None:
                     return json.dumps(metadata_override)
@@ -100,6 +104,15 @@ class HarnessTests(unittest.TestCase):
         for identity in ("DiscoveredSourceRole", "Origin", "SourceKind"):
             self.assertIn(identity, self.library.split("pub mod connectors")[0])
             self.assertIn(identity, self.library.split("pub mod connectors")[1])
+
+    def test_tail_recovery_stages_the_real_writer_classifier(self):
+        self.run_harness()
+        self.assertIn("mod source_writer_probe;", self.library)
+        self.assertIn("use source_writer_probe::source_can_recover_incomplete_tail;", self.library)
+        self.assertNotIn("fn source_can_recover_incomplete_tail", self.library)
+        self.assertIn("#[forbid(unsafe_code)]\npub mod codex;", self.library)
+        self.assertEqual(self.generated["lints"]["rust"]["unsafe_code"], "deny")
+        self.assertEqual(self.generated["dependencies"]["libc"], {"version": "1"})
 
     def test_metadata_precedes_locked_native_test_and_clippy_commands(self):
         self.run_harness()

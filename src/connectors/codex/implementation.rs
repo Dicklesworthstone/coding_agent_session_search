@@ -260,8 +260,21 @@ fn augment_modern_codex_reader(
         let raw = match serde_json::from_str::<Value>(line) {
             Ok(value) => value,
             Err(parse_err) if !terminated && parse_err.is_eof() => {
-                // An active writer's unfinished last record is not malformed
-                // historical data. Refuse completion so it can be read again.
+                // GH #560: a dead writer can leave a cut final record forever.
+                // Recover its complete history only after the same activity
+                // checks used by indexing. Actual reader errors, truncation,
+                // and observable rewrites still fail the enclosing snapshot.
+                if crate::indexer::source_can_recover_incomplete_tail(&conversation.source_path) {
+                    warn!(
+                        source_path = %conversation.source_path.display(),
+                        line_no,
+                        reason = "inactive_incomplete_tail",
+                        "codex rollout has an inactive incomplete final record; skipping that record",
+                    );
+                    continue;
+                }
+                // A recent, held-open, or locked source remains retryable.
+                // Compressed frame/reader failures are never recovered here.
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     format!(
@@ -1200,6 +1213,129 @@ mod tests {
         assert_eq!(retry.messages.len(), 2);
         assert!(retry.messages[1].content.contains("completed_tail"));
         assert_eq!(std::fs::read(&path)?, before_retry);
+        Ok(())
+    }
+
+    fn age_rollout(path: &std::path::Path) -> Result<()> {
+        File::open(path)?
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7_200))?;
+        Ok(())
+    }
+
+    #[test]
+    fn inactive_cut_tail_preserves_complete_records_without_editing_the_source() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-abandoned.jsonl");
+        let complete = custom_call("patch-1", "recoverable_complete_record");
+        let tail = custom_call("patch-2", "incomplete_record_must_stay_absent").to_string();
+        let bytes = format!("{complete}\n{}", &tail[..tail.len() - 1]);
+        std::fs::write(&path, &bytes)?;
+        age_rollout(&path)?;
+        let before = std::fs::metadata(&path)?;
+        let mut conversation = conversation_at(&path);
+        for _ in 0..2 {
+            augment_modern_codex_messages(&mut conversation, None)?;
+            assert_eq!(conversation.messages.len(), 1);
+            assert!(
+                conversation.messages[0]
+                    .content
+                    .contains("recoverable_complete_record")
+            );
+            assert!(
+                !conversation.messages[0]
+                    .content
+                    .contains("incomplete_record")
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&path)?, bytes);
+        assert!(same_rollout_snapshot(&before, &std::fs::metadata(&path)?)?);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn old_cut_tail_with_a_writable_descriptor_is_still_retryable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-held-open.jsonl");
+        std::fs::write(
+            &path,
+            format!("{}\n{{\"type\":", custom_call("patch-1", "complete")),
+        )?;
+        let writer = std::fs::OpenOptions::new().append(true).open(&path)?;
+        age_rollout(&path)?;
+        let mut conversation = conversation_at(&path);
+        let error = augment_modern_codex_messages(&mut conversation, None).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::UnexpectedEof)
+        );
+        drop(writer);
+        augment_modern_codex_messages(&mut conversation, None)?;
+        assert_eq!(conversation.messages.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn old_cut_tail_with_an_advisory_lock_is_still_retryable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-locked.jsonl");
+        std::fs::write(
+            &path,
+            format!("{}\n{{\"type\":", custom_call("patch-1", "complete")),
+        )?;
+        age_rollout(&path)?;
+        // Read-only so this exercises the lock check independently of the
+        // Linux writable-descriptor census.
+        let locked = File::open(&path)?;
+        locked.try_lock()?;
+        let mut conversation = conversation_at(&path);
+        let error = augment_modern_codex_messages(&mut conversation, None).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::UnexpectedEof)
+        );
+        locked.unlock()?;
+        augment_modern_codex_messages(&mut conversation, None)?;
+        assert_eq!(conversation.messages.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn inactive_tail_recovery_does_not_hide_invalid_utf8_or_mid_read_truncation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-inactive-invalid.jsonl");
+        let complete = format!("{}\n", custom_call("patch-1", "valid_prefix"));
+        let mut bytes = complete.as_bytes().to_vec();
+        bytes.extend_from_slice(b"{\"type\":\xff");
+        std::fs::write(&path, bytes)?;
+        age_rollout(&path)?;
+        let mut conversation = conversation_at(&path);
+        let error = augment_modern_codex_messages(&mut conversation, None).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidData)
+        );
+
+        std::fs::write(&path, format!("{complete}{{\"type\":"))?;
+        age_rollout(&path)?;
+        let ticks = AtomicUsize::new(0);
+        let truncate = || {
+            if ticks.fetch_add(1, Ordering::Relaxed) == 0 {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(complete.len() as u64)
+                    .unwrap();
+            }
+        };
+        let mut conversation = conversation_at(&path);
+        let error = augment_modern_codex_messages(&mut conversation, Some(&truncate)).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::UnexpectedEof)
+        );
+        assert!(error.to_string().contains("truncated while reading"));
         Ok(())
     }
 
