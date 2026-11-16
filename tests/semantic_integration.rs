@@ -146,12 +146,55 @@ fn certified_semantic_cli_uses_manifest_ann_and_rejects_invalid_pairing()
     manifest["hnsw"]["index_path"] = json!(selected_relative);
     manifest["hnsw"]["size_bytes"] = json!(fs::metadata(&selected_path)?.len());
     fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    let check_status = |declared: Option<&std::path::Path>,
+                        present: bool|
+     -> Result<(), Box<dyn std::error::Error>> {
+        let before = [&vector_path, &selected_path]
+            .into_iter()
+            .map(|path| Ok((path, fs::read(path)?, fs::metadata(path)?)))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let inventory = || -> std::io::Result<Vec<_>> {
+            let mut names = fs::read_dir(data.join("vector_index"))?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            names.sort();
+            Ok(names)
+        };
+        let names = inventory()?;
+        let status = run(&["status", "--json"])?;
+        let semantic = &status["semantic"];
+        assert_eq!(semantic["hnsw_path"], serde_json::to_value(declared)?);
+        assert_eq!(semantic["hnsw_present"], present);
+        assert_eq!(semantic["hnsw_ready"], false);
+        assert_eq!(
+            semantic["hnsw_state"],
+            if present {
+                "present_unverified"
+            } else {
+                "absent"
+            }
+        );
+        for (path, bytes, metadata) in before {
+            let after = fs::metadata(path)?;
+            assert_eq!(fs::read(path)?, bytes);
+            assert_eq!(after.modified()?, metadata.modified()?);
+            assert_eq!(after.permissions(), metadata.permissions());
+        }
+        assert_eq!(inventory()?, names);
+        Ok(())
+    };
+    check_status(Some(&selected_path), true)?;
     let accelerated = run(&approximate_args)?;
     for field in ["source_path", "conversation_id", "line_number"] {
         assert_eq!(accelerated["hits"][0][field], exact["hits"][0][field]);
     }
     assert_eq!(accelerated["_meta"]["ann_stats"]["is_approximate"], true);
     assert!(accelerated["_meta"]["ann_stats"]["exact_fallback"].is_null());
+
+    let mut undeclared = manifest.clone();
+    undeclared["hnsw"] = Value::Null;
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&undeclared)?)?;
+    check_status(None, false)?;
 
     let alias = data.join("vector_index/aliased-native.chsw");
     std::os::unix::fs::symlink(&selected_path, &alias)?;
@@ -197,6 +240,7 @@ fn certified_semantic_cli_uses_manifest_ann_and_rejects_invalid_pairing()
     // The valid conventional graph built above must not replace this rejected
     // manifest selection. Recover only through the retained exact vectors.
     let recovered = run(&approximate_args)?;
+    check_status(Some(&selected_path), true)?;
     for field in ["source_path", "conversation_id", "line_number", "score"] {
         assert_eq!(recovered["hits"][0][field], exact["hits"][0][field]);
     }

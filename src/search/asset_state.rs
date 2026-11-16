@@ -845,7 +845,9 @@ pub(crate) fn inspect_semantic_assets(
                 )
             });
         match observation {
-            Ok(Some((record, coverage))) => {
+            Ok(Some(observation)) => {
+                let record = observation.record;
+                let coverage = observation.coverage;
                 let mut state = semantic_state_from_availability(
                     data_dir,
                     &availability,
@@ -874,9 +876,11 @@ pub(crate) fn inspect_semantic_assets(
                 state.hint = (coverage.status == "partial").then(||
                     "Results exclude changed or removed identities; newer messages become searchable after semantic catch-up.".to_owned());
                 state.vector_index_path = Some(data_dir.join(&record.index_path));
-                state.hnsw_path = None;
-                state.hnsw_present = false;
-                state.hnsw_state = "missing";
+                // Keep the declaration paired with this coverage observation.
+                // Presence is bounded metadata only, never native admission.
+                state.hnsw_path = observation.ann_path;
+                (state.hnsw_present, state.hnsw_state) =
+                    bounded_ann_presence(state.hnsw_path.as_deref());
                 let tier = match record.tier {
                     TierKind::Fast => &mut state.fast_tier,
                     TierKind::Quality => &mut state.quality_tier,

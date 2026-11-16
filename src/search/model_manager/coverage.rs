@@ -247,14 +247,25 @@ pub(super) fn probe(data_dir: &Path, embedder_id: &str, dimension: usize) -> Res
     Ok(true)
 }
 
+pub(crate) struct CoveredSemanticObservation {
+    pub(crate) record: ArtifactRecord,
+    pub(crate) coverage: SemanticCoverageSnapshot,
+    pub(crate) ann_path: Option<PathBuf>,
+}
+
 pub(crate) fn observe_covered_semantic_artifact(
     data_dir: &Path,
     storage: &FrankenStorage,
     embedder_id: &str,
-) -> Result<Option<(ArtifactRecord, SemanticCoverageSnapshot)>, String> {
-    let Some((record, certificate)) = covered_semantic_record(data_dir, embedder_id)? else {
+) -> Result<Option<CoveredSemanticObservation>, String> {
+    let Some(selected) = select_covered_semantic_record(data_dir, embedder_id)? else {
         return Ok(None);
     };
+    let CoveredSemanticSelection {
+        record,
+        certificate,
+        ann_path,
+    } = selected;
     let snapshot = archive_snapshot(storage, &certificate)?;
     authenticate_artifact(
         data_dir,
@@ -265,5 +276,9 @@ pub(crate) fn observe_covered_semantic_artifact(
         None,
     )
     .map_err(|error| format!("semantic coverage admission: {error:#}"))?;
-    Ok(Some((record, snapshot)))
+    Ok(Some(CoveredSemanticObservation {
+        record,
+        coverage: snapshot,
+        ann_path,
+    }))
 }
