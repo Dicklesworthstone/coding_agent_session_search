@@ -3,7 +3,9 @@ mod source_budget;
 
 #[cfg(test)]
 pub(crate) use source_budget::over_budget_scan_error;
-pub(crate) use source_budget::{over_budget_sources, source_read_budget};
+pub(crate) use source_budget::{
+    SourceFailureReason, for_each_source_failure, over_budget_sources, source_read_budget,
+};
 
 use std::collections::HashMap;
 use std::fs::File;

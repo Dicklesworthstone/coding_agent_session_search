@@ -177,6 +177,22 @@ fn reports_bound_samples_and_preserve_budget_only_schema() -> Result<()> {
                 MAX_REJECTION_SAMPLES
             );
             assert!(error.downcast_ref::<io::Error>().is_some());
+            let mut samples = Vec::new();
+            assert!(for_each_source_failure(&error, |observed_path, reason| {
+                samples.push((observed_path.to_path_buf(), reason));
+            }));
+            assert_eq!(samples.len(), MAX_REJECTION_SAMPLES);
+            for (index, (observed_path, reason)) in samples.iter().enumerate() {
+                assert_eq!(observed_path, &path);
+                assert_eq!(
+                    *reason,
+                    if index % 2 == 0 {
+                        SourceFailureReason::UnfinishedSource
+                    } else {
+                        SourceFailureReason::ReadBudgetExceeded
+                    }
+                );
+            }
         } else {
             assert_eq!(json["reason"], "enrichment_read_budget_exceeded");
             assert_eq!(json["rejected_source_count"], count);

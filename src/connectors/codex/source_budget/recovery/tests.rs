@@ -73,7 +73,10 @@ fn unfinished_middle_source_does_not_starve_later_sessions() -> Result<()> {
         );
         let report = error.downcast_ref::<FailureReport>().unwrap();
         assert_eq!(report.failed_source_count, 1);
-        assert_eq!(report.failed_sources[0].reason, "unfinished_source");
+        assert_eq!(
+            report.failed_sources[0].reason,
+            SourceFailureReason::UnfinishedSource
+        );
         assert_eq!(
             PathBuf::from(&report.failed_sources[0].source_path),
             paths[1]
@@ -113,8 +116,14 @@ fn invalid_data_and_budget_failures_are_both_reported() -> Result<()> {
     assert_eq!(delivered, [paths[2].clone()]);
     let report = error.downcast_ref::<FailureReport>().unwrap();
     assert_eq!(report.failed_source_count, 2);
-    assert_eq!(report.failed_sources[0].reason, "invalid_source_data");
-    assert_eq!(report.failed_sources[1].reason, "read_budget_exceeded");
+    assert_eq!(
+        report.failed_sources[0].reason,
+        SourceFailureReason::InvalidSourceData
+    );
+    assert_eq!(
+        report.failed_sources[1].reason,
+        SourceFailureReason::ReadBudgetExceeded
+    );
     assert_eq!(
         error.downcast_ref::<io::Error>().unwrap().kind(),
         io::ErrorKind::InvalidData
