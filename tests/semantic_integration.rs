@@ -15,6 +15,197 @@ use std::path::PathBuf;
 
 mod util;
 
+/// A real CLI publication must retain its manifest-selected native accelerator.
+/// This is an explicit hash-producer control, not MiniLM relevance evidence.
+#[cfg(unix)]
+#[test]
+fn certified_semantic_cli_uses_manifest_ann_and_rejects_invalid_pairing()
+-> Result<(), Box<dyn std::error::Error>> {
+    use frankensearch::index::{HnswConfig, HnswIndex, VectorIndex};
+    use serde_json::json;
+    use std::time::Duration;
+
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("cass-certified-ann-").disable_cleanup(true);
+    let tmp = builder.tempdir()?;
+    let root = tmp.path();
+    println!("certified ANN fixture retained at {}", root.display());
+    let data = root.join("data");
+    let config = root.join("config");
+    let source = root.join("source/.codex");
+    let sessions = source.join("sessions/2025/11/25");
+    fs::create_dir_all(&sessions)?;
+    fs::create_dir_all(config.join("cass"))?;
+    fs::write(
+        config.join("cass/sources.toml"),
+        format!(
+            "[[sources]]\nname = \"certified-ann-fixture\"\ntype = \"local\"\npaths = [{}]\n",
+            serde_json::to_string(&source.to_string_lossy())?
+        ),
+    )?;
+    let fixture = include_str!("fixtures/codex_real/sessions/2025/11/25/rollout-test.jsonl");
+    let positive = sessions.join("rollout-positive.jsonl");
+    fs::write(&positive, fixture)?;
+    let negative = sessions.join("rollout-negative.jsonl");
+    let mut metadata: Value = serde_json::from_str(fixture.lines().next().ok_or("empty fixture")?)?;
+    metadata["payload"]["id"] = json!("certified-ann-bread-negative");
+    metadata["payload"]["cwd"] = json!("/test/bakery");
+    fs::write(
+        &negative,
+        format!(
+            "{}\n{}\n",
+            metadata,
+            json!({"timestamp":"2025-09-30T15:42:36.190Z", "type":"response_item",
+                "payload":{"type":"message", "role":"user", "content":[{
+                    "type":"input_text", "text":"Knead sourdough bread and bake it in a hot oven"}]}})
+        ),
+    )?;
+    let run = |args: &[&str]| -> Result<Value, Box<dyn std::error::Error>> {
+        let output = cargo_bin_cmd!("cass")
+            .args(args)
+            .current_dir(root)
+            .env("CASS_DATA_DIR", &data)
+            .env("XDG_CONFIG_HOME", &config)
+            .env_remove("CASS_IGNORE_SOURCES_CONFIG")
+            .env("CASS_SEMANTIC_EMBEDDER", "hash")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .env("RAYON_NUM_THREADS", "1")
+            .timeout(Duration::from_secs(30))
+            .output()?;
+        assert!(
+            output.status.success(),
+            "cass {args:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    let indexed = run(&[
+        "index",
+        "--watch-once",
+        positive.to_str().ok_or("positive path is not UTF-8")?,
+        negative.to_str().ok_or("negative path is not UTF-8")?,
+        "--json",
+    ])?;
+    assert_eq!(indexed["conversations"], 2);
+    assert_eq!(indexed["messages"], 4);
+    let backfill = run(&[
+        "models",
+        "backfill",
+        "--tier",
+        "fast",
+        "--embedder",
+        "hash",
+        "--json",
+    ])?;
+    assert_eq!(backfill["published"], true);
+    let query = "Help me implement soldier matrix completion cma-es";
+    let exact_args = [
+        "search",
+        query,
+        "--mode",
+        "semantic",
+        "--fast-only",
+        "--robot",
+        "--limit",
+        "1",
+    ];
+    let approximate_args = [
+        "search",
+        query,
+        "--mode",
+        "semantic",
+        "--fast-only",
+        "--approximate",
+        "--robot",
+        "--limit",
+        "1",
+    ];
+    let exact = run(&exact_args)?;
+    assert_eq!(exact["hits"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        exact["hits"][0]["source_path"],
+        positive.to_string_lossy().as_ref()
+    );
+    let built = run(&["models", "build-hnsw", "--tier", "fast", "--json"])?;
+    assert_eq!(built["state_after"], "native_valid");
+
+    let manifest_path = data.join("vector_index/semantic_manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let vector_path = data.join(
+        manifest["fast_tier"]["index_path"]
+            .as_str()
+            .ok_or("missing certified vector path")?,
+    );
+    let vectors = VectorIndex::open_read_only(&vector_path)?;
+    let selected_relative = "vector_index/manifest-selected-native.chsw";
+    let selected_path = data.join(selected_relative);
+    HnswIndex::build_from_vector_index(&vectors, HnswConfig::default())?.save(&selected_path)?;
+    manifest["hnsw"]["index_path"] = json!(selected_relative);
+    manifest["hnsw"]["size_bytes"] = json!(fs::metadata(&selected_path)?.len());
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    let accelerated = run(&approximate_args)?;
+    for field in ["source_path", "conversation_id", "line_number"] {
+        assert_eq!(accelerated["hits"][0][field], exact["hits"][0][field]);
+    }
+    assert_eq!(accelerated["_meta"]["ann_stats"]["is_approximate"], true);
+    assert!(accelerated["_meta"]["ann_stats"]["exact_fallback"].is_null());
+
+    let alias = data.join("vector_index/aliased-native.chsw");
+    std::os::unix::fs::symlink(&selected_path, &alias)?;
+    let outside = root.join("outside-native.chsw");
+    HnswIndex::build_from_vector_index(&vectors, HnswConfig::default())?.save(&outside)?;
+    assert!(HnswIndex::try_load_native(&outside, &vectors)?.is_some());
+    let parent_alias = data.join("vector_index/aliased-parent");
+    std::os::unix::fs::symlink(root, &parent_alias)?;
+    for (field, value) in [
+        ("ready", json!(false)),
+        ("base_tier", json!("quality")),
+        ("embedder_id", json!("minilm-384")),
+        ("index_path", json!("vector_index/missing-native.chsw")),
+        ("index_path", json!("../outside-native.chsw")),
+        ("index_path", json!(selected_path.to_string_lossy())),
+        ("index_path", json!("vector_index/aliased-native.chsw")),
+        (
+            "index_path",
+            json!("vector_index/aliased-parent/outside-native.chsw"),
+        ),
+    ] {
+        let mut refused = manifest.clone();
+        refused["hnsw"][field] = value;
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&refused)?)?;
+        let recovered = run(&approximate_args)?;
+        for identity in ["source_path", "conversation_id", "line_number", "score"] {
+            assert_eq!(
+                recovered["hits"][0][identity], exact["hits"][0][identity],
+                "{field}: {identity}"
+            );
+        }
+        assert_eq!(recovered["_meta"]["search_mode"], "semantic", "{field}");
+        assert!(
+            recovered["_meta"]["ann_stats"].is_null(),
+            "{field}: {recovered}"
+        );
+    }
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    fs::write(
+        &selected_path,
+        b"deliberately invalid selected native metadata",
+    )?;
+    // The valid conventional graph built above must not replace this rejected
+    // manifest selection. Recover only through the retained exact vectors.
+    let recovered = run(&approximate_args)?;
+    for field in ["source_path", "conversation_id", "line_number", "score"] {
+        assert_eq!(recovered["hits"][0][field], exact["hits"][0][field]);
+    }
+    assert_eq!(recovered["_meta"]["search_mode"], "semantic");
+    assert!(recovered["_meta"]["ann_stats"].is_null());
+    assert!(!data.join("models").exists());
+    Ok(())
+}
+
 /// Helper to create Codex session with modern envelope format.
 fn make_codex_session(
     root: &std::path::Path,

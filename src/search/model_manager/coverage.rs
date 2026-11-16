@@ -19,6 +19,20 @@ pub fn covered_semantic_record(
     data_dir: &Path,
     embedder_id: &str,
 ) -> Result<Option<(ArtifactRecord, SemanticCoverageCertificate)>, String> {
+    Ok(select_covered_semantic_record(data_dir, embedder_id)?
+        .map(|selected| (selected.record, selected.certificate)))
+}
+
+struct CoveredSemanticSelection {
+    record: ArtifactRecord,
+    certificate: SemanticCoverageCertificate,
+    ann_path: Option<PathBuf>,
+}
+
+fn select_covered_semantic_record(
+    data_dir: &Path,
+    embedder_id: &str,
+) -> Result<Option<CoveredSemanticSelection>, String> {
     let Some(manifest) = SemanticManifest::load(data_dir)
         .map_err(|error| format!("semantic coverage ledger: {error}"))?
     else {
@@ -42,7 +56,19 @@ pub fn covered_semantic_record(
     {
         return Err("semantic coverage uses an incompatible producer contract".to_owned());
     }
-    Ok(Some((record.clone(), certificate.clone())))
+    // The optional accelerator must come from the SAME ledger read and tier
+    // as the certified vector owner. Never rediscover a conventional filename.
+    // Its native graph/source binding is still admitted by SearchClient.
+    let ann_path = manifest
+        .hnsw
+        .as_ref()
+        .filter(|ann| ann.ready && ann.base_tier == record.tier && ann.embedder_id == embedder_id)
+        .and_then(|ann| semantic_sidecar_path(data_dir, &ann.index_path));
+    Ok(Some(CoveredSemanticSelection {
+        record: record.clone(),
+        certificate: certificate.clone(),
+        ann_path,
+    }))
 }
 
 fn archive_snapshot(
@@ -87,6 +113,7 @@ fn authenticate_artifact(
     certificate: SemanticCoverageCertificate,
     dimension: usize,
     snapshot: SemanticCoverageSnapshot,
+    ann_path: Option<PathBuf>,
 ) -> anyhow::Result<SemanticIndexArtifact> {
     anyhow::ensure!(
         record.dimension == dimension,
@@ -115,8 +142,9 @@ fn authenticate_artifact(
     // The legacy reader opens by path. Fence that open with descriptor and
     // pathname witnesses, and retain the authenticated descriptor with it.
     ensure_same_file_metadata(&metadata, &std::fs::symlink_metadata(&path)?)?;
-    let artifact = open_validated_semantic_artifact(&path, None, &record.embedder_id, dimension)
-        .map_err(anyhow::Error::msg)?;
+    let artifact =
+        open_validated_semantic_artifact(&path, ann_path, &record.embedder_id, dimension)
+            .map_err(anyhow::Error::msg)?;
     ensure_same_file_metadata(&metadata, &file.metadata()?)?;
     ensure_same_file_metadata(&metadata, &std::fs::symlink_metadata(&path)?)?;
     require_no_wal()?;
@@ -166,9 +194,14 @@ pub(super) fn load_context(
     strict_read_only: bool,
     embedder: impl FnOnce() -> Result<Arc<dyn Embedder>, String>,
 ) -> Result<Option<SemanticContext>, String> {
-    let Some((record, certificate)) = covered_semantic_record(data_dir, embedder_id)? else {
+    let Some(selected) = select_covered_semantic_record(data_dir, embedder_id)? else {
         return Ok(None);
     };
+    let CoveredSemanticSelection {
+        record,
+        certificate,
+        ann_path,
+    } = selected;
     let storage = if strict_read_only {
         FrankenStorage::open_strict_readonly(db_path)
     } else {
@@ -176,8 +209,18 @@ pub(super) fn load_context(
     }
     .map_err(|error| format!("semantic archive: {error}"))?;
     let snapshot = archive_snapshot(&storage, &certificate)?;
-    let artifact = authenticate_artifact(data_dir, &record, certificate, dimension, snapshot)
-        .map_err(|error| format!("semantic coverage admission: {error:#}"))?;
+    let ann_path = ann_path.filter(|path| {
+        crate::search::semantic_manifest::selection::optional_ann_path_is_safe(data_dir, path)
+    });
+    let artifact = authenticate_artifact(
+        data_dir,
+        &record,
+        certificate,
+        dimension,
+        snapshot,
+        ann_path,
+    )
+    .map_err(|error| format!("semantic coverage admission: {error:#}"))?;
     let filter_maps = SemanticFilterMaps::from_storage(&storage)
         .map_err(|error| format!("semantic filter maps: {error}"))?;
     Ok(Some(SemanticContext {
@@ -199,7 +242,7 @@ pub(super) fn probe(data_dir: &Path, embedder_id: &str, dimension: usize) -> Res
         certificate.mutation_seq,
         certificate.max_message_id,
     );
-    authenticate_artifact(data_dir, &record, certificate, dimension, snapshot)
+    authenticate_artifact(data_dir, &record, certificate, dimension, snapshot, None)
         .map_err(|error| format!("semantic coverage admission: {error:#}"))?;
     Ok(true)
 }
@@ -219,6 +262,7 @@ pub(crate) fn observe_covered_semantic_artifact(
         certificate,
         record.dimension,
         snapshot.clone(),
+        None,
     )
     .map_err(|error| format!("semantic coverage admission: {error:#}"))?;
     Ok(Some((record, snapshot)))
