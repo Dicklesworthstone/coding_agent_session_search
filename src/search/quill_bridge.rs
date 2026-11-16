@@ -111,6 +111,14 @@ pub fn is_engine_invariant_failure(error: &anyhow::Error) -> bool {
 ///   planners ([`plan_capped_merge_runs`], [`plan_capped_balanced_merge_runs`])
 ///   already own merging after incremental runs and at the end of a rebuild,
 ///   under both the byte cap and the document bound.
+/// * `max_ingest_shards = 1` keeps document-id allocation independent of
+///   the host CPU count (GH #556). Every shard leases 65,536 ids; spreading
+///   small batches across shards burns the unused tails when the writer
+///   closes and leaves permanent holes for later merges to represent. A
+///   single shard resumes at the published high watermark without that burn.
+///   Document projection and bounded merge runs retain their own parallelism.
+///   Do not use `deterministic_ingest` for this: it also zeroes publication
+///   timestamps in the engine's replay mode.
 /// * `query_fuel_budget` honours [`CASS_QUILL_QUERY_FUEL_BUDGET_ENV`].
 ///
 /// Everything else keeps the engine default so the on-disk format and the
@@ -120,6 +128,7 @@ pub fn cass_quill_config() -> QuillConfig {
     let mut config = QuillConfig {
         max_visibility_lag_ms: u64::MAX,
         tier_fanout: usize::MAX,
+        max_ingest_shards: 1,
         ..QuillConfig::default()
     };
     if let Some(budget) = query_fuel_budget_override(
@@ -2416,6 +2425,176 @@ mod tests {
             default.scribe_shard_budget_bytes
         );
         assert_eq!(config.query_fuel_budget, default.query_fuel_budget);
+        assert_eq!(config.max_ingest_shards, 1);
+        assert!(!config.deterministic_ingest);
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct IncrementalIngestWitness {
+        high_watermark: u64,
+        segment_ranges: Vec<(u64, u64)>,
+        // External identity, global docid, and exact score bits, sorted by identity.
+        hits: Vec<(String, u32, u32)>,
+    }
+
+    /// Recreate ordinary incremental writer lifetimes inside an explicit Rayon
+    /// pool. Small batches take the engine's scalar route, which still rotates
+    /// between ingest shards unless CASS bounds the shard count.
+    fn incremental_ingest_witnesses(
+        directory: &Path,
+        workers: usize,
+        config: &QuillConfig,
+        sessions: std::ops::Range<u64>,
+    ) -> Vec<IncrementalIngestWitness> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .expect("incremental ingest pool");
+        pool.install(|| {
+            sessions
+                .map(|session| {
+                    let mut writer =
+                        QuillCassIndex::open_or_create_with_config(directory, config)
+                            .expect("open incremental writer");
+                    for batch in 0..3_u64 {
+                        let documents: Vec<_> = (0..2)
+                            .map(|offset| {
+                                sample(
+                                    "gh556",
+                                    session * 6 + batch * 2 + offset,
+                                    "gh556cohort dense append",
+                                )
+                            })
+                            .collect();
+                        if batch % 2 == 0 {
+                            writer.add_cass_documents(&documents).expect("owned append");
+                        } else {
+                            let borrowed: Vec<_> =
+                                documents.iter().map(QuillCassDocument::as_ref).collect();
+                            writer
+                                .add_cass_document_refs(&borrowed)
+                                .expect("borrowed append");
+                        }
+                    }
+                    writer.commit().expect("publish incremental session");
+                    drop(writer);
+
+                    // Check durable state through a fresh strict reader after
+                    // the writer has relinquished all allocation state.
+                    let reader = open_cass_reader(directory).expect("reopen durable reader");
+                    let parser =
+                        frankensearch::quill::query::CassQueryParser::new(CASS_SEMANTIC_SCHEMA)
+                            .expect("CASS parser");
+                    let query = parser.parse(
+                        "gh556cohort",
+                        &frankensearch::quill::query::CassQueryFilters::default(),
+                    );
+                    let expected = usize::try_from((session + 1) * 6).expect("fixture count");
+                    let page = search_paginated(&reader, &query.query, expected + 1, 0, true)
+                        .expect("query every appended document");
+                    assert_eq!(page.doc_count, expected);
+                    assert_eq!(page.total_count, Some(expected));
+                    assert_eq!(page.hits.len(), expected);
+                    let mut hits: Vec<_> = page
+                        .hits
+                        .into_iter()
+                        .map(|hit| (hit.document_id, hit.global_docid, hit.bm25_score.to_bits()))
+                        .collect();
+                    hits.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+                    let manifest = frankensearch::quill::load_manifest_pair(directory)
+                        .expect("read published manifest")
+                        .manifest;
+                    IncrementalIngestWitness {
+                        high_watermark: manifest.docid_high_watermark,
+                        segment_ranges: manifest
+                            .segments
+                            .iter()
+                            .map(|segment| (segment.docid_lo, segment.docid_hi))
+                            .collect(),
+                        hits,
+                    }
+                })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn gh556_incremental_docids_do_not_depend_on_cpu_count() {
+        let single = tempfile::tempdir().expect("one-worker index");
+        let multiple = tempfile::tempdir().expect("eight-worker index");
+        let control = tempfile::tempdir().expect("multi-shard control index");
+        let config = cass_quill_config();
+        let one_worker = incremental_ingest_witnesses(single.path(), 1, &config, 0..4);
+        let eight_workers = incremental_ingest_witnesses(multiple.path(), 8, &config, 0..4);
+        assert_eq!(
+            eight_workers, one_worker,
+            "CPU count must not change durable ranges, identities, docids or scores"
+        );
+        for (session, witness) in one_worker.iter().enumerate() {
+            let expected = u64::try_from((session + 1) * 6).expect("fixture count");
+            assert_eq!(witness.high_watermark, expected);
+            let mut next = 0;
+            for &(lo, hi) in &witness.segment_ranges {
+                assert_eq!(lo, next, "incremental sessions must leave no lease holes");
+                next = hi;
+            }
+            assert_eq!(next, expected);
+        }
+
+        // Keep the reported failure mode live in the same test: restore only
+        // the prior CPU-derived shard cap, using the same documents and opens.
+        let incumbent = QuillConfig {
+            max_ingest_shards: QuillConfig::default().max_ingest_shards,
+            ..config
+        };
+        let holes = incremental_ingest_witnesses(control.path(), 8, &incumbent, 0..4);
+        for (old, fixed) in holes.iter().zip(&one_worker) {
+            assert!(
+                old.high_watermark > fixed.high_watermark,
+                "control must reproduce unused doc-id lease tails"
+            );
+            assert_eq!(
+                old.hits.iter().map(|hit| (&hit.0, hit.2)).collect::<Vec<_>>(),
+                fixed
+                    .hits
+                    .iter()
+                    .map(|hit| (&hit.0, hit.2))
+                    .collect::<Vec<_>>(),
+                "allocation policy must preserve document identities and exact scores"
+            );
+        }
+    }
+
+    #[test]
+    fn gh556_reopening_a_sparse_index_does_not_burn_more_lease_tails() {
+        let directory = tempfile::tempdir().expect("existing sparse index");
+        let config = cass_quill_config();
+        let incumbent = QuillConfig {
+            max_ingest_shards: QuillConfig::default().max_ingest_shards,
+            ..config.clone()
+        };
+        let history = incremental_ingest_witnesses(directory.path(), 8, &incumbent, 0..2);
+        let before = history.last().expect("published sparse history");
+        assert!(before.high_watermark > 12, "control must contain lease holes");
+
+        let appended = incremental_ingest_witnesses(directory.path(), 8, &config, 2..4);
+        for (session, after) in appended.iter().enumerate() {
+            let added = u64::try_from((session + 1) * 6).expect("fixture count");
+            assert_eq!(
+                after.high_watermark,
+                before.high_watermark + added,
+                "a reopened existing index allocates exactly its new documents"
+            );
+            for (identity, global_docid, _) in &before.hits {
+                assert!(
+                    after
+                        .hits
+                        .iter()
+                        .any(|hit| &hit.0 == identity && hit.1 == *global_docid),
+                    "changing ingest policy must preserve existing document {identity}"
+                );
+            }
+        }
     }
 
     /// Segments and documents published after `commits` single-document
