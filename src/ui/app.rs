@@ -16564,9 +16564,11 @@ impl super::ftui_adapter::Model for CassApp {
                     // conversation view underneath the modal.
                     return ftui::Cmd::none();
                 }
+                CassMsg::QuitRequested => {
+                    return self.update(CassMsg::ExportModalClosed);
+                }
                 _ => {
-                    // Let non-intercepted messages (like Tick, QuitRequested,
-                    // ExportModalOpened/Closed, etc.) fall through to normal handling.
+                    // Let non-intercepted messages fall through to normal handling.
                 }
             }
         }
@@ -16769,7 +16771,21 @@ impl super::ftui_adapter::Model for CassApp {
         // ── Detail modal intercept ──────────────────────────────────
         // When the full-screen detail modal is open, remap navigation and
         // provide find-in-detail text search (Ctrl+F or /).
-        if self.show_detail_modal {
+        if self.show_detail_modal
+            && !matches!(
+                msg,
+                CassMsg::ExportModalOpened
+                    | CassMsg::ExportModalClosed
+                    | CassMsg::ExportFieldChanged { .. }
+                    | CassMsg::ExportFieldToggled(_)
+                    | CassMsg::ExportFocusMoved { .. }
+                    | CassMsg::ExportExecuted
+                    | CassMsg::ExportMarkdownExecuted
+                    | CassMsg::ExportProgressUpdated(_)
+                    | CassMsg::ExportCompleted { .. }
+                    | CassMsg::ExportFailed(_)
+            )
+        {
             // Sub-intercept: when find bar is active, route text input there.
             if self.detail_find.is_some() && self.input_mode == InputMode::DetailFind {
                 match &msg {
@@ -16801,8 +16817,6 @@ impl super::ftui_adapter::Model for CassApp {
                     | CassMsg::DetailClosed
                     | CassMsg::DetailLoadRequested { .. }
                     | CassMsg::DetailTabChanged(_)
-                    | CassMsg::ExportModalOpened
-                    | CassMsg::ExportMarkdownExecuted
                     | CassMsg::DetailScrolled { .. }
                     | CassMsg::DetailWrapToggled
                     | CassMsg::DetailPaneToggled
@@ -16960,8 +16974,6 @@ impl super::ftui_adapter::Model for CassApp {
                     CassMsg::DetailClosed
                     | CassMsg::DetailLoadRequested { .. }
                     | CassMsg::DetailTabChanged(_)
-                    | CassMsg::ExportModalOpened
-                    | CassMsg::ExportMarkdownExecuted
                     | CassMsg::DetailScrolled { .. }
                     | CassMsg::DetailWrapToggled
                     | CassMsg::DetailPaneToggled
@@ -24713,32 +24725,43 @@ mod tests {
     #[test]
     fn export_modal_enter_exports_when_default_focus_is_valid() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        let mut app = app_with_hits(1);
-        let _ = app.update(CassMsg::ExportModalOpened);
-        app.export_modal_state = Some(ExportModalState {
-            output_dir: tmp.path().to_path_buf(),
-            output_dir_buffer: tmp.path().display().to_string(),
-            filename_preview: "session.html".to_string(),
-            focused: ExportField::OutputDir,
-            ..Default::default()
-        });
+        for from_detail in [false, true] {
+            let mut app = app_with_hits(1);
+            if from_detail {
+                let _ = app.update(CassMsg::DetailOpened);
+                assert!(app.show_detail_modal);
+            }
+            let _ = app.update(CassMsg::ExportModalOpened);
+            app.export_modal_state = Some(ExportModalState {
+                output_dir: tmp.path().to_path_buf(),
+                output_dir_buffer: tmp.path().display().to_string(),
+                filename_preview: "session.html".to_string(),
+                focused: ExportField::OutputDir,
+                ..Default::default()
+            });
 
-        let cmd = app.update(CassMsg::DetailOpened);
+            let cmd = app.update(CassMsg::DetailOpened);
 
-        assert!(
-            matches!(cmd, ftui::Cmd::Task(..)),
-            "Enter should execute export from the default focused field when valid"
-        );
-        assert_eq!(app.status, "Exporting HTML...");
-        assert!(matches!(
-            app.export_modal_state
-                .as_ref()
-                .expect("export modal state")
-                .progress,
-            ExportProgress::Preparing
-        ));
-        let _ = app.update(CassMsg::ExportFailed("cannot write output".to_string()));
-        assert!(app.export_modal_state.as_ref().unwrap().can_export());
+            assert!(
+                matches!(cmd, ftui::Cmd::Task(..)),
+                "Enter should execute export from the default focused field when valid"
+            );
+            assert_eq!(app.status, "Exporting HTML...");
+            assert!(matches!(
+                app.export_modal_state
+                    .as_ref()
+                    .expect("export modal state")
+                    .progress,
+                ExportProgress::Preparing
+            ));
+            let _ = app.update(CassMsg::ExportFailed("cannot write output".to_string()));
+            assert!(app.export_modal_state.as_ref().unwrap().can_export());
+
+            let _ = app.update(CassMsg::QuitRequested);
+            assert!(!app.show_export_modal);
+            assert!(app.export_modal_state.is_none());
+            assert_eq!(app.show_detail_modal, from_detail);
+        }
     }
 
     #[test]
@@ -24802,11 +24825,24 @@ mod tests {
         second.title = second_prompt.to_string();
         let before = std::fs::read(&db_path)?;
 
-        for action in [CassMsg::ExportExecuted, CassMsg::ExportMarkdownExecuted] {
+        for (from_detail, action) in [
+            (false, CassMsg::ExportExecuted),
+            (false, CassMsg::ExportMarkdownExecuted),
+            (true, CassMsg::ExportExecuted),
+            (true, CassMsg::ExportMarkdownExecuted),
+        ] {
             let mut app = app_with_hits(2);
             app.db_path = db_path.clone();
             app.panes[0].hits = vec![first.clone(), second.clone()];
-            let ftui::Cmd::Msg(load) = app.update(CassMsg::ExportModalOpened) else {
+            let open = if from_detail {
+                let _ = app.update(CassMsg::DetailOpened);
+                let _ = app.update(CassMsg::DetailTabChanged(DetailTab::Export));
+                assert!(app.show_detail_modal);
+                CassMsg::QueryChanged("h".to_string())
+            } else {
+                CassMsg::ExportModalOpened
+            };
+            let ftui::Cmd::Msg(load) = app.update(open) else {
                 anyhow::bail!("export modal did not request the conversation");
             };
             let state = app.export_modal_state.as_mut().unwrap();
@@ -24856,6 +24892,7 @@ mod tests {
             let _ = app.update(completion);
             assert!(app.export_modal_hit.is_none());
             assert!(app.export_modal_state.is_none());
+            assert_eq!(app.show_detail_modal, from_detail);
         }
         assert_eq!(std::fs::read(db_path)?, before);
         assert!(!first_path.exists() && !second_path.exists());
