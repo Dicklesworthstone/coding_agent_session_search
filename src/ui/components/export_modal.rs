@@ -202,11 +202,12 @@ impl ExportModalState {
             .title
             .as_deref()
             .map(str::trim)
-            .filter(|title| !title.is_empty())
+            .filter(|title| !title.is_empty() && !crate::export::is_skill_injection(title))
             .map(str::to_string)
             .or_else(|| {
                 let hit_title = hit.title.trim();
-                (!hit_title.is_empty()).then(|| hit_title.to_string())
+                (!hit_title.is_empty() && !crate::export::is_skill_injection(hit_title))
+                    .then(|| hit_title.to_string())
             })
             .map(|mut title| {
                 privacy.redact_text(&mut title);
@@ -216,26 +217,32 @@ impl ExportModalState {
                 title
             })
             .or_else(|| {
-                view.messages.first().map(|m| {
-                    let mut content = m.content.trim().to_string();
-                    // Preserve the complete encoded JSON while inspecting it;
-                    // truncation can otherwise conceal its credential fields.
-                    privacy.redact_text(&mut content);
-                    export_title = serde_json::from_str::<serde_json::Value>(&content)
-                        .is_ok()
-                        .then(|| content.clone());
-                    // Use char_indices to truncate at a UTF-8 boundary (56 chars + "...").
-                    if content.chars().count() > 60 {
-                        let end_idx = content
-                            .char_indices()
-                            .nth(56)
-                            .map(|(idx, _)| idx)
-                            .unwrap_or(content.len());
-                        format!("{}...", &content[..end_idx])
-                    } else {
-                        content
-                    }
-                })
+                view.messages
+                    .iter()
+                    .find(|m| {
+                        !m.content.trim().is_empty()
+                            && !crate::export::is_skill_injection(&m.content)
+                    })
+                    .map(|m| {
+                        let mut content = m.content.trim().to_string();
+                        // Preserve the complete encoded JSON while inspecting it;
+                        // truncation can otherwise conceal its credential fields.
+                        privacy.redact_text(&mut content);
+                        export_title = serde_json::from_str::<serde_json::Value>(&content)
+                            .is_ok()
+                            .then(|| content.clone());
+                        // Use char_indices to truncate at a UTF-8 boundary (56 chars + "...").
+                        if content.chars().count() > 60 {
+                            let end_idx = content
+                                .char_indices()
+                                .nth(56)
+                                .map(|(idx, _)| idx)
+                                .unwrap_or(content.len());
+                            format!("{}...", &content[..end_idx])
+                        } else {
+                            content
+                        }
+                    })
             })
             .filter(|title| !title.trim().is_empty())
             .unwrap_or_else(|| "Untitled Session".to_string());
@@ -591,6 +598,58 @@ mod tests {
                 .content
                 .contains("synthetic-export-body-84")
         );
+
+        let injected = format!(
+            "PRIVATEPREVIEWCANARY{}\nBase directory for this skill: /synthetic/private",
+            "界".repeat(80)
+        );
+        for field in ["canonical", "hit", "message", "all-injected"] {
+            let mut hit = make_hit(None);
+            hit.title.clear();
+            let mut view = make_view(None, Some(1_700_000_000));
+            view.convo.title = None;
+            view.messages[0].content = "Modal ordinary fallback café 界".to_string();
+            match field {
+                "canonical" => view.convo.title = Some(injected.clone()),
+                "hit" => hit.title.clone_from(&injected),
+                _ => {
+                    let mut ordinary = view.messages[0].clone();
+                    ordinary.id = Some(2);
+                    ordinary.idx = 1;
+                    view.messages[0].content.clone_from(&injected);
+                    if field == "message" {
+                        view.messages.push(ordinary);
+                    }
+                }
+            }
+            let before_hit_title = hit.title.clone();
+            let before_title = view.convo.title.clone();
+            let before_messages: Vec<_> = view.messages.iter().map(|m| m.content.clone()).collect();
+            let state = ExportModalState::from_hit(&hit, &view);
+            let expected = if field == "all-injected" {
+                "Untitled Session"
+            } else {
+                "Modal ordinary fallback café 界"
+            };
+            assert_eq!(state.title_preview, expected, "{field}");
+            assert_eq!(state.to_export_options().title.as_deref(), Some(expected));
+            assert!(state.export_title.is_none());
+            assert!(
+                !state
+                    .filename_preview
+                    .to_ascii_lowercase()
+                    .contains("privatepreviewcanary")
+            );
+            assert_eq!(hit.title, before_hit_title);
+            assert_eq!(view.convo.title, before_title);
+            assert_eq!(
+                view.messages
+                    .iter()
+                    .map(|m| m.content.clone())
+                    .collect::<Vec<_>>(),
+                before_messages
+            );
+        }
     }
 
     #[test]

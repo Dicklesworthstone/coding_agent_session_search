@@ -11106,10 +11106,18 @@ impl CassApp {
         }
 
         let downloads = get_downloads_dir();
-        let mut fallback_title = hit_title_display(hit)
-            .or_else(|| search_hit_snippet_fallback_text_opt(hit))
-            .unwrap_or("Untitled Session")
-            .to_string();
+        // Inspect each complete candidate before truncation can hide an
+        // injection marker while leaving its private prefix in the filename.
+        let mut fallback_title = [
+            hit_title_display(hit),
+            trimmed_non_empty(&hit.snippet),
+            trimmed_non_empty(&hit.content),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|text| !crate::export::is_skill_injection(text))
+        .unwrap_or("Untitled Session")
+        .to_string();
         // Inspect the complete JSON payload before truncation can turn a
         // quoted credential object into ordinary, unparseable prose.
         let mut privacy = crate::export::ExportPrivacy::new(false);
@@ -34531,6 +34539,46 @@ not jsonl",
         }
         assert_eq!(hit.title, before.title);
         assert_eq!(hit.workspace, before.workspace);
+
+        let injected = format!(
+            "PRIVATEPREVIEWCANARY{}\nBase directory for this skill: /synthetic/private",
+            "界".repeat(80)
+        );
+        for field in ["title", "snippet", "content", "safe-content"] {
+            let mut hit = make_test_hit();
+            hit.title.clear();
+            hit.snippet.clear();
+            hit.content.clear();
+            match field {
+                "title" => hit.title.clone_from(&injected),
+                "snippet" => hit.snippet.clone_from(&injected),
+                "content" => hit.content.clone_from(&injected),
+                _ => {
+                    hit.title.clone_from(&injected);
+                    hit.snippet.clone_from(&injected);
+                    hit.content = "Ordinary fallback café 界".to_string();
+                }
+            }
+            let before = hit.clone();
+            let state = app.detail_export_state_for_hit(&hit);
+            let expected = if field == "safe-content" {
+                "Ordinary fallback café 界"
+            } else {
+                "Untitled Session"
+            };
+            assert_eq!(state.title_preview, expected, "{field}");
+            assert_eq!(state.to_export_options().title.as_deref(), Some(expected));
+            assert!(state.export_title.is_none());
+            assert!(
+                !state
+                    .filename_preview
+                    .to_ascii_lowercase()
+                    .contains("privatepreviewcanary")
+            );
+            assert_eq!(hit.title, before.title);
+            assert_eq!(hit.snippet, before.snippet);
+            assert_eq!(hit.content, before.content);
+        }
     }
 
     #[test]
