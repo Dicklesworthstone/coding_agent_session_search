@@ -108,6 +108,9 @@ use std::time::{Duration, Instant};
 use ftui::runtime::input_macro::{MacroPlayback, MacroRecorder};
 use ftui::runtime::{StopSignal, SubId, Subscription};
 
+use crate::html_export::{
+    FilenameMetadata, FilenameOptions, generate_filename, get_downloads_dir, unique_filename,
+};
 use crate::model::types::MessageRole;
 use crate::search::model_manager::SemanticAvailability;
 use crate::search::query::{MatchType, QuerySuggestion, SearchFilters, SearchHit, SearchMode};
@@ -133,12 +136,6 @@ use crate::ui::time_parser::parse_time_input;
 use crate::update_check::{UpdateInfo, open_in_browser, skip_version};
 #[cfg(not(test))]
 use crate::update_check::{run_self_update, spawn_update_check};
-use crate::{
-    html_export::{
-        FilenameMetadata, FilenameOptions, generate_filename, get_downloads_dir, unique_filename,
-    },
-    smart_truncate,
-};
 use ftui::render::drawing::Draw;
 use ftui::widgets::Widget;
 use ftui::widgets::block::{Alignment, Block};
