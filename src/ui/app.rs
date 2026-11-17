@@ -5404,6 +5404,8 @@ pub struct CassApp {
     pub show_export_modal: bool,
     /// State of the export modal form.
     pub export_modal_state: Option<ExportModalState>,
+    /// The hit that opened the export form, even if search results change.
+    export_modal_hit: Option<SearchHit>,
     /// Pending screenshot capture (set in update, consumed in view).
     pub screenshot_pending: Option<ScreenshotFormat>,
     /// Buffer for screenshot data captured during view() (RefCell for &self access).
@@ -5705,6 +5707,7 @@ impl Default for CassApp {
             has_seen_help: false,
             show_export_modal: false,
             export_modal_state: None,
+            export_modal_hit: None,
             screenshot_pending: None,
             screenshot_result: RefCell::new(None),
             show_bulk_modal: false,
@@ -11106,26 +11109,9 @@ impl CassApp {
         }
 
         let downloads = get_downloads_dir();
-        // Inspect each complete candidate before truncation can hide an
-        // injection marker while leaving its private prefix in the filename.
-        let mut fallback_title = [
-            hit_title_display(hit),
-            trimmed_non_empty(&hit.snippet),
-            trimmed_non_empty(&hit.content),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|text| !crate::export::is_skill_injection(text))
-        .unwrap_or("Untitled Session")
-        .to_string();
-        // Inspect the complete JSON payload before truncation can turn a
-        // quoted credential object into ordinary, unparseable prose.
+        // The indexed excerpt can lose a marker that survives only in the
+        // stored message envelope. Wait for verified details before using it.
         let mut privacy = crate::export::ExportPrivacy::new(false);
-        privacy.redact_text(&mut fallback_title);
-        let export_title = serde_json::from_str::<serde_json::Value>(&fallback_title)
-            .is_ok()
-            .then(|| fallback_title.clone());
-        let fallback_title = smart_truncate(&fallback_title, 60);
         let created_date = hit
             .created_at
             .and_then(smart_timestamp)
@@ -11145,14 +11131,14 @@ impl CassApp {
             agent: (!agent_name.is_empty()).then(|| agent_name.clone()),
             date: created_date,
             project: (!workspace.is_empty()).then(|| workspace.clone()),
-            topic: Some(fallback_title.clone()),
+            topic: None,
             title: None,
         };
         let options = FilenameOptions {
             include_date: true,
             include_agent: true,
             include_project: true,
-            include_topic: true,
+            include_topic: false,
             ..Default::default()
         };
         let base_filename = format!("{}.html", generate_filename(&metadata, &options));
@@ -11170,10 +11156,26 @@ impl CassApp {
             workspace,
             timestamp,
             message_count: 0,
-            title_preview: fallback_title,
-            export_title,
+            title_preview: "Untitled Session".to_string(),
             ..Default::default()
         }
+    }
+
+    fn export_hit_for_action(&self) -> Option<&SearchHit> {
+        if self.show_export_modal {
+            self.export_modal_hit.as_ref()
+        } else {
+            self.selected_hit()
+        }
+    }
+
+    fn close_export_modal(&mut self) {
+        if self.show_export_modal {
+            self.focus_manager.pop_trap();
+        }
+        self.show_export_modal = false;
+        self.export_modal_state = None;
+        self.export_modal_hit = None;
     }
 
     /// Derive the markdown filename from the HTML filename suggestion.
@@ -11188,11 +11190,21 @@ impl CassApp {
     /// Refresh export-modal metadata after detail data becomes available.
     ///
     /// Preserves user-toggled options while updating derived session metadata.
-    fn refresh_open_export_modal_for_hit(&mut self, hit: &SearchHit) {
+    fn refresh_open_export_modal_for_hit(&mut self, loaded_key: &SelectedHitKey) {
         if !self.show_export_modal {
             return;
         }
-        let refreshed = self.detail_export_state_for_hit(hit);
+        let Some(hit) = self
+            .export_modal_hit
+            .as_ref()
+            .filter(|hit| SelectedHitKey::from_hit(hit) == *loaded_key)
+        else {
+            return;
+        };
+        let Some(view) = self.cached_detail_for_render(hit) else {
+            return;
+        };
+        let refreshed = ExportModalState::from_hit(hit, view);
         let Some(state) = self.export_modal_state.as_mut() else {
             return;
         };
@@ -11377,7 +11389,7 @@ impl CassApp {
             lines.push(ftui::text::Line::from(""));
             lines.push(ftui::text::Line::from_spans(vec![
                 ftui::text::Span::styled(
-                    "Conversation details are still loading; file names are derived from indexed metadata for now.",
+                    "Suggested file names use a neutral title until conversation details are available.",
                     muted_style,
                 ),
             ]));
@@ -18364,10 +18376,10 @@ impl super::ftui_adapter::Model for CassApp {
                     && hit_source_id_display(&hit) == loaded_source_id
                 {
                     self.sync_detail_session_hit_state(&hit);
-                    self.refresh_open_export_modal_for_hit(&hit);
                     self.detail_session_hit_scroll_pending.set(true);
                     self.detail_pending_scroll_to.set(None);
                 }
+                self.refresh_open_export_modal_for_hit(&loaded_key);
                 self.clear_loading_context(LoadingContext::DetailModal);
                 ftui::Cmd::none()
             }
@@ -19300,23 +19312,25 @@ impl super::ftui_adapter::Model for CassApp {
 
             // -- Export modal -------------------------------------------------
             CassMsg::ExportModalOpened => {
-                // Initialize modal state from the currently selected hit + conversation.
-                if let Some(hit) = self.selected_hit().cloned() {
+                if !self.show_export_modal
+                    && let Some(hit) = self.selected_hit().cloned()
+                {
+                    let load_details =
+                        self.cached_detail_for_render(&hit).is_none() && self.db_path.exists();
                     let state = self.detail_export_state_for_hit(&hit);
                     self.export_modal_state = Some(state);
+                    self.export_modal_hit = Some(hit.clone());
                     self.show_export_modal = true;
                     self.focus_manager.push_trap(focus_ids::GROUP_EXPORT);
                     self.focus_manager.focus(focus_ids::EXPORT_MODAL);
+                    if load_details {
+                        return ftui::Cmd::msg(CassMsg::DetailLoadRequested { hit });
+                    }
                 }
                 ftui::Cmd::none()
             }
             CassMsg::ExportModalClosed => {
-                let was_open = self.show_export_modal;
-                self.show_export_modal = false;
-                self.export_modal_state = None;
-                if was_open {
-                    self.focus_manager.pop_trap();
-                }
+                self.close_export_modal();
                 ftui::Cmd::none()
             }
             CassMsg::ExportFieldChanged { field, value } => {
@@ -19353,16 +19367,15 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::none()
             }
             CassMsg::ExportMarkdownExecuted => {
-                let Some(hit) = self.selected_hit().cloned() else {
+                let Some(export_hit) = self.export_hit_for_action().cloned() else {
                     self.status = "No active result to export.".to_string();
                     return ftui::Cmd::none();
                 };
                 let export_state = self
                     .export_modal_state
                     .clone()
-                    .unwrap_or_else(|| self.detail_export_state_for_hit(&hit));
+                    .unwrap_or_else(|| self.detail_export_state_for_hit(&export_hit));
                 let db_path = self.db_path.clone();
-                let export_hit = hit.clone();
                 let output_dir = export_state.output_dir.clone();
                 let output_filename =
                     Self::markdown_filename_from_html(&export_state.filename_preview);
@@ -19381,7 +19394,7 @@ impl super::ftui_adapter::Model for CassApp {
                 })
             }
             CassMsg::ExportExecuted => {
-                let Some(export_hit) = self.selected_hit().cloned() else {
+                let Some(export_hit) = self.export_hit_for_action().cloned() else {
                     self.status = "No active result to export.".to_string();
                     return ftui::Cmd::none();
                 };
@@ -19437,12 +19450,7 @@ impl super::ftui_adapter::Model for CassApp {
                 file_size: _,
                 encrypted: _,
             } => {
-                let was_open = self.show_export_modal;
-                self.show_export_modal = false;
-                self.export_modal_state = None;
-                if was_open {
-                    self.focus_manager.pop_trap();
-                }
+                self.close_export_modal();
                 self.status = format!("Exported to {}", output_path.display());
                 self.toast_manager
                     .push(crate::ui::components::toast::Toast::success(format!(
@@ -19452,6 +19460,11 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::none()
             }
             CassMsg::ExportFailed(err) => {
+                if let Some(state) = self.export_modal_state.as_mut()
+                    && state.progress.is_busy()
+                {
+                    state.progress = ExportProgress::Error(err.clone());
+                }
                 self.status = format!("Export failed: {err}");
                 self.toast_manager
                     .push(crate::ui::components::toast::Toast::error(format!(
@@ -21413,9 +21426,7 @@ impl super::ftui_adapter::Model for CassApp {
                     return ftui::Cmd::none();
                 }
                 if self.show_export_modal {
-                    self.show_export_modal = false;
-                    self.export_modal_state = None;
-                    self.focus_manager.pop_trap();
+                    self.close_export_modal();
                     return ftui::Cmd::none();
                 }
                 if self.show_bulk_modal {
@@ -24706,7 +24717,7 @@ mod tests {
     fn export_modal_enter_exports_when_default_focus_is_valid() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut app = app_with_hits(1);
-        app.show_export_modal = true;
+        let _ = app.update(CassMsg::ExportModalOpened);
         app.export_modal_state = Some(ExportModalState {
             output_dir: tmp.path().to_path_buf(),
             output_dir_buffer: tmp.path().display().to_string(),
@@ -24729,6 +24740,129 @@ mod tests {
                 .progress,
             ExportProgress::Preparing
         ));
+        let _ = app.update(CassMsg::ExportFailed("cannot write output".to_string()));
+        assert!(app.export_modal_state.as_ref().unwrap().can_export());
+    }
+
+    #[test]
+    fn nd6pc_export_modal_validates_preview_and_keeps_the_opened_session() -> anyhow::Result<()> {
+        use crate::franken_sync::SqliteValue;
+
+        let root = tempfile::Builder::new()
+            .prefix("cass-pinned-export-")
+            .disable_cleanup(true)
+            .tempdir()?;
+        let first_path = root.path().join("first.jsonl");
+        let second_path = root.path().join("second.jsonl");
+        let db_path = root.path().join("archive.db");
+        let private = "PINNED_PRIVATE_TITLE";
+        let first_prompt = "PINNED_ORDINARY_PROMPT café 界";
+        let second_prompt = "OTHER_RESULT_FROM_REFRESH";
+        let private_envelope = serde_json::json!({
+            "metadata": {"source":"Base directory for this skill: /synthetic/pinned"}
+        })
+        .to_string();
+
+        let storage = FrankenStorage::open(&db_path)?;
+        let conn = storage.raw();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'codex', 'Codex', 'local', 0, 0)")?;
+        for (id, path, title) in [(1, &first_path, private), (2, &second_path, second_prompt)] {
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, ?2, ?3, 'local', 10)",
+                &[
+                    SqliteValue::Integer(id),
+                    SqliteValue::Text(title.into()),
+                    SqliteValue::Text(path.display().to_string().into()),
+                ],
+            )?;
+        }
+        for (id, idx, content, extra) in [
+            (1, 0, private, private_envelope.as_str()),
+            (1, 1, first_prompt, "null"),
+            (2, 0, second_prompt, "null"),
+        ] {
+            conn.execute_with_params(
+                "INSERT INTO messages (conversation_id, idx, role, content, extra_json) VALUES (?1, ?2, 'user', ?3, ?4)",
+                &[
+                    SqliteValue::Integer(id),
+                    SqliteValue::Integer(idx),
+                    SqliteValue::Text(content.into()),
+                    SqliteValue::Text(extra.into()),
+                ],
+            )?;
+        }
+        drop(storage);
+        let mut first = make_exact_hit(&first_path.display().to_string(), "local", 1, private);
+        first.conversation_id = Some(1);
+        first.title = private.to_string();
+        let mut second = make_exact_hit(
+            &second_path.display().to_string(),
+            "local",
+            1,
+            second_prompt,
+        );
+        second.conversation_id = Some(2);
+        second.title = second_prompt.to_string();
+        let before = std::fs::read(&db_path)?;
+
+        for action in [CassMsg::ExportExecuted, CassMsg::ExportMarkdownExecuted] {
+            let mut app = app_with_hits(2);
+            app.db_path = db_path.clone();
+            app.panes[0].hits = vec![first.clone(), second.clone()];
+            let ftui::Cmd::Msg(load) = app.update(CassMsg::ExportModalOpened) else {
+                anyhow::bail!("export modal did not request the conversation");
+            };
+            let state = app.export_modal_state.as_mut().unwrap();
+            assert_eq!(state.title_preview, "Untitled Session");
+            assert!(
+                !state
+                    .filename_preview
+                    .to_ascii_lowercase()
+                    .contains("private")
+            );
+            state.output_dir = root.path().to_path_buf();
+            state.include_tools = false;
+
+            app.panes[0].selected = 1;
+            let _ = app.update(CassMsg::DetailLoadRequested {
+                hit: second.clone(),
+            });
+            assert_eq!(
+                app.export_modal_state.as_ref().unwrap().title_preview,
+                "Untitled Session"
+            );
+            let _ = app.update(load);
+            let state = app.export_modal_state.as_ref().unwrap();
+            assert_eq!(state.title_preview, first_prompt);
+            assert_eq!(state.output_dir, root.path());
+            assert!(!state.include_tools);
+            assert_eq!(
+                app.selected_hit().and_then(|hit| hit.conversation_id),
+                Some(2)
+            );
+
+            let ftui::Cmd::Task(_, task) = app.update(action) else {
+                anyhow::bail!("export did not dispatch the pinned session");
+            };
+            let completion = task();
+            let CassMsg::ExportCompleted {
+                ref output_path, ..
+            } = completion
+            else {
+                anyhow::bail!("pinned export failed: {completion:?}");
+            };
+            assert_eq!(output_path.parent(), Some(root.path()));
+            let output = std::fs::read_to_string(output_path)?;
+            assert!(output.contains(first_prompt));
+            assert!(!output.contains(private));
+            assert!(!output.contains(second_prompt));
+            let _ = app.update(completion);
+            assert!(app.export_modal_hit.is_none());
+            assert!(app.export_modal_state.is_none());
+        }
+        assert_eq!(std::fs::read(db_path)?, before);
+        assert!(!first_path.exists() && !second_path.exists());
+        Ok(())
     }
 
     #[test]
@@ -32295,7 +32429,6 @@ mod tests {
         let bytes = b"{\"role\":\"user\",\"content\":\"clean-title-body\"}\n";
         std::fs::write(&session, bytes)?;
         let db = root.path().join("absent.db");
-        let app = CassApp::default();
         let payload = serde_json::json!({
             "registration_token":"tiny-title-551",
             "zz_note":format!("{}title-end-kept", "café 界 ".repeat(20))
@@ -32308,7 +32441,11 @@ mod tests {
             }
             let mut hit = make_exact_hit(&session.display().to_string(), "local", 1, "fixture");
             hit.title.clone_from(&title);
-            let state = app.detail_export_state_for_hit(&hit);
+            let mut view = export_preview_view(&title);
+            let mut preview_hit = hit.clone();
+            preview_hit.title.clear();
+            view.convo.source_path = session.clone();
+            let state = ExportModalState::from_hit(&preview_hit, &view);
             assert!(!state.title_preview.contains("title-end-kept"));
             assert!(!state.filename_preview.contains("tiny-title-551"));
             let options = state.to_export_options();
@@ -33607,6 +33744,23 @@ not jsonl",
         }
     }
 
+    fn export_preview_view(content: &str) -> ConversationView {
+        let mut view = make_test_conversation_view();
+        view.convo.title = None;
+        view.convo.workspace = None;
+        view.messages.push(Message {
+            id: None,
+            idx: 0,
+            role: crate::model::types::MessageRole::User,
+            author: None,
+            created_at: None,
+            content: content.to_string(),
+            extra_json: serde_json::Value::Null,
+            snippets: Vec::new(),
+        });
+        view
+    }
+
     /// Stored message ordinals are unique within a conversation.
     fn number_messages_canonically(messages: &mut [Message]) {
         for (idx, message) in messages.iter_mut().enumerate() {
@@ -34645,7 +34799,7 @@ not jsonl",
     }
 
     #[test]
-    fn detail_export_state_uses_visible_excerpt_when_title_and_snippet_are_empty() {
+    fn detail_export_state_masks_unverified_excerpt() {
         let app = CassApp::default();
         let mut hit = make_test_hit();
         hit.title.clear();
@@ -34656,12 +34810,10 @@ not jsonl",
 
         let state = app.detail_export_state_for_hit(&hit);
 
-        assert!(
-            state
-                .title_preview
-                .contains("export preview content fallback"),
-            "export title preview should reuse the same fallback excerpt the user already sees"
-        );
+        assert_eq!(state.title_preview, "Untitled Session");
+        assert!(!state.filename_preview.contains("fallback"));
+        let verified = ExportModalState::from_hit(&hit, &export_preview_view(&hit.content));
+        assert_eq!(verified.title_preview, "export preview content fallback");
     }
 
     #[test]
@@ -34671,7 +34823,10 @@ not jsonl",
         hit.title = "Session password=synthetic-export-title-84".into();
         hit.workspace = "/tmp/password=synthetic-export-workspace-84".into();
         let before = hit.clone();
-        let state = app.detail_export_state_for_hit(&hit);
+        let cold = app.detail_export_state_for_hit(&hit);
+        assert_eq!(cold.title_preview, "Untitled Session");
+        assert!(!cold.workspace.contains("synthetic-export"));
+        let state = ExportModalState::from_hit(&hit, &export_preview_view("ordinary message"));
         assert!(state.title_preview.contains("[REDACTED]"));
         for value in [state.title_preview, state.workspace, state.filename_preview] {
             assert!(!value.contains("synthetic-export"));
@@ -34700,13 +34855,11 @@ not jsonl",
             }
             let before = hit.clone();
             let state = app.detail_export_state_for_hit(&hit);
-            let expected = if field == "safe-content" {
-                "Ordinary fallback café 界"
-            } else {
-                "Untitled Session"
-            };
-            assert_eq!(state.title_preview, expected, "{field}");
-            assert_eq!(state.to_export_options().title.as_deref(), Some(expected));
+            assert_eq!(state.title_preview, "Untitled Session", "{field}");
+            assert_eq!(
+                state.to_export_options().title.as_deref(),
+                Some("Untitled Session")
+            );
             assert!(state.export_title.is_none());
             assert!(
                 !state
@@ -34717,6 +34870,10 @@ not jsonl",
             assert_eq!(hit.title, before.title);
             assert_eq!(hit.snippet, before.snippet);
             assert_eq!(hit.content, before.content);
+            if field == "safe-content" {
+                let verified = ExportModalState::from_hit(&hit, &export_preview_view(&hit.content));
+                assert_eq!(verified.title_preview, "Ordinary fallback café 界");
+            }
         }
     }
 
@@ -34750,11 +34907,14 @@ not jsonl",
                 }
                 let before = hit.clone();
                 let state = app.detail_export_state_for_hit(&hit);
-                assert_eq!(
-                    state.title_preview,
-                    smart_truncate(&expected, 60),
-                    "{field}"
-                );
+                assert_eq!(state.title_preview, "Untitled Session", "{field}");
+                assert!(state.export_title.is_none());
+                let mut preview_hit = hit.clone();
+                preview_hit.title.clear();
+                let state = ExportModalState::from_hit(&preview_hit, &export_preview_view(&text));
+                let expected_preview =
+                    format!("{}...", expected.chars().take(56).collect::<String>());
+                assert_eq!(state.title_preview, expected_preview, "{field}");
                 assert_eq!(state.export_title.as_deref(), Some(expected.as_str()));
                 assert_eq!(
                     state.to_export_options().title.as_deref(),
@@ -34768,24 +34928,26 @@ not jsonl",
         }
         let mut hit = make_test_hit();
         hit.title = "  { \"note\": \"café 界\", \"token_count\": 42 }  ".into();
-        let state = app.detail_export_state_for_hit(&hit);
+        let view = export_preview_view("ordinary message");
+        let state = ExportModalState::from_hit(&hit, &view);
         assert_eq!(state.title_preview, hit.title.trim());
         hit.title = "ordinary prose café 界 ".repeat(20);
-        let state = app.detail_export_state_for_hit(&hit);
+        let state = ExportModalState::from_hit(&hit, &view);
         assert_eq!(state.export_title, None);
         assert_eq!(state.to_export_options().title, Some(state.title_preview));
         Ok(())
     }
 
     #[test]
-    fn detail_export_state_trims_whitespace_hit_title_when_no_cached_detail() {
+    fn detail_export_state_trims_whitespace_after_validation() {
         let app = CassApp::default();
         let mut hit = make_test_hit();
         hit.title = "   Export Session   ".to_string();
 
         let state = app.detail_export_state_for_hit(&hit);
-
-        assert_eq!(state.title_preview, "Export Session");
+        assert_eq!(state.title_preview, "Untitled Session");
+        let verified = ExportModalState::from_hit(&hit, &export_preview_view("ordinary message"));
+        assert_eq!(verified.title_preview, "Export Session");
     }
 
     #[test]
@@ -34965,6 +35127,7 @@ not jsonl",
         anchor_selected_hit_to_detail(&mut app, &mut loaded_view);
         let hit = app.selected_hit().cloned().expect("anchored selected hit");
         app.cached_detail = Some((hit.source_path.clone(), loaded_view));
+        app.export_modal_hit = Some(hit.clone());
 
         let _ = app.update(CassMsg::DetailLoadRequested { hit: hit.clone() });
 
