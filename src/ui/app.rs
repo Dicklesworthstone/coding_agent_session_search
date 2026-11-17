@@ -23347,6 +23347,16 @@ fn export_session_task(
     }
     let mut title = Some(title.to_string());
     privacy.redact_optional_text(&mut title);
+    if title
+        .as_deref()
+        .is_some_and(crate::export::is_skill_injection)
+    {
+        title = messages
+            .iter()
+            .find(|message| message.role == "user" && !message.content.trim().is_empty())
+            .and_then(|message| message.content.lines().next())
+            .map(|line| crate::smart_truncate(line, 80));
+    }
     let title = title.as_deref().unwrap_or("Conversation Export");
     let mut agent_name = Some(agent_name.to_string());
     privacy.redact_optional_text(&mut agent_name);
@@ -23478,6 +23488,12 @@ fn export_session_markdown_task(
     privacy.redact_optional_text(&mut session_title);
 
     messages.retain(|message| !crate::export::message_is_skill_injection(message));
+    if session_title
+        .as_deref()
+        .is_some_and(crate::export::is_skill_injection)
+    {
+        session_title = None;
+    }
     if messages.is_empty() {
         return CassMsg::ExportFailed("No messages found in session".to_string());
     }
@@ -31769,6 +31785,49 @@ mod tests {
                 assert!(!markdown.contains(omitted), "source leaked {omitted}");
             }
         }
+        for (case, (cached_title, expected_title)) in [
+            (body, "MARKDOWN_ORDINARY_PROMPT café 界"),
+            (
+                "Ordinary cached title café 界",
+                "Ordinary cached title café 界",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut titled_hit = hit.clone();
+            titled_hit.title = cached_title.to_string();
+            let result = export_session_markdown_task(
+                &absent_db,
+                &titled_hit,
+                &root.path().join(format!("source-titled-{case}.md")),
+                true,
+            );
+            let CassMsg::ExportCompleted { output_path, .. } = result else {
+                anyhow::bail!("titled markdown export failed: {result:?}");
+            };
+            let markdown = std::fs::read_to_string(output_path)?;
+            assert!(markdown.starts_with(&format!("# {expected_title}\n")));
+            assert!(!markdown.contains("PLAIN_PRIVATE_BODY"));
+            let result = export_session_task(
+                &absent_db,
+                &titled_hit,
+                &root.path().join(format!("source-titled-{case}.html")),
+                false,
+                None,
+                false,
+                true,
+                cached_title,
+                "claude_code",
+            );
+            let CassMsg::ExportCompleted { output_path, .. } = result else {
+                anyhow::bail!("titled HTML export failed: {result:?}");
+            };
+            let html = std::fs::read_to_string(output_path)?;
+            assert!(html.contains(&format!("<title>{expected_title}</title>")));
+            assert!(html.contains("MARKDOWN_ORDINARY_ANSWER"));
+            assert!(!html.contains("PLAIN_PRIVATE_BODY"));
+        }
         assert_eq!(std::fs::read(&session)?, bytes.as_bytes());
         let after = std::fs::metadata(&session)?;
         assert_eq!(before.modified()?, after.modified()?);
@@ -31831,6 +31890,55 @@ mod tests {
             assert!(markdown.contains("INDEXED_ORDINARY_PROMPT café 界"));
             assert!(markdown.contains("INDEXED_ORDINARY_ANSWER"));
             assert!(!markdown.contains("PLAIN_PRIVATE_BODY"));
+        }
+        for (case, title) in [
+            body,
+            "<system-reminder>ARCHIVE_PRIVATE_TITLE</system-reminder>",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            conn.execute_with_params(
+                "UPDATE conversations SET title = ?1 WHERE id = 1",
+                &[SqliteValue::Text(title.into())],
+            )?;
+            let result = export_session_markdown_task(
+                &db,
+                &indexed_hit,
+                &root.path().join(format!("archive-titled-{case}.md")),
+                true,
+            );
+            let CassMsg::ExportCompleted { output_path, .. } = result else {
+                anyhow::bail!("titled archive markdown export failed: {result:?}");
+            };
+            let markdown = std::fs::read_to_string(output_path)?;
+            assert!(markdown.starts_with("# INDEXED_ORDINARY_PROMPT café 界\n"));
+            assert!(markdown.contains("INDEXED_ORDINARY_ANSWER"));
+            let result = export_session_task(
+                &db,
+                &indexed_hit,
+                &root.path().join(format!("archive-titled-{case}.html")),
+                false,
+                None,
+                false,
+                true,
+                title,
+                "claude_code",
+            );
+            let CassMsg::ExportCompleted { output_path, .. } = result else {
+                anyhow::bail!("titled archive HTML export failed: {result:?}");
+            };
+            let html = std::fs::read_to_string(output_path)?;
+            assert!(html.contains("<title>INDEXED_ORDINARY_PROMPT café 界</title>"));
+            assert!(html.contains("INDEXED_ORDINARY_ANSWER"));
+            for omitted in ["PLAIN_PRIVATE_BODY", "ARCHIVE_PRIVATE_TITLE"] {
+                assert!(!markdown.contains(omitted));
+                assert!(!html.contains(omitted));
+            }
+            let archived_title: String = conn
+                .query_row("SELECT title FROM conversations WHERE id = 1")?
+                .get_typed(0)?;
+            assert_eq!(archived_title, title);
         }
         assert!(!missing.exists());
         let archived: String = conn

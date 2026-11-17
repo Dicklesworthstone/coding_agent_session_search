@@ -117584,6 +117584,12 @@ fn run_export(
 
     if !include_skills {
         messages.retain(|msg| !crate::export::message_is_skill_injection(msg));
+        if session_title
+            .as_deref()
+            .is_some_and(crate::export::is_skill_injection)
+        {
+            session_title = None;
+        }
     }
 
     if messages.is_empty() {
@@ -118268,6 +118274,14 @@ fn run_export_html(
     privacy.redact_optional_text(&mut session_title);
     privacy.redact_optional_text(&mut workspace);
     privacy.redact_optional_text(&mut agent_name);
+
+    if !include_skills
+        && session_title
+            .as_deref()
+            .is_some_and(crate::export::is_skill_injection)
+    {
+        session_title = None;
+    }
 
     let pi_family_export = matches!(agent_name.as_deref(), Some("pi_agent" | "omp"));
 

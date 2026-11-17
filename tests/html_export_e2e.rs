@@ -1163,6 +1163,142 @@ fn test_color_contrast_indicators() {
 // ============================================================================
 
 #[test]
+fn nd6pc_explicit_titles_follow_skill_policy() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::Builder::new()
+        .prefix("cass-skill-title-policy-")
+        .disable_cleanup(true)
+        .tempdir()?;
+    let session = root
+        .path()
+        .join("storage/session/project-title/title-session.json");
+    let message = root
+        .path()
+        .join("storage/message/title-session/message.json");
+    let part = root.path().join("storage/part/message/part.json");
+    for path in [&session, &message, &part] {
+        fs::create_dir_all(path.parent().ok_or("fixture parent missing")?)?;
+    }
+    fs::write(
+        &message,
+        serde_json::to_vec(&serde_json::json!({
+            "id":"message", "sessionID":"title-session", "role":"user",
+            "time":{"created":1733000001000_i64}
+        }))?,
+    )?;
+    fs::write(
+        &part,
+        serde_json::to_vec(&serde_json::json!({
+            "id":"part", "messageID":"message", "type":"text",
+            "text":"TITLE_ORDINARY_PROMPT café 界"
+        }))?,
+    )?;
+    for (title, html_title, private) in [
+        (
+            "Base directory for this skill: /synthetic/TITLESECRETALPHA",
+            "Base directory for this skill: /synthetic/TITLESECRETALPHA",
+            true,
+        ),
+        (
+            "<system-reminder>TITLESECRETALPHA</system-reminder>",
+            "&lt;system-reminder&gt;TITLESECRETALPHA&lt;/system-reminder&gt;",
+            true,
+        ),
+        (
+            "Ordinary explicit title café 界",
+            "Ordinary explicit title café 界",
+            false,
+        ),
+    ] {
+        fs::write(
+            &session,
+            serde_json::to_vec(&serde_json::json!({
+                "id":"title-session", "title":title,
+                "time":{"created":1733000000000_i64, "updated":1733000002000_i64}
+            }))?,
+        )?;
+        let originals = [&session, &message, &part]
+            .into_iter()
+            .map(|path| Ok((path, fs::read(path)?, fs::metadata(path)?)))
+            .collect::<Result<Vec<_>, std::io::Error>>()?;
+        for include_skills in [false, true] {
+            for format in ["markdown", "html", "export-html"] {
+                let mut cmd = export_privacy_command(root.path());
+                if format == "export-html" {
+                    cmd.arg("export-html")
+                        .arg(&session)
+                        .arg("--output-dir")
+                        .arg(root.path().join("exports"))
+                        .arg("--json");
+                } else {
+                    cmd.arg("export").arg(&session).args(["--format", format]);
+                }
+                if include_skills {
+                    cmd.arg("--include-skills");
+                }
+                let output = cmd.output()?;
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let exported = if format == "export-html" {
+                    let receipt: Value = serde_json::from_slice(&output.stdout)?;
+                    let path = Path::new(
+                        receipt
+                            .get("exported")
+                            .and_then(|exported| exported.get("output_path"))
+                            .and_then(Value::as_str)
+                            .ok_or("output path missing")?,
+                    );
+                    if !include_skills {
+                        assert!(
+                            !path
+                                .file_name()
+                                .ok_or("filename missing")?
+                                .to_string_lossy()
+                                .to_ascii_lowercase()
+                                .contains("titlesecretalpha")
+                        );
+                    }
+                    fs::read_to_string(path)?
+                } else {
+                    String::from_utf8(output.stdout)?
+                };
+                assert!(exported.contains("TITLE_ORDINARY_PROMPT café 界"));
+                assert_eq!(
+                    exported.contains("TITLESECRETALPHA"),
+                    private && include_skills,
+                    "{format}, {title}, include_skills={include_skills}"
+                );
+                let expected_title = if private && !include_skills {
+                    "TITLE_ORDINARY_PROMPT café 界"
+                } else {
+                    title
+                };
+                if format == "markdown" {
+                    assert!(exported.starts_with(&format!("# {expected_title}\n")));
+                } else {
+                    let expected = if private && !include_skills {
+                        "TITLE_ORDINARY_PROMPT café 界"
+                    } else {
+                        html_title
+                    };
+                    assert!(exported.contains(&format!("<title>{expected}</title>")));
+                }
+            }
+        }
+        for (path, bytes, before) in originals {
+            assert_eq!(fs::read(path)?, bytes);
+            let after = fs::metadata(path)?;
+            assert_eq!(before.modified()?, after.modified()?);
+            assert_eq!(before.permissions(), after.permissions());
+        }
+    }
+    assert!(!root.path().join("data/agent_search.db").exists());
+    Ok(())
+}
+
+#[test]
 fn nd6pc_all_export_formats_share_complete_message_skill_policy()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = TempDir::new()?;
