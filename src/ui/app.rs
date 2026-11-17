@@ -31695,13 +31695,19 @@ mod tests {
             "{\"id\":\"reply\",\"role\":\"assistant\",\"content\":\"TUI_RECOVERED_RESPONSE\"}\n",
         );
         let mut source = bytes.as_bytes().to_vec();
-        source.extend_from_slice(b"\xff\n{\"role\":\"assistant\",\"content\":\"TUI_FINAL_RESPONSE\"}\n");
+        source.extend_from_slice(
+            b"\xff\n{\"role\":\"assistant\",\"content\":\"TUI_FINAL_RESPONSE\"}\n",
+        );
         std::fs::write(&session, &source)?;
         let before = std::fs::metadata(&session)?;
         let db = root.path().join("absent.db");
-        let hit = make_exact_hit(&session.display().to_string(), "local", 1, "TUI_FIRST_PROMPT");
-        let markdown =
-            export_session_markdown_task(&db, &hit, &root.path().join("torn.md"), false);
+        let hit = make_exact_hit(
+            &session.display().to_string(),
+            "local",
+            1,
+            "TUI_FIRST_PROMPT",
+        );
+        let markdown = export_session_markdown_task(&db, &hit, &root.path().join("torn.md"), false);
         let html = export_session_task(
             &db,
             &hit,
