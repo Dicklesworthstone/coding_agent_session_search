@@ -28,10 +28,13 @@ impl ExportPrivacy {
     }
 
     pub(crate) fn redact_messages(&mut self, messages: &mut [Value]) {
-        if self.include_secrets {
-            return;
-        }
         for message in messages {
+            self.redact_message(message);
+        }
+    }
+
+    pub(crate) fn redact_message(&mut self, message: &mut Value) {
+        if !self.include_secrets {
             let redacted = crate::indexer::redact_secrets::redact_json(message);
             self.redaction_applied |= redacted != *message;
             *message = redacted;
@@ -87,12 +90,22 @@ pub(crate) fn message_is_skill_injection(message: &Value) -> bool {
     is_skill_injection(&message.to_string())
 }
 
-/// Convert complete source messages after the caller applies export privacy.
-/// Keep tool extraction and exclusion identical for CLI and TUI exports.
+/// Select original records before redaction can erase a skill marker.
+/// Keep source indexes for HTML rendering and archive message lookup.
+pub(crate) fn select_html_source_records(
+    raw_messages: &mut [Value],
+    include_skills: bool,
+) -> impl Iterator<Item = (usize, &mut Value)> {
+    raw_messages
+        .iter_mut()
+        .enumerate()
+        .filter(move |(_, message)| include_skills || !message_is_skill_injection(message))
+}
+
+/// Convert the selected source records after the caller redacts credentials.
 pub(crate) fn html_messages_from_raw<'a>(
     raw_messages: impl IntoIterator<Item = (usize, &'a Value)>,
     include_tools: bool,
-    include_skills: bool,
     pi_family_export: bool,
 ) -> Vec<crate::html_export::Message> {
     use crate::html_export::Message;
@@ -103,9 +116,6 @@ pub(crate) fn html_messages_from_raw<'a>(
         .flat_map(|(i, msg)| {
             let role = crate::extract_role(msg);
             if !include_tools && role == "tool" {
-                return Vec::new();
-            }
-            if !include_skills && message_is_skill_injection(msg) {
                 return Vec::new();
             }
             let timestamp = crate::extract_message_timestamp(msg)

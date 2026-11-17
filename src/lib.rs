@@ -109820,20 +109820,9 @@ pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<T
     Ok((messages, session_start, session_end, skipped))
 }
 
-/// Report damaged lines and recovery on stderr; stdout remains data-only.
-/// Physical line coordinates are retained even when one line yielded several
-/// recovered records. No claim is made about connector-ingest coverage.
-fn report_skipped_jsonl_lines(path: &Path, decoded: usize, skipped: &JsonlParseDiagnostics) {
-    if skipped.malformed_lines == 0 {
-        return;
-    }
-    let recovered = skipped.recovered_records;
-    let discarded = skipped.discarded_bytes;
-    for line in skipped
-        .details
-        .iter()
-        .take(MAX_REPORTED_SKIPPED_JSONL_LINES)
-    {
+/// Log the bounded sample of damaged physical lines for CLI and TUI exports.
+fn trace_skipped_jsonl_lines(path: &Path, skipped: &JsonlParseDiagnostics) {
+    for line in &skipped.details {
         tracing::warn!(
             source_path = %path.display(),
             line_no = line.line_number,
@@ -109842,12 +109831,23 @@ fn report_skipped_jsonl_lines(path: &Path, decoded: usize, skipped: &JsonlParseD
             discarded_bytes = line.discarded_bytes,
             recovery_limited = line.recovery_limited,
             total_malformed_lines = skipped.malformed_lines,
-            total_recovered_records = recovered,
-            total_discarded_bytes = discarded,
+            total_recovered_records = skipped.recovered_records,
+            total_discarded_bytes = skipped.discarded_bytes,
             omitted_line_diagnostics = skipped.malformed_lines.saturating_sub(MAX_REPORTED_SKIPPED_JSONL_LINES),
             "session JSONL line failed to parse; retained complete records and skipped malformed bytes (GH #427 / GH #553)"
         );
     }
+}
+
+/// Report damaged lines and recovery on stderr while stdout stays data-only.
+/// Physical coordinates remain available when one line yields several records.
+fn report_skipped_jsonl_lines(path: &Path, decoded: usize, skipped: &JsonlParseDiagnostics) {
+    if skipped.malformed_lines == 0 {
+        return;
+    }
+    trace_skipped_jsonl_lines(path, skipped);
+    let recovered = skipped.recovered_records;
+    let discarded = skipped.discarded_bytes;
     if recovered == 0 {
         eprintln!(
             "warning: skipped {} malformed JSONL record(s) in {}; rendered the remaining {} record(s)",
@@ -117578,10 +117578,6 @@ fn run_export(
         });
     }
 
-    let mut privacy = crate::export::ExportPrivacy::new(include_secrets);
-    privacy.redact_messages(&mut messages);
-    privacy.redact_optional_text(&mut session_title);
-
     if !include_skills {
         messages.retain(|msg| !crate::export::message_is_skill_injection(msg));
         if session_title
@@ -117591,6 +117587,10 @@ fn run_export(
             session_title = None;
         }
     }
+
+    let mut privacy = crate::export::ExportPrivacy::new(include_secrets);
+    privacy.redact_messages(&mut messages);
+    privacy.redact_optional_text(&mut session_title);
 
     if messages.is_empty() {
         return Err(CliError {
@@ -118269,12 +118269,6 @@ fn run_export_html(
         return Err(err);
     }
 
-    let mut privacy = crate::export::ExportPrivacy::new(include_secrets);
-    privacy.redact_messages(&mut raw_messages);
-    privacy.redact_optional_text(&mut session_title);
-    privacy.redact_optional_text(&mut workspace);
-    privacy.redact_optional_text(&mut agent_name);
-
     if !include_skills
         && session_title
             .as_deref()
@@ -118283,12 +118277,23 @@ fn run_export_html(
         session_title = None;
     }
 
+    let mut privacy = crate::export::ExportPrivacy::new(include_secrets);
+    privacy.redact_optional_text(&mut session_title);
+    privacy.redact_optional_text(&mut workspace);
+    privacy.redact_optional_text(&mut agent_name);
+
+    let selected_records: Vec<_> =
+        crate::export::select_html_source_records(&mut raw_messages, include_skills)
+            .map(|(index, message)| {
+                privacy.redact_message(message);
+                (index, &*message)
+            })
+            .collect();
     let pi_family_export = matches!(agent_name.as_deref(), Some("pi_agent" | "omp"));
 
     let messages: Vec<Message> = crate::export::html_messages_from_raw(
-        raw_messages.iter().enumerate(),
+        selected_records.iter().copied(),
         include_tools,
-        include_skills,
         pi_family_export,
     );
 
@@ -118307,18 +118312,12 @@ fn run_export_html(
     // Count message types from RAW messages for accuracy.
     // Must distinguish human-typed prompts from tool results, which both have role "user".
     // Tool results have content as an array containing {"type": "tool_result", ...} blocks.
-    // Also exclude skill injections from counts when !include_skills, since those messages
-    // are dropped from the rendered output and shouldn't inflate the prompt count.
+    // Use the same selection as the renderer so omitted records don't inflate the counts.
     let mut human_turns = 0usize;
     let mut assistant_msgs = 0usize;
     let mut tool_use_count = 0usize;
-    for msg in &raw_messages {
+    for (_, msg) in selected_records {
         let role = extract_role(msg);
-
-        // Skip messages that would be dropped by skill filtering
-        if !include_skills && crate::export::message_is_skill_injection(msg) {
-            continue;
-        }
 
         match role.as_str() {
             "user" => {

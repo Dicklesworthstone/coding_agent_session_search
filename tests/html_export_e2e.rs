@@ -1401,6 +1401,92 @@ fn nd6pc_all_export_formats_share_complete_message_skill_policy()
 }
 
 #[test]
+fn nd6pc_skill_selection_precedes_credential_redaction() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::Builder::new()
+        .prefix("cass-export-skill-order-")
+        .disable_cleanup(true)
+        .tempdir()?;
+    let session = root.path().join("session.jsonl");
+    let marker = "Base directory for this skill: /synthetic/marker";
+    let credential = "synthetic-credential-order-canary";
+    let prompt = serde_json::json!({
+        "id": "prompt", "role": "user", "content": "ORDER_ORDINARY café 界",
+        "metadata": {"registration_token": credential}
+    });
+    let private = serde_json::json!({
+        "id": "private", "role": "assistant", "content": "ORDER_PRIVATE_CANARY",
+        "metadata": {"registration_token": marker}
+    });
+    let bytes = format!("{prompt}\n{private}\n");
+    fs::write(&session, &bytes)?;
+    let before = fs::metadata(&session)?;
+    for (case, (skills, secrets)) in [(false, false), (true, false), (false, true), (true, true)]
+        .into_iter()
+        .enumerate()
+    {
+        for html in [false, true] {
+            let mut cmd = export_privacy_command(root.path());
+            if html {
+                cmd.arg("export-html")
+                    .arg(&session)
+                    .arg("--output-dir")
+                    .arg(root.path().join(format!("html-{case}")))
+                    .arg("--json");
+            } else {
+                cmd.arg("export").arg(&session).args(["--format", "json"]);
+            }
+            if skills {
+                cmd.arg("--include-skills");
+            }
+            if secrets {
+                cmd.arg("--include-secrets");
+            }
+            let output = cmd.output()?;
+            assert!(
+                output.status.success(),
+                "{case}/{html}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: Value = serde_json::from_slice(&output.stdout)?;
+            if html {
+                let path = result["exported"]["output_path"]
+                    .as_str()
+                    .ok_or("HTML output path missing")?;
+                let rendered = fs::read_to_string(path)?;
+                assert!(rendered.contains("ORDER_ORDINARY café 界"));
+                assert_eq!(rendered.contains("ORDER_PRIVATE_CANARY"), skills);
+                let count = if skills { 1 } else { 0 };
+                assert!(rendered.contains(&format!("<span>1 prompt, {count} response")));
+                assert_eq!(result["privacy"]["redaction_applied"], !secrets);
+            } else {
+                let records = result.as_array().ok_or("exported JSON is not an array")?;
+                let ids: Vec<_> = records
+                    .iter()
+                    .filter_map(|record| record["id"].as_str())
+                    .collect();
+                let expected: &[_] = if skills {
+                    &["prompt", "private"]
+                } else {
+                    &["prompt"]
+                };
+                assert_eq!(ids, expected);
+                let rendered = String::from_utf8(output.stdout)?;
+                assert!(rendered.contains("ORDER_ORDINARY café 界"));
+                assert_eq!(rendered.contains("ORDER_PRIVATE_CANARY"), skills);
+                assert_eq!(rendered.contains(credential), secrets);
+                assert_eq!(rendered.contains(marker), skills && secrets);
+            }
+        }
+    }
+    assert_eq!(fs::read(&session)?, bytes.as_bytes());
+    let after = fs::metadata(&session)?;
+    assert_eq!(before.modified()?, after.modified()?);
+    assert_eq!(before.permissions(), after.permissions());
+    assert!(!root.path().join("data/agent_search.db").exists());
+    Ok(())
+}
+
+#[test]
 fn nd6pc_html_counts_exclude_structured_skill_messages() -> Result<(), Box<dyn std::error::Error>> {
     let root = TempDir::new()?;
     let session = root.path().join("session.jsonl");

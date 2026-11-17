@@ -23098,9 +23098,6 @@ fn tui_prefers_direct_followup_file(hit: &SearchHit) -> bool {
 fn load_local_export_raw_messages(
     session_path: &std::path::Path,
 ) -> Result<(Vec<serde_json::Value>, Option<String>, Option<i64>), String> {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-
     if !session_path.exists() {
         return Err(format!("Session not found: {}", session_path.display()));
     }
@@ -23111,69 +23108,15 @@ fn load_local_export_raw_messages(
             .map_err(|err| format!("Failed to parse OpenCode session: {err}"));
     }
 
-    let file = File::open(session_path).map_err(|err| format!("Cannot open session: {err}"))?;
-    let reader = BufReader::new(file);
-    let mut messages = Vec::new();
-    let mut session_start = None;
-    // GH #427: apply the indexer's per-line policy. A record that fails to
-    // decode is skipped (and logged) rather than aborting the export; only a
-    // file with no decodable record at all is rejected, so the indexed
-    // fallback still engages for genuinely non-JSONL paths.
-    let mut skipped: usize = 0;
-    let mut first_parse_error: Option<String> = None;
-
-    for (line_index, line_result) in reader.lines().enumerate() {
-        let line = line_result.map_err(|err| {
-            format!(
-                "Failed to read session: {err}. The session file may be truncated or contain invalid UTF-8."
-            )
-        })?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let message = match serde_json::from_str::<serde_json::Value>(&line) {
-            Ok(message) => message,
-            Err(err) => {
-                let line_number = line_index + 1;
-                tracing::warn!(
-                    source_path = %session_path.display(),
-                    line_no = line_number,
-                    error = %err,
-                    "session JSONL line failed to parse; skipping (GH #427)"
-                );
-                skipped += 1;
-                if first_parse_error.is_none() {
-                    first_parse_error = Some(format!(
-                        "Failed to parse session JSONL at line {line_number}: {err}"
-                    ));
-                }
-                continue;
+    let (messages, session_start, _, skipped) =
+        crate::parse_followup_jsonl_messages_tolerant(session_path).map_err(|error| {
+            if let Some(hint) = error.hint {
+                format!("{} ({hint})", error.message)
+            } else {
+                error.message
             }
-        };
-        if let Some(ts) = crate::extract_message_timestamp(&message)
-            && session_start.is_none_or(|start| ts < start)
-        {
-            session_start = Some(ts);
-        }
-        messages.push(message);
-    }
-
-    if messages.is_empty()
-        && let Some(first) = first_parse_error
-    {
-        return Err(format!(
-            "{first} (none of the {skipped} non-empty line(s) decoded as JSON)"
-        ));
-    }
-    if skipped > 0 {
-        tracing::warn!(
-            source_path = %session_path.display(),
-            skipped,
-            decoded = messages.len(),
-            "export skipped malformed JSONL record(s); rendered the rest (GH #427)"
-        );
-    }
-
+        })?;
+    crate::trace_skipped_jsonl_lines(session_path, &skipped);
     Ok((messages, None, session_start))
 }
 
@@ -23207,7 +23150,7 @@ mod gh427_tui_export_loader_tests {
 
         let err = load_local_export_raw_messages(&path).unwrap_err();
         assert!(err.contains("at line 1"), "{err}");
-        assert!(err.contains("none of the 1"), "{err}");
+        assert!(err.contains("None of the 1 non-empty line(s)"), "{err}");
     }
 }
 
@@ -23251,32 +23194,32 @@ fn export_session_task(
     let prefer_direct_file = tui_prefers_direct_followup_file(hit);
 
     let convert_raw = |raw: &mut [serde_json::Value], pi_family_export| {
-        for message in raw.iter_mut() {
-            let explicit_role = message
-                .get("role")
-                .or_else(|| message.get("message").and_then(|inner| inner.get("role")))
-                .or_else(|| message.get("payload").and_then(|inner| inner.get("role")))
-                .and_then(serde_json::Value::as_str);
-            if explicit_role.is_some() {
-                let role = crate::extract_role(message);
-                let normalized = match role.as_str() {
-                    "user" | "assistant" | "system" | "tool" | "unknown" => continue,
-                    "agent" => "assistant",
-                    "function" => "tool",
-                    _ => "unknown",
-                };
-                // The TUI already retained canonical custom-role messages.
-                // Keep those as unknown without admitting bookkeeping types.
-                message["role"] = serde_json::json!(normalized);
-            }
-        }
-        crate::export::ExportPrivacy::new(false).redact_messages(raw);
-        crate::export::html_messages_from_raw(
-            raw.iter().enumerate(),
-            include_tools,
-            false,
-            pi_family_export,
-        )
+        let mut privacy = crate::export::ExportPrivacy::new(false);
+        let selected =
+            crate::export::select_html_source_records(raw, false).map(|(index, message)| {
+                let explicit_role = message
+                    .get("role")
+                    .or_else(|| message.get("message").and_then(|inner| inner.get("role")))
+                    .or_else(|| message.get("payload").and_then(|inner| inner.get("role")))
+                    .and_then(serde_json::Value::as_str);
+                if explicit_role.is_some() {
+                    let role = crate::extract_role(message);
+                    let normalized = match role.as_str() {
+                        "user" | "assistant" | "system" | "tool" | "unknown" => None,
+                        "agent" => Some("assistant"),
+                        "function" => Some("tool"),
+                        _ => Some("unknown"),
+                    };
+                    // The TUI already retained canonical custom-role messages.
+                    // Keep those as unknown without admitting bookkeeping types.
+                    if let Some(normalized) = normalized {
+                        message["role"] = serde_json::json!(normalized);
+                    }
+                }
+                privacy.redact_message(message);
+                (index, &*message)
+            });
+        crate::export::html_messages_from_raw(selected, include_tools, pi_family_export)
     };
 
     let html_messages_from_view = |view: crate::ui::data::ConversationView| {
@@ -23353,18 +23296,16 @@ fn export_session_task(
         privacy.redact_text(&mut message.content);
         privacy.redact_optional_text(&mut message.author);
     }
-    let mut title = Some(title.to_string());
-    privacy.redact_optional_text(&mut title);
-    if title
-        .as_deref()
-        .is_some_and(crate::export::is_skill_injection)
-    {
-        title = messages
+    let mut title = if crate::export::is_skill_injection(title) {
+        messages
             .iter()
             .find(|message| message.role == "user" && !message.content.trim().is_empty())
             .and_then(|message| message.content.lines().next())
-            .map(|line| crate::smart_truncate(line, 80));
-    }
+            .map(|line| crate::smart_truncate(line, 80))
+    } else {
+        Some(title.to_string())
+    };
+    privacy.redact_optional_text(&mut title);
     let title = title.as_deref().unwrap_or("Conversation Export");
     let mut agent_name = Some(agent_name.to_string());
     privacy.redact_optional_text(&mut agent_name);
@@ -23491,10 +23432,6 @@ fn export_session_markdown_task(
         session_title = Some(hit.title.trim().to_string());
     }
 
-    let mut privacy = crate::export::ExportPrivacy::new(false);
-    privacy.redact_messages(&mut messages);
-    privacy.redact_optional_text(&mut session_title);
-
     messages.retain(|message| !crate::export::message_is_skill_injection(message));
     if session_title
         .as_deref()
@@ -23502,6 +23439,10 @@ fn export_session_markdown_task(
     {
         session_title = None;
     }
+    let mut privacy = crate::export::ExportPrivacy::new(false);
+    privacy.redact_messages(&mut messages);
+    privacy.redact_optional_text(&mut session_title);
+
     if messages.is_empty() {
         return CassMsg::ExportFailed("No messages found in session".to_string());
     }
@@ -31741,6 +31682,65 @@ mod tests {
     }
 
     #[test]
+    fn gh553_tui_export_keeps_complete_records_after_a_torn_write() -> anyhow::Result<()> {
+        let root = tempfile::Builder::new()
+            .prefix("cass-tui-torn-export-")
+            .disable_cleanup(true)
+            .tempdir()?;
+        let session = root.path().join("torn.jsonl");
+        let bytes = concat!(
+            "{\"id\":\"first\",\"role\":\"user\",\"content\":\"TUI_FIRST_PROMPT\"}\n",
+            "{\"id\":\"torn\",\"role\":\"assistant\",\"content\":\"TORN_PREFIX_ONLY",
+            "{\"id\":\"suffix\",\"role\":\"user\",\"content\":\"TUI_RECOVERED_PROMPT café 界\"}",
+            "{\"id\":\"reply\",\"role\":\"assistant\",\"content\":\"TUI_RECOVERED_RESPONSE\"}\n",
+        );
+        let mut source = bytes.as_bytes().to_vec();
+        source.extend_from_slice(b"\xff\n{\"role\":\"assistant\",\"content\":\"TUI_FINAL_RESPONSE\"}\n");
+        std::fs::write(&session, &source)?;
+        let before = std::fs::metadata(&session)?;
+        let db = root.path().join("absent.db");
+        let hit = make_exact_hit(&session.display().to_string(), "local", 1, "TUI_FIRST_PROMPT");
+        let markdown =
+            export_session_markdown_task(&db, &hit, &root.path().join("torn.md"), false);
+        let html = export_session_task(
+            &db,
+            &hit,
+            &root.path().join("torn.html"),
+            false,
+            None,
+            false,
+            true,
+            "Recovered session",
+            "pi_agent",
+        );
+        for result in [markdown, html] {
+            let CassMsg::ExportCompleted { output_path, .. } = result else {
+                anyhow::bail!("torn session export failed: {result:?}");
+            };
+            let exported = std::fs::read_to_string(output_path)?;
+            let mut remainder = exported.as_str();
+            for expected in [
+                "TUI_FIRST_PROMPT",
+                "TUI_RECOVERED_PROMPT café 界",
+                "TUI_RECOVERED_RESPONSE",
+                "TUI_FINAL_RESPONSE",
+            ] {
+                let Some((_, after)) = remainder.split_once(expected) else {
+                    anyhow::bail!("missing or out of order in export: {expected}");
+                };
+                remainder = after;
+            }
+            assert!(!exported.contains("TORN_PREFIX_ONLY"));
+        }
+        assert_eq!(std::fs::read(&session)?, source);
+        let after = std::fs::metadata(&session)?;
+        assert_eq!(before.modified()?, after.modified()?);
+        assert_eq!(before.permissions(), after.permissions());
+        assert!(!db.exists());
+        Ok(())
+    }
+
+    #[test]
     fn nd6pc_tui_markdown_omits_skills_from_source_and_archive() -> anyhow::Result<()> {
         use crate::franken_sync::{SqliteValue, compat::RowExt};
         use crate::storage::sqlite::FrankenStorage;
@@ -31761,6 +31761,7 @@ mod tests {
             ]}}),
             serde_json::json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"private-call","content":"Base directory for this skill: /synthetic/private\nRESULT_PRIVATE_BODY"}]}),
             serde_json::json!({"role":"assistant","content":"META_PRIVATE_NARRATIVE","metadata":{"document":body}}),
+            serde_json::json!({"role":"assistant","content":"REDACTION_ORDER_PRIVATE_NARRATIVE","metadata":{"registration_token":body}}),
         ];
         let bytes = events
             .iter()
@@ -31789,12 +31790,19 @@ mod tests {
                 "ARG_PRIVATE_NARRATIVE",
                 "RESULT_PRIVATE_BODY",
                 "META_PRIVATE_NARRATIVE",
+                "REDACTION_ORDER_PRIVATE_NARRATIVE",
             ] {
                 assert!(!markdown.contains(omitted), "source leaked {omitted}");
             }
         }
+        let encoded_title = serde_json::json!({
+            "registration_token": body,
+            "note": "REDACTION_ORDER_PRIVATE_TITLE"
+        })
+        .to_string();
         for (case, (cached_title, expected_title)) in [
             (body, "MARKDOWN_ORDINARY_PROMPT café 界"),
+            (encoded_title.as_str(), "MARKDOWN_ORDINARY_PROMPT café 界"),
             (
                 "Ordinary cached title café 界",
                 "Ordinary cached title café 界",
@@ -31817,6 +31825,8 @@ mod tests {
             let markdown = std::fs::read_to_string(output_path)?;
             assert!(markdown.starts_with(&format!("# {expected_title}\n")));
             assert!(!markdown.contains("PLAIN_PRIVATE_BODY"));
+            assert!(!markdown.contains("REDACTION_ORDER_PRIVATE_NARRATIVE"));
+            assert!(!markdown.contains("REDACTION_ORDER_PRIVATE_TITLE"));
             let result = export_session_task(
                 &absent_db,
                 &titled_hit,
@@ -31835,6 +31845,8 @@ mod tests {
             assert!(html.contains(&format!("<title>{expected_title}</title>")));
             assert!(html.contains("MARKDOWN_ORDINARY_ANSWER"));
             assert!(!html.contains("PLAIN_PRIVATE_BODY"));
+            assert!(!html.contains("REDACTION_ORDER_PRIVATE_NARRATIVE"));
+            assert!(!html.contains("REDACTION_ORDER_PRIVATE_TITLE"));
         }
         assert_eq!(std::fs::read(&session)?, bytes.as_bytes());
         let after = std::fs::metadata(&session)?;
