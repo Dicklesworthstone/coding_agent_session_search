@@ -31810,7 +31810,12 @@ mod tests {
                 ],
             )?;
         }
-        let indexed_hit = make_exact_hit(&missing.display().to_string(), "local", 2, "fixture");
+        let indexed_hit = make_exact_hit(
+            &missing.display().to_string(),
+            "local",
+            2,
+            "INDEXED_ORDINARY_PROMPT café 界",
+        );
         for include_tools in [false, true] {
             let result = export_session_markdown_task(
                 &db,
