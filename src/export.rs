@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
 
+use crate::model::types::Message;
 use crate::search::query::SearchHit;
 
 /// Sharing policy applied before raw or archived conversation data is rendered.
@@ -90,16 +91,28 @@ pub(crate) fn message_is_skill_injection(message: &Value) -> bool {
     is_skill_injection(&message.to_string())
 }
 
+/// A normalized archive row can retain a marker only in its source envelope.
+pub(crate) fn archived_message_is_skill_injection(message: &Message) -> bool {
+    !message.extra_json.is_null() && message_is_skill_injection(&message.extra_json)
+}
+
 /// Select original records before redaction can erase a skill marker.
 /// Keep source indexes for HTML rendering and archive message lookup.
-pub(crate) fn select_html_source_records(
-    raw_messages: &mut [Value],
+pub(crate) fn select_html_source_records<'a>(
+    raw_messages: &'a mut [Value],
+    archived_messages: Option<&'a [Message]>,
     include_skills: bool,
-) -> impl Iterator<Item = (usize, &mut Value)> {
+) -> impl Iterator<Item = (usize, &'a mut Value)> {
     raw_messages
         .iter_mut()
         .enumerate()
-        .filter(move |(_, message)| include_skills || !message_is_skill_injection(message))
+        .filter(move |(index, message)| {
+            include_skills
+                || (!message_is_skill_injection(message)
+                    && !archived_messages
+                        .and_then(|archived| archived.get(*index))
+                        .is_some_and(archived_message_is_skill_injection))
+        })
 }
 
 /// Convert the selected source records after the caller redacts credentials.

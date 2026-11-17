@@ -109340,9 +109340,14 @@ fn role_to_export_string(role: &crate::model::types::MessageRole) -> String {
 
 fn conversation_view_to_raw_messages(
     view: &crate::ui::data::ConversationView,
+    include_archived_skill_records: bool,
 ) -> Vec<serde_json::Value> {
     view.messages
         .iter()
+        .filter(|message| {
+            include_archived_skill_records
+                || !crate::export::archived_message_is_skill_injection(message)
+        })
         .map(|msg| {
             let mut json_msg = serde_json::json!({
                 "role": role_to_export_string(&msg.role),
@@ -109366,7 +109371,9 @@ fn conversation_view_to_raw_messages(
 fn conversation_view_to_html_raw_messages(
     view: &crate::ui::data::ConversationView,
 ) -> Vec<serde_json::Value> {
-    let mut messages = conversation_view_to_raw_messages(view);
+    // The HTML selector receives the original archive rows alongside this
+    // projection, so keep them aligned by position here.
+    let mut messages = conversation_view_to_raw_messages(view, true);
     if !matches!(view.convo.agent_slug.as_str(), "pi_agent" | "omp") {
         return messages;
     }
@@ -109601,7 +109608,7 @@ fn try_load_indexed_conversation_from_db_with_source(
 fn serialize_indexed_view_lines(
     view: &crate::ui::data::ConversationView,
 ) -> CliResult<Vec<String>> {
-    conversation_view_to_raw_messages(view)
+    conversation_view_to_raw_messages(view, true)
         .into_iter()
         .map(|msg| {
             serde_json::to_string(&msg).map_err(|e| CliError {
@@ -117481,7 +117488,7 @@ fn run_export(
                     session_title = view.convo.title.clone();
                     session_start = view.convo.started_at;
                     _session_end = view.convo.ended_at;
-                    messages = conversation_view_to_raw_messages(view);
+                    messages = conversation_view_to_raw_messages(view, include_skills);
                 } else {
                     return Err(err);
                 }
@@ -117491,7 +117498,7 @@ fn run_export(
         session_title = view.convo.title.clone();
         session_start = view.convo.started_at;
         _session_end = view.convo.ended_at;
-        messages = conversation_view_to_raw_messages(view);
+        messages = conversation_view_to_raw_messages(view, include_skills);
     } else if allow_direct_file && detect_opencode_sqlite_session(path) {
         // OpenCode SQLite-backed session: path is db_path/session_id (#149)
         match load_opencode_sqlite_session_for_export(path) {
@@ -118282,13 +118289,17 @@ fn run_export_html(
     privacy.redact_optional_text(&mut workspace);
     privacy.redact_optional_text(&mut agent_name);
 
-    let selected_records: Vec<_> =
-        crate::export::select_html_source_records(&mut raw_messages, include_skills)
-            .map(|(index, message)| {
-                privacy.redact_message(message);
-                (index, &*message)
-            })
-            .collect();
+    let archived_messages = indexed_view.as_ref().map(|view| view.messages.as_slice());
+    let selected_records: Vec<_> = crate::export::select_html_source_records(
+        &mut raw_messages,
+        archived_messages,
+        include_skills,
+    )
+    .map(|(index, message)| {
+        privacy.redact_message(message);
+        (index, &*message)
+    })
+    .collect();
     let pi_family_export = matches!(agent_name.as_deref(), Some("pi_agent" | "omp"));
 
     let messages: Vec<Message> = crate::export::html_messages_from_raw(
@@ -120785,7 +120796,7 @@ mod indexed_conversation_fallback_tests {
         assert_eq!(loaded.convo.external_id.as_deref(), Some("composer-123"));
         assert_eq!(loaded.messages.len(), 1);
 
-        let raw_messages = conversation_view_to_raw_messages(&loaded);
+        let raw_messages = conversation_view_to_raw_messages(&loaded, true);
         assert_eq!(raw_messages.len(), 1);
         assert_eq!(extract_role(&raw_messages[0]), "user");
         assert_eq!(extract_text_content(&raw_messages[0]), "hello from cursor");

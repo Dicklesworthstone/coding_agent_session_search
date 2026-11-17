@@ -23193,10 +23193,12 @@ fn export_session_task(
     let allow_direct_file = hit_is_local_source(hit);
     let prefer_direct_file = tui_prefers_direct_followup_file(hit);
 
-    let convert_raw = |raw: &mut [serde_json::Value], pi_family_export| {
+    let convert_raw = |raw: &mut [serde_json::Value],
+                       archived: Option<&[crate::model::types::Message]>,
+                       pi_family_export| {
         let mut privacy = crate::export::ExportPrivacy::new(false);
         let selected =
-            crate::export::select_html_source_records(raw, false).map(|(index, message)| {
+            crate::export::select_html_source_records(raw, archived, false).map(|(index, message)| {
                 let explicit_role = message
                     .get("role")
                     .or_else(|| message.get("message").and_then(|inner| inner.get("role")))
@@ -23226,6 +23228,7 @@ fn export_session_task(
         let mut raw = crate::conversation_view_to_html_raw_messages(&view);
         let mut messages = convert_raw(
             &mut raw,
+            Some(&view.messages),
             matches!(view.convo.agent_slug.as_str(), "pi_agent" | "omp"),
         );
         // A source record can expand into several correlated tool messages.
@@ -23261,6 +23264,7 @@ fn export_session_task(
             Ok((mut raw_messages, _, _)) => {
                 let mut messages = convert_raw(
                     &mut raw_messages,
+                    None,
                     matches!(hit.agent.as_str(), "pi_agent" | "omp"),
                 );
                 for message in &mut messages {
@@ -23369,7 +23373,7 @@ fn export_session_markdown_task(
 
     let indexed_markdown_view = |view: crate::ui::data::ConversationView| {
         (
-            crate::conversation_view_to_raw_messages(&view),
+            crate::conversation_view_to_raw_messages(&view, false),
             view.convo.title.clone(),
             view.convo.started_at,
         )
@@ -31881,17 +31885,20 @@ mod tests {
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'skill-policy', 'Indexed ordinary', ?1, 'local', 10)",
             &[SqliteValue::Text(missing.display().to_string().into())],
         )?;
-        for (idx, role, content) in [
-            (0, "user", body),
-            (1, "user", "INDEXED_ORDINARY_PROMPT café 界"),
-            (2, "assistant", "INDEXED_ORDINARY_ANSWER"),
+        let private_envelope = serde_json::json!({"metadata": {"source": body}}).to_string();
+        for (idx, role, content, extra_json) in [
+            (0, "user", body, "null"),
+            (1, "user", "INDEXED_ORDINARY_PROMPT café 界", "null"),
+            (2, "assistant", "ARCHIVED_PRIVATE_NARRATIVE", private_envelope.as_str()),
+            (3, "assistant", "INDEXED_ORDINARY_ANSWER", "null"),
         ] {
             conn.execute_with_params(
-                "INSERT INTO messages (conversation_id, idx, role, content) VALUES (1, ?1, ?2, ?3)",
+                "INSERT INTO messages (conversation_id, idx, role, content, extra_json) VALUES (1, ?1, ?2, ?3, ?4)",
                 &[
                     SqliteValue::Integer(idx),
                     SqliteValue::Text(role.into()),
                     SqliteValue::Text(content.into()),
+                    SqliteValue::Text(extra_json.into()),
                 ],
             )?;
         }
@@ -31916,6 +31923,7 @@ mod tests {
             assert!(markdown.contains("INDEXED_ORDINARY_PROMPT café 界"));
             assert!(markdown.contains("INDEXED_ORDINARY_ANSWER"));
             assert!(!markdown.contains("PLAIN_PRIVATE_BODY"));
+            assert!(!markdown.contains("ARCHIVED_PRIVATE_NARRATIVE"));
         }
         for (case, title) in [
             body,
@@ -31957,7 +31965,11 @@ mod tests {
             let html = std::fs::read_to_string(output_path)?;
             assert!(html.contains("<title>INDEXED_ORDINARY_PROMPT café 界</title>"));
             assert!(html.contains("INDEXED_ORDINARY_ANSWER"));
-            for omitted in ["PLAIN_PRIVATE_BODY", "ARCHIVE_PRIVATE_TITLE"] {
+            for omitted in [
+                "PLAIN_PRIVATE_BODY",
+                "ARCHIVE_PRIVATE_TITLE",
+                "ARCHIVED_PRIVATE_NARRATIVE",
+            ] {
                 assert!(!markdown.contains(omitted));
                 assert!(!html.contains(omitted));
             }
@@ -31971,6 +31983,10 @@ mod tests {
             .query_row("SELECT content FROM messages WHERE idx = 0")?
             .get_typed(0)?;
         assert_eq!(archived, body);
+        let envelope: String = conn
+            .query_row("SELECT extra_json FROM messages WHERE idx = 2")?
+            .get_typed(0)?;
+        assert_eq!(envelope, private_envelope);
         Ok(())
     }
 

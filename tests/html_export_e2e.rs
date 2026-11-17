@@ -742,6 +742,20 @@ fn export_redaction_covers_unredacted_archive_with_never_created_source()
             },
             Message {
                 id: None,
+                idx: 8,
+                role: MessageRole::Agent,
+                author: None,
+                created_at: None,
+                content: "ARCHIVED_PRIVATE_NARRATIVE".into(),
+                extra_json: serde_json::json!({
+                    "type": "message",
+                    "message": {"role": "assistant", "content": "ARCHIVED_PRIVATE_NARRATIVE"},
+                    "metadata": {"source": "Base directory for this skill: /synthetic/archive"}
+                }),
+                snippets: Vec::new(),
+            },
+            Message {
+                id: None,
                 idx: 9,
                 role: MessageRole::Agent,
                 author: None,
@@ -776,6 +790,7 @@ fn export_redaction_covers_unredacted_archive_with_never_created_source()
             );
             let exported = String::from_utf8(output.stdout)?;
             assert_eq!(exported.contains(EXPORT_PRIVACY_SECRET), include_secrets);
+            assert!(!exported.contains("ARCHIVED_PRIVATE_NARRATIVE"), "{format}");
             assert!(exported.contains("ordinary-kept-marker"));
             assert!(exported.contains("café 界"));
         }
@@ -788,7 +803,22 @@ fn export_redaction_covers_unredacted_archive_with_never_created_source()
         );
         assert!(html.contains("ordinary-kept-marker"));
         assert!(html.contains("café 界"));
+        assert!(!html.contains("ARCHIVED_PRIVATE_NARRATIVE"));
     }
+    let output = export_privacy_command(root.path())
+        .arg("export")
+        .arg(&absent)
+        .args(["--source", "local", "--format", "json", "--include-skills"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let exported = String::from_utf8(output.stdout)?;
+    assert!(exported.contains("ARCHIVED_PRIVATE_NARRATIVE"));
+    assert!(!exported.contains(EXPORT_PRIVACY_SECRET));
+    assert!(!exported.contains("/synthetic/archive"));
     assert!(!absent.exists());
     assert_eq!(fs::read(&db_path)?, db_before);
     assert_eq!(fs::read(&wal_path).ok(), wal_before);
