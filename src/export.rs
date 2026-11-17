@@ -96,6 +96,41 @@ pub(crate) fn archived_message_is_skill_injection(message: &Message) -> bool {
     !message.extra_json.is_null() && message_is_skill_injection(&message.extra_json)
 }
 
+/// Generated titles can preserve the start of a skill message after its
+/// marker was truncated or was kept only in the archived envelope.
+fn derived_title_prefix(title: &str) -> Option<&str> {
+    let title = title.trim();
+    let prefix = title
+        .strip_suffix('…')
+        .or_else(|| title.strip_suffix("..."))
+        .unwrap_or(title)
+        .trim_end();
+    (!prefix.is_empty()).then_some(prefix)
+}
+
+pub(crate) fn title_is_skill_injection(title: &str, archived: &[Message]) -> bool {
+    is_skill_injection(title)
+        || derived_title_prefix(title).is_some_and(|prefix| {
+            archived.iter().any(|message| {
+                message.content.trim_start().starts_with(prefix)
+                    && (is_skill_injection(&message.content)
+                        || archived_message_is_skill_injection(message))
+            })
+        })
+}
+
+pub(crate) fn raw_title_is_skill_injection(title: &str, messages: &[Value]) -> bool {
+    is_skill_injection(title)
+        || derived_title_prefix(title).is_some_and(|prefix| {
+            messages.iter().any(|message| {
+                crate::extract_text_content(message)
+                    .trim_start()
+                    .starts_with(prefix)
+                    && message_is_skill_injection(message)
+            })
+        })
+}
+
 /// Select original records before redaction can erase a skill marker.
 /// Keep source indexes for HTML rendering and archive message lookup.
 pub(crate) fn select_html_source_records<'a>(

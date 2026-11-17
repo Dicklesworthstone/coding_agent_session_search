@@ -197,17 +197,19 @@ impl ExportModalState {
         // filenames do not drift when the indexed conversation already has a real title.
         let mut privacy = crate::export::ExportPrivacy::new(false);
         let mut export_title = None;
+        let safe_title = |title: &str| {
+            !title.is_empty() && !crate::export::title_is_skill_injection(title, &view.messages)
+        };
         let title_preview = view
             .convo
             .title
             .as_deref()
             .map(str::trim)
-            .filter(|title| !title.is_empty() && !crate::export::is_skill_injection(title))
+            .filter(|title| safe_title(title))
             .map(str::to_string)
             .or_else(|| {
                 let hit_title = hit.title.trim();
-                (!hit_title.is_empty() && !crate::export::is_skill_injection(hit_title))
-                    .then(|| hit_title.to_string())
+                safe_title(hit_title).then(|| hit_title.to_string())
             })
             .map(|mut title| {
                 privacy.redact_text(&mut title);
@@ -222,6 +224,7 @@ impl ExportModalState {
                     .find(|m| {
                         !m.content.trim().is_empty()
                             && !crate::export::is_skill_injection(&m.content)
+                            && !crate::export::archived_message_is_skill_injection(m)
                     })
                     .map(|m| {
                         let mut content = m.content.trim().to_string();

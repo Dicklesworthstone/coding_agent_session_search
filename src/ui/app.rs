@@ -19368,9 +19368,16 @@ impl super::ftui_adapter::Model for CassApp {
                     Self::markdown_filename_from_html(&export_state.filename_preview);
                 let output_path = unique_filename(&output_dir, &output_filename);
                 let include_tools = export_state.include_tools;
+                let filename_title = export_state.title_preview;
                 self.status = "Exporting markdown...".to_string();
                 ftui::Cmd::task(move || {
-                    export_session_markdown_task(&db_path, &export_hit, &output_path, include_tools)
+                    export_session_markdown_task(
+                        &db_path,
+                        &export_hit,
+                        &output_path,
+                        include_tools,
+                        &filename_title,
+                    )
                 })
             }
             CassMsg::ExportExecuted => {
@@ -23226,6 +23233,8 @@ fn export_session_task(
     };
 
     let html_messages_from_view = |view: crate::ui::data::ConversationView| {
+        let filename_hidden = !crate::export::is_skill_injection(title)
+            && crate::export::title_is_skill_injection(title, &view.messages);
         let mut raw = crate::conversation_view_to_html_raw_messages(&view);
         let mut messages = convert_raw(
             &mut raw,
@@ -23240,7 +23249,7 @@ fn export_session_task(
                 message.author.clone_from(&archived.author);
             }
         }
-        messages
+        (messages, filename_hidden)
     };
 
     let indexed_view = if !prefer_direct_file {
@@ -23258,11 +23267,14 @@ fn export_session_task(
         None
     };
 
-    let mut messages: Vec<HtmlMessage> = if let Some(view) = indexed_view {
+    let (mut messages, filename_hidden): (Vec<HtmlMessage>, bool) = if let Some(view) = indexed_view
+    {
         html_messages_from_view(view)
     } else if allow_direct_file && session_path.exists() {
         match load_local_export_raw_messages(session_path) {
             Ok((mut raw_messages, _, _)) => {
+                let filename_hidden = !crate::export::is_skill_injection(title)
+                    && crate::export::raw_title_is_skill_injection(title, &raw_messages);
                 let mut messages = convert_raw(
                     &mut raw_messages,
                     None,
@@ -23276,7 +23288,7 @@ fn export_session_task(
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_string);
                 }
-                messages
+                (messages, filename_hidden)
             }
             Err(local_err) => match load_indexed_export_view(db_path, hit) {
                 Ok(Some(view)) => html_messages_from_view(view),
@@ -23301,7 +23313,7 @@ fn export_session_task(
         privacy.redact_text(&mut message.content);
         privacy.redact_optional_text(&mut message.author);
     }
-    let mut title = if crate::export::is_skill_injection(title) {
+    let mut title = if filename_hidden || crate::export::is_skill_injection(title) {
         messages
             .iter()
             .find(|message| message.role == "user" && !message.content.trim().is_empty())
@@ -23348,7 +23360,12 @@ fn export_session_task(
         Err(e) => return CassMsg::ExportFailed(format!("HTML generation failed: {e}")),
     };
 
-    match write_export_bytes_no_overwrite(output_path, html.as_bytes()) {
+    let safe_output =
+        filename_hidden.then(|| output_path.with_file_name("conversation-export.html"));
+    match write_export_bytes_no_overwrite(
+        safe_output.as_deref().unwrap_or(output_path),
+        html.as_bytes(),
+    ) {
         Ok(final_path) => CassMsg::ExportCompleted {
             output_path: final_path,
             file_size: html.len(),
@@ -23367,21 +23384,43 @@ fn export_session_markdown_task(
     hit: &SearchHit,
     output_path: &std::path::Path,
     include_tools: bool,
+    filename_title: &str,
 ) -> CassMsg {
     let session_path = std::path::Path::new(&hit.source_path);
     let allow_direct_file = hit_is_local_source(hit);
     let prefer_direct_file = tui_prefers_direct_followup_file(hit);
 
+    let hit_title = (!hit.title.trim().is_empty()).then_some(hit.title.trim());
+    let load_local = || {
+        load_local_export_raw_messages(session_path).map(|(messages, title, start)| {
+            let filename_hidden = !filename_title.is_empty()
+                && crate::export::raw_title_is_skill_injection(filename_title, &messages);
+            let title = title
+                .or_else(|| hit_title.map(str::to_string))
+                .filter(|title| !crate::export::raw_title_is_skill_injection(title, &messages));
+            (messages, title, start, filename_hidden)
+        })
+    };
     let indexed_markdown_view = |view: crate::ui::data::ConversationView| {
+        let filename_hidden =
+            crate::export::title_is_skill_injection(filename_title, &view.messages);
+        let title = view
+            .convo
+            .title
+            .as_deref()
+            .or(hit_title)
+            .filter(|title| !crate::export::title_is_skill_injection(title, &view.messages))
+            .map(str::to_string);
         (
             crate::conversation_view_to_raw_messages(&view, false),
-            view.convo.title.clone(),
+            title,
             view.convo.started_at,
+            filename_hidden,
         )
     };
 
-    let (mut messages, mut session_title, session_start) = if prefer_direct_file {
-        match load_local_export_raw_messages(session_path) {
+    let (mut messages, mut session_title, session_start, filename_hidden) = if prefer_direct_file {
+        match load_local() {
             Ok(loaded) => loaded,
             Err(local_err) => match load_indexed_export_view(db_path, hit) {
                 Ok(Some(view)) => indexed_markdown_view(view),
@@ -23398,7 +23437,7 @@ fn export_session_markdown_task(
             Ok(Some(view)) => indexed_markdown_view(view),
             Ok(None) => {
                 if allow_direct_file && session_path.exists() {
-                    match load_local_export_raw_messages(session_path) {
+                    match load_local() {
                         Ok(loaded) => loaded,
                         Err(err) => return CassMsg::ExportFailed(err),
                     }
@@ -23411,7 +23450,7 @@ fn export_session_markdown_task(
             }
             Err(err) => {
                 if allow_direct_file && session_path.exists() {
-                    match load_local_export_raw_messages(session_path) {
+                    match load_local() {
                         Ok(loaded) => loaded,
                         Err(fallback_err) => {
                             return CassMsg::ExportFailed(format!(
@@ -23425,17 +23464,13 @@ fn export_session_markdown_task(
             }
         }
     } else if allow_direct_file && session_path.exists() {
-        match load_local_export_raw_messages(session_path) {
+        match load_local() {
             Ok(loaded) => loaded,
             Err(err) => return CassMsg::ExportFailed(err),
         }
     } else {
         return CassMsg::ExportFailed(format!("Session not found: {}", hit.source_path));
     };
-
-    if session_title.is_none() && !hit.title.trim().is_empty() {
-        session_title = Some(hit.title.trim().to_string());
-    }
 
     messages.retain(|message| !crate::export::message_is_skill_injection(message));
     if session_title
@@ -23467,7 +23502,11 @@ fn export_session_markdown_task(
 
     let markdown =
         crate::format_as_markdown(&messages, &session_title, session_start, include_tools);
-    match write_export_bytes_no_overwrite(output_path, markdown.as_bytes()) {
+    let safe_output = filename_hidden.then(|| output_path.with_file_name("conversation-export.md"));
+    match write_export_bytes_no_overwrite(
+        safe_output.as_deref().unwrap_or(output_path),
+        markdown.as_bytes(),
+    ) {
         Ok(final_path) => CassMsg::ExportCompleted {
             output_path: final_path,
             file_size: markdown.len(),
@@ -31442,7 +31481,7 @@ mod tests {
 
         let missing_db = tmp.path().join("missing.db");
         let export_hit = make_exact_hit(&session_path.display().to_string(), "local", 1, "hello");
-        let msg = export_session_markdown_task(&missing_db, &export_hit, &existing_path, false);
+        let msg = export_session_markdown_task(&missing_db, &export_hit, &existing_path, false, "");
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
             other => panic!("expected ExportCompleted, got: {other:?}"),
@@ -31577,7 +31616,7 @@ mod tests {
             1,
             "remote markdown body",
         );
-        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false);
+        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false, "");
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
             other => panic!("expected ExportCompleted, got: {other:?}"),
@@ -31626,7 +31665,7 @@ mod tests {
             1,
             "new markdown body",
         );
-        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false);
+        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false, "");
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
             other => panic!("expected ExportCompleted, got: {other:?}"),
@@ -31660,7 +31699,8 @@ mod tests {
         let db = temp.path().join("absent.db");
         let mut hit = make_exact_hit(&session.display().to_string(), "local", 1, "fixture");
         hit.title.clone_from(&title);
-        let markdown = export_session_markdown_task(&db, &hit, &temp.path().join("safe.md"), true);
+        let markdown =
+            export_session_markdown_task(&db, &hit, &temp.path().join("safe.md"), true, "");
         let html = export_session_task(
             &db,
             &hit,
@@ -31712,7 +31752,8 @@ mod tests {
             1,
             "TUI_FIRST_PROMPT",
         );
-        let markdown = export_session_markdown_task(&db, &hit, &root.path().join("torn.md"), false);
+        let markdown =
+            export_session_markdown_task(&db, &hit, &root.path().join("torn.md"), false, "");
         let html = export_session_task(
             &db,
             &hit,
@@ -31789,6 +31830,7 @@ mod tests {
                 &hit,
                 &root.path().join(format!("source-{include_tools}.md")),
                 include_tools,
+                "",
             );
             let CassMsg::ExportCompleted { output_path, .. } = result else {
                 anyhow::bail!("source markdown export failed: {result:?}");
@@ -31818,30 +31860,47 @@ mod tests {
                 "Ordinary cached title café 界",
                 "Ordinary cached title café 界",
             ),
+            (
+                "REDACTION_ORDER_PRIVATE_NARR…",
+                "MARKDOWN_ORDINARY_PROMPT café 界",
+            ),
         ]
         .into_iter()
         .enumerate()
         {
             let mut titled_hit = hit.clone();
             titled_hit.title = cached_title.to_string();
+            let derived = case == 3;
+            let output_dir = if derived {
+                root.path().join("raw-derived")
+            } else {
+                root.path().to_path_buf()
+            };
+            let markdown_path = output_dir.join(format!("source-titled-{case}.md"));
             let result = export_session_markdown_task(
                 &absent_db,
                 &titled_hit,
-                &root.path().join(format!("source-titled-{case}.md")),
+                &markdown_path,
                 true,
+                if derived { cached_title } else { "" },
             );
             let CassMsg::ExportCompleted { output_path, .. } = result else {
                 anyhow::bail!("titled markdown export failed: {result:?}");
             };
+            if derived {
+                assert_eq!(output_path, output_dir.join("conversation-export.md"));
+                assert!(!markdown_path.exists());
+            }
             let markdown = std::fs::read_to_string(output_path)?;
             assert!(markdown.starts_with(&format!("# {expected_title}\n")));
             assert!(!markdown.contains("PLAIN_PRIVATE_BODY"));
             assert!(!markdown.contains("REDACTION_ORDER_PRIVATE_NARRATIVE"));
             assert!(!markdown.contains("REDACTION_ORDER_PRIVATE_TITLE"));
+            let html_path = output_dir.join(format!("source-titled-{case}.html"));
             let result = export_session_task(
                 &absent_db,
                 &titled_hit,
-                &root.path().join(format!("source-titled-{case}.html")),
+                &html_path,
                 false,
                 None,
                 false,
@@ -31852,12 +31911,18 @@ mod tests {
             let CassMsg::ExportCompleted { output_path, .. } = result else {
                 anyhow::bail!("titled HTML export failed: {result:?}");
             };
+            if derived {
+                assert_eq!(output_path, output_dir.join("conversation-export.html"));
+                assert!(!html_path.exists());
+            }
             let html = std::fs::read_to_string(output_path)?;
             assert!(html.contains(&format!("<title>{expected_title}</title>")));
             assert!(html.contains("MARKDOWN_ORDINARY_ANSWER"));
             assert!(!html.contains("PLAIN_PRIVATE_BODY"));
             assert!(!html.contains("REDACTION_ORDER_PRIVATE_NARRATIVE"));
             assert!(!html.contains("REDACTION_ORDER_PRIVATE_TITLE"));
+            assert!(!html.contains("REDACTION_ORDER_PRIVATE_NARR…"));
+            assert!(!markdown.contains("REDACTION_ORDER_PRIVATE_NARR…"));
         }
         assert_eq!(std::fs::read(&session)?, bytes.as_bytes());
         let after = std::fs::metadata(&session)?;
@@ -31870,7 +31935,7 @@ mod tests {
         std::fs::write(&only_skill, &only_bytes)?;
         let only_hit = make_exact_hit(&only_skill.display().to_string(), "local", 1, "fixture");
         let only_output = root.path().join("only-skill.md");
-        let result = export_session_markdown_task(&absent_db, &only_hit, &only_output, true);
+        let result = export_session_markdown_task(&absent_db, &only_hit, &only_output, true, "");
         assert!(
             matches!(result, CassMsg::ExportFailed(ref message) if message == "No messages found in session")
         );
@@ -31920,6 +31985,7 @@ mod tests {
                 &indexed_hit,
                 &root.path().join(format!("archive-{include_tools}.md")),
                 include_tools,
+                "",
             );
             let CassMsg::ExportCompleted { output_path, .. } = result else {
                 anyhow::bail!("indexed markdown export failed: {result:?}");
@@ -31934,6 +32000,7 @@ mod tests {
         for (case, title) in [
             body,
             "<system-reminder>ARCHIVE_PRIVATE_TITLE</system-reminder>",
+            "ARCHIVED_PRIVATE…",
         ]
         .into_iter()
         .enumerate()
@@ -31942,22 +32009,36 @@ mod tests {
                 "UPDATE conversations SET title = ?1 WHERE id = 1",
                 &[SqliteValue::Text(title.into())],
             )?;
+            let title_was_generated = case == 2;
+            let filename_title = if title_was_generated { title } else { "" };
+            let stem = if title_was_generated {
+                "archived-private"
+            } else {
+                "archive-titled"
+            };
+            let markdown_path = root.path().join(format!("{stem}-{case}.md"));
             let result = export_session_markdown_task(
                 &db,
                 &indexed_hit,
-                &root.path().join(format!("archive-titled-{case}.md")),
+                &markdown_path,
                 true,
+                filename_title,
             );
             let CassMsg::ExportCompleted { output_path, .. } = result else {
                 anyhow::bail!("titled archive markdown export failed: {result:?}");
             };
+            if title_was_generated {
+                assert!(!markdown_path.exists());
+                assert_eq!(output_path.file_name().unwrap(), "conversation-export.md");
+            }
             let markdown = std::fs::read_to_string(output_path)?;
             assert!(markdown.starts_with("# INDEXED_ORDINARY_PROMPT café 界\n"));
             assert!(markdown.contains("INDEXED_ORDINARY_ANSWER"));
+            let html_path = root.path().join(format!("{stem}-{case}.html"));
             let result = export_session_task(
                 &db,
                 &indexed_hit,
-                &root.path().join(format!("archive-titled-{case}.html")),
+                &html_path,
                 false,
                 None,
                 false,
@@ -31968,6 +32049,23 @@ mod tests {
             let CassMsg::ExportCompleted { output_path, .. } = result else {
                 anyhow::bail!("titled archive HTML export failed: {result:?}");
             };
+            if title_was_generated {
+                assert!(!html_path.exists());
+                assert_eq!(output_path.file_name().unwrap(), "conversation-export.html");
+                let mut cached_hit = indexed_hit.clone();
+                cached_hit.title = title.to_string();
+                let view = load_indexed_export_view(&db, &cached_hit)
+                    .map_err(anyhow::Error::msg)?
+                    .ok_or_else(|| anyhow::anyhow!("missing archive controls"))?;
+                let state = ExportModalState::from_hit(&cached_hit, &view);
+                assert_eq!(state.title_preview, "INDEXED_ORDINARY_PROMPT café 界");
+                assert!(
+                    !state
+                        .filename_preview
+                        .to_ascii_lowercase()
+                        .contains("archived")
+                );
+            }
             let html = std::fs::read_to_string(output_path)?;
             assert!(html.contains("<title>INDEXED_ORDINARY_PROMPT café 界</title>"));
             assert!(html.contains("INDEXED_ORDINARY_ANSWER"));
@@ -31975,6 +32073,7 @@ mod tests {
                 "PLAIN_PRIVATE_BODY",
                 "ARCHIVE_PRIVATE_TITLE",
                 "ARCHIVED_PRIVATE_NARRATIVE",
+                "ARCHIVED_PRIVATE…",
             ] {
                 assert!(!markdown.contains(omitted));
                 assert!(!html.contains(omitted));
@@ -32289,7 +32388,7 @@ mod tests {
             "stale indexed markdown body",
         );
         export_hit.title = "Indexed Session".to_string();
-        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false);
+        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false, "");
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
             other => panic!("expected ExportCompleted, got: {other:?}"),
@@ -32345,7 +32444,7 @@ mod tests {
             1,
             "indexed markdown fallback body",
         );
-        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false);
+        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false, "");
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
             other => panic!("expected ExportCompleted, got: {other:?}"),
@@ -32399,7 +32498,7 @@ not jsonl",
             1,
             "indexed aider markdown body",
         );
-        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false);
+        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false, "");
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
             other => panic!("expected ExportCompleted, got: {other:?}"),

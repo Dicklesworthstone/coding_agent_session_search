@@ -769,6 +769,17 @@ fn export_redaction_covers_unredacted_archive_with_never_created_source()
         origin_host: None,
     };
     storage.insert_conversation_tree(agent_id, None, &conversation)?;
+    let title_source = root.path().join("never-created-title.jsonl");
+    let mut titled = conversation.clone();
+    titled.source_path = title_source.clone();
+    titled.external_id = Some("archived-skill-derived-title".into());
+    titled.title = Some("ARCHIVED_PRIVATE…".into());
+    titled
+        .messages
+        .first_mut()
+        .ok_or("no archive prompt")?
+        .content = "ARCHIVED_TITLE_ORDINARY café 界".into();
+    storage.insert_conversation_tree(agent_id, None, &titled)?;
     drop(storage);
     let db_before = fs::read(&db_path)?;
     let wal_path = root.path().join("data/agent_search.db-wal");
@@ -819,9 +830,114 @@ fn export_redaction_covers_unredacted_archive_with_never_created_source()
     assert!(exported.contains("ARCHIVED_PRIVATE_NARRATIVE"));
     assert!(!exported.contains(EXPORT_PRIVACY_SECRET));
     assert!(!exported.contains("/synthetic/archive"));
+    for include_skills in [false, true] {
+        for markdown in [false, true] {
+            let mut cmd = export_privacy_command(root.path());
+            if markdown {
+                cmd.arg("export")
+                    .arg(&title_source)
+                    .args(["--format", "markdown"]);
+            } else {
+                cmd.arg("export-html")
+                    .arg(&title_source)
+                    .arg("--output-dir")
+                    .arg(root.path().join("title-exports"))
+                    .arg("--json");
+            }
+            cmd.args(["--source", "local"]);
+            if include_skills {
+                cmd.arg("--include-skills");
+            }
+            let output = cmd.output()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let rendered = if markdown {
+                String::from_utf8(output.stdout)?
+            } else {
+                let receipt: Value = serde_json::from_slice(&output.stdout)?;
+                let path = Path::new(
+                    receipt["exported"]["output_path"]
+                        .as_str()
+                        .ok_or("output path missing")?,
+                );
+                let name = path
+                    .file_name()
+                    .ok_or("filename missing")?
+                    .to_string_lossy()
+                    .to_ascii_lowercase();
+                assert_eq!(name.contains("private"), include_skills, "{name}");
+                fs::read_to_string(path)?
+            };
+            let title = if include_skills {
+                "ARCHIVED_PRIVATE…"
+            } else {
+                "ARCHIVED_TITLE_ORDINARY café 界"
+            };
+            if markdown {
+                assert!(rendered.starts_with(&format!("# {title}\n")));
+            } else {
+                assert!(rendered.contains(&format!("<title>{title}</title>")));
+            }
+            assert_eq!(rendered.contains("ARCHIVED_PRIVATE"), include_skills);
+            assert!(rendered.contains("ordinary-kept-marker"));
+        }
+    }
+    assert!(!title_source.exists());
     assert!(!absent.exists());
     assert_eq!(fs::read(&db_path)?, db_before);
     assert_eq!(fs::read(&wal_path).ok(), wal_before);
+    Ok(())
+}
+
+#[test]
+fn nd6pc_html_omits_an_all_filtered_session_without_writing_an_artifact()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TempDir::new()?;
+    let session = root.path().join("skill.jsonl");
+    let bytes = br#"{"role":"user","content":"Base directory for this skill: /synthetic/only\nONLY_PRIVATE_SKILL"}
+"#;
+    fs::write(&session, bytes)?;
+    let directory = root.path().join("exports");
+    for option in [None, Some("--dry-run"), Some("--explain")] {
+        let mut cmd = export_privacy_command(root.path());
+        cmd.arg("export-html")
+            .arg(&session)
+            .arg("--output-dir")
+            .arg(&directory)
+            .arg("--json");
+        if let Some(option) = option {
+            cmd.arg(option);
+        }
+        let output = cmd.output()?;
+        assert_eq!(output.status.code(), Some(9));
+        let receipt: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(receipt["success"], false);
+        assert_eq!(receipt["error"]["kind"], "empty-session");
+        assert!(!directory.exists());
+    }
+    let output = export_privacy_command(root.path())
+        .arg("export-html")
+        .arg(&session)
+        .arg("--output-dir")
+        .arg(&directory)
+        .args(["--json", "--include-skills"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&output.stdout)?;
+    let result = fs::read_to_string(
+        receipt["exported"]["output_path"]
+            .as_str()
+            .ok_or("output path missing")?,
+    )?;
+    assert!(result.contains("ONLY_PRIVATE_SKILL"));
+    assert_eq!(fs::read(session)?, bytes);
     Ok(())
 }
 

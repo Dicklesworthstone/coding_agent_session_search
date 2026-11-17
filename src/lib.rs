@@ -117587,9 +117587,13 @@ fn run_export(
 
     if !include_skills {
         messages.retain(|msg| !crate::export::message_is_skill_injection(msg));
+        let archived = indexed_view
+            .as_ref()
+            .map(|view| view.messages.as_slice())
+            .unwrap_or_default();
         if session_title
             .as_deref()
-            .is_some_and(crate::export::is_skill_injection)
+            .is_some_and(|title| crate::export::title_is_skill_injection(title, archived))
         {
             session_title = None;
         }
@@ -118276,10 +118280,11 @@ fn run_export_html(
         return Err(err);
     }
 
+    let archived_messages = indexed_view.as_ref().map(|view| view.messages.as_slice());
     if !include_skills
-        && session_title
-            .as_deref()
-            .is_some_and(crate::export::is_skill_injection)
+        && session_title.as_deref().is_some_and(|title| {
+            crate::export::title_is_skill_injection(title, archived_messages.unwrap_or_default())
+        })
     {
         session_title = None;
     }
@@ -118289,7 +118294,6 @@ fn run_export_html(
     privacy.redact_optional_text(&mut workspace);
     privacy.redact_optional_text(&mut agent_name);
 
-    let archived_messages = indexed_view.as_ref().map(|view| view.messages.as_slice());
     let selected_records: Vec<_> = crate::export::select_html_source_records(
         &mut raw_messages,
         archived_messages,
@@ -118307,6 +118311,18 @@ fn run_export_html(
         include_tools,
         pi_family_export,
     );
+
+    if selected_records.is_empty() {
+        let err = CliError {
+            code: 9,
+            kind: CliErrorKind::EmptySession.kind_str(),
+            message: "No messages remain for HTML export with the selected options".to_string(),
+            hint: None,
+            retryable: false,
+        };
+        emit_structured_error(&err);
+        return Err(err);
+    }
 
     // Derive the title from retained narrative so an omitted skill or tool
     // result cannot reappear in the document title or generated filename.
