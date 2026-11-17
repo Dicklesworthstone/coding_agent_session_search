@@ -117583,10 +117583,7 @@ fn run_export(
     privacy.redact_optional_text(&mut session_title);
 
     if !include_skills {
-        messages.retain(|msg| {
-            let content = extract_text_content(msg);
-            !crate::export::is_skill_injection(&content)
-        });
+        messages.retain(|msg| !crate::export::message_is_skill_injection(msg));
     }
 
     if messages.is_empty() {
@@ -118303,10 +118300,9 @@ fn run_export_html(
     let mut tool_use_count = 0usize;
     for msg in &raw_messages {
         let role = extract_role(msg);
-        let text = extract_text_content(msg);
 
         // Skip messages that would be dropped by skill filtering
-        if !include_skills && crate::export::is_skill_injection(&text) {
+        if !include_skills && crate::export::message_is_skill_injection(msg) {
             continue;
         }
 

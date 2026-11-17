@@ -23469,10 +23469,6 @@ fn export_session_markdown_task(
         return CassMsg::ExportFailed(format!("Session not found: {}", hit.source_path));
     };
 
-    if messages.is_empty() {
-        return CassMsg::ExportFailed("No messages found in session".to_string());
-    }
-
     if session_title.is_none() && !hit.title.trim().is_empty() {
         session_title = Some(hit.title.trim().to_string());
     }
@@ -23480,6 +23476,11 @@ fn export_session_markdown_task(
     let mut privacy = crate::export::ExportPrivacy::new(false);
     privacy.redact_messages(&mut messages);
     privacy.redact_optional_text(&mut session_title);
+
+    messages.retain(|message| !crate::export::message_is_skill_injection(message));
+    if messages.is_empty() {
+        return CassMsg::ExportFailed("No messages found in session".to_string());
+    }
 
     if session_title.is_none() {
         for message in &messages {
@@ -31713,6 +31714,125 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(&session).unwrap(), bytes);
         assert!(!db.exists());
+    }
+
+    #[test]
+    fn nd6pc_tui_markdown_omits_skills_from_source_and_archive() -> anyhow::Result<()> {
+        use crate::franken_sync::{SqliteValue, compat::RowExt};
+        use crate::storage::sqlite::FrankenStorage;
+
+        let root = tempfile::Builder::new()
+            .prefix("cass-tui-skill-policy-")
+            .disable_cleanup(true)
+            .tempdir()?;
+        let session = root.path().join("source.jsonl");
+        let body = "PLAIN_PRIVATE_BODY\nBase directory for this skill: /synthetic/private";
+        let events = [
+            serde_json::json!({"role":"user","content":body}),
+            serde_json::json!({"role":"user","content":"MARKDOWN_ORDINARY_PROMPT café 界"}),
+            serde_json::json!({"role":"assistant","content":"MARKDOWN_ORDINARY_ANSWER; discuss skills and matchedSkills."}),
+            serde_json::json!({"type":"message","message":{"role":"assistant","content":[
+                {"type":"text","text":"ARG_PRIVATE_NARRATIVE"},
+                {"type":"toolCall","id":"private-call","name":"Skill","arguments":{"body":body}}
+            ]}}),
+            serde_json::json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"private-call","content":"Base directory for this skill: /synthetic/private\nRESULT_PRIVATE_BODY"}]}),
+            serde_json::json!({"role":"assistant","content":"META_PRIVATE_NARRATIVE","metadata":{"document":body}}),
+        ];
+        let bytes = events
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect::<String>();
+        std::fs::write(&session, &bytes)?;
+        let before = std::fs::metadata(&session)?;
+        let absent_db = root.path().join("absent.db");
+        let mut hit = make_exact_hit(&session.display().to_string(), "local", 1, "fixture");
+        hit.title.clear();
+        for include_tools in [false, true] {
+            let result = export_session_markdown_task(
+                &absent_db,
+                &hit,
+                &root.path().join(format!("source-{include_tools}.md")),
+                include_tools,
+            );
+            let CassMsg::ExportCompleted { output_path, .. } = result else {
+                anyhow::bail!("source markdown export failed: {result:?}");
+            };
+            let markdown = std::fs::read_to_string(output_path)?;
+            assert!(markdown.starts_with("# MARKDOWN_ORDINARY_PROMPT café 界\n"));
+            assert!(markdown.contains("MARKDOWN_ORDINARY_ANSWER"));
+            for omitted in [
+                "PLAIN_PRIVATE_BODY",
+                "ARG_PRIVATE_NARRATIVE",
+                "RESULT_PRIVATE_BODY",
+                "META_PRIVATE_NARRATIVE",
+            ] {
+                assert!(!markdown.contains(omitted), "source leaked {omitted}");
+            }
+        }
+        assert_eq!(std::fs::read(&session)?, bytes.as_bytes());
+        let after = std::fs::metadata(&session)?;
+        assert_eq!(before.modified()?, after.modified()?);
+        assert_eq!(before.permissions(), after.permissions());
+        assert!(!absent_db.exists());
+
+        let only_skill = root.path().join("only-skill.jsonl");
+        let only_bytes = format!("{}\n", events[0]);
+        std::fs::write(&only_skill, &only_bytes)?;
+        let only_hit = make_exact_hit(&only_skill.display().to_string(), "local", 1, "fixture");
+        let only_output = root.path().join("only-skill.md");
+        let result = export_session_markdown_task(&absent_db, &only_hit, &only_output, true);
+        assert!(
+            matches!(result, CassMsg::ExportFailed(ref message) if message == "No messages found in session")
+        );
+        assert!(!only_output.exists());
+        assert_eq!(std::fs::read(&only_skill)?, only_bytes.as_bytes());
+
+        let db = root.path().join("archive.db");
+        let missing = root.path().join("missing.jsonl");
+        let storage = FrankenStorage::open(&db)?;
+        let conn = storage.raw();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude', 'local', 0, 0)")?;
+        conn.execute_with_params(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'skill-policy', 'Indexed ordinary', ?1, 'local', 10)",
+            &[SqliteValue::Text(missing.display().to_string().into())],
+        )?;
+        for (idx, role, content) in [
+            (0, "user", body),
+            (1, "user", "INDEXED_ORDINARY_PROMPT café 界"),
+            (2, "assistant", "INDEXED_ORDINARY_ANSWER"),
+        ] {
+            conn.execute_with_params(
+                "INSERT INTO messages (conversation_id, idx, role, content) VALUES (1, ?1, ?2, ?3)",
+                &[
+                    SqliteValue::Integer(idx),
+                    SqliteValue::Text(role.into()),
+                    SqliteValue::Text(content.into()),
+                ],
+            )?;
+        }
+        let indexed_hit = make_exact_hit(&missing.display().to_string(), "local", 2, "fixture");
+        for include_tools in [false, true] {
+            let result = export_session_markdown_task(
+                &db,
+                &indexed_hit,
+                &root.path().join(format!("archive-{include_tools}.md")),
+                include_tools,
+            );
+            let CassMsg::ExportCompleted { output_path, .. } = result else {
+                anyhow::bail!("indexed markdown export failed: {result:?}");
+            };
+            let markdown = std::fs::read_to_string(output_path)?;
+            assert!(markdown.starts_with("# Indexed ordinary\n"));
+            assert!(markdown.contains("INDEXED_ORDINARY_PROMPT café 界"));
+            assert!(markdown.contains("INDEXED_ORDINARY_ANSWER"));
+            assert!(!markdown.contains("PLAIN_PRIVATE_BODY"));
+        }
+        assert!(!missing.exists());
+        let archived: String = conn
+            .query_row("SELECT content FROM messages WHERE idx = 0")?
+            .get_typed(0)?;
+        assert_eq!(archived, body);
+        Ok(())
     }
 
     #[test]

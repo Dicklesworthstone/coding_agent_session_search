@@ -1163,6 +1163,134 @@ fn test_color_contrast_indicators() {
 // ============================================================================
 
 #[test]
+fn nd6pc_all_export_formats_share_complete_message_skill_policy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TempDir::new()?;
+    let body = "Base directory for this skill: /synthetic/private\nFORMATS_PRIVATE_BODY";
+    let variants = [
+        serde_json::json!({"id":"private","type":"message","message":{"role":"assistant","content":[
+            {"type":"text","text":"WHOLEMESSAGE_BYSTANDER"},
+            {"type":"toolCall","id":"private-call","name":"Skill","arguments":{"body":body}}
+        ]}}),
+        serde_json::json!({"id":"private","type":"tool","message":{"role":"tool","content":"WHOLEMESSAGE_BYSTANDER","tool_name":"Skill","tool_output":body}}),
+        serde_json::json!({"id":"private","role":"assistant","content":[
+            {"type":"text","text":"WHOLEMESSAGE_BYSTANDER"},
+            {"type":"tool_use","id":"private-call","name":"Skill","input":{"body":body}}
+        ]}),
+        serde_json::json!({"id":"private","role":"assistant","content":"WHOLEMESSAGE_BYSTANDER","metadata":{"documents":[{"text":body}]}}),
+        serde_json::json!({"id":"private","role":"assistant","content":"WHOLEMESSAGE_BYSTANDER","metadata":{"skillInjection:":{"matchedSkills":["FORMATS_PRIVATE_BODY"]}}}),
+        serde_json::json!({"id":"private","role":"assistant","content":"WHOLEMESSAGE_BYSTANDER","metadata":{(body):"private document key"}}),
+    ];
+    for (variant, injection) in variants.into_iter().enumerate() {
+        let case_root = root.path().join(variant.to_string());
+        fs::create_dir_all(&case_root)?;
+        let session = case_root.join("session.jsonl");
+        let records = [
+            serde_json::json!({"id":"prompt","role":"user","content":"FORMATS_ORDINARY_PROMPT café 界"}),
+            serde_json::json!({"id":"answer","role":"assistant","content":"FORMATS_ORDINARY_ANSWER: discuss skills and the matchedSkills field.","metadata":{"ok":true,"count":7,"missing":null,"tags":["ordinary"]}}),
+            injection,
+            serde_json::json!({"id":"final","role":"assistant","content":"FORMATS_ORDINARY_FINAL"}),
+        ];
+        let mut bytes = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut bytes, &record)?;
+            bytes.push(b'\n');
+        }
+        fs::write(&session, &bytes)?;
+        let before = fs::metadata(&session)?;
+        for format in ["markdown", "text", "json", "html"] {
+            for include_skills in [false, true] {
+                for include_tools in [false, true] {
+                    let mut cmd = export_privacy_command(&case_root);
+                    cmd.arg("export").arg(&session).args(["--format", format]);
+                    if include_skills {
+                        cmd.arg("--include-skills");
+                    }
+                    if include_tools {
+                        cmd.arg("--include-tools");
+                    }
+                    let output = cmd.output()?;
+                    assert!(
+                        output.status.success(),
+                        "variant {variant}/{format}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    let exported = String::from_utf8(output.stdout)?;
+                    for marker in [
+                        "FORMATS_ORDINARY_PROMPT",
+                        "FORMATS_ORDINARY_ANSWER",
+                        "FORMATS_ORDINARY_FINAL",
+                        "café 界",
+                    ] {
+                        assert!(
+                            exported.contains(marker),
+                            "missing {marker} in variant {variant}/{format}"
+                        );
+                    }
+                    assert_eq!(
+                        exported.contains("WHOLEMESSAGE_BYSTANDER"),
+                        include_skills,
+                        "variant {variant}/{format}"
+                    );
+                    if !include_skills {
+                        assert!(
+                            !exported.contains("FORMATS_PRIVATE_BODY"),
+                            "variant {variant}/{format}"
+                        );
+                    }
+                    if format == "json" {
+                        let messages: Vec<Value> = serde_json::from_str(&exported)?;
+                        let ids: Vec<_> = messages
+                            .iter()
+                            .filter_map(|m| m.get("id").and_then(Value::as_str))
+                            .collect();
+                        let expected = if include_skills {
+                            vec!["prompt", "answer", "private", "final"]
+                        } else {
+                            vec!["prompt", "answer", "final"]
+                        };
+                        assert_eq!(ids, expected);
+                        assert_eq!(exported.contains("FORMATS_PRIVATE_BODY"), include_skills);
+                    }
+                }
+            }
+        }
+        assert_eq!(fs::read(&session)?, bytes);
+        let after = fs::metadata(&session)?;
+        assert_eq!(before.modified()?, after.modified()?);
+        assert_eq!(before.permissions(), after.permissions());
+        assert!(!case_root.join("data/agent_search.db").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn nd6pc_html_counts_exclude_structured_skill_messages() -> Result<(), Box<dyn std::error::Error>> {
+    let root = TempDir::new()?;
+    let session = root.path().join("session.jsonl");
+    let records = [
+        serde_json::json!({"role":"user","content":"COUNTS_ORDINARY_PROMPT"}),
+        serde_json::json!({"type":"message","message":{"role":"assistant","content":[
+            {"type":"text","text":"COUNTS_PRIVATE_NARRATIVE"},
+            {"type":"toolCall","id":"private-call","name":"Skill","arguments":{"body":"Base directory for this skill: /synthetic/private"}}
+        ]}}),
+        serde_json::json!({"role":"assistant","content":"COUNTS_ORDINARY_ANSWER"}),
+    ];
+    let mut bytes = Vec::new();
+    for record in records {
+        serde_json::to_writer(&mut bytes, &record)?;
+        bytes.push(b'\n');
+    }
+    fs::write(&session, &bytes)?;
+    let (_, html) = export_privacy_html(root.path(), &session, None, false, false)?;
+    assert!(html.contains("<span>1 prompt, 1 response, 0 tool uses</span>"));
+    assert!(!html.contains("COUNTS_PRIVATE_NARRATIVE"));
+    assert!(html.contains("COUNTS_ORDINARY_PROMPT") && html.contains("COUNTS_ORDINARY_ANSWER"));
+    assert_eq!(fs::read(session)?, bytes);
+    Ok(())
+}
+
+#[test]
 fn nd6pc_html_skill_blocks_require_explicit_opt_in() -> Result<(), Box<dyn std::error::Error>> {
     let root = TempDir::new()?;
     let body = "Base directory for this skill: /synthetic/private\nPROPRIETARYSKILLBODY café 界";

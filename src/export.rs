@@ -81,6 +81,12 @@ pub(crate) fn is_skill_injection(content: &str) -> bool {
         || content.contains("<!-- skillInjection:")
 }
 
+/// Inspect the complete source record, including tool data and metadata.
+/// Serialization also preserves paired hook markers split across fields.
+pub(crate) fn message_is_skill_injection(message: &Value) -> bool {
+    is_skill_injection(&message.to_string())
+}
+
 /// Convert complete source messages after the caller applies export privacy.
 /// Keep tool extraction and exclusion identical for CLI and TUI exports.
 pub(crate) fn html_messages_from_raw<'a>(
@@ -99,28 +105,17 @@ pub(crate) fn html_messages_from_raw<'a>(
             if !include_tools && role == "tool" {
                 return Vec::new();
             }
+            if !include_skills && message_is_skill_injection(msg) {
+                return Vec::new();
+            }
             let timestamp = crate::extract_message_timestamp(msg)
                 .and_then(|ts| chrono::Utc.timestamp_millis_opt(ts).single())
                 .map(|dt| dt.to_rfc3339());
-            let mut tool_calls = if include_tools || !include_skills {
+            let tool_calls = if include_tools {
                 crate::extract_tool_calls(msg)
             } else {
                 Vec::new()
             };
-            // Check the complete message before removing tool blocks. Skill
-            // bodies can live in tool output or arguments instead of narrative.
-            if !include_skills
-                && (is_skill_injection(&crate::extract_text_content(msg))
-                    || tool_calls.iter().any(|call| {
-                        is_skill_injection(&call.input)
-                            || call.output.as_deref().is_some_and(is_skill_injection)
-                    }))
-            {
-                return Vec::new();
-            }
-            if !include_tools {
-                tool_calls.clear();
-            }
             let content = if include_tools {
                 if !tool_calls.is_empty() {
                     crate::strip_tool_marker(&crate::extract_text_content_without_tool_blocks(msg))
