@@ -23197,8 +23197,8 @@ fn export_session_task(
                        archived: Option<&[crate::model::types::Message]>,
                        pi_family_export| {
         let mut privacy = crate::export::ExportPrivacy::new(false);
-        let selected =
-            crate::export::select_html_source_records(raw, archived, false).map(|(index, message)| {
+        let selected = crate::export::select_html_source_records(raw, archived, false).map(
+            |(index, message)| {
                 let explicit_role = message
                     .get("role")
                     .or_else(|| message.get("message").and_then(|inner| inner.get("role")))
@@ -23220,7 +23220,8 @@ fn export_session_task(
                 }
                 privacy.redact_message(message);
                 (index, &*message)
-            });
+            },
+        );
         crate::export::html_messages_from_raw(selected, include_tools, pi_family_export)
     };
 
@@ -31889,7 +31890,12 @@ mod tests {
         for (idx, role, content, extra_json) in [
             (0, "user", body, "null"),
             (1, "user", "INDEXED_ORDINARY_PROMPT café 界", "null"),
-            (2, "assistant", "ARCHIVED_PRIVATE_NARRATIVE", private_envelope.as_str()),
+            (
+                2,
+                "assistant",
+                "ARCHIVED_PRIVATE_NARRATIVE",
+                private_envelope.as_str(),
+            ),
             (3, "assistant", "INDEXED_ORDINARY_ANSWER", "null"),
         ] {
             conn.execute_with_params(
