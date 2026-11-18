@@ -32698,6 +32698,9 @@ mod tests {
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, ?1, 'user', 'indexed-prompt-kept')",
             &[SqliteValue::Integer(prompt_index)],
         )?;
+        conn.execute(
+            "INSERT INTO messages (conversation_id, idx, role, content) VALUES (1, 6, 'user', ' ')",
+        )?;
         conn.execute("INSERT INTO messages (conversation_id, idx, role, content) VALUES (1, 12, 'custom-role', 'indexed-custom-role-kept')")?;
         let events = [
             (
@@ -32752,6 +32755,18 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("indexedtool")
         );
+        let mut untitled_view = view.clone();
+        untitled_view.convo.title = None;
+        let mut untitled_hit = hit.clone();
+        untitled_hit.title.clear();
+        let fallback = ExportModalState::from_hit(&untitled_hit, &untitled_view);
+        assert!(fallback.title_preview.contains("[REDACTED]\n"));
+        let projected = crate::conversation_view_to_rendered_raw_messages(&untitled_view, false);
+        assert!(crate::export::archived_title_has_hidden_pi_tools(
+            &fallback.title_preview,
+            &untitled_view,
+            &projected
+        ));
         let html_title = state.to_export_options().title.expect("modal export title");
         for include_tools in [true, false] {
             let html_path = root.path().join(&state.filename_preview);

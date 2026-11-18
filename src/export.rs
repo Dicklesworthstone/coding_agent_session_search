@@ -187,38 +187,45 @@ pub(crate) fn archived_title_has_hidden_pi_tools(
     if !matches!(view.convo.agent_slug.as_str(), "pi_agent" | "omp") {
         return false;
     }
-    view.messages
-        .first()
-        .zip(projected.first())
-        .is_some_and(|(archived, message)| {
-            title_matches_hidden_pi_tools(
-                title,
-                &crate::extract_role(message),
-                &archived.content,
-                message,
-            )
-        })
+    for (archived, message) in view.messages.iter().zip(projected) {
+        if title_matches_hidden_pi_tools(
+            title,
+            &crate::extract_role(message),
+            &archived.content,
+            message,
+        ) {
+            return true;
+        }
+        // The modal skips empty and injected messages when deriving a title.
+        if !archived.content.trim().is_empty() && !archived_message_is_skill_injection(archived) {
+            break;
+        }
+    }
+    false
 }
 
 pub(crate) fn raw_title_has_hidden_pi_tools(title: &str, agent: &str, messages: &[Value]) -> bool {
     if !matches!(agent, "pi_agent" | "omp") {
         return false;
     }
-    let Some(message) = messages
-        .iter()
-        .find(|message| message.get("type").and_then(Value::as_str) == Some("message"))
-    else {
-        return false;
-    };
-    let role = crate::extract_role(message);
-    if !matches!(role.as_str(), "assistant" | "tool") {
-        return false;
+    for message in messages {
+        if message.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(content) = message.pointer("/message/content") else {
+            continue;
+        };
+        let searchable =
+            franken_agent_detection::connectors::pi_wire::flatten_message_content(content);
+        if title_matches_hidden_pi_tools(title, &crate::extract_role(message), &searchable, message)
+        {
+            return true;
+        }
+        if !searchable.trim().is_empty() && !ExportInjections::default().excludes_raw(message) {
+            break;
+        }
     }
-    let Some(content) = message.pointer("/message/content") else {
-        return false;
-    };
-    let searchable = franken_agent_detection::connectors::pi_wire::flatten_message_content(content);
-    title_matches_hidden_pi_tools(title, &role, &searchable, message)
+    false
 }
 
 fn title_matches_hidden_pi_tools(
@@ -230,30 +237,34 @@ fn title_matches_hidden_pi_tools(
     let Some(prefix) = derived_title_prefix(title) else {
         return false;
     };
-    let Some(first_line) = searchable.lines().next().map(str::trim_start) else {
-        return false;
-    };
-    if role != "tool" && (role != "assistant" || !first_line.starts_with("[Tool:")) {
+    let searchable = searchable.trim_start();
+    if role != "tool" && (role != "assistant" || !searchable.starts_with("[Tool:")) {
         return false;
     }
 
     // TUI writers receive a title that has already passed credential redaction.
-    // Preserve exact raw matching for CLI titles, including with secrets enabled.
-    let compare_redacted = !first_line.starts_with(prefix);
-    let matches_title = |line: &str| {
-        let line = line.trim_start();
-        if !compare_redacted {
-            return line.starts_with(prefix);
+    // Its fallback title can span lines. Preserve raw matching for CLI titles
+    // and compare the visible text using the same form as the matched source.
+    let compare_redacted = !searchable.starts_with(prefix);
+    let mut privacy = ExportPrivacy::new(false);
+    if compare_redacted {
+        let mut preview = searchable.to_owned();
+        privacy.redact_text(&mut preview);
+        if !preview.trim_start().starts_with(prefix) {
+            return false;
         }
-        let mut preview = line.to_owned();
-        ExportPrivacy::new(false).redact_text(&mut preview);
-        preview.trim_start().starts_with(prefix)
-    };
-    matches_title(first_line)
-        && (role == "tool"
-            || !crate::extract_text_content_without_tool_blocks(rendered)
-                .lines()
-                .any(matches_title))
+    }
+    if role == "tool" {
+        return true;
+    }
+
+    let mut visible = crate::extract_text_content_without_tool_blocks(rendered);
+    if compare_redacted {
+        privacy.redact_text(&mut visible);
+    }
+    !std::iter::once(0)
+        .chain(visible.match_indices('\n').map(|(index, _)| index + 1))
+        .any(|start| visible[start..].trim_start().starts_with(prefix))
 }
 
 // Only use a path basename with the syntax of a skill identifier. Never copy
@@ -794,6 +805,7 @@ mod tests {
         let export_messages = |blocks| {
             [
                 session.clone(),
+                serde_json::json!({"type": "message", "message": {"role": "user", "content": " "}}),
                 serde_json::json!({
                     "type": "message",
                     "message": {"role": "assistant", "content": blocks}
@@ -821,12 +833,17 @@ mod tests {
         let redacted_title = "[Tool: Read] path=fixture [REDACTED]";
         let tool = serde_json::json!({
             "type": "toolCall", "name": "Read",
-            "arguments": {"path": "fixture password=synthetic-tool-title"}
+            "arguments": {"path": "fixture password=synthetic-tool-title\nprivate continuation"}
         });
         let narrative = serde_json::json!({"type": "text", "text": "Ordinary narrative"});
         let hidden = export_messages([tool.clone(), narrative]);
         assert!(raw_title_has_hidden_pi_tools(
             redacted_title,
+            "omp",
+            &hidden
+        ));
+        assert!(raw_title_has_hidden_pi_tools(
+            "[Tool: Read] path=fixture [REDACTED]\nprivate cont...",
             "omp",
             &hidden
         ));
@@ -842,6 +859,11 @@ mod tests {
             &visible
         ));
         assert!(raw_title_has_hidden_pi_tools(raw_title, "omp", &visible));
+        assert!(raw_title_has_hidden_pi_tools(
+            "[Tool: Read] path=fixture [REDACTED]\nprivate cont...",
+            "omp",
+            &visible
+        ));
     }
 
     #[test]
