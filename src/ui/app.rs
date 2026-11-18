@@ -5403,6 +5403,9 @@ pub struct CassApp {
     pub export_modal_state: Option<ExportModalState>,
     /// The hit that opened the export form, even if search results change.
     export_modal_hit: Option<SearchHit>,
+    /// The background write that can update the current export form.
+    export_modal_task: Option<u64>,
+    next_export_task: u64,
     /// Pending screenshot capture (set in update, consumed in view).
     pub screenshot_pending: Option<ScreenshotFormat>,
     /// Buffer for screenshot data captured during view() (RefCell for &self access).
@@ -5705,6 +5708,8 @@ impl Default for CassApp {
             show_export_modal: false,
             export_modal_state: None,
             export_modal_hit: None,
+            export_modal_task: None,
+            next_export_task: 0,
             screenshot_pending: None,
             screenshot_result: RefCell::new(None),
             show_bulk_modal: false,
@@ -11173,6 +11178,14 @@ impl CassApp {
         self.show_export_modal = false;
         self.export_modal_state = None;
         self.export_modal_hit = None;
+        self.export_modal_task = None;
+    }
+
+    fn begin_export_modal_task(&mut self) -> u64 {
+        let task = self.next_export_task;
+        self.next_export_task = self.next_export_task.wrapping_add(1);
+        self.export_modal_task = Some(task);
+        task
     }
 
     /// Derive the markdown filename from the HTML filename suggestion.
@@ -14654,16 +14667,11 @@ pub enum CassMsg {
     ExportExecuted,
     /// Quick-export the current session as Markdown.
     ExportMarkdownExecuted,
-    /// Export progress update from background task.
-    ExportProgressUpdated(ExportProgress),
-    /// Export completed successfully.
-    ExportCompleted {
-        output_path: PathBuf,
-        file_size: usize,
-        encrypted: bool,
+    /// Export finished. Quick exports have no modal task ID.
+    ExportTaskFinished {
+        modal_task: Option<u64>,
+        result: Result<PathBuf, String>,
     },
-    /// Export failed.
-    ExportFailed(String),
 
     // -- Source filter menu ------------------------------------------------
     /// Toggle the source filter popup menu.
@@ -16781,9 +16789,7 @@ impl super::ftui_adapter::Model for CassApp {
                     | CassMsg::ExportFocusMoved { .. }
                     | CassMsg::ExportExecuted
                     | CassMsg::ExportMarkdownExecuted
-                    | CassMsg::ExportProgressUpdated(_)
-                    | CassMsg::ExportCompleted { .. }
-                    | CassMsg::ExportFailed(_)
+                    | CassMsg::ExportTaskFinished { .. }
             )
         {
             // Sub-intercept: when find bar is active, route text input there.
@@ -19391,15 +19397,28 @@ impl super::ftui_adapter::Model for CassApp {
                 let output_path = unique_filename(&output_dir, &output_filename);
                 let include_tools = export_state.include_tools;
                 let filename_title = export_state.title_preview;
+                let modal_task = if self.show_export_modal {
+                    let Some(state) = self.export_modal_state.as_mut() else {
+                        return ftui::Cmd::none();
+                    };
+                    if state.progress.is_busy() {
+                        return ftui::Cmd::none();
+                    }
+                    state.progress = ExportProgress::Preparing;
+                    Some(self.begin_export_modal_task())
+                } else {
+                    None
+                };
                 self.status = "Exporting markdown...".to_string();
-                ftui::Cmd::task(move || {
-                    export_session_markdown_task(
+                ftui::Cmd::task(move || CassMsg::ExportTaskFinished {
+                    modal_task,
+                    result: export_session_markdown_task(
                         &db_path,
                         &export_hit,
                         &output_path,
                         include_tools,
                         &filename_title,
-                    )
+                    ),
                 })
             }
             CassMsg::ExportExecuted => {
@@ -19429,11 +19448,13 @@ impl super::ftui_adapter::Model for CassApp {
                         .agent_name
                         .unwrap_or_else(|| state.agent_name.clone());
                     let db_path = self.db_path.clone();
+                    let modal_task = Some(self.begin_export_modal_task());
                     self.status = "Exporting HTML...".to_string();
 
                     // Dispatch the export as a background task.
-                    return ftui::Cmd::task(move || {
-                        export_session_task(
+                    return ftui::Cmd::task(move || CassMsg::ExportTaskFinished {
+                        modal_task,
+                        result: export_session_task(
                             &db_path,
                             &export_hit,
                             &output_path,
@@ -19443,42 +19464,40 @@ impl super::ftui_adapter::Model for CassApp {
                             include_tools,
                             &title,
                             &agent_name,
-                        )
+                        ),
                     });
                 }
                 ftui::Cmd::none()
             }
-            CassMsg::ExportProgressUpdated(progress) => {
-                if let Some(ref mut state) = self.export_modal_state {
-                    state.progress = progress;
+            CassMsg::ExportTaskFinished { modal_task, result } => {
+                use crate::ui::components::toast::Toast;
+
+                let owns_form = modal_task.is_some() && modal_task == self.export_modal_task;
+                let (status, toast) = match result {
+                    Ok(output_path) => {
+                        if owns_form {
+                            self.close_export_modal();
+                        }
+                        let status = format!("Exported to {}", output_path.display());
+                        let toast = Toast::success(status.clone());
+                        (status, toast)
+                    }
+                    Err(err) => {
+                        if owns_form {
+                            self.export_modal_task = None;
+                            if let Some(state) = self.export_modal_state.as_mut() {
+                                state.progress = ExportProgress::Error(err.clone());
+                            }
+                        }
+                        let status = format!("Export failed: {err}");
+                        let toast = Toast::error(status.clone());
+                        (status, toast)
+                    }
+                };
+                if self.export_modal_task.is_none() {
+                    self.status = status;
                 }
-                ftui::Cmd::none()
-            }
-            CassMsg::ExportCompleted {
-                output_path,
-                file_size: _,
-                encrypted: _,
-            } => {
-                self.close_export_modal();
-                self.status = format!("Exported to {}", output_path.display());
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::success(format!(
-                        "Exported to {}",
-                        output_path.display()
-                    )));
-                ftui::Cmd::none()
-            }
-            CassMsg::ExportFailed(err) => {
-                if let Some(state) = self.export_modal_state.as_mut()
-                    && state.progress.is_busy()
-                {
-                    state.progress = ExportProgress::Error(err.clone());
-                }
-                self.status = format!("Export failed: {err}");
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::error(format!(
-                        "Export failed: {err}"
-                    )));
+                self.toast_manager.push(toast);
                 ftui::Cmd::none()
             }
 
@@ -20074,6 +20093,7 @@ impl super::ftui_adapter::Model for CassApp {
                 let db_reader = self.db_reader.clone();
                 let known_workspaces = self.known_workspaces.clone();
                 let next_state_save_token = self.next_state_save_token;
+                let next_export_task = self.next_export_task;
                 let state_file_io_epoch = Arc::clone(&self.state_file_io_epoch);
                 let state_file_io_lock = Arc::clone(&self.state_file_io_lock);
                 state_file_io_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -20091,6 +20111,7 @@ impl super::ftui_adapter::Model for CassApp {
                     db_reader,
                     known_workspaces,
                     next_state_save_token,
+                    next_export_task,
                     state_file_io_epoch,
                     state_file_io_lock: state_file_io_lock_for_reset,
                     ..CassApp::default()
@@ -23192,8 +23213,8 @@ fn load_indexed_export_view(
         return Ok(None);
     }
 
-    let storage =
-        FrankenStorage::open(db_path).map_err(|err| format!("Failed to open database: {err}"))?;
+    let storage = FrankenStorage::open_readonly(db_path)
+        .map_err(|err| format!("Failed to open database: {err}"))?;
     load_conversation_for_hit(&storage, hit).map_err(|err| format!("Failed to load session: {err}"))
 }
 
@@ -23211,7 +23232,7 @@ fn export_session_task(
     include_tools: bool,
     title: &str,
     agent_name: &str,
-) -> CassMsg {
+) -> Result<PathBuf, String> {
     use crate::html_export::{
         ExportOptions as HtmlExportOptions, HtmlExporter, Message as HtmlMessage, TemplateMetadata,
     };
@@ -23279,7 +23300,7 @@ fn export_session_task(
                 if allow_direct_file && session_path.exists() {
                     None
                 } else {
-                    return CassMsg::ExportFailed(err);
+                    return Err(err);
                 }
             }
         }
@@ -23312,20 +23333,18 @@ fn export_session_task(
             }
             Err(local_err) => match load_indexed_export_view(db_path, hit) {
                 Ok(Some(view)) => html_messages_from_view(view),
-                Ok(None) => return CassMsg::ExportFailed(local_err),
+                Ok(None) => return Err(local_err),
                 Err(index_err) => {
-                    return CassMsg::ExportFailed(format!(
-                        "{local_err}; indexed fallback failed: {index_err}"
-                    ));
+                    return Err(format!("{local_err}; indexed fallback failed: {index_err}"));
                 }
             },
         }
     } else {
-        return CassMsg::ExportFailed(format!("Session not found: {}", hit.source_path));
+        return Err(format!("Session not found: {}", hit.source_path));
     };
 
     if messages.is_empty() {
-        return CassMsg::ExportFailed("No messages found in session".to_string());
+        return Err("No messages found in session".to_string());
     }
 
     let mut privacy = crate::export::ExportPrivacy::new(false);
@@ -23375,24 +23394,16 @@ fn export_session_task(
     };
 
     let groups = crate::group_messages_for_export(messages);
-    let html = match exporter.export_messages(title, &groups, metadata, password) {
-        Ok(h) => h,
-        Err(e) => return CassMsg::ExportFailed(format!("HTML generation failed: {e}")),
-    };
+    let html = exporter
+        .export_messages(title, &groups, metadata, password)
+        .map_err(|e| format!("HTML generation failed: {e}"))?;
 
     let safe_output =
         filename_hidden.then(|| output_path.with_file_name("conversation-export.html"));
-    match write_export_bytes_no_overwrite(
+    write_export_bytes_no_overwrite(
         safe_output.as_deref().unwrap_or(output_path),
         html.as_bytes(),
-    ) {
-        Ok(final_path) => CassMsg::ExportCompleted {
-            output_path: final_path,
-            file_size: html.len(),
-            encrypted: encrypt,
-        },
-        Err(err) => CassMsg::ExportFailed(err),
-    }
+    )
 }
 
 /// Background task: export a session to Markdown.
@@ -23405,7 +23416,7 @@ fn export_session_markdown_task(
     output_path: &std::path::Path,
     include_tools: bool,
     filename_title: &str,
-) -> CassMsg {
+) -> Result<PathBuf, String> {
     let session_path = std::path::Path::new(&hit.source_path);
     let allow_direct_file = hit_is_local_source(hit);
     let prefer_direct_file = tui_prefers_direct_followup_file(hit);
@@ -23444,11 +23455,9 @@ fn export_session_markdown_task(
             Ok(loaded) => loaded,
             Err(local_err) => match load_indexed_export_view(db_path, hit) {
                 Ok(Some(view)) => indexed_markdown_view(view),
-                Ok(None) => return CassMsg::ExportFailed(local_err),
+                Ok(None) => return Err(local_err),
                 Err(index_err) => {
-                    return CassMsg::ExportFailed(format!(
-                        "{local_err}; indexed fallback failed: {index_err}"
-                    ));
+                    return Err(format!("{local_err}; indexed fallback failed: {index_err}"));
                 }
             },
         }
@@ -23457,39 +23466,25 @@ fn export_session_markdown_task(
             Ok(Some(view)) => indexed_markdown_view(view),
             Ok(None) => {
                 if allow_direct_file && session_path.exists() {
-                    match load_local() {
-                        Ok(loaded) => loaded,
-                        Err(err) => return CassMsg::ExportFailed(err),
-                    }
+                    load_local()?
                 } else {
-                    return CassMsg::ExportFailed(format!(
-                        "Session not found in index: {}",
-                        hit.source_path
-                    ));
+                    return Err(format!("Session not found in index: {}", hit.source_path));
                 }
             }
             Err(err) => {
                 if allow_direct_file && session_path.exists() {
-                    match load_local() {
-                        Ok(loaded) => loaded,
-                        Err(fallback_err) => {
-                            return CassMsg::ExportFailed(format!(
-                                "{fallback_err}; indexed fallback failed: {err}"
-                            ));
-                        }
-                    }
+                    load_local().map_err(|fallback_err| {
+                        format!("{fallback_err}; indexed fallback failed: {err}")
+                    })?
                 } else {
-                    return CassMsg::ExportFailed(err);
+                    return Err(err);
                 }
             }
         }
     } else if allow_direct_file && session_path.exists() {
-        match load_local() {
-            Ok(loaded) => loaded,
-            Err(err) => return CassMsg::ExportFailed(err),
-        }
+        load_local()?
     } else {
-        return CassMsg::ExportFailed(format!("Session not found: {}", hit.source_path));
+        return Err(format!("Session not found: {}", hit.source_path));
     };
 
     messages.retain(|message| !crate::export::message_is_skill_injection(message));
@@ -23504,7 +23499,7 @@ fn export_session_markdown_task(
     privacy.redact_optional_text(&mut session_title);
 
     if messages.is_empty() {
-        return CassMsg::ExportFailed("No messages found in session".to_string());
+        return Err("No messages found in session".to_string());
     }
 
     if session_title.is_none() {
@@ -23523,17 +23518,10 @@ fn export_session_markdown_task(
     let markdown =
         crate::format_as_markdown(&messages, &session_title, session_start, include_tools);
     let safe_output = filename_hidden.then(|| output_path.with_file_name("conversation-export.md"));
-    match write_export_bytes_no_overwrite(
+    write_export_bytes_no_overwrite(
         safe_output.as_deref().unwrap_or(output_path),
         markdown.as_bytes(),
-    ) {
-        Ok(final_path) => CassMsg::ExportCompleted {
-            output_path: final_path,
-            file_size: markdown.len(),
-            encrypted: false,
-        },
-        Err(err) => CassMsg::ExportFailed(err),
-    }
+    )
 }
 
 /// Configuration for inline TUI mode.
@@ -24754,7 +24742,10 @@ mod tests {
                     .progress,
                 ExportProgress::Preparing
             ));
-            let _ = app.update(CassMsg::ExportFailed("cannot write output".to_string()));
+            let _ = app.update(CassMsg::ExportTaskFinished {
+                modal_task: app.export_modal_task,
+                result: Err("cannot write output".to_string()),
+            });
             assert!(app.export_modal_state.as_ref().unwrap().can_export());
 
             let _ = app.update(CassMsg::QuitRequested);
@@ -24762,6 +24753,154 @@ mod tests {
             assert!(app.export_modal_state.is_none());
             assert_eq!(app.show_detail_modal, from_detail);
         }
+    }
+
+    #[test]
+    fn nd6pc_export_modal_ignores_late_results_from_other_writes() -> anyhow::Result<()> {
+        let root = tempfile::Builder::new()
+            .prefix("cass-overlapping-exports-")
+            .disable_cleanup(true)
+            .tempdir()?;
+        let earlier = root.path().join("earlier.jsonl");
+        let missing = root.path().join("missing.jsonl");
+        let current = root.path().join("current.jsonl");
+        std::fs::write(&earlier, r#"{"role":"user","content":"earlier export"}"#)?;
+        std::fs::write(&current, r#"{"role":"user","content":"current export"}"#)?;
+
+        let mut app = app_with_hits(3);
+        app.db_path = root.path().join("absent.db");
+        app.panes[0].hits = [&earlier, &missing, &current]
+            .into_iter()
+            .map(|path| make_exact_hit(&path.display().to_string(), "local", 1, "fixture"))
+            .collect();
+
+        let _ = app.update(CassMsg::ExportModalOpened);
+        let state = app.export_modal_state.as_mut().unwrap();
+        state.output_dir = root.path().to_path_buf();
+        state.filename_preview = "earlier.html".to_string();
+        let ftui::Cmd::Task(_, earlier_write) = app.update(CassMsg::ExportExecuted) else {
+            anyhow::bail!("earlier export did not dispatch");
+        };
+        let _ = app.update(CassMsg::QuitRequested);
+
+        app.panes[0].selected = 1;
+        let _ = app.update(CassMsg::ExportModalOpened);
+        let state = app.export_modal_state.as_mut().unwrap();
+        state.output_dir = root.path().to_path_buf();
+        let ftui::Cmd::Task(_, failed_write) = app.update(CassMsg::ExportExecuted) else {
+            anyhow::bail!("missing source export did not dispatch");
+        };
+        let _ = app.update(CassMsg::QuitRequested);
+
+        app.panes[0].selected = 0;
+        // Keep the quick export in the fixture directory.
+        app.export_modal_state = Some(ExportModalState {
+            output_dir: root.path().to_path_buf(),
+            filename_preview: "quick.html".to_string(),
+            ..Default::default()
+        });
+        let ftui::Cmd::Task(_, quick_write) = app.update(CassMsg::ExportMarkdownExecuted) else {
+            anyhow::bail!("quick export did not dispatch");
+        };
+
+        app.panes[0].selected = 2;
+        let _ = app.update(CassMsg::ExportModalOpened);
+        let state = app.export_modal_state.as_mut().unwrap();
+        state.output_dir = root.path().to_path_buf();
+        state.filename_preview = "current.html".to_string();
+        let ftui::Cmd::Task(_, current_write) = app.update(CassMsg::ExportMarkdownExecuted) else {
+            anyhow::bail!("current export did not dispatch");
+        };
+        assert!(matches!(
+            app.update(CassMsg::ExportMarkdownExecuted),
+            ftui::Cmd::None
+        ));
+        assert!(matches!(
+            app.update(CassMsg::ExportExecuted),
+            ftui::Cmd::None
+        ));
+
+        let earlier_result = earlier_write();
+        let failure = failed_write();
+        let quick_result = quick_write();
+        assert!(matches!(
+            earlier_result,
+            CassMsg::ExportTaskFinished { result: Ok(_), .. }
+        ));
+        assert!(matches!(
+            failure,
+            CassMsg::ExportTaskFinished { result: Err(_), .. }
+        ));
+        assert!(matches!(
+            quick_result,
+            CassMsg::ExportTaskFinished {
+                modal_task: None,
+                result: Ok(_),
+            }
+        ));
+        for result in [earlier_result, failure, quick_result] {
+            let _ = app.update(result);
+            assert!(app.show_export_modal);
+            assert!(app.export_modal_state.as_ref().unwrap().progress.is_busy());
+            assert_eq!(app.status, "Exporting markdown...");
+        }
+        assert!(
+            std::fs::read_to_string(root.path().join("earlier.html"))?.contains("earlier export")
+        );
+        assert!(std::fs::read_to_string(root.path().join("quick.md"))?.contains("earlier export"));
+
+        let result = current_write();
+        assert!(matches!(
+            result,
+            CassMsg::ExportTaskFinished { result: Ok(_), .. }
+        ));
+        let _ = app.update(result);
+        assert!(!app.show_export_modal);
+        assert!(app.export_modal_task.is_none());
+        let markdown = std::fs::read_to_string(root.path().join("current.md"))?;
+        assert!(markdown.contains("current export"));
+        assert!(!markdown.contains("earlier export"));
+        Ok(())
+    }
+
+    #[test]
+    fn nd6pc_export_refuses_to_initialize_an_unrelated_database() -> anyhow::Result<()> {
+        let root = tempfile::Builder::new()
+            .prefix("cass-readonly-export-")
+            .disable_cleanup(true)
+            .tempdir()?;
+        let db_path = root.path().join("unrelated.db");
+        let conn = fsqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+        conn.execute("CREATE TABLE sentinel (value TEXT)")?;
+        conn.execute("INSERT INTO sentinel (value) VALUES ('retain me')")?;
+        drop(conn);
+        let before = std::fs::read(&db_path)?;
+        let hit = make_exact_hit(
+            &root.path().join("absent.jsonl").display().to_string(),
+            "local",
+            1,
+            "fixture",
+        );
+        let html_path = root.path().join("out.html");
+        let md_path = root.path().join("out.md");
+        assert!(
+            export_session_task(
+                &db_path,
+                &hit,
+                &html_path,
+                false,
+                None,
+                true,
+                true,
+                "Untitled Session",
+                "Codex",
+            )
+            .is_err()
+        );
+        assert!(export_session_markdown_task(&db_path, &hit, &md_path, true, "").is_err());
+        assert_eq!(std::fs::read(db_path)?, before);
+        assert!(!html_path.exists() && !md_path.exists());
+        Ok(())
     }
 
     #[test]
@@ -24878,8 +25017,9 @@ mod tests {
                 anyhow::bail!("export did not dispatch the pinned session");
             };
             let completion = task();
-            let CassMsg::ExportCompleted {
-                ref output_path, ..
+            let CassMsg::ExportTaskFinished {
+                result: Ok(ref output_path),
+                ..
             } = completion
             else {
                 anyhow::bail!("pinned export failed: {completion:?}");
@@ -31650,10 +31790,7 @@ mod tests {
         let missing_db = tmp.path().join("missing.db");
         let export_hit = make_exact_hit(&session_path.display().to_string(), "local", 1, "hello");
         let msg = export_session_markdown_task(&missing_db, &export_hit, &existing_path, false, "");
-        let exported_path = match msg {
-            CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
-        };
+        let exported_path = msg.expect("export should succeed");
 
         assert_ne!(
             exported_path, existing_path,
@@ -31785,10 +31922,7 @@ mod tests {
             "remote markdown body",
         );
         let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false, "");
-        let exported_path = match msg {
-            CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
-        };
+        let exported_path = msg.expect("export should succeed");
         let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
         assert!(
             markdown.contains("remote markdown body"),
@@ -31834,10 +31968,7 @@ mod tests {
             "new markdown body",
         );
         let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false, "");
-        let exported_path = match msg {
-            CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
-        };
+        let exported_path = msg.expect("export should succeed");
         let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
         assert!(
             markdown.contains("new markdown body"),
@@ -31881,7 +32012,7 @@ mod tests {
             "Codex",
         );
         for result in [markdown, html] {
-            let CassMsg::ExportCompleted { output_path, .. } = result else {
+            let Ok(output_path) = result else {
                 panic!("export did not complete: {result:?}");
             };
             let output = std::fs::read_to_string(output_path).unwrap();
@@ -31934,7 +32065,7 @@ mod tests {
             "pi_agent",
         );
         for result in [markdown, html] {
-            let CassMsg::ExportCompleted { output_path, .. } = result else {
+            let Ok(output_path) = result else {
                 anyhow::bail!("torn session export failed: {result:?}");
             };
             let exported = std::fs::read_to_string(output_path)?;
@@ -32000,7 +32131,7 @@ mod tests {
                 include_tools,
                 "",
             );
-            let CassMsg::ExportCompleted { output_path, .. } = result else {
+            let Ok(output_path) = result else {
                 anyhow::bail!("source markdown export failed: {result:?}");
             };
             let markdown = std::fs::read_to_string(output_path)?;
@@ -32052,7 +32183,7 @@ mod tests {
                 true,
                 if derived { cached_title } else { "" },
             );
-            let CassMsg::ExportCompleted { output_path, .. } = result else {
+            let Ok(output_path) = result else {
                 anyhow::bail!("titled markdown export failed: {result:?}");
             };
             if derived {
@@ -32076,7 +32207,7 @@ mod tests {
                 cached_title,
                 "claude_code",
             );
-            let CassMsg::ExportCompleted { output_path, .. } = result else {
+            let Ok(output_path) = result else {
                 anyhow::bail!("titled HTML export failed: {result:?}");
             };
             if derived {
@@ -32104,9 +32235,7 @@ mod tests {
         let only_hit = make_exact_hit(&only_skill.display().to_string(), "local", 1, "fixture");
         let only_output = root.path().join("only-skill.md");
         let result = export_session_markdown_task(&absent_db, &only_hit, &only_output, true, "");
-        assert!(
-            matches!(result, CassMsg::ExportFailed(ref message) if message == "No messages found in session")
-        );
+        assert_eq!(result.unwrap_err(), "No messages found in session");
         assert!(!only_output.exists());
         assert_eq!(std::fs::read(&only_skill)?, only_bytes.as_bytes());
 
@@ -32155,7 +32284,7 @@ mod tests {
                 include_tools,
                 "",
             );
-            let CassMsg::ExportCompleted { output_path, .. } = result else {
+            let Ok(output_path) = result else {
                 anyhow::bail!("indexed markdown export failed: {result:?}");
             };
             let markdown = std::fs::read_to_string(output_path)?;
@@ -32192,7 +32321,7 @@ mod tests {
                 true,
                 filename_title,
             );
-            let CassMsg::ExportCompleted { output_path, .. } = result else {
+            let Ok(output_path) = result else {
                 anyhow::bail!("titled archive markdown export failed: {result:?}");
             };
             if title_was_generated {
@@ -32214,7 +32343,7 @@ mod tests {
                 title,
                 "claude_code",
             );
-            let CassMsg::ExportCompleted { output_path, .. } = result else {
+            let Ok(output_path) = result else {
                 anyhow::bail!("titled archive HTML export failed: {result:?}");
             };
             if title_was_generated {
@@ -32311,7 +32440,7 @@ mod tests {
                 "Tool transcript",
                 "Claude Code",
             );
-            let CassMsg::ExportCompleted { output_path, .. } = result else {
+            let Ok(output_path) = result else {
                 anyhow::bail!("HTML export did not complete: {result:?}");
             };
             let html = std::fs::read_to_string(output_path)?;
@@ -32423,7 +32552,7 @@ mod tests {
                 "Indexed tools",
                 "Pi",
             );
-            let CassMsg::ExportCompleted { output_path, .. } = result else {
+            let Ok(output_path) = result else {
                 anyhow::bail!("indexed HTML export failed: {result:?}");
             };
             let html = std::fs::read_to_string(output_path)?;
@@ -32497,7 +32626,7 @@ mod tests {
                     .ok_or_else(|| anyhow::anyhow!("missing export title"))?,
                 "Codex",
             );
-            let CassMsg::ExportCompleted { output_path, .. } = result else {
+            let Ok(output_path) = result else {
                 anyhow::bail!("HTML export did not complete: {result:?}");
             };
             let html = std::fs::read_to_string(output_path)?;
@@ -32560,10 +32689,7 @@ mod tests {
         );
         export_hit.title = "Indexed Session".to_string();
         let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false, "");
-        let exported_path = match msg {
-            CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
-        };
+        let exported_path = msg.expect("export should succeed");
         let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
         assert!(
             markdown.contains("# Indexed Session"),
@@ -32616,10 +32742,7 @@ mod tests {
             "indexed markdown fallback body",
         );
         let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false, "");
-        let exported_path = match msg {
-            CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
-        };
+        let exported_path = msg.expect("export should succeed");
         let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
         assert!(
             markdown.contains("indexed markdown fallback body"),
@@ -32670,10 +32793,7 @@ not jsonl",
             "indexed aider markdown body",
         );
         let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false, "");
-        let exported_path = match msg {
-            CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
-        };
+        let exported_path = msg.expect("export should succeed");
         let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
         assert!(
             markdown.contains("indexed aider markdown body"),
@@ -32720,10 +32840,7 @@ not jsonl",
             "Session",
             "claude_code",
         );
-        let exported_path = match msg {
-            CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
-        };
+        let exported_path = msg.expect("export should succeed");
 
         assert_ne!(
             exported_path, existing_path,
@@ -32788,10 +32905,7 @@ not jsonl",
             "Shared Session",
             "claude_code",
         );
-        let exported_path = match msg {
-            CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
-        };
+        let exported_path = msg.expect("export should succeed");
         let html = std::fs::read_to_string(exported_path).expect("read exported html");
         assert!(
             html.contains("remote export body"),
@@ -32847,10 +32961,7 @@ not jsonl",
             "Shared Session",
             "claude_code",
         );
-        let exported_path = match msg {
-            CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
-        };
+        let exported_path = msg.expect("export should succeed");
         let html = std::fs::read_to_string(exported_path).expect("read exported html");
         assert!(
             html.contains("new export body"),
@@ -32914,10 +33025,7 @@ not jsonl",
             "Fresh Session",
             "claude_code",
         );
-        let exported_path = match msg {
-            CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
-        };
+        let exported_path = msg.expect("export should succeed");
         let html = std::fs::read_to_string(exported_path).expect("read exported html");
         assert!(
             html.contains("fresh local html body"),
@@ -32976,10 +33084,7 @@ not jsonl",
             "Indexed Session",
             "claude_code",
         );
-        let exported_path = match msg {
-            CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
-        };
+        let exported_path = msg.expect("export should succeed");
         let html = std::fs::read_to_string(exported_path).expect("read exported html");
         assert!(
             html.contains("indexed html fallback body"),
@@ -33040,10 +33145,7 @@ not jsonl",
             "Aider Session",
             "aider",
         );
-        let exported_path = match msg {
-            CassMsg::ExportCompleted { output_path, .. } => output_path,
-            other => panic!("expected ExportCompleted, got: {other:?}"),
-        };
+        let exported_path = msg.expect("export should succeed");
         let html = std::fs::read_to_string(exported_path).expect("read exported html");
         assert!(
             html.contains("indexed aider html body"),
