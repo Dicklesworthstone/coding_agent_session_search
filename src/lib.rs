@@ -117611,10 +117611,15 @@ fn run_export(
         .as_ref()
         .map(|view| view.messages.as_slice())
         .unwrap_or_default();
-    if session_title
-        .as_deref()
-        .is_some_and(|title| injections.excludes_title(title, &messages, archived_title_context))
-    {
+    if session_title.as_deref().is_some_and(|title| {
+        injections.excludes_title(title, &messages, archived_title_context)
+            || (!include_tools
+                && format != ConvExportFormat::Json
+                && archived_messages.is_some()
+                && indexed_view.as_ref().is_some_and(|view| {
+                    crate::export::archived_title_has_hidden_pi_tools(title, view, &messages)
+                }))
+    }) {
         session_title = None;
     }
     let mut messages: Vec<_> =
@@ -118312,6 +118317,11 @@ fn run_export_html(
         .unwrap_or_default();
     if session_title.as_deref().is_some_and(|title| {
         injections.excludes_title(title, &raw_messages, archived_title_context)
+            || (!include_tools
+                && archived_messages.is_some()
+                && indexed_view.as_ref().is_some_and(|view| {
+                    crate::export::archived_title_has_hidden_pi_tools(title, view, &raw_messages)
+                }))
     }) {
         session_title = None;
     }
@@ -122535,14 +122545,14 @@ This should stay behind the indexed html export.
             "message": {
                 "role": "assistant",
                 "content": [
-                    { "type": "thinking", "thinking": "OMPTHINKINGSENTINEL" },
-                    { "type": "text", "text": "OMPASSISTANTSENTINEL" },
                     {
                         "type": "toolCall",
                         "id": "ompcall42",
                         "name": "inspect_workspace",
                         "arguments": { "file_path": "OMPARGUMENTSENTINEL\nOMPCONTINUATIONSENTINEL" }
                     },
+                    { "type": "thinking", "thinking": "OMPTHINKINGSENTINEL" },
+                    { "type": "text", "text": "OMPASSISTANTSENTINEL" },
                     { "type": "text", "text": "[Tool: literal discussion] OMPLITERALNARRATIVE" }
                 ]
             }
@@ -122603,7 +122613,7 @@ This should stay behind the indexed html export.
                     agent_slug: "omp".to_string(),
                     workspace: Some(PathBuf::from("/workspace/cass")),
                     external_id: Some("omp-indexed".to_string()),
-                    title: Some("OMPUSERSENTINEL".to_string()),
+                    title: Some("[Tool: inspect_workspace] file_path=OMPARGUMENTSENTINEL".into()),
                     source_path: indexed_path.clone(),
                     started_at: Some(1_787_572_800_000),
                     ended_at: Some(1_787_572_803_000),
@@ -122613,21 +122623,21 @@ This should stay behind the indexed html export.
                         Message {
                             id: None,
                             idx: 0,
-                            role: MessageRole::User,
+                            role: MessageRole::Agent,
                             author: None,
                             created_at: Some(1_787_572_801_000),
-                            content: "OMPUSERSENTINEL".to_string(),
-                            extra_json: user_event,
+                            content: "[Tool: inspect_workspace] file_path=OMPARGUMENTSENTINEL\nOMPCONTINUATIONSENTINEL\n[Thinking] OMPTHINKINGSENTINEL\nOMPASSISTANTSENTINEL\n[Tool: literal discussion] OMPLITERALNARRATIVE".to_string(),
+                            extra_json: assistant_event,
                             snippets: Vec::new(),
                         },
                         Message {
                             id: None,
                             idx: 1,
-                            role: MessageRole::Agent,
+                            role: MessageRole::User,
                             author: None,
                             created_at: Some(1_787_572_802_000),
-                            content: "[Thinking] OMPTHINKINGSENTINEL\nOMPASSISTANTSENTINEL\n[Tool: inspect_workspace] file_path=OMPARGUMENTSENTINEL\nOMPCONTINUATIONSENTINEL\n[Tool: literal discussion] OMPLITERALNARRATIVE".to_string(),
-                            extra_json: assistant_event,
+                            content: "OMPUSERSENTINEL".to_string(),
+                            extra_json: user_event,
                             snippets: Vec::new(),
                         },
                         Message {

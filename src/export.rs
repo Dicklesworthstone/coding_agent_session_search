@@ -177,6 +177,71 @@ pub(crate) fn raw_title_is_skill_injection(title: &str, messages: &[Value]) -> b
     ExportInjections::default().excludes_title(title, messages, &[])
 }
 
+/// Pi-family fallback titles can come from the first indexed message's
+/// searchable text, even when the corresponding tool is hidden in an export.
+pub(crate) fn archived_title_has_hidden_pi_tools(
+    title: &str,
+    view: &crate::ui::data::ConversationView,
+    projected: &[Value],
+) -> bool {
+    if !matches!(view.convo.agent_slug.as_str(), "pi_agent" | "omp") {
+        return false;
+    }
+    view.messages
+        .first()
+        .zip(projected.first())
+        .is_some_and(|(archived, message)| {
+            title_matches_hidden_pi_tools(
+                title,
+                &crate::extract_role(message),
+                &archived.content,
+                message,
+            )
+        })
+}
+
+pub(crate) fn raw_title_has_hidden_pi_tools(title: &str, agent: &str, messages: &[Value]) -> bool {
+    if !matches!(agent, "pi_agent" | "omp") {
+        return false;
+    }
+    let Some(message) = messages
+        .iter()
+        .find(|message| message.get("type").and_then(Value::as_str) == Some("message"))
+    else {
+        return false;
+    };
+    let role = crate::extract_role(message);
+    if !matches!(role.as_str(), "assistant" | "tool") {
+        return false;
+    }
+    let Some(content) = message.pointer("/message/content") else {
+        return false;
+    };
+    let searchable = franken_agent_detection::connectors::pi_wire::flatten_message_content(content);
+    title_matches_hidden_pi_tools(title, &role, &searchable, message)
+}
+
+fn title_matches_hidden_pi_tools(
+    title: &str,
+    role: &str,
+    searchable: &str,
+    rendered: &Value,
+) -> bool {
+    let Some(prefix) = derived_title_prefix(title) else {
+        return false;
+    };
+    let Some(first_line) = searchable.lines().next().map(str::trim_start) else {
+        return false;
+    };
+    first_line.starts_with(prefix)
+        && (role == "tool"
+            || (role == "assistant"
+                && first_line.starts_with("[Tool:")
+                && !crate::extract_text_content_without_tool_blocks(rendered)
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(prefix))))
+}
+
 // Only use a path basename with the syntax of a skill identifier. Never copy
 // prose, the absolute path, or source record metadata into the replacement.
 fn skill_placeholder(message: &Value) -> Option<Value> {

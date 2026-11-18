@@ -23287,9 +23287,11 @@ fn export_session_task(
         };
 
     let html_messages_from_view = |view: crate::ui::data::ConversationView| {
-        let filename_hidden = !crate::export::is_skill_injection(title)
-            && crate::export::title_is_skill_injection(title, &view.messages);
         let mut raw = crate::conversation_view_to_rendered_raw_messages(&view, include_tools);
+        let filename_hidden = (!crate::export::is_skill_injection(title)
+            && crate::export::title_is_skill_injection(title, &view.messages))
+            || (!include_tools
+                && crate::export::archived_title_has_hidden_pi_tools(title, &view, &raw));
         let mut messages = convert_raw(&mut raw, Some(&view.messages));
         // A source record can expand into several correlated tool messages.
         // Retain its canonical index and author on every expanded message.
@@ -23328,8 +23330,14 @@ fn export_session_task(
     } else if allow_direct_file && session_path.exists() {
         match load_local_export_raw_messages(session_path) {
             Ok((mut raw_messages, _, _)) => {
-                let filename_hidden = !crate::export::is_skill_injection(title)
-                    && crate::export::raw_title_is_skill_injection(title, &raw_messages);
+                let filename_hidden = (!crate::export::is_skill_injection(title)
+                    && crate::export::raw_title_is_skill_injection(title, &raw_messages))
+                    || (!include_tools
+                        && crate::export::raw_title_has_hidden_pi_tools(
+                            title,
+                            &hit.agent,
+                            &raw_messages,
+                        ));
                 let mut messages = convert_raw(&mut raw_messages, None);
                 for message in &mut messages {
                     message.author = message
@@ -23434,29 +23442,39 @@ fn export_session_markdown_task(
     let hit_title = (!hit.title.trim().is_empty()).then_some(hit.title.trim());
     let load_local = || {
         load_local_export_raw_messages(session_path).map(|(messages, title, start)| {
-            let filename_hidden = !filename_title.is_empty()
-                && crate::export::raw_title_is_skill_injection(filename_title, &messages);
+            let title_hidden = |title: &str| {
+                crate::export::raw_title_is_skill_injection(title, &messages)
+                    || (!include_tools
+                        && crate::export::raw_title_has_hidden_pi_tools(
+                            title, &hit.agent, &messages,
+                        ))
+            };
+            let filename_hidden = !filename_title.is_empty() && title_hidden(filename_title);
             let title = title
                 .or_else(|| hit_title.map(str::to_string))
-                .filter(|title| !crate::export::raw_title_is_skill_injection(title, &messages));
+                .filter(|title| !title_hidden(title));
             (messages, title, start, filename_hidden, None)
         })
     };
     let indexed_markdown_view = |view: crate::ui::data::ConversationView| {
-        let filename_hidden =
-            crate::export::title_is_skill_injection(filename_title, &view.messages);
-        let title = view
-            .convo
-            .title
-            .as_deref()
-            .or(hit_title)
-            .filter(|title| !crate::export::title_is_skill_injection(title, &view.messages))
-            .map(str::to_string);
         let messages = if include_tools {
             crate::conversation_view_to_raw_messages(&view)
         } else {
             crate::conversation_view_to_rendered_raw_messages(&view, false)
         };
+        let title_hidden = |title: &str| {
+            crate::export::title_is_skill_injection(title, &view.messages)
+                || (!include_tools
+                    && crate::export::archived_title_has_hidden_pi_tools(title, &view, &messages))
+        };
+        let filename_hidden = title_hidden(filename_title);
+        let title = view
+            .convo
+            .title
+            .as_deref()
+            .or(hit_title)
+            .filter(|title| !title_hidden(title))
+            .map(str::to_string);
         (
             messages,
             title,
@@ -32665,22 +32683,26 @@ mod tests {
         let storage = FrankenStorage::open(&db)?;
         let conn = storage.raw();
         conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'pi_agent', 'Pi', 'local', 0, 0)")?;
+        let tool_title = "[Tool: IndexedTool] note=indexed-input-kept";
         conn.execute_with_params(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'indexed-tools', 'Indexed tools', ?1, 'local', 10)",
-            &[SqliteValue::Text(source.display().to_string().into())],
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'indexed-tools', ?1, ?2, 'local', 10)",
+            &[
+                SqliteValue::Text(tool_title.into()),
+                SqliteValue::Text(source.display().to_string().into()),
+            ],
         )?;
-        conn.execute("INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 3, 'user', 'indexed-prompt-kept')")?;
+        conn.execute("INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 8, 'user', 'indexed-prompt-kept')")?;
         conn.execute("INSERT INTO messages (conversation_id, idx, role, content) VALUES (1, 12, 'custom-role', 'indexed-custom-role-kept')")?;
         let events = [
             (
                 7,
                 "assistant",
-                "indexed-narrative-kept café 界\n[Tool: IndexedTool] note=indexed-input-kept\nindexed-input-continuation\n[Tool: literal discussion] indexed-literal-kept",
+                "[Tool: IndexedTool] note=indexed-input-kept\nindexed-input-continuation\nindexed-narrative-kept café 界\n[Tool: literal discussion] indexed-literal-kept",
                 serde_json::json!({
                     "type":"message", "message":{"role":"assistant", "content":[
-                        {"type":"text","text":"indexed-narrative-kept café 界"},
                         {"type":"toolCall","id":"indexed-call","name":"IndexedTool",
                          "arguments":{"note":"indexed-input-kept\nindexed-input-continuation","registration_token":"synthetic-indexed-551"}},
+                        {"type":"text","text":"indexed-narrative-kept café 界"},
                         {"type":"text","text":"[Tool: literal discussion] indexed-literal-kept"}
                     ]}
                 }),
@@ -32709,20 +32731,22 @@ mod tests {
             "indexed-prompt-kept",
         );
         for include_tools in [true, false] {
+            let html_path = root.path().join(format!("indexed-{include_tools}.html"));
             let result = export_session_task(
                 &db,
                 &hit,
-                &root.path().join(format!("indexed-{include_tools}.html")),
+                &html_path,
                 false,
                 None,
                 true,
                 include_tools,
-                "Indexed tools",
+                tool_title,
                 "Pi",
             );
             let Ok(output_path) = result else {
                 anyhow::bail!("indexed HTML export failed: {result:?}");
             };
+            assert_eq!(output_path == html_path, include_tools);
             let html = std::fs::read_to_string(output_path)?;
             assert!(html.contains("indexed-prompt-kept"));
             assert!(html.contains("indexed-narrative-kept"));
@@ -32742,10 +32766,12 @@ mod tests {
             assert!(!html.contains("synthetic-indexed-551"));
 
             let markdown_path = root.path().join(format!("indexed-{include_tools}.md"));
-            let result = export_session_markdown_task(&db, &hit, &markdown_path, include_tools, "");
+            let result =
+                export_session_markdown_task(&db, &hit, &markdown_path, include_tools, tool_title);
             let Ok(output_path) = result else {
                 anyhow::bail!("indexed Markdown export failed: {result:?}");
             };
+            assert_eq!(output_path == markdown_path, include_tools);
             let markdown = std::fs::read_to_string(output_path)?;
             for narrative in [
                 "indexed-prompt-kept",
