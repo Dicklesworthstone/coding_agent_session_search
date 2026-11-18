@@ -11188,6 +11188,43 @@ impl CassApp {
         task
     }
 
+    fn finish_export_task(&mut self, modal_task: Option<u64>, result: Result<PathBuf, String>) {
+        use crate::ui::components::toast::Toast;
+
+        let owns_form = modal_task.is_some() && modal_task == self.export_modal_task;
+        if owns_form {
+            self.export_modal_task = None;
+        }
+        let toast = match result {
+            Ok(output_path) => {
+                let toast = Toast::success(format!("Exported to {}", output_path.display()));
+                if owns_form {
+                    if self.focus_manager.is_focused(focus_ids::EXPORT_MODAL) {
+                        self.close_export_modal();
+                    } else if let Some(state) = self.export_modal_state.as_mut() {
+                        // Leave the covering overlay's focus trap in place.
+                        state.progress = ExportProgress::Complete(output_path);
+                    }
+                }
+                toast
+            }
+            Err(err) => {
+                let toast = Toast::error(format!("Export failed: {err}"));
+                if owns_form && let Some(state) = self.export_modal_state.as_mut() {
+                    state.progress = ExportProgress::Error(err);
+                }
+                toast
+            }
+        };
+        if self.export_modal_task.is_none()
+            && !self.source_filter_menu_open
+            && !self.show_saved_views_modal
+        {
+            self.status.clone_from(&toast.message);
+        }
+        self.toast_manager.push(toast);
+    }
+
     /// Derive the markdown filename from the HTML filename suggestion.
     fn markdown_filename_from_html(html_filename: &str) -> String {
         if let Some(base) = html_filename.strip_suffix(".html") {
@@ -16438,6 +16475,12 @@ impl super::ftui_adapter::Model for CassApp {
     fn update(&mut self, msg: CassMsg) -> ftui::Cmd<CassMsg> {
         let raw_event = take_raw_event();
 
+        // Background export results must cross overlays that capture keyboard input.
+        if let CassMsg::ExportTaskFinished { modal_task, result } = msg {
+            self.finish_export_task(modal_task, result);
+            return ftui::Cmd::none();
+        }
+
         // Record raw event for model-level macro recording.
         if let Some(ref mut recorder) = self.macro_recorder
             && let Some(ref raw_event) = raw_event
@@ -16491,6 +16534,8 @@ impl super::ftui_adapter::Model for CassApp {
 
         // Export modal intercepts keyboard input for form navigation and text editing.
         if self.show_export_modal
+            && !self.source_filter_menu_open
+            && !self.show_saved_views_modal
             && let Some(ref mut state) = self.export_modal_state
         {
             match &msg {
@@ -16789,7 +16834,6 @@ impl super::ftui_adapter::Model for CassApp {
                     | CassMsg::ExportFocusMoved { .. }
                     | CassMsg::ExportExecuted
                     | CassMsg::ExportMarkdownExecuted
-                    | CassMsg::ExportTaskFinished { .. }
             )
         {
             // Sub-intercept: when find bar is active, route text input there.
@@ -19469,37 +19513,8 @@ impl super::ftui_adapter::Model for CassApp {
                 }
                 ftui::Cmd::none()
             }
-            CassMsg::ExportTaskFinished { modal_task, result } => {
-                use crate::ui::components::toast::Toast;
-
-                let owns_form = modal_task.is_some() && modal_task == self.export_modal_task;
-                let (status, toast) = match result {
-                    Ok(output_path) => {
-                        if owns_form {
-                            self.close_export_modal();
-                        }
-                        let status = format!("Exported to {}", output_path.display());
-                        let toast = Toast::success(status.clone());
-                        (status, toast)
-                    }
-                    Err(err) => {
-                        if owns_form {
-                            self.export_modal_task = None;
-                            if let Some(state) = self.export_modal_state.as_mut() {
-                                state.progress = ExportProgress::Error(err.clone());
-                            }
-                        }
-                        let status = format!("Export failed: {err}");
-                        let toast = Toast::error(status.clone());
-                        (status, toast)
-                    }
-                };
-                if self.export_modal_task.is_none() {
-                    self.status = status;
-                }
-                self.toast_manager.push(toast);
-                ftui::Cmd::none()
-            }
+            // Delivered before modal input routing.
+            CassMsg::ExportTaskFinished { .. } => ftui::Cmd::none(),
 
             // -- Screenshot export --------------------------------------------
             CassMsg::ScreenshotRequested(format) => {
@@ -24860,6 +24875,127 @@ mod tests {
         let markdown = std::fs::read_to_string(root.path().join("current.md"))?;
         assert!(markdown.contains("current export"));
         assert!(!markdown.contains("earlier export"));
+        Ok(())
+    }
+
+    #[test]
+    fn nd6pc_export_results_cross_source_and_saved_view_overlays() -> anyhow::Result<()> {
+        use crate::ui::components::toast::ToastType;
+
+        let root = tempfile::Builder::new()
+            .prefix("cass-covered-export-")
+            .disable_cleanup(true)
+            .tempdir()?;
+        let session = root.path().join("session.jsonl");
+        let input = r#"{"role":"user","content":"export under a covering overlay"}"#;
+        std::fs::write(&session, input)?;
+        for (name, open_overlay, focus, rename) in [
+            (
+                "source",
+                CassMsg::SourceFilterMenuToggled,
+                focus_ids::SOURCE_FILTER_MENU,
+                false,
+            ),
+            (
+                "saved",
+                CassMsg::SavedViewsOpened,
+                focus_ids::SAVED_VIEWS_MODAL,
+                false,
+            ),
+            (
+                "rename",
+                CassMsg::SavedViewsOpened,
+                focus_ids::SAVED_VIEWS_MODAL,
+                true,
+            ),
+        ] {
+            let mut app = app_with_hits(1);
+            app.db_path = root.path().join("absent.db");
+            app.panes[0].hits[0] =
+                make_exact_hit(&session.display().to_string(), "local", 1, "fixture");
+            if rename {
+                let _ = app.update(CassMsg::ViewSaved(1));
+            }
+            // Give the quick export an isolated output directory.
+            app.export_modal_state = Some(ExportModalState {
+                output_dir: root.path().to_path_buf(),
+                filename_preview: format!("quick-{name}.html"),
+                ..Default::default()
+            });
+            let ftui::Cmd::Task(_, quick) = app.update(CassMsg::ExportMarkdownExecuted) else {
+                anyhow::bail!("quick export did not dispatch");
+            };
+
+            let _ = app.update(CassMsg::ExportModalOpened);
+            let state = app.export_modal_state.as_mut().unwrap();
+            // Use a real file as the output directory to force a write error.
+            state.output_dir = if rename {
+                session.clone()
+            } else {
+                root.path().to_path_buf()
+            };
+            state.filename_preview = format!("form-{name}.html");
+            let ftui::Cmd::Task(_, form) = app.update(CassMsg::ExportExecuted) else {
+                anyhow::bail!("form export did not dispatch");
+            };
+            let _ = app.update(open_overlay);
+            assert!(app.focus_manager.is_focused(focus));
+            if rename {
+                let _ = app.update(CassMsg::SavedViewRenameStarted);
+                assert!(app.saved_view_rename_mode);
+                let _ = app.update(CassMsg::QueryChanged(" draft".to_string()));
+                assert!(app.saved_view_rename_buffer.ends_with(" draft"));
+            }
+            let status = app.status.clone();
+            let rename_buffer = app.saved_view_rename_buffer.clone();
+
+            let _ = app.update(quick());
+            assert!(
+                std::fs::read_to_string(root.path().join(format!("quick-{name}.md")))?
+                    .contains("export under a covering overlay")
+            );
+            assert!(app.export_modal_state.as_ref().unwrap().progress.is_busy());
+            assert!(
+                app.toast_manager
+                    .visible()
+                    .any(|toast| toast.toast_type == ToastType::Success
+                        && toast.message.contains(&format!("quick-{name}.md")))
+            );
+
+            let _ = app.update(form());
+            assert!(app.show_export_modal);
+            assert!(app.export_modal_task.is_none());
+            assert!(app.focus_manager.is_focused(focus));
+            assert_eq!(app.status, status);
+            assert_eq!(app.saved_view_rename_buffer, rename_buffer);
+            let state = app.export_modal_state.as_ref().unwrap();
+            if rename {
+                assert!(app.saved_view_rename_mode);
+                assert!(matches!(state.progress, ExportProgress::Error(_)));
+                assert!(state.can_export());
+                assert!(
+                    app.toast_manager
+                        .visible()
+                        .any(|toast| toast.toast_type == ToastType::Error)
+                );
+                let _ = app.update(CassMsg::QuitRequested);
+                assert!(!app.saved_view_rename_mode);
+            } else {
+                let path = root.path().join(format!("form-{name}.html"));
+                assert!(matches!(&state.progress, ExportProgress::Complete(p) if p == &path));
+                assert!(std::fs::read_to_string(path)?.contains("export under a covering overlay"));
+            }
+
+            if let ftui::Cmd::Msg(close) = app.update(CassMsg::QuitRequested) {
+                let _ = app.update(close);
+            }
+            assert!(app.show_export_modal);
+            assert!(app.focus_manager.is_focused(focus_ids::EXPORT_MODAL));
+            let _ = app.update(CassMsg::QuitRequested);
+            assert!(!app.show_export_modal);
+            assert!(app.focus_manager.is_focused(focus_ids::RESULTS_LIST));
+        }
+        assert_eq!(std::fs::read_to_string(session)?, input);
         Ok(())
     }
 
