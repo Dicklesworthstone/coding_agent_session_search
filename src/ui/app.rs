@@ -23533,7 +23533,7 @@ fn export_session_markdown_task(
     if session_title.is_none() {
         for message in &messages {
             if crate::extract_role(message) == "user" {
-                let content = crate::extract_text_content(message);
+                let content = crate::export_rendered_text(message, include_tools);
                 if !content.trim().is_empty() {
                     let first_line = content.lines().next().unwrap_or("Untitled Session");
                     session_title = Some(crate::smart_truncate(first_line, 80));

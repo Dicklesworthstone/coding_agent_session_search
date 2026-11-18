@@ -1045,7 +1045,8 @@ fn nd6pc_raw_and_indexed_export_privacy_flags_are_independent()
 }
 
 #[test]
-fn nd6pc_export_preserves_single_text_blocks() -> Result<(), Box<dyn std::error::Error>> {
+fn nd6pc_export_preserves_single_blocks_and_tool_visibility()
+-> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::Builder::new()
         .prefix("cass-export-single-text-block-")
         .disable_cleanup(true)
@@ -1062,6 +1063,17 @@ fn nd6pc_export_preserves_single_text_blocks() -> Result<(), Box<dyn std::error:
         serde_json::json!({"role":"user","content":{"type":"input_text","text":"ORDINARY_INPUT_OBJECT"}}),
         serde_json::json!({"role":"assistant","content":{"text":"ORDINARY_UNTYPED_OBJECT"}}),
         serde_json::json!({"role":"assistant","content":{"type":"tool_result","text":"TOOL_OBJECT_CANARY"}}),
+        serde_json::json!({"role":"assistant","content":[
+            {"type":"text","text":"ORDINARY_MIXED_ARRAY"},
+            {"type":"tool_use","id":"array","name":"Read","input":{"description":"ARRAY_TOOL_DETAIL"}}
+        ]}),
+        serde_json::json!({"type":"response_item","payload":{"role":"assistant","content":{
+            "type":"tool_use","id":"scalar","name":"ScalarRead","input":{"query":"example"}
+        }}}),
+        serde_json::json!({"type":"user","message":{"role":"user","content":{
+            "type":"tool_result","tool_use_id":"scalar","content":"SCALAR_TOOL_RESULT","is_error":true
+        }}}),
+        serde_json::json!({"role":"tool","content":"STANDALONE_TOOL_DETAIL"}),
     ];
     let mut bytes = Vec::new();
     for record in &records {
@@ -1071,16 +1083,25 @@ fn nd6pc_export_preserves_single_text_blocks() -> Result<(), Box<dyn std::error:
     fs::write(&session, &bytes)?;
 
     for format in ["markdown", "text", "html", "export-html"] {
-        for include_skills in [false, true] {
+        for (include_skills, include_tools) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             let mut cmd = export_privacy_command(root.path());
             if format == "export-html" {
                 cmd.arg("export-html")
                     .arg(&session)
                     .arg("--output-dir")
-                    .arg(root.path().join(format!("output-{include_skills}")))
-                    .args(["--json", "--include-tools=false"]);
+                    .arg(
+                        root.path()
+                            .join(format!("output-{include_skills}-{include_tools}")),
+                    )
+                    .arg("--json")
+                    .arg(format!("--include-tools={include_tools}"));
             } else {
                 cmd.arg("export").arg(&session).args(["--format", format]);
+                if include_tools {
+                    cmd.arg("--include-tools");
+                }
             }
             if include_skills {
                 cmd.arg("--include-skills");
@@ -1088,7 +1109,7 @@ fn nd6pc_export_preserves_single_text_blocks() -> Result<(), Box<dyn std::error:
             let output = cmd.output()?;
             assert!(
                 output.status.success(),
-                "{format}, include_skills={include_skills}: {}",
+                "{format}, skills={include_skills}, tools={include_tools}: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
             let rendered = if format == "export-html" {
@@ -1106,10 +1127,33 @@ fn nd6pc_export_preserves_single_text_blocks() -> Result<(), Box<dyn std::error:
                 "ORDINARY_CODEX_OBJECT café 界",
                 "ORDINARY_INPUT_OBJECT",
                 "ORDINARY_UNTYPED_OBJECT",
+                "ORDINARY_MIXED_ARRAY",
             ] {
                 assert!(rendered.contains(expected), "{format}: missing {expected}");
             }
             assert!(!rendered.contains("TOOL_OBJECT_CANARY"), "{format}");
+            for detail in [
+                "ARRAY_TOOL_DETAIL",
+                "SCALAR_TOOL_RESULT",
+                "STANDALONE_TOOL_DETAIL",
+                "ScalarRead",
+            ] {
+                assert_eq!(
+                    rendered.contains(detail),
+                    include_tools,
+                    "{format}: {detail}"
+                );
+            }
+            if format == "export-html" && include_tools {
+                assert!(rendered.contains(r#"aria-label="ScalarRead: error""#));
+                let prompts = if include_skills {
+                    "3 prompts"
+                } else {
+                    "2 prompts"
+                };
+                assert!(rendered.contains(&format!("<span>{prompts}, ")));
+                assert!(rendered.contains("2 tool uses</span>"));
+            }
             assert_eq!(
                 rendered.contains("PRIVATE_OBJECT_BODY"),
                 include_skills,

@@ -117618,7 +117618,7 @@ fn run_export(
         for msg in &messages {
             let role = extract_role(msg);
             if role == "user" {
-                let content = extract_text_content(msg);
+                let content = export_rendered_text(msg, include_tools);
                 if !content.is_empty() {
                     let first_line = content.lines().next().unwrap_or("Untitled Session");
                     session_title = Some(smart_truncate(first_line, 80));
@@ -118334,7 +118334,7 @@ fn run_export_html(
 
     // Count message types from RAW messages for accuracy.
     // Must distinguish human-typed prompts from tool results, which both have role "user".
-    // Tool results have content as an array containing {"type": "tool_result", ...} blocks.
+    // Tool results can appear as a single block or inside a content array.
     // Use the same selection as the renderer so omitted records don't inflate the counts.
     let mut human_turns = 0usize;
     let mut assistant_msgs = 0usize;
@@ -118345,17 +118345,11 @@ fn run_export_html(
         match role.as_str() {
             "user" => {
                 // Check if this is a tool result return or a human-typed message.
-                // Tool results have content as an array with tool_result type blocks.
-                let is_tool_result = msg
-                    .get("message")
-                    .or(Some(msg))
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_array())
-                    .is_some_and(|arr| {
-                        arr.iter().any(|item| {
-                            item.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                        })
-                    });
+                let is_tool_result = export_content_blocks(msg).is_some_and(|blocks| {
+                    blocks.iter().any(|item| {
+                        item.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                    })
+                });
                 if !is_tool_result {
                     human_turns += 1;
                 }
@@ -118363,12 +118357,7 @@ fn run_export_html(
             "assistant" => {
                 assistant_msgs += 1;
                 // Count tool_use blocks within assistant messages
-                if let Some(content) = msg
-                    .get("message")
-                    .or(Some(msg))
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_array())
-                {
+                if let Some(content) = export_content_blocks(msg) {
                     tool_use_count += content
                         .iter()
                         .filter(|item| {
@@ -118675,10 +118664,23 @@ fn stringify_tool_value(value: &serde_json::Value) -> String {
     }
 }
 
+fn export_content_blocks(msg: &serde_json::Value) -> Option<&[serde_json::Value]> {
+    let content = msg
+        .get("message")
+        .and_then(|inner| inner.get("content"))
+        .or_else(|| msg.get("content"))
+        .or_else(|| msg.get("payload").and_then(|inner| inner.get("content")))?;
+    match content {
+        serde_json::Value::Array(blocks) => Some(blocks),
+        serde_json::Value::Object(_) => Some(std::slice::from_ref(content)),
+        _ => None,
+    }
+}
+
 /// Extract all tool call/result blocks from a message for HTML export.
 ///
 /// Supports multiple formats:
-/// 1. Claude/Anthropic format: `content` array with `type: "tool_use"` or `type: "tool_result"` blocks
+/// 1. Claude/Anthropic format: `content` with `type: "tool_use"` or `type: "tool_result"` blocks
 /// 2. Cursor/generic format: `type: "tool"` at top level with `message.tool_name`, `message.tool_input`, `message.tool_output`
 /// 3. Pi-family format: camelCase `toolCall` blocks and `toolResult` messages
 fn extract_tool_calls(msg: &serde_json::Value) -> Vec<html_export::ToolCall> {
@@ -118754,15 +118756,9 @@ fn extract_tool_calls(msg: &serde_json::Value) -> Vec<html_export::ToolCall> {
         }];
     }
 
-    // Format 1: Claude/Anthropic format - content array with tool_use/tool_result blocks
-    let content = msg
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .or_else(|| msg.get("content"));
-
     let mut tool_calls = Vec::new();
-    if let Some(arr) = content.and_then(|c| c.as_array()) {
-        for block in arr {
+    if let Some(blocks) = export_content_blocks(msg) {
+        for block in blocks {
             if let Some(block_type) = block.get("type").and_then(|t| t.as_str()) {
                 match block_type {
                     "tool_use" | "toolCall" => {
@@ -123538,7 +123534,8 @@ fn format_as_markdown(
         if !matches!(
             role.as_str(),
             "user" | "assistant" | "system" | "tool" | "unknown"
-        ) {
+        ) || (!include_tools && role == "tool")
+        {
             continue;
         }
         match role.as_str() {
@@ -123547,49 +123544,37 @@ fn format_as_markdown(
             _ => md.push_str(&format!("## {}\n\n", role)),
         }
 
-        let content = extract_text_content(msg);
+        let content = export_rendered_text(msg, include_tools);
         if !content.is_empty() {
             md.push_str(&content);
             md.push_str("\n\n");
         }
 
-        // Also handle tool blocks if include_tools is set
-        if include_tools {
-            let content_val = msg
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .or_else(|| msg.get("content"));
-            if let Some(arr) = content_val.and_then(|c| c.as_array()) {
-                for block in arr {
-                    if let Some(block_type) = block.get("type").and_then(|t| t.as_str()) {
-                        match block_type {
-                            "tool_use" => {
-                                let name =
-                                    block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                                md.push_str(&format!("**Tool: {}**\n", name));
-                                if let Some(input) = block.get("input") {
-                                    md.push_str("```json\n");
-                                    md.push_str(
-                                        &serde_json::to_string_pretty(input).unwrap_or_default(),
-                                    );
-                                    md.push_str("\n```\n\n");
-                                }
-                            }
-                            "tool_result" => {
-                                md.push_str("**Tool Result:**\n");
-                                if let Some(c) = block.get("content").and_then(|c| c.as_str()) {
-                                    let preview: String = c.chars().take(500).collect();
-                                    md.push_str("```\n");
-                                    md.push_str(&preview);
-                                    if c.len() > 500 {
-                                        md.push_str("\n... (truncated)");
-                                    }
-                                    md.push_str("\n```\n\n");
-                                }
-                            }
-                            _ => {}
+        if include_tools && let Some(blocks) = export_content_blocks(msg) {
+            for block in blocks {
+                match block.get("type").and_then(serde_json::Value::as_str) {
+                    Some("tool_use") => {
+                        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                        md.push_str(&format!("**Tool: {}**\n", name));
+                        if let Some(input) = block.get("input") {
+                            md.push_str("```json\n");
+                            md.push_str(&serde_json::to_string_pretty(input).unwrap_or_default());
+                            md.push_str("\n```\n\n");
                         }
                     }
+                    Some("tool_result") => {
+                        md.push_str("**Tool Result:**\n");
+                        if let Some(c) = block.get("content").and_then(|c| c.as_str()) {
+                            let preview: String = c.chars().take(500).collect();
+                            md.push_str("```\n");
+                            md.push_str(&preview);
+                            if c.len() > 500 {
+                                md.push_str("\n... (truncated)");
+                            }
+                            md.push_str("\n```\n\n");
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -123606,39 +123591,30 @@ fn format_as_text(messages: &[serde_json::Value], include_tools: bool) -> String
         if !matches!(
             role.as_str(),
             "user" | "assistant" | "system" | "tool" | "unknown"
-        ) {
+        ) || (!include_tools && role == "tool")
+        {
             continue;
         }
         text.push_str(&format!("=== {} ===\n\n", role.to_uppercase()));
 
-        let content = extract_text_content(msg);
+        let content = export_rendered_text(msg, include_tools);
         if !content.is_empty() {
             text.push_str(&content);
             text.push_str("\n\n");
         }
 
-        // Also handle tool blocks if include_tools is set
-        if include_tools {
-            // Check nested message.content for tool blocks
-            let content_val = msg
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .or_else(|| msg.get("content"));
-            if let Some(arr) = content_val.and_then(|c| c.as_array()) {
-                for block in arr {
-                    if let Some(block_type) = block.get("type").and_then(|t| t.as_str())
-                        && block_type == "tool_use"
-                    {
-                        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                        text.push_str(&format!("[Tool: {}]\n", name));
-                    } else if block.get("type").and_then(serde_json::Value::as_str)
-                        == Some("tool_result")
-                        && let Some(output) = block.get("content")
-                    {
-                        text.push_str("[Tool Result]\n");
-                        text.push_str(&stringify_tool_value(output));
-                        text.push_str("\n\n");
-                    }
+        if include_tools && let Some(blocks) = export_content_blocks(msg) {
+            for block in blocks {
+                let kind = block.get("type").and_then(serde_json::Value::as_str);
+                if kind == Some("tool_use") {
+                    let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                    text.push_str(&format!("[Tool: {}]\n", name));
+                } else if kind == Some("tool_result")
+                    && let Some(output) = block.get("content")
+                {
+                    text.push_str("[Tool Result]\n");
+                    text.push_str(&stringify_tool_value(output));
+                    text.push_str("\n\n");
                 }
             }
         }
@@ -123701,7 +123677,8 @@ fn format_as_html(
         if !matches!(
             role.as_str(),
             "user" | "assistant" | "system" | "tool" | "unknown"
-        ) {
+        ) || (!include_tools && role == "tool")
+        {
             continue;
         }
         let role_class = if role == "user" { "user" } else { "assistant" };
@@ -123718,8 +123695,7 @@ fn format_as_html(
         <div class="content">"#
         ));
 
-        // Use extract_text_content for consistent content extraction
-        let content = extract_text_content(msg);
+        let content = export_rendered_text(msg, include_tools);
         // Strip "[Tool: X]" markers when we're showing tool badges
         let content = if include_tools {
             strip_tool_marker(&content)
@@ -123728,63 +123704,55 @@ fn format_as_html(
         };
         html.push_str(&html_escape(&content));
 
-        // Also handle tool use blocks if requested
-        if include_tools {
-            // Check for tool_use in nested message.content array
-            let content_val = msg
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .or_else(|| msg.get("content"));
-            if let Some(arr) = content_val.and_then(|c| c.as_array()) {
-                let mut tool_badges = Vec::new();
-                for block in arr {
-                    if block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
-                        && let Some(output) = block.get("content")
-                    {
-                        html.push_str(
-                            "<div class=\"tool-result\"><strong>Tool Result:</strong><pre>",
-                        );
-                        html.push_str(&html_escape(&stringify_tool_value(output)));
-                        html.push_str("</pre></div>");
-                    }
-                    if let Some("tool_use") = block.get("type").and_then(|t| t.as_str()) {
-                        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                        let icon = match name.to_lowercase().as_str() {
-                            "bash" | "shell" => "💻",
-                            "read" | "read_file" => "📖",
-                            "write" | "write_file" => "📝",
-                            "edit" => "✏️",
-                            "glob" | "find" => "🔍",
-                            "grep" | "search" => "🔎",
-                            "webfetch" | "fetch" | "http" => "🌐",
-                            "websearch" => "🔍",
-                            "task" => "🚀",
-                            _ => "🔧",
-                        };
-                        // Get input preview (truncated)
-                        let input_preview = block
-                            .get("input")
-                            .map(|v| {
-                                let s = serde_json::to_string_pretty(v).unwrap_or_default();
-                                if s.len() > 400 {
-                                    format!("{}…", &s[..s.floor_char_boundary(400)])
-                                } else {
-                                    s
-                                }
-                            })
-                            .unwrap_or_default();
+        if include_tools && let Some(blocks) = export_content_blocks(msg) {
+            let mut tool_badges = Vec::new();
+            for block in blocks {
+                let kind = block.get("type").and_then(serde_json::Value::as_str);
+                if kind == Some("tool_result")
+                    && let Some(output) = block.get("content")
+                {
+                    html.push_str("<div class=\"tool-result\"><strong>Tool Result:</strong><pre>");
+                    html.push_str(&html_escape(&stringify_tool_value(output)));
+                    html.push_str("</pre></div>");
+                }
+                if kind == Some("tool_use") {
+                    let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                    let icon = match name.to_lowercase().as_str() {
+                        "bash" | "shell" => "💻",
+                        "read" | "read_file" => "📖",
+                        "write" | "write_file" => "📝",
+                        "edit" => "✏️",
+                        "glob" | "find" => "🔍",
+                        "grep" | "search" => "🔎",
+                        "webfetch" | "fetch" | "http" => "🌐",
+                        "websearch" => "🔍",
+                        "task" => "🚀",
+                        _ => "🔧",
+                    };
+                    // Get input preview (truncated)
+                    let input_preview = block
+                        .get("input")
+                        .map(|v| {
+                            let s = serde_json::to_string_pretty(v).unwrap_or_default();
+                            if s.len() > 400 {
+                                format!("{}…", &s[..s.floor_char_boundary(400)])
+                            } else {
+                                s
+                            }
+                        })
+                        .unwrap_or_default();
 
-                        let popover_content = if !input_preview.is_empty() {
-                            format!(
-                                r#"<div class="tool-popover-section"><span class="tool-popover-label">Input</span><pre>{}</pre></div>"#,
-                                html_escape(&input_preview)
-                            )
-                        } else {
-                            String::new()
-                        };
+                    let popover_content = if !input_preview.is_empty() {
+                        format!(
+                            r#"<div class="tool-popover-section"><span class="tool-popover-label">Input</span><pre>{}</pre></div>"#,
+                            html_escape(&input_preview)
+                        )
+                    } else {
+                        String::new()
+                    };
 
-                        tool_badges.push(format!(
-                            r#"<span class="tool-badge" tabindex="0">
+                    tool_badges.push(format!(
+                        r#"<span class="tool-badge" tabindex="0">
                                 <span>{icon}</span>
                                 <span class="tool-badge-name">{name}</span>
                                 <div class="tool-popover">
@@ -123792,19 +123760,18 @@ fn format_as_html(
                                     {popover}
                                 </div>
                             </span>"#,
-                            icon = icon,
-                            name = html_escape(name),
-                            popover = popover_content,
-                        ));
-                    }
+                        icon = icon,
+                        name = html_escape(name),
+                        popover = popover_content,
+                    ));
                 }
-                if !tool_badges.is_empty() {
-                    html.push_str(r#"<div class="tool-badges">"#);
-                    for badge in tool_badges {
-                        html.push_str(&badge);
-                    }
-                    html.push_str("</div>");
+            }
+            if !tool_badges.is_empty() {
+                html.push_str(r#"<div class="tool-badges">"#);
+                for badge in tool_badges {
+                    html.push_str(&badge);
                 }
+                html.push_str("</div>");
             }
         }
 
@@ -124121,6 +124088,14 @@ fn extract_text_content_without_tool_blocks(msg: &serde_json::Value) -> String {
         return text;
     }
     String::new()
+}
+
+fn export_rendered_text(msg: &serde_json::Value, include_tools: bool) -> String {
+    if include_tools {
+        extract_text_content(msg)
+    } else {
+        extract_text_content_without_tool_blocks(msg)
+    }
 }
 
 fn extract_text_content(msg: &serde_json::Value) -> String {
