@@ -1770,6 +1770,7 @@ fn nd6pc_all_export_formats_share_complete_message_skill_policy()
         let case_root = root.path().join(variant.to_string());
         fs::create_dir_all(&case_root)?;
         let session = case_root.join("session.jsonl");
+        let tool_record = injection["type"] == "tool";
         let records = [
             serde_json::json!({"id":"prompt","role":"user","content":"FORMATS_ORDINARY_PROMPT café 界"}),
             serde_json::json!({"id":"answer","role":"assistant","content":"FORMATS_ORDINARY_ANSWER: discuss skills and the matchedSkills field.","metadata":{"ok":true,"count":7,"missing":null,"tags":["ordinary"]}}),
@@ -1814,8 +1815,8 @@ fn nd6pc_all_export_formats_share_complete_message_skill_policy()
                     }
                     assert_eq!(
                         exported.contains("WHOLEMESSAGE_BYSTANDER"),
-                        include_skills,
-                        "variant {variant}/{format}"
+                        include_skills && (format == "json" || include_tools || !tool_record),
+                        "variant {variant}/{format}, skills={include_skills}, tools={include_tools}"
                     );
                     if !include_skills {
                         assert!(
