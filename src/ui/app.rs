@@ -24870,7 +24870,7 @@ mod tests {
             .disable_cleanup(true)
             .tempdir()?;
         let db_path = root.path().join("unrelated.db");
-        let conn = fsqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())?;
         conn.execute("CREATE TABLE sentinel (value TEXT)")?;
         conn.execute("INSERT INTO sentinel (value) VALUES ('retain me')")?;
         drop(conn);
