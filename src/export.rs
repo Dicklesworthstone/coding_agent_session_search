@@ -264,7 +264,11 @@ fn title_matches_hidden_pi_tools(
     }
     !std::iter::once(0)
         .chain(visible.match_indices('\n').map(|(index, _)| index + 1))
-        .any(|start| visible[start..].trim_start().starts_with(prefix))
+        .any(|start| {
+            visible[start..]
+                .trim_start_matches(|ch: char| ch != '\n' && ch.is_whitespace())
+                .starts_with(prefix)
+        })
 }
 
 // Only use a path basename with the syntax of a skill identifier. Never copy
@@ -852,7 +856,7 @@ mod tests {
             "type": "text",
             "text": "[Tool: Read] path=fixture password=synthetic-visible-example"
         });
-        let visible = export_messages([tool, literal]);
+        let visible = export_messages([tool.clone(), literal]);
         assert!(!raw_title_has_hidden_pi_tools(
             redacted_title,
             "omp",
@@ -863,6 +867,15 @@ mod tests {
             "[Tool: Read] path=fixture [REDACTED]\nprivate cont...",
             "omp",
             &visible
+        ));
+        let literal = serde_json::json!({
+            "type": "text",
+            "text": "\n \n[Tool: Read] path=fixture password=synthetic-visible-example\nprivate continuation"
+        });
+        assert!(!raw_title_has_hidden_pi_tools(
+            "[Tool: Read] path=fixture [REDACTED]\nprivate cont...",
+            "omp",
+            &export_messages([tool, literal])
         ));
     }
 
