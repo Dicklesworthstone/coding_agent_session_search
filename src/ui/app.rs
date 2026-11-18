@@ -32241,7 +32241,7 @@ mod tests {
     }
 
     #[test]
-    fn nd6pc_tui_markdown_omits_skills_from_source_and_archive() -> anyhow::Result<()> {
+    fn nd6pc_tui_exports_withhold_skill_bodies_from_source_and_archive() -> anyhow::Result<()> {
         use crate::franken_sync::{SqliteValue, compat::RowExt};
         use crate::storage::sqlite::FrankenStorage;
 
@@ -32383,12 +32383,29 @@ mod tests {
         let only_skill = root.path().join("only-skill.jsonl");
         let only_bytes = format!("{}\n", events[0]);
         std::fs::write(&only_skill, &only_bytes)?;
-        let only_hit = make_exact_hit(&only_skill.display().to_string(), "local", 1, "fixture");
+        let mut only_hit = make_exact_hit(&only_skill.display().to_string(), "local", 1, "fixture");
+        only_hit.title.clear();
         let only_output = root.path().join("only-skill.md");
-        let result = export_session_markdown_task(&absent_db, &only_hit, &only_output, true, "");
-        assert_eq!(result.unwrap_err(), "No messages found in session");
-        assert!(!only_output.exists());
+        let output = export_session_markdown_task(&absent_db, &only_hit, &only_output, true, "")
+            .map_err(anyhow::Error::msg)?;
+        let markdown = std::fs::read_to_string(output)?;
+        assert!(markdown.starts_with("# Conversation Export\n"));
+        assert!(markdown.contains("[Skill loaded: private]"));
+        assert!(!markdown.contains("PLAIN_PRIVATE_BODY"));
+        assert!(!markdown.contains("/synthetic/"));
         assert_eq!(std::fs::read(&only_skill)?, only_bytes.as_bytes());
+
+        let reminder = root.path().join("only-reminder.jsonl");
+        let reminder_bytes =
+            r#"{"role":"user","content":"<system-reminder>PRIVATE_REMINDER</system-reminder>"}"#;
+        std::fs::write(&reminder, reminder_bytes)?;
+        let reminder_hit = make_exact_hit(&reminder.display().to_string(), "local", 1, "fixture");
+        let reminder_output = root.path().join("only-reminder.md");
+        let result =
+            export_session_markdown_task(&absent_db, &reminder_hit, &reminder_output, true, "");
+        assert_eq!(result.unwrap_err(), "No messages found in session");
+        assert!(!reminder_output.exists());
+        assert_eq!(std::fs::read_to_string(&reminder)?, reminder_bytes);
 
         let db = root.path().join("archive.db");
         let missing = root.path().join("missing.jsonl");
@@ -32442,6 +32459,7 @@ mod tests {
             assert!(markdown.starts_with("# Indexed ordinary\n"));
             assert!(markdown.contains("INDEXED_ORDINARY_PROMPT café 界"));
             assert!(markdown.contains("INDEXED_ORDINARY_ANSWER"));
+            assert!(markdown.contains("[Skill loaded: private]"));
             assert!(!markdown.contains("PLAIN_PRIVATE_BODY"));
             assert!(!markdown.contains("ARCHIVED_PRIVATE_NARRATIVE"));
         }
@@ -32517,6 +32535,7 @@ mod tests {
             let html = std::fs::read_to_string(output_path)?;
             assert!(html.contains("<title>INDEXED_ORDINARY_PROMPT café 界</title>"));
             assert!(html.contains("INDEXED_ORDINARY_ANSWER"));
+            assert!(html.contains("[Skill loaded: private]"));
             for omitted in [
                 "PLAIN_PRIVATE_BODY",
                 "ARCHIVE_PRIVATE_TITLE",
@@ -32565,7 +32584,7 @@ mod tests {
                 {"type":"tool_result","tool_use_id":"call-beta","content":"result-beta-kept"}
             ]}),
             serde_json::json!({"role":"tool","content":"standalone-tool-kept"}),
-            serde_json::json!({"role":"user","content":"Base directory for this skill: private-skill-omitted"}),
+            serde_json::json!({"role":"user","content":"Base directory for this skill: /synthetic/private-skill\nprivate-skill-body-omitted"}),
             serde_json::json!({"role":"custom-role","content":"custom-role-kept café 界"}),
             serde_json::json!({"role":"function","content":"function-tool-kept"}),
             serde_json::json!({"role":"agent","content":"agent-alias-kept"}),
@@ -32621,7 +32640,9 @@ mod tests {
                 );
             }
             assert!(!html.contains("synthetic-tools-551"));
-            assert!(!html.contains("private-skill-omitted"));
+            assert!(html.contains("[Skill loaded: private-skill]"));
+            assert!(!html.contains("private-skill-body-omitted"));
+            assert!(!html.contains("/synthetic/private-skill"));
             assert!(!html.contains("bookkeeping-omitted"));
             if include_tools {
                 assert!(html.contains("[REDACTED]"));
