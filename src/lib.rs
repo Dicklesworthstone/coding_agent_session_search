@@ -119647,18 +119647,19 @@ mod export_timestamp_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn export_html_reports_file_read_errors_instead_of_truncating() {
-        let temp = TempDir::new().expect("temp dir");
-        let session_path = temp.path().join("broken-session.jsonl");
-        fs::write(
-            &session_path,
-            b"{\"role\":\"user\",\"content\":\"hello\"}\n\xff\n",
-        )
-        .expect("write invalid session");
+        let temp = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .expect("temp dir");
+        let session_path = temp.path().join("unreadable-session.jsonl");
+        // On Unix, opening the directory succeeds and reading from it fails.
+        fs::create_dir(&session_path).expect("create directory with a JSONL suffix");
 
         let err = run_export_html(
             &session_path,
-            None,
+            Some(temp.path().join("absent.db")),
             None,
             Some(temp.path()),
             Some("out.html"),
@@ -119675,7 +119676,7 @@ mod export_timestamp_tests {
             false,
             None,
         )
-        .expect_err("invalid utf-8 should fail explicitly");
+        .expect_err("reader failure should fail explicitly");
 
         assert_eq!(err.kind, "file-read");
         assert!(
@@ -119683,6 +119684,48 @@ mod export_timestamp_tests {
             "unexpected error: {}",
             err.message
         );
+        assert!(!temp.path().join("out.html").exists());
+        assert!(session_path.is_dir());
+    }
+
+    #[test]
+    fn export_html_keeps_valid_records_around_invalid_utf8() {
+        let temp = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .expect("temp dir");
+        let session_path = temp.path().join("partially-damaged.jsonl");
+        let bytes = b"{\"role\":\"user\",\"content\":\"before-corruption\"}\n\
+            \xff{\"role\":\"user\",\"content\":\"corrupt-record-canary\"}\n\
+            {\"role\":\"assistant\",\"content\":\"after-corruption\"}\n";
+        fs::write(&session_path, bytes).expect("write damaged session fixture");
+
+        run_export_html(
+            &session_path,
+            Some(temp.path().join("absent.db")),
+            None,
+            Some(temp.path()),
+            Some("out.html"),
+            false,
+            false,
+            true,
+            true,
+            false,
+            Default::default(),
+            false,
+            "system",
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("intact records should still export");
+
+        let html = fs::read_to_string(temp.path().join("out.html")).expect("read exported HTML");
+        assert!(html.contains("before-corruption"));
+        assert!(html.contains("after-corruption"));
+        assert!(!html.contains("corrupt-record-canary"));
+        assert_eq!(fs::read(&session_path).expect("read fixture"), bytes);
     }
 
     #[test]
