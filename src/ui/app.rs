@@ -23260,7 +23260,7 @@ fn export_session_task(
                        archived: Option<&[crate::model::types::Message]>,
                        pi_family_export| {
         let mut privacy = crate::export::ExportPrivacy::new(false);
-        let selected = crate::export::select_html_source_records(raw, archived, false).map(
+        let selected = crate::export::select_export_records(raw, archived, Default::default()).map(
             |(index, message)| {
                 let explicit_role = message
                     .get("role")
@@ -23302,7 +23302,12 @@ fn export_session_task(
         for message in &mut messages {
             if let Some(archived) = message.index.and_then(|i| view.messages.get(i)) {
                 message.index = Some(archived.idx.max(0) as usize);
-                message.author.clone_from(&archived.author);
+                // A replacement system message must not inherit the hidden author.
+                if message.role != "system"
+                    || archived.role != crate::model::types::MessageRole::User
+                {
+                    message.author.clone_from(&archived.author);
+                }
             }
         }
         (messages, filename_hidden)
@@ -23444,7 +23449,7 @@ fn export_session_markdown_task(
             let title = title
                 .or_else(|| hit_title.map(str::to_string))
                 .filter(|title| !crate::export::raw_title_is_skill_injection(title, &messages));
-            (messages, title, start, filename_hidden)
+            (messages, title, start, filename_hidden, None)
         })
     };
     let indexed_markdown_view = |view: crate::ui::data::ConversationView| {
@@ -23458,14 +23463,15 @@ fn export_session_markdown_task(
             .filter(|title| !crate::export::title_is_skill_injection(title, &view.messages))
             .map(str::to_string);
         (
-            crate::conversation_view_to_raw_messages(&view, false),
+            crate::conversation_view_to_raw_messages(&view),
             title,
             view.convo.started_at,
             filename_hidden,
+            Some(view.messages),
         )
     };
 
-    let (mut messages, mut session_title, session_start, filename_hidden) = if prefer_direct_file {
+    let loaded = if prefer_direct_file {
         match load_local() {
             Ok(loaded) => loaded,
             Err(local_err) => match load_indexed_export_view(db_path, hit) {
@@ -23502,7 +23508,14 @@ fn export_session_markdown_task(
         return Err(format!("Session not found: {}", hit.source_path));
     };
 
-    messages.retain(|message| !crate::export::message_is_skill_injection(message));
+    let (mut raw_messages, mut session_title, session_start, filename_hidden, archived) = loaded;
+    let mut messages: Vec<_> = crate::export::select_export_records(
+        &mut raw_messages,
+        archived.as_deref(),
+        Default::default(),
+    )
+    .map(|(_, record)| std::mem::take(record))
+    .collect();
     if session_title
         .as_deref()
         .is_some_and(crate::export::is_skill_injection)
@@ -32273,6 +32286,7 @@ mod tests {
             let markdown = std::fs::read_to_string(output_path)?;
             assert!(markdown.starts_with("# MARKDOWN_ORDINARY_PROMPT café 界\n"));
             assert!(markdown.contains("MARKDOWN_ORDINARY_ANSWER"));
+            assert!(markdown.contains("[Skill loaded: private]"));
             for omitted in [
                 "PLAIN_PRIVATE_BODY",
                 "ARG_PRIVATE_NARRATIVE",
@@ -32354,6 +32368,7 @@ mod tests {
             assert!(html.contains(&format!("<title>{expected_title}</title>")));
             assert!(html.contains("MARKDOWN_ORDINARY_ANSWER"));
             assert!(!html.contains("PLAIN_PRIVATE_BODY"));
+            assert!(html.contains("[Skill loaded: private]"));
             assert!(!html.contains("REDACTION_ORDER_PRIVATE_NARRATIVE"));
             assert!(!html.contains("REDACTION_ORDER_PRIVATE_TITLE"));
             assert!(!html.contains("REDACTION_ORDER_PRIVATE_NARR…"));

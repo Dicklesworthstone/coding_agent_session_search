@@ -74,26 +74,77 @@ impl ExportPrivacy {
     }
 }
 
-/// Whole-message skill and hook injections excluded from handoffs and exports
-/// unless the caller explicitly opts in. Inspect the full message before any
-/// excerpt truncation so a retained suffix cannot hide its injection marker.
-pub(crate) fn is_skill_injection(content: &str) -> bool {
-    content.contains("Base directory for this skill:")
-        || content.contains("<system-reminder>")
-        || content.contains("The following skills are available for use with the Skill tool:")
-        || (content.contains("skillInjection:") && content.contains("matchedSkills"))
-        || content.contains("<!-- skillInjection:")
+const SKILL_DIRECTORY_MARKER: &str = "Base directory for this skill:";
+
+#[derive(Clone, Copy, Debug, Default, clap::Args)]
+pub struct ExportInjections {
+    /// Include the full content of injected skills.
+    #[arg(long)]
+    pub include_skills: bool,
+    /// Include injected system reminders and hook metadata.
+    #[arg(long)]
+    pub include_system_reminders: bool,
 }
 
-/// Inspect the complete source record, including tool data and metadata.
-/// Serialization also preserves paired hook markers split across fields.
-pub(crate) fn message_is_skill_injection(message: &Value) -> bool {
-    is_skill_injection(&message.to_string())
+impl ExportInjections {
+    #[cfg(test)]
+    pub(crate) const INCLUDE_ALL: Self = Self {
+        include_skills: true,
+        include_system_reminders: true,
+    };
+
+    fn excludes(self, content: &str) -> bool {
+        (!self.include_skills && content.contains(SKILL_DIRECTORY_MARKER))
+            || (!self.include_system_reminders
+                && (content.contains("<system-reminder>")
+                    || content.contains(
+                        "The following skills are available for use with the Skill tool:",
+                    )
+                    || (content.contains("skillInjection:") && content.contains("matchedSkills"))
+                    || content.contains("<!-- skillInjection:")))
+    }
+
+    fn excludes_raw(self, message: &Value) -> bool {
+        (!self.include_skills || !self.include_system_reminders)
+            && self.excludes(&message.to_string())
+    }
+
+    fn excludes_archived(self, message: &Message) -> bool {
+        self.excludes(&message.content)
+            || (!message.extra_json.is_null() && self.excludes_raw(&message.extra_json))
+    }
+
+    fn excludes_record(self, raw: &Value, archived: Option<&Message>) -> bool {
+        self.excludes_raw(raw) || archived.is_some_and(|message| self.excludes_archived(message))
+    }
+
+    pub(crate) fn excludes_title(self, title: &str, raw: &[Value], archived: &[Message]) -> bool {
+        if self.include_skills && self.include_system_reminders {
+            return false;
+        }
+        self.excludes(title)
+            || derived_title_prefix(title).is_some_and(|prefix| {
+                archived.iter().any(|message| {
+                    message.content.trim_start().starts_with(prefix)
+                        && self.excludes_archived(message)
+                }) || raw.iter().any(|message| {
+                    crate::extract_text_content(message)
+                        .trim_start()
+                        .starts_with(prefix)
+                        && self.excludes_raw(message)
+                })
+            })
+    }
+}
+
+/// Whole-message skill and hook injections omitted from handoffs and previews.
+pub(crate) fn is_skill_injection(content: &str) -> bool {
+    ExportInjections::default().excludes(content)
 }
 
 /// A normalized archive row can retain a marker only in its source envelope.
 pub(crate) fn archived_message_is_skill_injection(message: &Message) -> bool {
-    !message.extra_json.is_null() && message_is_skill_injection(&message.extra_json)
+    ExportInjections::default().excludes_archived(message)
 }
 
 /// Generated titles can preserve the start of a skill message after its
@@ -109,44 +160,64 @@ fn derived_title_prefix(title: &str) -> Option<&str> {
 }
 
 pub(crate) fn title_is_skill_injection(title: &str, archived: &[Message]) -> bool {
-    is_skill_injection(title)
-        || derived_title_prefix(title).is_some_and(|prefix| {
-            archived.iter().any(|message| {
-                message.content.trim_start().starts_with(prefix)
-                    && (is_skill_injection(&message.content)
-                        || archived_message_is_skill_injection(message))
-            })
-        })
+    ExportInjections::default().excludes_title(title, &[], archived)
 }
 
 pub(crate) fn raw_title_is_skill_injection(title: &str, messages: &[Value]) -> bool {
-    is_skill_injection(title)
-        || derived_title_prefix(title).is_some_and(|prefix| {
-            messages.iter().any(|message| {
-                crate::extract_text_content(message)
-                    .trim_start()
-                    .starts_with(prefix)
-                    && message_is_skill_injection(message)
-            })
-        })
+    ExportInjections::default().excludes_title(title, messages, &[])
 }
 
-/// Select original records before redaction can erase a skill marker.
-/// Keep source indexes for HTML rendering and archive message lookup.
-pub(crate) fn select_html_source_records<'a>(
+// Only use a path basename with the syntax of a skill identifier. Never copy
+// prose, the absolute path, or source record metadata into the replacement.
+fn skill_placeholder(message: &Value) -> Option<Value> {
+    if crate::extract_role(message) != "user" {
+        return None;
+    }
+    let content = crate::extract_text_content_without_tool_blocks(message);
+    let directory = content
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix(SKILL_DIRECTORY_MARKER))?
+        .trim()
+        .trim_end_matches(['/', '\\']);
+    let name = directory.rsplit(['/', '\\']).next().filter(|name| {
+        name.len() <= 64
+            && name
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    });
+    Some(serde_json::json!({
+        "role": "system",
+        "content": format!("[Skill loaded: {}]", name.unwrap_or("unknown")),
+    }))
+}
+
+/// Apply the policy before credential redaction can erase an injection marker.
+/// Keep source indexes for HTML rendering and indexed record lookup.
+pub(crate) fn select_export_records<'a>(
     raw_messages: &'a mut [Value],
     archived_messages: Option<&'a [Message]>,
-    include_skills: bool,
+    injections: ExportInjections,
 ) -> impl Iterator<Item = (usize, &'a mut Value)> {
     raw_messages
         .iter_mut()
         .enumerate()
-        .filter(move |(index, message)| {
-            include_skills
-                || (!message_is_skill_injection(message)
-                    && !archived_messages
-                        .and_then(|archived| archived.get(*index))
-                        .is_some_and(archived_message_is_skill_injection))
+        .filter_map(move |(index, message)| {
+            let archived = archived_messages.and_then(|archived| archived.get(index));
+            if injections.excludes_record(message, archived) {
+                let reminders = ExportInjections {
+                    include_skills: true,
+                    ..injections
+                };
+                if injections.include_skills || reminders.excludes_record(message, archived) {
+                    return None;
+                }
+                *message = skill_placeholder(message)?;
+            }
+            Some((index, message))
         })
 }
 

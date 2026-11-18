@@ -893,15 +893,169 @@ fn export_redaction_covers_unredacted_archive_with_never_created_source()
 }
 
 #[test]
+fn nd6pc_raw_and_indexed_export_privacy_flags_are_independent()
+-> Result<(), Box<dyn std::error::Error>> {
+    use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use coding_agent_search::storage::sqlite::SqliteStorage;
+
+    let root = tempfile::Builder::new()
+        .prefix("cass-export-injection-opt-ins-")
+        .disable_cleanup(true)
+        .tempdir()?;
+    let raw = root.path().join("direct.jsonl");
+    let indexed = root.path().join("indexed-only.jsonl");
+    let db_path = root.path().join("data/agent_search.db");
+    fs::create_dir_all(root.path().join("data"))?;
+    let records = [
+        serde_json::json!({"role":"user", "content":"SKILLBODYPRIVATE\nBase directory for this skill: /home/private-user/.claude/skills/example-skill/"}),
+        serde_json::json!({"role":"user", "content":"HOOKBODYPRIVATE", "metadata":{"hook":"<system-reminder>hook detail</system-reminder>"}}),
+        serde_json::json!({"role":"user", "content":"Base directory for this skill: C:\\private-user\\mixed-skill\n<system-reminder>MIXEDBODYPRIVATE</system-reminder>"}),
+        serde_json::json!({"role":"user", "content":"Ordinary prompt café 界"}),
+    ];
+    let mut bytes = Vec::new();
+    for record in &records {
+        serde_json::to_writer(&mut bytes, record)?;
+        bytes.push(b'\n');
+    }
+    fs::write(&raw, &bytes)?;
+
+    let storage = SqliteStorage::open(&db_path)?;
+    let agent = storage.ensure_agent(&Agent {
+        id: None,
+        slug: "codex".into(),
+        name: "Codex".into(),
+        version: None,
+        kind: AgentKind::Cli,
+    })?;
+    let indexed_messages = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| Message {
+            id: None,
+            idx: index as i64,
+            role: MessageRole::User,
+            author: None,
+            created_at: None,
+            content: record["content"].as_str().unwrap_or_default().into(),
+            extra_json: record.clone(),
+            snippets: Vec::new(),
+        })
+        .collect();
+    storage.insert_conversation_tree(
+        agent,
+        None,
+        &Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("injection-independence".into()),
+            title: Some("HOOKBODYPRIVATE…".into()),
+            source_path: indexed.clone(),
+            started_at: None,
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: indexed_messages,
+            source_id: "local".into(),
+            origin_host: None,
+        },
+    )?;
+    drop(storage);
+    let db_before = fs::read(&db_path)?;
+    let wal_path = db_path.with_extension("db-wal");
+    let wal_before = fs::read(&wal_path).ok();
+    for (path, archive_only) in [(&raw, false), (&indexed, true)] {
+        for (skills, reminders) in [(false, false), (true, false), (false, true), (true, true)] {
+            for format in ["markdown", "json", "export-html"] {
+                let mut cmd = export_privacy_command(root.path());
+                if format == "export-html" {
+                    cmd.arg("export-html")
+                        .arg(path)
+                        .arg("--output-dir")
+                        .arg(root.path().join("exports"))
+                        .arg("--json");
+                } else {
+                    cmd.arg("export").arg(path).args(["--format", format]);
+                }
+                if archive_only {
+                    cmd.args(["--source", "local"]);
+                }
+                if skills {
+                    cmd.arg("--include-skills");
+                }
+                if reminders {
+                    cmd.arg("--include-system-reminders");
+                }
+                let output = cmd.output()?;
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let rendered = if format == "export-html" {
+                    let receipt: Value = serde_json::from_slice(&output.stdout)?;
+                    let out = Path::new(
+                        receipt["exported"]["output_path"]
+                            .as_str()
+                            .ok_or("export path")?,
+                    );
+                    let name = out
+                        .file_name()
+                        .ok_or("filename")?
+                        .to_string_lossy()
+                        .to_ascii_lowercase();
+                    assert_eq!(
+                        name.contains("hookbodyprivate"),
+                        reminders && (archive_only || !skills)
+                    );
+                    fs::read_to_string(out)?
+                } else {
+                    String::from_utf8(output.stdout)?
+                };
+                assert!(rendered.contains("Ordinary prompt café 界"));
+                assert_eq!(
+                    rendered.contains("SKILLBODYPRIVATE"),
+                    skills,
+                    "{archive_only} {format}"
+                );
+                assert_eq!(
+                    rendered.contains("HOOKBODYPRIVATE"),
+                    reminders,
+                    "{archive_only} {format}"
+                );
+                assert_eq!(rendered.contains("MIXEDBODYPRIVATE"), skills && reminders);
+                assert_eq!(rendered.contains("[Skill loaded: example-skill]"), !skills);
+                assert_eq!(
+                    rendered.contains("[Skill loaded: mixed-skill]"),
+                    !skills && reminders
+                );
+                assert_eq!(rendered.contains("/home/private-user/"), skills);
+            }
+        }
+    }
+    assert_eq!(fs::read(raw)?, bytes);
+    assert!(!indexed.exists());
+    assert_eq!(fs::read(db_path)?, db_before);
+    assert_eq!(fs::read(wal_path).ok(), wal_before);
+    Ok(())
+}
+
+#[test]
 fn nd6pc_html_omits_an_all_filtered_session_without_writing_an_artifact()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = TempDir::new()?;
-    let session = root.path().join("skill.jsonl");
-    let bytes = br#"{"role":"user","content":"Base directory for this skill: /synthetic/only\nONLY_PRIVATE_SKILL"}
+    let session = root.path().join("reminder.jsonl");
+    let bytes =
+        br#"{"role":"user","content":"<system-reminder>ONLY_PRIVATE_REMINDER</system-reminder>"}
 "#;
     fs::write(&session, bytes)?;
     let directory = root.path().join("exports");
-    for option in [None, Some("--dry-run"), Some("--explain")] {
+    for option in [
+        None,
+        Some("--dry-run"),
+        Some("--explain"),
+        Some("--include-skills"),
+    ] {
         let mut cmd = export_privacy_command(root.path());
         cmd.arg("export-html")
             .arg(&session)
@@ -923,7 +1077,7 @@ fn nd6pc_html_omits_an_all_filtered_session_without_writing_an_artifact()
         .arg(&session)
         .arg("--output-dir")
         .arg(&directory)
-        .args(["--json", "--include-skills"])
+        .args(["--json", "--include-system-reminders"])
         .output()?;
     assert!(
         output.status.success(),
@@ -936,7 +1090,17 @@ fn nd6pc_html_omits_an_all_filtered_session_without_writing_an_artifact()
             .as_str()
             .ok_or("output path missing")?,
     )?;
-    assert!(result.contains("ONLY_PRIVATE_SKILL"));
+    assert!(result.contains("ONLY_PRIVATE_REMINDER"));
+    assert_eq!(fs::read(session)?, bytes);
+
+    let session = root.path().join("skill.jsonl");
+    let bytes = br#"{"role":"user","content":"Base directory for this skill: /synthetic/only-skill\nONLY_PRIVATE_SKILL"}
+"#;
+    fs::write(&session, bytes)?;
+    let (_, html) = export_privacy_html(root.path(), &session, None, false, false)?;
+    assert!(html.contains("[Skill loaded: only-skill]"));
+    assert!(!html.contains("ONLY_PRIVATE_SKILL"));
+    assert!(!html.contains("/synthetic/"));
     assert_eq!(fs::read(session)?, bytes);
     Ok(())
 }
@@ -1338,21 +1502,21 @@ fn nd6pc_explicit_titles_follow_skill_policy() -> Result<(), Box<dyn std::error:
             "text":"TITLE_ORDINARY_PROMPT café 界"
         }))?,
     )?;
-    for (title, html_title, private) in [
+    for (title, html_title, opt_in) in [
         (
             "Base directory for this skill: /synthetic/TITLESECRETALPHA",
             "Base directory for this skill: /synthetic/TITLESECRETALPHA",
-            true,
+            Some("--include-skills"),
         ),
         (
             "<system-reminder>TITLESECRETALPHA</system-reminder>",
             "&lt;system-reminder&gt;TITLESECRETALPHA&lt;/system-reminder&gt;",
-            true,
+            Some("--include-system-reminders"),
         ),
         (
             "Ordinary explicit title café 界",
             "Ordinary explicit title café 界",
-            false,
+            None,
         ),
     ] {
         fs::write(
@@ -1366,7 +1530,13 @@ fn nd6pc_explicit_titles_follow_skill_policy() -> Result<(), Box<dyn std::error:
             .into_iter()
             .map(|path| Ok((path, fs::read(path)?, fs::metadata(path)?)))
             .collect::<Result<Vec<_>, std::io::Error>>()?;
-        for include_skills in [false, true] {
+        for flags in [
+            [].as_slice(),
+            ["--include-skills"].as_slice(),
+            ["--include-system-reminders"].as_slice(),
+            ["--include-skills", "--include-system-reminders"].as_slice(),
+        ] {
+            let reveal_private = opt_in.is_some_and(|flag| flags.contains(&flag));
             for format in ["markdown", "html", "export-html"] {
                 let mut cmd = export_privacy_command(root.path());
                 if format == "export-html" {
@@ -1378,9 +1548,7 @@ fn nd6pc_explicit_titles_follow_skill_policy() -> Result<(), Box<dyn std::error:
                 } else {
                     cmd.arg("export").arg(&session).args(["--format", format]);
                 }
-                if include_skills {
-                    cmd.arg("--include-skills");
-                }
+                cmd.args(flags);
                 let output = cmd.output()?;
                 assert!(
                     output.status.success(),
@@ -1396,7 +1564,7 @@ fn nd6pc_explicit_titles_follow_skill_policy() -> Result<(), Box<dyn std::error:
                             .and_then(Value::as_str)
                             .ok_or("output path missing")?,
                     );
-                    if !include_skills {
+                    if !reveal_private {
                         assert!(
                             !path
                                 .file_name()
@@ -1413,10 +1581,10 @@ fn nd6pc_explicit_titles_follow_skill_policy() -> Result<(), Box<dyn std::error:
                 assert!(exported.contains("TITLE_ORDINARY_PROMPT café 界"));
                 assert_eq!(
                     exported.contains("TITLESECRETALPHA"),
-                    private && include_skills,
-                    "{format}, {title}, include_skills={include_skills}"
+                    reveal_private,
+                    "{format}, {title}, {flags:?}"
                 );
-                let expected_title = if private && !include_skills {
+                let expected_title = if opt_in.is_some() && !reveal_private {
                     "TITLE_ORDINARY_PROMPT café 界"
                 } else {
                     title
@@ -1424,7 +1592,7 @@ fn nd6pc_explicit_titles_follow_skill_policy() -> Result<(), Box<dyn std::error:
                 if format == "markdown" {
                     assert!(exported.starts_with(&format!("# {expected_title}\n")));
                 } else {
-                    let expected = if private && !include_skills {
+                    let expected = if opt_in.is_some() && !reveal_private {
                         "TITLE_ORDINARY_PROMPT café 界"
                     } else {
                         html_title
@@ -1486,7 +1654,7 @@ fn nd6pc_all_export_formats_share_complete_message_skill_policy()
                     let mut cmd = export_privacy_command(&case_root);
                     cmd.arg("export").arg(&session).args(["--format", format]);
                     if include_skills {
-                        cmd.arg("--include-skills");
+                        cmd.args(["--include-skills", "--include-system-reminders"]);
                     }
                     if include_tools {
                         cmd.arg("--include-tools");

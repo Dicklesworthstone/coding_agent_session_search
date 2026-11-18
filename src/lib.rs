@@ -1420,9 +1420,8 @@ pub enum Commands {
         /// Include tool use details in export
         #[arg(long)]
         include_tools: bool,
-        /// Include skill content in export (default: stripped for privacy)
-        #[arg(long)]
-        include_skills: bool,
+        #[command(flatten)]
+        injections: crate::export::ExportInjections,
         /// Include credentials from the source text (sensitive output).
         /// By default exports redact recognized secrets, regardless of index settings.
         #[arg(long)]
@@ -1482,11 +1481,8 @@ pub enum Commands {
         #[arg(long)]
         no_cdns: bool,
 
-        /// Include skill content in export (default: stripped for privacy).
-        /// Skills injected by Claude Code/Codex contain proprietary SKILL.md
-        /// content that should not appear in shared/published exports.
-        #[arg(long)]
-        include_skills: bool,
+        #[command(flatten)]
+        injections: crate::export::ExportInjections,
 
         /// Include credentials from the source text (sensitive output, even when encrypted).
         /// By default exports redact recognized secrets, regardless of index settings.
@@ -9491,7 +9487,7 @@ async fn execute_cli(
                     output,
                     clipboard,
                     include_tools,
-                    include_skills,
+                    injections,
                     include_secrets,
                 } => {
                     run_export(
@@ -9502,7 +9498,7 @@ async fn execute_cli(
                         output.as_deref(),
                         clipboard,
                         include_tools,
-                        include_skills,
+                        injections,
                         include_secrets,
                     )?;
                 }
@@ -9516,7 +9512,7 @@ async fn execute_cli(
                     include_tools,
                     show_timestamps,
                     no_cdns,
-                    include_skills,
+                    injections,
                     include_secrets,
                     theme,
                     dry_run,
@@ -9536,7 +9532,7 @@ async fn execute_cli(
                         include_tools,
                         show_timestamps,
                         !no_cdns,
-                        include_skills,
+                        injections,
                         include_secrets,
                         &theme,
                         dry_run,
@@ -109340,14 +109336,9 @@ fn role_to_export_string(role: &crate::model::types::MessageRole) -> String {
 
 fn conversation_view_to_raw_messages(
     view: &crate::ui::data::ConversationView,
-    include_archived_skill_records: bool,
 ) -> Vec<serde_json::Value> {
     view.messages
         .iter()
-        .filter(|message| {
-            include_archived_skill_records
-                || !crate::export::archived_message_is_skill_injection(message)
-        })
         .map(|msg| {
             let mut json_msg = serde_json::json!({
                 "role": role_to_export_string(&msg.role),
@@ -109373,7 +109364,7 @@ fn conversation_view_to_html_raw_messages(
 ) -> Vec<serde_json::Value> {
     // The HTML selector receives the original archive rows alongside this
     // projection, so keep them aligned by position here.
-    let mut messages = conversation_view_to_raw_messages(view, true);
+    let mut messages = conversation_view_to_raw_messages(view);
     if !matches!(view.convo.agent_slug.as_str(), "pi_agent" | "omp") {
         return messages;
     }
@@ -109608,7 +109599,7 @@ fn try_load_indexed_conversation_from_db_with_source(
 fn serialize_indexed_view_lines(
     view: &crate::ui::data::ConversationView,
 ) -> CliResult<Vec<String>> {
-    conversation_view_to_raw_messages(view, true)
+    conversation_view_to_raw_messages(view)
         .into_iter()
         .map(|msg| {
             serde_json::to_string(&msg).map_err(|e| CliError {
@@ -110134,7 +110125,7 @@ mod gh427_tolerant_jsonl_tests {
             Some(&output),
             false,
             true,
-            true,
+            crate::export::ExportInjections::INCLUDE_ALL,
             false,
         )
         .expect("export must retain tool results before Pi control records");
@@ -110163,7 +110154,7 @@ mod gh427_tolerant_jsonl_tests {
             Some(&json_output),
             false,
             true,
-            true,
+            crate::export::ExportInjections::INCLUDE_ALL,
             false,
         )
         .expect("JSON export must retain the recovered complete tool result");
@@ -110187,7 +110178,7 @@ mod gh427_tolerant_jsonl_tests {
             Some(&text_output),
             false,
             true,
-            true,
+            crate::export::ExportInjections::INCLUDE_ALL,
             false,
         )
         .unwrap();
@@ -117429,7 +117420,7 @@ fn run_export(
     output: Option<&Path>,
     clipboard: bool,
     include_tools: bool,
-    include_skills: bool,
+    injections: crate::export::ExportInjections,
     include_secrets: bool,
 ) -> CliResult<()> {
     use std::fs::File;
@@ -117463,6 +117454,7 @@ fn run_export(
     }
 
     let mut messages: Vec<serde_json::Value>;
+    let mut archived_messages = None;
     let indexed_title = indexed_view
         .as_ref()
         .and_then(|view| view.convo.title.clone());
@@ -117488,7 +117480,8 @@ fn run_export(
                     session_title = view.convo.title.clone();
                     session_start = view.convo.started_at;
                     _session_end = view.convo.ended_at;
-                    messages = conversation_view_to_raw_messages(view, include_skills);
+                    messages = conversation_view_to_raw_messages(view);
+                    archived_messages = Some(view.messages.as_slice());
                 } else {
                     return Err(err);
                 }
@@ -117498,7 +117491,8 @@ fn run_export(
         session_title = view.convo.title.clone();
         session_start = view.convo.started_at;
         _session_end = view.convo.ended_at;
-        messages = conversation_view_to_raw_messages(view, include_skills);
+        messages = conversation_view_to_raw_messages(view);
+        archived_messages = Some(view.messages.as_slice());
     } else if allow_direct_file && detect_opencode_sqlite_session(path) {
         // OpenCode SQLite-backed session: path is db_path/session_id (#149)
         match load_opencode_sqlite_session_for_export(path) {
@@ -117585,19 +117579,20 @@ fn run_export(
         });
     }
 
-    if !include_skills {
-        messages.retain(|msg| !crate::export::message_is_skill_injection(msg));
-        let archived = indexed_view
-            .as_ref()
-            .map(|view| view.messages.as_slice())
-            .unwrap_or_default();
-        if session_title
-            .as_deref()
-            .is_some_and(|title| crate::export::title_is_skill_injection(title, archived))
-        {
-            session_title = None;
-        }
+    let archived_title_context = indexed_view
+        .as_ref()
+        .map(|view| view.messages.as_slice())
+        .unwrap_or_default();
+    if session_title
+        .as_deref()
+        .is_some_and(|title| injections.excludes_title(title, &messages, archived_title_context))
+    {
+        session_title = None;
     }
+    let mut messages: Vec<_> =
+        crate::export::select_export_records(&mut messages, archived_messages, injections)
+            .map(|(_, record)| std::mem::take(record))
+            .collect();
 
     let mut privacy = crate::export::ExportPrivacy::new(include_secrets);
     privacy.redact_messages(&mut messages);
@@ -117951,7 +117946,7 @@ fn run_export_html(
     include_tools: bool,
     show_timestamps: bool,
     enable_cdns: bool,
-    include_skills: bool,
+    injections: crate::export::ExportInjections,
     include_secrets: bool,
     theme: &str,
     dry_run: bool,
@@ -118110,6 +118105,7 @@ fn run_export_html(
 
     // --- Load session messages ---
     let mut raw_messages: Vec<serde_json::Value>;
+    let mut archived_messages = None;
     let indexed_title = indexed_view
         .as_ref()
         .and_then(|view| view.convo.title.clone());
@@ -118157,6 +118153,7 @@ fn run_export_html(
                         .as_ref()
                         .map(|p| p.display().to_string());
                     raw_messages = conversation_view_to_html_raw_messages(view);
+                    archived_messages = Some(view.messages.as_slice());
                 } else {
                     emit_structured_error(&err);
                     return Err(err);
@@ -118174,6 +118171,7 @@ fn run_export_html(
             .as_ref()
             .map(|p| p.display().to_string());
         raw_messages = conversation_view_to_html_raw_messages(view);
+        archived_messages = Some(view.messages.as_slice());
     } else {
         // Detect agent from path
         let path_str = session_path.to_string_lossy();
@@ -118280,12 +118278,13 @@ fn run_export_html(
         return Err(err);
     }
 
-    let archived_messages = indexed_view.as_ref().map(|view| view.messages.as_slice());
-    if !include_skills
-        && session_title.as_deref().is_some_and(|title| {
-            crate::export::title_is_skill_injection(title, archived_messages.unwrap_or_default())
-        })
-    {
+    let archived_title_context = indexed_view
+        .as_ref()
+        .map(|view| view.messages.as_slice())
+        .unwrap_or_default();
+    if session_title.as_deref().is_some_and(|title| {
+        injections.excludes_title(title, &raw_messages, archived_title_context)
+    }) {
         session_title = None;
     }
 
@@ -118294,16 +118293,13 @@ fn run_export_html(
     privacy.redact_optional_text(&mut workspace);
     privacy.redact_optional_text(&mut agent_name);
 
-    let selected_records: Vec<_> = crate::export::select_html_source_records(
-        &mut raw_messages,
-        archived_messages,
-        include_skills,
-    )
-    .map(|(index, message)| {
-        privacy.redact_message(message);
-        (index, &*message)
-    })
-    .collect();
+    let selected_records: Vec<_> =
+        crate::export::select_export_records(&mut raw_messages, archived_messages, injections)
+            .map(|(index, message)| {
+                privacy.redact_message(message);
+                (index, &*message)
+            })
+            .collect();
     let pi_family_export = matches!(agent_name.as_deref(), Some("pi_agent" | "omp"));
 
     let messages: Vec<Message> = crate::export::html_messages_from_raw(
@@ -119671,7 +119667,7 @@ mod export_timestamp_tests {
             true,
             true,
             false,
-            false,
+            Default::default(),
             false,
             "system",
             false,
@@ -119719,7 +119715,7 @@ mod export_timestamp_tests {
             true,
             true,
             false,
-            false,
+            Default::default(),
             false,
             "system",
             false,
@@ -119841,7 +119837,7 @@ mod export_timestamp_tests {
             true,
             true,
             false,
-            false,
+            Default::default(),
             false,
             "system",
             false,
@@ -120812,7 +120808,7 @@ mod indexed_conversation_fallback_tests {
         assert_eq!(loaded.convo.external_id.as_deref(), Some("composer-123"));
         assert_eq!(loaded.messages.len(), 1);
 
-        let raw_messages = conversation_view_to_raw_messages(&loaded, true);
+        let raw_messages = conversation_view_to_raw_messages(&loaded);
         assert_eq!(raw_messages.len(), 1);
         assert_eq!(extract_role(&raw_messages[0]), "user");
         assert_eq!(extract_text_content(&raw_messages[0]), "hello from cursor");
@@ -121079,7 +121075,7 @@ mod indexed_conversation_fallback_tests {
             Some(output_path.as_path()),
             false, // clipboard
             false,
-            true,
+            crate::export::ExportInjections::INCLUDE_ALL,
             false, // include_secrets
         )
         .expect("run export");
@@ -121150,7 +121146,7 @@ mod indexed_conversation_fallback_tests {
             Some(output_path.as_path()),
             false, // clipboard
             false,
-            true,
+            crate::export::ExportInjections::INCLUDE_ALL,
             false, // include_secrets
         )
         .expect("export should prefer the local JSONL file over stale indexed content");
@@ -121231,7 +121227,7 @@ mod indexed_conversation_fallback_tests {
             false,
             true,
             true,
-            false,
+            Default::default(),
             false,
             "system",
             false,
@@ -121282,7 +121278,7 @@ mod indexed_conversation_fallback_tests {
             false,
             true,
             true,
-            false,
+            Default::default(),
             false,
             "system",
             false,
@@ -121333,7 +121329,7 @@ mod indexed_conversation_fallback_tests {
             false,
             true,
             true,
-            false,
+            Default::default(),
             false,
             "system",
             false,
@@ -121707,7 +121703,7 @@ This is not JSONL.
             Some(output_path.as_path()),
             false, // clipboard
             false,
-            true,
+            crate::export::ExportInjections::INCLUDE_ALL,
             false, // include_secrets
         )
         .expect("export should fall back to indexed content when the local JSONL is invalid");
@@ -121778,7 +121774,7 @@ This should stay behind the indexed export.
             Some(output_path.as_path()),
             false, // clipboard
             false,
-            true,
+            crate::export::ExportInjections::INCLUDE_ALL,
             false, // include_secrets
         )
         .expect("export should prefer indexed content for local markdown-backed sessions");
@@ -121850,7 +121846,7 @@ This should stay behind the indexed export.
             false,
             true,
             true,
-            false,
+            Default::default(),
             false,
             "system",
             false,
@@ -121931,7 +121927,7 @@ This should stay behind the indexed html export.
             false,
             true,
             true,
-            false,
+            Default::default(),
             false,
             "system",
             false,
@@ -122249,7 +122245,7 @@ This should stay behind the indexed html export.
             false,
             true,
             true,
-            false,
+            Default::default(),
             false,
             "system",
             false,
@@ -122390,7 +122386,7 @@ This should stay behind the indexed html export.
                 false,
                 true,
                 true,
-                false,
+                Default::default(),
                 false,
                 "system",
                 false,
@@ -122567,7 +122563,7 @@ This should stay behind the indexed html export.
                 include_tools,
                 true,
                 true,
-                false,
+                Default::default(),
                 false,
                 "system",
                 false,

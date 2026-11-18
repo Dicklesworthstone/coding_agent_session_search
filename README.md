@@ -3558,6 +3558,13 @@ also redacts by default; encryption alone does not opt into raw credentials.
 TUI HTML and Markdown exports, including suggested filenames, use the default
 redaction policy; intentional raw-fidelity exports use the CLI option.
 
+By default, conversation exports omit injected system reminders and replace
+recognized injected skill messages with a marker such as `[Skill loaded: review]`.
+On `cass export` and `cass export-html`, use `--include-skills` for full skill
+content and `--include-system-reminders` for hook reminders and their metadata.
+A record containing both requires both flags. These options are independent of
+credential redaction.
+
 **What is recognized.** Thirteen pattern families: AWS access key IDs, AWS
 secret keys and session tokens in assignment context, GitHub tokens (classic and
 fine-grained), OpenAI and Anthropic API keys, `Bearer` tokens, JWTs, PEM/OpenSSH/PGP
