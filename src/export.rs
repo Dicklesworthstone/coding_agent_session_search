@@ -100,7 +100,7 @@ impl ExportInjections {
                     || content.contains(
                         "The following skills are available for use with the Skill tool:",
                     )
-                    || (content.contains("skillInjection:") && content.contains("matchedSkills"))
+                    || has_hook_match_metadata(content)
                     || content.contains("<!-- skillInjection:")))
     }
 
@@ -135,6 +135,16 @@ impl ExportInjections {
                 })
             })
     }
+}
+
+// Handle the textual marker, JSON object keys, and JSON archived as a string.
+fn has_hook_match_metadata(content: &str) -> bool {
+    content.contains("matchedSkills")
+        && content.split("skillInjection").skip(1).any(|tail| {
+            tail.trim_start_matches(['\\', '"'])
+                .trim_start()
+                .starts_with(':')
+        })
 }
 
 /// Whole-message skill and hook injections omitted from handoffs and previews.
@@ -826,6 +836,8 @@ mod tests {
             "<system-reminder>",
             "The following skills are available for use with the Skill tool:",
             "skillInjection: metadata matchedSkills",
+            r#"{"skillInjection":{"matchedSkills":["review"]}}"#,
+            r#"{"source_line":"{\"skillInjection\":{\"matchedSkills\":[\"review\"]}}"}"#,
             "<!-- skillInjection:",
         ] {
             assert!(is_skill_injection(&format!(
@@ -838,6 +850,7 @@ mod tests {
             "Implement a new skill and test it.",
             "matchedSkills is the parser field name.",
             "skillInjection: is a label without matched entries.",
+            "Discuss skillInjection and matchedSkills as separate field names.",
             "The skill tool should preserve ordinary discussion.",
         ] {
             assert!(!is_skill_injection(ordinary), "{ordinary}");

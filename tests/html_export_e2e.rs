@@ -908,7 +908,7 @@ fn nd6pc_raw_and_indexed_export_privacy_flags_are_independent()
     fs::create_dir_all(root.path().join("data"))?;
     let records = [
         serde_json::json!({"role":"user", "content":"SKILLBODYPRIVATE\nBase directory for this skill: /home/private-user/.claude/skills/example-skill/"}),
-        serde_json::json!({"role":"user", "content":"HOOKBODYPRIVATE", "metadata":{"hook":"<system-reminder>hook detail</system-reminder>"}}),
+        serde_json::json!({"role":"user", "content":"HOOKBODYPRIVATE", "metadata":{"skillInjection":{"matchedSkills":["review"]}}}),
         serde_json::json!({"role":"user", "content":"Base directory for this skill: C:\\private-user\\mixed-skill\n<system-reminder>MIXEDBODYPRIVATE</system-reminder>"}),
         serde_json::json!({"role":"user", "content":"Ordinary prompt café 界"}),
     ];
@@ -937,7 +937,11 @@ fn nd6pc_raw_and_indexed_export_privacy_flags_are_independent()
             author: None,
             created_at: None,
             content: record["content"].as_str().unwrap_or_default().into(),
-            extra_json: record.clone(),
+            extra_json: if record.get("metadata").is_some() {
+                serde_json::json!({"source_line": record.to_string()})
+            } else {
+                record.clone()
+            },
             snippets: Vec::new(),
         })
         .collect();
