@@ -233,13 +233,27 @@ fn title_matches_hidden_pi_tools(
     let Some(first_line) = searchable.lines().next().map(str::trim_start) else {
         return false;
     };
-    first_line.starts_with(prefix)
+    if role != "tool" && (role != "assistant" || !first_line.starts_with("[Tool:")) {
+        return false;
+    }
+
+    // TUI writers receive a title that has already passed credential redaction.
+    // Preserve exact raw matching for CLI titles, including with secrets enabled.
+    let compare_redacted = !first_line.starts_with(prefix);
+    let matches_title = |line: &str| {
+        let line = line.trim_start();
+        if !compare_redacted {
+            return line.starts_with(prefix);
+        }
+        let mut preview = line.to_owned();
+        ExportPrivacy::new(false).redact_text(&mut preview);
+        preview.trim_start().starts_with(prefix)
+    };
+    matches_title(first_line)
         && (role == "tool"
-            || (role == "assistant"
-                && first_line.starts_with("[Tool:")
-                && !crate::extract_text_content_without_tool_blocks(rendered)
-                    .lines()
-                    .any(|line| line.trim_start().starts_with(prefix))))
+            || !crate::extract_text_content_without_tool_blocks(rendered)
+                .lines()
+                .any(matches_title))
 }
 
 // Only use a path basename with the syntax of a skill identifier. Never copy
@@ -802,6 +816,32 @@ mod tests {
             "pi_agent",
             &export_messages([literal, tool])
         ));
+
+        let raw_title = "[Tool: Read] path=fixture password=synthetic-tool-title";
+        let redacted_title = "[Tool: Read] path=fixture [REDACTED]";
+        let tool = serde_json::json!({
+            "type": "toolCall", "name": "Read",
+            "arguments": {"path": "fixture password=synthetic-tool-title"}
+        });
+        let narrative = serde_json::json!({"type": "text", "text": "Ordinary narrative"});
+        let hidden = export_messages([tool.clone(), narrative]);
+        assert!(raw_title_has_hidden_pi_tools(
+            redacted_title,
+            "omp",
+            &hidden
+        ));
+
+        let literal = serde_json::json!({
+            "type": "text",
+            "text": "[Tool: Read] path=fixture password=synthetic-visible-example"
+        });
+        let visible = export_messages([tool, literal]);
+        assert!(!raw_title_has_hidden_pi_tools(
+            redacted_title,
+            "omp",
+            &visible
+        ));
+        assert!(raw_title_has_hidden_pi_tools(raw_title, "omp", &visible));
     }
 
     #[test]

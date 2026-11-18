@@ -32683,11 +32683,13 @@ mod tests {
         let storage = FrankenStorage::open(&db)?;
         let conn = storage.raw();
         conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'pi_agent', 'Pi', 'local', 0, 0)")?;
-        let tool_title = "[Tool: IndexedTool] note=indexed-input-kept";
+        let argument = "indexed-input-kept password=synthetic-tool-title-551";
+        let continuation = "indexed-input-continuation";
+        let tool_title = format!("[Tool: IndexedTool] note={argument}");
         conn.execute_with_params(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'indexed-tools', ?1, ?2, 'local', 10)",
             &[
-                SqliteValue::Text(tool_title.into()),
+                SqliteValue::Text(tool_title.as_str().into()),
                 SqliteValue::Text(source.display().to_string().into()),
             ],
         )?;
@@ -32701,11 +32703,13 @@ mod tests {
             (
                 7,
                 "assistant",
-                "[Tool: IndexedTool] note=indexed-input-kept\nindexed-input-continuation\nindexed-narrative-kept café 界\n[Tool: literal discussion] indexed-literal-kept",
+                format!(
+                    "{tool_title}\n{continuation}\nindexed-narrative-kept café 界\n[Tool: literal discussion] indexed-literal-kept"
+                ),
                 serde_json::json!({
                     "type":"message", "message":{"role":"assistant", "content":[
                         {"type":"toolCall","id":"indexed-call","name":"IndexedTool",
-                         "arguments":{"note":"indexed-input-kept\nindexed-input-continuation","registration_token":"synthetic-indexed-551"}},
+                         "arguments":{"note":format!("{argument}\n{continuation}"),"registration_token":"synthetic-indexed-551"}},
                         {"type":"text","text":"indexed-narrative-kept café 界"},
                         {"type":"text","text":"[Tool: literal discussion] indexed-literal-kept"}
                     ]}
@@ -32714,7 +32718,7 @@ mod tests {
             (
                 9,
                 "tool",
-                "indexed-result-kept",
+                "indexed-result-kept".to_string(),
                 serde_json::json!({
                     "type":"message", "message":{"role":"toolResult", "toolName":"IndexedTool",
                         "toolCallId":"indexed-call", "content":[{"type":"text","text":"indexed-result-kept"}], "isError":false}
@@ -32725,7 +32729,7 @@ mod tests {
             conn.execute_with_params(
                 "INSERT INTO messages (conversation_id, idx, role, author, content, extra_json) VALUES (1, ?1, ?2, 'named-scribe', ?3, ?4)",
                 &[SqliteValue::Integer(*idx), SqliteValue::Text((*role).into()),
-                  SqliteValue::Text((*content).into()), SqliteValue::Text(event.to_string().into())],
+                  SqliteValue::Text(content.as_str().into()), SqliteValue::Text(event.to_string().into())],
             )?;
         }
         let hit = make_exact_hit(
@@ -32734,8 +32738,24 @@ mod tests {
             crate::ui::data::canonical_message_number(prompt_index).expect("fixture prompt line"),
             "indexed-prompt-kept",
         );
+        let view = load_indexed_export_view(&db, &hit)
+            .map_err(anyhow::Error::msg)?
+            .expect("indexed export view");
+        let state = ExportModalState::from_hit(&hit, &view);
+        assert_eq!(
+            state.title_preview,
+            "[Tool: IndexedTool] note=indexed-input-kept [REDACTED]"
+        );
+        assert!(
+            state
+                .filename_preview
+                .to_ascii_lowercase()
+                .contains("indexedtool")
+        );
+        let html_title = state.to_export_options().title.expect("modal export title");
         for include_tools in [true, false] {
-            let html_path = root.path().join(format!("indexed-{include_tools}.html"));
+            let html_path = root.path().join(&state.filename_preview);
+            let markdown_path = html_path.with_extension("md");
             let result = export_session_task(
                 &db,
                 &hit,
@@ -32744,7 +32764,7 @@ mod tests {
                 None,
                 true,
                 include_tools,
-                tool_title,
+                &html_title,
                 "Pi",
             );
             let Ok(output_path) = result else {
@@ -32775,10 +32795,15 @@ mod tests {
                 assert_eq!(html.contains(marker), include_tools, "{marker}");
             }
             assert!(!html.contains("synthetic-indexed-551"));
+            assert!(!html.contains("synthetic-tool-title-551"));
 
-            let markdown_path = root.path().join(format!("indexed-{include_tools}.md"));
-            let result =
-                export_session_markdown_task(&db, &hit, &markdown_path, include_tools, tool_title);
+            let result = export_session_markdown_task(
+                &db,
+                &hit,
+                &markdown_path,
+                include_tools,
+                &state.title_preview,
+            );
             let Ok(output_path) = result else {
                 anyhow::bail!("indexed Markdown export failed: {result:?}");
             };
@@ -32806,6 +32831,7 @@ mod tests {
                 assert_eq!(markdown.contains(detail), include_tools, "{detail}");
             }
             assert!(!markdown.contains("synthetic-indexed-551"));
+            assert!(!markdown.contains("synthetic-tool-title-551"));
         }
         let extra: String = conn
             .query_row("SELECT extra_json FROM messages WHERE idx = 7")?
