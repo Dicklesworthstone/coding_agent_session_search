@@ -32746,7 +32746,14 @@ mod tests {
             let Ok(output_path) = result else {
                 anyhow::bail!("indexed HTML export failed: {result:?}");
             };
-            assert_eq!(output_path == html_path, include_tools);
+            assert_eq!(
+                output_path,
+                if include_tools {
+                    html_path
+                } else {
+                    root.path().join("conversation-export.html")
+                }
+            );
             let html = std::fs::read_to_string(output_path)?;
             assert!(html.contains("indexed-prompt-kept"));
             assert!(html.contains("indexed-narrative-kept"));
@@ -32771,7 +32778,14 @@ mod tests {
             let Ok(output_path) = result else {
                 anyhow::bail!("indexed Markdown export failed: {result:?}");
             };
-            assert_eq!(output_path == markdown_path, include_tools);
+            assert_eq!(
+                output_path,
+                if include_tools {
+                    markdown_path
+                } else {
+                    root.path().join("conversation-export.md")
+                }
+            );
             let markdown = std::fs::read_to_string(output_path)?;
             for narrative in [
                 "indexed-prompt-kept",

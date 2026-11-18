@@ -771,6 +771,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pi_tool_title_detection_keeps_visible_literal_text() {
+        let session = serde_json::json!({"type": "session"});
+        let tool = serde_json::json!({
+            "type": "toolCall", "name": "Read", "arguments": {"path": "fixture"}
+        });
+        let title = "[Tool: Read] path=fixture";
+        let export_messages = |blocks| {
+            [
+                session.clone(),
+                serde_json::json!({
+                    "type": "message",
+                    "message": {"role": "assistant", "content": blocks}
+                }),
+            ]
+        };
+        let narrative = serde_json::json!({"type": "text", "text": "Ordinary narrative"});
+        let hidden = export_messages([tool.clone(), narrative]);
+        assert!(raw_title_has_hidden_pi_tools(title, "omp", &hidden));
+        assert!(!raw_title_has_hidden_pi_tools(title, "codex", &hidden));
+        assert!(!raw_title_has_hidden_pi_tools(
+            "Custom title",
+            "omp",
+            &hidden
+        ));
+
+        let literal = serde_json::json!({"type": "text", "text": title});
+        assert!(!raw_title_has_hidden_pi_tools(
+            title,
+            "pi_agent",
+            &export_messages([literal, tool])
+        ));
+    }
+
+    #[test]
     fn export_privacy_redacts_nested_credentials_and_preserves_message_identity() {
         let original = serde_json::json!({
             "role": "assistant",

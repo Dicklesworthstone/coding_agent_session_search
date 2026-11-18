@@ -1176,6 +1176,144 @@ fn nd6pc_export_preserves_single_blocks_and_tool_visibility()
 }
 
 #[test]
+fn nd6pc_indexed_pi_tool_visibility_applies_to_narrative_and_titles()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::Builder::new()
+        .prefix("cass-indexed-pi-export-tools-")
+        .disable_cleanup(true)
+        .tempdir()?;
+    let pi_home = root.path().join(".pi/agent");
+    let source = pi_home.join("sessions/workspace/2026-01-01T00-00-00_export.jsonl");
+    fs::create_dir_all(source.parent().ok_or("Pi session directory")?)?;
+    let records = [
+        serde_json::json!({
+            "type":"session", "version":3, "id":"export-tools", "cwd":"/synthetic/workspace",
+            "timestamp":"2026-01-01T00:00:00.000Z"
+        }),
+        serde_json::json!({
+            "type":"message", "id":"first", "parentId":null,
+            "timestamp":"2026-01-01T00:00:01.000Z", "message":{"role":"assistant","content":[
+                {"type":"toolCall","id":"call","name":"TitleLeak","arguments":{
+                    "input":"PRIVATE_TOOL_ARGUMENT\nPRIVATE_TOOL_CONTINUATION"
+                }},
+                {"type":"text","text":"Ordinary narrative café 界\n[Tool: literal discussion] KEEP_LITERAL"}
+            ]}
+        }),
+    ];
+    let mut bytes = Vec::new();
+    for record in &records {
+        serde_json::to_writer(&mut bytes, record)?;
+        bytes.push(b'\n');
+    }
+    fs::write(&source, &bytes)?;
+
+    let data = root.path().join("data");
+    let command = || {
+        let mut cmd = base_cmd();
+        cmd.env_clear()
+            .current_dir(root.path())
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env(
+                "SYSTEMROOT",
+                std::env::var_os("SYSTEMROOT").unwrap_or_default(),
+            )
+            .env("HOME", root.path())
+            .env("USERPROFILE", root.path())
+            .env("PI_CODING_AGENT_DIR", &pi_home)
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("local-share"))
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .timeout(std::time::Duration::from_secs(120));
+        cmd
+    };
+    let index = command().args(["index", "--full", "--json"]).output()?;
+    assert!(
+        index.status.success(),
+        "{}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&index.stdout)?;
+    assert_eq!(receipt["indexing_stats"]["total_messages"], 1);
+    let retained = root.path().join("retained-session.jsonl");
+    fs::rename(&source, &retained)?;
+    let db = data.join("agent_search.db");
+    let db_before = fs::read(&db)?;
+    let wal = data.join("agent_search.db-wal");
+    let wal_before = fs::read(&wal).ok();
+
+    for format in ["markdown", "text", "html", "json", "export-html"] {
+        for include_tools in [false, true] {
+            let mut cmd = command();
+            if format == "export-html" {
+                cmd.arg(format)
+                    .arg(&source)
+                    .arg("--output-dir")
+                    .arg(root.path().join(format!("html-{include_tools}")))
+                    .args(["--source", "local", "--json"])
+                    .arg(format!("--include-tools={include_tools}"));
+            } else {
+                cmd.arg("export")
+                    .arg(&source)
+                    .args(["--source", "local", "--format", format]);
+                if include_tools {
+                    cmd.arg("--include-tools");
+                }
+            }
+            let output = cmd.output()?;
+            assert!(
+                output.status.success(),
+                "{format}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let rendered = if format == "export-html" {
+                let receipt: Value = serde_json::from_slice(&output.stdout)?;
+                let path = Path::new(
+                    receipt["exported"]["output_path"]
+                        .as_str()
+                        .ok_or("output path")?,
+                );
+                assert_eq!(
+                    path.file_name()
+                        .ok_or("output filename")?
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains("titleleak"),
+                    include_tools,
+                );
+                fs::read_to_string(path)?
+            } else {
+                String::from_utf8(output.stdout)?
+            };
+            assert!(rendered.contains("Ordinary narrative café 界"), "{format}");
+            assert!(
+                rendered.contains("[Tool: literal discussion] KEEP_LITERAL"),
+                "{format}"
+            );
+            for detail in [
+                "TitleLeak",
+                "PRIVATE_TOOL_ARGUMENT",
+                "PRIVATE_TOOL_CONTINUATION",
+            ] {
+                assert_eq!(
+                    rendered.contains(detail),
+                    include_tools || format == "json",
+                    "{format}: {detail}"
+                );
+            }
+        }
+    }
+    assert_eq!(fs::read(retained)?, bytes);
+    assert!(!source.exists());
+    assert_eq!(fs::read(db)?, db_before);
+    assert_eq!(fs::read(wal).ok(), wal_before);
+    Ok(())
+}
+
+#[test]
 fn nd6pc_html_omits_an_all_filtered_session_without_writing_an_artifact()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = TempDir::new()?;
