@@ -32691,7 +32691,11 @@ mod tests {
                 SqliteValue::Text(source.display().to_string().into()),
             ],
         )?;
-        conn.execute("INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 8, 'user', 'indexed-prompt-kept')")?;
+        let prompt_index = 8;
+        conn.execute_with_params(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, ?1, 'user', 'indexed-prompt-kept')",
+            &[SqliteValue::Integer(prompt_index)],
+        )?;
         conn.execute("INSERT INTO messages (conversation_id, idx, role, content) VALUES (1, 12, 'custom-role', 'indexed-custom-role-kept')")?;
         let events = [
             (
@@ -32727,7 +32731,7 @@ mod tests {
         let hit = make_exact_hit(
             &source.display().to_string(),
             "local",
-            4,
+            crate::ui::data::canonical_message_number(prompt_index).expect("fixture prompt line"),
             "indexed-prompt-kept",
         );
         for include_tools in [true, false] {
