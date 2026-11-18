@@ -23256,47 +23256,41 @@ fn export_session_task(
     let allow_direct_file = hit_is_local_source(hit);
     let prefer_direct_file = tui_prefers_direct_followup_file(hit);
 
-    let convert_raw = |raw: &mut [serde_json::Value],
-                       archived: Option<&[crate::model::types::Message]>,
-                       pi_family_export| {
-        let mut privacy = crate::export::ExportPrivacy::new(false);
-        let selected = crate::export::select_export_records(raw, archived, Default::default()).map(
-            |(index, message)| {
-                let explicit_role = message
-                    .get("role")
-                    .or_else(|| message.get("message").and_then(|inner| inner.get("role")))
-                    .or_else(|| message.get("payload").and_then(|inner| inner.get("role")))
-                    .and_then(serde_json::Value::as_str);
-                if explicit_role.is_some() {
-                    let role = crate::extract_role(message);
-                    let normalized = match role.as_str() {
-                        "user" | "assistant" | "system" | "tool" | "unknown" => None,
-                        "agent" => Some("assistant"),
-                        "function" => Some("tool"),
-                        _ => Some("unknown"),
-                    };
-                    // The TUI already retained canonical custom-role messages.
-                    // Keep those as unknown without admitting bookkeeping types.
-                    if let Some(normalized) = normalized {
-                        message["role"] = serde_json::json!(normalized);
+    let convert_raw =
+        |raw: &mut [serde_json::Value], archived: Option<&[crate::model::types::Message]>| {
+            let mut privacy = crate::export::ExportPrivacy::new(false);
+            let selected = crate::export::select_export_records(raw, archived, Default::default())
+                .map(|(index, message)| {
+                    let explicit_role = message
+                        .get("role")
+                        .or_else(|| message.get("message").and_then(|inner| inner.get("role")))
+                        .or_else(|| message.get("payload").and_then(|inner| inner.get("role")))
+                        .and_then(serde_json::Value::as_str);
+                    if explicit_role.is_some() {
+                        let role = crate::extract_role(message);
+                        let normalized = match role.as_str() {
+                            "user" | "assistant" | "system" | "tool" | "unknown" => None,
+                            "agent" => Some("assistant"),
+                            "function" => Some("tool"),
+                            _ => Some("unknown"),
+                        };
+                        // The TUI already retained canonical custom-role messages.
+                        // Keep those as unknown without admitting bookkeeping types.
+                        if let Some(normalized) = normalized {
+                            message["role"] = serde_json::json!(normalized);
+                        }
                     }
-                }
-                privacy.redact_message(message);
-                (index, &*message)
-            },
-        );
-        crate::export::html_messages_from_raw(selected, include_tools, pi_family_export)
-    };
+                    privacy.redact_message(message);
+                    (index, &*message)
+                });
+            crate::export::html_messages_from_raw(selected, include_tools)
+        };
 
     let html_messages_from_view = |view: crate::ui::data::ConversationView| {
         let filename_hidden = !crate::export::is_skill_injection(title)
             && crate::export::title_is_skill_injection(title, &view.messages);
-        let mut raw = crate::conversation_view_to_html_raw_messages(&view);
-        let mut messages = convert_raw(
-            &mut raw,
-            Some(&view.messages),
-            matches!(view.convo.agent_slug.as_str(), "pi_agent" | "omp"),
-        );
+        let mut raw = crate::conversation_view_to_rendered_raw_messages(&view, include_tools);
+        let mut messages = convert_raw(&mut raw, Some(&view.messages));
         // A source record can expand into several correlated tool messages.
         // Retain its canonical index and author on every expanded message.
         for message in &mut messages {
@@ -23336,11 +23330,7 @@ fn export_session_task(
             Ok((mut raw_messages, _, _)) => {
                 let filename_hidden = !crate::export::is_skill_injection(title)
                     && crate::export::raw_title_is_skill_injection(title, &raw_messages);
-                let mut messages = convert_raw(
-                    &mut raw_messages,
-                    None,
-                    matches!(hit.agent.as_str(), "pi_agent" | "omp"),
-                );
+                let mut messages = convert_raw(&mut raw_messages, None);
                 for message in &mut messages {
                     message.author = message
                         .index
@@ -23462,8 +23452,13 @@ fn export_session_markdown_task(
             .or(hit_title)
             .filter(|title| !crate::export::title_is_skill_injection(title, &view.messages))
             .map(str::to_string);
+        let messages = if include_tools {
+            crate::conversation_view_to_raw_messages(&view)
+        } else {
+            crate::conversation_view_to_rendered_raw_messages(&view, false)
+        };
         (
-            crate::conversation_view_to_raw_messages(&view),
+            messages,
             title,
             view.convo.started_at,
             filename_hidden,
@@ -32657,7 +32652,7 @@ mod tests {
     }
 
     #[test]
-    fn export_redaction_tui_html_uses_indexed_pi_tool_envelopes() -> anyhow::Result<()> {
+    fn export_redaction_tui_uses_indexed_pi_tool_envelopes() -> anyhow::Result<()> {
         use crate::franken_sync::{SqliteValue, compat::RowExt};
         use crate::storage::sqlite::FrankenStorage;
 
@@ -32680,12 +32675,13 @@ mod tests {
             (
                 7,
                 "assistant",
-                "indexed-narrative-kept",
+                "indexed-narrative-kept café 界\n[Tool: IndexedTool] note=indexed-input-kept\nindexed-input-continuation\n[Tool: literal discussion] indexed-literal-kept",
                 serde_json::json!({
                     "type":"message", "message":{"role":"assistant", "content":[
                         {"type":"text","text":"indexed-narrative-kept café 界"},
                         {"type":"toolCall","id":"indexed-call","name":"IndexedTool",
-                         "arguments":{"note":"indexed-input-kept","registration_token":"synthetic-indexed-551"}}
+                         "arguments":{"note":"indexed-input-kept\nindexed-input-continuation","registration_token":"synthetic-indexed-551"}},
+                        {"type":"text","text":"[Tool: literal discussion] indexed-literal-kept"}
                     ]}
                 }),
             ),
@@ -32731,17 +32727,41 @@ mod tests {
             assert!(html.contains("indexed-prompt-kept"));
             assert!(html.contains("indexed-narrative-kept"));
             assert!(html.contains("indexed-custom-role-kept"));
+            assert!(html.contains("indexed-literal-kept"));
             assert!(html.contains("café 界"));
             assert!(html.contains("id=\"msg-7\""));
             assert!(html.contains("named-scribe"));
             for marker in [
                 "indexed-input-kept",
+                "indexed-input-continuation",
                 "indexed-result-kept",
                 "data-tool-name=\"IndexedTool\"",
             ] {
                 assert_eq!(html.contains(marker), include_tools, "{marker}");
             }
             assert!(!html.contains("synthetic-indexed-551"));
+
+            let markdown_path = root.path().join(format!("indexed-{include_tools}.md"));
+            let result = export_session_markdown_task(&db, &hit, &markdown_path, include_tools, "");
+            let Ok(output_path) = result else {
+                anyhow::bail!("indexed Markdown export failed: {result:?}");
+            };
+            let markdown = std::fs::read_to_string(output_path)?;
+            for narrative in [
+                "indexed-prompt-kept",
+                "indexed-narrative-kept café 界",
+                "[Tool: literal discussion] indexed-literal-kept",
+            ] {
+                assert!(markdown.contains(narrative), "{narrative}");
+            }
+            for detail in [
+                "indexed-input-kept",
+                "indexed-input-continuation",
+                "indexed-result-kept",
+            ] {
+                assert_eq!(markdown.contains(detail), include_tools, "{detail}");
+            }
+            assert!(!markdown.contains("synthetic-indexed-551"));
         }
         let extra: String = conn
             .query_row("SELECT extra_json FROM messages WHERE idx = 7")?

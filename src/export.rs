@@ -235,7 +235,6 @@ pub(crate) fn select_export_records<'a>(
 pub(crate) fn html_messages_from_raw<'a>(
     raw_messages: impl IntoIterator<Item = (usize, &'a Value)>,
     include_tools: bool,
-    pi_family_export: bool,
 ) -> Vec<crate::html_export::Message> {
     use crate::html_export::Message;
     use chrono::TimeZone;
@@ -262,12 +261,7 @@ pub(crate) fn html_messages_from_raw<'a>(
                     crate::extract_text_content(msg)
                 }
             } else {
-                let content = crate::extract_text_content_without_tool_blocks(msg);
-                if pi_family_export && role == "assistant" {
-                    crate::strip_flattened_tool_call_lines(&content)
-                } else {
-                    content
-                }
+                crate::extract_text_content_without_tool_blocks(msg)
             };
             match role.as_str() {
                 "user" | "assistant" | "system" | "tool" | "unknown" => {}

@@ -109355,14 +109355,13 @@ fn conversation_view_to_raw_messages(
         .collect()
 }
 
-/// Rehydrate Pi-family source events for HTML export when the canonical
-/// archive still has their per-message envelope. The normalized message text
-/// is deliberately flattened for search, so it cannot retain full tool
-/// arguments, correlation ids, or result status on its own.
-fn conversation_view_to_html_raw_messages(
+/// Prefer Pi-family source events for rendered exports. The archive's
+/// searchable text does not preserve the boundary of a tool argument.
+fn conversation_view_to_rendered_raw_messages(
     view: &crate::ui::data::ConversationView,
+    include_tools: bool,
 ) -> Vec<serde_json::Value> {
-    // The HTML selector receives the original archive rows alongside this
+    // The export selector receives the original archive rows alongside this
     // projection, so keep them aligned by position here.
     let mut messages = conversation_view_to_raw_messages(view);
     if !matches!(view.convo.agent_slug.as_str(), "pi_agent" | "omp") {
@@ -109370,25 +109369,47 @@ fn conversation_view_to_html_raw_messages(
     }
 
     for (raw_message, archived_message) in messages.iter_mut().zip(&view.messages) {
-        let Some(source_line) = crate::storage::sqlite::message_extra_to_source_jsonl_line(
-            &archived_message.extra_json,
-        ) else {
-            continue;
-        };
-        let Ok(source_event) = serde_json::from_str::<serde_json::Value>(&source_line) else {
-            tracing::warn!(
-                message_idx = archived_message.idx,
-                agent = %view.convo.agent_slug,
-                "pi-family HTML export could not decode the archived source event"
-            );
-            continue;
-        };
-        if source_event.get("type").and_then(serde_json::Value::as_str) == Some("message")
-            && source_event
-                .get("message")
-                .is_some_and(serde_json::Value::is_object)
+        if let Some(source_line) =
+            crate::storage::sqlite::message_extra_to_source_jsonl_line(&archived_message.extra_json)
         {
-            *raw_message = source_event;
+            match serde_json::from_str::<serde_json::Value>(&source_line) {
+                Ok(event) => {
+                    if event.get("type").and_then(serde_json::Value::as_str) == Some("message")
+                        && let Some(body) = event.get("message").filter(|body| body.is_object())
+                    {
+                        if include_tools {
+                            *raw_message = event;
+                            continue;
+                        }
+                        let role = body
+                            .get("role")
+                            .and_then(serde_json::Value::as_str)
+                            .map(normalized_export_role);
+                        if role == raw_message.get("role").and_then(serde_json::Value::as_str)
+                            && let Some(content) = body.get("content").filter(|content| {
+                                content.is_array() || export_text_block(content).is_some()
+                            })
+                        {
+                            // Restore the original block boundaries while keeping
+                            // the canonical row's role, author and timestamp.
+                            raw_message["content"] = content.clone();
+                            continue;
+                        }
+                    }
+                }
+                Err(_) => tracing::warn!(
+                    message_idx = archived_message.idx,
+                    agent = %view.convo.agent_slug,
+                    "Could not decode Pi-family export source event"
+                ),
+            }
+        }
+        if !include_tools && archived_message.role == crate::model::types::MessageRole::Agent {
+            let content = &archived_message.content;
+            let visible = without_flattened_tool_suffix(content);
+            if visible.len() != content.len() {
+                raw_message["content"] = serde_json::Value::String(visible.to_owned());
+            }
         }
     }
 
@@ -117462,6 +117483,13 @@ fn run_export(
     let session_start: Option<i64>;
     let mut _session_end: Option<i64>;
     let prefer_direct_file = prefers_direct_jsonl_file(path, source_id);
+    let project_archive = |view: &crate::ui::data::ConversationView| {
+        if include_tools || format == ConvExportFormat::Json {
+            conversation_view_to_raw_messages(view)
+        } else {
+            conversation_view_to_rendered_raw_messages(view, false)
+        }
+    };
 
     if prefer_direct_file {
         match parse_followup_jsonl_messages(path) {
@@ -117480,7 +117508,7 @@ fn run_export(
                     session_title = view.convo.title.clone();
                     session_start = view.convo.started_at;
                     _session_end = view.convo.ended_at;
-                    messages = conversation_view_to_raw_messages(view);
+                    messages = project_archive(view);
                     archived_messages = Some(view.messages.as_slice());
                 } else {
                     return Err(err);
@@ -117491,7 +117519,7 @@ fn run_export(
         session_title = view.convo.title.clone();
         session_start = view.convo.started_at;
         _session_end = view.convo.ended_at;
-        messages = conversation_view_to_raw_messages(view);
+        messages = project_archive(view);
         archived_messages = Some(view.messages.as_slice());
     } else if allow_direct_file && detect_opencode_sqlite_session(path) {
         // OpenCode SQLite-backed session: path is db_path/session_id (#149)
@@ -118152,7 +118180,7 @@ fn run_export_html(
                         .workspace
                         .as_ref()
                         .map(|p| p.display().to_string());
-                    raw_messages = conversation_view_to_html_raw_messages(view);
+                    raw_messages = conversation_view_to_rendered_raw_messages(view, include_tools);
                     archived_messages = Some(view.messages.as_slice());
                 } else {
                     emit_structured_error(&err);
@@ -118170,7 +118198,7 @@ fn run_export_html(
             .workspace
             .as_ref()
             .map(|p| p.display().to_string());
-        raw_messages = conversation_view_to_html_raw_messages(view);
+        raw_messages = conversation_view_to_rendered_raw_messages(view, include_tools);
         archived_messages = Some(view.messages.as_slice());
     } else {
         // Detect agent from path
@@ -118300,13 +118328,8 @@ fn run_export_html(
                 (index, &*message)
             })
             .collect();
-    let pi_family_export = matches!(agent_name.as_deref(), Some("pi_agent" | "omp"));
-
-    let messages: Vec<Message> = crate::export::html_messages_from_raw(
-        selected_records.iter().copied(),
-        include_tools,
-        pi_family_export,
-    );
+    let messages: Vec<Message> =
+        crate::export::html_messages_from_raw(selected_records.iter().copied(), include_tools);
 
     if selected_records.is_empty() {
         let err = CliError {
@@ -122340,6 +122363,12 @@ This should stay behind the indexed html export.
                     "__cass_historical_raw_json__": "{not-valid-json"
                 }),
             ),
+            (
+                "wrong-role",
+                serde_json::json!({
+                    "type": "message", "message": {"role": "user", "content": "WRONG_ROLE_ENVELOPE"}
+                }),
+            ),
         ];
         let mut exports = Vec::new();
         for (case, unavailable_envelope) in cases {
@@ -122380,7 +122409,7 @@ This should stay behind the indexed html export.
                                 author: None,
                                 created_at: Some(1_787_572_802_000),
                                 content: format!(
-                                    "[Thinking] {case}-thinking-sentinel\n{assistant_sentinel}\n[Tool: inspect_workspace] path={argument_sentinel}"
+                                    "[Thinking] {case}-thinking-sentinel\n{assistant_sentinel}\n[Tool: inspect_workspace] path={argument_sentinel}\n{case}-tool-continuation"
                                 ),
                                 extra_json: unavailable_envelope.clone(),
                                 snippets: Vec::new(),
@@ -122435,27 +122464,55 @@ This should stay behind the indexed html export.
             )
             .expect("export indexed OMP HTML without tools");
 
-            let html = std::fs::read_to_string(output_dir.join(&filename))
-                .expect("read indexed OMP export");
-            for retained in [
-                format!("{case}-user-sentinel"),
-                format!("{case}-thinking-sentinel"),
-                assistant_sentinel,
+            let mut outputs = vec![(
+                std::fs::read_to_string(output_dir.join(&filename))
+                    .expect("read indexed OMP export"),
+                false,
+            )];
+            for format in [
+                ConvExportFormat::Markdown,
+                ConvExportFormat::Text,
+                ConvExportFormat::Html,
+                ConvExportFormat::Json,
             ] {
-                assert!(
-                    html.contains(&retained),
-                    "{case} envelope fallback should retain {retained}"
-                );
+                for include_tools in [false, true] {
+                    let output = output_dir.join(format!("{case}-{format:?}-{include_tools}"));
+                    run_export(
+                        &indexed_path,
+                        Some(db_path.clone()),
+                        None,
+                        format,
+                        Some(&output),
+                        false,
+                        include_tools,
+                        Default::default(),
+                        false,
+                    )
+                    .expect("export indexed OMP transcript");
+                    outputs.push((
+                        std::fs::read_to_string(output).expect("read indexed OMP transcript"),
+                        include_tools || format == ConvExportFormat::Json,
+                    ));
+                }
             }
-            for omitted in [
-                "inspect_workspace".to_string(),
-                argument_sentinel,
-                result_sentinel,
-            ] {
-                assert!(
-                    !html.contains(&omitted),
-                    "{case} envelope fallback must omit {omitted}"
-                );
+            for (rendered, keep_tools) in outputs {
+                for retained in [
+                    format!("{case}-user-sentinel"),
+                    format!("{case}-thinking-sentinel"),
+                    assistant_sentinel.clone(),
+                ] {
+                    assert!(rendered.contains(&retained), "{case}: missing {retained}");
+                }
+                let continuation_sentinel = format!("{case}-tool-continuation");
+                for detail in [
+                    "inspect_workspace",
+                    argument_sentinel.as_str(),
+                    result_sentinel.as_str(),
+                    continuation_sentinel.as_str(),
+                ] {
+                    assert_eq!(rendered.contains(detail), keep_tools, "{case}: {detail}");
+                }
+                assert!(!rendered.contains("WRONG_ROLE_ENVELOPE"));
             }
         }
     }
@@ -122484,8 +122541,9 @@ This should stay behind the indexed html export.
                         "type": "toolCall",
                         "id": "ompcall42",
                         "name": "inspect_workspace",
-                        "arguments": { "file_path": "OMPARGUMENTSENTINEL" }
-                    }
+                        "arguments": { "file_path": "OMPARGUMENTSENTINEL\nOMPCONTINUATIONSENTINEL" }
+                    },
+                    { "type": "text", "text": "[Tool: literal discussion] OMPLITERALNARRATIVE" }
                 ]
             }
         });
@@ -122568,7 +122626,7 @@ This should stay behind the indexed html export.
                             role: MessageRole::Agent,
                             author: None,
                             created_at: Some(1_787_572_802_000),
-                            content: "[Thinking] OMPTHINKINGSENTINEL\nOMPASSISTANTSENTINEL\n[Tool: inspect_workspace] file_path=OMPARGUMENTSENTINEL".to_string(),
+                            content: "[Thinking] OMPTHINKINGSENTINEL\nOMPASSISTANTSENTINEL\n[Tool: inspect_workspace] file_path=OMPARGUMENTSENTINEL\nOMPCONTINUATIONSENTINEL\n[Tool: literal discussion] OMPLITERALNARRATIVE".to_string(),
                             extra_json: assistant_event,
                             snippets: Vec::new(),
                         },
@@ -122626,7 +122684,9 @@ This should stay behind the indexed html export.
                 "OMPASSISTANTSENTINEL",
                 "inspect_workspace",
                 "OMPARGUMENTSENTINEL",
+                "OMPCONTINUATIONSENTINEL",
                 "OMPRESULTSENTINEL",
+                "OMPLITERALNARRATIVE",
             ] {
                 assert!(
                     html.contains(sentinel),
@@ -122635,24 +122695,47 @@ This should stay behind the indexed html export.
             }
         }
 
-        for html in [&direct_without_tools, &indexed_without_tools] {
+        let mut tool_free = vec![direct_without_tools, indexed_without_tools];
+        for format in [
+            ConvExportFormat::Markdown,
+            ConvExportFormat::Text,
+            ConvExportFormat::Html,
+        ] {
+            let output = output_dir.join(format!("indexed-{format:?}"));
+            run_export(
+                &indexed_path,
+                Some(db_path.clone()),
+                None,
+                format,
+                Some(&output),
+                false,
+                false,
+                Default::default(),
+                false,
+            )
+            .expect("export OMP transcript without tools");
+            tool_free.push(std::fs::read_to_string(output).expect("read OMP transcript"));
+        }
+        for rendered in tool_free {
             for sentinel in [
                 "OMPUSERSENTINEL",
                 "OMPTHINKINGSENTINEL",
                 "OMPASSISTANTSENTINEL",
+                "OMPLITERALNARRATIVE",
             ] {
                 assert!(
-                    html.contains(sentinel),
+                    rendered.contains(sentinel),
                     "tool-free export should retain conversational content {sentinel}"
                 );
             }
             for omitted in [
                 "inspect_workspace",
                 "OMPARGUMENTSENTINEL",
+                "OMPCONTINUATIONSENTINEL",
                 "OMPRESULTSENTINEL",
             ] {
                 assert!(
-                    !html.contains(omitted),
+                    !rendered.contains(omitted),
                     "tool-free export must omit {omitted}"
                 );
             }
@@ -124177,21 +124260,19 @@ fn extract_role(msg: &serde_json::Value) -> String {
     "unknown".to_string()
 }
 
-/// Remove lossy tool-call lines from normalized Pi-family assistant text.
-///
-/// This is only used when the canonical source envelope is unavailable and
-/// the caller explicitly disabled tools. FAD emits each flattened invocation
-/// on its own line as `[Tool: name] arguments`; without the envelope there is
-/// no structured representation left to filter.
-fn strip_flattened_tool_call_lines(content: &str) -> String {
+/// The Pi-family archive fallback can identify the start of the first
+/// flattened call. An argument may contain newlines, so the suffix needs the
+/// original envelope to distinguish tool continuation from later narrative.
+fn without_flattened_tool_suffix(content: &str) -> &str {
+    let mut offset = 0;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("[Tool:") && trimmed.contains(']') {
+            return content[..offset].trim_end_matches(['\r', '\n']);
+        }
+        offset += line.len();
+    }
     content
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim_start();
-            !(trimmed.starts_with("[Tool:") && trimmed.contains(']'))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Strip redundant "[Tool: X]" markers from content when tool call is shown separately.
