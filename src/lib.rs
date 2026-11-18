@@ -124061,6 +124061,19 @@ fn flatten_pi_family_text_content(content: &serde_json::Value) -> Option<String>
     (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
+fn export_text_block(item: &serde_json::Value) -> Option<&str> {
+    if let Some(text) = item.as_str() {
+        return Some(text);
+    }
+
+    match item.get("type").and_then(serde_json::Value::as_str) {
+        None | Some("text" | "input_text" | "output_text") => {
+            item.get("text").and_then(serde_json::Value::as_str)
+        }
+        _ => None,
+    }
+}
+
 fn extract_text_content_without_tool_blocks(msg: &serde_json::Value) -> String {
     fn flatten_without_tool_blocks(content: &serde_json::Value) -> Option<String> {
         if let Some(s) = content.as_str() {
@@ -124071,37 +124084,20 @@ fn extract_text_content_without_tool_blocks(msg: &serde_json::Value) -> String {
             return Some(text);
         }
 
-        let arr = content.as_array()?;
+        let Some(arr) = content.as_array() else {
+            return export_text_block(content)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string);
+        };
         let mut result = String::new();
         for item in arr {
-            let item_type = item.get("type").and_then(|v| v.as_str());
-            if matches!(item_type, Some("tool_use" | "tool_result" | "toolCall")) {
-                continue;
-            }
-
-            let part = if let Some(text) = item.as_str() {
-                Some(text.to_string())
-            } else if matches!(
-                item_type,
-                None | Some("text" | "input_text" | "output_text")
-            ) {
-                item.get("text")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            } else {
-                None
-            };
-
-            let Some(part) = part else {
+            let Some(part) = export_text_block(item).filter(|text| !text.is_empty()) else {
                 continue;
             };
-            if part.is_empty() {
-                continue;
-            }
             if !result.is_empty() {
                 result.push('\n');
             }
-            result.push_str(&part);
+            result.push_str(part);
         }
 
         (!result.is_empty()).then_some(result)
@@ -124129,11 +124125,13 @@ fn extract_text_content_without_tool_blocks(msg: &serde_json::Value) -> String {
 
 fn extract_text_content(msg: &serde_json::Value) -> String {
     // Use the well-tested flatten_content helper from connectors module
-    // It handles: direct strings, {"type": "text"}, {"type": "input_text"},
-    // blocks with "text" but no "type", and tool_use blocks
+    // It handles strings and arrays with text or tool_use blocks.
     fn try_flatten(content: &serde_json::Value) -> Option<String> {
         if let Some(result) = flatten_pi_family_text_content(content) {
             return Some(result);
+        }
+        if let Some(text) = export_text_block(content) {
+            return (!text.is_empty()).then(|| text.to_string());
         }
         let result = crate::connectors::flatten_content(content);
         if result.is_empty() {

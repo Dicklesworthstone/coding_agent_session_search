@@ -1045,6 +1045,93 @@ fn nd6pc_raw_and_indexed_export_privacy_flags_are_independent()
 }
 
 #[test]
+fn nd6pc_export_preserves_single_text_blocks() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::Builder::new()
+        .prefix("cass-export-single-text-block-")
+        .disable_cleanup(true)
+        .tempdir()?;
+    let session = root.path().join("session.jsonl");
+    let records = [
+        serde_json::json!({"role":"user","content":"ORDINARY_STRING"}),
+        serde_json::json!({"type":"user","message":{"role":"user","content":{
+            "type":"text","text":"Base directory for this skill: /private/synthetic/object-skill\nPRIVATE_OBJECT_BODY"
+        }}}),
+        serde_json::json!({"type":"response_item","payload":{"role":"assistant","content":{
+            "type":"output_text","text":"ORDINARY_CODEX_OBJECT café 界"
+        }}}),
+        serde_json::json!({"role":"user","content":{"type":"input_text","text":"ORDINARY_INPUT_OBJECT"}}),
+        serde_json::json!({"role":"assistant","content":{"text":"ORDINARY_UNTYPED_OBJECT"}}),
+        serde_json::json!({"role":"assistant","content":{"type":"tool_result","text":"TOOL_OBJECT_CANARY"}}),
+    ];
+    let mut bytes = Vec::new();
+    for record in &records {
+        serde_json::to_writer(&mut bytes, record)?;
+        bytes.push(b'\n');
+    }
+    fs::write(&session, &bytes)?;
+
+    for format in ["markdown", "text", "html", "export-html"] {
+        for include_skills in [false, true] {
+            let mut cmd = export_privacy_command(root.path());
+            if format == "export-html" {
+                cmd.arg("export-html")
+                    .arg(&session)
+                    .arg("--output-dir")
+                    .arg(root.path().join(format!("output-{include_skills}")))
+                    .args(["--json", "--include-tools=false"]);
+            } else {
+                cmd.arg("export").arg(&session).args(["--format", format]);
+            }
+            if include_skills {
+                cmd.arg("--include-skills");
+            }
+            let output = cmd.output()?;
+            assert!(
+                output.status.success(),
+                "{format}, include_skills={include_skills}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let rendered = if format == "export-html" {
+                let receipt: Value = serde_json::from_slice(&output.stdout)?;
+                fs::read_to_string(
+                    receipt["exported"]["output_path"]
+                        .as_str()
+                        .ok_or("output path")?,
+                )?
+            } else {
+                String::from_utf8(output.stdout)?
+            };
+            for expected in [
+                "ORDINARY_STRING",
+                "ORDINARY_CODEX_OBJECT café 界",
+                "ORDINARY_INPUT_OBJECT",
+                "ORDINARY_UNTYPED_OBJECT",
+            ] {
+                assert!(rendered.contains(expected), "{format}: missing {expected}");
+            }
+            assert!(!rendered.contains("TOOL_OBJECT_CANARY"), "{format}");
+            assert_eq!(
+                rendered.contains("PRIVATE_OBJECT_BODY"),
+                include_skills,
+                "{format}"
+            );
+            assert_eq!(
+                rendered.contains("/private/synthetic/"),
+                include_skills,
+                "{format}"
+            );
+            assert_eq!(
+                rendered.contains("[Skill loaded: object-skill]"),
+                !include_skills,
+                "{format}"
+            );
+        }
+    }
+    assert_eq!(fs::read(session)?, bytes);
+    Ok(())
+}
+
+#[test]
 fn nd6pc_html_omits_an_all_filtered_session_without_writing_an_artifact()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = TempDir::new()?;
