@@ -19436,6 +19436,23 @@ impl super::ftui_adapter::Model for CassApp {
                     self.status = "No active result to export.".to_string();
                     return ftui::Cmd::none();
                 };
+                let modal_task = if self.show_export_modal {
+                    let Some(state) = self.export_modal_state.as_mut() else {
+                        return ftui::Cmd::none();
+                    };
+                    if state.progress.is_busy() {
+                        return ftui::Cmd::none();
+                    }
+                    if state.encrypt {
+                        self.status = "Clear Encrypt to save plaintext Markdown.".to_string();
+                        state.progress = ExportProgress::Error(self.status.clone());
+                        return ftui::Cmd::none();
+                    }
+                    state.progress = ExportProgress::Preparing;
+                    Some(self.begin_export_modal_task())
+                } else {
+                    None
+                };
                 let export_state = self
                     .export_modal_state
                     .clone()
@@ -19448,18 +19465,6 @@ impl super::ftui_adapter::Model for CassApp {
                 let include_tools = export_state.include_tools;
                 let preview_title =
                     (!export_state.withholds_title()).then_some(export_state.title_preview);
-                let modal_task = if self.show_export_modal {
-                    let Some(state) = self.export_modal_state.as_mut() else {
-                        return ftui::Cmd::none();
-                    };
-                    if state.progress.is_busy() {
-                        return ftui::Cmd::none();
-                    }
-                    state.progress = ExportProgress::Preparing;
-                    Some(self.begin_export_modal_task())
-                } else {
-                    None
-                };
                 self.status = "Exporting markdown...".to_string();
                 ftui::Cmd::task(move || CassMsg::ExportTaskFinished {
                     modal_task,
@@ -23428,7 +23433,7 @@ fn export_session_task(
         .export_messages(title, &groups, metadata, password)
         .map_err(|e| format!("HTML generation failed: {e}"))?;
 
-    let safe_output = filename_hidden
+    let safe_output = (encrypt || filename_hidden)
         .then(|| output_path.with_file_name(crate::export::SAFE_HTML_EXPORT_FILENAME));
     write_export_bytes_no_overwrite(
         safe_output.as_deref().unwrap_or(output_path),
@@ -31930,6 +31935,143 @@ mod tests {
             "status should use generic in-flight text, got: {}",
             app.status
         );
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn export_redaction_tui_respects_encryption_for_shortcuts_and_filenames() -> anyhow::Result<()> {
+        use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
+
+        let root = tempfile::Builder::new()
+            .prefix("cass-encrypted-export-modal-")
+            .disable_cleanup(true)
+            .tempdir()?;
+        let source = root.path().join("session.jsonl");
+        let out = root.path().join("exports");
+        let title = "fixtureprivatetitle";
+        let workspace = "fixtureprivateworkspace";
+        let body = "fixture-private-body-canary";
+        let password = "fixture-share-password";
+        let record = serde_json::json!({"role":"user", "content":body});
+        std::fs::write(&source, format!("{record}\n"))?;
+
+        let mut app = app_with_hits(1);
+        app.db_path = root.path().join("absent.db");
+        let hit = make_exact_hit(&source.display().to_string(), "local", 1, body);
+        app.panes[0].hits[0] = hit.clone();
+        let mut view = export_preview_view(body);
+        view.convo.title = Some(title.to_string());
+        view.convo.workspace = Some(PathBuf::from(workspace));
+        anchor_selected_hit_to_detail(&mut app, &mut view);
+        app.cached_detail = Some((hit.source_path.clone(), view));
+        let _ = app.update(CassMsg::ExportModalOpened);
+        let state = app.export_modal_state.as_mut().expect("open export modal");
+        state.output_dir.clone_from(&out);
+        let ordinary_filename = state.suggested_html_filename().to_string();
+        assert!(ordinary_filename.contains(title));
+        assert!(ordinary_filename.contains(workspace));
+
+        let markdown_shortcut = || {
+            CassMsg::from(Event::Key(KeyEvent {
+                code: KeyCode::Char('e'),
+                modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+                kind: ftui::KeyEventKind::Press,
+            }))
+        };
+        let _ = app.update(CassMsg::ExportFieldToggled(ExportField::Encrypt));
+        for password in ["", password] {
+            let _ = app.update(CassMsg::ExportFieldChanged {
+                field: ExportField::Password,
+                value: password.to_string(),
+            });
+            assert!(matches!(app.update(markdown_shortcut()), ftui::Cmd::None));
+            assert!(app.export_modal_task.is_none());
+            assert!(!out.exists());
+            let state = app.export_modal_state.as_ref().expect("open export modal");
+            assert!(state.encrypt);
+            assert_eq!(state.suggested_html_filename(), "conversation-export.html");
+            assert!(matches!(
+                &state.progress,
+                ExportProgress::Error(message) if message.contains("Clear Encrypt")
+            ));
+        }
+
+        let ftui::Cmd::Task(_, write_html) = app.update(CassMsg::ExportExecuted) else {
+            anyhow::bail!("encrypted HTML export did not dispatch");
+        };
+        let pending = app.export_modal_task;
+        assert!(pending.is_some());
+        assert!(matches!(app.update(markdown_shortcut()), ftui::Cmd::None));
+        assert_eq!(app.export_modal_task, pending);
+        assert!(
+            app.export_modal_state
+                .as_ref()
+                .is_some_and(|state| state.progress.is_busy())
+        );
+        let finished = write_html();
+        let CassMsg::ExportTaskFinished {
+            result: Ok(path), ..
+        } = &finished
+        else {
+            anyhow::bail!("encrypted HTML export did not complete: {finished:?}");
+        };
+        assert_eq!(path, &out.join("conversation-export.html"));
+        let encrypted = std::fs::read_to_string(path)?;
+        assert!(encrypted.contains("<title>Encrypted conversation</title>"));
+        assert!(encrypted.contains(r#"<div id="encrypted-content" hidden>"#));
+        for marker in [title, workspace, body, password] {
+            assert!(!encrypted.contains(marker));
+        }
+
+        // A queued or precomputed plaintext name must also be replaced by the writer.
+        let earlier = path.clone();
+        let stale_path = out.join(&ordinary_filename);
+        let second = export_session_task(
+            &app.db_path,
+            &hit,
+            &stale_path,
+            true,
+            Some(password),
+            true,
+            true,
+            Some(title),
+            "Claude Code",
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_ne!(second, earlier);
+        assert!(!stale_path.exists());
+        assert!(
+            second
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("conversation-export"))
+        );
+        assert_eq!(std::fs::read_to_string(&earlier)?, encrypted);
+        let _ = app.update(finished);
+
+        let _ = app.update(CassMsg::ExportModalOpened);
+        let _ = app.update(CassMsg::ExportFieldToggled(ExportField::Encrypt));
+        let _ = app.update(CassMsg::ExportFieldToggled(ExportField::Encrypt));
+        app.export_modal_state
+            .as_mut()
+            .expect("open export modal")
+            .output_dir
+            .clone_from(&out);
+        let ftui::Cmd::Task(_, write_markdown) = app.update(markdown_shortcut()) else {
+            anyhow::bail!("Markdown export did not dispatch after clearing Encrypt");
+        };
+        let CassMsg::ExportTaskFinished {
+            result: Ok(path), ..
+        } = write_markdown()
+        else {
+            anyhow::bail!("plaintext Markdown export did not complete");
+        };
+        assert_eq!(
+            path,
+            out.join(CassApp::markdown_filename_from_html(&ordinary_filename))
+        );
+        assert!(std::fs::read_to_string(path)?.contains(body));
+        Ok(())
     }
 
     #[test]

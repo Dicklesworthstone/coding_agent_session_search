@@ -348,7 +348,7 @@ impl ExportModalState {
     }
 
     pub(crate) fn suggested_html_filename(&self) -> &str {
-        if self.withholds_title() {
+        if self.encrypt || self.withholds_title() {
             crate::export::SAFE_HTML_EXPORT_FILENAME
         } else {
             &self.filename_preview
