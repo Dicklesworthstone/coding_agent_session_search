@@ -130,8 +130,8 @@ pub struct ExportModalState {
     /// the exporter can inspect it again without losing safe context.
     /// Plain-text titles use the existing display-length limit.
     pub export_title: Option<String>,
-    /// Whether the title excerpt overlaps a tool block in the indexed source.
-    pub title_has_hidden_tools: bool,
+    /// Tool overlap in the title excerpt, once verified against cached details.
+    pub title_has_hidden_tools: Option<bool>,
 }
 
 impl Default for ExportModalState {
@@ -156,7 +156,7 @@ impl Default for ExportModalState {
             message_count: 0,
             title_preview: String::new(),
             export_title: None,
-            title_has_hidden_tools: false,
+            title_has_hidden_tools: None,
         }
     }
 }
@@ -212,7 +212,10 @@ impl ExportModalState {
             .map(str::to_string)
             .or_else(|| {
                 let hit_title = hit.title.trim();
-                safe_title(hit_title).then(|| hit_title.to_string())
+                // Pi-family search hits can outlive the tool call that
+                // supplied their title. Prefer the current archive excerpt.
+                (!matches!(agent.as_str(), "pi_agent" | "omp") && safe_title(hit_title))
+                    .then(|| hit_title.to_string())
             })
             .map(|mut title| {
                 privacy.redact_text(&mut title);
@@ -311,7 +314,7 @@ impl ExportModalState {
             message_count,
             title_preview,
             export_title,
-            title_has_hidden_tools: false,
+            title_has_hidden_tools: None,
         }
     }
 
@@ -320,16 +323,24 @@ impl ExportModalState {
         let projected = view.messages.iter().map(|message| {
             crate::pi_archived_export_message(message, &view.convo.agent_slug, false)
         });
-        self.title_has_hidden_tools =
-            crate::export::archived_title_has_hidden_pi_tools(&self.title_preview, view, projected);
+        self.title_has_hidden_tools = Some(crate::export::archived_title_has_hidden_pi_tools(
+            &self.title_preview,
+            view,
+            projected,
+        ));
     }
 
-    pub(crate) fn hides_tool_title(&self) -> bool {
-        !self.include_tools && self.title_has_hidden_tools
+    pub(crate) fn withholds_title(&self) -> bool {
+        // Saving can run before details load. A live transcript cannot vouch
+        // for a tool-derived search-hit title from an older indexed version.
+        !self.include_tools
+            && self
+                .title_has_hidden_tools
+                .unwrap_or(matches!(self.agent_name.as_str(), "pi_agent" | "omp"))
     }
 
     pub(crate) fn displayed_title(&self) -> &str {
-        if self.hides_tool_title() {
+        if self.withholds_title() {
             "Conversation Export"
         } else {
             &self.title_preview
@@ -337,7 +348,7 @@ impl ExportModalState {
     }
 
     pub(crate) fn suggested_html_filename(&self) -> &str {
-        if self.hides_tool_title() {
+        if self.withholds_title() {
             crate::export::SAFE_HTML_EXPORT_FILENAME
         } else {
             &self.filename_preview
@@ -434,7 +445,7 @@ impl ExportModalState {
     /// Get export options from current state.
     pub fn to_export_options(&self) -> ExportOptions {
         ExportOptions {
-            title: (!self.hides_tool_title()).then(|| {
+            title: (!self.withholds_title()).then(|| {
                 self.export_title
                     .clone()
                     .unwrap_or_else(|| self.title_preview.clone())

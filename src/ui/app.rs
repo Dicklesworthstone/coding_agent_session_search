@@ -19446,8 +19446,8 @@ impl super::ftui_adapter::Model for CassApp {
                     Self::markdown_filename_from_html(export_state.suggested_html_filename());
                 let output_path = unique_filename(&output_dir, &output_filename);
                 let include_tools = export_state.include_tools;
-                let filename_title =
-                    (!export_state.hides_tool_title()).then_some(export_state.title_preview);
+                let preview_title =
+                    (!export_state.withholds_title()).then_some(export_state.title_preview);
                 let modal_task = if self.show_export_modal {
                     let Some(state) = self.export_modal_state.as_mut() else {
                         return ftui::Cmd::none();
@@ -19468,7 +19468,7 @@ impl super::ftui_adapter::Model for CassApp {
                         &export_hit,
                         &output_path,
                         include_tools,
-                        filename_title.as_deref(),
+                        preview_title.as_deref(),
                     ),
                 })
             }
@@ -23445,15 +23445,22 @@ fn export_session_markdown_task(
     hit: &SearchHit,
     output_path: &std::path::Path,
     include_tools: bool,
-    filename_title: Option<&str>,
+    preview_title: Option<&str>,
 ) -> Result<PathBuf, String> {
     let session_path = std::path::Path::new(&hit.source_path);
     let allow_direct_file = hit_is_local_source(hit);
     let prefer_direct_file = tui_prefers_direct_followup_file(hit);
-    let title_withheld = filename_title.is_none();
-    let filename_title = filename_title.unwrap_or_default();
-
-    let hit_title = (!hit.title.trim().is_empty()).then_some(hit.title.trim());
+    let title_withheld = preview_title.is_none();
+    let preview_title = preview_title.unwrap_or_default();
+    // When tools are excluded, only the verified Pi-family preview can
+    // supply an indexed fallback title. The hit itself may be out of date.
+    let fallback_title = if !include_tools && matches!(hit.agent.as_str(), "pi_agent" | "omp") {
+        preview_title
+    } else {
+        &hit.title
+    }
+    .trim();
+    let fallback_title = (!fallback_title.is_empty()).then_some(fallback_title);
     let load_local = || {
         load_local_export_raw_messages(session_path).map(|(messages, title, start)| {
             let title_hidden = |title: &str| {
@@ -23464,9 +23471,9 @@ fn export_session_markdown_task(
                         ))
             };
             let filename_hidden =
-                title_withheld || (!filename_title.is_empty() && title_hidden(filename_title));
+                title_withheld || (!preview_title.is_empty() && title_hidden(preview_title));
             let title = title
-                .or_else(|| hit_title.map(str::to_string))
+                .or_else(|| fallback_title.map(str::to_string))
                 .filter(|title| !title_withheld && !title_hidden(title));
             (messages, title, start, filename_hidden, None)
         })
@@ -23482,12 +23489,12 @@ fn export_session_markdown_task(
                 || (!include_tools
                     && crate::export::archived_title_has_hidden_pi_tools(title, &view, &messages))
         };
-        let filename_hidden = title_withheld || title_hidden(filename_title);
+        let filename_hidden = title_withheld || title_hidden(preview_title);
         let title = view
             .convo
             .title
             .as_deref()
-            .or(hit_title)
+            .or(fallback_title)
             .filter(|title| !title_withheld && !title_hidden(title))
             .map(str::to_string);
         (
@@ -32983,7 +32990,9 @@ mod tests {
         let _ = app.update(CassMsg::ExportModalOpened);
         let _ = app.update(CassMsg::ExportFieldToggled(ExportField::IncludeTools));
         let state = app.export_modal_state.as_mut().expect("open export modal");
-        assert_eq!(state.displayed_title(), "Untitled Session");
+        assert_eq!(state.title_preview, "Untitled Session");
+        assert_eq!(state.displayed_title(), "Conversation Export");
+        assert!(state.to_export_options().title.is_none());
         state.output_dir = root.path().to_path_buf();
         app.cached_detail = Some((hit.source_path.clone(), view));
         app.refresh_open_export_modal_for_hit(&SelectedHitKey::from_hit(&hit));
@@ -33037,24 +33046,49 @@ mod tests {
         std::fs::write(&source, format!("{event}\n"))?;
         assert!(tui_prefers_direct_followup_file(&hit));
         app.panes[0].hits[0].title.clone_from(&original_title);
-        let live_exports = root.path().join("live-exports");
-        for (action, filename, expected_title) in [
+        for (details_loaded, action, filename, expected_title) in [
             (
+                true,
                 CassMsg::ExportExecuted,
                 "conversation-export.html",
                 "<title>Updated public prompt</title>",
             ),
             (
+                true,
                 CassMsg::ExportMarkdownExecuted,
                 "conversation-export.md",
                 "# Updated public prompt\n",
             ),
+            (
+                false,
+                CassMsg::ExportMarkdownExecuted,
+                "conversation-export.md",
+                "# Updated public prompt\n",
+            ),
+            (
+                false,
+                CassMsg::ExportExecuted,
+                "conversation-export.html",
+                "<title>Updated public prompt</title>",
+            ),
         ] {
             let _ = app.update(CassMsg::ExportModalClosed);
-            let _ = app.update(CassMsg::ExportModalOpened);
+            let live_exports = if details_loaded {
+                root.path().join("live-exports")
+            } else {
+                app.cached_detail = None;
+                root.path().join("cold-live-exports")
+            };
+            let opened = app.update(CassMsg::ExportModalOpened);
+            if !details_loaded {
+                assert!(matches!(
+                    opened,
+                    ftui::Cmd::Msg(CassMsg::DetailLoadRequested { .. })
+                ));
+            }
             let _ = app.update(CassMsg::ExportFieldToggled(ExportField::IncludeTools));
             let state = app.export_modal_state.as_mut().expect("open export modal");
-            assert!(state.hides_tool_title());
+            let title_withheld = state.withholds_title();
             state.output_dir.clone_from(&live_exports);
             let ftui::Cmd::Task(_, task) = app.update(action) else {
                 anyhow::bail!("live file export did not dispatch");
@@ -33065,13 +33099,47 @@ mod tests {
             else {
                 anyhow::bail!("live file export did not complete");
             };
-            assert_eq!(path, live_exports.join(filename));
-            let output = std::fs::read_to_string(path)?;
-            assert!(output.contains(expected_title));
-            assert!(!output.contains("Public user prompt"));
+            let output = std::fs::read_to_string(&path)?;
             assert!(!output.contains("HiddenTitle"));
             assert!(!output.contains("private-canary"));
+            assert!(output.contains(expected_title));
+            assert!(!output.contains("Public user prompt"));
+            assert_eq!(path, live_exports.join(filename));
+            assert!(title_withheld);
         }
+
+        // A detail refresh can find a different safe excerpt while the
+        // selected hit still carries the older, tool-derived title.
+        conn.execute(
+            "UPDATE messages SET content = 'Reviewed archive title', extra_json = '{}' WHERE idx = 0",
+        )?;
+        let retained_hit = app.selected_hit().cloned().expect("retained search hit");
+        assert!(retained_hit.title.contains("private-canary"));
+        let reviewed = load_indexed_export_view(&db, &retained_hit)
+            .map_err(anyhow::Error::msg)?
+            .expect("updated archive details");
+        assert!(reviewed.convo.title.is_none());
+        app.cached_detail = Some((retained_hit.source_path.clone(), reviewed));
+        let _ = app.update(CassMsg::ExportModalClosed);
+        let _ = app.update(CassMsg::ExportModalOpened);
+        let _ = app.update(CassMsg::ExportFieldToggled(ExportField::IncludeTools));
+        let state = app.export_modal_state.as_mut().expect("open export modal");
+        state.output_dir = root.path().join("reviewed-exports");
+        assert_eq!(state.displayed_title(), "Reviewed archive title");
+        assert!(state.suggested_html_filename().contains("reviewed"));
+        let ftui::Cmd::Task(_, task) = app.update(CassMsg::ExportMarkdownExecuted) else {
+            anyhow::bail!("reviewed archive title export did not dispatch");
+        };
+        let CassMsg::ExportTaskFinished {
+            result: Ok(path), ..
+        } = task()
+        else {
+            anyhow::bail!("reviewed archive title export did not complete");
+        };
+        let markdown = std::fs::read_to_string(path)?;
+        assert!(markdown.starts_with("# Reviewed archive title\n"));
+        assert!(markdown.contains(live_prompt));
+        assert!(!markdown.contains("private-canary"));
         Ok(())
     }
 
