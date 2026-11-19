@@ -324,8 +324,12 @@ impl ExportModalState {
             crate::export::archived_title_has_hidden_pi_tools(&self.title_preview, view, projected);
     }
 
+    pub(crate) fn hides_tool_title(&self) -> bool {
+        !self.include_tools && self.title_has_hidden_tools
+    }
+
     pub(crate) fn displayed_title(&self) -> &str {
-        if !self.include_tools && self.title_has_hidden_tools {
+        if self.hides_tool_title() {
             "Conversation Export"
         } else {
             &self.title_preview
@@ -333,7 +337,7 @@ impl ExportModalState {
     }
 
     pub(crate) fn suggested_html_filename(&self) -> &str {
-        if !self.include_tools && self.title_has_hidden_tools {
+        if self.hides_tool_title() {
             crate::export::SAFE_HTML_EXPORT_FILENAME
         } else {
             &self.filename_preview
@@ -430,10 +434,11 @@ impl ExportModalState {
     /// Get export options from current state.
     pub fn to_export_options(&self) -> ExportOptions {
         ExportOptions {
-            title: self
-                .export_title
-                .clone()
-                .or_else(|| Some(self.title_preview.clone())),
+            title: (!self.hides_tool_title()).then(|| {
+                self.export_title
+                    .clone()
+                    .unwrap_or_else(|| self.title_preview.clone())
+            }),
             include_cdn: true,
             syntax_highlighting: true,
             include_search: true,

@@ -19446,7 +19446,8 @@ impl super::ftui_adapter::Model for CassApp {
                     Self::markdown_filename_from_html(export_state.suggested_html_filename());
                 let output_path = unique_filename(&output_dir, &output_filename);
                 let include_tools = export_state.include_tools;
-                let filename_title = export_state.title_preview;
+                let filename_title =
+                    (!export_state.hides_tool_title()).then_some(export_state.title_preview);
                 let modal_task = if self.show_export_modal {
                     let Some(state) = self.export_modal_state.as_mut() else {
                         return ftui::Cmd::none();
@@ -19467,7 +19468,7 @@ impl super::ftui_adapter::Model for CassApp {
                         &export_hit,
                         &output_path,
                         include_tools,
-                        &filename_title,
+                        filename_title.as_deref(),
                     ),
                 })
             }
@@ -19492,7 +19493,7 @@ impl super::ftui_adapter::Model for CassApp {
                     };
                     let show_timestamps = options.show_timestamps;
                     let include_tools = options.show_tool_calls;
-                    let title = options.title.unwrap_or_else(|| state.title_preview.clone());
+                    let title = options.title;
                     let agent_name = options
                         .agent_name
                         .unwrap_or_else(|| state.agent_name.clone());
@@ -19511,7 +19512,7 @@ impl super::ftui_adapter::Model for CassApp {
                             password.as_deref(),
                             show_timestamps,
                             include_tools,
-                            &title,
+                            title.as_deref(),
                             &agent_name,
                         ),
                     });
@@ -23250,7 +23251,7 @@ fn export_session_task(
     password: Option<&str>,
     show_timestamps: bool,
     include_tools: bool,
-    title: &str,
+    title: Option<&str>,
     agent_name: &str,
 ) -> Result<PathBuf, String> {
     use crate::html_export::{
@@ -23260,6 +23261,10 @@ fn export_session_task(
     let session_path = std::path::Path::new(&hit.source_path);
     let allow_direct_file = hit_is_local_source(hit);
     let prefer_direct_file = tui_prefers_direct_followup_file(hit);
+    // A verified preview can withhold a tool-derived title even when a newer
+    // local file no longer carries the message that originally supplied it.
+    let title_withheld = title.is_none();
+    let title = title.unwrap_or_default();
 
     let convert_raw =
         |raw: &mut [serde_json::Value], archived: Option<&[crate::model::types::Message]>| {
@@ -23293,8 +23298,9 @@ fn export_session_task(
 
     let html_messages_from_view = |view: crate::ui::data::ConversationView| {
         let mut raw = crate::conversation_view_to_rendered_raw_messages(&view, include_tools);
-        let filename_hidden = (!crate::export::is_skill_injection(title)
-            && crate::export::title_is_skill_injection(title, &view.messages))
+        let filename_hidden = title_withheld
+            || (!crate::export::is_skill_injection(title)
+                && crate::export::title_is_skill_injection(title, &view.messages))
             || (!include_tools
                 && crate::export::archived_title_has_hidden_pi_tools(title, &view, &raw));
         let mut messages = convert_raw(&mut raw, Some(&view.messages));
@@ -23335,8 +23341,9 @@ fn export_session_task(
     } else if allow_direct_file && session_path.exists() {
         match load_local_export_raw_messages(session_path) {
             Ok((mut raw_messages, _, _)) => {
-                let filename_hidden = (!crate::export::is_skill_injection(title)
-                    && crate::export::raw_title_is_skill_injection(title, &raw_messages))
+                let filename_hidden = title_withheld
+                    || (!crate::export::is_skill_injection(title)
+                        && crate::export::raw_title_is_skill_injection(title, &raw_messages))
                     || (!include_tools
                         && crate::export::raw_title_has_hidden_pi_tools(
                             title,
@@ -23438,11 +23445,13 @@ fn export_session_markdown_task(
     hit: &SearchHit,
     output_path: &std::path::Path,
     include_tools: bool,
-    filename_title: &str,
+    filename_title: Option<&str>,
 ) -> Result<PathBuf, String> {
     let session_path = std::path::Path::new(&hit.source_path);
     let allow_direct_file = hit_is_local_source(hit);
     let prefer_direct_file = tui_prefers_direct_followup_file(hit);
+    let title_withheld = filename_title.is_none();
+    let filename_title = filename_title.unwrap_or_default();
 
     let hit_title = (!hit.title.trim().is_empty()).then_some(hit.title.trim());
     let load_local = || {
@@ -23454,10 +23463,11 @@ fn export_session_markdown_task(
                             title, &hit.agent, &messages,
                         ))
             };
-            let filename_hidden = !filename_title.is_empty() && title_hidden(filename_title);
+            let filename_hidden =
+                title_withheld || (!filename_title.is_empty() && title_hidden(filename_title));
             let title = title
                 .or_else(|| hit_title.map(str::to_string))
-                .filter(|title| !title_hidden(title));
+                .filter(|title| !title_withheld && !title_hidden(title));
             (messages, title, start, filename_hidden, None)
         })
     };
@@ -23472,13 +23482,13 @@ fn export_session_markdown_task(
                 || (!include_tools
                     && crate::export::archived_title_has_hidden_pi_tools(title, &view, &messages))
         };
-        let filename_hidden = title_hidden(filename_title);
+        let filename_hidden = title_withheld || title_hidden(filename_title);
         let title = view
             .convo
             .title
             .as_deref()
             .or(hit_title)
-            .filter(|title| !title_hidden(title))
+            .filter(|title| !title_withheld && !title_hidden(title))
             .map(str::to_string);
         (
             messages,
@@ -25060,12 +25070,12 @@ mod tests {
                 None,
                 true,
                 true,
-                "Untitled Session",
+                Some("Untitled Session"),
                 "Codex",
             )
             .is_err()
         );
-        assert!(export_session_markdown_task(&db_path, &hit, &md_path, true, "").is_err());
+        assert!(export_session_markdown_task(&db_path, &hit, &md_path, true, Some("")).is_err());
         assert_eq!(std::fs::read(db_path)?, before);
         assert!(!html_path.exists() && !md_path.exists());
         Ok(())
@@ -31957,7 +31967,8 @@ mod tests {
 
         let missing_db = tmp.path().join("missing.db");
         let export_hit = make_exact_hit(&session_path.display().to_string(), "local", 1, "hello");
-        let msg = export_session_markdown_task(&missing_db, &export_hit, &existing_path, false, "");
+        let msg =
+            export_session_markdown_task(&missing_db, &export_hit, &existing_path, false, Some(""));
         let exported_path = msg.expect("export should succeed");
 
         assert_ne!(
@@ -32089,7 +32100,8 @@ mod tests {
             1,
             "remote markdown body",
         );
-        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false, "");
+        let msg =
+            export_session_markdown_task(&db_path, &export_hit, &output_path, false, Some(""));
         let exported_path = msg.expect("export should succeed");
         let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
         assert!(
@@ -32135,7 +32147,8 @@ mod tests {
             1,
             "new markdown body",
         );
-        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false, "");
+        let msg =
+            export_session_markdown_task(&db_path, &export_hit, &output_path, false, Some(""));
         let exported_path = msg.expect("export should succeed");
         let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
         assert!(
@@ -32167,7 +32180,7 @@ mod tests {
         let mut hit = make_exact_hit(&session.display().to_string(), "local", 1, "fixture");
         hit.title.clone_from(&title);
         let markdown =
-            export_session_markdown_task(&db, &hit, &temp.path().join("safe.md"), true, "");
+            export_session_markdown_task(&db, &hit, &temp.path().join("safe.md"), true, Some(""));
         let html = export_session_task(
             &db,
             &hit,
@@ -32176,7 +32189,7 @@ mod tests {
             None,
             false,
             true,
-            &title,
+            Some(&title),
             "Codex",
         );
         for result in [markdown, html] {
@@ -32220,7 +32233,7 @@ mod tests {
             "TUI_FIRST_PROMPT",
         );
         let markdown =
-            export_session_markdown_task(&db, &hit, &root.path().join("torn.md"), false, "");
+            export_session_markdown_task(&db, &hit, &root.path().join("torn.md"), false, Some(""));
         let html = export_session_task(
             &db,
             &hit,
@@ -32229,7 +32242,7 @@ mod tests {
             None,
             false,
             true,
-            "Recovered session",
+            Some("Recovered session"),
             "pi_agent",
         );
         for result in [markdown, html] {
@@ -32297,7 +32310,7 @@ mod tests {
                 &hit,
                 &root.path().join(format!("source-{include_tools}.md")),
                 include_tools,
-                "",
+                Some(""),
             );
             let Ok(output_path) = result else {
                 anyhow::bail!("source markdown export failed: {result:?}");
@@ -32350,7 +32363,7 @@ mod tests {
                 &titled_hit,
                 &markdown_path,
                 true,
-                if derived { cached_title } else { "" },
+                Some(if derived { cached_title } else { "" }),
             );
             let Ok(output_path) = result else {
                 anyhow::bail!("titled markdown export failed: {result:?}");
@@ -32373,7 +32386,7 @@ mod tests {
                 None,
                 false,
                 true,
-                cached_title,
+                Some(cached_title),
                 "claude_code",
             );
             let Ok(output_path) = result else {
@@ -32405,8 +32418,9 @@ mod tests {
         let mut only_hit = make_exact_hit(&only_skill.display().to_string(), "local", 1, "fixture");
         only_hit.title.clear();
         let only_output = root.path().join("only-skill.md");
-        let output = export_session_markdown_task(&absent_db, &only_hit, &only_output, true, "")
-            .map_err(anyhow::Error::msg)?;
+        let output =
+            export_session_markdown_task(&absent_db, &only_hit, &only_output, true, Some(""))
+                .map_err(anyhow::Error::msg)?;
         let markdown = std::fs::read_to_string(output)?;
         assert!(markdown.starts_with("# Conversation Export\n"));
         assert!(markdown.contains("[Skill loaded: private]"));
@@ -32420,8 +32434,13 @@ mod tests {
         std::fs::write(&reminder, reminder_bytes)?;
         let reminder_hit = make_exact_hit(&reminder.display().to_string(), "local", 1, "fixture");
         let reminder_output = root.path().join("only-reminder.md");
-        let result =
-            export_session_markdown_task(&absent_db, &reminder_hit, &reminder_output, true, "");
+        let result = export_session_markdown_task(
+            &absent_db,
+            &reminder_hit,
+            &reminder_output,
+            true,
+            Some(""),
+        );
         assert_eq!(result.unwrap_err(), "No messages found in session");
         assert!(!reminder_output.exists());
         assert_eq!(std::fs::read_to_string(&reminder)?, reminder_bytes);
@@ -32469,7 +32488,7 @@ mod tests {
                 &indexed_hit,
                 &root.path().join(format!("archive-{include_tools}.md")),
                 include_tools,
-                "",
+                Some(""),
             );
             let Ok(output_path) = result else {
                 anyhow::bail!("indexed markdown export failed: {result:?}");
@@ -32507,7 +32526,7 @@ mod tests {
                 &indexed_hit,
                 &markdown_path,
                 true,
-                filename_title,
+                Some(filename_title),
             );
             let Ok(output_path) = result else {
                 anyhow::bail!("titled archive markdown export failed: {result:?}");
@@ -32528,7 +32547,7 @@ mod tests {
                 None,
                 false,
                 true,
-                title,
+                Some(title),
                 "claude_code",
             );
             let Ok(output_path) = result else {
@@ -32626,7 +32645,7 @@ mod tests {
                 None,
                 true,
                 include_tools,
-                "Tool transcript",
+                Some("Tool transcript"),
                 "Claude Code",
             );
             let Ok(output_path) = result else {
@@ -32785,7 +32804,7 @@ mod tests {
                 None,
                 true,
                 include_tools,
-                &html_title,
+                Some(&html_title),
                 "Pi",
             );
             let Ok(output_path) = result else {
@@ -32823,7 +32842,7 @@ mod tests {
                 &hit,
                 &markdown_path,
                 include_tools,
-                &state.title_preview,
+                Some(&state.title_preview),
             );
             let Ok(output_path) = result else {
                 anyhow::bail!("indexed Markdown export failed: {result:?}");
@@ -32976,7 +32995,8 @@ mod tests {
         );
 
         // The writers also guard a path captured before the toggle.
-        let html_title = state.to_export_options().title.expect("modal export title");
+        let original_title = state.title_preview.clone();
+        assert!(state.to_export_options().title.is_none());
         let html = export_session_task(
             &db,
             &hit,
@@ -32985,7 +33005,7 @@ mod tests {
             None,
             true,
             state.include_tools,
-            &html_title,
+            Some(&original_title),
             "Pi",
         )
         .map_err(anyhow::Error::msg)?;
@@ -32994,7 +33014,7 @@ mod tests {
             &hit,
             &proposed.with_extension("md"),
             state.include_tools,
-            &state.title_preview,
+            Some(&original_title),
         )
         .map_err(anyhow::Error::msg)?;
         assert_eq!(html, root.path().join("conversation-export.html"));
@@ -33008,6 +33028,49 @@ mod tests {
             assert!(body.contains("[Tool: literal example] visible after the call"));
             assert!(!body.contains("HiddenTitle"));
             assert!(!body.contains("private-canary"));
+        }
+
+        let live_prompt = "Updated public prompt";
+        let event = serde_json::json!({
+            "type":"message", "message":{"role":"user", "content":live_prompt}
+        });
+        std::fs::write(&source, format!("{event}\n"))?;
+        assert!(tui_prefers_direct_followup_file(&hit));
+        app.panes[0].hits[0].title.clone_from(&original_title);
+        let live_exports = root.path().join("live-exports");
+        for (action, filename, expected_title) in [
+            (
+                CassMsg::ExportExecuted,
+                "conversation-export.html",
+                "<title>Updated public prompt</title>",
+            ),
+            (
+                CassMsg::ExportMarkdownExecuted,
+                "conversation-export.md",
+                "# Updated public prompt\n",
+            ),
+        ] {
+            let _ = app.update(CassMsg::ExportModalClosed);
+            let _ = app.update(CassMsg::ExportModalOpened);
+            let _ = app.update(CassMsg::ExportFieldToggled(ExportField::IncludeTools));
+            let state = app.export_modal_state.as_mut().expect("open export modal");
+            assert!(state.hides_tool_title());
+            state.output_dir.clone_from(&live_exports);
+            let ftui::Cmd::Task(_, task) = app.update(action) else {
+                anyhow::bail!("live file export did not dispatch");
+            };
+            let CassMsg::ExportTaskFinished {
+                result: Ok(path), ..
+            } = task()
+            else {
+                anyhow::bail!("live file export did not complete");
+            };
+            assert_eq!(path, live_exports.join(filename));
+            let output = std::fs::read_to_string(path)?;
+            assert!(output.contains(expected_title));
+            assert!(!output.contains("Public user prompt"));
+            assert!(!output.contains("HiddenTitle"));
+            assert!(!output.contains("private-canary"));
         }
         Ok(())
     }
@@ -33050,10 +33113,12 @@ mod tests {
                 None,
                 options.show_timestamps,
                 options.show_tool_calls,
-                options
-                    .title
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("missing export title"))?,
+                Some(
+                    options
+                        .title
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("missing export title"))?,
+                ),
                 "Codex",
             );
             let Ok(output_path) = result else {
@@ -33118,7 +33183,8 @@ mod tests {
             "stale indexed markdown body",
         );
         export_hit.title = "Indexed Session".to_string();
-        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false, "");
+        let msg =
+            export_session_markdown_task(&db_path, &export_hit, &output_path, false, Some(""));
         let exported_path = msg.expect("export should succeed");
         let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
         assert!(
@@ -33171,7 +33237,8 @@ mod tests {
             1,
             "indexed markdown fallback body",
         );
-        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false, "");
+        let msg =
+            export_session_markdown_task(&db_path, &export_hit, &output_path, false, Some(""));
         let exported_path = msg.expect("export should succeed");
         let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
         assert!(
@@ -33222,7 +33289,8 @@ not jsonl",
             1,
             "indexed aider markdown body",
         );
-        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false, "");
+        let msg =
+            export_session_markdown_task(&db_path, &export_hit, &output_path, false, Some(""));
         let exported_path = msg.expect("export should succeed");
         let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
         assert!(
@@ -33267,7 +33335,7 @@ not jsonl",
             None,
             true,
             false,
-            "Session",
+            Some("Session"),
             "claude_code",
         );
         let exported_path = msg.expect("export should succeed");
@@ -33332,7 +33400,7 @@ not jsonl",
             None,
             true,
             false,
-            "Shared Session",
+            Some("Shared Session"),
             "claude_code",
         );
         let exported_path = msg.expect("export should succeed");
@@ -33388,7 +33456,7 @@ not jsonl",
             None,
             true,
             false,
-            "Shared Session",
+            Some("Shared Session"),
             "claude_code",
         );
         let exported_path = msg.expect("export should succeed");
@@ -33452,7 +33520,7 @@ not jsonl",
             None,
             true,
             false,
-            "Fresh Session",
+            Some("Fresh Session"),
             "claude_code",
         );
         let exported_path = msg.expect("export should succeed");
@@ -33511,7 +33579,7 @@ not jsonl",
             None,
             true,
             false,
-            "Indexed Session",
+            Some("Indexed Session"),
             "claude_code",
         );
         let exported_path = msg.expect("export should succeed");
@@ -33572,7 +33640,7 @@ not jsonl",
             None,
             true,
             false,
-            "Aider Session",
+            Some("Aider Session"),
             "aider",
         );
         let exported_path = msg.expect("export should succeed");
