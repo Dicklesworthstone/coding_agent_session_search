@@ -19444,8 +19444,10 @@ impl super::ftui_adapter::Model for CassApp {
                         return ftui::Cmd::none();
                     }
                     if state.encrypt {
-                        self.status = "Clear Encrypt to save plaintext Markdown.".to_string();
-                        state.progress = ExportProgress::Error(self.status.clone());
+                        self.toast_manager
+                            .push(crate::ui::components::toast::Toast::warning(
+                                "Clear Encrypt before saving Markdown.",
+                            ));
                         return ftui::Cmd::none();
                     }
                     state.progress = ExportProgress::Preparing;
@@ -31939,7 +31941,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "encryption")]
-    fn export_redaction_tui_respects_encryption_for_shortcuts_and_filenames() -> anyhow::Result<()> {
+    fn export_redaction_tui_honors_encryption_for_saves() -> anyhow::Result<()> {
         use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
 
         let root = tempfile::Builder::new()
@@ -31990,10 +31992,11 @@ mod tests {
             let state = app.export_modal_state.as_ref().expect("open export modal");
             assert!(state.encrypt);
             assert_eq!(state.suggested_html_filename(), "conversation-export.html");
-            assert!(matches!(
-                &state.progress,
-                ExportProgress::Error(message) if message.contains("Clear Encrypt")
-            ));
+            assert!(matches!(state.progress, ExportProgress::Idle));
+            assert!(app.toast_manager.visible().any(|toast| {
+                toast.toast_type == crate::ui::components::toast::ToastType::Warning
+                    && toast.message == "Clear Encrypt before saving Markdown."
+            }));
         }
 
         let ftui::Cmd::Task(_, write_html) = app.update(CassMsg::ExportExecuted) else {
