@@ -130,6 +130,8 @@ pub struct ExportModalState {
     /// the exporter can inspect it again without losing safe context.
     /// Plain-text titles use the existing display-length limit.
     pub export_title: Option<String>,
+    /// Whether the title excerpt overlaps a tool block in the indexed source.
+    pub title_has_hidden_tools: bool,
 }
 
 impl Default for ExportModalState {
@@ -154,6 +156,7 @@ impl Default for ExportModalState {
             message_count: 0,
             title_preview: String::new(),
             export_title: None,
+            title_has_hidden_tools: false,
         }
     }
 }
@@ -308,6 +311,32 @@ impl ExportModalState {
             message_count,
             title_preview,
             export_title,
+            title_has_hidden_tools: false,
+        }
+    }
+
+    /// Prepare the alternate preview once when the modal opens or details load.
+    pub(crate) fn prepare_tool_off_preview(&mut self, view: &ConversationView) {
+        let projected = view.messages.iter().map(|message| {
+            crate::pi_archived_export_message(message, &view.convo.agent_slug, false)
+        });
+        self.title_has_hidden_tools =
+            crate::export::archived_title_has_hidden_pi_tools(&self.title_preview, view, projected);
+    }
+
+    pub(crate) fn displayed_title(&self) -> &str {
+        if !self.include_tools && self.title_has_hidden_tools {
+            "Conversation Export"
+        } else {
+            &self.title_preview
+        }
+    }
+
+    pub(crate) fn suggested_html_filename(&self) -> &str {
+        if !self.include_tools && self.title_has_hidden_tools {
+            crate::export::SAFE_HTML_EXPORT_FILENAME
+        } else {
+            &self.filename_preview
         }
     }
 
@@ -420,7 +449,7 @@ impl ExportModalState {
 
     /// Get the full output path.
     pub fn output_path(&self) -> PathBuf {
-        self.output_dir.join(&self.filename_preview)
+        self.output_dir.join(self.suggested_html_filename())
     }
 }
 

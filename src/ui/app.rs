@@ -11251,7 +11251,8 @@ impl CassApp {
         let Some(view) = self.cached_detail_for_render(hit) else {
             return;
         };
-        let refreshed = ExportModalState::from_hit(hit, view);
+        let mut refreshed = ExportModalState::from_hit(hit, view);
+        refreshed.prepare_tool_off_preview(view);
         let Some(state) = self.export_modal_state.as_mut() else {
             return;
         };
@@ -11268,6 +11269,7 @@ impl CassApp {
         state.message_count = refreshed.message_count;
         state.title_preview = refreshed.title_preview;
         state.export_title = refreshed.export_title;
+        state.title_has_hidden_tools = refreshed.title_has_hidden_tools;
     }
 
     fn detail_clipboard_width(&self) -> u16 {
@@ -11354,7 +11356,8 @@ impl CassApp {
 
         let export_state = self.detail_export_state_for_hit(hit);
         let html_path = export_state.output_path();
-        let markdown_filename = Self::markdown_filename_from_html(&export_state.filename_preview);
+        let markdown_filename =
+            Self::markdown_filename_from_html(export_state.suggested_html_filename());
         let markdown_path = unique_filename(&export_state.output_dir, &markdown_filename);
         let max_path_chars = inner_width.saturating_sub(14).clamp(24, 160) as usize;
         let truncate_path = |path: &Path| {
@@ -13494,7 +13497,7 @@ impl CassApp {
                 .render(Rect::new(x, y, w, 1), frame);
             y += 1;
 
-            let title_text = &state.title_preview;
+            let title_text = state.displayed_title();
             Paragraph::new(title_text.to_string())
                 .style(text_style)
                 .render(Rect::new(x, y, w, 1), frame);
@@ -13625,7 +13628,7 @@ impl CassApp {
         }
 
         if y < inner.y + inner.height {
-            Paragraph::new(state.filename_preview.clone())
+            Paragraph::new(state.suggested_html_filename().to_string())
                 .style(text_style)
                 .render(Rect::new(x, y, w, 1), frame);
             y += 1;
@@ -19374,9 +19377,12 @@ impl super::ftui_adapter::Model for CassApp {
                 if !self.show_export_modal
                     && let Some(hit) = self.selected_hit().cloned()
                 {
-                    let load_details =
-                        self.cached_detail_for_render(&hit).is_none() && self.db_path.exists();
-                    let state = self.detail_export_state_for_hit(&hit);
+                    let view = self.cached_detail_for_render(&hit);
+                    let load_details = view.is_none() && self.db_path.exists();
+                    let mut state = self.detail_export_state_for_hit(&hit);
+                    if let Some(view) = view {
+                        state.prepare_tool_off_preview(view);
+                    }
                     self.export_modal_state = Some(state);
                     self.export_modal_hit = Some(hit.clone());
                     self.show_export_modal = true;
@@ -19437,7 +19443,7 @@ impl super::ftui_adapter::Model for CassApp {
                 let db_path = self.db_path.clone();
                 let output_dir = export_state.output_dir.clone();
                 let output_filename =
-                    Self::markdown_filename_from_html(&export_state.filename_preview);
+                    Self::markdown_filename_from_html(export_state.suggested_html_filename());
                 let output_path = unique_filename(&output_dir, &output_filename);
                 let include_tools = export_state.include_tools;
                 let filename_title = export_state.title_preview;
@@ -19475,9 +19481,8 @@ impl super::ftui_adapter::Model for CassApp {
                         return ftui::Cmd::none();
                     }
                     state.progress = ExportProgress::Preparing;
-                    let output_dir = state.output_dir.clone();
-                    let output_filename = state.filename_preview.clone();
-                    let output_path = unique_filename(&output_dir, &output_filename);
+                    let output_path =
+                        unique_filename(&state.output_dir, state.suggested_html_filename());
                     let options = state.to_export_options();
                     let encrypt = options.encrypt;
                     let password = if encrypt {
@@ -23416,8 +23421,8 @@ fn export_session_task(
         .export_messages(title, &groups, metadata, password)
         .map_err(|e| format!("HTML generation failed: {e}"))?;
 
-    let safe_output =
-        filename_hidden.then(|| output_path.with_file_name("conversation-export.html"));
+    let safe_output = filename_hidden
+        .then(|| output_path.with_file_name(crate::export::SAFE_HTML_EXPORT_FILENAME));
     write_export_bytes_no_overwrite(
         safe_output.as_deref().unwrap_or(output_path),
         html.as_bytes(),
@@ -23558,7 +23563,8 @@ fn export_session_markdown_task(
 
     let markdown =
         crate::format_as_markdown(&messages, &session_title, session_start, include_tools);
-    let safe_output = filename_hidden.then(|| output_path.with_file_name("conversation-export.md"));
+    let safe_output = filename_hidden
+        .then(|| output_path.with_file_name(crate::export::SAFE_MARKDOWN_EXPORT_FILENAME));
     write_export_bytes_no_overwrite(
         safe_output.as_deref().unwrap_or(output_path),
         markdown.as_bytes(),
@@ -32902,12 +32908,19 @@ mod tests {
             crate::ui::data::canonical_message_number(1).expect("fixture prompt line"),
             "Public user prompt",
         );
+        hit.agent = "pi_agent".to_string();
         hit.title.clear();
         let view = load_indexed_export_view(&db, &hit)
             .map_err(anyhow::Error::msg)?
             .expect("indexed export view");
         assert!(view.convo.title.is_none());
-        let state = ExportModalState::from_hit(&hit, &view);
+        let mut app = app_with_hits(1);
+        app.db_path = db.clone();
+        app.panes[0].hits[0] = hit.clone();
+        app.cached_detail = Some((hit.source_path.clone(), view.clone()));
+        let _ = app.update(CassMsg::ExportModalOpened);
+        let state = app.export_modal_state.as_mut().expect("open export modal");
+        state.output_dir = root.path().to_path_buf();
         assert!(
             state
                 .title_preview
@@ -32915,9 +32928,54 @@ mod tests {
         );
         assert!(state.title_preview.contains("private-canary"));
         assert!(state.title_preview.ends_with("..."));
-        assert!(state.filename_preview.contains("hiddentitle"));
+        assert!(state.displayed_title().contains("private-canary"));
+        assert!(state.suggested_html_filename().contains("hiddentitle"));
+        let proposed = state.output_path();
 
-        let proposed = root.path().join(&state.filename_preview);
+        let _ = app.update(CassMsg::ExportFieldToggled(ExportField::IncludeTools));
+        let state = app.export_modal_state.as_ref().expect("open export modal");
+        assert_eq!(state.displayed_title(), "Conversation Export");
+        assert_eq!(
+            state.output_path(),
+            root.path().join("conversation-export.html")
+        );
+        assert_eq!(
+            CassApp::markdown_filename_from_html(state.suggested_html_filename()),
+            "conversation-export.md"
+        );
+        let _ = app.update(CassMsg::ExportFieldToggled(ExportField::IncludeTools));
+        let state = app.export_modal_state.as_ref().expect("open export modal");
+        assert!(state.displayed_title().contains("private-canary"));
+        assert_eq!(state.output_path(), proposed);
+
+        // A clean excerpt that ends before the tool remains usable in the preview.
+        let mut titled_view = view.clone();
+        titled_view.convo.title = Some("Public café".to_string());
+        let mut titled = ExportModalState::from_hit(&hit, &titled_view);
+        titled.prepare_tool_off_preview(&titled_view);
+        titled.focused = ExportField::IncludeTools;
+        titled.toggle_current();
+        assert_eq!(titled.displayed_title(), "Public café");
+        assert_eq!(titled.suggested_html_filename(), titled.filename_preview);
+
+        // Details can arrive after the user turns tools off.
+        let _ = app.update(CassMsg::ExportModalClosed);
+        app.cached_detail = None;
+        let _ = app.update(CassMsg::ExportModalOpened);
+        let _ = app.update(CassMsg::ExportFieldToggled(ExportField::IncludeTools));
+        let state = app.export_modal_state.as_mut().expect("open export modal");
+        assert_eq!(state.displayed_title(), "Untitled Session");
+        state.output_dir = root.path().to_path_buf();
+        app.cached_detail = Some((hit.source_path.clone(), view));
+        app.refresh_open_export_modal_for_hit(&SelectedHitKey::from_hit(&hit));
+        let state = app.export_modal_state.as_ref().expect("open export modal");
+        assert_eq!(state.displayed_title(), "Conversation Export");
+        assert_eq!(
+            state.output_path(),
+            root.path().join("conversation-export.html")
+        );
+
+        // The writers also guard a path captured before the toggle.
         let html_title = state.to_export_options().title.expect("modal export title");
         let html = export_session_task(
             &db,
@@ -32926,7 +32984,7 @@ mod tests {
             false,
             None,
             true,
-            false,
+            state.include_tools,
             &html_title,
             "Pi",
         )
@@ -32935,7 +32993,7 @@ mod tests {
             &db,
             &hit,
             &proposed.with_extension("md"),
-            false,
+            state.include_tools,
             &state.title_preview,
         )
         .map_err(anyhow::Error::msg)?;

@@ -109337,22 +109337,21 @@ fn role_to_export_string(role: &crate::model::types::MessageRole) -> String {
 fn conversation_view_to_raw_messages(
     view: &crate::ui::data::ConversationView,
 ) -> Vec<serde_json::Value> {
-    view.messages
-        .iter()
-        .map(|msg| {
-            let mut json_msg = serde_json::json!({
-                "role": role_to_export_string(&msg.role),
-                "content": msg.content,
-            });
-            if let Some(ts) = msg.created_at {
-                json_msg["timestamp"] = serde_json::json!(ts);
-            }
-            if let Some(author) = &msg.author {
-                json_msg["author"] = serde_json::json!(author);
-            }
-            json_msg
-        })
-        .collect()
+    view.messages.iter().map(archived_export_message).collect()
+}
+
+fn archived_export_message(msg: &crate::model::types::Message) -> serde_json::Value {
+    let mut json_msg = serde_json::json!({
+        "role": role_to_export_string(&msg.role),
+        "content": msg.content,
+    });
+    if let Some(ts) = msg.created_at {
+        json_msg["timestamp"] = serde_json::json!(ts);
+    }
+    if let Some(author) = &msg.author {
+        json_msg["author"] = serde_json::json!(author);
+    }
+    json_msg
 }
 
 /// Prefer Pi-family source events for rendered exports. The archive's
@@ -109363,57 +109362,62 @@ fn conversation_view_to_rendered_raw_messages(
 ) -> Vec<serde_json::Value> {
     // The export selector receives the original archive rows alongside this
     // projection, so keep them aligned by position here.
-    let mut messages = conversation_view_to_raw_messages(view);
     if !matches!(view.convo.agent_slug.as_str(), "pi_agent" | "omp") {
-        return messages;
+        return conversation_view_to_raw_messages(view);
     }
+    view.messages
+        .iter()
+        .map(|message| pi_archived_export_message(message, &view.convo.agent_slug, include_tools))
+        .collect()
+}
 
-    for (raw_message, archived_message) in messages.iter_mut().zip(&view.messages) {
-        if let Some(source_line) =
-            crate::storage::sqlite::message_extra_to_source_jsonl_line(&archived_message.extra_json)
-        {
-            match serde_json::from_str::<serde_json::Value>(&source_line) {
-                Ok(event) => {
-                    if event.get("type").and_then(serde_json::Value::as_str) == Some("message")
-                        && let Some(body) = event.get("message").filter(|body| body.is_object())
+fn pi_archived_export_message(
+    archived_message: &crate::model::types::Message,
+    agent_slug: &str,
+    include_tools: bool,
+) -> serde_json::Value {
+    let mut raw_message = archived_export_message(archived_message);
+    if let Some(source_line) =
+        crate::storage::sqlite::message_extra_to_source_jsonl_line(&archived_message.extra_json)
+    {
+        match serde_json::from_str::<serde_json::Value>(&source_line) {
+            Ok(event) => {
+                if event.get("type").and_then(serde_json::Value::as_str) == Some("message")
+                    && let Some(body) = event.get("message").filter(|body| body.is_object())
+                {
+                    if include_tools {
+                        return event;
+                    }
+                    let role = body
+                        .get("role")
+                        .and_then(serde_json::Value::as_str)
+                        .map(normalized_export_role);
+                    if role == raw_message.get("role").and_then(serde_json::Value::as_str)
+                        && let Some(content) = body.get("content").filter(|content| {
+                            content.is_array() || export_text_block(content).is_some()
+                        })
                     {
-                        if include_tools {
-                            *raw_message = event;
-                            continue;
-                        }
-                        let role = body
-                            .get("role")
-                            .and_then(serde_json::Value::as_str)
-                            .map(normalized_export_role);
-                        if role == raw_message.get("role").and_then(serde_json::Value::as_str)
-                            && let Some(content) = body.get("content").filter(|content| {
-                                content.is_array() || export_text_block(content).is_some()
-                            })
-                        {
-                            // Restore the original block boundaries while keeping
-                            // the canonical row's role, author and timestamp.
-                            raw_message["content"] = content.clone();
-                            continue;
-                        }
+                        // Keep the canonical row's role, author and timestamp.
+                        raw_message["content"] = content.clone();
+                        return raw_message;
                     }
                 }
-                Err(_) => tracing::warn!(
-                    message_idx = archived_message.idx,
-                    agent = %view.convo.agent_slug,
-                    "Could not decode Pi-family export source event"
-                ),
             }
-        }
-        if !include_tools && archived_message.role == crate::model::types::MessageRole::Agent {
-            let content = &archived_message.content;
-            let visible = without_flattened_tool_suffix(content);
-            if visible.len() != content.len() {
-                raw_message["content"] = serde_json::Value::String(visible.to_owned());
-            }
+            Err(_) => tracing::warn!(
+                message_idx = archived_message.idx,
+                agent = %agent_slug,
+                "Could not decode Pi-family export source event"
+            ),
         }
     }
-
-    messages
+    if !include_tools && archived_message.role == crate::model::types::MessageRole::Agent {
+        let content = &archived_message.content;
+        let visible = without_flattened_tool_suffix(content);
+        if visible.len() != content.len() {
+            raw_message["content"] = serde_json::Value::String(visible.to_owned());
+        }
+    }
+    raw_message
 }
 
 fn canonical_followup_source_id(source_id: Option<&str>) -> Option<String> {

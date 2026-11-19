@@ -7,7 +7,7 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 
 use crate::model::types::Message;
 use crate::search::query::SearchHit;
@@ -75,6 +75,8 @@ impl ExportPrivacy {
 }
 
 const SKILL_DIRECTORY_MARKER: &str = "Base directory for this skill:";
+pub(crate) const SAFE_HTML_EXPORT_FILENAME: &str = "conversation-export.html";
+pub(crate) const SAFE_MARKDOWN_EXPORT_FILENAME: &str = "conversation-export.md";
 
 #[derive(Clone, Copy, Debug, Default, clap::Args)]
 pub struct ExportInjections {
@@ -182,12 +184,13 @@ pub(crate) fn raw_title_is_skill_injection(title: &str, messages: &[Value]) -> b
 pub(crate) fn archived_title_has_hidden_pi_tools(
     title: &str,
     view: &crate::ui::data::ConversationView,
-    projected: &[Value],
+    projected: impl IntoIterator<Item: Borrow<Value>>,
 ) -> bool {
     if !matches!(view.convo.agent_slug.as_str(), "pi_agent" | "omp") {
         return false;
     }
     for (archived, message) in view.messages.iter().zip(projected) {
+        let message = message.borrow();
         if title_matches_hidden_pi_tools(
             title,
             &crate::extract_role(message),
