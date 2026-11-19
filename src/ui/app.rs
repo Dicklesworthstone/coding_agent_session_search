@@ -32860,6 +32860,101 @@ mod tests {
     }
 
     #[test]
+    fn export_redaction_tui_hides_embedded_tool_in_untitled_session() -> anyhow::Result<()> {
+        use crate::franken_sync::SqliteValue;
+        use crate::storage::sqlite::FrankenStorage;
+        use franken_agent_detection::connectors::pi_wire::flatten_message_content;
+
+        let root = tempfile::Builder::new()
+            .prefix("cass-tui-mixed-title-")
+            .disable_cleanup(true)
+            .tempdir()?;
+        let db = root.path().join("archive.db");
+        let source = root.path().join("missing.jsonl");
+        let storage = FrankenStorage::open(&db)?;
+        let conn = storage.raw();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'pi_agent', 'Pi', 'local', 0, 0)")?;
+        conn.execute_with_params(
+            "INSERT INTO conversations (id, agent_id, external_id, source_path, source_id, approx_tokens) VALUES (1, 1, 'mixed-title', ?1, 'local', 10)",
+            &[SqliteValue::Text(source.display().to_string().into())],
+        )?;
+        let blocks = serde_json::json!([
+            {"type":"text", "text":"Public café"},
+            {"type":"toolCall", "id":"mixed-call", "name":"HiddenTitle", "arguments":{"note":"private-canary"}},
+            {"type":"text", "text":"[Tool: literal example] visible after the call"}
+        ]);
+        let content = flatten_message_content(&blocks);
+        let event = serde_json::json!({
+            "type":"message", "message":{"role":"assistant", "content":blocks}
+        });
+        conn.execute_with_params(
+            "INSERT INTO messages (conversation_id, idx, role, content, extra_json) VALUES (1, 0, 'assistant', ?1, ?2)",
+            &[
+                SqliteValue::Text(content.into()),
+                SqliteValue::Text(event.to_string().into()),
+            ],
+        )?;
+        conn.execute("INSERT INTO messages (conversation_id, idx, role, content) VALUES (1, 1, 'user', 'Public user prompt')")?;
+
+        let mut hit = make_exact_hit(
+            &source.display().to_string(),
+            "local",
+            crate::ui::data::canonical_message_number(1).expect("fixture prompt line"),
+            "Public user prompt",
+        );
+        hit.title.clear();
+        let view = load_indexed_export_view(&db, &hit)
+            .map_err(anyhow::Error::msg)?
+            .expect("indexed export view");
+        assert!(view.convo.title.is_none());
+        let state = ExportModalState::from_hit(&hit, &view);
+        assert!(
+            state
+                .title_preview
+                .starts_with("Public café\n[Tool: HiddenTitle]")
+        );
+        assert!(state.title_preview.contains("private-canary"));
+        assert!(state.title_preview.ends_with("..."));
+        assert!(state.filename_preview.contains("hiddentitle"));
+
+        let proposed = root.path().join(&state.filename_preview);
+        let html_title = state.to_export_options().title.expect("modal export title");
+        let html = export_session_task(
+            &db,
+            &hit,
+            &proposed,
+            false,
+            None,
+            true,
+            false,
+            &html_title,
+            "Pi",
+        )
+        .map_err(anyhow::Error::msg)?;
+        let markdown = export_session_markdown_task(
+            &db,
+            &hit,
+            &proposed.with_extension("md"),
+            false,
+            &state.title_preview,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(html, root.path().join("conversation-export.html"));
+        assert_eq!(markdown, root.path().join("conversation-export.md"));
+        let html = std::fs::read_to_string(html)?;
+        let markdown = std::fs::read_to_string(markdown)?;
+        assert!(html.contains("<title>Public user prompt</title>"));
+        assert!(markdown.starts_with("# Public user prompt\n"));
+        for body in [html, markdown] {
+            assert!(body.contains("Public café"));
+            assert!(body.contains("[Tool: literal example] visible after the call"));
+            assert!(!body.contains("HiddenTitle"));
+            assert!(!body.contains("private-canary"));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn export_redaction_tui_html_preserves_complete_title_after_preview() -> anyhow::Result<()> {
         let root = tempfile::Builder::new()
             .prefix("cass-tui-complete-title-")

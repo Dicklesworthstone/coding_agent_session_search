@@ -238,7 +238,7 @@ fn title_matches_hidden_pi_tools(
         return false;
     };
     let searchable = searchable.trim_start();
-    if role != "tool" && (role != "assistant" || !searchable.starts_with("[Tool:")) {
+    if role != "tool" && (role != "assistant" || !searchable.contains("[Tool:")) {
         return false;
     }
 
@@ -247,15 +247,36 @@ fn title_matches_hidden_pi_tools(
     // and compare the visible text using the same form as the matched source.
     let compare_redacted = !searchable.starts_with(prefix);
     let mut privacy = ExportPrivacy::new(false);
+    let mut source = Cow::Borrowed(searchable);
     if compare_redacted {
-        let mut preview = searchable.to_owned();
-        privacy.redact_text(&mut preview);
-        if !preview.trim_start().starts_with(prefix) {
-            return false;
-        }
+        privacy.redact_text(source.to_mut());
+    }
+    let source = source.trim_start();
+    if !source.starts_with(prefix) {
+        return false;
     }
     if role == "tool" {
         return true;
+    }
+
+    // A flattened tool block can follow ordinary text. Inspect the matched
+    // source lines so a preview that cuts through the marker still overlaps it.
+    let mut line_start = 0;
+    let mut overlaps_tool_line = false;
+    for line in source.split_inclusive('\n') {
+        if line_start >= prefix.len() {
+            break;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("[Tool:") && line_start + (line.len() - trimmed.len()) < prefix.len()
+        {
+            overlaps_tool_line = true;
+            break;
+        }
+        line_start += line.len();
+    }
+    if !overlaps_tool_line {
+        return false;
     }
 
     let mut visible = crate::extract_text_content_without_tool_blocks(rendered);
@@ -829,6 +850,32 @@ mod tests {
         let literal = serde_json::json!({"type": "text", "text": title});
         assert!(!raw_title_has_hidden_pi_tools(
             title,
+            "pi_agent",
+            &export_messages([literal, tool.clone()])
+        ));
+
+        let narrative = serde_json::json!({"type": "text", "text": "Ordinary narrative"});
+        let mixed = export_messages([narrative.clone(), tool.clone()]);
+        assert!(raw_title_has_hidden_pi_tools(
+            "Ordinary narrative\n[Tool: Read] path=fixture",
+            "pi_agent",
+            &mixed
+        ));
+        assert!(raw_title_has_hidden_pi_tools(
+            "Ordinary narrative\n[To...",
+            "pi_agent",
+            &mixed
+        ));
+        assert!(!raw_title_has_hidden_pi_tools(
+            "Ordinary narrative...",
+            "pi_agent",
+            &mixed
+        ));
+        let literal = serde_json::json!({
+            "type": "text", "text": "Ordinary narrative\n[Tool: a literal example]"
+        });
+        assert!(!raw_title_has_hidden_pi_tools(
+            "Ordinary narrative\n[Tool: a literal example]",
             "pi_agent",
             &export_messages([literal, tool])
         ));
