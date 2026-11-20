@@ -2809,6 +2809,98 @@ fn tui_pty_record_macro_creates_file() {
     tracker.complete();
 }
 
+#[cfg(unix)]
+#[test]
+fn tui_pty_macro_recordings_omit_export_password_input() {
+    let _guard_lock = tui_flow_guard();
+    let trace = trace_id();
+    let tracker = tracker_for("tui_pty_macro_recordings_omit_export_password_input");
+    let env = prepare_ftui_pty_env(&trace, &tracker);
+    let launch_macro = env.data_dir.join("launch-recording.jsonl");
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            cols: 130,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open PTY");
+    let reader = pair.master.try_clone_reader().expect("clone PTY reader");
+    let (captured, reader_handle) = spawn_reader(reader);
+    let mut writer = pair.master.take_writer().expect("take PTY writer");
+    let mut cmd = CommandBuilder::new(cass_bin_path());
+    cmd.arg("tui");
+    cmd.arg("--record-macro");
+    cmd.arg(&launch_macro);
+    apply_ftui_env(&mut cmd, &env);
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn CASS in PTY");
+    let wait_for_text = |needle| {
+        assert!(
+            wait_for_rendered_output(&captured, PTY_STARTUP_TIMEOUT, |text| text.contains(needle)),
+            "expected to see {needle:?} in the TUI"
+        );
+    };
+
+    wait_for_text("Search sessions, messages");
+    send_key_sequence(&mut *writer, b"\x1bm");
+    wait_for_text("Macro recording started");
+    send_key_sequence(&mut *writer, b"h\x1b[200~ello\x1b[201~\r");
+    assert!(wait_for_rendered_output(
+        &captured,
+        PTY_STARTUP_TIMEOUT,
+        rendered_contains_hello_fixture_content,
+    ));
+    send_key_sequence(&mut *writer, b"\x05"); // Ctrl+E
+    wait_for_text("Export Session as HTML");
+    send_key_sequence(&mut *writer, b"\t\t \t");
+    wait_for_text("Password:");
+
+    // Both the single key and the bracketed paste supply the synthetic password.
+    send_key_sequence(&mut *writer, b"q\x1b[200~macro-private-synthetic\x1b[201~");
+    wait_for_text("••••");
+    send_key_sequence(&mut *writer, b"\r\r");
+    wait_for_text("Exported to");
+    send_key_sequence(&mut *writer, b"\x1bm");
+    wait_for_text("Macro saved (");
+
+    let (status, _) =
+        quit_tui_with_escape(&mut *writer, &mut *child, 8, Duration::from_millis(180));
+    assert!(status.success());
+    drop(writer);
+    drop(pair);
+    let _ = reader_handle.join();
+
+    let html =
+        fs::read_to_string(env.home.join("conversation-export.html")).expect("encrypted export");
+    assert!(html.contains(r#"<div id="encrypted-content" hidden>"#));
+    assert!(!html.contains("hello world"));
+    let macro_dir = env.xdg.join("coding-agent-search/macros");
+    let mut saved = fs::read_dir(macro_dir).expect("interactive macro directory");
+    let interactive_macro = saved
+        .next()
+        .expect("interactive macro file")
+        .expect("macro entry")
+        .path();
+    assert!(saved.next().is_none());
+    for (path, name) in [
+        (launch_macro, "cass-session"),
+        (interactive_macro, "cass-interactive"),
+    ] {
+        let recording = fs::read_to_string(path).expect("recorded macro");
+        let mut records = recording.lines().map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).expect("macro JSONL record")
+        });
+        assert_eq!(records.next().expect("macro header")["name"], name);
+        let events: Vec<_> = records.map(|mut record| record["event"].take()).collect();
+        assert!(events.iter().any(|event| event["key"]["char"] == "h"));
+        assert!(events.iter().any(|event| event["paste"] == "ello"));
+        assert!(events.iter().any(|event| event["key"] == "Tab"));
+        assert!(!events.iter().any(|event| event["key"]["char"] == "q"));
+        assert!(!recording.contains("macro-private-synthetic"));
+    }
+    tracker.complete();
+}
+
 #[test]
 fn tui_typing_writes_latency_trace() -> Result<(), String> {
     const LATENCY_QUERY: &str = "latencyprobe";

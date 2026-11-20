@@ -5570,6 +5570,8 @@ pub struct CassApp {
     // -- Macro recording/playback -----------------------------------------
     /// Active macro recorder (when interactive recording is in progress).
     pub macro_recorder: Option<MacroRecorder>,
+    /// Recorder for the whole session when launched with --record-macro.
+    launch_macro_recorder: Option<MacroRecorder>,
     /// Active macro playback scheduler (when replaying a macro).
     pub macro_playback: Option<MacroPlayback>,
     /// Whether to redact absolute paths when saving macros.
@@ -5801,6 +5803,7 @@ impl Default for CassApp {
             first_run_index_probed_at: None,
             live_search_request: None,
             macro_recorder: None,
+            launch_macro_recorder: None,
             macro_playback: None,
             macro_redact_paths: false,
             latency_trace: None,
@@ -11171,6 +11174,43 @@ impl CassApp {
         }
     }
 
+    fn record_macro_event(&mut self, event: &super::ftui_adapter::Event, msg: &CassMsg) {
+        use super::ftui_adapter::Event;
+
+        // Releases have no input semantics and can arrive after focus leaves the password field.
+        if matches!(event, Event::Tick)
+            || matches!(event, Event::Key(key) if key.kind == ftui::KeyEventKind::Release)
+        {
+            return;
+        }
+
+        if matches!(msg, CassMsg::QueryChanged(_))
+            && self.show_export_modal
+            && !self.source_filter_menu_open
+            && !self.show_saved_views_modal
+            && self
+                .export_modal_state
+                .as_ref()
+                .is_some_and(|state| state.focused == ExportField::Password)
+        {
+            return;
+        }
+
+        if let Some(recorder) = self
+            .launch_macro_recorder
+            .take_if(|recorder| recorder.event_count() == 0)
+        {
+            let (width, height) = self.last_terminal_size.get();
+            self.launch_macro_recorder = Some(recorder.with_terminal_size(width, height));
+        }
+        for recorder in [&mut self.macro_recorder, &mut self.launch_macro_recorder]
+            .into_iter()
+            .flatten()
+        {
+            recorder.record_event(event.clone());
+        }
+    }
+
     fn close_export_modal(&mut self) {
         if self.show_export_modal {
             self.focus_manager.pop_trap();
@@ -16484,11 +16524,8 @@ impl super::ftui_adapter::Model for CassApp {
             return ftui::Cmd::none();
         }
 
-        // Record raw event for model-level macro recording.
-        if let Some(ref mut recorder) = self.macro_recorder
-            && let Some(ref raw_event) = raw_event
-        {
-            recorder.record_event(raw_event.clone());
+        if let Some(ref raw_event) = raw_event {
+            self.record_macro_event(raw_event, &msg);
         }
 
         let raw_alt_update_shortcut = matches!(
@@ -20142,6 +20179,7 @@ impl super::ftui_adapter::Model for CassApp {
                     next_export_task,
                     state_file_io_epoch,
                     state_file_io_lock: state_file_io_lock_for_reset,
+                    launch_macro_recorder: self.launch_macro_recorder.take(),
                     ..CassApp::default()
                 };
                 *self = reset;
@@ -23872,6 +23910,10 @@ pub fn run_tui_ftui(
         );
         model.macro_playback = Some(MacroPlayback::new(macro_data));
     }
+    if macro_config.record_path.is_some() {
+        // The runtime's raw recorder runs before the export form can filter password input.
+        model.launch_macro_recorder = Some(MacroRecorder::new("cass-session"));
+    }
 
     // Unix: native ftui-tty backend. Non-Unix (Windows): crossterm-compat —
     // ftui_tty::TtyBackend is "Unix-first; Windows deferred", and on non-Unix
@@ -23880,37 +23922,19 @@ pub fn run_tui_ftui(
     // ftui-demo-showcase split.
     let result = {
         #[cfg(unix)]
-        {
-            let mut program = ftui::Program::with_native_backend(model, config)
-                .map_err(|e| anyhow::anyhow!("ftui program creation error: {e}"))?;
-            if macro_config.record_path.is_some() {
-                program.start_recording("cass-session");
-            }
-            let run_result = program.run();
-            if let Some(ref record_path) = macro_config.record_path
-                && let Some(recorded) = program.stop_recording()
-            {
-                macro_file::save_macro(record_path, &recorded, false)?;
-                eprintln!("Macro saved to: {}", record_path.display());
-            }
-            run_result
-        }
+        let program = ftui::Program::with_native_backend(model, config);
         #[cfg(not(unix))]
+        let program = ftui::Program::with_config(model, config);
+        let mut program =
+            program.map_err(|e| anyhow::anyhow!("ftui program creation error: {e}"))?;
+        let run_result = program.run();
+        if let Some(ref record_path) = macro_config.record_path
+            && let Some(recorder) = program.model_mut().launch_macro_recorder.take()
         {
-            let mut program = ftui::Program::with_config(model, config)
-                .map_err(|e| anyhow::anyhow!("ftui program creation error: {e}"))?;
-            if macro_config.record_path.is_some() {
-                program.start_recording("cass-session");
-            }
-            let run_result = program.run();
-            if let Some(ref record_path) = macro_config.record_path
-                && let Some(recorded) = program.stop_recording()
-            {
-                macro_file::save_macro(record_path, &recorded, false)?;
-                eprintln!("Macro saved to: {}", record_path.display());
-            }
-            run_result
+            macro_file::save_macro(record_path, &recorder.finish(), false)?;
+            eprintln!("Macro saved to: {}", record_path.display());
         }
+        run_result
     };
 
     if let Some(recorder) = latency_trace {
@@ -45714,6 +45738,47 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         let _ = app.update(CassMsg::MacroRecordingToggled);
         assert!(app.macro_recorder.is_some());
         assert!(app.status.contains("Recording"));
+    }
+
+    #[test]
+    fn macro_recording_skips_repeated_password_input_and_late_release() {
+        use ftui::{Event, KeyCode, KeyEvent, KeyEventKind};
+
+        let mut app = app_with_hits(1);
+        let _ = app.update(CassMsg::MacroRecordingToggled);
+        let _ = app.update(CassMsg::ExportModalOpened);
+        let _ = app.update(CassMsg::ExportFieldToggled(ExportField::Encrypt));
+        let state = app.export_modal_state.as_mut().expect("open export form");
+        state.focused = ExportField::Password;
+
+        let typing = KeyEvent::new(KeyCode::Char('q'));
+        let repeat = KeyEvent {
+            kind: KeyEventKind::Repeat,
+            ..typing
+        };
+        for event in [typing, repeat, KeyEvent::new(KeyCode::Backspace)] {
+            let _ = app.update(CassMsg::from(Event::Key(event)));
+        }
+        let state = app.export_modal_state.as_ref().expect("open export form");
+        assert_eq!(state.password, "q");
+
+        let tab = Event::Key(KeyEvent::new(KeyCode::Tab));
+        let _ = app.update(CassMsg::from(tab.clone()));
+        let state = app.export_modal_state.as_ref().expect("open export form");
+        assert_eq!(state.focused, ExportField::ShowTimestamps);
+
+        let release = KeyEvent {
+            kind: KeyEventKind::Release,
+            ..typing
+        };
+        let _ = app.update(CassMsg::from(Event::Key(release)));
+        let macro_recording = app
+            .macro_recorder
+            .take()
+            .expect("recording active")
+            .finish();
+        assert_eq!(macro_recording.len(), 1);
+        assert_eq!(macro_recording.events()[0].event, tab);
     }
 
     #[test]
