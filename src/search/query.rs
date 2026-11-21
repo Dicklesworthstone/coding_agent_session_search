@@ -2714,6 +2714,23 @@ impl PartialOrd for SearchHitKey {
 const FEDERATED_RRF_K: f32 = 60.0;
 
 #[derive(Debug)]
+struct RankedLexicalHit {
+    // Preserve the engine rank even when earlier candidates were noise. A
+    // federated merge must not promote the survivors to a different RRF rank.
+    rank: usize,
+    hit: SearchHit,
+}
+
+#[derive(Debug)]
+struct LexicalCandidates {
+    hits: Vec<RankedLexicalHit>,
+    total_count: Option<usize>,
+    // Retry admission depends on the original window, including filtered
+    // candidates. An all-noise first window can still need a larger fetch.
+    fetched_count: usize,
+}
+
+#[derive(Debug)]
 struct FederatedRankedHit {
     hit: SearchHit,
     shard_index: usize,
@@ -5047,7 +5064,11 @@ impl SearchClient {
                 offset = 0,
                 "search_start"
             );
-            let (hits, tantivy_total_count) = self.search_tantivy(
+            let LexicalCandidates {
+                hits,
+                total_count: tantivy_total_count,
+                fetched_count: initial_hit_count,
+            } = self.search_tantivy(
                 &reader,
                 &fields,
                 query,
@@ -5060,11 +5081,15 @@ impl SearchClient {
             if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
                 *tc = tantivy_total_count;
             }
-            if !hits.is_empty() {
-                let initial_hit_count = hits.len();
-                let page_hits = |raw_hits: Vec<SearchHit>| {
+            if initial_hit_count != 0 {
+                let page_hits = |admitted_hits: Vec<RankedLexicalHit>| {
                     self.postprocess_hits_page(
-                        raw_hits, &sanitized, &filters, limit, offset, field_mask,
+                        admitted_hits.into_iter().map(|ranked| ranked.hit).collect(),
+                        None,
+                        &filters,
+                        limit,
+                        offset,
+                        field_mask,
                     )
                 };
 
@@ -5096,7 +5121,11 @@ impl SearchClient {
                         field_mask,
                     );
                     match self.settle_lexical_retry(attempt, paged_hits.len())? {
-                        Some((retry_hits, retry_total_count)) => {
+                        Some(LexicalCandidates {
+                            hits: retry_hits,
+                            total_count: retry_total_count,
+                            ..
+                        }) => {
                             if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
                                 *tc = retry_total_count;
                             }
@@ -5136,7 +5165,11 @@ impl SearchClient {
                 shards = readers.len(),
                 "search_start"
             );
-            let (hits, tantivy_total_count) = self.search_tantivy_federated(
+            let LexicalCandidates {
+                hits,
+                total_count: tantivy_total_count,
+                fetched_count: initial_hit_count,
+            } = self.search_tantivy_federated(
                 readers.as_ref(),
                 query,
                 &sanitized,
@@ -5147,11 +5180,15 @@ impl SearchClient {
             if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
                 *tc = tantivy_total_count;
             }
-            if !hits.is_empty() {
-                let initial_hit_count = hits.len();
-                let page_hits = |raw_hits: Vec<SearchHit>| {
+            if initial_hit_count != 0 {
+                let page_hits = |admitted_hits: Vec<RankedLexicalHit>| {
                     self.postprocess_hits_page(
-                        raw_hits, &sanitized, &filters, limit, offset, field_mask,
+                        admitted_hits.into_iter().map(|ranked| ranked.hit).collect(),
+                        None,
+                        &filters,
+                        limit,
+                        offset,
+                        field_mask,
                     )
                 };
 
@@ -5187,7 +5224,11 @@ impl SearchClient {
                         field_mask,
                     );
                     match self.settle_lexical_retry(attempt, paged_hits.len())? {
-                        Some((retry_hits, retry_total_count)) => {
+                        Some(LexicalCandidates {
+                            hits: retry_hits,
+                            total_count: retry_total_count,
+                            ..
+                        }) => {
                             if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
                                 *tc = retry_total_count;
                             }
@@ -5255,8 +5296,14 @@ impl SearchClient {
                 0, // Always fetch from 0 for global dedup
                 field_mask,
             )?;
-            let (_, paged_hits) =
-                self.postprocess_hits_page(hits, &sanitized, &filters, limit, offset, field_mask);
+            let (_, paged_hits) = self.postprocess_hits_page(
+                hits,
+                Some(&sanitized),
+                &filters,
+                limit,
+                offset,
+                field_mask,
+            );
 
             if can_use_cache && offset == 0 {
                 self.put_cache(query, &filters, field_mask, cache_epoch, &paged_hits);
@@ -7404,8 +7451,14 @@ impl SearchClient {
                 let (hydrated, mut coverage) =
                     self.hydrate_semantic_hits_at_generation(&results, field_mask, retained)?;
                 let hits = hydrated.into_iter().map(|(_, hit)| hit).collect();
-                let (available_hits, paged_hits) =
-                    self.postprocess_hits_page(hits, query, &filters, limit, offset, field_mask);
+                let (available_hits, paged_hits) = self.postprocess_hits_page(
+                    hits,
+                    Some(query),
+                    &filters,
+                    limit,
+                    offset,
+                    field_mask,
+                );
                 let needs_more = (available_hits < target_hits && retry_state.has_more_candidates)
                     || retry_state.exact_window_may_omit_competitor;
                 if needs_more && fetch_limit < maximum_fetch {
@@ -7710,7 +7763,7 @@ impl SearchClient {
     fn postprocess_hits_page(
         &self,
         mut hits: Vec<SearchHit>,
-        query: &str,
+        noise_query: Option<&str>,
         filters: &SearchFilters,
         limit: usize,
         offset: usize,
@@ -7721,7 +7774,7 @@ impl SearchClient {
         }
         postprocess_hits_page_core(
             hits,
-            Some(query),
+            noise_query,
             &filters.session_paths,
             limit,
             offset,
@@ -8538,8 +8591,9 @@ impl SearchClient {
         limit: usize,
         offset: usize,
         field_mask: FieldMask,
-    ) -> Result<(Vec<SearchHit>, Option<usize>)> {
+    ) -> Result<LexicalCandidates> {
         struct PendingTantivyHit {
+            rank: usize,
             score: f32,
             title: String,
             stored_content: String,
@@ -8605,11 +8659,12 @@ impl SearchClient {
             top_docs.total_count
         };
         let query_match_type = dominant_match_type(sanitized_query);
-        let mut pending_hits = Vec::with_capacity(top_docs.hits.len());
+        let fetched_count = top_docs.hits.len();
+        let mut pending_hits = Vec::with_capacity(fetched_count);
         let mut missing_exact_content_keys = Vec::new();
         let mut missing_fallback_content_keys = Vec::new();
 
-        for ranked_hit in top_docs.hits {
+        for (rank, ranked_hit) in top_docs.hits.into_iter().enumerate() {
             let score = ranked_hit.bm25_score;
             let global_docid = ranked_hit.global_docid;
             let title = if field_mask.wants_title() {
@@ -8694,6 +8749,7 @@ impl SearchClient {
             }
 
             pending_hits.push(PendingTantivyHit {
+                rank,
                 score,
                 title,
                 stored_content,
@@ -8763,6 +8819,9 @@ impl SearchClient {
                             .cloned()
                     }
                 });
+            let content_is_complete = !pending.stored_content.is_empty()
+                || hydrated_content.is_some()
+                || stored_preview_is_complete_content(&pending.stored_preview);
             let effective_content = if !pending.stored_content.is_empty() {
                 pending.stored_content
             } else if let Some(content) = hydrated_content {
@@ -8770,6 +8829,18 @@ impl SearchClient {
             } else {
                 pending.stored_preview
             };
+            // Index-only callers (notably cass serve) intentionally have no
+            // archive to hydrate. A truncated source prefix cannot prove that
+            // a tool marker is malformed, or that the entire message is noise.
+            // Keep uncertain candidates and classify only complete source text.
+            // The lexical reducer must preserve this decision, including when
+            // the caller asks for a content field containing only that prefix.
+            if content_is_complete
+                && (is_search_noise_text(&effective_content, sanitized_query)
+                    || is_tool_invocation_noise(&effective_content))
+            {
+                continue;
+            }
             let snippet = if wants_snippet {
                 if let Some(snippet) = pending.stored_preview_snippet.clone() {
                     snippet
@@ -8811,28 +8882,35 @@ impl SearchClient {
                 pending.raw_origin_kind.as_deref(),
             )
             .to_string();
-            hits.push(SearchHit {
-                title: pending.title,
-                snippet,
-                // Keep raw text through reduction; the public page and cache
-                // receive only the requested projection afterward.
-                content: effective_content,
-                content_hash,
-                conversation_id: pending.conversation_id,
-                score: pending.score,
-                source_path: pending.source_path,
-                agent: pending.agent,
-                workspace: pending.workspace,
-                workspace_original: pending.workspace_original,
-                created_at: pending.created_at,
-                line_number: pending.line_number,
-                match_type: query_match_type,
-                source_id: pending.source_id,
-                origin_kind,
-                origin_host: pending.origin_host,
+            hits.push(RankedLexicalHit {
+                rank: pending.rank,
+                hit: SearchHit {
+                    title: pending.title,
+                    snippet,
+                    // Keep source text for deduplication and project only
+                    // after admission, source filtering, and pagination.
+                    content: effective_content,
+                    content_hash,
+                    conversation_id: pending.conversation_id,
+                    score: pending.score,
+                    source_path: pending.source_path,
+                    agent: pending.agent,
+                    workspace: pending.workspace,
+                    workspace_original: pending.workspace_original,
+                    created_at: pending.created_at,
+                    line_number: pending.line_number,
+                    match_type: query_match_type,
+                    source_id: pending.source_id,
+                    origin_kind,
+                    origin_host: pending.origin_host,
+                },
             });
         }
-        Ok((hits, tantivy_total_count))
+        Ok(LexicalCandidates {
+            hits,
+            total_count: tantivy_total_count,
+            fetched_count,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8844,12 +8922,13 @@ impl SearchClient {
         filters: SearchFilters,
         limit: usize,
         field_mask: FieldMask,
-    ) -> Result<(Vec<SearchHit>, Option<usize>)> {
+    ) -> Result<LexicalCandidates> {
         let mut ranked_hits = Vec::new();
         let mut total_count = Some(0usize);
+        let mut fetched_count = 0usize;
 
         for (shard_index, shard) in readers.iter().enumerate() {
-            let (shard_hits, shard_total_count) = self.search_tantivy(
+            let candidates = self.search_tantivy(
                 &shard.reader,
                 &shard.fields,
                 raw_query,
@@ -8859,11 +8938,16 @@ impl SearchClient {
                 0,
                 field_mask,
             )?;
-            total_count = match (total_count, shard_total_count) {
+            fetched_count = fetched_count.saturating_add(candidates.fetched_count);
+            total_count = match (total_count, candidates.total_count) {
                 (Some(total), Some(shard_total)) => Some(total.saturating_add(shard_total)),
                 _ => None,
             };
-            for (shard_rank, hit) in shard_hits.into_iter().enumerate() {
+            for RankedLexicalHit {
+                rank: shard_rank,
+                hit,
+            } in candidates.hits
+            {
                 ranked_hits.push(FederatedRankedHit {
                     hit,
                     shard_index,
@@ -8873,7 +8957,6 @@ impl SearchClient {
             }
         }
 
-        let raw_hit_count = ranked_hits.len();
         let generation_signature = self.federated_generation_signature(readers);
         self.track_generation(generation_signature);
         let combined_hits = merge_federated_ranked_hits(ranked_hits);
@@ -8881,13 +8964,21 @@ impl SearchClient {
             generation_signature,
             shard_count = readers.len(),
             total_count,
-            raw_hit_count,
+            raw_hit_count = fetched_count,
             returned_hit_count = combined_hits.len(),
             merge_policy = "rrf_rank_then_stable_hit_key",
             "federated lexical search merged shard results"
         );
 
-        Ok((combined_hits, total_count))
+        Ok(LexicalCandidates {
+            hits: combined_hits
+                .into_iter()
+                .enumerate()
+                .map(|(rank, hit)| RankedLexicalHit { rank, hit })
+                .collect(),
+            total_count,
+            fetched_count,
+        })
     }
 
     fn sqlite_fts_uses_message_id_column(conn: &SearchSqliteConnection) -> Result<bool> {
@@ -17105,7 +17196,7 @@ mod tests {
 
         let (_, projected) = client.postprocess_hits_page(
             hits.into_iter().map(|(_, hit)| hit).collect(),
-            "semantic",
+            Some("semantic"),
             &SearchFilters::default(),
             2,
             0,
@@ -20941,6 +21032,181 @@ mod tests {
     // Filter Fidelity Property Tests (glt.9)
     // Verify filters are never violated in search results
     // ============================================================
+
+    #[test]
+    fn gh564_all_noise_first_window_retries_for_a_lower_ranked_valid_hit() -> Result<()> {
+        use frankensearch::quill::cass::CassDocument;
+
+        let directory = TempDir::new()?;
+        let query = "deploy cache stall";
+        let documents = [
+            (1, "[Tool: deploy cache stall"),
+            (2, "[Tool: deploy cache stall"),
+            (
+                3,
+                "We checked the deploy and found the cache stall after restarting the worker. The diagnostic details explain the configuration and retained logs.",
+            ),
+        ]
+        .into_iter()
+        .map(|(id, content)| CassDocument {
+            agent: "claude_code".into(),
+            workspace: Some("/work".into()),
+            workspace_original: None,
+            source_path: format!("/history/retry-{id}.jsonl"),
+            msg_idx: 0,
+            created_at: Some(1_700_000_000_000 + id),
+            title: Some("retry fixture".into()),
+            content: content.into(),
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+            conversation_id: Some(id),
+        })
+        .collect::<Vec<_>>();
+        let mut writer = TantivyIndex::open_or_create(directory.path())?;
+        writer.add_prebuilt_documents_slice(&documents)?;
+        writer.commit()?;
+        drop(writer);
+        let client = SearchClient::open(directory.path(), None)?.expect("native reader");
+        let (reader, fields) = client.reader.get().expect("single native reader");
+        let parser = frankensearch::quill::query::CassQueryParser::new(
+            frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+        )
+        .map_err(|error| anyhow!("query parser: {error}"))?;
+        let parsed = indexed_terms::parse(&parser, query, &FsCassQueryFilters::default());
+        let raw = execute_query_with_bounded_exact_count(&reader, &parsed, 3, 0)?;
+        let ranked_ids = raw
+            .hits
+            .iter()
+            .map(|hit| {
+                crate::search::quill_bridge::stored_i64(
+                    &reader,
+                    fields.conversation_id,
+                    hit.global_docid,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(ranked_ids.len(), 3);
+        assert!(ranked_ids[..2].iter().all(|id| matches!(id, Some(1 | 2))));
+        assert_eq!(ranked_ids[2], Some(3));
+
+        // A page of one first fetches two candidates, both confirmed noise.
+        // The valid third candidate is reachable only through the existing
+        // bounded retry; admission must not erase its saturation evidence.
+        for mask in [
+            FieldMask::new(false, false, false, false),
+            FieldMask::new(false, true, true, false),
+            FieldMask::new(true, true, true, false),
+        ] {
+            let hits = client.search(query, SearchFilters::default(), 1, 0, mask)?;
+            assert_eq!(hits.len(), 1, "{mask:?}");
+            assert_eq!(hits[0].conversation_id, Some(3), "{mask:?}");
+            assert_eq!(hits[0].content.is_empty(), !mask.needs_content());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gh564_federated_noise_filter_preserves_original_shard_ranks() -> Result<()> {
+        use frankensearch::quill::cass::CassDocument;
+
+        let directory = TempDir::new()?;
+        let shard_a = directory.path().join("shard-a");
+        let shard_b = directory.path().join("shard-b");
+        let query = "deploy cache stall";
+        let document = |id: i64, source_path: &str, content: &str| CassDocument {
+            agent: "claude_code".into(),
+            workspace: Some("/work".into()),
+            workspace_original: None,
+            source_path: source_path.into(),
+            msg_idx: 0,
+            created_at: Some(1_700_000_000_000 + id),
+            title: Some("federated fixture".into()),
+            content: content.into(),
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+            conversation_id: Some(id),
+        };
+        let mut writer_a = TantivyIndex::open_or_create(&shard_a)?;
+        writer_a.add_prebuilt_documents_slice(&[
+            document(1, "/history/noise.jsonl", "[Tool: deploy cache stall"),
+            document(
+                2,
+                "/history/a.jsonl",
+                "We checked the deploy and found the cache stall after restarting the worker. The diagnostic details explain the configuration and retained logs.",
+            ),
+        ])?;
+        writer_a.commit()?;
+        drop(writer_a);
+        let mut writer_b = TantivyIndex::open_or_create(&shard_b)?;
+        writer_b.add_prebuilt_documents_slice(&[document(
+            3,
+            "/history/z.jsonl",
+            "The deploy cache stall was resolved.",
+        )])?;
+        writer_b.commit()?;
+        drop(writer_b);
+
+        let reader_a = crate::search::quill_bridge::open_cass_reader(&shard_a)?;
+        let reader_b = crate::search::quill_bridge::open_cass_reader(&shard_b)?;
+        let fields = crate::search::quill_bridge::QuillCassFields::compiled();
+        let parser = frankensearch::quill::query::CassQueryParser::new(
+            frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+        )
+        .map_err(|error| anyhow!("query parser: {error}"))?;
+        let parsed = indexed_terms::parse(&parser, query, &FsCassQueryFilters::default());
+        let raw = execute_query_with_bounded_exact_count(&reader_a, &parsed, 2, 0)?;
+        let ranked_ids = raw
+            .hits
+            .iter()
+            .map(|hit| {
+                crate::search::quill_bridge::stored_i64(
+                    &reader_a,
+                    fields.conversation_id,
+                    hit.global_docid,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(ranked_ids, vec![Some(1), Some(2)]);
+
+        // Admit real Quill shard readers directly: the legacy bundle
+        // publisher used by the older federated fixture is Tantivy-only.
+        let client = SearchClient::from_opened_lexical_index(
+            crate::search::tantivy::OpenedLexicalIndex {
+                path: directory.path().to_path_buf(),
+                reader: None,
+                federated_readers: Some(vec![(reader_a, fields), (reader_b, fields)]),
+            },
+            None,
+            SearchClientOptions {
+                enable_reload: false,
+                enable_warm: false,
+                strict_read_only: true,
+            },
+        )?
+        .expect("federated native reader");
+        assert!(client.reader.get().is_none());
+        assert_eq!(client.total_docs(), 3);
+
+        for mask in [
+            FieldMask::new(false, true, true, false),
+            FieldMask::new(true, true, true, false),
+        ] {
+            let hits = client.search(query, SearchFilters::default(), 2, 0, mask)?;
+            let ids = hits
+                .iter()
+                .map(|hit| hit.conversation_id)
+                .collect::<Vec<_>>();
+            assert_eq!(ids, vec![Some(3), Some(2)], "{mask:?}");
+            // If admission compacted shard A's ranks, both would score as
+            // rank zero and the /history/a.jsonl tie-break would win instead.
+            assert_eq!(hits[0].score, federated_rrf_score(0));
+            assert_eq!(hits[1].score, federated_rrf_score(1));
+            assert!(hits[0].score > hits[1].score);
+        }
+        Ok(())
+    }
 
     #[test]
     fn gh564_noise_filter_precedes_all_lexical_projections() -> Result<()> {

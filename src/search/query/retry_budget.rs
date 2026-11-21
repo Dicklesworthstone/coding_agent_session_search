@@ -6,13 +6,11 @@
 
 use anyhow::Result;
 
-use super::{SearchClient, SearchHit};
+use super::{LexicalCandidates, SearchClient};
 
 /// A native lexical page is incomplete because its larger deduplication fetch
 /// exhausted fuel. Unlike `query_fuel_exhausted`, the lexical leg was not lost.
 pub const LEXICAL_RETRY_QUERY_FUEL_EXHAUSTED: &str = "dedup_retry_query_fuel_exhausted";
-
-type FetchedPage = (Vec<SearchHit>, Option<usize>);
 
 fn admit_retry<T>(attempt: Result<T>, retained_hits: usize) -> Result<Option<T>> {
     match attempt {
@@ -36,9 +34,9 @@ fn admit_retry<T>(attempt: Result<T>, retained_hits: usize) -> Result<Option<T>>
 impl SearchClient {
     pub(super) fn settle_lexical_retry(
         &self,
-        attempt: Result<FetchedPage>,
+        attempt: Result<LexicalCandidates>,
         retained_hits: usize,
-    ) -> Result<Option<FetchedPage>> {
+    ) -> Result<Option<LexicalCandidates>> {
         let retry = admit_retry(attempt, retained_hits)?;
         if retry.is_none() {
             self.record_lexical_degrade_reason(Some(LEXICAL_RETRY_QUERY_FUEL_EXHAUSTED));

@@ -127,6 +127,13 @@ timestamp, origin and score fields. Titles are limited to 256 characters and
 snippets to 800 characters, on Unicode character boundaries. No `content`
 field is returned.
 
+Noise filtering uses source text before output projection, never highlighted
+snippets. Complete source text still receives the normal malformed-tool and
+prompt checks. When only an incomplete stored preview is available, search
+retains the candidate: a closing tool bracket may lie beyond that prefix.
+This can retain long noise that a database-backed search can classify after
+hydration; the service does not open the archive to resolve that uncertainty.
+
 Pagination probes for one extra hit. `has_more: true` means an extra hit was
 actually observed. When another same-sized page is within the service budget,
 `next_offset` supplies its offset. With no observed extra hit, both fields are

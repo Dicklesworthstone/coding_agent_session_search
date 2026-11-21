@@ -187,6 +187,12 @@ fn gh564_tool_hits_survive_cli_projections_stdio_and_mcp() -> anyhow::Result<()>
     contents.extend((1..=4).map(|step| {
         format!("note {step}: ordinary prose about release checks. After the deploy the cache had a stall on restart.")
     }));
+    let long_tool_id = i64::try_from(contents.len())? + 1;
+    contents.push(format!(
+        "[Tool: Bash - deploy cache stall {}]",
+        "工具 ".repeat(1000)
+    ));
+    let expected_match_count = contents.len();
     contents.extend([
         "[Tool: Bash - deploy cache stall".into(),
         "[Tool:]".into(),
@@ -214,18 +220,32 @@ fn gh564_tool_hits_survive_cli_projections_stdio_and_mcp() -> anyhow::Result<()>
     writer.add_prebuilt_documents_slice(&documents)?;
     writer.commit()?;
     drop(writer);
-    // All source texts fit in their stored preview; the fixture needs no
-    // canonical database to classify them before rendering.
+    // The long tool call loses its closing bracket in the stored preview.
+    // Index-only callers must retain that inconclusive prefix while still
+    // rejecting the complete malformed and system-prompt messages above.
     let client = SearchClient::open(&path, None)?.expect("fixture reader");
     let mut expected_pages = Vec::new();
     for limit in [5, 50] {
         let baseline = client.search(query, SearchFilters::default(), limit, 0, FieldMask::FULL)?;
-        assert_eq!(baseline.len(), limit.min(28));
+        assert_eq!(baseline.len(), limit.min(expected_match_count));
         let expected: Vec<i64> = baseline
             .iter()
             .map(|hit| hit.conversation_id.unwrap())
             .collect();
-        assert!(expected.iter().all(|id| *id <= 28));
+        assert!(expected.iter().all(|id| *id <= long_tool_id));
+        if limit >= expected_match_count {
+            let long_hit = baseline
+                .iter()
+                .find(|hit| hit.conversation_id == Some(long_tool_id))
+                .expect("long tool call must survive without a canonical database");
+            assert!(
+                long_hit
+                    .content
+                    .starts_with("[Tool: Bash - deploy cache stall ")
+            );
+            assert!(long_hit.content.ends_with('…'));
+            assert!(!long_hit.content.contains(']'));
+        }
         for fields in [
             "minimal",
             "conversation_id,content",
@@ -278,6 +298,11 @@ fn gh564_tool_hits_survive_cli_projections_stdio_and_mcp() -> anyhow::Result<()>
         expected_pages.push((limit, expected));
     }
 
+    // Keep the service index-only even when a canonical-looking path exists.
+    // Opening this file to resolve the long preview would fail the request.
+    let archive = temp.path().join("agent_search.db");
+    let archive_sentinel = b"must not be opened to classify a stored preview";
+    std::fs::write(&archive, archive_sentinel)?;
     for mcp in [false, true] {
         let mut command = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
         command
@@ -353,6 +378,7 @@ fn gh564_tool_hits_survive_cli_projections_stdio_and_mcp() -> anyhow::Result<()>
             assert_eq!(actual, expected_pages[index / 2].1, "MCP={mcp}, {reply}");
         }
     }
+    assert_eq!(std::fs::read(&archive)?, archive_sentinel);
     Ok(())
 }
 
