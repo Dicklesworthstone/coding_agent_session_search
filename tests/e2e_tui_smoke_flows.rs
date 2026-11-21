@@ -2901,6 +2901,7 @@ fn tui_pty_macro_recordings_omit_export_password_input() {
         assert!(events.iter().any(|event| event["paste"] == "ello"));
         assert!(events.iter().any(|event| event["key"] == "Tab"));
         assert!(!events.iter().any(|event| event["key"]["char"] == "q"));
+        assert!(!events.iter().any(|event| event["key"]["char"] == "m"));
         assert!(!recording.contains("macro-private-synthetic"));
     }
     tracker.complete();

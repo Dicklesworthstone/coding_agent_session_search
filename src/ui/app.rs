@@ -11177,10 +11177,13 @@ impl CassApp {
     fn record_macro_event(&mut self, event: &super::ftui_adapter::Event, msg: &CassMsg) {
         use super::ftui_adapter::Event;
 
-        // A release may arrive after password focus moves. Revealing a password is interactive.
+        // A release may arrive after password focus moves. Keep interactive controls out of macros.
         if matches!(event, Event::Tick)
             || matches!(event, Event::Key(key) if key.kind == ftui::KeyEventKind::Release)
-            || matches!(msg, CassMsg::ExportPasswordVisibilityToggled)
+            || matches!(
+                msg,
+                CassMsg::ExportPasswordVisibilityToggled | CassMsg::MacroRecordingToggled
+            )
         {
             return;
         }
@@ -16131,10 +16134,14 @@ const QUERY_HISTORY_CAP: usize = 50;
 
 impl From<super::ftui_adapter::Event> for CassMsg {
     fn from(event: super::ftui_adapter::Event) -> Self {
-        use super::ftui_adapter::{Event, KeyCode, Modifiers};
-
-        // Stash raw event for model-level macro recording.
         stash_raw_event(&event);
+        Self::decode_terminal_event(event)
+    }
+}
+
+impl CassMsg {
+    fn decode_terminal_event(event: super::ftui_adapter::Event) -> Self {
+        use super::ftui_adapter::{Event, KeyCode, Modifiers};
 
         match event {
             Event::Key(key) => {
@@ -20379,8 +20386,15 @@ impl super::ftui_adapter::Model for CassApp {
                 if let Some(ref mut playback) = self.macro_playback {
                     let events = playback.advance(dt);
                     for event in events {
-                        let msg = CassMsg::from(event);
-                        cmds.push(ftui::Cmd::msg(msg));
+                        // Queued replay messages do not own the live raw-event slot.
+                        let msg = CassMsg::decode_terminal_event(event);
+                        if !matches!(
+                            msg,
+                            CassMsg::MacroRecordingToggled
+                                | CassMsg::ExportPasswordVisibilityToggled
+                        ) {
+                            cmds.push(ftui::Cmd::msg(msg));
+                        }
                     }
                     if playback.is_done() {
                         self.macro_playback = None;
@@ -45918,6 +45932,48 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         assert!(app.macro_playback.is_none());
         // The cmd should contain batch with messages.
         assert!(!matches!(cmd, ftui::Cmd::None));
+    }
+
+    #[test]
+    fn macro_playback_password_paste_stays_out_of_live_recorders() {
+        use ftui::core::input_parser::InputParser;
+
+        let mut app = app_with_hits(1);
+        let _ = app.update(CassMsg::MacroRecordingToggled);
+        app.launch_macro_recorder = Some(MacroRecorder::new("launch-recording"));
+        let _ = app.update(CassMsg::ExportModalOpened);
+        let _ = app.update(CassMsg::ExportFieldToggled(ExportField::Encrypt));
+        for _ in 0..3 {
+            let _ = app.update(CassMsg::ExportFocusMoved { forward: true });
+        }
+
+        let mut replay = MacroRecorder::new("previous-recording");
+        let events = InputParser::new().parse(b"\x1bm\x1bx\x1b[200~synthetic-replay-only\x1b[201~");
+        for event in events {
+            replay.record_event_with_delay(event, Duration::ZERO);
+        }
+        app.macro_playback = Some(MacroPlayback::new(replay.finish()));
+        let ftui::Cmd::Batch(cmds) = app.update(CassMsg::Tick) else {
+            panic!("expected queued playback messages");
+        };
+        let mut recording_toggle_queued = false;
+        for cmd in cmds {
+            let ftui::Cmd::Msg(msg) = cmd else {
+                continue;
+            };
+            if matches!(msg, CassMsg::MacroRecordingToggled) {
+                recording_toggle_queued = true;
+                continue;
+            }
+            let _ = app.update(msg);
+        }
+
+        assert_eq!(app.macro_recorder.as_ref().unwrap().event_count(), 0);
+        assert_eq!(app.launch_macro_recorder.as_ref().unwrap().event_count(), 0);
+        let state = app.export_modal_state.as_ref().unwrap();
+        assert_eq!(state.password, "synthetic-replay-only");
+        assert!(!state.password_visible);
+        assert!(!recording_toggle_queued);
     }
 
     #[test]
