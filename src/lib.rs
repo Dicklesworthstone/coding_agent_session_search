@@ -1714,7 +1714,7 @@ pub enum Commands {
         group(clap::ArgGroup::new("exclusion_action")
             .multiple(false)
             .args(["list", "reinclude"])),
-        after_long_help = "Repeat --source-path for a batch of exact stored paths; glob metacharacters and whitespace are literal. Repeat --source-glob for a union of patterns. The union of all source paths and globs is intersected with workspace and age, then deleted in one transaction with one derived rebuild. Duplicates and overlaps select each conversation once. A zero-match apply skips rebuilding unless an interrupted forget still needs repair.\n\nGlobs match stored paths case-sensitively; * also matches /. A source path can be a logical database/session handle. Missing workspaces do not match --workspace-glob. Age uses the latest message timestamp, strictly before the reported cutoff; sessions with no messages or any missing message timestamp are kept.\n\nShared stores use durable per-session tombstones scoped by source provenance, agent, source path and external session ID. Edits, appends, sibling changes, --full and changes to CASS_EXCLUDE_WORKSPACES do not restore that identity. Inspect exclusions with --list, then preview an explicit release with --reinclude and --source-path, --source-glob, --source-id, --agent and/or --external-id. These management modes accept only one source path or glob. Add --apply to release the reviewed exclusions, then run cass index. Current workspace/path policies still apply.\n\nHistorical exclusions have no recorded workspace or message-age metadata, so --workspace-glob and --older-than cannot select --list or --reinclude records. Exact identity selectors never silently release a path-wide source exclusion; preview a source-only release if such an overlap is reported.\n\nOrdinary single-session files retain size/mtime tombstones: unchanged files stay forgotten, and a changed stamp makes the file eligible for indexing again. Source files and existing raw-mirror captures are kept. All deletion and re-inclusion is explicit; there is no automatic age pruning."
+        after_long_help = "Repeat --source-path for a batch of exact stored paths; glob metacharacters and whitespace are literal. Repeat --source-glob for a union of patterns. The union of all source paths and globs is intersected with workspace and age, validated in full, then deleted in bounded transactions with one derived rebuild. Duplicates and overlaps select each conversation once. Each transaction holds at most 256 conversations and targets 8 MiB of canonical payload; one oversized conversation remains atomic. Earlier batches survive interruption: retry the same selectors with --apply. A zero-match apply skips rebuilding unless an interrupted forget still needs repair.\n\nThe optional fallback FTS shadow respects CASS_FTS_SHADOW_MAX_MESSAGES; oversized shadows are retired before any canonical write and stay retired during repair. Lexical rebuilding defaults to the bounded profile. Progress phases go to stderr; JSON reports fallback_fts and rebuild_profile.\n\nGlobs match stored paths case-sensitively; * also matches /. A source path can be a logical database/session handle. Missing workspaces do not match --workspace-glob. Age uses the latest message timestamp, strictly before the reported cutoff; sessions with no messages or any missing message timestamp are kept.\n\nShared stores use durable per-session tombstones scoped by source provenance, agent, source path and external session ID. Edits, appends, sibling changes, --full and changes to CASS_EXCLUDE_WORKSPACES do not restore that identity. Inspect exclusions with --list, then preview an explicit release with --reinclude and --source-path, --source-glob, --source-id, --agent and/or --external-id. These management modes accept only one source path or glob. Add --apply to release the reviewed exclusions, then run cass index. Current workspace/path policies still apply.\n\nHistorical exclusions have no recorded workspace or message-age metadata, so --workspace-glob and --older-than cannot select --list or --reinclude records. Exact identity selectors never silently release a path-wide source exclusion; preview a source-only release if such an overlap is reported.\n\nOrdinary single-session files retain size/mtime tombstones: unchanged files stay forgotten, and a changed stamp makes the file eligible for indexing again. Source files and existing raw-mirror captures are kept. All deletion and re-inclusion is explicit; there is no automatic age pruning."
     )]
     Forget {
         /// Glob over conversation `source_path`; repeat to select a union.
@@ -10391,6 +10391,13 @@ impl ForgetCommandOptions {
     }
 }
 
+/// Long maintenance phases must be visible even when tracing is disabled.
+/// Keep diagnostics on stderr so robot stdout remains a single JSON report.
+fn forget_phase(phase: &str) {
+    tracing::info!(target: "cass::forget", phase, "forget maintenance phase");
+    eprintln!("forget: {phase}");
+}
+
 /// Prune an explicitly selected subset of archived conversations. Preview
 /// opens strictly read-only; apply holds maintenance ownership through both
 /// canonical deletion and publication of the replacement search generation.
@@ -10504,7 +10511,68 @@ fn run_forget_command(
             })
         })
         .transpose()?;
-    let storage = if apply {
+    // GH #565: a writable open can hydrate the entire optional FTS5 shadow
+    // before the first canonical deletion. Inspect without writes first,
+    // then use the indexer's deferred-FTS retirement preflight under the
+    // maintenance lease. A genuine no-op must leave derived assets alone.
+    let mut no_op_report = None;
+    if apply && !exclusion_action {
+        let inspection =
+            FrankenStorage::open_strict_readonly(&db_path).map_err(|error| CliError {
+                code: 5,
+                kind: "forget",
+                message: format!("failed to inspect canonical database: {error}"),
+                hint: None,
+                retryable: false,
+            })?;
+        let mut preview = inspection
+            .forget_conversations(
+                filter
+                    .as_ref()
+                    .ok_or_else(|| CliError::usage("missing forget selectors", None))?,
+                true,
+            )
+            .map_err(|error| CliError {
+                code: 5,
+                kind: "forget",
+                message: format!("forget selection failed: {error:#}"),
+                hint: Some("Preview the same selectors before adding --apply.".to_string()),
+                retryable: false,
+            })?;
+        let pending = inspection
+            .forget_derived_rebuild_pending()
+            .map_err(|error| CliError {
+                code: 5,
+                kind: "forget",
+                message: format!("failed to inspect forget rebuild state: {error}"),
+                hint: Some("Retry the same forget command with --apply.".to_string()),
+                retryable: true,
+            })?;
+        inspection
+            .close_without_checkpoint()
+            .map_err(|error| CliError {
+                code: 5,
+                kind: "forget",
+                message: format!("failed to close forget inspection: {error}"),
+                hint: None,
+                retryable: true,
+            })?;
+        if preview.conversations_matched > 0 || pending {
+            forget_phase("fallback-fts-preflight");
+            crate::indexer::preflight_fts_shadow_before_lexical_readers(&db_path)
+                .map_err(|error| CliError {
+                    code: 5,
+                    kind: "forget",
+                    message: format!("failed to prepare bounded-memory forget: {error:#}"),
+                    hint: Some("No new canonical deletion was applied; retry the same selectors with --apply.".to_string()),
+                    retryable: true,
+                })?;
+        } else {
+            preview.dry_run = false;
+            no_op_report = Some(preview);
+        }
+    }
+    let storage = if apply && no_op_report.is_none() {
         FrankenStorage::open(&db_path)
     } else {
         FrankenStorage::open_strict_readonly(&db_path)
@@ -10523,18 +10591,26 @@ fn run_forget_command(
 
     let filter = filter.ok_or_else(|| CliError::usage("missing forget selectors", None))?;
 
-    let report = storage
-        .forget_conversations(&filter, !apply)
-        .map_err(|e| CliError {
-            code: 5,
-            kind: "forget",
-            message: format!("forget failed: {e}"),
-            hint: Some(
-                "Preview the same selectors with `cass forget ... --json` before adding --apply."
-                    .to_string(),
-            ),
-            retryable: false,
-        })?;
+    let report = if let Some(report) = no_op_report {
+        report
+    } else {
+        if apply {
+            forget_phase("canonical-delete");
+        }
+        storage
+            .forget_conversations(&filter, !apply)
+            .map_err(|e| CliError {
+                code: 5,
+                kind: "forget",
+                message: format!("forget failed: {e:#}"),
+                hint: Some(if apply {
+                    "Earlier deletion batches may have committed. Retry the same selectors with --apply to finish deletion and rebuild derived data.".to_string()
+                } else {
+                    "Review the selectors before adding --apply.".to_string()
+                }),
+                retryable: apply,
+            })?
+    };
 
     // A previous attempt may have committed deletion before rebuilding failed.
     // Its durable marker must also trigger repair when this retry matches no
@@ -10556,8 +10632,28 @@ fn run_forget_command(
     // until the lexical generation is rebuilt a plain search kept returning
     // the forgotten text (2l1b0.50). Failures are typed errors: a warning
     // with exit 0 would report success while the text stays searchable.
+    let mut fallback_fts = None;
+    let mut rebuild_profile = None;
     let remaining_conversations = if apply && (report.conversations_deleted > 0 || rebuild_pending)
     {
+        // Older releases persisted only the SQL repair marker. A zero-match
+        // retry must install reader admission before rebuilding rollups in
+        // bounded transactions, just as a fresh deletion does.
+        if !crate::search::privacy::repair_pending(&db_path).map_err(|error| CliError {
+            code: 5,
+            kind: "forget",
+            message: format!("failed to inspect forget reader admission: {error}"),
+            hint: Some("Retry the same forget command with --apply.".to_string()),
+            retryable: true,
+        })? {
+            crate::search::privacy::begin_forget(&db_path).map_err(|error| CliError {
+                code: 5,
+                kind: "forget",
+                message: format!("failed to protect readers during forget repair: {error}"),
+                hint: Some("Retry the same forget command with --apply.".to_string()),
+                retryable: true,
+            })?;
+        }
         let derived_error = |kind: CliErrorKind, surface: &str, error: anyhow::Error| {
             CliError {
             code: 5,
@@ -10573,9 +10669,12 @@ fn run_forget_command(
             retryable: true,
         }
         };
-        storage
-            .rebuild_search_fallback_after_forget()
-            .map_err(|e| derived_error(CliErrorKind::ArchiveFtsRebuild, "the FTS fallback", e))?;
+        forget_phase("fallback-fts");
+        fallback_fts =
+            Some(storage.rebuild_search_fallback_after_forget().map_err(|e| {
+                derived_error(CliErrorKind::ArchiveFtsRebuild, "the FTS fallback", e)
+            })?);
+        forget_phase("analytics");
         storage.rebuild_analytics().map_err(|e| {
             derived_error(
                 CliErrorKind::ArchiveAnalyticsRebuild,
@@ -10583,16 +10682,20 @@ fn run_forget_command(
                 e,
             )
         })?;
+        forget_phase("daily-stats");
         storage
-            .rebuild_daily_stats()
+            .rebuild_daily_stats_after_forget()
             .map_err(|e| derived_error(CliErrorKind::ArchiveDailyStatsRebuild, "daily stats", e))?;
-        storage.rebuild_token_daily_stats().map_err(|e| {
-            derived_error(
-                CliErrorKind::ArchiveTokenDailyStatsRebuild,
-                "token daily stats",
-                e,
-            )
-        })?;
+        forget_phase("token-daily-stats");
+        storage
+            .rebuild_token_daily_stats_after_forget()
+            .map_err(|e| {
+                derived_error(
+                    CliErrorKind::ArchiveTokenDailyStatsRebuild,
+                    "token daily stats",
+                    e,
+                )
+            })?;
         Some(
             storage.total_conversation_count().map_err(|e| {
                 derived_error(CliErrorKind::ArchiveCount, "the conversation count", e)
@@ -10631,6 +10734,12 @@ fn run_forget_command(
     }
 
     if let Some(remaining_conversations) = remaining_conversations {
+        // Forget is maintenance work, including recovery of an interrupted
+        // deletion. Use the existing bounded lexical pipeline by default;
+        // explicit per-knob environment overrides retain their normal meaning.
+        crate::indexer::set_lexical_rebuild_profile(crate::indexer::LexicalRebuildProfile::Bounded);
+        rebuild_profile = Some(crate::indexer::lexical_rebuild_profile_report());
+        forget_phase("lexical-index");
         // The marker stays set across this failure, including a retry whose
         // selector no longer matches any canonical rows.
         let rebuilt = if dotenvy::var("CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE")
@@ -10706,6 +10815,11 @@ fn run_forget_command(
             obj.insert(
                 "derived_rebuilt".to_string(),
                 serde_json::json!(remaining_conversations.is_some()),
+            );
+            obj.insert("fallback_fts".to_string(), serde_json::json!(fallback_fts));
+            obj.insert(
+                "rebuild_profile".to_string(),
+                serde_json::json!(rebuild_profile),
             );
             obj.insert("older_than".to_string(), serde_json::json!(older_than));
             obj.insert(
@@ -29174,7 +29288,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass expand <path> --message-index N [--source ID] [--conversation-id ID] [-C CONTEXT] [--json]  Follow search line_number; --line is for raw JSONL.".to_string(),
             "  cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.".to_string(),
             "  cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.".to_string(),
-            "  cass forget [--source-path PATH]... [--source-glob '<glob>']... [--workspace-glob '<glob>'] [--older-than 90d] [--apply] [--json]  Require at least one selector. Source paths/globs form a union, intersected with workspace and age. Apply deletes the batch atomically and rebuilds once; no-match skips rebuilding unless a repair is pending. Shared-session tombstones persist until explicitly released.".to_string(),
+            "  cass forget [--source-path PATH]... [--source-glob '<glob>']... [--workspace-glob '<glob>'] [--older-than 90d] [--apply] [--json]  Require at least one selector. Source paths/globs form a union, intersected with workspace and age. Apply validates the selection, commits bounded deletion batches and rebuilds once with the bounded lexical profile; no-match skips rebuilding unless a repair is pending. Retry the same selectors after interruption. Shared-session tombstones persist until explicitly released.".to_string(),
             "  cass forget --list [--source-glob '<glob>' | --source-path PATH] [--source-id ID] [--agent SLUG] [--external-id ID] --json  Inspect recorded exclusions; historical records have no workspace or message-age metadata.".to_string(),
             "  cass forget --reinclude [identity selectors] [--apply] --json  Preview explicit exclusion release; at least one selector is required. After apply, run cass index; current indexing policies still apply.".to_string(),
             "  cass mirror prune [--older-than 90d] [--max-size 100GB] [--keep-latest 1] [--keep-tag important] [--apply] [--json]  Plan or apply raw-mirror retention with an audit log.".to_string(),

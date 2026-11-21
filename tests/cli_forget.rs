@@ -1542,6 +1542,10 @@ fn batch_forget_unions_exact_and_overlapping_selectors_once_across_all_surfaces(
     assert_eq!(applied["conversations_deleted"], 2);
     assert_eq!(applied["messages_matched"], 4);
     assert_eq!(applied["derived_rebuilt"], true);
+    assert_eq!(applied["delete_batches_committed"], 1);
+    assert_eq!(applied["max_delete_batch_conversations"], 2);
+    assert_eq!(applied["fallback_fts"]["status"], "rebuilt");
+    assert_eq!(applied["rebuild_profile"]["name"], "bounded");
     assert_archive_counts(&archive, 1, 2)?;
     for (surface, args) in SURFACES {
         for (path, marker) in sources {
@@ -1702,6 +1706,186 @@ fn an_invalid_later_batch_selector_cannot_partially_forget() -> TestResult {
         archive.forget_selected(&["--source-path", &with_space], false)?["conversations_matched"],
         0
     );
+    Ok(())
+}
+
+#[test]
+fn forget_retires_oversized_fts_and_retries_without_recreating_it() -> TestResult {
+    use coding_agent_search::franken_sync::compat::RowExt;
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let (archive, forgotten) = indexed_archive(&[])?;
+    let database = archive.data_dir.join("agent_search.db");
+    let source = forgotten.to_str().ok_or("non-utf8 fixture path")?;
+    // Seed a real populated shadow, then lower the production viability
+    // threshold only in the child. The unpatched forget recreates this shadow
+    // regardless of that threshold, reproducing #565 without a 65 GiB fixture.
+    let storage = FrankenStorage::open(&database)?;
+    storage.rebuild_fts()?;
+    assert_eq!(
+        storage
+            .raw()
+            .query("SELECT COUNT(*) FROM fts_messages_docsize")?[0]
+            .get_typed::<i64>(0)?,
+        4,
+        "negative control: the optional shadow must contain the complete fixture"
+    );
+    storage.close_without_checkpoint()?;
+    let fts_snapshot = || -> TestResult<BTreeMap<String, Vec<String>>> {
+        let storage = FrankenStorage::open_readonly(&database)?;
+        let mut snapshot = BTreeMap::new();
+        for table in [
+            "fts_messages_data",
+            "fts_messages_docsize",
+            "fts_messages_idx",
+            "fts_messages_config",
+        ] {
+            let mut rows: Vec<_> = storage
+                .raw()
+                .query(&format!("SELECT * FROM {table}"))?
+                .into_iter()
+                .map(|row| format!("{:?}", row.values()))
+                .collect();
+            rows.sort();
+            snapshot.insert(table.to_string(), rows);
+        }
+        storage.close_without_checkpoint()?;
+        Ok(snapshot)
+    };
+    let before = fts_snapshot()?;
+    for (label, args) in [
+        (
+            "bounded forget preview must not retire FTS",
+            vec!["forget", "--source-path", source, "--json"],
+        ),
+        (
+            "bounded no-match apply must not retire FTS",
+            vec![
+                "forget",
+                "--source-path",
+                "/absent/never-indexed.jsonl",
+                "--apply",
+                "--json",
+            ],
+        ),
+    ] {
+        let mut command = archive.cmd();
+        command.env("CASS_FTS_SHADOW_MAX_MESSAGES", "1");
+        let output = archive.run_step(label, command, &args)?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(report["derived_rebuilt"], false);
+        assert!(report["fallback_fts"].is_null());
+        assert!(report["rebuild_profile"].is_null());
+        assert_eq!(fts_snapshot()?, before, "{label}");
+    }
+
+    let mut failing = archive.cmd();
+    failing
+        .env("CASS_FTS_SHADOW_MAX_MESSAGES", "1")
+        .env("CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE", "1");
+    let args = ["forget", "--source-path", source, "--apply", "--json"];
+    let output = archive.run_step(
+        "bounded forget interrupted before lexical publication",
+        failing,
+        &args,
+    )?;
+    assert_eq!(output.status.code(), Some(5));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let error: Value =
+        serde_json::from_str(stderr.lines().last().ok_or("missing error envelope")?)?;
+    assert_eq!(error["error"]["kind"], "lexical-rebuild");
+    for phase in [
+        "fallback-fts-preflight",
+        "canonical-delete",
+        "fallback-fts",
+        "analytics",
+        "daily-stats",
+        "token-daily-stats",
+        "lexical-index",
+    ] {
+        assert!(
+            stderr.contains(&format!("forget: {phase}")),
+            "missing phase {phase}: {stderr}"
+        );
+    }
+    let storage = FrankenStorage::open_readonly(&database)?;
+    assert_eq!(storage.total_conversation_count()?, 1);
+    assert!(storage.forget_derived_rebuild_pending()?);
+    assert!(storage.raw().query("SELECT name FROM sqlite_master WHERE name = 'fts_messages' OR name LIKE 'fts_messages_%'")?.is_empty());
+    assert_eq!(
+        storage
+            .raw()
+            .query("SELECT value FROM meta WHERE key = 'fts_shadow_not_viable'")?
+            .len(),
+        1
+    );
+    storage.close_without_checkpoint()?;
+
+    // A zero-match retry must finish the derived repair with the same bound.
+    let mut retry = archive.cmd();
+    retry.env("CASS_FTS_SHADOW_MAX_MESSAGES", "1");
+    let output = archive.run_step(
+        "finish bounded forget after all matches were deleted",
+        retry,
+        &args,
+    )?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["conversations_deleted"], 0);
+    assert_eq!(report["derived_rebuilt"], true);
+    assert_eq!(report["fallback_fts"]["status"], "retired");
+    assert_eq!(report["fallback_fts"]["corpus_messages"], 2);
+    assert_eq!(report["fallback_fts"]["bound_messages"], 1);
+    assert_eq!(report["rebuild_profile"]["name"], "bounded");
+    let storage = FrankenStorage::open_readonly(&database)?;
+    assert!(!storage.forget_derived_rebuild_pending()?);
+    assert!(
+        storage
+            .raw()
+            .query("SELECT name FROM sqlite_master WHERE name = 'fts_messages'")?
+            .is_empty()
+    );
+    storage.close_without_checkpoint()?;
+    assert_archive_counts(&archive, 1, 2)?;
+    assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+    assert!(forgotten.is_file(), "source transcripts are retained");
+    Ok(())
+}
+
+#[test]
+fn forget_retry_upgrades_a_legacy_sql_only_repair_marker() -> TestResult {
+    use coding_agent_search::search::privacy;
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let (archive, _) = indexed_archive(&[])?;
+    let database = archive.data_dir.join("agent_search.db");
+    let storage = FrankenStorage::open(&database)?;
+    storage.raw().execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES('forget_derived_rebuild_pending', '1')",
+    )?;
+    storage.close_without_checkpoint()?;
+    assert!(!privacy::state_path_for_database(&database).exists());
+    let report =
+        archive.forget_selected(&["--source-path", "/absent/legacy-forget.jsonl"], true)?;
+    assert_eq!(report["conversations_deleted"], 0);
+    assert_eq!(report["derived_rebuilt"], true);
+    assert_eq!(report["rebuild_profile"]["name"], "bounded");
+    let storage = FrankenStorage::open_readonly(&database)?;
+    assert!(!storage.forget_derived_rebuild_pending()?);
+    storage.close_without_checkpoint()?;
+    assert!(!privacy::repair_pending(&database)?);
+    assert_archive_counts(&archive, 2, 4)?;
+    assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
     Ok(())
 }
 
@@ -1949,6 +2133,9 @@ fn assert_forget_clears_every_search_surface(
 
 #[test]
 fn a_failed_lexical_purge_is_a_typed_error_and_the_next_index_completes_it() -> TestResult {
+    use coding_agent_search::franken_sync::compat::RowExt;
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
     let (archive, forgotten) = indexed_archive(&[])?;
     let forgotten_str = forgotten.to_str().ok_or("non-utf8 fixture path")?;
 
@@ -1985,12 +2172,46 @@ fn a_failed_lexical_purge_is_a_typed_error_and_the_next_index_completes_it() -> 
         return Err("the canonical rows must stay deleted after a failed purge".into());
     }
 
-    // 2l1b0.79: a plain incremental `cass index` finishes the purge. Its
-    // preflight sees fewer canonical conversations than the lexical
-    // checkpoint was certified against and rebuilds from the canonical rows.
-    // Before, it never revisited the deleted rows' documents and status
-    // stayed stale with the forgotten text searchable.
+    // Simulate interruption during a bounded derived reset, as well as the
+    // stale lexical generation. Ordinary incremental indexing defers these
+    // tables, so reader admission must depend on the complete forget repair.
+    let database = archive.data_dir.join("agent_search.db");
+    let storage = FrankenStorage::open(&database)?;
+    assert!(storage.forget_derived_rebuild_pending()?);
+    let mut derived_counts = BTreeMap::new();
+    for table in [
+        "message_metrics",
+        "token_usage",
+        "daily_stats",
+        "token_daily_stats",
+    ] {
+        let count = storage
+            .raw()
+            .query(&format!("SELECT COUNT(*) FROM {table}"))?[0]
+            .get_typed::<i64>(0)?;
+        derived_counts.insert(table, count);
+        storage.raw().execute(&format!("DELETE FROM {table}"))?;
+    }
+    assert!(derived_counts["message_metrics"] > 0);
+    assert!(derived_counts["daily_stats"] > 0);
+    storage.close_without_checkpoint()?;
+
+    // A plain incremental index repairs already committed deletions before
+    // its ordinary startup paths, including the durable reader fence.
     archive.index(&[])?;
+    let repaired = FrankenStorage::open_readonly(&database)?;
+    assert!(!repaired.forget_derived_rebuild_pending()?);
+    for (table, count) in derived_counts {
+        assert_eq!(
+            repaired
+                .raw()
+                .query(&format!("SELECT COUNT(*) FROM {table}"))?[0]
+                .get_typed::<i64>(0)?,
+            count,
+            "index recovery must completely rebuild {table}"
+        );
+    }
+    repaired.close_without_checkpoint()?;
     let after = archive.search_hit_paths(FORGOTTEN_MARKER)?;
     if !after.is_empty() {
         return Err(format!("the next index left the forgotten text searchable: {after:?}").into());

@@ -3025,7 +3025,7 @@ fn confirm_nonresumable_pending_lexical_rebuild_state_from_readonly_db(
 /// Runs under the index writer lock, before spawning readonly rebuild workers.
 /// Only the optional fallback shadow and its repair markers may change here;
 /// canonical conversations and messages remain the rebuild authority.
-fn preflight_fts_shadow_before_lexical_readers(db_path: &Path) -> Result<()> {
+pub(crate) fn preflight_fts_shadow_before_lexical_readers(db_path: &Path) -> Result<()> {
     let storage = FrankenStorage::open_deferred_fts5_for_repair(db_path)
         .with_context(|| format!("opening deferred FTS5 preflight for {}", db_path.display()))?;
     let result = (|| -> Result<()> {
@@ -3073,6 +3073,88 @@ fn should_try_readonly_nonresumable_lexical_resume(opts: &IndexOptions) -> bool 
             .watch_once_paths
             .as_ref()
             .is_none_or(|paths| paths.is_empty())
+}
+
+/// Repair every surface covered by a committed forget before reopening reader
+/// admission. The caller owns both maintenance leases. Ordinary incremental
+/// indexing alone cannot prove that the old lexical documents were removed.
+fn repair_forget_derived_assets_for_index(
+    opts: &IndexOptions,
+    progress_bump: Arc<AtomicI64>,
+    mut phase: impl FnMut(&'static str) -> Result<()>,
+) -> Result<()> {
+    crate::search::privacy::begin_forget(&opts.db_path)?;
+    let repair_heartbeat: crate::search::quill_bridge::EngineHeartbeat = {
+        let progress = opts.progress.clone();
+        let progress_bump = Arc::clone(&progress_bump);
+        Arc::new(move || {
+            if let Some(progress) = progress.as_ref() {
+                progress.tick_activity();
+            }
+            bump_index_run_lock_progress_atomic(&progress_bump);
+        })
+    };
+    phase("forget:fallback-fts-preflight")?;
+    // SQL pages may take minutes on a large archive. Feed the existing stall
+    // watchdog only observed CPU/sidecar activity, and retain cancellation
+    // through the storage operations rather than waiting for an entire pass.
+    let total_conversations = crate::search::quill_bridge::run_with_liveness_ticks(
+        storage_open_liveness_targets(&opts.db_path),
+        Arc::clone(&repair_heartbeat),
+        || -> Result<usize> {
+            let _repair_cancellation_scope = opts
+                .progress
+                .as_ref()
+                .map(|progress| progress.storage_cancellation.enter());
+            preflight_fts_shadow_before_lexical_readers(&opts.db_path)?;
+            let storage = FrankenStorage::open(&opts.db_path)
+                .context("opening canonical storage for pending forget repair")?;
+            phase("forget:fallback-fts")?;
+            storage.rebuild_search_fallback_after_forget()?;
+            phase("forget:analytics")?;
+            storage.rebuild_analytics()?;
+            phase("forget:daily-stats")?;
+            storage.rebuild_daily_stats_after_forget()?;
+            phase("forget:token-daily-stats")?;
+            storage.rebuild_token_daily_stats_after_forget()?;
+            let total_conversations = storage.total_conversation_count()?;
+            close_storage_with_wal_checkpoint(storage, &opts.db_path, "index-forget-repair")?;
+            Ok(total_conversations)
+        },
+    )?;
+
+    phase("forget:lexical-index")?;
+    let previous_profile = lexical_rebuild_profile();
+    set_lexical_rebuild_profile(LexicalRebuildProfile::Bounded);
+    let rebuilt = rebuild_tantivy_from_db_with_progress_bump(
+        &opts.db_path,
+        &opts.data_dir,
+        total_conversations,
+        opts.progress.clone(),
+        progress_bump,
+    );
+    set_lexical_rebuild_profile(previous_profile);
+    rebuilt.context("rebuilding the canonical lexical generation for pending forget repair")?;
+
+    // The pending marker and reader fence survive every earlier failure.
+    // This also handles older releases that persisted only the SQL marker.
+    crate::search::quill_bridge::run_with_liveness_ticks(
+        storage_open_liveness_targets(&opts.db_path),
+        repair_heartbeat,
+        || -> Result<()> {
+            if let Some(progress) = opts.progress.as_ref() {
+                progress.check_stop()?;
+            }
+            let _repair_cancellation_scope = opts
+                .progress
+                .as_ref()
+                .map(|progress| progress.storage_cancellation.enter());
+            let storage = FrankenStorage::open(&opts.db_path)
+                .context("reopening completed forget repair state")?;
+            storage.clear_forget_derived_rebuild_pending()?;
+            close_storage_with_wal_checkpoint(storage, &opts.db_path, "index-forget-complete")
+        },
+    )
 }
 
 fn should_try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> bool {
@@ -18399,6 +18481,31 @@ fn run_index_with_storage_ownership(
     preflight_phase!("watch_startup:ensure_storage_headroom");
     ensure_index_startup_storage_headroom(&opts)?;
     complete_preflight_phase!();
+    // A zero-byte placeholder is still a new archive; ordinary preparation
+    // must be allowed to create its schema before querying maintenance state.
+    if opts
+        .db_path
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    {
+        let inspection = open_readonly_rebuild_storage(&opts.db_path, || {
+            index_run_lock.acquire_archive_write_lease()
+        })
+        .context("inspecting pending forget repair before index startup")?;
+        let forget_pending = inspection.forget_derived_rebuild_pending()?;
+        inspection.close_without_checkpoint()?;
+        if forget_pending {
+            // This must precede the readonly resume/force-rebuild returns:
+            // lexical publication alone does not finish fenced SQL rollups.
+            index_run_lock.acquire_archive_write_lease()?;
+            repair_forget_derived_assets_for_index(&opts, Arc::clone(&progress_bump), |phase| {
+                work_phase!(phase);
+                tracing::info!(phase, "repairing an interrupted forget before indexing");
+                eprintln!("{phase}");
+                Ok(())
+            })?;
+        }
+    }
     if should_try_readonly_nonresumable_lexical_resume(&opts) {
         // GH #413: classify the small staged-checkpoint sidecar before opening
         // the canonical DB, then restart the non-resumable build without an

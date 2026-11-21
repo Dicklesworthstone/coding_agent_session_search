@@ -2,7 +2,8 @@
 
 use crate::connectors::omp::{PiFamilyOwner, PiFamilyOwnership};
 use crate::franken_sync::{
-    Connection as FrankenConnection, Row as FrankenRow, SqliteValue,
+    Connection as FrankenConnection, PreparedStatement as FrankenPreparedStatement,
+    Row as FrankenRow, SqliteValue,
     compat::{
         ConnectionExt as FrankenConnectionExt, OpenFlags as FrankenOpenFlags,
         OptionalExtension as FrankenOptionalExtension, ParamValue, RowExt as FrankenRowExt,
@@ -8537,6 +8538,101 @@ fn delete_duplicate_conversation_rows(
     Ok(())
 }
 
+/// Delete bounded primary-key sets instead of letting the engine materialize
+/// every matching wide row before a predicate DELETE. The enclosing forget
+/// transaction is bounded separately by conversation count and payload size.
+fn delete_forget_rows_by_id_pages(
+    tx: &FrankenTransaction<'_>,
+    select_sql: &str,
+    delete_prefix: &'static str,
+    parameters: &[ParamValue],
+) -> Result<()> {
+    loop {
+        let ids: Vec<i64> = tx.query_map_collect(select_sql, parameters, |row| row.get_typed(0))?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let deleted = delete_rows_by_i64_chunks(tx, delete_prefix, &ids)?;
+        anyhow::ensure!(
+            deleted == ids.len(),
+            "forget child deletion lost selected primary keys"
+        );
+    }
+}
+
+fn delete_forgotten_conversation_rows(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+) -> Result<()> {
+    record_semantic_conversation_changes(tx, &[conversation_id], true)?;
+    for (select, delete) in [
+        (
+            "SELECT rowid FROM conversation_external_lookup WHERE conversation_id = ?1 ORDER BY rowid LIMIT 256",
+            "DELETE FROM conversation_external_lookup WHERE rowid IN",
+        ),
+        (
+            "SELECT rowid FROM conversation_external_tail_lookup WHERE conversation_id = ?1 ORDER BY rowid LIMIT 256",
+            "DELETE FROM conversation_external_tail_lookup WHERE rowid IN",
+        ),
+        (
+            "SELECT rowid FROM conversation_tags WHERE conversation_id = ?1 ORDER BY rowid LIMIT 256",
+            "DELETE FROM conversation_tags WHERE rowid IN",
+        ),
+        (
+            "SELECT id FROM token_usage INDEXED BY idx_token_usage_conv WHERE conversation_id = ?1 ORDER BY id LIMIT 256",
+            "DELETE FROM token_usage WHERE id IN",
+        ),
+    ] {
+        delete_forget_rows_by_id_pages(tx, select, delete, fparams![conversation_id])?;
+    }
+    loop {
+        // Taking the first remaining index run also covers negative idx/ids.
+        let ids: Vec<i64> = tx.query_map_collect(
+            "SELECT id FROM messages INDEXED BY sqlite_autoindex_messages_1
+             WHERE conversation_id = ?1 ORDER BY idx LIMIT 256",
+            fparams![conversation_id],
+            |row| row.get_typed(0),
+        )?;
+        if ids.is_empty() {
+            break;
+        }
+        let parameters: Vec<_> = ids.iter().map(|id| ParamValue::from(*id)).collect();
+        let placeholders = sql_placeholders(ids.len());
+        for (table, delete) in [
+            ("snippets", "DELETE FROM snippets WHERE id IN"),
+            ("token_usage", "DELETE FROM token_usage WHERE id IN"),
+        ] {
+            delete_forget_rows_by_id_pages(
+                tx,
+                &format!(
+                    "SELECT id FROM {table} WHERE message_id IN ({placeholders}) ORDER BY id LIMIT 256"
+                ),
+                delete,
+                &parameters,
+            )?;
+        }
+        delete_rows_by_i64_chunks(tx, "DELETE FROM message_metrics WHERE message_id IN", &ids)?;
+        let deleted = delete_rows_by_i64_chunks(tx, "DELETE FROM messages WHERE id IN", &ids)?;
+        anyhow::ensure!(
+            deleted == ids.len(),
+            "forget message deletion lost selected primary keys"
+        );
+    }
+    tx.execute_compat(
+        "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
+        fparams![conversation_id],
+    )?;
+    let deleted = tx.execute_compat(
+        "DELETE FROM conversations WHERE id = ?1",
+        fparams![conversation_id],
+    )?;
+    anyhow::ensure!(
+        deleted == 1,
+        "forget conversation {conversation_id} disappeared before deletion"
+    );
+    Ok(())
+}
+
 /// Reconcile only the provider-owned attribution fields. A missing workspace
 /// in an ordinary partial packet must never erase a known association.
 fn franken_reconcile_provider_workspace(
@@ -11904,7 +12000,7 @@ impl FrankenStorage {
         let track_a = self
             .rebuild_analytics_since_with_chunk_size_and_progress(
                 None,
-                LEGACY_OMP_ANALYTICS_CHUNK_SIZE,
+                ANALYTICS_REBUILD_MAX_PAGE_ROWS,
                 progress,
                 heartbeat,
                 Some(context.as_str()),
@@ -12556,14 +12652,20 @@ impl FrankenStorage {
     /// this marker until those assets have been published successfully, so an
     /// identical retry repairs them even when no canonical rows still match.
     pub fn forget_derived_rebuild_pending(&self) -> Result<bool> {
-        let pending: Option<String> = self
-            .conn
-            .query_row_map(
-                "SELECT value FROM meta WHERE key = 'forget_derived_rebuild_pending'",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .optional()?;
+        // A valid nonempty SQLite file may still await its first CASS
+        // migration. Inspecting maintenance state must not block that normal
+        // initialization or create schema during a read-only probe.
+        let pending: Option<String> = if historical_table_exists(&self.conn, "meta")? {
+            self.conn
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = 'forget_derived_rebuild_pending'",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )
+                .optional()?
+        } else {
+            None
+        };
         // The file is published before canonical mutation so database-free
         // search readers are fenced too. A crash (or transaction rollback)
         // between that publication and the SQL commit still requires repair:
@@ -12613,20 +12715,24 @@ impl FrankenStorage {
     }
 
     /// Select the union of source globs and literal paths, intersected with
-    /// workspace and age predicates. One snapshot covers the entire batch's
-    /// selection, tombstones and deletion;
-    /// a dry run uses only reads and explicitly releases its snapshot. The
-    /// caller rebuilds derived search/analytics assets after an applied change.
+    /// workspace and age predicates. One read snapshot validates the entire
+    /// selection before mutation. Apply spools compact intents beside the
+    /// archive, then commits pages of at most 256 conversations and a target
+    /// of 8 MiB estimated canonical payload. One oversized conversation stays
+    /// atomic and is committed alone. Completed pages survive interruption;
+    /// retrying the same selectors removes the untouched remainder.
     ///
     /// Candidate envelopes and message timestamps are read in bounded pages.
-    /// No message body or metadata payload is hydrated for a preview, and no
-    /// SQL statement grows with the total number of selected conversations.
+    /// No message body or metadata payload is hydrated for a preview; previews
+    /// never create a spool or write the database. The caller holds the archive
+    /// maintenance lease through selection, deletion and derived rebuilding.
     pub fn forget_conversations(
         &self,
         filter: &ForgetConversationsFilter<'_>,
         dry_run: bool,
     ) -> Result<ForgetConversationsResult> {
-        const PAGE_SIZE: usize = 256;
+        use std::io::Seek as _;
+
         let parse_glob = |value: Option<&str>, label: &str| -> Result<Option<glob::Pattern>> {
             value
                 .map(|pattern| {
@@ -12673,255 +12779,278 @@ impl FrankenStorage {
             dry_run,
             ..Default::default()
         };
+        let selection = CompiledForgetSelection {
+            source_patterns: &source_patterns,
+            source_paths: &source_paths,
+            workspace_pattern: workspace_glob.as_ref(),
+            before_ms: filter.before_ms,
+        };
+        // A read-only v22 preview has no session tombstone table yet.
+        let has_session_tombstones = self.schema_version()? >= 23;
         let mut tx = self.conn.transaction()?;
         // GH #565: an IN-list GROUP BY can materialize the entire messages
         // table in FrankenSQLite before returning a small aggregate result.
-        // Seek only the selected conversations' timestamp cells, with one
-        // prepared statement reused across every page in this same snapshot.
-        let message_statistics = self.conn.prepare(FORGET_MESSAGE_STATISTICS_PAGE_SQL)?;
+        // Reuse prepared, indexed timestamp pages throughout this snapshot.
+        // Only selected apply records use the separate payload-width query.
+        let message_statistics = ForgetMessageStatisticsReader::new(&self.conn, !dry_run)?;
         let mut next_id = i64::MIN;
-        let mut matched = Vec::new();
-        let mut selected_by_path: HashMap<String, usize> = HashMap::new();
+        let mut source_cache: HashMap<String, ForgetSourceSelection> = HashMap::new();
+        let mut plan: Option<std::io::BufWriter<fs::File>> = None;
         loop {
-            let page: Vec<ForgetCandidate> = tx.query_map_collect(
-                "SELECT c.id, c.source_id, a.slug, c.source_path, c.external_id, w.path
-                 FROM conversations c
-                 JOIN agents a ON a.id = c.agent_id
-                 LEFT JOIN workspaces w ON w.id = c.workspace_id
-                 WHERE c.id >= ?1 ORDER BY c.id LIMIT 256",
-                fparams![next_id],
-                |row| {
-                    Ok(ForgetCandidate {
-                        id: row.get_typed(0)?,
-                        source_id: row.get_typed(1)?,
-                        agent_slug: row.get_typed(2)?,
-                        source_path: row.get_typed(3)?,
-                        external_id: row.get_typed(4)?,
-                        workspace: row.get_typed(5)?,
-                    })
-                },
-            )?;
-            let Some(last) = page.last() else { break };
-            let following_id = last.id.checked_add(1);
-            let candidates: Vec<_> = page
-                .into_iter()
-                .filter(|candidate| {
-                    (!has_source_selector
-                        || candidate.source_path.as_deref().is_some_and(|path| {
-                            source_paths.contains(path)
-                                || source_patterns.iter().any(|pattern| pattern.matches(path))
-                        }))
-                        && workspace_glob.as_ref().is_none_or(|pattern| {
-                            candidate
-                                .workspace
-                                .as_deref()
-                                .is_some_and(|path| pattern.matches(path))
-                        })
-                })
-                .collect();
-            if !candidates.is_empty() {
-                for candidate in candidates {
-                    let mut message_count = 0_usize;
-                    let mut dated_count = 0_usize;
-                    let mut latest: Option<i64> = None;
-                    let mut next_idx = i64::MIN;
-                    loop {
-                        let mut page_count = 0_usize;
-                        let mut page_dated_count = 0_usize;
-                        let mut last_idx = None;
-                        message_statistics.query_with_params_for_each(
-                            &[
-                                SqliteValue::Integer(candidate.id),
-                                SqliteValue::Integer(next_idx),
-                                SqliteValue::Integer(FORGET_MESSAGE_STATISTICS_PAGE_SIZE as i64),
-                            ],
-                            |row| {
-                                last_idx = Some(row.get_typed::<i64>(0)?);
-                                page_count += 1;
-                                if let Some(timestamp) = row.get_typed::<Option<i64>>(1)? {
-                                    page_dated_count += 1;
-                                    latest = Some(
-                                        latest.map_or(timestamp, |value| value.max(timestamp)),
-                                    );
-                                }
-                                Ok(())
-                            },
+            let (last_id, candidates) = forget_candidate_page(&tx, next_id, None)?;
+            for mut candidate in candidates {
+                if !selection.matches_envelope(&candidate) {
+                    continue;
+                }
+                let mut statistics = message_statistics.read(candidate.id, false)?;
+                if !statistics.matches_before(filter.before_ms) {
+                    continue;
+                }
+                if !dry_run {
+                    statistics = message_statistics.read(candidate.id, true)?;
+                    candidate.payload_bytes = forget_conversation_payload_bytes(&tx, candidate.id)?;
+                }
+                let tombstone = if let Some(path) = candidate.source_path.as_deref() {
+                    let source = if let Some(source) = source_cache.get(path).copied() {
+                        source
+                    } else {
+                        if source_cache.len() >= FORGET_SOURCE_CACHE_CAPACITY {
+                            source_cache.clear();
+                        }
+                        let source = classify_forget_source(
+                            &tx,
+                            &message_statistics,
+                            path,
+                            &selection,
+                            has_session_tombstones,
                         )?;
-                        message_count = message_count
-                            .checked_add(page_count)
-                            .context("matched message count overflow")?;
-                        dated_count = dated_count
-                            .checked_add(page_dated_count)
-                            .context("dated message count overflow")?;
-                        if page_count < FORGET_MESSAGE_STATISTICS_PAGE_SIZE {
-                            break;
+                        source_cache.insert(path.to_owned(), source);
+                        source
+                    };
+                    if source.shared
+                        && candidate
+                            .external_id
+                            .as_deref()
+                            .is_some_and(|id| !id.trim().is_empty())
+                    {
+                        ForgetTombstone::Session {
+                            clear_source_stamp: !source.file_tombstone,
                         }
-                        let Some(following_idx) = last_idx.and_then(|idx| idx.checked_add(1))
-                        else {
-                            break;
-                        };
-                        next_idx = following_idx;
+                    } else {
+                        ForgetTombstone::File
                     }
-                    if filter.before_ms.is_some_and(|cutoff| {
-                        message_count == 0
-                            || dated_count != message_count
-                            || latest.is_none_or(|timestamp| timestamp >= cutoff)
-                    }) {
-                        continue;
+                } else {
+                    ForgetTombstone::None
+                };
+                report.conversations_matched = report
+                    .conversations_matched
+                    .checked_add(1)
+                    .context("matched conversation count overflow")?;
+                report.messages_matched = report
+                    .messages_matched
+                    .checked_add(statistics.messages)
+                    .context("matched message count overflow")?;
+                if report.sample_source_paths.len() < 20
+                    && let Some(path) = &candidate.source_path
+                {
+                    report.sample_source_paths.push(path.clone());
+                }
+                if report.sample_sessions.len() < 20 {
+                    report.sample_sessions.push(ForgetSessionSample {
+                        source_path: candidate.source_path.clone(),
+                        external_id: candidate.external_id.clone(),
+                        workspace: candidate.workspace.clone(),
+                        last_message_at: statistics.last_message_at,
+                    });
+                }
+                if !dry_run {
+                    if plan.is_none() {
+                        let directory = self
+                            .db_path
+                            .parent()
+                            .filter(|path| !path.as_os_str().is_empty())
+                            .unwrap_or_else(|| Path::new("."));
+                        // The archive's filesystem, not /tmp (often tmpfs).
+                        // Anonymous temporary storage is released even after a
+                        // crash; committed conversations are independently
+                        // tombstoned, so retries select only the remainder.
+                        plan = Some(std::io::BufWriter::with_capacity(
+                            64 * 1024,
+                            tempfile::tempfile_in(directory)
+                                .context("creating disk-backed forget plan")?,
+                        ));
                     }
-                    report.messages_matched = report
-                        .messages_matched
-                        .checked_add(message_count)
-                        .context("matched message count overflow")?;
-                    if let Some(path) = &candidate.source_path {
-                        *selected_by_path.entry(path.clone()).or_default() += 1;
-                        if report.sample_source_paths.len() < 20 {
-                            report.sample_source_paths.push(path.clone());
-                        }
-                    }
-                    if report.sample_sessions.len() < 20 {
-                        report.sample_sessions.push(ForgetSessionSample {
-                            source_path: candidate.source_path.clone(),
-                            external_id: candidate.external_id.clone(),
-                            workspace: candidate.workspace.clone(),
-                            last_message_at: latest,
-                        });
-                    }
-                    matched.push(candidate);
+                    let estimated_bytes =
+                        forget_estimated_conversation_bytes(&candidate, &statistics);
+                    let entry = ForgetDeletionPlanEntry {
+                        candidate,
+                        statistics,
+                        tombstone,
+                        estimated_bytes,
+                    };
+                    let writer = plan.as_mut().context("missing disk-backed forget plan")?;
+                    serde_json::to_writer(&mut *writer, &entry)
+                        .context("writing forget plan entry")?;
+                    writer
+                        .write_all(b"\n")
+                        .context("writing forget plan separator")?;
                 }
             }
-            let Some(following_id) = following_id else {
+            let Some(following_id) = last_id.and_then(|id| id.checked_add(1)) else {
                 break;
             };
             next_id = following_id;
         }
-        report.conversations_matched = matched.len();
-        if matched.is_empty() {
+        drop(message_statistics);
+        if dry_run || report.conversations_matched == 0 {
             tx.rollback()?;
             return Ok(report);
         }
+        let mut writer = plan.context("missing validated forget plan")?;
+        writer.flush().context("flushing validated forget plan")?;
+        let mut plan_file = writer.into_inner().map_err(|error| error.into_error())?;
+        // No canonical mutation or reader invalidation precedes full source
+        // validation and successful spooling. Release the selection snapshot
+        // so each write page can release its dirty pages after commit.
+        tx.rollback()?;
+        plan_file
+            .rewind()
+            .context("rewinding validated forget plan")?;
+        drop(source_cache);
 
-        // Source-wide stamps must never suppress unselected siblings. Count
-        // all rows for only the matched paths, using bounded parameter lists.
-        let paths: Vec<_> = selected_by_path.keys().map(String::as_str).collect();
-        let mut total_by_path: HashMap<String, usize> = HashMap::new();
-        for page in paths.chunks(PAGE_SIZE) {
-            let placeholders = vec!["?"; page.len()].join(",");
-            let parameters: Vec<_> = page.iter().map(|path| ParamValue::from(*path)).collect();
-            let counts: Vec<(String, i64)> = tx.query_map_collect(
-                &format!("SELECT source_path, COUNT(*) FROM conversations WHERE source_path IN ({placeholders}) GROUP BY source_path"),
-                &parameters,
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-            )?;
-            for (path, count) in counts {
-                total_by_path.insert(
-                    path,
-                    usize::try_from(count).context("invalid source conversation count")?,
-                );
-            }
-        }
-        // A source remains shared even after earlier forgets removed all but
-        // one of its sessions. A read-only v22 preview has no session table yet.
-        let previously_shared: HashSet<String> = if self.schema_version()? >= 23 {
-            tx.query_map_collect(
-                "SELECT source_path FROM forgotten_conversations",
-                fparams![],
-                |row| row.get_typed(0),
-            )?
-            .into_iter()
-            .collect()
-        } else {
-            HashSet::new()
-        };
-        let mut session_tombstones = Vec::new();
-        let mut file_tombstones = BTreeSet::new();
-        let mut session_only_paths = BTreeSet::new();
-        for candidate in &matched {
-            let Some(path) = &candidate.source_path else {
-                continue;
-            };
-            let total = *total_by_path
-                .get(path)
-                .context("matched source lost its conversation count")?;
-            let shared =
-                total > 1 || source_path_is_shared_store(path) || previously_shared.contains(path);
-            let external_id = candidate
-                .external_id
-                .as_deref()
-                .filter(|id| !id.trim().is_empty());
-            if shared && let Some(external_id) = external_id {
-                session_tombstones.push(ForgottenConversationKey {
-                    source_id: candidate.source_id.clone(),
-                    agent_slug: candidate.agent_slug.clone(),
-                    source_path: path.clone(),
-                    external_id: external_id.to_owned(),
-                });
-                session_only_paths.insert(path.clone());
-            } else {
-                if selected_by_path.get(path).copied() != Some(total) {
-                    bail!(
-                        "cannot forget only part of shared source {path}: a selected conversation has no stable external ID; select the entire source with --source-glob"
-                    );
-                }
-                file_tombstones.insert(path.clone());
-            }
-        }
-        if dry_run {
-            tx.rollback()?;
-            return Ok(report);
-        }
-
-        // Invalidate every retained reader before deletion can commit, not
-        // after publication. The epoch survives the lexical directory swap
-        // and remains changed after repair, so pinned readers and their
-        // caches cannot resume serving a pre-forget generation.
         crate::search::privacy::begin_forget(&self.db_path)?;
+        let apply = (|| -> Result<()> {
+            let reader = BufReader::with_capacity(64 * 1024, plan_file);
+            let entries = serde_json::Deserializer::from_reader(reader)
+                .into_iter::<ForgetDeletionPlanEntry>();
+            let mut page = Vec::with_capacity(FORGET_DELETE_MAX_CONVERSATIONS);
+            let mut page_bytes = 0_u64;
+            for entry in entries {
+                let entry = entry.context("reading validated forget plan")?;
+                if !forget_delete_batch_fits(page.len(), page_bytes, entry.estimated_bytes) {
+                    self.commit_forget_delete_page(&page, &mut report)?;
+                    page.clear();
+                    page_bytes = 0;
+                }
+                page_bytes = page_bytes.saturating_add(entry.estimated_bytes);
+                page.push(entry);
+            }
+            if !page.is_empty() {
+                self.commit_forget_delete_page(&page, &mut report)?;
+            }
+            Ok(())
+        })();
+        apply.with_context(|| format!(
+            "forget stopped after committing {} conversation(s) in {} batch(es); \
+             those deletions and tombstones are durable, and search remains fenced; \
+             retry the same forget selectors with --apply to finish the remaining conversations and derived repair",
+            report.conversations_deleted, report.delete_batches_committed
+        ))?;
+        Ok(report)
+    }
+
+    fn commit_forget_delete_page(
+        &self,
+        page: &[ForgetDeletionPlanEntry],
+        report: &mut ForgetConversationsResult,
+    ) -> Result<()> {
+        let mut tx = self.conn.transaction()?;
+        let message_statistics = ForgetMessageStatisticsReader::new(&self.conn, true)?;
         tx.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('forget_derived_rebuild_pending', '1')",
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('forget_derived_rebuild_pending', '1')",
         )?;
         let forgotten_at_ms = Self::now_millis();
-        for key in &session_tombstones {
-            tx.execute_compat(
-                "INSERT OR REPLACE INTO forgotten_conversations
-                     (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                fparams![
-                    key.source_id.as_str(),
-                    key.agent_slug.as_str(),
-                    key.source_path.as_str(),
-                    key.external_id.as_str(),
-                    forgotten_at_ms
-                ],
-            )?;
-        }
-        for path in session_only_paths.difference(&file_tombstones) {
-            tx.execute_compat(
-                "DELETE FROM forgotten_sources WHERE source_path = ?1",
-                fparams![path.as_str()],
-            )?;
-        }
-        for path in &file_tombstones {
-            let stamp = SourceFileStamp::of(Path::new(path));
-            tx.execute_compat(
-                "INSERT OR REPLACE INTO forgotten_sources
-                     (source_path, size_bytes, mtime_ms, forgotten_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)",
-                fparams![
-                    path.as_str(),
-                    stamp.size_bytes,
-                    stamp.mtime_ms,
-                    forgotten_at_ms
-                ],
-            )?;
-        }
-        for candidate in &matched {
-            delete_duplicate_conversation_rows(&tx, candidate.id)?;
+        for entry in page {
+            let candidate = &entry.candidate;
+            let mut current = tx
+                .query_row_map(
+                    &format!("{FORGET_CANDIDATE_PROJECTION} WHERE c.id = ?1"),
+                    fparams![candidate.id],
+                    decode_forget_candidate,
+                )
+                .optional()?
+                .and_then(|(_, candidate)| candidate);
+            if let Some(current) = &mut current {
+                current.payload_bytes = forget_conversation_payload_bytes(&tx, current.id)?;
+            }
+            anyhow::ensure!(
+                current.as_ref() == Some(candidate)
+                    && message_statistics.read(candidate.id, true)? == entry.statistics,
+                "canonical conversation {} changed after forget preflight; the current page was not committed",
+                candidate.id
+            );
+            match &entry.tombstone {
+                ForgetTombstone::None => {}
+                ForgetTombstone::File => {
+                    let path = candidate
+                        .source_path
+                        .as_deref()
+                        .context("file tombstone has no source path")?;
+                    let stamp = SourceFileStamp::of(Path::new(path));
+                    tx.execute_compat(
+                        "INSERT OR REPLACE INTO forgotten_sources
+                             (source_path, size_bytes, mtime_ms, forgotten_at_ms)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        fparams![path, stamp.size_bytes, stamp.mtime_ms, forgotten_at_ms],
+                    )?;
+                }
+                ForgetTombstone::Session { clear_source_stamp } => {
+                    let path = candidate
+                        .source_path
+                        .as_deref()
+                        .context("session tombstone has no source path")?;
+                    let external_id = candidate
+                        .external_id
+                        .as_deref()
+                        .context("session tombstone has no external ID")?;
+                    tx.execute_compat(
+                        "INSERT OR REPLACE INTO forgotten_conversations
+                             (source_id, agent_slug, source_path, external_id, forgotten_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        fparams![
+                            candidate.source_id.as_str(),
+                            candidate.agent_slug.as_str(),
+                            path,
+                            external_id,
+                            forgotten_at_ms
+                        ],
+                    )?;
+                    if *clear_source_stamp {
+                        tx.execute_compat(
+                            "DELETE FROM forgotten_sources WHERE source_path = ?1",
+                            fparams![path],
+                        )?;
+                    }
+                }
+            }
+            delete_forgotten_conversation_rows(&tx, candidate.id)?;
         }
         clear_semantic_embed_watermark_after_deletion(&tx)?;
         tx.commit()?;
         self.invalidate_fts_messages_present_cache();
-        report.conversations_deleted = matched.len();
-        Ok(report)
+        let estimated_bytes = page.iter().fold(0_u64, |bytes, entry| {
+            bytes.saturating_add(entry.estimated_bytes)
+        });
+        report.conversations_deleted += page.len();
+        report.delete_batches_committed += 1;
+        report.max_delete_batch_conversations =
+            report.max_delete_batch_conversations.max(page.len());
+        report.max_delete_batch_estimated_bytes =
+            report.max_delete_batch_estimated_bytes.max(estimated_bytes);
+        report.oversized_conversations += page
+            .iter()
+            .filter(|entry| entry.estimated_bytes > FORGET_DELETE_TARGET_BYTES)
+            .count();
+        tracing::info!(
+            target: "cass::forget",
+            conversations_deleted = report.conversations_deleted,
+            conversations_matched = report.conversations_matched,
+            batches_committed = report.delete_batches_committed,
+            batch_conversations = page.len(),
+            estimated_bytes,
+            "forget canonical deletion page committed"
+        );
+        Ok(())
     }
 
     /// `coding_agent_session_search-uhhxy` (gh #302 ask #2): collapse
@@ -16371,21 +16500,36 @@ impl FrankenStorage {
     /// must be retired, not recreated by a full-archive transaction after the
     /// canonical deletion commits (GH #565). The caller still rebuilds the
     /// authoritative lexical index before clearing the privacy fence.
-    pub(crate) fn rebuild_search_fallback_after_forget(&self) -> Result<()> {
+    pub(crate) fn rebuild_search_fallback_after_forget(
+        &self,
+    ) -> Result<ForgetFtsRebuildOutcome> {
         self.rebuild_search_fallback_after_forget_with_bound(fts_shadow_max_messages())
     }
 
     fn rebuild_search_fallback_after_forget_with_bound(
         &self,
         bound_messages: Option<u64>,
-    ) -> Result<()> {
-        if let Some(detail) = self.fts_shadow_recreate_refused_with_bound(bound_messages)? {
+    ) -> Result<ForgetFtsRebuildOutcome> {
+        let corpus_messages = self.fts_shadow_corpus_messages()?;
+        if let Some(bound_messages) = bound_messages
+            && corpus_messages > bound_messages
+        {
+            let detail = fts_shadow_not_viable_detail(corpus_messages, bound_messages);
             if !self.fts_shadow_retirement_matches(&detail)? {
                 self.drop_fts_shadow_as_not_viable(&detail)?;
             }
-            return Ok(());
+            return Ok(ForgetFtsRebuildOutcome::Retired {
+                corpus_messages,
+                bound_messages,
+            });
         }
-        self.rebuild_fts()
+
+        // A large forget can bring an archive back under the bound. Clear
+        // the obsolete retirement marker only after its replacement exists.
+        self.rebuild_fts()?;
+        self.clear_fts_shadow_not_viable_marker()?;
+        self.record_fallback_fts_repair_pending(None)?;
+        Ok(ForgetFtsRebuildOutcome::Rebuilt { corpus_messages })
     }
 
     /// Best-effort repair for the derived SQLite FTS fallback index.
@@ -19953,6 +20097,19 @@ pub(crate) enum FtsShadowViability {
     },
 }
 
+/// Truthful completion state for forget's optional in-database FTS fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum ForgetFtsRebuildOutcome {
+    Rebuilt {
+        corpus_messages: u64,
+    },
+    Retired {
+        corpus_messages: u64,
+        bound_messages: u64,
+    },
+}
+
 /// The one sentence every surface (index log, status marker, doctor) uses
 /// for a shadow the engine cannot materialize.
 /// GH #374: frankensqlite versions before its canonical-shadow fix created the
@@ -21981,6 +22138,17 @@ const TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY: &str = "token_daily_stats_rebuild_cu
 /// Same-row ledger revisions must invalidate both resumed and active rebuilds.
 const TOKEN_USAGE_REVISION_GENERATION_META_KEY: &str = "token_usage_revision_generation";
 
+/// The pinned engine cannot stream ORDER BY id from the conversation index's
+/// implicit rowid suffix. Force a rowid scan with an early LIMIT so a token
+/// page never enters the sorter or its spill path (GH #565).
+const FORGET_TOKEN_USAGE_PAGE_SQL: &str =
+    "SELECT id, day_id, role, COALESCE(model_family, 'unknown'),
+            input_tokens, output_tokens, cache_read_tokens,
+            cache_creation_tokens, thinking_tokens,
+            has_tool_calls, tool_call_count, content_chars, estimated_cost_usd
+     FROM token_usage NOT INDEXED
+     WHERE conversation_id = ?1 AND id >= ?2 ORDER BY id LIMIT 128";
+
 /// Same upsert as the live-table writer, addressed to `table` — which must be
 /// one of the two compile-time table-name constants above (never caller
 /// input; it is spliced into SQL text).
@@ -22709,6 +22877,206 @@ impl FrankenStorage {
         self.rebuild_token_daily_stats_with_progress(None, None)
     }
 
+    /// Rebuild the Track B rollup behind forget's durable reader fence. The
+    /// normal staged rebuild preserves a readable last-good generation; forget
+    /// must keep that generation unreadable anyway, so it can clear and refill
+    /// the live table in fixed pages without an archive-sized final publish.
+    pub(crate) fn rebuild_token_daily_stats_after_forget(&self) -> Result<usize> {
+        self.rebuild_token_daily_stats_after_forget_with_control(None, None)
+    }
+
+    fn rebuild_token_daily_stats_after_forget_with_control(
+        &self,
+        heartbeat: Option<&dyn Fn()>,
+        control: Option<&dyn Fn() -> Result<()>>,
+    ) -> Result<usize> {
+        self.require_forget_derived_repair()?;
+        if let Some(control) = control {
+            control()?;
+        }
+        let ledger = token_daily_stats_ledger_fingerprint(&self.conn)?;
+        // A previous ordinary staged rebuild cannot certify this replacement.
+        // Its disk stage may remain, but without its cursor the next ordinary
+        // rebuild will reset it instead of adding deltas to the wrong prefix.
+        self.conn.execute_compat(
+            "DELETE FROM meta WHERE key = ?1",
+            fparams![TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY],
+        )?;
+        self.delete_derived_rows_in_pages(
+            "SELECT rowid FROM token_daily_stats NOT INDEXED WHERE rowid >= ?1 ORDER BY rowid LIMIT 128",
+            "DELETE FROM token_daily_stats WHERE rowid IN",
+            fparams![],
+            heartbeat,
+            control,
+        )?;
+
+        let mut next_conversation_id = Some(i64::MIN);
+        let mut processed_conversations = 0_usize;
+        let mut processed_usage_rows = 0_usize;
+        while let Some(lower) = next_conversation_id {
+            if let Some(control) = control {
+                control()?;
+            }
+            let conversations = self.conn.query_map_collect(
+                "SELECT c.id, c.started_at, c.source_id,
+                        COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown')
+                 FROM conversations c WHERE c.id >= ?1 ORDER BY c.id LIMIT 128",
+                fparams![lower],
+                |row| {
+                    Ok((
+                        row.get_typed::<i64>(0)?,
+                        row.get_typed::<Option<i64>>(1)?,
+                        row.get_typed::<String>(2)?,
+                        row.get_typed::<String>(3)?,
+                    ))
+                },
+            )?;
+            let Some(last) = conversations.last() else {
+                break;
+            };
+            next_conversation_id = last.0.checked_add(1);
+
+            for (conversation_id, started_at, source_id, agent_slug) in conversations {
+                let mut next_usage_id = Some(i64::MIN);
+                let mut session_model_family = String::from("unknown");
+                while let Some(lower) = next_usage_id {
+                    if let Some(control) = control {
+                        control()?;
+                    }
+                    let usage_rows = self.conn.query_map_collect(
+                        FORGET_TOKEN_USAGE_PAGE_SQL,
+                        fparams![conversation_id, lower],
+                        |row| {
+                            Ok((
+                                row.get_typed::<i64>(0)?,
+                                row.get_typed::<i64>(1)?,
+                                row.get_typed::<String>(2)?,
+                                row.get_typed::<String>(3)?,
+                                row.get_typed::<Option<i64>>(4)?,
+                                row.get_typed::<Option<i64>>(5)?,
+                                row.get_typed::<Option<i64>>(6)?,
+                                row.get_typed::<Option<i64>>(7)?,
+                                row.get_typed::<Option<i64>>(8)?,
+                                row.get_typed::<i64>(9)?,
+                                row.get_typed::<i64>(10)?,
+                                row.get_typed::<i64>(11)?,
+                                row.get_typed::<Option<f64>>(12)?,
+                            ))
+                        },
+                    )?;
+                    let Some(last) = usage_rows.last() else {
+                        break;
+                    };
+                    next_usage_id = last.0.checked_add(1);
+                    processed_usage_rows = processed_usage_rows.saturating_add(usage_rows.len());
+                    // The aggregate is flushed per ledger page, never per
+                    // conversation: one long session can span arbitrarily
+                    // many days/model families without growing this map.
+                    let mut aggregate = TokenStatsAggregator::new();
+                    for (
+                        _,
+                        day_id,
+                        role,
+                        model_family,
+                        input_tokens,
+                        output_tokens,
+                        cache_read_tokens,
+                        cache_creation_tokens,
+                        thinking_tokens,
+                        has_tool_calls,
+                        tool_call_count,
+                        content_chars,
+                        estimated_cost_usd,
+                    ) in usage_rows
+                    {
+                        if model_family != "unknown" {
+                            session_model_family = model_family.clone();
+                        }
+                        let usage = crate::connectors::ExtractedTokenUsage {
+                            model_name: None,
+                            provider: None,
+                            input_tokens,
+                            output_tokens,
+                            cache_read_tokens,
+                            cache_creation_tokens,
+                            thinking_tokens,
+                            service_tier: None,
+                            has_tool_calls: has_tool_calls != 0,
+                            tool_call_count: u32::try_from(tool_call_count.max(0)).unwrap_or(0),
+                            data_source: franken_agent_detection::TokenDataSource::Api,
+                        };
+                        aggregate.record(
+                            &agent_slug,
+                            &source_id,
+                            day_id,
+                            &model_family,
+                            &role,
+                            &usage,
+                            content_chars,
+                            estimated_cost_usd.unwrap_or(0.0),
+                        );
+                    }
+                    let entries = aggregate.expand();
+                    let mut tx = self.conn.transaction()?;
+                    franken_update_token_daily_stats_batched_in_tx(&tx, &entries)?;
+                    if let Some(control) = control {
+                        control()?;
+                    }
+                    tx.commit()?;
+                    if let Some(heartbeat) = heartbeat {
+                        heartbeat();
+                    }
+                }
+
+                let mut sessions = TokenStatsAggregator::new();
+                sessions.record_session(
+                    &agent_slug,
+                    &source_id,
+                    started_at.map(Self::day_id_from_millis).unwrap_or(0),
+                    &session_model_family,
+                );
+                if let Some(control) = control {
+                    control()?;
+                }
+                let mut tx = self.conn.transaction()?;
+                franken_update_token_daily_stats_batched_in_tx(&tx, &sessions.expand())?;
+                if let Some(control) = control {
+                    control()?;
+                }
+                tx.commit()?;
+                processed_conversations += 1;
+                if let Some(heartbeat) = heartbeat {
+                    heartbeat();
+                }
+            }
+            tracing::info!(
+                target: "cass::analytics",
+                processed_conversations,
+                processed_usage_rows,
+                "forget token_daily_stats rebuild progress"
+            );
+        }
+
+        // Keep the privacy fence pending if a writer outside maintenance
+        // ownership changed the ledger. A retry clears this partial rollup.
+        if let Some(control) = control {
+            control()?;
+        }
+        let mut tx = self.conn.transaction()?;
+        let ledger_after = token_daily_stats_ledger_fingerprint(&self.conn)?;
+        anyhow::ensure!(
+            ledger_after.fingerprint() == ledger.fingerprint(),
+            "token_usage ledger changed during bounded forget repair; retry the forget to rebuild its rollup"
+        );
+        let rows: i64 = tx.query_row_map(
+            "SELECT COUNT(*) FROM token_daily_stats",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        tx.commit()?;
+        usize::try_from(rows).context("invalid rebuilt token_daily_stats row count")
+    }
+
     fn rebuild_token_daily_stats_with_progress(
         &self,
         heartbeat: Option<&dyn Fn()>,
@@ -23031,6 +23399,159 @@ impl FrankenStorage {
         Ok(rows_created)
     }
 
+    /// Delete only the next fixed page of derived rowids in each transaction.
+    /// The select must use `rowid >= ?1 ORDER BY rowid LIMIT 128`; deleting by explicit
+    /// rowids avoids the engine's whole-table mutation materialization path.
+    /// The local keyset includes negative and maximum ids and never revisits
+    /// an out-of-scope prefix. Retrying starts from the first remaining row.
+    fn delete_derived_rows_in_pages(
+        &self,
+        select_sql: &'static str,
+        delete_prefix: &'static str,
+        parameters: &[ParamValue],
+        heartbeat: Option<&dyn Fn()>,
+        control: Option<&dyn Fn() -> Result<()>>,
+    ) -> Result<()> {
+        let mut next_id = Some(i64::MIN);
+        while let Some(lower) = next_id {
+            if let Some(control) = control {
+                control()?;
+            }
+            let mut tx = self.conn.transaction()?;
+            let mut page_parameters = vec![ParamValue::from(lower)];
+            page_parameters.extend_from_slice(parameters);
+            let ids: Vec<i64> =
+                tx.query_map_collect(select_sql, &page_parameters, |row| row.get_typed(0))?;
+            anyhow::ensure!(ids.len() <= 128, "derived reset exceeded its row budget");
+            if ids.is_empty() {
+                tx.rollback()?;
+                break;
+            }
+            next_id = ids.last().and_then(|id| id.checked_add(1));
+            let deleted = delete_rows_by_i64_chunks(&tx, delete_prefix, &ids)?;
+            anyhow::ensure!(deleted == ids.len(), "derived reset lost selected rows");
+            if let Some(control) = control {
+                control()?;
+            }
+            tx.commit()?;
+            if let Some(heartbeat) = heartbeat {
+                heartbeat();
+            }
+        }
+        Ok(())
+    }
+
+    fn reset_analytics_in_bounded_pages(
+        &self,
+        cutoff: Option<(i64, i64)>,
+        heartbeat: Option<&dyn Fn()>,
+        control: Option<&dyn Fn() -> Result<()>>,
+    ) -> Result<()> {
+        if let Some(control) = control {
+            control()?;
+        }
+        // No later OMP repair may resume additive deltas over a reset prefix,
+        // including a reset interrupted between two page commits.
+        let mut tx = self.conn.transaction()?;
+        tx.execute_compat(
+            "DELETE FROM meta WHERE key IN (?1, ?2, ?3)",
+            fparams![
+                LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+                LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
+                LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY
+            ],
+        )?;
+        tx.commit()?;
+
+        for (whole_table, recent_rows, delete_prefix, hourly) in [
+            (
+                "SELECT rowid FROM message_metrics NOT INDEXED WHERE rowid >= ?1 ORDER BY rowid LIMIT 128",
+                "SELECT rowid FROM message_metrics NOT INDEXED WHERE rowid >= ?1 AND day_id >= ?2 ORDER BY rowid LIMIT 128",
+                "DELETE FROM message_metrics WHERE rowid IN",
+                false,
+            ),
+            (
+                "SELECT rowid FROM usage_hourly NOT INDEXED WHERE rowid >= ?1 ORDER BY rowid LIMIT 128",
+                "SELECT rowid FROM usage_hourly NOT INDEXED WHERE rowid >= ?1 AND hour_id >= ?2 ORDER BY rowid LIMIT 128",
+                "DELETE FROM usage_hourly WHERE rowid IN",
+                true,
+            ),
+            (
+                "SELECT rowid FROM usage_daily NOT INDEXED WHERE rowid >= ?1 ORDER BY rowid LIMIT 128",
+                "SELECT rowid FROM usage_daily NOT INDEXED WHERE rowid >= ?1 AND day_id >= ?2 ORDER BY rowid LIMIT 128",
+                "DELETE FROM usage_daily WHERE rowid IN",
+                false,
+            ),
+            (
+                "SELECT rowid FROM usage_models_daily NOT INDEXED WHERE rowid >= ?1 ORDER BY rowid LIMIT 128",
+                "SELECT rowid FROM usage_models_daily NOT INDEXED WHERE rowid >= ?1 AND day_id >= ?2 ORDER BY rowid LIMIT 128",
+                "DELETE FROM usage_models_daily WHERE rowid IN",
+                false,
+            ),
+        ] {
+            if let Some((day, hour)) = cutoff {
+                self.delete_derived_rows_in_pages(
+                    recent_rows,
+                    delete_prefix,
+                    fparams![if hourly { hour } else { day }],
+                    heartbeat,
+                    control,
+                )?;
+            } else {
+                self.delete_derived_rows_in_pages(
+                    whole_table,
+                    delete_prefix,
+                    fparams![],
+                    heartbeat,
+                    control,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve dimensions only for the current payload page, using bounded
+    /// primary-key probes. A joined LIMIT can materialize the entire archive
+    /// in FrankenSQLite; an archive-wide dimensions map also defeats a page
+    /// bound when many short conversations are retained (GH #565).
+    fn analytics_dimensions_for_page(
+        &self,
+        rows: &[AnalyticsMessageRow],
+    ) -> Result<HashMap<i64, AnalyticsConversationDim>> {
+        let ids: Vec<_> = rows
+            .iter()
+            .map(|row| row.conversation_id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut dimensions = HashMap::with_capacity(ids.len());
+        for page in ids.chunks(128) {
+            let parameters: Vec<_> = page.iter().copied().map(ParamValue::from).collect();
+            let values = self.conn.query_map_collect(
+                &format!(
+                    "SELECT c.id, c.started_at, c.source_id, c.workspace_id,
+                            COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown')
+                     FROM conversations c WHERE c.id IN ({})",
+                    sql_placeholders(page.len())
+                ),
+                &parameters,
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        AnalyticsConversationDim {
+                            started_at: row.get_typed(1)?,
+                            source_id: row.get_typed(2)?,
+                            workspace_id: row.get_typed(3)?,
+                            agent_slug: row.get_typed(4)?,
+                        },
+                    ))
+                },
+            )?;
+            dimensions.extend(values);
+        }
+        Ok(dimensions)
+    }
+
     /// Rebuild analytics tables (message_metrics + rollups) from existing
     /// messages in the database. Does NOT re-parse raw agent session files.
     ///
@@ -23060,10 +23581,10 @@ impl FrankenStorage {
     /// the number of rescanned rows rather than quadratic as the previous
     /// `LIMIT/OFFSET` form was. A progress event is logged per chunk.
     ///
-    /// GH #424: the keyset runs over `messages` alone and resolves the
-    /// `conversations` / `agents` dimensions from in-memory maps; every chunk
-    /// commits on its own. GH #565: full resets also commit bounded rowid
-    /// pages, and raw message pages observe a byte budget before hydration.
+    /// The keyset runs over `messages` alone and resolves only each page's
+    /// conversation/agent dimensions. Reset and insert pages commit separately;
+    /// each payload page holds at most 128 rows and 8 MiB of stored content and
+    /// metadata, except that one oversized message is processed alone intact.
     /// See [`Self::rebuild_analytics_since_with_chunk_size`].
     pub fn rebuild_analytics_since(&self, since_ms: Option<i64>) -> Result<AnalyticsRebuildResult> {
         self.rebuild_analytics_since_with_chunk_size(since_ms, ANALYTICS_REBUILD_CHUNK_SIZE)
@@ -23145,11 +23666,15 @@ impl FrankenStorage {
                 bail!("cannot reset analytics: missing ordinary table {table}");
             };
             if *without_rowid != 0 {
+                anyhow::ensure!(
+                    resume_context.is_some() && !self.forget_derived_rebuild_pending()?,
+                    "cannot reset analytics table {table}: WITHOUT ROWID does not support bounded reset; refusing an unbounded ordinary or pending-forget rebuild"
+                );
                 bounded = false;
                 tracing::warn!(
                     target: "cass::analytics",
                     table,
-                    "analytics table is WITHOUT ROWID; retaining the transactional reset because bounded rowid delete seeks are unavailable"
+                    "legacy analytics table is WITHOUT ROWID; retaining the migration-only transactional reset because bounded rowid delete seeks are unavailable"
                 );
             }
         }
@@ -23204,8 +23729,9 @@ impl FrankenStorage {
         checkpoint()?;
         let mut tx = self.conn.transaction()?;
         if !bounded {
-            // Preserve the previous all-table reset for unexpected layouts.
-            // This fallback deliberately carries no row-count/RSS bound.
+            // Preserve the previous migration-only reset for historical
+            // layouts. Ordinary rebuilds and pending forget repairs are
+            // rejected before mutation because this fallback is unbounded.
             for (table, _, _) in TABLES {
                 tx.execute(&format!("DELETE FROM {table}"))?;
                 if let Some(control) = control {
@@ -23290,59 +23816,6 @@ impl FrankenStorage {
         if let Some(progress) = progress {
             progress(0, total_messages);
         }
-        if let Some(heartbeat) = heartbeat {
-            heartbeat();
-        }
-
-        // GH #424: resolve the dimension tables once, in memory, instead of
-        // JOINing `conversations` (plus the agents subquery) into every
-        // chunk. frankensqlite 0.3.8 materializes `JOIN ... ORDER BY ...
-        // LIMIT` in full before applying the limit, which measured ~635 s per
-        // 10k-row chunk on a 652k-message archive; the single-table keyset
-        // costs ~0.2 s. Both maps are tiny next to `messages`: one entry per
-        // conversation and one per agent.
-        if let Some(control) = control {
-            control()?;
-        }
-        let agent_slugs: HashMap<i64, String> = self
-            .conn
-            .query_map_collect("SELECT id, slug FROM agents", fparams![], |row| {
-                Ok((row.get_typed(0)?, row.get_typed(1)?))
-            })?
-            .into_iter()
-            .collect();
-        if let Some(heartbeat) = heartbeat {
-            heartbeat();
-        }
-        if let Some(control) = control {
-            control()?;
-        }
-        let conversation_dims: HashMap<i64, AnalyticsConversationDim> = self
-            .conn
-            .query_map_collect(
-                "SELECT id, started_at, source_id, workspace_id, agent_id FROM conversations",
-                fparams![],
-                |row| {
-                    let id: i64 = row.get_typed(0)?;
-                    let agent_id: Option<i64> = row.get_typed(4)?;
-                    Ok((
-                        id,
-                        AnalyticsConversationDim {
-                            started_at: row.get_typed(1)?,
-                            source_id: row.get_typed(2)?,
-                            workspace_id: row.get_typed(3)?,
-                            // Same degradation as the former correlated
-                            // subquery: NULL or dangling agent_id -> 'unknown',
-                            // matching the FTS / lexical rebuild paths.
-                            agent_slug: agent_id
-                                .and_then(|agent_id| agent_slugs.get(&agent_id).cloned())
-                                .unwrap_or_else(|| "unknown".to_string()),
-                        },
-                    ))
-                },
-            )?
-            .into_iter()
-            .collect();
         if let Some(heartbeat) = heartbeat {
             heartbeat();
         }
@@ -23483,38 +23956,11 @@ impl FrankenStorage {
             self.reset_analytics_for_full_rebuild(resume_context, progress, heartbeat, control)?;
         }
         if let Some((cutoff_day, cutoff_hour, _)) = scope {
-            if let Some(control) = control {
-                control()?;
-            }
-            let mut tx = self.conn.transaction()?;
-            tx.execute_compat(
-                "DELETE FROM message_metrics WHERE day_id >= ?1",
-                fparams![cutoff_day],
+            self.reset_analytics_in_bounded_pages(
+                Some((cutoff_day, cutoff_hour)),
+                heartbeat,
+                control,
             )?;
-            tx.execute_compat(
-                "DELETE FROM usage_hourly WHERE hour_id >= ?1",
-                fparams![cutoff_hour],
-            )?;
-            tx.execute_compat(
-                "DELETE FROM usage_daily WHERE day_id >= ?1",
-                fparams![cutoff_day],
-            )?;
-            tx.execute_compat(
-                "DELETE FROM usage_models_daily WHERE day_id >= ?1",
-                fparams![cutoff_day],
-            )?;
-            // A scoped rebuild changes the live derivatives outside the
-            // OMP cursor's transaction chain. Invalidate it atomically with
-            // this reset so migration cannot replay additive rollup deltas.
-            tx.execute_compat(
-                "DELETE FROM meta WHERE key IN (?1, ?2, ?3)",
-                fparams![
-                    LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
-                    LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
-                    LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY
-                ],
-            )?;
-            tx.commit()?;
         }
 
         // Keyset cursor: the largest message id fetched so far. The first
@@ -23563,11 +24009,7 @@ impl FrankenStorage {
                      FROM messages WHERE id >= ?1 ORDER BY id LIMIT ?2",
                     fparams![
                         lower,
-                        if resume_context.is_some() {
-                            chunk_size.min(LEGACY_OMP_ANALYTICS_CHUNK_SIZE as i64)
-                        } else {
-                            chunk_size
-                        }
+                        chunk_size.min(ANALYTICS_REBUILD_MAX_PAGE_ROWS as i64)
                     ],
                     |row| row.get_typed(0),
                 )?;
@@ -23641,6 +24083,7 @@ impl FrankenStorage {
             last_id = last_row.id;
             first_page = false;
 
+            let conversation_dims = self.analytics_dimensions_for_page(&rows)?;
             let mut entries = Vec::with_capacity(fetched);
             let mut rollup_agg = AnalyticsRollupAggregator::new();
 
@@ -23728,6 +24171,7 @@ impl FrankenStorage {
             // Extraction has copied only compact metrics into `entries`.
             // Do not retain raw content/JSON beside the writer's dirty pages.
             drop(rows);
+            drop(conversation_dims);
 
             kept += entries.len() as i64;
             let next_processed = processed.saturating_add(fetched as i64);
@@ -23851,10 +24295,40 @@ impl FrankenStorage {
         self.rebuild_daily_stats_with_progress(None, None)
     }
 
+    /// Forget already fences analytics readers until all derived repairs are
+    /// complete. Build directly into the live rollup in that interval instead
+    /// of keeping a TEMP copy of every aggregate and publishing one large
+    /// DELETE/INSERT transaction (GH #565). A failed run is cleared and replayed
+    /// on retry while reader admission remains closed.
+    pub(crate) fn rebuild_daily_stats_after_forget(&self) -> Result<DailyStatsRebuildResult> {
+        self.rebuild_daily_stats_with_target(None, None, DailyStatsBatchTarget::Canonical)
+    }
+
+    fn require_forget_derived_repair(&self) -> Result<()> {
+        anyhow::ensure!(
+            crate::search::privacy::repair_pending(&self.db_path)?,
+            "bounded forget rollup repair requires the durable reader privacy fence"
+        );
+        Ok(())
+    }
+
     fn rebuild_daily_stats_with_progress(
         &self,
         heartbeat: Option<&dyn Fn()>,
         control: Option<&dyn Fn() -> Result<()>>,
+    ) -> Result<DailyStatsRebuildResult> {
+        self.rebuild_daily_stats_with_target(
+            heartbeat,
+            control,
+            DailyStatsBatchTarget::RebuildStage,
+        )
+    }
+
+    fn rebuild_daily_stats_with_target(
+        &self,
+        heartbeat: Option<&dyn Fn()>,
+        control: Option<&dyn Fn() -> Result<()>>,
+        target: DailyStatsBatchTarget,
     ) -> Result<DailyStatsRebuildResult> {
         if let Some(control) = control {
             control()?;
@@ -23870,6 +24344,12 @@ impl FrankenStorage {
             "CASS_DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE",
             DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE,
         );
+        let direct = matches!(target, DailyStatsBatchTarget::Canonical);
+        if direct {
+            self.require_forget_derived_repair()?;
+            conversation_batch_size = conversation_batch_size.min(128);
+            message_batch_size = message_batch_size.min(DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE);
+        }
 
         if let Some(heartbeat) = heartbeat {
             heartbeat();
@@ -23884,9 +24364,22 @@ impl FrankenStorage {
         if let Some(control) = control {
             control()?;
         }
-        self.conn
-            .execute(
-                "CREATE TEMP TABLE IF NOT EXISTS daily_stats_rebuild_stage (
+        if direct {
+            self.conn.execute_compat(
+                "DELETE FROM meta WHERE key = ?1",
+                fparams![DAILY_STATS_HEALTH_GENERATION_META_KEY],
+            )?;
+            self.delete_derived_rows_in_pages(
+                "SELECT rowid FROM daily_stats NOT INDEXED WHERE rowid >= ?1 ORDER BY rowid LIMIT 128",
+                "DELETE FROM daily_stats WHERE rowid IN",
+                fparams![],
+                heartbeat,
+                control,
+            )?;
+        } else {
+            self.conn
+                .execute(
+                    "CREATE TEMP TABLE IF NOT EXISTS daily_stats_rebuild_stage (
                 day_id INTEGER NOT NULL,
                 agent_slug TEXT NOT NULL,
                 source_id TEXT NOT NULL,
@@ -23896,11 +24389,12 @@ impl FrankenStorage {
                 last_updated INTEGER NOT NULL,
                 PRIMARY KEY (day_id, agent_slug, source_id)
             )",
-            )
-            .with_context(|| "daily_stats phase=create_stage")?;
-        self.conn
-            .execute("DELETE FROM daily_stats_rebuild_stage")
-            .with_context(|| "daily_stats phase=clear_stage")?;
+                )
+                .with_context(|| "daily_stats phase=create_stage")?;
+            self.conn
+                .execute("DELETE FROM daily_stats_rebuild_stage")
+                .with_context(|| "daily_stats phase=clear_stage")?;
+        }
 
         let mut last_conversation_id = 0_i64;
         let mut conversation_batch_count = 0_usize;
@@ -24020,7 +24514,7 @@ impl FrankenStorage {
                 franken_update_daily_stats_batched_in_tx_for_target(
                     &batch_tx,
                     &entries,
-                    DailyStatsBatchTarget::RebuildStage,
+                    target,
                 )
                 .with_context(|| {
                     format!(
@@ -24140,7 +24634,7 @@ impl FrankenStorage {
                         franken_update_daily_stats_batched_in_tx_for_target(
                             &batch_tx,
                             &entries,
-                            DailyStatsBatchTarget::RebuildStage,
+                            target,
                         )
                         .with_context(|| {
                             format!(
@@ -24181,7 +24675,11 @@ impl FrankenStorage {
         let rows_created: i64 = self
             .conn
             .query_row_map(
-                "SELECT COUNT(*) FROM daily_stats_rebuild_stage",
+                if direct {
+                    "SELECT COUNT(*) FROM daily_stats"
+                } else {
+                    "SELECT COUNT(*) FROM daily_stats_rebuild_stage"
+                },
                 fparams![],
                 |row| row.get_typed(0),
             )
@@ -24189,7 +24687,11 @@ impl FrankenStorage {
         let total_sessions: i64 = self
             .conn
             .query_row_map(
-                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats_rebuild_stage WHERE agent_slug = 'all' AND source_id = 'all'",
+                if direct {
+                    "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'"
+                } else {
+                    "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats_rebuild_stage WHERE agent_slug = 'all' AND source_id = 'all'"
+                },
                 fparams![],
                 |row| row.get_typed(0),
             )
@@ -24202,18 +24704,19 @@ impl FrankenStorage {
             .conn
             .transaction()
             .with_context(|| "daily_stats phase=publish_begin")?;
-        publish_tx
-            .execute("DELETE FROM daily_stats")
-            .with_context(|| "daily_stats phase=publish_delete")?;
-        publish_tx
-            .execute(
+        if !direct {
+            publish_tx
+                .execute("DELETE FROM daily_stats")
+                .with_context(|| "daily_stats phase=publish_delete")?;
+            publish_tx.execute(
                 "INSERT INTO daily_stats (
                 day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
              )
              SELECT day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
              FROM daily_stats_rebuild_stage",
             )
-            .with_context(|| "daily_stats phase=publish_insert")?;
+                .with_context(|| "daily_stats phase=publish_insert")?;
+        }
         publish_tx.execute_compat(
             "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
             fparams![
@@ -24230,9 +24733,11 @@ impl FrankenStorage {
         if let Some(heartbeat) = heartbeat {
             heartbeat();
         }
-        self.conn
-            .execute("DELETE FROM daily_stats_rebuild_stage")
-            .with_context(|| "daily_stats phase=clear_stage_after_publish")?;
+        if !direct {
+            self.conn
+                .execute("DELETE FROM daily_stats_rebuild_stage")
+                .with_context(|| "daily_stats phase=clear_stage_after_publish")?;
+        }
 
         tracing::info!(
             target: "cass::perf::daily_stats",
@@ -25267,15 +25772,15 @@ fn sql_like_match_bytes(val: &[u8], pat: &[u8]) -> bool {
     }
 }
 
-/// Default keyset chunk for `rebuild_analytics_since`: rows fetched per
-/// `SELECT` and committed per transaction (GH #424).
+/// Requested default keyset chunk; the payload planner applies the hard
+/// per-page row and byte ceilings below to every analytics rebuild (GH #565).
 const ANALYTICS_REBUILD_CHUNK_SIZE: usize = 10_000;
-/// Bound legacy repair's transaction and simultaneously materialized payloads.
-const LEGACY_OMP_ANALYTICS_CHUNK_SIZE: usize = 128;
+/// Bound dirty transactions, dimension maps and simultaneously held payloads.
+const ANALYTICS_REBUILD_MAX_PAGE_ROWS: usize = 128;
 const ANALYTICS_REBUILD_PAGE_BYTES: i64 = 8 * 1024 * 1024;
 
-/// Per-conversation dimensions resolved once per analytics rebuild instead
-/// of being JOINed into every keyset chunk (GH #424).
+/// Per-conversation dimensions resolved only for the current message page,
+/// without a joined archive materialization or an archive-sized map.
 struct AnalyticsConversationDim {
     started_at: Option<i64>,
     source_id: String,
@@ -25567,6 +26072,15 @@ pub struct ForgetConversationsResult {
     pub conversations_matched: usize,
     pub messages_matched: usize,
     pub conversations_deleted: usize,
+    /// Canonical write transactions durably committed by this invocation.
+    pub delete_batches_committed: usize,
+    /// Largest committed page, with at most 256 conversations.
+    pub max_delete_batch_conversations: usize,
+    /// Estimated canonical payload and row overhead of the largest page.
+    /// One oversized conversation remains atomic and is committed alone.
+    pub max_delete_batch_estimated_bytes: u64,
+    /// Conversations committed alone because they exceed the byte target.
+    pub oversized_conversations: usize,
     /// Bounded (<= 20) sample of matched source paths, for operator review.
     pub sample_source_paths: Vec<String>,
     /// Bounded (<= 20) sample of the actual sessions selected for deletion.
@@ -25575,6 +26089,7 @@ pub struct ForgetConversationsResult {
 
 /// Only the narrow envelope needed to select and tombstone a conversation.
 /// Message bodies and wide metadata never enter a forget preview.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct ForgetCandidate {
     id: i64,
     source_id: String,
@@ -25582,10 +26097,353 @@ struct ForgetCandidate {
     source_path: Option<String>,
     external_id: Option<String>,
     workspace: Option<String>,
+    /// Canonical title/metadata width, without loading their payloads.
+    payload_bytes: u64,
+}
+
+const FORGET_DELETE_MAX_CONVERSATIONS: usize = 256;
+const FORGET_DELETE_TARGET_BYTES: u64 = 8 * 1024 * 1024;
+const FORGET_SOURCE_CACHE_CAPACITY: usize = 256;
+const FORGET_ROW_OVERHEAD_BYTES: u64 = 256;
+
+struct CompiledForgetSelection<'a> {
+    source_patterns: &'a [glob::Pattern],
+    source_paths: &'a BTreeSet<&'a str>,
+    workspace_pattern: Option<&'a glob::Pattern>,
+    before_ms: Option<i64>,
+}
+
+impl CompiledForgetSelection<'_> {
+    fn matches_envelope(&self, candidate: &ForgetCandidate) -> bool {
+        (self.source_patterns.is_empty() && self.source_paths.is_empty()
+            || candidate.source_path.as_deref().is_some_and(|path| {
+                self.source_paths.contains(path)
+                    || self
+                        .source_patterns
+                        .iter()
+                        .any(|pattern| pattern.matches(path))
+            }))
+            && self.workspace_pattern.is_none_or(|pattern| {
+                candidate
+                    .workspace
+                    .as_deref()
+                    .is_some_and(|path| pattern.matches(path))
+            })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ForgetMessageStatistics {
+    messages: usize,
+    dated_messages: usize,
+    last_message_at: Option<i64>,
+    payload_bytes: u64,
+}
+
+impl ForgetMessageStatistics {
+    fn matches_before(&self, cutoff: Option<i64>) -> bool {
+        cutoff.is_none_or(|cutoff| {
+            self.messages > 0
+                && self.dated_messages == self.messages
+                && self
+                    .last_message_at
+                    .is_some_and(|timestamp| timestamp < cutoff)
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ForgetSourceSelection {
+    shared: bool,
+    file_tombstone: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+enum ForgetTombstone {
+    None,
+    File,
+    Session { clear_source_stamp: bool },
+}
+
+#[derive(Serialize, Deserialize)]
+struct ForgetDeletionPlanEntry {
+    candidate: ForgetCandidate,
+    statistics: ForgetMessageStatistics,
+    tombstone: ForgetTombstone,
+    estimated_bytes: u64,
+}
+
+const FORGET_CANDIDATE_PROJECTION: &str = "SELECT c.id, c.source_id,
+            (SELECT a.slug FROM agents a WHERE a.id = c.agent_id),
+            c.source_path, c.external_id,
+            (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id), 0
+     FROM conversations c";
+
+fn decode_forget_candidate(
+    row: &FrankenRow,
+) -> std::result::Result<(i64, Option<ForgetCandidate>), crate::franken_sync::FrankenError> {
+    let id = row.get_typed(0)?;
+    let agent_slug: Option<String> = row.get_typed(2)?;
+    // Preserve the former inner join's exclusion of orphan agent identities,
+    // while still advancing the keyset past every envelope read.
+    let candidate = if let Some(agent_slug) = agent_slug {
+        Some(ForgetCandidate {
+            id,
+            source_id: row.get_typed(1)?,
+            agent_slug,
+            source_path: row.get_typed(3)?,
+            external_id: row.get_typed(4)?,
+            workspace: row.get_typed(5)?,
+            payload_bytes: row.get_typed::<i64>(6)?.max(0) as u64,
+        })
+    } else {
+        None
+    };
+    Ok((id, candidate))
+}
+
+fn forget_candidate_page(
+    tx: &FrankenTransaction<'_>,
+    next_id: i64,
+    source_path: Option<&str>,
+) -> Result<(Option<i64>, Vec<ForgetCandidate>)> {
+    // JOIN + ORDER BY + LIMIT can materialize the whole archive in fsqlite
+    // before applying LIMIT. Keep both the engine input and result bounded.
+    let (sql, parameters) = if let Some(path) = source_path {
+        (
+            format!(
+                "{FORGET_CANDIDATE_PROJECTION} INDEXED BY idx_conversations_source_path
+                 WHERE c.source_path = ?1 AND c.id >= ?2 ORDER BY c.id LIMIT 256"
+            ),
+            vec![ParamValue::from(path), ParamValue::from(next_id)],
+        )
+    } else {
+        (
+            format!(
+                "{FORGET_CANDIDATE_PROJECTION}
+                 WHERE c.id >= ?1 ORDER BY c.id LIMIT 256"
+            ),
+            vec![ParamValue::from(next_id)],
+        )
+    };
+    let rows = tx.query_map_collect(&sql, &parameters, decode_forget_candidate)?;
+    let last_id = rows.last().map(|(id, _)| *id);
+    Ok((
+        last_id,
+        rows.into_iter()
+            .filter_map(|(_, candidate)| candidate)
+            .collect(),
+    ))
+}
+
+struct ForgetMessageStatisticsReader<'conn> {
+    timestamps: FrankenPreparedStatement<'conn>,
+    payloads: Option<FrankenPreparedStatement<'conn>>,
+}
+
+impl<'conn> ForgetMessageStatisticsReader<'conn> {
+    fn new(conn: &'conn FrankenConnection, include_payload_size: bool) -> Result<Self> {
+        Ok(Self {
+            timestamps: conn.prepare(FORGET_MESSAGE_STATISTICS_PAGE_SQL)?,
+            payloads: include_payload_size
+                .then(|| conn.prepare(FORGET_MESSAGE_PAYLOAD_STATISTICS_PAGE_SQL))
+                .transpose()?,
+        })
+    }
+
+    fn read(
+        &self,
+        conversation_id: i64,
+        include_payload_size: bool,
+    ) -> Result<ForgetMessageStatistics> {
+        // No aggregate or GROUP BY can materialize an archive-sized input.
+        // The unique (conversation_id, idx) index seeks directly to each
+        // bounded page, including negative and maximum message indices.
+        let statement = if include_payload_size {
+            self.payloads
+                .as_ref()
+                .context("forget payload statistics were not prepared for this preview")?
+        } else {
+            &self.timestamps
+        };
+        let mut statistics = ForgetMessageStatistics {
+            messages: 0,
+            dated_messages: 0,
+            last_message_at: None,
+            payload_bytes: 0,
+        };
+        let mut next_idx = i64::MIN;
+        loop {
+            let mut page_count = 0_usize;
+            let mut page_dated_count = 0_usize;
+            let mut page_payload_bytes = 0_u64;
+            let mut last_idx = None;
+            statement.query_with_params_for_each(
+                &[
+                    SqliteValue::Integer(conversation_id),
+                    SqliteValue::Integer(next_idx),
+                    SqliteValue::Integer(FORGET_MESSAGE_STATISTICS_PAGE_SIZE as i64),
+                ],
+                |row| {
+                    last_idx = Some(row.get_typed::<i64>(0)?);
+                    page_count += 1;
+                    if let Some(timestamp) = row.get_typed::<Option<i64>>(1)? {
+                        page_dated_count += 1;
+                        statistics.last_message_at = Some(
+                            statistics
+                                .last_message_at
+                                .map_or(timestamp, |value| value.max(timestamp)),
+                        );
+                    }
+                    if include_payload_size {
+                        page_payload_bytes = page_payload_bytes
+                            .saturating_add(row.get_typed::<i64>(2)?.max(0) as u64);
+                    }
+                    Ok(())
+                },
+            )?;
+            statistics.messages = statistics
+                .messages
+                .checked_add(page_count)
+                .context("matched message count overflow")?;
+            statistics.dated_messages = statistics
+                .dated_messages
+                .checked_add(page_dated_count)
+                .context("dated message count overflow")?;
+            statistics.payload_bytes = statistics
+                .payload_bytes
+                .saturating_add(page_payload_bytes);
+            if page_count < FORGET_MESSAGE_STATISTICS_PAGE_SIZE {
+                break;
+            }
+            let Some(following_idx) = last_idx.and_then(|idx| idx.checked_add(1)) else {
+                break;
+            };
+            next_idx = following_idx;
+        }
+        Ok(statistics)
+    }
+}
+
+fn forget_conversation_payload_bytes(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+) -> Result<u64> {
+    // Wide metadata is never inspected by previews or by the archive scan.
+    // Only selected apply intents need a point-read estimate for batching.
+    let bytes: i64 = tx.query_row_map(
+        "SELECT COALESCE(LENGTH(CAST(title AS BLOB)), 0)
+                + COALESCE(LENGTH(CAST(metadata_json AS BLOB)), 0)
+                + COALESCE(LENGTH(metadata_bin), 0)
+         FROM conversations WHERE id = ?1",
+        fparams![conversation_id],
+        |row| row.get_typed(0),
+    )?;
+    u64::try_from(bytes).context("invalid forget conversation payload size")
+}
+
+fn classify_forget_source(
+    tx: &FrankenTransaction<'_>,
+    message_statistics: &ForgetMessageStatisticsReader<'_>,
+    path: &str,
+    selection: &CompiledForgetSelection<'_>,
+    has_session_tombstones: bool,
+) -> Result<ForgetSourceSelection> {
+    let total: i64 = tx.query_row_map(
+        "SELECT COUNT(*) FROM conversations INDEXED BY idx_conversations_source_path
+         WHERE source_path = ?1",
+        fparams![path],
+        |row| row.get_typed(0),
+    )?;
+    anyhow::ensure!(total > 0, "matched source lost its conversation count");
+    let previously_shared = has_session_tombstones
+        && !tx
+            .query_params(
+                "SELECT 1 FROM forgotten_conversations WHERE source_path = ?1 LIMIT 1",
+                fparams![path],
+            )?
+            .is_empty();
+    let shared = total > 1 || source_path_is_shared_store(path) || previously_shared;
+    if !shared {
+        return Ok(ForgetSourceSelection {
+            shared: false,
+            file_tombstone: true,
+        });
+    }
+    // A whole-file stamp is allowed only if every sibling is selected.
+    // Later session pages must preserve a stamp an earlier file page wrote.
+    let mut selected = 0_i64;
+    let mut file_tombstone = false;
+    let mut next_id = i64::MIN;
+    loop {
+        let (last_id, candidates) = forget_candidate_page(tx, next_id, Some(path))?;
+        for candidate in candidates {
+            if !selection.matches_envelope(&candidate) {
+                continue;
+            }
+            if selection.before_ms.is_some()
+                && !message_statistics.read(candidate.id, false)?
+                    .matches_before(selection.before_ms)
+            {
+                continue;
+            }
+            selected += 1;
+            file_tombstone |= candidate
+                .external_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty());
+        }
+        let Some(following_id) = last_id.and_then(|id| id.checked_add(1)) else {
+            break;
+        };
+        next_id = following_id;
+    }
+    if file_tombstone && selected != total {
+        bail!(
+            "cannot forget only part of shared source {path}: a selected conversation has no stable external ID; select the entire source with --source-glob"
+        );
+    }
+    Ok(ForgetSourceSelection {
+        shared,
+        file_tombstone,
+    })
+}
+
+fn forget_estimated_conversation_bytes(
+    candidate: &ForgetCandidate,
+    statistics: &ForgetMessageStatistics,
+) -> u64 {
+    let envelope_bytes = candidate.source_id.len()
+        + candidate.agent_slug.len()
+        + candidate.source_path.as_ref().map_or(0, String::len)
+        + candidate.external_id.as_ref().map_or(0, String::len)
+        + candidate.workspace.as_ref().map_or(0, String::len);
+    statistics
+        .payload_bytes
+        .saturating_add(candidate.payload_bytes)
+        .saturating_add(u64::try_from(envelope_bytes).unwrap_or(u64::MAX))
+        .saturating_add(
+            u64::try_from(statistics.messages)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1)
+                .saturating_mul(FORGET_ROW_OVERHEAD_BYTES),
+        )
+}
+
+fn forget_delete_batch_fits(count: usize, bytes: u64, next_bytes: u64) -> bool {
+    count == 0
+        || (count < FORGET_DELETE_MAX_CONVERSATIONS
+            && bytes.saturating_add(next_bytes) <= FORGET_DELETE_TARGET_BYTES)
 }
 
 const FORGET_MESSAGE_STATISTICS_PAGE_SIZE: usize = 256;
 const FORGET_MESSAGE_STATISTICS_PAGE_SQL: &str = "SELECT idx, created_at FROM messages INDEXED BY sqlite_autoindex_messages_1 \
+     WHERE conversation_id = ?1 AND idx >= ?2 ORDER BY idx LIMIT ?3";
+const FORGET_MESSAGE_PAYLOAD_STATISTICS_PAGE_SQL: &str = "SELECT idx, created_at,
+     COALESCE(LENGTH(CAST(content AS BLOB)), 0)
+     + COALESCE(LENGTH(CAST(extra_json AS BLOB)), 0)
+     + COALESCE(LENGTH(extra_bin), 0)
+     FROM messages INDEXED BY sqlite_autoindex_messages_1
      WHERE conversation_id = ?1 AND idx >= ?2 ORDER BY idx LIMIT ?3";
 
 fn source_path_is_shared_store(path: &str) -> bool {
@@ -31359,6 +32217,398 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
     }
 
     #[test]
+    #[serial]
+    fn forget_derived_fts_retirement_is_complete_and_recreation_obeys_the_bound() -> Result<()> {
+        let _bound = set_env_var("CASS_FTS_SHADOW_MAX_MESSAGES", "1");
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("forget-fts-bound.db"))?;
+        seed_atomic_fts_rebuild_fixture(&storage);
+        storage.raw().execute(
+            "INSERT INTO messages(conversation_id, idx, role, content)
+             SELECT id, 1, 'user', 'second canonical message' FROM conversations LIMIT 1",
+        )?;
+        let retired = ForgetFtsRebuildOutcome::Retired {
+            corpus_messages: 2,
+            bound_messages: 1,
+        };
+        assert_eq!(storage.rebuild_search_fallback_after_forget()?, retired);
+        assert!(!storage.fts_shadow_registered()?);
+        assert!(storage.fts_shadow_retirement_is_recorded()?);
+        assert_eq!(storage.fts_shadow_corpus_messages()?, 2);
+        assert_eq!(storage.rebuild_search_fallback_after_forget()?, retired);
+        assert!(
+            !storage.fts_shadow_registered()?,
+            "retry must not recreate a retired shadow"
+        );
+
+        storage
+            .raw()
+            .execute("DELETE FROM messages WHERE idx = 1")?;
+        assert_eq!(
+            storage.rebuild_search_fallback_after_forget()?,
+            ForgetFtsRebuildOutcome::Rebuilt { corpus_messages: 1 }
+        );
+        assert_eq!(
+            storage.inspect_search_fallback_fts_parity()?.status,
+            FtsShadowParityStatus::Healthy
+        );
+        assert!(storage.fts_shadow_not_viable_marker()?.is_none());
+        assert!(storage.read_fallback_fts_repair_pending()?.is_none());
+        let hits: i64 = storage.raw().query_row_map(
+            "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH 'survives'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(hits, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_derived_token_pages_stream_without_a_sorter() -> Result<()> {
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("forget-token-page-plan.db"))?;
+        let opcodes: Vec<(String, i64, i64)> = storage.raw().query_map_collect(
+            &format!("EXPLAIN {FORGET_TOKEN_USAGE_PAGE_SQL}"),
+            fparams![42_i64, i64::MIN],
+            |row| Ok((row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+        )?;
+        let rootpage: i64 = storage.raw().query_row_map(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'token_usage'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        let cursor = opcodes
+            .iter()
+            .find_map(|(op, p1, p2)| (op == "OpenRead" && *p2 == rootpage).then_some(*p1))
+            .expect("the token page must open the rowid table");
+        assert!(
+            opcodes.iter().any(|(op, p1, _)| op == "Next" && *p1 == cursor)
+                && opcodes.iter().any(|(op, _, _)| op == "ResultRow")
+                && opcodes.iter().any(|(op, _, _)| op == "DecrJumpZero"),
+            "token pages must stream rows and stop at their LIMIT: {opcodes:?}"
+        );
+        assert!(
+            !opcodes.iter().any(|(op, _, _)| matches!(
+                op.as_str(),
+                "SorterOpen" | "SorterInsert" | "SorterSort" | "OpenEphemeral" | "OpenAutoindex"
+            )),
+            "token pages must not materialize a sorter or temporary table: {opcodes:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn forget_derived_ordinary_analytics_hydrates_only_a_byte_bounded_page() -> Result<()> {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "1");
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("forget-analytics-bytes.db"))?;
+        let agent = gh423_agent(&storage);
+        let mut conversation = gh423_storage_snapshot();
+        conversation.messages[0].content = "a".repeat(5 * 1024 * 1024);
+        conversation.messages[1].content = "b".repeat(5 * 1024 * 1024);
+        storage
+            .insert_conversations_batched_with_analytics(&[(agent, None, &conversation)], false)?;
+        let stopped = std::cell::Cell::new(false);
+        let committed = std::cell::RefCell::new(Vec::new());
+        let progress = |processed, _total| {
+            if processed > 0 {
+                committed.borrow_mut().push(processed);
+                stopped.set(true);
+            }
+        };
+        let control = || -> Result<()> {
+            anyhow::ensure!(!stopped.get(), "injected bounded analytics interruption");
+            Ok(())
+        };
+        let error = storage
+            .rebuild_analytics_since_with_chunk_size_and_progress(
+                None,
+                10_000,
+                Some(&progress),
+                None,
+                None,
+                Some(&control),
+            )
+            .expect_err("ordinary rebuild must stop after its first byte-bounded commit");
+        assert!(
+            error
+                .to_string()
+                .contains("injected bounded analytics interruption")
+        );
+        assert_eq!(*committed.borrow(), vec![1]);
+        let metrics: i64 = storage.raw().query_row_map(
+            "SELECT COUNT(*) FROM message_metrics",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(
+            metrics, 1,
+            "two 5 MiB messages cannot share the first payload page"
+        );
+        storage.rebuild_analytics()?;
+        let (count, chars, tools): (i64, i64, i64) = storage.raw().query_row_map(
+            "SELECT COUNT(*), SUM(content_chars), SUM(tool_call_count) FROM message_metrics",
+            fparams![],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        )?;
+        assert_eq!(count, 3);
+        assert_eq!(
+            chars,
+            conversation
+                .messages
+                .iter()
+                .map(|message| message.content.len() as i64)
+                .sum::<i64>()
+        );
+        assert_eq!(tools, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_derived_scoped_reset_commits_bounded_pages_and_preserves_old_rows() -> Result<()> {
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("forget-reset-pages.db"))?;
+        let mut tx = storage.raw().transaction()?;
+        for id in -130_i64..=130 {
+            tx.execute_compat(
+                "INSERT INTO usage_daily(rowid, day_id, agent_slug, workspace_id, source_id, message_count, last_updated)
+                 VALUES(?1, ?2, 'codex', ?1, 'local', 1, 42)",
+                fparams![id, if id < 0 { 1_i64 } else { 2_i64 }],
+            )?;
+        }
+        for key in [
+            LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+            LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
+            LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY,
+        ] {
+            tx.execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'old')",
+                fparams![key],
+            )?;
+        }
+        tx.commit()?;
+        let stopped = std::cell::Cell::new(false);
+        let heartbeat = || stopped.set(true);
+        let control = || -> Result<()> {
+            anyhow::ensure!(!stopped.get(), "injected derived reset interruption");
+            Ok(())
+        };
+        let error = storage
+            .reset_analytics_in_bounded_pages(Some((2, 48)), Some(&heartbeat), Some(&control))
+            .expect_err("stop after one committed reset page");
+        assert!(
+            error
+                .to_string()
+                .contains("injected derived reset interruption")
+        );
+        let counts = || -> Result<(i64, i64)> {
+            Ok(storage.raw().query_row_map(
+                "SELECT SUM(CASE WHEN day_id = 1 THEN 1 ELSE 0 END), SUM(CASE WHEN day_id = 2 THEN 1 ELSE 0 END) FROM usage_daily",
+                fparams![], |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )?)
+        };
+        assert_eq!(
+            counts()?,
+            (130, 3),
+            "exactly 128 selected rows must be committed"
+        );
+        for key in [
+            LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+            LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
+            LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY,
+        ] {
+            let marker: Option<String> = storage
+                .raw()
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    fparams![key],
+                    |row| row.get_typed(0),
+                )
+                .optional()?;
+            assert!(marker.is_none());
+        }
+        storage.reset_analytics_in_bounded_pages(Some((2, 48)), None, None)?;
+        assert_eq!(counts()?, (130, 0));
+        let changed_old_rows: i64 = storage.raw().query_row_map(
+            "SELECT COUNT(*) FROM usage_daily WHERE day_id != 1 OR message_count != 1 OR last_updated != 42",
+            fparams![], |row| row.get_typed(0),
+        )?;
+        assert_eq!(changed_old_rows, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn forget_derived_rollups_require_a_fence_and_recover_without_staging_or_double_counts()
+    -> Result<()> {
+        fn snapshot(storage: &FrankenStorage, table: &str) -> Result<Vec<String>> {
+            let columns: Vec<String> = storage.raw().query_map_collect(
+                &format!("PRAGMA table_info({table})"),
+                fparams![],
+                |row| row.get_typed(1),
+            )?;
+            let projection = columns
+                .into_iter()
+                .filter(|column| column != "last_updated")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut rows: Vec<_> = storage
+                .raw()
+                .query(&format!("SELECT {projection} FROM {table}"))?
+                .into_iter()
+                .map(|row| format!("{:?}", row.values()))
+                .collect();
+            rows.sort();
+            Ok(rows)
+        }
+
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "1");
+        let dir = TempDir::new()?;
+        let path = dir.path().join("forget-rollup-pages.db");
+        let storage = FrankenStorage::open(&path)?;
+        let agent = gh423_agent(&storage);
+        let mut conversation = gh423_storage_snapshot();
+        let first = conversation.messages[0].clone();
+        conversation.messages = (0_i64..260)
+            .map(|idx| {
+                let mut message = first.clone();
+                message.idx = idx;
+                message.created_at = first.created_at.map(|time| time + idx * 86_400_000);
+                message.content = format!("retained canonical message {idx}");
+                message.extra_json["id"] = serde_json::json!(format!("native-{idx}"));
+                message.extra_json["codebuff_message_id"] =
+                    serde_json::json!(format!("native-{idx}"));
+                message
+            })
+            .collect();
+        storage
+            .insert_conversations_batched_with_analytics(&[(agent, None, &conversation)], false)?;
+        storage.raw().execute("UPDATE token_usage SET input_tokens = 11, output_tokens = 3, cache_read_tokens = 0, cache_creation_tokens = 0, thinking_tokens = 0, estimated_cost_usd = 0.5, model_family = 'fixture'")?;
+        let progress = std::cell::RefCell::new(Vec::new());
+        storage.rebuild_analytics_since_with_chunk_size_and_progress(
+            None,
+            10_000,
+            Some(&|count, _| progress.borrow_mut().push(count)),
+            None,
+            None,
+            None,
+        )?;
+        assert_eq!(*progress.borrow(), vec![0, 128, 256, 260]);
+        storage.rebuild_daily_stats()?;
+        storage.rebuild_token_daily_stats()?;
+        let expected_daily = snapshot(&storage, "daily_stats")?;
+        let expected_tokens = snapshot(&storage, "token_daily_stats")?;
+        assert!(!expected_daily.is_empty());
+        assert!(expected_tokens.len() > 128);
+        assert!(storage.rebuild_daily_stats_after_forget().is_err());
+        assert!(storage.rebuild_token_daily_stats_after_forget().is_err());
+        assert_eq!(snapshot(&storage, "daily_stats")?, expected_daily);
+        assert_eq!(snapshot(&storage, "token_daily_stats")?, expected_tokens);
+        let canonical = ["conversations", "messages", "token_usage"]
+            .map(|table| snapshot(&storage, table).unwrap());
+        crate::search::privacy::begin_forget(&path)?;
+        storage.close_without_checkpoint()?;
+        let storage = FrankenStorage::open(&path)?;
+
+        let stopped = std::cell::Cell::new(false);
+        let control = || -> Result<()> {
+            anyhow::ensure!(!stopped.get(), "injected rollup interruption");
+            Ok(())
+        };
+        let daily_heartbeat = || {
+            let count: i64 = storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM daily_stats", fparams![], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            if count == 0 {
+                stopped.set(true);
+            }
+        };
+        let error = storage
+            .rebuild_daily_stats_with_target(
+                Some(&daily_heartbeat),
+                Some(&control),
+                DailyStatsBatchTarget::Canonical,
+            )
+            .expect_err("stop after a committed live daily-stats reset");
+        assert!(error.to_string().contains("injected rollup interruption"));
+        assert!(snapshot(&storage, "daily_stats")?.is_empty());
+        assert!(crate::search::privacy::repair_pending(&path)?);
+        storage.rebuild_daily_stats_after_forget()?;
+        assert_eq!(snapshot(&storage, "daily_stats")?, expected_daily);
+
+        let cleared = std::cell::Cell::new(false);
+        let token_stop = std::cell::Cell::new(false);
+        let observed = std::cell::Cell::new(0_i64);
+        let token_control = || -> Result<()> {
+            let count: i64 = storage.raw().query_row_map(
+                "SELECT COUNT(*) FROM token_daily_stats",
+                fparams![],
+                |row| row.get_typed(0),
+            )?;
+            if count == 0 {
+                cleared.set(true);
+            }
+            anyhow::ensure!(!token_stop.get(), "injected token page interruption");
+            Ok(())
+        };
+        let heartbeat = || {
+            let count: i64 = storage.raw().query_row_map(
+                "SELECT COALESCE(SUM(api_call_count), 0) FROM token_daily_stats WHERE agent_slug = 'all' AND source_id = 'all' AND model_family = 'all'",
+                fparams![], |row| row.get_typed(0),
+            ).unwrap();
+            if cleared.get() && count > 0 {
+                observed.set(count);
+                token_stop.set(true);
+            }
+        };
+        let error = storage
+            .rebuild_token_daily_stats_after_forget_with_control(
+                Some(&heartbeat),
+                Some(&token_control),
+            )
+            .expect_err("stop after one ledger page even within one large conversation");
+        assert!(
+            error
+                .to_string()
+                .contains("injected token page interruption")
+        );
+        assert_eq!(observed.get(), 128);
+        assert!(crate::search::privacy::repair_pending(&path)?);
+        storage.rebuild_token_daily_stats_after_forget()?;
+        assert_eq!(snapshot(&storage, "token_daily_stats")?, expected_tokens);
+        assert_eq!(snapshot(&storage, "daily_stats")?, expected_daily);
+        let tables: Vec<String> =
+            storage
+                .raw()
+                .query_map_collect("PRAGMA table_list", fparams![], |row| row.get_typed(1))?;
+        assert!(
+            !tables
+                .iter()
+                .any(|table| table == "daily_stats_rebuild_stage"
+                    || table == TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE)
+        );
+        for (table, expected) in ["conversations", "messages", "token_usage"]
+            .iter()
+            .zip(canonical)
+        {
+            assert_eq!(
+                snapshot(&storage, table)?,
+                expected,
+                "canonical {table} must be unchanged"
+            );
+        }
+        assert!(
+            crate::search::privacy::repair_pending(&path)?,
+            "only the outer forget publisher may reopen readers"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rebuild_analytics_repopulates_from_messages() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
@@ -32456,6 +33706,43 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             "the warned fallback must use a real WITHOUT ROWID layout"
         );
         let context = "gh424-alternate-layout";
+        let ordinary_error = storage
+            .reset_analytics_for_full_rebuild(None, None, None, None)
+            .expect_err("ordinary rebuild must refuse an unbounded historical reset");
+        assert!(
+            ordinary_error
+                .to_string()
+                .contains("refusing an unbounded ordinary or pending-forget rebuild")
+        );
+        // A privacy fence can survive without its SQL marker if the first
+        // canonical transaction rolls back. Even an explicit migration must
+        // not enter the historical unbounded fallback while that repair waits.
+        crate::search::privacy::begin_forget(&storage.db_path)?;
+        let pending_error = storage
+            .reset_analytics_for_full_rebuild(Some(context), None, None, None)
+            .expect_err("pending forget must refuse the unbounded migration fallback");
+        assert!(
+            pending_error
+                .to_string()
+                .contains("refusing an unbounded ordinary or pending-forget rebuild")
+        );
+        for (table, expression) in [
+            ("messages", "COUNT(*)"),
+            ("message_metrics", "COUNT(*)"),
+            ("usage_models_daily", "SUM(message_count)"),
+        ] {
+            let retained: i64 = storage.raw().query_row_map(
+                &format!("SELECT {expression} FROM {table}"),
+                fparams![],
+                |row| row.get_typed(0),
+            )?;
+            assert_eq!(retained, 3, "refused reset must preserve {table}");
+        }
+        assert!(storage.forget_derived_rebuild_pending()?);
+        assert!(crate::search::privacy::repair_pending(&storage.db_path)?);
+        // No deletion ran in this fixture; release the synthetic fence to
+        // exercise the retained legacy-only transaction contract below.
+        storage.clear_forget_derived_rebuild_pending()?;
         let control = || -> Result<()> {
             let metrics: i64 = storage.raw().query_row_map(
                 "SELECT COUNT(*) FROM message_metrics",
@@ -49167,44 +50454,428 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             .conversation_id)
     }
 
+    fn seed_forget_page_fixture(
+        storage: &FrankenStorage,
+        selected: usize,
+        kept: usize,
+    ) -> Result<()> {
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "opencode".into(),
+            name: "opencode".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let retired = storage.ensure_workspace(Path::new("/work/retired"), None)?;
+        let current = storage.ensure_workspace(Path::new("/work/current"), None)?;
+        storage
+            .raw()
+            .execute("INSERT INTO tags(id, name) VALUES (1, 'preserve-sibling')")?;
+        for start in (0..selected + kept).step_by(32) {
+            let mut tx = storage.raw().transaction()?;
+            for index in start..(start + 32).min(selected + kept) {
+                let id = i64::try_from(index + 1)?;
+                let external_id = format!("session-{id}");
+                let workspace = if index < selected { retired } else { current };
+                tx.execute_compat(
+                    "INSERT INTO conversations(id, agent_id, workspace_id, source_id, external_id, source_path, started_at)
+                     VALUES (?1, ?2, ?3, 'local', ?4, '/fixture/bounded.sqlite', 1)",
+                    fparams![id, agent_id, workspace, external_id.as_str()],
+                )?;
+                tx.execute_compat(
+                    "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
+                     VALUES (?1, ?1, 0, 'user', 'fixture message', 10)",
+                    fparams![id],
+                )?;
+                let key = conversation_external_lookup_key(LOCAL_SOURCE_ID, agent_id, &external_id);
+                tx.execute_compat(
+                    "INSERT INTO conversation_external_lookup(lookup_key, conversation_id) VALUES (?1, ?2)",
+                    fparams![key.as_str(), id],
+                )?;
+                tx.execute_compat(
+                    "INSERT INTO conversation_external_tail_lookup(lookup_key, conversation_id) VALUES (?1, ?2)",
+                    fparams![key.as_str(), id],
+                )?;
+                tx.execute_compat(
+                    "INSERT INTO conversation_tail_state(conversation_id) VALUES (?1)",
+                    fparams![id],
+                )?;
+                tx.execute_compat(
+                    "INSERT INTO conversation_tags(conversation_id, tag_id) VALUES (?1, 1)",
+                    fparams![id],
+                )?;
+            }
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn forget_preview_and_source_pages_exclude_wide_payloads() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("forget-preview-width.db"))?;
+        seed_forget_page_fixture(&storage, 1, 1)?;
+        let wide = "not decoded by forget preview".repeat(32_768);
+        storage.raw().execute_compat(
+            "UPDATE conversations SET title = ?1, metadata_json = ?1, metadata_bin = ?2",
+            fparams![wide.as_str(), wide.as_bytes()],
+        )?;
+        storage.raw().execute_compat(
+            "UPDATE messages SET content = ?1, extra_json = ?1, extra_bin = ?2",
+            fparams![wide.as_str(), wide.as_bytes()],
+        )?;
+        let mut tx = storage.raw().transaction()?;
+        for source in [None, Some("/fixture/bounded.sqlite")] {
+            let (_, candidates) = forget_candidate_page(&tx, i64::MIN, source)?;
+            assert_eq!(candidates.len(), 2);
+            for candidate in candidates {
+                assert_eq!(
+                    candidate.payload_bytes, 0,
+                    "archive and source scans must not evaluate metadata widths"
+                );
+                assert!(
+                    serde_json::to_vec(&candidate)?.len() < 1024,
+                    "a scan envelope must not carry title or metadata payloads"
+                );
+            }
+        }
+        let message_statistics = ForgetMessageStatisticsReader::new(storage.raw(), true)?;
+        let statistics = message_statistics.read(1, false)?;
+        assert_eq!(statistics.messages, 1);
+        assert_eq!(statistics.payload_bytes, 0);
+        assert_eq!(
+            message_statistics.read(1, true)?.payload_bytes,
+            (wide.len() * 3) as u64,
+            "selected apply pages must account for content and both metadata forms"
+        );
+        assert!(
+            forget_conversation_payload_bytes(&tx, 1)? >= (wide.len() * 3) as u64,
+            "selected apply point probes must still account for the real wide record"
+        );
+        drop(message_statistics);
+        tx.rollback()?;
+        let preview = storage.forget_conversations(
+            &ForgetConversationsFilter {
+                workspace_glob: Some("/work/retired"),
+                ..Default::default()
+            },
+            true,
+        )?;
+        assert_eq!(preview.conversations_matched, 1);
+        assert_eq!(preview.messages_matched, 1);
+        assert_eq!(preview.delete_batches_committed, 0);
+        assert!(!storage.forget_derived_rebuild_pending()?);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_commits_bounded_pages_and_removes_exact_children() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("forget-pages.db"))?;
+        let selected = FORGET_DELETE_MAX_CONVERSATIONS + 1;
+        seed_forget_page_fixture(&storage, selected, 2)?;
+        // More than one child page, including negative message indices.
+        for start in (0..257).step_by(32) {
+            let mut tx = storage.raw().transaction()?;
+            for index in start..(start + 32).min(257) {
+                let id = 10_000 + index as i64;
+                tx.execute_compat(
+                    "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
+                     VALUES (?1, 1, ?2, 'assistant', 'child fixture', 11)",
+                    fparams![id, -(index as i64) - 1],
+                )?;
+                tx.execute_compat(
+                    "INSERT INTO snippets(id, message_id, snippet_text) VALUES (?1, ?1, 'snippet fixture')",
+                    fparams![id],
+                )?;
+                tx.execute_compat(
+                    "INSERT INTO token_usage(message_id, conversation_id, agent_id, timestamp_ms, day_id, role, content_chars)
+                     VALUES (?1, 1, 1, 11, 0, 'assistant', 13)",
+                    fparams![id],
+                )?;
+                tx.execute_compat(
+                    "INSERT INTO message_metrics(message_id, created_at_ms, hour_id, day_id, agent_slug, role, content_chars, content_tokens_est)
+                     VALUES (?1, 11, 0, 0, 'opencode', 'assistant', 13, 4)",
+                    fparams![id],
+                )?;
+            }
+            tx.commit()?;
+        }
+        let filter = ForgetConversationsFilter {
+            workspace_glob: Some("/work/retired"),
+            ..Default::default()
+        };
+        let preview = storage.forget_conversations(&filter, true)?;
+        assert_eq!(preview.conversations_matched, selected);
+        assert_eq!(preview.messages_matched, selected + 257);
+        assert_eq!(preview.delete_batches_committed, 0);
+        assert!(!storage.forget_derived_rebuild_pending()?);
+        let applied = storage.forget_conversations(&filter, false)?;
+        assert_eq!(applied.conversations_deleted, selected);
+        assert_eq!(applied.messages_matched, preview.messages_matched);
+        assert_eq!(applied.delete_batches_committed, 2);
+        assert_eq!(
+            applied.max_delete_batch_conversations,
+            FORGET_DELETE_MAX_CONVERSATIONS
+        );
+        assert!(applied.max_delete_batch_estimated_bytes <= FORGET_DELETE_TARGET_BYTES);
+        assert_eq!(applied.oversized_conversations, 0);
+        assert_eq!(storage.total_conversation_count()?, 2);
+        assert_eq!(storage.total_message_count()?, 2);
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), selected);
+        assert!(storage.forgotten_source_stamps()?.is_empty());
+        for table in ["snippets", "token_usage", "message_metrics"] {
+            let count: i64 = storage.raw().query_row_map(
+                &format!("SELECT COUNT(*) FROM {table}"),
+                fparams![],
+                |row| row.get_typed(0),
+            )?;
+            assert_eq!(count, 0, "forgotten child rows remain in {table}");
+        }
+        for table in [
+            "conversation_external_lookup",
+            "conversation_external_tail_lookup",
+            "conversation_tail_state",
+            "conversation_tags",
+        ] {
+            let count: i64 = storage.raw().query_row_map(
+                &format!("SELECT COUNT(*) FROM {table}"),
+                fparams![],
+                |row| row.get_typed(0),
+            )?;
+            assert_eq!(count, 2, "retained sibling records changed in {table}");
+        }
+        assert!(storage.forget_derived_rebuild_pending()?);
+        Ok(())
+    }
+
+    #[test]
+    fn forget_prevalidates_unsafe_shared_source_after_page_boundary() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("forget-prevalidate.db"))?;
+        let selected = FORGET_DELETE_MAX_CONVERSATIONS + 1;
+        seed_forget_page_fixture(&storage, selected, 1)?;
+        storage.raw().execute_compat(
+            "UPDATE conversations SET source_path = '/fixture/unsafe.sqlite', external_id = ?2 WHERE id = ?1",
+            fparams![selected as i64, "\t\u{00a0}\n"],
+        )?;
+        storage.raw().execute_compat(
+            "UPDATE conversations SET source_path = '/fixture/unsafe.sqlite' WHERE id = ?1",
+            fparams![(selected + 1) as i64],
+        )?;
+        let filter = ForgetConversationsFilter {
+            workspace_glob: Some("/work/retired"),
+            ..Default::default()
+        };
+        for dry_run in [true, false] {
+            let error = storage.forget_conversations(&filter, dry_run).unwrap_err();
+            assert!(format!("{error:#}").contains("cannot forget only part of shared source"));
+            assert_eq!(storage.total_conversation_count()?, selected + 1);
+            assert_eq!(storage.total_message_count()?, selected + 1);
+            assert!(storage.forgotten_conversation_keys()?.is_empty());
+            assert!(storage.forgotten_source_stamps()?.is_empty());
+            assert!(
+                !storage.forget_derived_rebuild_pending()?,
+                "prevalidation must precede the reader fence"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn forget_committed_prefix_survives_later_page_failure_and_retry() -> Result<()> {
+        let directory = TempDir::new()?;
+        let path = directory.path().join("forget-prefix.db");
+        let storage = FrankenStorage::open(&path)?;
+        let selected = FORGET_DELETE_MAX_CONVERSATIONS + 1;
+        seed_forget_page_fixture(&storage, selected, 0)?;
+        storage.raw().execute(
+            "CREATE TABLE forget_page_guard(conversation_id INTEGER PRIMARY KEY REFERENCES conversations(id) ON DELETE RESTRICT)",
+        )?;
+        storage.raw().execute_compat(
+            "INSERT INTO forget_page_guard VALUES (?1)",
+            fparams![selected as i64],
+        )?;
+        let filter = ForgetConversationsFilter {
+            workspace_glob: Some("/work/retired"),
+            ..Default::default()
+        };
+        let error = storage.forget_conversations(&filter, false).unwrap_err();
+        assert!(format!("{error:#}").contains("committing 256 conversation(s) in 1 batch(es)"));
+        storage.close()?;
+        let reopened = FrankenStorage::open(&path)?;
+        assert_eq!(reopened.total_conversation_count()?, 1);
+        assert_eq!(reopened.total_message_count()?, 1);
+        assert_eq!(reopened.forgotten_conversation_keys()?.len(), selected - 1);
+        assert!(reopened.forget_derived_rebuild_pending()?);
+        assert_eq!(
+            reopened
+                .forget_conversations(&filter, true)?
+                .conversations_matched,
+            1
+        );
+        reopened.raw().execute("DELETE FROM forget_page_guard")?;
+        let retried = reopened.forget_conversations(&filter, false)?;
+        assert_eq!(retried.conversations_deleted, 1);
+        assert_eq!(retried.delete_batches_committed, 1);
+        assert_eq!(reopened.total_conversation_count()?, 0);
+        assert_eq!(reopened.total_message_count()?, 0);
+        assert_eq!(reopened.forgotten_conversation_keys()?.len(), selected);
+        assert!(
+            reopened.forget_derived_rebuild_pending()?,
+            "only derived publication may reopen readers"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forget_pages_preserve_file_stamp_required_by_an_earlier_session() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("forget-file-stamp.db"))?;
+        let selected = FORGET_DELETE_MAX_CONVERSATIONS + 1;
+        seed_forget_page_fixture(&storage, selected, 0)?;
+        storage
+            .raw()
+            .execute("UPDATE conversations SET external_id = NULL WHERE id = 1")?;
+        let applied =
+            storage.forget_conversations_by_source_glob("/fixture/bounded.sqlite", false)?;
+        assert_eq!(applied.delete_batches_committed, 2);
+        assert_eq!(storage.total_conversation_count()?, 0);
+        assert_eq!(storage.forgotten_conversation_keys()?.len(), selected - 1);
+        assert!(
+            storage
+                .forgotten_source_stamps()?
+                .contains_key("/fixture/bounded.sqlite"),
+            "a later session page must not erase an earlier unidentified sibling's file tombstone"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forget_byte_target_splits_small_counts_and_isolates_oversized_conversation() -> Result<()> {
+        let directory = TempDir::new()?;
+        let storage = FrankenStorage::open(&directory.path().join("forget-bytes.db"))?;
+        seed_forget_page_fixture(&storage, 3, 1)?;
+        for (id, bytes) in [
+            (1_i64, FORGET_DELETE_TARGET_BYTES / 2),
+            (2, FORGET_DELETE_TARGET_BYTES / 2),
+            (3, FORGET_DELETE_TARGET_BYTES + 1),
+        ] {
+            let content = "x".repeat(usize::try_from(bytes)?);
+            storage.raw().execute_compat(
+                "UPDATE messages SET content = ?2 WHERE id = ?1",
+                fparams![id, content.as_str()],
+            )?;
+        }
+        let applied = storage.forget_conversations(
+            &ForgetConversationsFilter {
+                workspace_glob: Some("/work/retired"),
+                ..Default::default()
+            },
+            false,
+        )?;
+        assert_eq!(applied.conversations_deleted, 3);
+        assert_eq!(applied.delete_batches_committed, 3);
+        assert_eq!(applied.max_delete_batch_conversations, 1);
+        assert_eq!(applied.oversized_conversations, 1);
+        assert!(applied.max_delete_batch_estimated_bytes > FORGET_DELETE_TARGET_BYTES);
+        assert_eq!(storage.total_conversation_count()?, 1);
+        assert_eq!(storage.total_message_count()?, 1);
+        assert!(
+            forget_delete_batch_fits(0, 0, u64::MAX),
+            "an oversized conversation must make progress alone"
+        );
+        assert!(
+            !forget_delete_batch_fits(1, u64::MAX, 1),
+            "byte arithmetic must not wrap into admission"
+        );
+        assert!(!forget_delete_batch_fits(
+            FORGET_DELETE_MAX_CONVERSATIONS,
+            0,
+            0
+        ));
+        assert!(forget_delete_batch_fits(
+            1,
+            FORGET_DELETE_TARGET_BYTES / 2,
+            FORGET_DELETE_TARGET_BYTES / 2
+        ));
+        Ok(())
+    }
+
     #[test]
     fn gh565_forget_message_statistics_seek_selected_conversation_without_aggregation() -> Result<()>
     {
         let directory = TempDir::new()?;
         let storage = FrankenStorage::open(&directory.path().join("forget-statistics-plan.db"))?;
-        let opcodes: Vec<(String, i64, i64)> = storage.raw().query_map_collect(
-            &format!("EXPLAIN {FORGET_MESSAGE_STATISTICS_PAGE_SQL}"),
-            fparams![42_i64, 700_i64, FORGET_MESSAGE_STATISTICS_PAGE_SIZE as i64],
-            |row| Ok((row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
-        )?;
         let rootpage: i64 = storage.raw().query_row_map(
             "SELECT rootpage FROM sqlite_master WHERE name = 'sqlite_autoindex_messages_1'",
             fparams![],
             |row| row.get_typed(0),
         )?;
-        let cursor = opcodes
-            .iter()
-            .find_map(|(op, p1, p2)| (op == "OpenRead" && *p2 == rootpage).then_some(*p1))
-            .expect("forget statistics must open the conversation/idx index");
-        assert!(
-            opcodes
+        let table_rootpage: i64 = storage.raw().query_row_map(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'messages'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        let columns: Vec<(i64, String)> = storage.raw().query_map_collect(
+            "PRAGMA table_info(messages)",
+            fparams![],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )?;
+        let payload_columns: Vec<_> = columns
+            .into_iter()
+            .filter_map(|(index, name)| {
+                matches!(name.as_str(), "content" | "extra_json" | "extra_bin")
+                    .then_some(index)
+            })
+            .collect();
+        assert_eq!(payload_columns.len(), 3);
+        for (sql, includes_payload) in [
+            (FORGET_MESSAGE_STATISTICS_PAGE_SQL, false),
+            (FORGET_MESSAGE_PAYLOAD_STATISTICS_PAGE_SQL, true),
+        ] {
+            let opcodes: Vec<(String, i64, i64)> = storage.raw().query_map_collect(
+                &format!("EXPLAIN {sql}"),
+                fparams![42_i64, 700_i64, FORGET_MESSAGE_STATISTICS_PAGE_SIZE as i64],
+                |row| Ok((row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+            )?;
+            let cursor = opcodes
                 .iter()
-                .any(|(op, p1, _)| op == "SeekGE" && *p1 == cursor),
-            "forget statistics must seek to the selected conversation: {opcodes:?}"
-        );
-        assert!(
-            !opcodes
+                .find_map(|(op, p1, p2)| (op == "OpenRead" && *p2 == rootpage).then_some(*p1))
+                .expect("forget statistics must open the conversation/idx index");
+            assert!(
+                opcodes
+                    .iter()
+                    .any(|(op, p1, _)| op == "SeekGE" && *p1 == cursor),
+                "forget statistics must seek to the selected conversation: {opcodes:?}"
+            );
+            assert!(
+                !opcodes
+                    .iter()
+                    .any(|(op, p1, _)| matches!(op.as_str(), "Rewind" | "Last") && *p1 == cursor),
+                "forget statistics must not walk unrelated conversation prefixes: {opcodes:?}"
+            );
+            assert!(
+                !opcodes.iter().any(|(op, _, _)| matches!(
+                    op.as_str(),
+                    "AggStep" | "AggFinal" | "SorterOpen" | "OpenEphemeral" | "OpenAutoindex"
+                )),
+                "forget statistics must not materialize aggregates or temporary tables: {opcodes:?}"
+            );
+            let table_cursor = opcodes
                 .iter()
-                .any(|(op, p1, _)| matches!(op.as_str(), "Rewind" | "Last") && *p1 == cursor),
-            "forget statistics must not walk unrelated conversation prefixes: {opcodes:?}"
-        );
-        assert!(
-            !opcodes.iter().any(|(op, _, _)| matches!(
-                op.as_str(),
-                "AggStep" | "AggFinal" | "SorterOpen" | "OpenEphemeral" | "OpenAutoindex"
-            )),
-            "forget statistics must not materialize aggregates or temporary tables: {opcodes:?}"
-        );
+                .find_map(|(op, p1, p2)| {
+                    (op == "OpenRead" && *p2 == table_rootpage).then_some(*p1)
+                })
+                .expect("forget statistics must read the selected message timestamp");
+            let reads_payload = opcodes.iter().any(|(op, p1, p2)| {
+                op == "Column" && *p1 == table_cursor && payload_columns.contains(p2)
+            });
+            assert_eq!(
+                reads_payload, includes_payload,
+                "only selected apply statistics may read payload columns: {opcodes:?}"
+            );
+        }
         Ok(())
     }
 
@@ -49656,6 +51327,50 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         let reader = FrankenStorage::open_strict_readonly(&path)?;
         assert!(!reader.forget_derived_rebuild_pending()?);
         reader.close_without_checkpoint()?;
+        Ok(())
+    }
+
+    #[test]
+    fn forget_pending_probe_accepts_nonzero_uninitialized_database() -> Result<()> {
+        let directory = TempDir::new()?;
+        let path = directory.path().join("forget-uninitialized.db");
+        let conn = FrankenConnection::open(path.to_string_lossy().into_owned())?;
+        conn.execute(
+            "CREATE TABLE bootstrap_marker (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+        )?;
+        conn.execute("INSERT INTO bootstrap_marker (id, value) VALUES (1, 'preserved')")?;
+        conn.close()?;
+        assert!(fs::metadata(&path)?.len() > 0);
+        let before = fs::read(&path)?;
+
+        let reader = FrankenStorage::open_strict_readonly(&path)?;
+        assert!(!historical_table_exists(reader.raw(), "meta")?);
+        assert!(!reader.forget_derived_rebuild_pending()?);
+        assert!(
+            !historical_table_exists(reader.raw(), "meta")?,
+            "the pending probe must not initialize CASS schema"
+        );
+
+        crate::search::privacy::begin_forget(&path)?;
+        assert!(
+            reader.forget_derived_rebuild_pending()?,
+            "a sidecar-only privacy fence must remain visible without meta"
+        );
+        assert!(!historical_table_exists(reader.raw(), "meta")?);
+        reader.close_without_checkpoint()?;
+        assert_eq!(fs::read(&path)?, before);
+
+        let migrated = FrankenStorage::open(&path)?;
+        assert_eq!(migrated.schema_version()?, CURRENT_SCHEMA_VERSION);
+        assert!(historical_table_exists(migrated.raw(), "meta")?);
+        assert!(migrated.forget_derived_rebuild_pending()?);
+        let preserved: String = migrated.raw().query_row_map(
+            "SELECT value FROM bootstrap_marker WHERE id = 1",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(preserved, "preserved");
+        migrated.close()?;
         Ok(())
     }
 
