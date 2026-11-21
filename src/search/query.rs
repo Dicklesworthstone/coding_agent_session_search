@@ -2935,10 +2935,12 @@ pub fn rrf_fuse_hits(
 
 /// A certified rank may only score the payload authenticated by its semantic
 /// read snapshot. Lexical and semantic phases may observe different snapshots.
+/// Both inputs have already passed their source-text noise checks. Their public
+/// content/snippets may be projected, so fusion must not classify them again.
 pub fn rrf_fuse_hits_with_coverage(
     lexical: &[SearchHit],
     semantic: &[SearchHit],
-    query: &str,
+    _query: &str,
     limit: usize,
     offset: usize,
     coverage: Option<&SemanticCoverageSnapshot>,
@@ -3052,10 +3054,6 @@ pub fn rrf_fuse_hits_with_coverage(
             Some(hit) => hit,
             None => continue,
         };
-        if hit_is_noise(&hit, query) {
-            continue;
-        }
-
         let normalized_source_id = normalized_search_hit_source_id(&hit);
         let source_key = if let Some(id) = source_ids.get(normalized_source_id.as_str()) {
             *id
@@ -4519,29 +4517,27 @@ pub(crate) fn is_tool_invocation_noise(content: &str) -> bool {
     false
 }
 
-fn hit_content_for_noise_check(hit: &SearchHit) -> &str {
-    if hit.content.is_empty() {
-        &hit.snippet
-    } else {
-        &hit.content
-    }
-}
-
 fn hit_is_noise(hit: &SearchHit, query: &str) -> bool {
-    let content_to_check = hit_content_for_noise_check(hit);
-    // When both `content` and `snippet` are empty, it usually means the caller
-    // explicitly asked for a projection (`--fields minimal` / `summary`) that
-    // excludes both fields — NOT that the underlying row was empty. Treating
-    // the hit as noise in that case silently drops every real match and makes
-    // `cass search --fields minimal` return zero results even when matches
-    // exist (reality-check bead q6xf9). The noise classifier cannot make a
-    // correctness-preserving decision without text to inspect, so default to
-    // "not noise" in that case and let the hit through; downstream projection
-    // will apply the requested field subset.
-    if content_to_check.is_empty() {
+    // Materializers retain source text until the first reduction. A hit that
+    // has already been projected (for example a cached progressive lexical
+    // hit) has already passed that check. Never classify a rendered snippet:
+    // highlighting and fragment boundaries can turn useful text into an
+    // apparently malformed tool marker or an acknowledgement (GH #564).
+    if hit.content.is_empty() {
         return false;
     }
-    is_search_noise_text(content_to_check, query) || is_tool_invocation_noise(content_to_check)
+    is_search_noise_text(&hit.content, query) || is_tool_invocation_noise(&hit.content)
+}
+
+fn project_hit_content(mut hit: SearchHit, field_mask: FieldMask) -> SearchHit {
+    if !field_mask.needs_content() {
+        hit.content.clear();
+    } else if let Some(max_chars) = field_mask.preview_content_limit()
+        && let Some((end, _)) = hit.content.char_indices().nth(max_chars)
+    {
+        hit.content.truncate(end);
+    }
+    hit
 }
 
 fn snippet_from_content(content: &str) -> String {
@@ -4567,7 +4563,12 @@ pub(crate) fn deduplicate_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
     deduplicate_hits_with_query(hits, "")
 }
 
-pub(crate) fn deduplicate_hits_with_query(hits: Vec<SearchHit>, query: &str) -> Vec<SearchHit> {
+pub(crate) fn deduplicate_hits_with_query(mut hits: Vec<SearchHit>, query: &str) -> Vec<SearchHit> {
+    hits.retain(|hit| !hit_is_noise(hit, query));
+    deduplicate_admitted_hits(hits)
+}
+
+fn deduplicate_admitted_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
     // Key: (source_numeric_id, source_path_numeric_id, conversation_id-or-title,
     //       line_number, created_at, content_hash) -> index in deduped.
     // Include message-level identity so repeated identical content in the same
@@ -4594,10 +4595,6 @@ pub(crate) fn deduplicate_hits_with_query(hits: Vec<SearchHit>, query: &str) -> 
     let mut deduped: Vec<SearchHit> = Vec::new();
 
     for hit in hits {
-        if hit_is_noise(&hit, query) {
-            continue;
-        }
-
         // Include normalized source identity AND source_path in the key so different
         // sessions keep their results while local provenance drift still coalesces.
         let normalized_source_id = normalized_search_hit_source_id(&hit);
@@ -4666,17 +4663,26 @@ fn remote_source_filter_is_post_applied(filter: &SourceFilter) -> bool {
 /// and feature-gated conformance callers.
 fn postprocess_hits_page_core(
     hits: Vec<SearchHit>,
-    query: &str,
+    noise_query: Option<&str>,
     session_paths: &HashSet<String>,
     limit: usize,
     offset: usize,
+    field_mask: FieldMask,
 ) -> (usize, Vec<SearchHit>) {
-    let mut hits = deduplicate_hits_with_query(hits, query);
+    let mut hits = match noise_query {
+        Some(query) => deduplicate_hits_with_query(hits, query),
+        None => deduplicate_admitted_hits(hits),
+    };
     if !session_paths.is_empty() {
         hits.retain(|hit| session_paths.contains(&hit.source_path));
     }
     let available_hits = hits.len();
-    let paged_hits = hits.into_iter().skip(offset).take(limit).collect();
+    let paged_hits = hits
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|hit| project_hit_content(hit, field_mask))
+        .collect();
     (available_hits, paged_hits)
 }
 
@@ -5057,7 +5063,9 @@ impl SearchClient {
             if !hits.is_empty() {
                 let initial_hit_count = hits.len();
                 let page_hits = |raw_hits: Vec<SearchHit>| {
-                    self.postprocess_hits_page(raw_hits, &sanitized, &filters, limit, offset)
+                    self.postprocess_hits_page(
+                        raw_hits, &sanitized, &filters, limit, offset, field_mask,
+                    )
                 };
 
                 let (mut deduped_len, mut paged_hits) = page_hits(hits);
@@ -5142,7 +5150,9 @@ impl SearchClient {
             if !hits.is_empty() {
                 let initial_hit_count = hits.len();
                 let page_hits = |raw_hits: Vec<SearchHit>| {
-                    self.postprocess_hits_page(raw_hits, &sanitized, &filters, limit, offset)
+                    self.postprocess_hits_page(
+                        raw_hits, &sanitized, &filters, limit, offset, field_mask,
+                    )
                 };
 
                 let (mut deduped_len, mut paged_hits) = page_hits(hits);
@@ -5246,7 +5256,7 @@ impl SearchClient {
                 field_mask,
             )?;
             let (_, paged_hits) =
-                self.postprocess_hits_page(hits, &sanitized, &filters, limit, offset);
+                self.postprocess_hits_page(hits, &sanitized, &filters, limit, offset, field_mask);
 
             if can_use_cache && offset == 0 {
                 self.put_cache(query, &filters, field_mask, cache_epoch, &paged_hits);
@@ -6776,11 +6786,6 @@ impl SearchClient {
                 } else {
                     String::new()
                 };
-                let content = if field_mask.needs_content() {
-                    message.full_content.clone()
-                } else {
-                    String::new()
-                };
                 let content_hash = stable_hit_hash(
                     &message.full_content,
                     &conversation.source_path,
@@ -6804,7 +6809,7 @@ impl SearchClient {
                         String::new()
                     },
                     snippet,
-                    content,
+                    content: message.full_content,
                     content_hash,
                     conversation_id: Some(message.conversation_id),
                     score: 0.0,
@@ -6912,6 +6917,7 @@ impl SearchClient {
         let mut hydrated_by_id: HashMap<u64, SearchHit> = self
             .hydrate_semantic_hits_with_ids(&missing, ctx.field_mask)?
             .into_iter()
+            .filter(|(_, hit)| !hit_is_noise(hit, ctx.query))
             .collect();
 
         let mut hydrated: Vec<(u64, SearchHit)> = Vec::with_capacity(collapsed.len());
@@ -6933,7 +6939,17 @@ impl SearchClient {
         }
 
         let mut hits: Vec<SearchHit> = hydrated.into_iter().map(|(_, hit)| hit).collect();
-        (_, hits) = self.postprocess_hits_page(hits, ctx.query, ctx.filters, ctx.limit, 0);
+        if remote_source_filter_is_post_applied(&ctx.filters.source_filter) {
+            hits.retain(|hit| hit.origin_kind != crate::sources::provenance::LOCAL_SOURCE_ID);
+        }
+        (_, hits) = postprocess_hits_page_core(
+            hits,
+            None,
+            &ctx.filters.session_paths,
+            ctx.limit,
+            0,
+            ctx.field_mask,
+        );
 
         let (wildcard_fallback, suggestions) = ctx
             .lexical_cache
@@ -7389,7 +7405,7 @@ impl SearchClient {
                     self.hydrate_semantic_hits_at_generation(&results, field_mask, retained)?;
                 let hits = hydrated.into_iter().map(|(_, hit)| hit).collect();
                 let (available_hits, paged_hits) =
-                    self.postprocess_hits_page(hits, query, &filters, limit, offset);
+                    self.postprocess_hits_page(hits, query, &filters, limit, offset, field_mask);
                 let needs_more = (available_hits < target_hits && retry_state.has_more_candidates)
                     || retry_state.exact_window_may_omit_competitor;
                 if needs_more && fetch_limit < maximum_fetch {
@@ -7652,10 +7668,11 @@ impl SearchClient {
         let hydrated_candidate_count = hydrated.len();
         let (available_hits, hits) = postprocess_hits_page_core(
             hydrated.into_iter().map(|(_, hit)| hit).collect(),
-            &sanitized_query,
+            Some(&sanitized_query),
             request.session_paths,
             request.limit,
             request.offset,
+            request.field_mask,
         );
         let hits = hits
             .into_iter()
@@ -7689,6 +7706,7 @@ impl SearchClient {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn postprocess_hits_page(
         &self,
         mut hits: Vec<SearchHit>,
@@ -7696,11 +7714,19 @@ impl SearchClient {
         filters: &SearchFilters,
         limit: usize,
         offset: usize,
+        field_mask: FieldMask,
     ) -> (usize, Vec<SearchHit>) {
         if remote_source_filter_is_post_applied(&filters.source_filter) {
             hits.retain(|hit| hit.origin_kind != crate::sources::provenance::LOCAL_SOURCE_ID);
         }
-        postprocess_hits_page_core(hits, query, &filters.session_paths, limit, offset)
+        postprocess_hits_page_core(
+            hits,
+            Some(query),
+            &filters.session_paths,
+            limit,
+            offset,
+            field_mask,
+        )
     }
 
     /// Search with automatic wildcard fallback for sparse results.
@@ -8532,7 +8558,6 @@ impl SearchClient {
         }
 
         let wants_snippet = field_mask.wants_snippet();
-        let needs_content = field_mask.needs_content() || wants_snippet;
 
         // Delegate cass-compatible query parsing + Tantivy clause construction to frankensearch.
         // cass retains ownership of paging/fallback orchestration and stored-field hydration.
@@ -8646,19 +8671,16 @@ impl SearchClient {
                 origin_host.as_deref(),
             );
 
-            let preview_satisfies_bounded_content =
-                field_mask.preview_content_limit().is_some() && !stored_preview.is_empty();
-            let preview_satisfies_full_content = field_mask.needs_content()
-                && field_mask.preview_content_limit().is_none()
-                && stored_preview_is_complete_content(&stored_preview);
-            if needs_content
-                && let Some(line_idx) = line_number
-                    .and_then(|line| line.checked_sub(1))
-                    .and_then(|line| i64::try_from(line).ok())
+            // Classification must use the same source text for every field
+            // projection. Complete stored previews avoid a database read;
+            // truncated previews cannot decide whether a tool bracket closes
+            // or an instruction marker occurs later in the message. Hydrate
+            // only those candidates, even when a snippet can render early.
+            if let Some(line_idx) = line_number
+                .and_then(|line| line.checked_sub(1))
+                .and_then(|line| i64::try_from(line).ok())
                 && stored_content.is_empty()
-                && !preview_satisfies_bounded_content
-                && !preview_satisfies_full_content
-                && stored_preview_snippet.is_none()
+                && !stored_preview_is_complete_content(&stored_preview)
             {
                 if let Some(conversation_id) = conversation_id {
                     missing_exact_content_keys.push((conversation_id, line_idx));
@@ -8690,8 +8712,9 @@ impl SearchClient {
             });
         }
 
-        let (hydrated_contents, hydrated_fallback_contents) = if needs_content
-            && (!missing_exact_content_keys.is_empty() || !missing_fallback_content_keys.is_empty())
+        let (hydrated_contents, hydrated_fallback_contents) = if !missing_exact_content_keys
+            .is_empty()
+            || !missing_fallback_content_keys.is_empty()
         {
             self.hydrate_tantivy_hit_contents(
                 &missing_exact_content_keys,
@@ -8740,19 +8763,12 @@ impl SearchClient {
                             .cloned()
                     }
                 });
-            let preview_satisfies_effective_content = !pending.stored_preview.is_empty()
-                && (field_mask.preview_content_limit().is_some()
-                    || (field_mask.needs_content()
-                        && field_mask.preview_content_limit().is_none()
-                        && stored_preview_is_complete_content(&pending.stored_preview)));
             let effective_content = if !pending.stored_content.is_empty() {
-                pending.stored_content.clone()
-            } else if preview_satisfies_effective_content {
-                pending.stored_preview.clone()
+                pending.stored_content
             } else if let Some(content) = hydrated_content {
                 content
             } else {
-                pending.stored_preview.clone()
+                pending.stored_preview
             };
             let snippet = if wants_snippet {
                 if let Some(snippet) = pending.stored_preview_snippet.clone() {
@@ -8763,9 +8779,7 @@ impl SearchClient {
                     // buffers — it reads the config and term weights and keeps
                     // no state between calls — so one generator serves every
                     // hit and the per-hit clone was pure allocation.
-                    let rendered = if !pending.stored_content.is_empty() {
-                        generator.snippet(&pending.stored_content)
-                    } else if !effective_content.is_empty() {
+                    let rendered = if !effective_content.is_empty() {
                         generator.snippet(&effective_content)
                     } else {
                         None
@@ -8786,11 +8800,6 @@ impl SearchClient {
             } else {
                 String::new()
             };
-            let content = if field_mask.needs_content() {
-                effective_content.clone()
-            } else {
-                String::new()
-            };
             let content_hash = stable_hit_hash(
                 &effective_content,
                 &pending.source_path,
@@ -8805,7 +8814,9 @@ impl SearchClient {
             hits.push(SearchHit {
                 title: pending.title,
                 snippet,
-                content,
+                // Keep raw text through reduction; the public page and cache
+                // receive only the requested projection afterward.
+                content: effective_content,
                 content_hash,
                 conversation_id: pending.conversation_id,
                 score: pending.score,
@@ -9004,11 +9015,8 @@ impl SearchClient {
         } else {
             "NULL"
         };
-        let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
-            "fts_messages.content"
-        } else {
-            "NULL"
-        };
+        // Noise classification precedes the caller's field projection.
+        let content_expr = "fts_messages.content";
         let message_key_expr = if uses_message_id {
             "CAST(fts_messages.message_id AS INTEGER)"
         } else {
@@ -9036,11 +9044,7 @@ impl SearchClient {
         } else {
             "''"
         };
-        let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
-            "COALESCE(m.content, '')"
-        } else {
-            "''"
-        };
+        let content_expr = "COALESCE(m.content, '')";
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
         // Literal rowid list: avoids the parameterized IN scan used by
@@ -9260,11 +9264,7 @@ impl SearchClient {
         } else {
             "''"
         };
-        let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
-            "COALESCE(m.content, '')"
-        } else {
-            "''"
-        };
+        let content_expr = "COALESCE(m.content, '')";
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
 
@@ -9408,11 +9408,7 @@ impl SearchClient {
         } else {
             String::new()
         };
-        let content = if request.field_mask.needs_content() {
-            raw_content
-        } else {
-            String::new()
-        };
+        let content = raw_content;
         let content_hash = if content.is_empty() {
             stable_hit_hash(&snippet, &source_path, line_number, created_at)
         } else {
@@ -9912,11 +9908,7 @@ impl SearchClient {
                 } else {
                     String::new()
                 };
-                let content = if field_mask.needs_content() {
-                    raw_content
-                } else {
-                    String::new()
-                };
+                let content = raw_content;
                 let content_hash = if content.is_empty() {
                     stable_hit_hash(&snippet, &source_path, line_number, created_at)
                 } else {
@@ -11691,26 +11683,19 @@ mod tests {
         assert!(!hit.content.is_empty(), "precondition: content populated");
     }
 
-    /// Third probe: if `content` is empty but `snippet` is populated
-    /// (e.g., a lexical projection that kept the snippet but dropped the
-    /// full content), `hit_content_for_noise_check` must fall through to
-    /// the snippet and the noise classifier must run normally. This
-    /// guards the less-common projection path from accidentally being
-    /// swallowed by the same empty-content early return.
+    /// A projected hit was classified before its raw content was removed.
+    /// Snippet boundaries must not reverse that decision (GH #564).
     #[test]
-    fn hit_is_noise_uses_snippet_when_content_empty_but_snippet_populated() {
+    fn gh564_noise_filter_never_reclassifies_rendered_snippets() {
         let mut hit = projected_minimal_fields_search_hit(
             "Real authentication hit",
             "/tmp/sessions/real-auth.jsonl",
         );
         hit.content = String::new();
-        hit.snippet = "The user asked about authentication flow options.".into();
-        // Snippet has real English content unrelated to noise heuristics,
-        // so the hit must survive the filter.
-        assert!(
-            !hit_is_noise(&hit, "authentication"),
-            "snippet-only hits with real content must survive the noise filter"
-        );
+        for snippet in ["[Tool: Bash - **deploy** check", "Acknowledged.", "[Tool:]"] {
+            hit.snippet = snippet.into();
+            assert!(!hit_is_noise(&hit, "deploy"), "{snippet}");
+        }
     }
 
     #[test]
@@ -17113,9 +17098,21 @@ mod tests {
             FieldMask::new(false, true, true, true),
         )?;
         assert_eq!(hits.len(), 2);
-        assert!(hits.iter().all(|(_, hit)| hit.content.is_empty()));
+        assert_eq!(hits[0].1.content, first);
+        assert_eq!(hits[1].1.content, second);
         assert!(hits.iter().all(|(_, hit)| !hit.snippet.is_empty()));
         assert_ne!(hits[0].1.content_hash, hits[1].1.content_hash);
+
+        let (_, projected) = client.postprocess_hits_page(
+            hits.into_iter().map(|(_, hit)| hit).collect(),
+            "semantic",
+            &SearchFilters::default(),
+            2,
+            0,
+            FieldMask::new(false, true, true, true),
+        );
+        assert_eq!(projected.len(), 2);
+        assert!(projected.iter().all(|hit| hit.content.is_empty()));
 
         Ok(())
     }
@@ -20946,6 +20943,157 @@ mod tests {
     // ============================================================
 
     #[test]
+    fn gh564_noise_filter_precedes_all_lexical_projections() -> Result<()> {
+        use frankensearch::quill::cass::CassDocument;
+
+        let dir = TempDir::new()?;
+        let index_path = dir.path().join("noise-index");
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        let conn = SearchSqliteFixture::in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                UNIQUE(conversation_id, idx)
+             );",
+        )?;
+        let query = "deploy cache stall";
+        let mut contents: Vec<String> = (1..=24)
+            .map(|step| format!("[Tool: Bash - deploy check {step}: did the cache stall]"))
+            .collect();
+        contents.extend((1..=4).map(|step| {
+            format!(
+                "note {step}: {} After the deploy the cache had a stall.",
+                "ordinary prose ".repeat(30)
+            )
+        }));
+        // Neither a long, valid wrapper nor a hidden prompt marker can be
+        // classified from the stored prefix. Both need the same bounded
+        // candidate hydration for minimal, snippet, full, and preview masks.
+        contents.push(format!(
+            "[Tool: Bash - deploy cache stall {}]",
+            "工具 ".repeat(1000)
+        ));
+        contents.push(format!(
+            "deploy cache stall {} follow the AGENTS.md instructions",
+            "ordinary prose ".repeat(1000)
+        ));
+        contents.extend([
+            "[Tool: Bash - deploy cache stall".into(),
+            "[Tool:]".into(),
+            "[Tool: ]".into(),
+            "Acknowledged.".into(),
+        ]);
+
+        let documents: Vec<_> = contents
+            .iter()
+            .enumerate()
+            .map(|(index, content)| CassDocument {
+                agent: "claude_code".into(),
+                workspace: Some("/work".into()),
+                workspace_original: None,
+                source_path: "/history/noise.jsonl".into(),
+                msg_idx: index as u64,
+                created_at: Some(1_700_000_000_000 + index as i64),
+                title: Some(query.into()),
+                content: content.clone(),
+                source_id: "local".into(),
+                origin_kind: "local".into(),
+                origin_host: None,
+                conversation_id: Some(1),
+            })
+            .collect();
+        for (index, content) in contents.iter().enumerate() {
+            conn.execute_with_params(
+                "INSERT INTO messages(id, conversation_id, idx, content) VALUES(?1, 1, ?2, ?3)",
+                &[
+                    fsqlite_types::value::SqliteValue::Integer(index as i64 + 1),
+                    fsqlite_types::value::SqliteValue::Integer(index as i64),
+                    fsqlite_types::value::SqliteValue::Text(content.clone().into()),
+                ],
+            )?;
+        }
+        index.add_prebuilt_documents_slice(&documents)?;
+        index.commit()?;
+        drop(index);
+        let client = SearchClient::open(&index_path, None)?.expect("lexical client");
+        *client.sqlite.lock().unwrap() = Some(conn.into_connection());
+
+        let expected = client.search(query, SearchFilters::default(), 100, 0, FieldMask::FULL)?;
+        assert_eq!(expected.len(), 29);
+        assert!(expected.iter().all(|hit| hit.line_number.unwrap() <= 29));
+        let identity = |hits: &[SearchHit]| {
+            hits.iter()
+                .map(|hit| (hit.conversation_id, hit.line_number, hit.content_hash))
+                .collect::<Vec<_>>()
+        };
+        for mask in [
+            FieldMask::new(false, false, false, false),
+            FieldMask::new(false, false, true, false),
+            FieldMask::new(false, true, true, true),
+            FieldMask::new(true, false, false, true),
+            FieldMask::FULL,
+            FieldMask::FULL.with_preview_content_limit(Some(32)),
+        ] {
+            for (limit, offset) in [(100, 0), (5, 0), (5, 3)] {
+                let baseline = client.search(
+                    query,
+                    SearchFilters::default(),
+                    limit,
+                    offset,
+                    FieldMask::new(true, true, true, false),
+                )?;
+                for _ in 0..2 {
+                    let hits =
+                        client.search(query, SearchFilters::default(), limit, offset, mask)?;
+                    assert_eq!(
+                        identity(&hits),
+                        identity(&baseline),
+                        "{mask:?}, {limit}/{offset}"
+                    );
+                    assert!(
+                        hits.iter()
+                            .all(|hit| hit.content.is_empty() == !mask.needs_content())
+                    );
+                    assert!(
+                        hits.iter()
+                            .all(|hit| hit.snippet.is_empty() == !mask.wants_snippet())
+                    );
+                    assert!(
+                        hits.iter()
+                            .all(|hit| hit.title.is_empty() == !mask.wants_title())
+                    );
+                    if let Some(bound) = mask.preview_content_limit() {
+                        assert!(hits.iter().all(|hit| hit.content.chars().count() <= bound));
+                    }
+                    let fused = rrf_fuse_hits(&hits, &[], query, limit, 0);
+                    assert_eq!(
+                        identity(&fused),
+                        identity(&hits),
+                        "fusion reclassified a projection"
+                    );
+                }
+            }
+        }
+        let prompt_hits = client.search(
+            "AGENTS.md instructions",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::new(false, true, false, false),
+        )?;
+        assert_eq!(
+            prompt_hits.len(),
+            1,
+            "explicit prompt queries retain instruction text"
+        );
+        assert_eq!(prompt_hits[0].line_number, Some(30));
+        Ok(())
+    }
+
+    #[test]
     fn tantivy_search_hydrates_long_content_when_content_field_is_not_stored() -> Result<()> {
         let dir = TempDir::new()?;
         let db_path = dir.path().join("cass.db");
@@ -21073,8 +21221,9 @@ mod tests {
             !bounded_hits[0]
                 .content
                 .contains("needle appears past the preview boundary"),
-            "bounded preview content should not hydrate the full sqlite row"
+            "bounded output must omit the tail even when classification hydrates it"
         );
+        assert_eq!(bounded_hits[0].content.chars().count(), 200);
 
         let short_client =
             SearchClient::open(&index_path, Some(&db_path))?.expect("db-backed client");
