@@ -18724,12 +18724,10 @@ fn run_index_with_storage_ownership(
     preflight_phase!("watch_startup:writable_preflight");
     // CASS #162 item 2: Verify the connection is writable early, before the
     // code reaches deep batch-insert paths where a readonly failure is hard
-    // to diagnose.  A benign no-op UPDATE catches "attempt to write a readonly
-    // database" from frankensqlite.
-    if let Err(err) = storage
-        .raw()
-        .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
-    {
+    // to diagnose. Roll back the real write probe: committing even a no-op
+    // UPDATE changes the DB/WAL epoch and invalidates the completed lexical
+    // authority that the next preflight must inspect (GH #472).
+    if let Err(err) = verify_index_storage_writable(&storage) {
         tracing::warn!(
             db_path = %opts.db_path.display(),
             error = %err,
@@ -23491,6 +23489,26 @@ fn open_storage_for_index(
             .map(|storage| (storage, false, full_index))
             .with_context(|| format!("creating frankensqlite storage at {}", db_path.display()))
     }
+}
+
+/// Exercise the same write permission as ingestion without publishing a write.
+/// A successful probe must not invalidate an unchanged archive's lexical proof,
+/// and must never renew proof after an unrelated canonical mutation. Explicit
+/// rollback also releases the transaction when the write itself is refused.
+fn verify_index_storage_writable(storage: &FrankenStorage) -> Result<()> {
+    use crate::franken_sync::compat::TransactionExt;
+
+    let mut transaction = storage
+        .raw()
+        .transaction()
+        .context("starting index storage writability probe")?;
+    let write_result =
+        transaction.execute("UPDATE meta SET value = value WHERE key = 'schema_version'");
+    transaction
+        .rollback()
+        .context("rolling back index storage writability probe")?;
+    write_result.context("checking index storage write permission")?;
+    Ok(())
 }
 
 fn index_storage_open_error_reason(err: &anyhow::Error) -> String {
@@ -63414,6 +63432,32 @@ mod tests {
             saturating_u32_from_i64(i64::from(u32::MAX) + 1234),
             u32::MAX
         );
+    }
+
+    #[test]
+    fn index_writable_preflight_rejects_readonly_without_leaving_a_transaction() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("readonly-preflight.db");
+        FrankenStorage::open(&db_path).unwrap().close().unwrap();
+        let storage = FrankenStorage::open_strict_readonly(&db_path).unwrap();
+        let epoch = lexical_resume::ArchiveEpoch::capture(&db_path).unwrap();
+
+        verify_index_storage_writable(&storage)
+            .expect_err("a rolled-back probe must still exercise write permission");
+        epoch.verify(&db_path).unwrap();
+        // A rejected probe must clean up its own transaction so later reads
+        // and explicitly scoped transactions are not stranded in that scope.
+        let mut transaction = storage.raw().transaction().unwrap();
+        assert_eq!(
+            transaction
+                .query("SELECT value FROM meta WHERE key = 'schema_version'")
+                .unwrap()
+                .len(),
+            1
+        );
+        transaction.rollback().unwrap();
+        storage.close_without_checkpoint().unwrap();
+        epoch.verify(&db_path).unwrap();
     }
 
     #[test]

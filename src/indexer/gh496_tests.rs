@@ -930,6 +930,121 @@ fn gh558_final_checkpoint_reuses_writer_and_refuses_missing_documents() {
 
 #[test]
 #[serial_test::serial]
+fn gh472_writable_preflight_preserves_completed_lexical_authority() {
+    let fixture = gh496_fixture();
+    rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();
+    let checkpoint_path = lexical_rebuild_state_path(&fixture.index_path);
+    let checkpoint_bytes = fs::read(&checkpoint_path).unwrap();
+    let state = load_lexical_rebuild_state(&fixture.index_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        completed_lexical_checkpoint_freshness_for_state(
+            &fixture.index_path,
+            &fixture.db_path,
+            &state,
+        )
+        .unwrap(),
+        LexicalCheckpointFreshness::Current
+    );
+
+    let (storage, rebuilt, _) = open_storage_for_index(&fixture.db_path, false).unwrap();
+    assert!(!rebuilt);
+    for _ in 0..2 {
+        verify_index_storage_writable(&storage).unwrap();
+        assert_eq!(
+            completed_lexical_checkpoint_freshness_for_state(
+                &fixture.index_path,
+                &fixture.db_path,
+                &state,
+            )
+            .unwrap(),
+            LexicalCheckpointFreshness::Current,
+            "a successful write-permission probe must preserve the original DB/WAL epoch"
+        );
+        let current = lexical_rebuild_db_state(&storage, &fixture.db_path).unwrap();
+        assert!(
+            matching_lexical_rebuild_state_status(&fixture.index_path, &current)
+                .unwrap()
+                .has_completed_checkpoint,
+            "nightly reconciliation must retain its verified incremental admission"
+        );
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_bytes);
+    }
+
+    // The former autocommit probe writes the same logical value but still
+    // changes the physical epoch. This is a real negative control, rather
+    // than a checkpoint assembled to agree with the replacement helper.
+    storage
+        .raw()
+        .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
+        .unwrap();
+    assert!(!state.completed_source_matches(&fixture.db_path));
+    assert!(matches!(
+        completed_lexical_checkpoint_freshness_for_state(
+            &fixture.index_path,
+            &fixture.db_path,
+            &state,
+        )
+        .unwrap(),
+        LexicalCheckpointFreshness::Unverified(_)
+    ));
+    assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_bytes);
+    storage.close_without_checkpoint().unwrap();
+}
+
+#[test]
+#[serial_test::serial]
+fn gh472_writable_preflight_never_renews_same_count_canonical_edits() {
+    let fixture = gh496_fixture();
+    rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();
+    let checkpoint_path = lexical_rebuild_state_path(&fixture.index_path);
+    let checkpoint_bytes = fs::read(&checkpoint_path).unwrap();
+    let state = load_lexical_rebuild_state(&fixture.index_path)
+        .unwrap()
+        .unwrap();
+    let (storage, _, _) = open_storage_for_index(&fixture.db_path, false).unwrap();
+    let before = lexical_rebuild_db_state(&storage, &fixture.db_path).unwrap();
+    assert_eq!(
+        storage
+            .raw()
+            .execute("UPDATE messages SET content = 'replacement canonical evidence' WHERE id = 1")
+            .unwrap(),
+        1
+    );
+    let after = lexical_rebuild_db_state(&storage, &fixture.db_path).unwrap();
+    assert_eq!(
+        before, after,
+        "counts and maximum IDs do not attest content"
+    );
+
+    verify_index_storage_writable(&storage).unwrap();
+    assert!(!state.completed_source_matches(&fixture.db_path));
+    assert!(
+        !matching_lexical_rebuild_state_status(&fixture.index_path, &after)
+            .unwrap()
+            .has_completed_checkpoint,
+        "an unaccounted edit must still refuse incremental reconciliation"
+    );
+    assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_bytes);
+    storage.close_without_checkpoint().unwrap();
+    assert!(
+        lexical_resume::revalidate_completed(
+            &fixture.db_path,
+            &fixture.index_path,
+            state,
+            None,
+            None,
+        )
+        .unwrap()
+        .is_none(),
+        "a content audit must reject the old native generation after the real edit"
+    );
+    assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_bytes);
+}
+
+#[test]
+#[serial_test::serial]
 fn gh558_completed_audit_reuses_one_authenticated_snapshot() {
     let fixture = gh496_fixture();
     rebuild_tantivy_from_db(&fixture.db_path, &fixture.data_dir, 2, None).unwrap();
