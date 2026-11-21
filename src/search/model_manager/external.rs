@@ -4,7 +4,16 @@
 use super::*;
 use crate::search::external_embedder::{CancelCheck, ExternalEmbedder, ExternalEmbeddingConfig};
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
-use crate::search::semantic_manifest::{ArtifactRecord, SemanticManifest};
+use crate::search::semantic_manifest::{
+    ArtifactRecord, SemanticCoverageCertificate, SemanticManifest,
+};
+use crate::search::vector_index::SemanticCoverageSnapshot;
+
+#[derive(Debug, Clone, PartialEq)]
+struct ExternalPublication {
+    record: ArtifactRecord,
+    coverage: Option<SemanticCoverageCertificate>,
+}
 
 fn failed(context: impl Into<String>) -> SemanticAvailability {
     SemanticAvailability::LoadFailed {
@@ -25,7 +34,7 @@ fn config_from_env() -> Result<ExternalEmbeddingConfig, SemanticAvailability> {
 fn recorded_artifact(
     data_dir: &Path,
     config: &ExternalEmbeddingConfig,
-) -> Result<ArtifactRecord, SemanticAvailability> {
+) -> Result<ExternalPublication, SemanticAvailability> {
     let id = config.identity();
     let stale = |reason: &str| SemanticAvailability::IndexStale {
         embedder_id: id.clone(),
@@ -36,16 +45,31 @@ fn recorded_artifact(
         .ok_or_else(|| {
             stale("external vectors have no completed publication; run external backfill")
         })?;
-    if manifest.checkpoint.as_ref().is_some_and(|checkpoint| {
-        checkpoint.embedder_id == id && checkpoint.tier == TierKind::Quality
+    let artifact = manifest
+        .quality_tier
+        .ok_or_else(|| stale("no completed external quality artifact; run external backfill"))?;
+    let coverage = manifest.coverage.get(&id).cloned();
+    // A certificate and its artifact come from the same ledger read. A damaged
+    // certificate must never downgrade to the mutable legacy builder path.
+    if coverage.as_ref().is_some_and(|certificate| {
+        !cfg!(unix)
+            || !certificate.matches_artifact(&artifact)
+            || Some(certificate.vector_space_revision.as_str())
+                != expected_vector_space_revision(&id)
     }) {
+        return Err(stale(
+            "external coverage does not match its completed publication",
+        ));
+    }
+    if coverage.is_none()
+        && manifest.checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint.embedder_id == id && checkpoint.tier == TierKind::Quality
+        })
+    {
         return Err(stale(
             "external backfill is incomplete; resume its durable checkpoint",
         ));
     }
-    let artifact = manifest
-        .quality_tier
-        .ok_or_else(|| stale("no completed external quality artifact; run external backfill"))?;
     // The CLI records the retained endpoint identity as its model revision.
     // The FSVI header revision describes only the transport/input contract and
     // cannot stand in for the model/endpoint/dimension/revision identity.
@@ -58,20 +82,43 @@ fn recorded_artifact(
         || artifact.schema_version != SEMANTIC_SCHEMA_VERSION
         || artifact.chunking_version != CHUNKING_STRATEGY_VERSION
         || !semantic_shard_artifact_path_is_safe(&artifact.index_path)
-        || data_dir.join(&artifact.index_path) != expected_path
+        || (coverage.is_none() && data_dir.join(&artifact.index_path) != expected_path)
     {
         return Err(stale(
             "external artifact identity or format changed; rebuild this external embedding space",
         ));
     }
-    Ok(artifact)
+    Ok(ExternalPublication {
+        record: artifact,
+        coverage,
+    })
 }
 
 fn open_recorded(
     data_dir: &Path,
     config: &ExternalEmbeddingConfig,
-    record: &ArtifactRecord,
+    publication: &ExternalPublication,
+    snapshot: Option<SemanticCoverageSnapshot>,
 ) -> Result<SemanticIndexArtifact, SemanticAvailability> {
+    let record = &publication.record;
+    if let Some(certificate) = &publication.coverage {
+        let snapshot = snapshot.unwrap_or_else(|| {
+            SemanticCoverageSnapshot::at_snapshot(
+                certificate,
+                certificate.mutation_seq,
+                certificate.max_message_id,
+            )
+        });
+        return coverage::authenticate_artifact(
+            data_dir,
+            record,
+            certificate.clone(),
+            config.dimension(),
+            snapshot,
+            None,
+        )
+        .map_err(|error| failed(format!("external semantic coverage admission: {error:#}")));
+    }
     let path = vector_index_path(data_dir, &config.identity());
     if !semantic_artifact_candidate_exists(&path).map_err(failed)? {
         return Err(SemanticAvailability::IndexMissing { index_path: path });
@@ -93,25 +140,30 @@ fn open_recorded(
     Ok(artifact)
 }
 
-fn require_current_archive(
+fn admit_archive(
     storage: &FrankenStorage,
-    record: &ArtifactRecord,
-) -> Result<(), SemanticAvailability> {
-    let invalidated = storage
-        .semantic_identity_rebuild_required(SemanticIdentityTier::Quality)
-        .map_err(|error| failed(format!("external canonical identity check: {error}")))?;
+    publication: &ExternalPublication,
+) -> Result<String, SemanticAvailability> {
+    let record = &publication.record;
     // Unlike the legacy manifest-less path, a dynamic endpoint requires
     // an authoritative fingerprint: inability to read it is a refusal.
     let fingerprint = crate::indexer::lexical_storage_fingerprint_for_storage(storage)
         .map_err(|error| failed(format!("external canonical fingerprint: {error}")))?;
-    if invalidated || record.db_fingerprint != fingerprint {
+    // Certified readers authenticate every returned passage against the query's
+    // canonical snapshot. They may serve their covered subset after ingest;
+    // legacy artifacts still require an exact current-archive match.
+    let invalidated = publication.coverage.is_none()
+        && storage
+            .semantic_identity_rebuild_required(SemanticIdentityTier::Quality)
+            .map_err(|error| failed(format!("external canonical identity check: {error}")))?;
+    if invalidated || (publication.coverage.is_none() && record.db_fingerprint != fingerprint) {
         return Err(SemanticAvailability::IndexStale {
             embedder_id: record.embedder_id.clone(),
             reason: "canonical archive changed; resume/rebuild this external embedding space"
                 .into(),
         });
     }
-    Ok(())
+    Ok(fingerprint)
 }
 
 /// HTTP preflight may outlive an archive update or the start of another
@@ -123,7 +175,9 @@ fn revalidate_after_preflight(
     data_dir: &Path,
     db_path: &Path,
     config: &ExternalEmbeddingConfig,
-    record: &ArtifactRecord,
+    publication: &ExternalPublication,
+    artifact: &SemanticIndexArtifact,
+    admitted_fingerprint: &str,
 ) -> Result<(), SemanticAvailability> {
     let storage = FrankenStorage::open_strict_readonly(db_path).map_err(|error| {
         SemanticAvailability::DatabaseUnavailable {
@@ -131,10 +185,24 @@ fn revalidate_after_preflight(
             error: error.to_string(),
         }
     })?;
-    require_current_archive(&storage, record)?;
+    let fingerprint = admit_archive(&storage, publication)?;
+    let record = &publication.record;
+    let coverage_changed = if let Some(certificate) = &publication.coverage {
+        let current = coverage::archive_snapshot(&storage, certificate).map_err(failed)?;
+        artifact.coverage_snapshot() != Some(&current)
+    } else {
+        false
+    };
+    if fingerprint != admitted_fingerprint || coverage_changed {
+        return Err(SemanticAvailability::IndexStale {
+            embedder_id: record.embedder_id.clone(),
+            reason: "canonical archive changed during external preflight; retry query admission"
+                .into(),
+        });
+    }
     // An unrelated fast-tier checkpoint/backlog update must not invalidate
     // quality. Compare the exact admitted quality record, not ledger bytes.
-    if recorded_artifact(data_dir, config)? != *record {
+    if recorded_artifact(data_dir, config)? != *publication {
         return Err(SemanticAvailability::IndexStale {
             embedder_id: record.embedder_id.clone(),
             reason: "external_admission_changed: completed publication changed during preflight; retry against the current external index".into(),
@@ -143,6 +211,9 @@ fn revalidate_after_preflight(
     if let Some(availability) = selected_generation_owner_requirement(data_dir) {
         return Err(availability);
     }
+    artifact
+        .verify_coverage_file()
+        .map_err(|error| failed(format!("external retained coverage changed: {error:#}")))?;
     Ok(())
 }
 
@@ -153,7 +224,7 @@ pub(super) fn probe(data_dir: &Path) -> SemanticAvailability {
     let result = (|| {
         let config = config_from_env()?;
         let record = recorded_artifact(data_dir, &config)?;
-        open_recorded(data_dir, &config, &record)?;
+        open_recorded(data_dir, &config, &record, None)?;
         Ok::<_, SemanticAvailability>(SemanticAvailability::Ready {
             embedder_id: config.identity(),
         })
@@ -188,8 +259,14 @@ pub(super) fn load_with_config(
         if let Some(availability) = selected_generation_owner_requirement(data_dir) {
             return Err(availability);
         }
-        let record = recorded_artifact(data_dir, &config)?;
-        let artifact = open_recorded(data_dir, &config, &record)?;
+        let publication = recorded_artifact(data_dir, &config)?;
+        // Preserve legacy file admission before opening the archive. Certified
+        // files additionally need the current canonical coverage snapshot.
+        let legacy_artifact = if publication.coverage.is_none() {
+            Some(open_recorded(data_dir, &config, &publication, None)?)
+        } else {
+            None
+        };
         let storage = if strict_read_only {
             FrankenStorage::open_strict_readonly(db_path)
         } else {
@@ -199,7 +276,17 @@ pub(super) fn load_with_config(
             db_path: db_path.to_path_buf(),
             error: error.to_string(),
         })?;
-        require_current_archive(&storage, &record)?;
+        let admitted_fingerprint = admit_archive(&storage, &publication)?;
+        let artifact = if let Some(artifact) = legacy_artifact {
+            artifact
+        } else {
+            let certificate = publication
+                .coverage
+                .as_ref()
+                .ok_or_else(|| failed("external semantic coverage is missing"))?;
+            let snapshot = coverage::archive_snapshot(&storage, certificate).map_err(failed)?;
+            open_recorded(data_dir, &config, &publication, Some(snapshot))?
+        };
         let filter_maps = SemanticFilterMaps::from_storage(&storage)
             .map_err(|error| failed(format!("external filter maps: {error}")))?;
         drop(storage);
@@ -210,7 +297,14 @@ pub(super) fn load_with_config(
         if cancelled() {
             return Err(failed("external_cancelled: query admission was cancelled"));
         }
-        revalidate_after_preflight(data_dir, db_path, &config, &record)?;
+        revalidate_after_preflight(
+            data_dir,
+            db_path,
+            &config,
+            &publication,
+            &artifact,
+            &admitted_fingerprint,
+        )?;
         if cancelled() {
             return Err(failed("external_cancelled: query admission was cancelled"));
         }

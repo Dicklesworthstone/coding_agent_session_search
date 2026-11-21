@@ -76,7 +76,7 @@ fn select_covered_semantic_record(
     }))
 }
 
-fn archive_snapshot(
+pub(super) fn archive_snapshot(
     storage: &FrankenStorage,
     certificate: &SemanticCoverageCertificate,
 ) -> Result<SemanticCoverageSnapshot, String> {
@@ -112,7 +112,7 @@ fn archive_snapshot(
     ))
 }
 
-fn authenticate_artifact(
+pub(super) fn authenticate_artifact(
     data_dir: &Path,
     record: &ArtifactRecord,
     certificate: SemanticCoverageCertificate,
@@ -120,6 +120,15 @@ fn authenticate_artifact(
     snapshot: SemanticCoverageSnapshot,
     ann_path: Option<PathBuf>,
 ) -> anyhow::Result<SemanticIndexArtifact> {
+    anyhow::ensure!(
+        cfg!(unix)
+            && certificate.matches_artifact(record)
+            && record.schema_version == SEMANTIC_SCHEMA_VERSION
+            && record.chunking_version == CHUNKING_STRATEGY_VERSION
+            && Some(certificate.vector_space_revision.as_str())
+                == expected_vector_space_revision(&record.embedder_id),
+        "semantic coverage uses an incompatible publication or producer contract"
+    );
     anyhow::ensure!(
         record.dimension == dimension,
         "semantic coverage dimension mismatch"

@@ -217,6 +217,60 @@ fn add_conversation(storage: &FrankenStorage, ordinal: u32) -> AnyResult<()> {
 }
 
 impl Fixture {
+    #[cfg(unix)]
+    fn covered() -> AnyResult<Self> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db)?;
+        add_conversation(&storage, 1)?;
+        add_conversation(&storage, 2)?;
+        let endpoint = Endpoint::start()?;
+        let manifest = publish_external(&storage, dir.path(), &endpoint)?;
+        let record = manifest
+            .quality_tier
+            .context("published external quality")?;
+        let certificate = manifest
+            .coverage
+            .get(&endpoint.config.identity())
+            .context("external producer did not certify canonical coverage")?;
+        assert!(certificate.matches_artifact(&record));
+        assert!(record.index_path.starts_with("vector_index/served/"));
+        endpoint.seen.lock().unwrap().clear();
+        drop(storage);
+        Ok(Self {
+            endpoint,
+            dir,
+            db,
+            record,
+        })
+    }
+
+    #[cfg(unix)]
+    fn client(&self) -> AnyResult<crate::search::query::SearchClient> {
+        use crate::search::query::{SearchClient, SearchClientOptions};
+        let setup = self.load(true);
+        let context = setup
+            .context
+            .with_context(|| format!("external admission: {:?}", setup.availability))?;
+        let client = SearchClient::open_semantic(
+            &self.db,
+            SearchClientOptions {
+                enable_reload: false,
+                enable_warm: false,
+                strict_read_only: true,
+            },
+        )?
+        .context("canonical fixture archive")?;
+        client.set_semantic_artifacts_context(
+            context.embedder,
+            context.artifacts,
+            context.quality_artifact,
+            context.filter_maps,
+            context.roles,
+        )?;
+        Ok(client)
+    }
+
     fn new() -> AnyResult<Self> {
         let dir = tempfile::tempdir()?;
         let db = dir.path().join("agent_search.db");
@@ -302,6 +356,310 @@ impl Fixture {
         );
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn publish_external(
+    storage: &FrankenStorage,
+    root: &Path,
+    endpoint: &Endpoint,
+) -> AnyResult<SemanticManifest> {
+    use crate::indexer::semantic::{SemanticBackfillStoragePlan, SemanticIndexer};
+    let indexer =
+        SemanticIndexer::with_external_config(endpoint.config.clone(), Arc::new(|| false))?;
+    let mut manifest = SemanticManifest::load_or_default(root)?;
+    let outcome = indexer.run_backfill_from_storage(
+        storage,
+        root,
+        &mut manifest,
+        SemanticBackfillStoragePlan {
+            tier: TierKind::Quality,
+            db_fingerprint: crate::indexer::lexical_storage_fingerprint_for_storage(storage)?,
+            model_revision: endpoint.config.identity(),
+            max_conversations: 64,
+        },
+    )?;
+    assert!(outcome.published || outcome.unchanged);
+    Ok(manifest)
+}
+
+#[cfg(unix)]
+fn search_external(
+    client: &crate::search::query::SearchClient,
+) -> AnyResult<(
+    Vec<crate::search::query::SearchHit>,
+    SemanticCoverageSnapshot,
+)> {
+    use crate::search::query::{FieldMask, SearchFilters, SemanticTierMode};
+    let (hits, stats, coverage) = client.search_semantic_with_tier_and_coverage(
+        "private original admission corpus 1",
+        SearchFilters::default(),
+        10,
+        0,
+        FieldMask::FULL,
+        false,
+        SemanticTierMode::Single,
+    )?;
+    assert!(stats.is_none(), "external serving keeps exact retrieval");
+    Ok((hits, coverage.context("external coverage receipt")?))
+}
+
+#[cfg(unix)]
+#[test]
+fn certified_external_search_survives_append_and_adopts_completed_backfill() -> AnyResult<()> {
+    let fixture = Fixture::covered()?;
+    let retained = fixture.client()?;
+    let (initial, complete) = search_external(&retained)?;
+    assert_eq!(initial.len(), 2);
+    assert_eq!(complete.status, "complete");
+    let storage = FrankenStorage::open(&fixture.db)?;
+    add_conversation(&storage, 3)?;
+    drop(storage);
+
+    // Both a warm reader and a fresh admission keep the same verified subset.
+    // The new message has no vector in that generation and is not advertised.
+    for client in [&retained, &fixture.client()?] {
+        let (hits, partial) = search_external(client)?;
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|hit| !hit.content.ends_with("corpus 3")));
+        assert_eq!(partial.status, "partial");
+        assert_eq!(partial.generation, complete.generation);
+        assert!(partial.current_max_message_id > complete.current_max_message_id);
+        assert!(partial.current_mutation_seq > complete.current_mutation_seq);
+    }
+
+    let storage = FrankenStorage::open(&fixture.db)?;
+    publish_external(&storage, fixture.dir.path(), &fixture.endpoint)?;
+    drop(storage);
+    let (current, newer) = search_external(&fixture.client()?)?;
+    assert_eq!(current.len(), 3);
+    assert_eq!(newer.status, "complete");
+    assert_ne!(newer.generation, complete.generation);
+    let (old, old_receipt) = search_external(&retained)?;
+    assert_eq!(old.len(), 2, "publication cannot replace a retained reader");
+    assert_eq!(old_receipt.generation, complete.generation);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn certified_external_preflight_still_refuses_a_concurrent_archive_change() -> AnyResult<()> {
+    let fixture = Fixture::covered()?;
+    let db = fixture.db.clone();
+    fixture.endpoint.arm(move || {
+        let storage = FrankenStorage::open(&db)?;
+        add_conversation(&storage, 3)
+    });
+    assert_stale(&fixture.load(true), "canonical archive changed");
+    fixture.endpoint.assert_only_public_preflight();
+    // A new admission may explicitly accept the now-partial covered generation.
+    let setup = fixture.load(true);
+    let context = setup
+        .context
+        .context("retry should admit covered history")?;
+    assert_eq!(
+        context.artifacts[0].coverage_snapshot().unwrap().status,
+        "partial"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn certified_external_revisions_are_excluded_and_forget_fences_retained_readers() -> AnyResult<()> {
+    use crate::storage::sqlite::ForgetConversationsFilter;
+    let fixture = Fixture::covered()?;
+    let storage = FrankenStorage::open(&fixture.db)?;
+    let agent = storage.ensure_agent(&Agent {
+        id: None,
+        slug: "codebuff".into(),
+        name: "Codebuff".into(),
+        version: None,
+        kind: AgentKind::Cli,
+    })?;
+    let mut conversation = Conversation {
+        id: None,
+        agent_slug: "codebuff".into(),
+        workspace: None,
+        external_id: Some("external-revision".into()),
+        title: None,
+        source_path: "/fixture/external-revision.json".into(),
+        started_at: Some(1),
+        ended_at: Some(2),
+        approx_tokens: None,
+        metadata_json: json!({}),
+        source_id: "local".into(),
+        origin_host: None,
+        messages: vec![Message {
+            id: None,
+            idx: 0,
+            role: MessageRole::Agent,
+            author: None,
+            created_at: Some(1),
+            content: "private original admission corpus revision".into(),
+            extra_json: json!({
+                "id": "native-0", "codebuff_message_id": "native-0",
+                "variant": "ai", "isComplete": false,
+                "blocks": [{"type": "text", "content": "private original admission corpus revision"}]
+            }),
+            snippets: Vec::new(),
+        }],
+    };
+    storage.insert_conversation_tree_with_analytics(agent, None, &conversation, false)?;
+    publish_external(&storage, fixture.dir.path(), &fixture.endpoint)?;
+    drop(storage);
+    let retained = fixture.client()?;
+    assert_eq!(search_external(&retained)?.0.len(), 3);
+
+    conversation.messages[0].content = "a changed message has no published embedding".into();
+    conversation.messages[0].extra_json["isComplete"] = json!(true);
+    conversation.messages[0].extra_json["blocks"][0]["content"] =
+        json!(conversation.messages[0].content);
+    let storage = FrankenStorage::open(&fixture.db)?;
+    let revised =
+        storage.insert_conversation_tree_with_analytics(agent, None, &conversation, false)?;
+    assert_eq!(revised.updated_indices, vec![0]);
+    drop(storage);
+    for client in [&retained, &fixture.client()?] {
+        let (hits, coverage) = search_external(client)?;
+        assert_eq!(
+            hits.len(),
+            2,
+            "the old vector cannot return rewritten content"
+        );
+        assert!(hits.iter().all(|hit| hit.agent != "codebuff"));
+        assert!(coverage.excluded_candidates >= 1);
+        assert_eq!(coverage.status, "partial");
+    }
+
+    let storage = FrankenStorage::open(&fixture.db)?;
+    storage.forget_conversations(
+        &ForgetConversationsFilter {
+            source_paths: &["/fixture/admission-1.jsonl".to_owned()],
+            ..Default::default()
+        },
+        false,
+    )?;
+    assert!(storage.forget_derived_rebuild_pending()?);
+    drop(storage);
+    let error = search_external(&retained).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("forget-repair-pending"),
+        "covered serving must retain the canonical deletion privacy fence: {error:#}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn certified_external_checkpoint_keeps_the_completed_owner_available() -> AnyResult<()> {
+    let fixture = Fixture::covered()?;
+    let record = fixture.record.clone();
+    let saved = fixture.mutate_manifest(move |manifest| {
+        manifest.checkpoint = Some(checkpoint(
+            &record,
+            TierKind::Quality,
+            record.embedder_id.clone(),
+        ));
+    });
+    let setup = fixture.load(true);
+    let context = setup
+        .context
+        .context("covered generation must remain available")?;
+    assert_eq!(context.artifacts[0].index().record_count(), 2);
+    assert!(context.artifacts[0].coverage_certificate().is_some());
+    fixture.endpoint.assert_only_public_preflight();
+    fixture.assert_manifest_retained(&saved)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn certified_external_publication_replacement_during_preflight_is_refused() -> AnyResult<()> {
+    let fixture = Fixture::covered()?;
+    let id = fixture.endpoint.config.identity();
+    let saved = fixture.mutate_manifest(move |manifest| {
+        manifest.quality_tier.as_mut().unwrap().completed_at_ms += 1;
+        manifest.coverage.get_mut(&id).unwrap().published_at_ms += 1;
+    });
+    assert_stale(&fixture.load(true), "external_admission_changed");
+    fixture.endpoint.assert_only_public_preflight();
+    fixture.assert_manifest_retained(&saved)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn certified_external_damaged_proof_is_refused_before_http() -> AnyResult<()> {
+    let fixture = Fixture::covered()?;
+    let manifest = SemanticManifest::load_or_default(fixture.dir.path())?;
+    let certificate = manifest
+        .coverage
+        .get(&fixture.endpoint.config.identity())
+        .context("coverage certificate")?;
+    let changed = fixture.dir.path().join(&certificate.artifact_path);
+    let mut damaged = fs::read(&changed)?;
+    *damaged.last_mut().context("nonempty vector artifact")? ^= 1;
+    fs::write(&changed, &damaged)?;
+    let setup = fixture.load(true);
+    assert!(setup.context.is_none());
+    match setup.availability {
+        SemanticAvailability::LoadFailed { context } => {
+            assert!(context.contains("artifact digest mismatch"), "{context}");
+        }
+        other => panic!("wrong damaged-file refusal: {other:?}"),
+    }
+    assert!(fixture.endpoint.seen.lock().unwrap().is_empty());
+    assert_eq!(
+        fs::read(changed)?,
+        damaged,
+        "query must not repair artifacts"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn unchanged_legacy_external_backfill_upgrades_through_canonical_reconciliation() -> AnyResult<()> {
+    let fixture = Fixture::covered()?;
+    let id = fixture.endpoint.config.identity();
+    let mut manifest = SemanticManifest::load_or_default(fixture.dir.path())?;
+    let builder_path = vector_index_path(fixture.dir.path(), &id);
+    let record = manifest.quality_tier.as_mut().context("quality artifact")?;
+    record.index_path = builder_path
+        .strip_prefix(fixture.dir.path())?
+        .to_string_lossy()
+        .into_owned();
+    record.size_bytes = fs::metadata(&builder_path)?.len();
+    manifest.coverage.remove(&id);
+    manifest.save(fixture.dir.path())?;
+    let storage = FrankenStorage::open(&fixture.db)?;
+    let upgraded = publish_external(&storage, fixture.dir.path(), &fixture.endpoint)?;
+    let certificate = upgraded
+        .coverage
+        .get(&id)
+        .context("legacy certificate upgrade")?;
+    assert!(certificate.matches_artifact(upgraded.quality_tier.as_ref().unwrap()));
+    // Same canonical documents retain their vectors; publication must not send
+    // the unchanged corpus to the provider again merely to attach provenance.
+    fixture.endpoint.assert_only_public_preflight();
+    add_conversation(&storage, 3)?;
+    drop(storage);
+    let (hits, coverage) = search_external(&fixture.client()?)?;
+    assert_eq!(hits.len(), 2);
+    assert_eq!(coverage.status, "partial");
+    Ok(())
+}
+
+#[test]
+fn legacy_external_append_still_requires_certified_republication() -> AnyResult<()> {
+    let fixture = Fixture::new()?;
+    let storage = FrankenStorage::open(&fixture.db)?;
+    add_conversation(&storage, 2)?;
+    drop(storage);
+    assert_stale(&fixture.load(true), "canonical archive changed");
+    assert!(fixture.endpoint.seen.lock().unwrap().is_empty());
+    Ok(())
 }
 
 fn checkpoint(record: &ArtifactRecord, tier: TierKind, id: String) -> BuildCheckpoint {

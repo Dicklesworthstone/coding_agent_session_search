@@ -4360,8 +4360,7 @@ impl SemanticIndexer {
     ) -> Result<Option<(PathBuf, CompletedBackfillCache)>> {
         // An old skip hint cannot bootstrap a coverage certificate. Upgrade
         // once through canonical reconciliation while retaining its vectors.
-        if !crate::search::external_embedder::is_external_identity(self.embedder_id())
-            && storage.semantic_archive_state()?.is_some()
+        if storage.semantic_archive_state()?.is_some()
             && !manifest.coverage.contains_key(self.embedder_id())
         {
             return Ok(None);
