@@ -10574,7 +10574,7 @@ fn run_forget_command(
         }
         };
         storage
-            .rebuild_fts()
+            .rebuild_search_fallback_after_forget()
             .map_err(|e| derived_error(CliErrorKind::ArchiveFtsRebuild, "the FTS fallback", e))?;
         storage.rebuild_analytics().map_err(|e| {
             derived_error(
