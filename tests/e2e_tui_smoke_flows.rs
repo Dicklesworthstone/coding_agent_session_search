@@ -2874,7 +2874,12 @@ fn tui_pty_macro_recordings_omit_export_password_input() {
         fs::read_to_string(env.home.join("conversation-export.html")).expect("encrypted export");
     assert!(html.contains(r#"<div id="encrypted-content" hidden>"#));
     assert!(!html.contains("hello world"));
-    let macro_dir = env.xdg.join("coding-agent-search/macros");
+    let data_local = if cfg!(target_os = "macos") {
+        env.home.join("Library/Application Support")
+    } else {
+        env.xdg.clone()
+    };
+    let macro_dir = data_local.join("coding-agent-search/macros");
     let mut saved = fs::read_dir(macro_dir).expect("interactive macro directory");
     let interactive_macro = saved
         .next()

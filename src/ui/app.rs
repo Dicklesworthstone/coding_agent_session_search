@@ -11177,9 +11177,10 @@ impl CassApp {
     fn record_macro_event(&mut self, event: &super::ftui_adapter::Event, msg: &CassMsg) {
         use super::ftui_adapter::Event;
 
-        // Releases have no input semantics and can arrive after focus leaves the password field.
+        // A release may arrive after password focus moves. Revealing a password is interactive.
         if matches!(event, Event::Tick)
             || matches!(event, Event::Key(key) if key.kind == ftui::KeyEventKind::Release)
+            || matches!(msg, CassMsg::ExportPasswordVisibilityToggled)
         {
             return;
         }
@@ -13627,13 +13628,13 @@ impl CassApp {
             let display = if state.password_visible {
                 state.password.clone()
             } else {
-                "\u{2022}".repeat(state.password.len())
+                "\u{2022}".repeat(state.password.chars().count())
             };
             let cursor = if focused { "_" } else { "" };
             let vis_hint = if state.password_visible {
-                "(Ctrl+H hide)"
+                "(Alt+X hide)"
             } else {
-                "(Ctrl+H show)"
+                "(Alt+X show)"
             };
             let line = format!("     Password: {display}{cursor} {vis_hint}");
             let row_style = if focused { accent_style } else { text_style };
@@ -14741,6 +14742,8 @@ pub enum CassMsg {
     },
     /// Toggle an export modal checkbox.
     ExportFieldToggled(crate::ui::components::export_modal::ExportField),
+    /// Temporarily show or hide the focused export password.
+    ExportPasswordVisibilityToggled,
     /// Move focus within the export modal.
     ExportFocusMoved { forward: bool },
     /// Execute the export.
@@ -16330,6 +16333,9 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::Char('e') if ctrl && shift => CassMsg::ExportMarkdownExecuted,
                     KeyCode::Char('E') if ctrl && shift => CassMsg::ExportMarkdownExecuted,
                     KeyCode::Char('e') if ctrl => CassMsg::ExportModalOpened,
+                    KeyCode::Char('x' | 'X') if alt && !ctrl => {
+                        CassMsg::ExportPasswordVisibilityToggled
+                    }
 
                     // -- Clipboard ------------------------------------------------
                     KeyCode::Char('Y') if ctrl => CassMsg::CopyQuery,
@@ -16610,11 +16616,9 @@ impl super::ftui_adapter::Model for CassApp {
                     state.toggle_current();
                     return ftui::Cmd::none();
                 }
-                CassMsg::QueryChanged(text) => {
-                    // Non-editing mode: check for Ctrl+H (password visibility toggle).
-                    if text == "\x08" {
-                        state.toggle_password_visibility();
-                    }
+                CassMsg::QueryChanged(_) => return ftui::Cmd::none(),
+                CassMsg::ExportPasswordVisibilityToggled => {
+                    state.toggle_password_visibility();
                     return ftui::Cmd::none();
                 }
                 CassMsg::QuerySubmitted | CassMsg::DetailOpened => {
@@ -19565,6 +19569,8 @@ impl super::ftui_adapter::Model for CassApp {
             }
             // Delivered before modal input routing.
             CassMsg::ExportTaskFinished { .. } => ftui::Cmd::none(),
+            // Only the active form accepts this shortcut.
+            CassMsg::ExportPasswordVisibilityToggled => ftui::Cmd::none(),
 
             // -- Screenshot export --------------------------------------------
             CassMsg::ScreenshotRequested(format) => {
@@ -45738,6 +45744,53 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         let _ = app.update(CassMsg::MacroRecordingToggled);
         assert!(app.macro_recorder.is_some());
         assert!(app.status.contains("Recording"));
+    }
+
+    #[test]
+    fn export_password_visibility_keeps_backspace_and_resets_mask() {
+        use ftui::core::input_parser::InputParser;
+
+        let send = |app: &mut CassApp, bytes: &[u8]| {
+            for event in InputParser::new().parse(bytes) {
+                let _ = app.update(CassMsg::from(event));
+            }
+        };
+        let mut app = app_with_hits(1);
+        let _ = app.update(CassMsg::MacroRecordingToggled);
+        let _ = app.update(CassMsg::ExportModalOpened);
+        let _ = app.update(CassMsg::ExportFieldToggled(ExportField::Encrypt));
+        send(&mut app, b"\x1bx\t\t\t");
+        let state = app.export_modal_state.as_ref().expect("open export form");
+        assert_eq!(state.focused, ExportField::Password);
+        assert!(!state.password_visible);
+
+        send(&mut app, b"qa\x1bx\x08");
+        let state = app.export_modal_state.as_ref().expect("open export form");
+        assert_eq!(state.password, "q");
+        assert!(state.password_visible);
+        assert_eq!(
+            app.macro_recorder
+                .as_ref()
+                .expect("recording")
+                .event_count(),
+            3
+        );
+
+        send(&mut app, b"\x1bx");
+        let state = app.export_modal_state.as_ref().expect("open export form");
+        assert!(!state.password_visible);
+        send(&mut app, b"\x1bx\t\x1b[Z"); // Reveal, Tab, Shift+Tab.
+        let state = app.export_modal_state.as_ref().expect("open export form");
+        assert_eq!(state.focused, ExportField::Password);
+        assert!(!state.password_visible);
+
+        send(&mut app, b"\x1bx");
+        let _ = app.update(CassMsg::ExportFieldToggled(ExportField::Encrypt));
+        let _ = app.update(CassMsg::ExportFieldToggled(ExportField::Encrypt));
+        let state = app.export_modal_state.as_ref().expect("open export form");
+        assert!(state.encrypt);
+        assert!(!state.password_visible);
+        assert!(state.password.is_empty());
     }
 
     #[test]

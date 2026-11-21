@@ -358,11 +358,13 @@ impl ExportModalState {
     /// Navigate to next field.
     pub fn next_field(&mut self) {
         self.focused = self.focused.next(self.encrypt);
+        self.password_visible = false;
     }
 
     /// Navigate to previous field.
     pub fn prev_field(&mut self) {
         self.focused = self.focused.prev(self.encrypt);
+        self.password_visible = false;
     }
 
     /// Toggle the current checkbox field or start editing text fields.
@@ -382,6 +384,7 @@ impl ExportModalState {
                 self.encrypt = !self.encrypt;
                 if !self.encrypt {
                     self.password.clear();
+                    self.password_visible = false;
                 }
             }
             ExportField::ShowTimestamps => self.show_timestamps = !self.show_timestamps,
@@ -420,7 +423,9 @@ impl ExportModalState {
 
     /// Toggle password visibility.
     pub fn toggle_password_visibility(&mut self) {
-        self.password_visible = !self.password_visible;
+        if self.encrypt && matches!(self.focused, ExportField::Password) {
+            self.password_visible = !self.password_visible;
+        }
     }
 
     /// Add character to password.
