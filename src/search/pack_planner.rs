@@ -376,6 +376,8 @@ fn match_type_robot_name(match_type: MatchType) -> &'static str {
         MatchType::Substring => "substring",
         MatchType::Wildcard => "wildcard",
         MatchType::ImplicitWildcard => "implicit_wildcard",
+        MatchType::SemanticTitle => "semantic_title",
+        MatchType::SemanticTitleBody => "semantic_title_body",
     }
 }
 

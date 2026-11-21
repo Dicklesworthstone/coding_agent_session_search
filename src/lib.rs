@@ -10670,10 +10670,13 @@ fn run_forget_command(
         }
         };
         forget_phase("fallback-fts");
-        fallback_fts =
-            Some(storage.rebuild_search_fallback_after_forget().map_err(|e| {
-                derived_error(CliErrorKind::ArchiveFtsRebuild, "the FTS fallback", e)
-            })?);
+        fallback_fts = Some(
+            storage
+                .rebuild_search_fallback_after_forget()
+                .map_err(|e| {
+                    derived_error(CliErrorKind::ArchiveFtsRebuild, "the FTS fallback", e)
+                })?,
+        );
         forget_phase("analytics");
         storage.rebuild_analytics().map_err(|e| {
             derived_error(
@@ -33597,6 +33600,33 @@ struct CliSearchSetup {
     rebuild_active: bool,
 }
 
+fn title_search_config_from_env() -> CliResult<crate::search::title_fusion::TitleSearchConfig> {
+    crate::search::title_fusion::TitleSearchConfig::from_env().map_err(|error| CliError {
+        code: 2,
+        kind: CliErrorKind::Usage.kind_str(),
+        message: format!("Invalid title search configuration: {error}"),
+        hint: Some("Check CASS_SEMANTIC_TITLES and CASS_TITLE_* settings".into()),
+        retryable: false,
+    })
+}
+
+/// Privacy refusals are authoritative across every search mode. In particular,
+/// `privacy-state-unavailable` must not match the ordinary semantic-unavailable
+/// fallback and silently turn into a lexical answer.
+fn privacy_search_cli_error(error: &anyhow::Error) -> Option<CliError> {
+    let privacy = error.downcast_ref::<crate::search::privacy::PrivacyError>()?;
+    Some(CliError {
+        code: 9,
+        kind: privacy.kind(),
+        message: privacy.to_string(),
+        hint: None,
+        retryable: matches!(
+            privacy,
+            crate::search::privacy::PrivacyError::SnapshotInvalidated { .. }
+        ),
+    })
+}
+
 fn empty_search_result() -> crate::search::query::SearchResult {
     crate::search::query::SearchResult {
         hits: Vec::new(),
@@ -33605,6 +33635,7 @@ fn empty_search_result() -> crate::search::query::SearchResult {
         suggestions: Vec::new(),
         ann_stats: None,
         ann_unavailable_reason: None,
+        title_search: None,
         total_count: None,
     }
 }
@@ -33712,8 +33743,8 @@ fn execute_search_operation(
                 }
             })?,
         SearchMode::Semantic => {
-            let (hits, ann_stats, semantic_coverage) = client
-                .search_semantic_with_tier_and_coverage(
+            let outcome = client
+                .search_semantic_with_metadata(
                     &query,
                     filters.clone(),
                     search_limit,
@@ -33723,6 +33754,9 @@ fn execute_search_operation(
                     semantic_execution_tier,
                 )
                 .map_err(|error| {
+                    if let Some(privacy) = privacy_search_cli_error(&error) {
+                        return privacy;
+                    }
                     let message = error.to_string();
                     if message.contains("HNSW index") {
                         CliError {
@@ -33760,7 +33794,7 @@ fn execute_search_operation(
                         }
                     }
                 })?;
-            mode_meta.semantic_coverage = semantic_coverage;
+            mode_meta.semantic_coverage = outcome.coverage;
             let ann_unavailable_reason = if approximate {
                 client
                     .ann_unavailability_reason()
@@ -33778,12 +33812,13 @@ fn execute_search_operation(
                 None
             };
             crate::search::query::SearchResult {
-                hits,
+                hits: outcome.hits,
                 wildcard_fallback: false,
                 cache_stats: crate::search::query::CacheStats::default(),
                 suggestions: Vec::new(),
-                ann_stats,
+                ann_stats: outcome.ann_stats,
                 ann_unavailable_reason,
+                title_search: outcome.titles,
                 total_count: None,
             }
         }
@@ -33802,6 +33837,9 @@ fn execute_search_operation(
                 result
             }
             Err(error) => {
+                if let Some(privacy) = privacy_search_cli_error(&error) {
+                    return Err(privacy);
+                }
                 let message = error.to_string();
                 if hybrid_fail_open
                     && (message.contains("unavailable") || message.contains("no embedder"))
@@ -33882,6 +33920,7 @@ fn configure_bounded_search_semantics(
     use std::sync::Arc;
 
     maybe_test_search_worker_delay("CASS_TEST_SEARCH_SEMANTIC_SETUP_SLOW_MS");
+    let title_config = title_search_config_from_env()?;
 
     let registry = EmbedderRegistry::new(&data_dir);
     let env_model = dotenvy::var("CASS_SEMANTIC_EMBEDDER")
@@ -33999,6 +34038,9 @@ fn configure_bounded_search_semantics(
             filter_maps,
             roles,
         ) {
+            if let Some(privacy) = privacy_search_cli_error(&error) {
+                return Err(privacy);
+            }
             let hint = if prefer_hash {
                 "Run 'cass index --semantic --embedder hash' to rebuild the hash vector index, or omit --mode semantic when lexical evidence is acceptable"
                     .to_string()
@@ -34018,6 +34060,16 @@ fn configure_bounded_search_semantics(
                     retryable: false,
                 });
             }
+        } else {
+            client
+                .set_title_search_config(&data_dir, title_config)
+                .map_err(|error| CliError {
+                    code: 9,
+                    kind: CliErrorKind::Search.kind_str(),
+                    message: format!("Failed to configure title search: {error}"),
+                    hint: None,
+                    retryable: true,
+                })?;
         }
     } else {
         let _ = client.clear_semantic_context();
@@ -34752,6 +34804,7 @@ fn run_cli_search(
     };
 
     if execute_semantic {
+        let title_config = title_search_config_from_env()?;
         maybe_test_search_worker_delay("CASS_TEST_SEARCH_DIRECT_SEMANTIC_SETUP_SLOW_MS");
         // Use embedder registry for model selection (bd-2mbe).
 
@@ -34864,6 +34917,9 @@ fn run_cli_search(
                 filter_maps,
                 roles,
             ) {
+                if let Some(privacy) = privacy_search_cli_error(&err) {
+                    return Err(privacy);
+                }
                 let hint = if prefer_hash {
                     "Run 'cass index --semantic --embedder hash' to rebuild the hash vector index, or omit --mode semantic when lexical evidence is acceptable"
                         .to_string()
@@ -34883,6 +34939,16 @@ fn run_cli_search(
                         retryable: false,
                     });
                 }
+            } else {
+                client
+                    .set_title_search_config(&data_dir, title_config)
+                    .map_err(|error| CliError {
+                        code: 9,
+                        kind: CliErrorKind::Search.kind_str(),
+                        message: format!("Failed to configure title search: {error}"),
+                        hint: None,
+                        retryable: true,
+                    })?;
             }
         } else {
             let _ = client.clear_semantic_context();
@@ -35102,8 +35168,8 @@ fn run_cli_search(
                 // frankensearch/native backend, so semantic availability is a
                 // runtime question (model/vector assets), not a compile-time one.
                 {
-                    let (hits, ann_stats, semantic_coverage) = client
-                    .search_semantic_with_tier_and_coverage(
+                    let outcome = client
+                    .search_semantic_with_metadata(
                         query,
                         filters.clone(),
                         search_limit,
@@ -35113,6 +35179,9 @@ fn run_cli_search(
                         semantic_execution_tier,
                     )
                     .map_err(|e| {
+                        if let Some(privacy) = privacy_search_cli_error(&e) {
+                            return privacy;
+                        }
                         let err_str = e.to_string();
                         if err_str.contains("HNSW index") {
                             CliError {
@@ -35152,7 +35221,7 @@ fn run_cli_search(
                             }
                         }
                     })?;
-                    mode_meta.semantic_coverage = semantic_coverage;
+                    mode_meta.semantic_coverage = outcome.coverage;
                     let ann_unavailable_reason = if approximate {
                         client.ann_unavailability_reason().map_err(|e| CliError {
                             code: 9,
@@ -35168,12 +35237,13 @@ fn run_cli_search(
                         None
                     };
                     crate::search::query::SearchResult {
-                        hits,
+                        hits: outcome.hits,
                         wildcard_fallback: false,
                         cache_stats: crate::search::query::CacheStats::default(),
                         suggestions: Vec::new(),
-                        ann_stats,
+                        ann_stats: outcome.ann_stats,
                         ann_unavailable_reason,
+                        title_search: outcome.titles,
                         total_count: None,
                     }
                 }
@@ -35193,6 +35263,9 @@ fn run_cli_search(
                     result
                 }
                 Err(e) => {
+                    if let Some(privacy) = privacy_search_cli_error(&e) {
+                        return Err(privacy);
+                    }
                     let err_str = e.to_string();
                     if hybrid_fail_open
                         && (err_str.contains("unavailable") || err_str.contains("no embedder"))
@@ -35394,6 +35467,7 @@ fn run_cli_search(
                             suggestions: result.suggestions,
                             ann_stats: result.ann_stats,
                             ann_unavailable_reason: result.ann_unavailable_reason,
+                            title_search: result.title_search,
                             total_count: result.total_count,
                         }
                     }
@@ -35468,6 +35542,7 @@ fn run_cli_search(
                 suggestions: result.suggestions.clone(),
                 ann_stats: result.ann_stats.clone(),
                 ann_unavailable_reason: result.ann_unavailable_reason,
+                title_search: result.title_search.clone(),
                 total_count: result.total_count,
             };
             let has_more = total > offset_val + display.hits.len();
@@ -35495,6 +35570,7 @@ fn run_cli_search(
                 suggestions: result.suggestions.clone(),
                 ann_stats: result.ann_stats.clone(),
                 ann_unavailable_reason: result.ann_unavailable_reason,
+                title_search: result.title_search.clone(),
                 total_count: result.total_count,
             };
             (Aggregations::default(), display, total, has_more, false)
@@ -35523,6 +35599,7 @@ fn run_cli_search(
                 suggestions: result.suggestions,
                 ann_stats: result.ann_stats,
                 ann_unavailable_reason: result.ann_unavailable_reason,
+                title_search: result.title_search,
                 total_count: result.total_count,
             };
             (
@@ -39189,8 +39266,12 @@ fn output_robot_results(
     if coverage_on_diagnostics && let Some(coverage) = &search_mode_meta.semantic_coverage {
         eprintln!("{}", serde_json::json!({"semantic_coverage": coverage}));
     }
-    let include_meta =
-        include_meta || (search_mode_meta.semantic_coverage.is_some() && !coverage_on_diagnostics);
+    if coverage_on_diagnostics && let Some(titles) = &result.title_search {
+        eprintln!("{}", serde_json::json!({"title_search": titles}));
+    }
+    let include_meta = include_meta
+        || ((search_mode_meta.semantic_coverage.is_some() || result.title_search.is_some())
+            && !coverage_on_diagnostics);
 
     if matches!(format, RobotFormat::Sessions) {
         // Output unique session paths only, one per line.
@@ -39807,6 +39888,9 @@ fn output_robot_results(
                 if let Some(coverage) = &search_mode_meta.semantic_coverage {
                     meta["semantic_coverage"] = serde_json::json!(coverage);
                 }
+                if let Some(titles) = &result.title_search {
+                    meta["title_search"] = serde_json::json!(titles);
+                }
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
                 {
@@ -39961,6 +40045,9 @@ fn output_robot_results(
                 });
                 if let Some(coverage) = &search_mode_meta.semantic_coverage {
                     meta["_meta"]["semantic_coverage"] = serde_json::json!(coverage);
+                }
+                if let Some(titles) = &result.title_search {
+                    meta["_meta"]["title_search"] = serde_json::json!(titles);
                 }
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut outer) = meta
@@ -40184,6 +40271,9 @@ fn output_robot_results(
                 if let Some(coverage) = &search_mode_meta.semantic_coverage {
                     meta["semantic_coverage"] = serde_json::json!(coverage);
                 }
+                if let Some(titles) = &result.title_search {
+                    meta["title_search"] = serde_json::json!(titles);
+                }
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
                 {
@@ -40370,6 +40460,9 @@ fn output_robot_results(
                 });
                 if let Some(coverage) = &search_mode_meta.semantic_coverage {
                     meta["semantic_coverage"] = serde_json::json!(coverage);
+                }
+                if let Some(titles) = &result.title_search {
+                    meta["title_search"] = serde_json::json!(titles);
                 }
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -106016,6 +106109,7 @@ fn response_schema_search_meta() -> serde_json::Value {
         // Truthful refinement level + typed fallback reason (bead .5.4).
         ("refinement_level", serde_json::json!({ "type": "string" })),
         ("semantic_coverage", response_schema_semantic_coverage()),
+        ("title_search", response_schema_opaque_object()),
         (
             "semantic_fallback_reason",
             serde_json::json!({ "type": ["string", "null"] }),
@@ -130393,17 +130487,26 @@ fn run_models_backfill(
                     previous.get("last_offset") != report.get("last_offset")
                         || previous.get("conversations_processed")
                             != report.get("conversations_processed")
+                        || previous.pointer("/titles/bootstrap_after")
+                            != report.pointer("/titles/bootstrap_after")
+                        || previous.pointer("/titles/journal_cursor")
+                            != report.pointer("/titles/journal_cursor")
+                        || previous.pointer("/titles/title_mutation_seq")
+                            != report.pointer("/titles/title_mutation_seq")
                 });
                 // Paused/disabled scheduler reports have no admitted batch.
                 if report.get("conversations_processed").is_some() {
                     completed += 1;
                     last_completed_batch = Some(report.clone());
                 }
-                let continue_backfill = report.get("checkpoint_saved")
+                let body_pending = report.get("checkpoint_saved")
                     == Some(&serde_json::Value::Bool(true))
                     && report.get("published") != Some(&serde_json::Value::Bool(true))
-                    && report.get("unchanged") != Some(&serde_json::Value::Bool(true))
-                    && made_progress;
+                    && report.get("unchanged") != Some(&serde_json::Value::Bool(true));
+                let titles_pending = report.pointer("/titles/complete")
+                    == Some(&serde_json::Value::Bool(false))
+                    && report.pointer("/titles/published") == Some(&serde_json::Value::Bool(true));
+                let continue_backfill = (body_pending || titles_pending) && made_progress;
                 last_report = Some(report);
                 // Still honor a signal delivered during the final batch.
                 if !continue_backfill && exit_code().is_none() {
@@ -130486,6 +130589,14 @@ fn run_models_backfill(
                 }
             }
         }
+        if let Some(titles) = batch.get("titles") {
+            if let Some(indexed) = titles.get("indexed_titles") {
+                println!("  Indexed titles: {indexed}");
+            }
+            if let Some(complete) = titles.get("complete") {
+                println!("  Title coverage complete: {complete}");
+            }
+        }
         if let Some(next_step) = report.get("next_step").and_then(serde_json::Value::as_str) {
             println!("  {next_step}");
         }
@@ -130557,6 +130668,17 @@ fn run_models_backfill_batch(
             TierKind::Quality => resolve_semantic_index_embedder(None),
         });
     let external = crate::search::embedder_registry::selects_external(Some(&embedder_type));
+    let title_config = title_search_config_from_env()?;
+    if title_config.enabled && external {
+        return Err(CliError {
+            code: 2,
+            kind: CliErrorKind::Usage.kind_str(),
+            message: "Title indexing requires the same native or hash embedder as body search"
+                .into(),
+            hint: Some("Use a local embedder or disable CASS_SEMANTIC_TITLES".into()),
+            retryable: false,
+        });
+    }
     if external && tier != TierKind::Quality {
         return Err(CliError {
             code: 2,
@@ -130725,6 +130847,22 @@ fn run_models_backfill_batch(
         hint: Some("Run 'cass health --json' to inspect the archive database".into()),
         retryable: true,
     })?;
+    let title_scope_ready = if title_config.enabled {
+        let setup = if scheduled_manifest.is_some() {
+            crate::indexer::semantic::title_scope_index_ready(&storage)
+        } else {
+            crate::indexer::semantic::prepare_title_scope_index(&storage).map(|_| true)
+        };
+        setup.map_err(|error| CliError {
+            code: 5,
+            kind: CliErrorKind::SemanticBackfill.kind_str(),
+            message: format!("Title indexing setup failed: {error:#}"),
+            hint: Some("Run explicit semantic indexing with CASS_SEMANTIC_TITLES=1".into()),
+            retryable: true,
+        })?
+    } else {
+        false
+    };
     // A corrupt external ledger is not permission to discard durable progress.
     let mut manifest = if let Some(manifest) = scheduled_manifest {
         Ok(manifest)
@@ -130927,6 +131065,30 @@ fn run_models_backfill_batch(
         })?;
     }
 
+    // Titles share this admitted model and cancellation lifetime. Their own
+    // cursor advances by the same bounded conversation budget, even when the
+    // body generation was already complete before titles were enabled.
+    let title_outcome = if title_scope_ready {
+        Some(
+            crate::indexer::semantic::maintain_title_index(
+                indexer,
+                &storage,
+                &data_dir,
+                effective_batch_conversations
+                    .min(crate::indexer::semantic::TITLE_MAX_BATCH_CONVERSATIONS),
+            )
+            .map_err(|error| CliError {
+                code: 5,
+                kind: CliErrorKind::SemanticBackfill.kind_str(),
+                message: format!("Title backfill failed: {error:#}"),
+                hint: Some("Rerun the same command to resume the durable title cursor".into()),
+                retryable: true,
+            })?,
+        )
+    } else {
+        None
+    };
+
     let progress_pct = outcome.progress_pct();
     let status = if outcome.unchanged {
         "unchanged"
@@ -130937,7 +131099,14 @@ fn run_models_backfill_batch(
     } else {
         "idle"
     };
-    let next_step = if outcome.published {
+    let next_step = if title_config.enabled && !title_scope_ready {
+        "run foreground semantic indexing with CASS_SEMANTIC_TITLES=1 to prepare title retrieval"
+    } else if title_outcome
+        .as_ref()
+        .is_some_and(|titles| !titles.complete)
+    {
+        "rerun the same command to continue the resumable title backfill"
+    } else if outcome.published {
         "semantic tier is ready"
     } else if outcome.checkpoint_saved {
         "rerun the same command to continue the resumable backfill"
@@ -130950,7 +131119,7 @@ fn run_models_backfill_batch(
         "quality_tier_processed": manifest.backlog.quality_tier_processed,
         "computed_at_ms": manifest.backlog.computed_at_ms,
     });
-    Ok(serde_json::json!({
+    let mut report = serde_json::json!({
         "status": status,
         "next_step": next_step,
         "tier": outcome.tier.as_str(),
@@ -130971,7 +131140,17 @@ fn run_models_backfill_batch(
         "index_path": outcome.index_path.display().to_string(),
         "manifest_path": outcome.manifest_path.display().to_string(),
         "backlog": backlog,
-    }))
+    });
+    if let Some(titles) = title_outcome {
+        report["titles"] = serde_json::json!(titles);
+    } else if title_config.enabled {
+        report["titles"] = serde_json::json!({
+            "complete": false,
+            "published": false,
+            "status": "needs_setup",
+        });
+    }
+    Ok(report)
 }
 
 #[cfg(test)]

@@ -3567,6 +3567,8 @@ impl ResultItem {
             MatchType::Substring => "substr",
             MatchType::Wildcard => "wild",
             MatchType::ImplicitWildcard => "auto",
+            MatchType::SemanticTitle => "title",
+            MatchType::SemanticTitleBody => "title+body",
         }
     }
 
@@ -3831,7 +3833,9 @@ impl RenderItem for ResultItem {
         let source_is_remote = self.source_kind() == "remote";
         let match_chip_style = match hit.match_type {
             MatchType::Exact => self.success_style.bold(),
-            MatchType::Prefix => self.score_style.bold(),
+            MatchType::Prefix | MatchType::SemanticTitle | MatchType::SemanticTitleBody => {
+                self.score_style.bold()
+            }
             MatchType::ImplicitWildcard
             | MatchType::Wildcard
             | MatchType::Suffix
@@ -7564,6 +7568,12 @@ impl CassApp {
             ) {
                 tracing::debug!(error = %err, "tui semantic context unavailable");
                 let _ = client.clear_semantic_context();
+            } else {
+                let titles = crate::search::title_fusion::TitleSearchConfig::from_env()
+                    .map_err(|error| format!("Invalid title search configuration: {error}"))?;
+                client
+                    .set_title_search_config(&self.data_dir, titles)
+                    .map_err(|error| format!("Title search unavailable: {error}"))?;
             }
         } else {
             let _ = client.clear_semantic_context();
@@ -8704,17 +8714,19 @@ impl CassApp {
         let mut exact = 0usize;
         let mut prefix = 0usize;
         let mut fuzzy = 0usize;
+        let mut title = 0usize;
         for hit in self.filtered_result_hits_for_stats() {
             match hit.match_type {
                 MatchType::Exact => exact += 1,
                 MatchType::Prefix => prefix += 1,
+                MatchType::SemanticTitle | MatchType::SemanticTitleBody => title += 1,
                 MatchType::ImplicitWildcard
                 | MatchType::Wildcard
                 | MatchType::Suffix
                 | MatchType::Substring => fuzzy += 1,
             }
         }
-        let total_match_kinds = exact + prefix + fuzzy;
+        let total_match_kinds = exact + prefix + fuzzy + title;
         let mix_token = if total_match_kinds == 0 {
             "···".to_string()
         } else {
@@ -8727,7 +8739,17 @@ impl CassApp {
                 let idx = (ratio * (BLOCKS.len() - 1) as f64).round() as usize;
                 BLOCKS[idx.min(BLOCKS.len() - 1)]
             };
-            format!("{}{}{}", level(exact), level(prefix), level(fuzzy))
+            if title > 0 {
+                format!(
+                    "{}{}{}{}",
+                    level(exact),
+                    level(prefix),
+                    level(fuzzy),
+                    level(title)
+                )
+            } else {
+                format!("{}{}{}", level(exact), level(prefix), level(fuzzy))
+            }
         };
         let mix_style = if total_match_kinds == 0 {
             value_s
@@ -9769,6 +9791,8 @@ impl CassApp {
             MatchType::Wildcard => ("wildcard", warning_style),
             MatchType::Suffix => ("suffix", muted_style),
             MatchType::Substring => ("substring", muted_style),
+            MatchType::SemanticTitle => ("title", info_style.bold()),
+            MatchType::SemanticTitleBody => ("title+body", info_style.bold()),
         };
         let top_lanes = vec![
             FooterHudLane {
@@ -16044,9 +16068,14 @@ impl SearchService for TantivySearchService {
                     .map(|result| (result, None))
                     .map_err(|e| e.to_string()),
                 SearchMode::Semantic => {
-                    let (hits, ann_stats, coverage) = self
+                    let crate::search::query::SemanticSearchOutcome {
+                        hits,
+                        ann_stats,
+                        coverage,
+                        titles: title_search,
+                    } = self
                         .client
-                        .search_semantic_with_tier_and_coverage(
+                        .search_semantic_with_metadata(
                             &params.query,
                             params.filters.clone(),
                             limit,
@@ -16065,6 +16094,7 @@ impl SearchService for TantivySearchService {
                             ann_stats,
                             ann_unavailable_reason: None,
                             total_count: None,
+                            title_search,
                         },
                         coverage,
                     ))
@@ -16090,7 +16120,10 @@ impl SearchService for TantivySearchService {
         // An explicit Semantic request must preserve the backend failure.
         let (backend, semantic_coverage) = match execute_mode(requested_mode) {
             Ok(result) => result,
-            Err(err) if matches!(requested_mode, SearchMode::Hybrid) => {
+            Err(err)
+                if matches!(requested_mode, SearchMode::Hybrid)
+                    && !crate::search::privacy::is_privacy_error_message(&err) =>
+            {
                 execute_mode(SearchMode::Lexical).map_err(|fallback_err| {
                     format!("search failed ({err}); lexical fallback failed: {fallback_err}")
                 })?

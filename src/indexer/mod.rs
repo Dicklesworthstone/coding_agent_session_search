@@ -20268,6 +20268,9 @@ fn run_index_with_storage_ownership(
         }
     }
 
+    // Retain one local model through body publication and optional title
+    // maintenance, including a one-shot delta followed by title catch-up.
+    let mut retained_semantic_model = None;
     // Semantic indexing (if enabled)
     if opts.semantic && targeted_semantic_watch_once {
         tracing::info!(
@@ -20275,6 +20278,11 @@ fn run_index_with_storage_ownership(
             "deferring broad semantic indexing until targeted watch-once ingest completes"
         );
     } else if opts.semantic {
+        let title_config = crate::search::title_fusion::TitleSearchConfig::from_env()?;
+        anyhow::ensure!(
+            !title_config.enabled || semantic_local_embedder_metadata(&opts.embedder).is_some(),
+            "title indexing requires the same native or hash embedder as body search"
+        );
         let semantic_identity_tier = semantic_identity_tier_for_requested_embedder(&opts.embedder);
         let semantic_identity_rebuild_required = storage
             .semantic_identity_rebuild_required(semantic_identity_tier)
@@ -20352,7 +20360,12 @@ fn run_index_with_storage_ownership(
             );
             let delta_started_at_ms = semantic_indexing_now_ms();
             let storage_cell = Mutex::new(storage);
-            let outcome = incremental_semantic_embed(&opts.embedder, &opts.data_dir, &storage_cell);
+            let outcome = incremental_semantic_embed_retained(
+                &opts.embedder,
+                &opts.data_dir,
+                &storage_cell,
+                &mut retained_semantic_model,
+            );
             storage = storage_cell
                 .into_inner()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -20455,7 +20468,11 @@ fn run_index_with_storage_ownership(
             );
             tracing::info!(embedder = %opts.embedder, "starting semantic indexing");
 
-            let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
+            let semantic_indexer = retained_local_semantic_indexer(
+                &mut retained_semantic_model,
+                &opts.embedder,
+                &opts.data_dir,
+            )?;
             let mut semantic_manifest_published = false;
             set_semantic_phase("semantic:replay");
             set_semantic_progress_phase(
@@ -20612,6 +20629,42 @@ fn run_index_with_storage_ownership(
             }
             update_semantic_progress(opts.progress.as_ref(), &progress_bump, 1, 1);
         }
+        if title_config.enabled {
+            index_run_lock.set_phase(initial_lock_mode, "semantic:titles")?;
+            persist::with_ephemeral_writer(
+                &storage,
+                false,
+                "preparing optional title retrieval",
+                |writer| semantic::prepare_title_scope_index(writer).map(|_| ()),
+            )?;
+            let (embedder_id, _) = semantic_local_embedder_metadata(&opts.embedder)
+                .context("title indexing requires a native or hash embedder")?;
+            if semantic::title_maintenance_needed(&storage, &opts.data_dir, &embedder_id)? {
+                let indexer = retained_local_semantic_indexer(
+                    &mut retained_semantic_model,
+                    &opts.embedder,
+                    &opts.data_dir,
+                )?;
+                loop {
+                    let outcome = semantic::maintain_title_index(
+                        indexer,
+                        &storage,
+                        &opts.data_dir,
+                        semantic::TITLE_MAX_BATCH_CONVERSATIONS,
+                    )?;
+                    tracing::info!(
+                        complete = outcome.complete,
+                        examined = outcome.examined_conversations,
+                        embedded = outcome.embedded_titles,
+                        indexed_titles = outcome.indexed_titles,
+                        "published optional semantic title coverage"
+                    );
+                    if outcome.complete {
+                        break;
+                    }
+                }
+            }
+        }
         // The embedding watermark can skip the bulk pass, or the delta path
         // can publish a replacement generation. Both still owe explicitly
         // requested graph maintenance, after the exact artifact is published.
@@ -20653,8 +20706,12 @@ fn run_index_with_storage_ownership(
                 }
                 let delta_started_at_ms = semantic_indexing_now_ms();
                 let storage_cell = Mutex::new(storage);
-                let outcome =
-                    incremental_semantic_embed(&opts.embedder, &opts.data_dir, &storage_cell);
+                let outcome = incremental_semantic_embed_retained(
+                    &opts.embedder,
+                    &opts.data_dir,
+                    &storage_cell,
+                    &mut retained_semantic_model,
+                );
                 storage = storage_cell
                     .into_inner()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -20693,6 +20750,28 @@ fn run_index_with_storage_ownership(
             ),
         }
     }
+
+    if !opts.semantic
+        && BACKGROUND_SEMANTIC_DELTA_ENABLED.load(Ordering::Relaxed)
+        && !opts.full
+        && !opts.watch
+        && !targeted_semantic_watch_once
+        && opts.embedder != "external"
+        && let Err(error) = maintain_routine_titles(
+            &opts.embedder,
+            &opts.data_dir,
+            &storage,
+            &mut retained_semantic_model,
+        )
+    {
+        tracing::warn!(
+            error = %error,
+            "optional title maintenance deferred; retry explicit semantic indexing"
+        );
+    }
+    // A watch run continues for the lifetime of the process. Release the
+    // one-shot model before entering that loop or doing unrelated maintenance.
+    drop(retained_semantic_model);
 
     if targeted_watch_once_only_run {
         tracing::info!(
@@ -22872,6 +22951,14 @@ fn run_targeted_semantic_watch_once_publish(
         }
     }
 
+    let mut retained = Some(indexer);
+    let guard = storage.lock().map_err(|error| {
+        anyhow::anyhow!("lock title maintenance after semantic watch-once: {error}")
+    })?;
+    if let Err(error) = maintain_routine_titles(embedder, data_dir, &guard, &mut retained) {
+        tracing::warn!(error = %error, "optional watch-once title maintenance deferred");
+    }
+
     Ok(SemanticWatchOnceStats {
         published: true,
         selected_docs,
@@ -23037,6 +23124,53 @@ fn finalize_one_shot_semantic_delta(
     Ok(doc_count)
 }
 
+fn retained_local_semantic_indexer<'a>(
+    retained: &'a mut Option<SemanticIndexer>,
+    embedder: &str,
+    data_dir: &Path,
+) -> Result<&'a SemanticIndexer> {
+    if retained.is_none() {
+        *retained = Some(SemanticIndexer::new(embedder, Some(data_dir))?);
+    }
+    retained
+        .as_ref()
+        .context("semantic model was not initialized")
+}
+
+/// Routine work advances at most 64 conversations and never creates the
+/// archive-wide scope index. A title-only edit can trigger this even when the
+/// body watermark is unchanged, without loading a model for a complete title
+/// generation or when title retrieval is disabled.
+fn maintain_routine_titles(
+    embedder: &str,
+    data_dir: &Path,
+    storage: &FrankenStorage,
+    retained: &mut Option<SemanticIndexer>,
+) -> Result<()> {
+    if !crate::search::title_fusion::TitleSearchConfig::from_env()?.enabled {
+        return Ok(());
+    }
+    if !semantic::title_scope_index_ready(storage)? {
+        tracing::debug!("title maintenance awaits explicit semantic indexing setup");
+        return Ok(());
+    }
+    let (embedder_id, _) = semantic_local_embedder_metadata(embedder)
+        .context("title indexing requires a native or hash embedder")?;
+    if !semantic::title_maintenance_needed(storage, data_dir, &embedder_id)? {
+        return Ok(());
+    }
+    let indexer = retained_local_semantic_indexer(retained, embedder, data_dir)?;
+    let outcome = semantic::maintain_title_index(indexer, storage, data_dir, 64)?;
+    tracing::info!(
+        complete = outcome.complete,
+        examined = outcome.examined_conversations,
+        embedded = outcome.embedded_titles,
+        indexed_titles = outcome.indexed_titles,
+        "advanced bounded semantic title maintenance"
+    );
+    Ok(())
+}
+
 /// Upgrade an established legacy tier, or repair a certified builder after an
 /// interrupted append, a deletion, or a changed prefix. Reuse exact surviving
 /// vectors through bounded backfill and its checkpoint. Certified owners stay
@@ -23045,8 +23179,9 @@ fn reconcile_existing_semantic_delta(
     embedder: &str,
     data_dir: &Path,
     storage: &Mutex<FrankenStorage>,
+    retained: &mut Option<SemanticIndexer>,
 ) -> Result<usize> {
-    let indexer = SemanticIndexer::new(embedder, Some(data_dir))?;
+    let indexer = retained_local_semantic_indexer(retained, embedder, data_dir)?;
     let guard = storage
         .lock()
         .map_err(|error| anyhow::anyhow!("lock bounded semantic reconciliation: {error}"))?;
@@ -23116,10 +23251,11 @@ fn reconcile_existing_semantic_delta(
 /// Maintain an established semantic tier. Small certified deltas use one
 /// atomic append; larger tails and interrupted candidates use source-bound
 /// resumable reconciliation. Only complete publication advances the watermark.
-fn incremental_semantic_embed(
+fn incremental_semantic_embed_retained(
     embedder: &str,
     data_dir: &Path,
     storage: &Mutex<FrankenStorage>,
+    retained: &mut Option<SemanticIndexer>,
 ) -> Result<usize> {
     let (embedder_id, dimension) = semantic_local_embedder_metadata(embedder)
         .context("incremental semantic maintenance requires a native embedder")?;
@@ -23140,18 +23276,18 @@ fn incremental_semantic_embed(
             // source-bound checkpoint before trying the same oversized append
             // again, even though the prior serving certificate is still valid.
             drop(guard);
-            return reconcile_existing_semantic_delta(embedder, data_dir, storage);
+            return reconcile_existing_semantic_delta(embedder, data_dir, storage, retained);
         }
         let Some(mut snapshot) = semantic::SemanticBuildSnapshot::capture(&guard, &embedder_id)?
         else {
             // Unsupported proof platforms keep strict serving, but an
             // established tier can still make bounded maintenance progress.
             drop(guard);
-            return reconcile_existing_semantic_delta(embedder, data_dir, storage);
+            return reconcile_existing_semantic_delta(embedder, data_dir, storage, retained);
         };
         if !snapshot.admit_incremental_base(&guard, data_dir, &embedder_id, dimension)? {
             drop(guard);
-            return reconcile_existing_semantic_delta(embedder, data_dir, storage);
+            return reconcile_existing_semantic_delta(embedder, data_dir, storage, retained);
         }
         if snapshot.is_unchanged_base() {
             return Ok(0);
@@ -23173,7 +23309,7 @@ fn incremental_semantic_embed(
                 "semantic delta exceeds fast append selection bounds; continuing through resumable reconciliation"
             );
             drop(guard);
-            return reconcile_existing_semantic_delta(embedder, data_dir, storage);
+            return reconcile_existing_semantic_delta(embedder, data_dir, storage, retained);
         };
         anyhow::ensure!(
             batch.raw_max_message_id.unwrap_or(watermark) <= snapshot.max_message_id,
@@ -23198,7 +23334,7 @@ fn incremental_semantic_embed(
         (snapshot, inputs)
     };
     let started_at = semantic_indexing_now_ms();
-    let indexer = SemanticIndexer::new(embedder, Some(data_dir))?;
+    let indexer = retained_local_semantic_indexer(retained, embedder, data_dir)?;
     let embedded = indexer.embed_messages(&inputs)?;
     {
         let guard = storage
@@ -23239,6 +23375,15 @@ fn incremental_semantic_embed(
         |writer| snapshot.certify_watermark(writer, &embedder_id).map(|_| ()),
     )?;
     Ok(embedded_count)
+}
+
+#[cfg(test)]
+fn incremental_semantic_embed(
+    embedder: &str,
+    data_dir: &Path,
+    storage: &Mutex<FrankenStorage>,
+) -> Result<usize> {
+    incremental_semantic_embed_retained(embedder, data_dir, storage, &mut None)
 }
 
 /// Open frankensqlite storage for indexing without replacing canonical data.

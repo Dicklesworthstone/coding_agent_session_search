@@ -21,8 +21,8 @@ pub use artifacts::{
 pub(crate) use delegate::{SemanticStorageBuildPhase, semantic_delta_selection_limits};
 pub use engine::*;
 pub use titles::{
-    TitleMaintenanceOutcome, maintain_title_index, prepare_title_scope_index,
-    title_maintenance_needed,
+    TITLE_MAX_BATCH_CONVERSATIONS, TitleMaintenanceOutcome, maintain_title_index,
+    prepare_title_scope_index, title_maintenance_needed, title_scope_index_ready,
 };
 // Explicitly select bounded message replay over the engine glob export.
 pub(crate) use replay::{

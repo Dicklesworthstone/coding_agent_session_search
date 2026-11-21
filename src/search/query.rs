@@ -10,6 +10,8 @@ use embedding::QueryCache;
 mod indexed_terms;
 #[path = "query/retry_budget.rs"]
 mod retry_budget;
+#[path = "query/titles.rs"]
+mod titles;
 pub use retry_budget::LEXICAL_RETRY_QUERY_FUEL_EXHAUSTED;
 
 use frankensearch::quill::query::{
@@ -963,6 +965,16 @@ pub type SemanticSearchWithCoverage = (
     Option<crate::search::ann_index::AnnSearchStats>,
     Option<SemanticCoverageSnapshot>,
 );
+
+/// Request-owned semantic results, including the independently admitted title
+/// channel. A body coverage certificate never certifies title coverage.
+#[derive(Debug, Clone)]
+pub struct SemanticSearchOutcome {
+    pub hits: Vec<SearchHit>,
+    pub ann_stats: Option<crate::search::ann_index::AnnSearchStats>,
+    pub coverage: Option<SemanticCoverageSnapshot>,
+    pub titles: Option<crate::search::title_fusion::TitleSearchMetadata>,
+}
 
 // ============================================================================
 // String Interner for Cache Keys (Opt 2.3)
@@ -2061,13 +2073,17 @@ pub enum MatchType {
     Wildcard,
     /// Matched via automatic wildcard fallback when exact search was sparse
     ImplicitWildcard,
+    /// An independently indexed conversation title supplied the semantic match.
+    SemanticTitle,
+    /// Both the title and a body passage supplied semantic ranking evidence.
+    SemanticTitleBody,
 }
 
 impl MatchType {
     /// Returns a quality factor for ranking (1.0 = best, lower = less precise match)
     pub fn quality_factor(self) -> f32 {
         match self {
-            MatchType::Exact => 1.0,
+            MatchType::Exact | MatchType::SemanticTitle | MatchType::SemanticTitleBody => 1.0,
             MatchType::Prefix => 0.9,
             MatchType::Suffix => 0.8,
             MatchType::Substring => 0.7,
@@ -2517,6 +2533,8 @@ pub struct SearchResult {
     /// `None`; robot output then reports `total_matches` as a lower bound
     /// instead of forcing an expensive exact recount.
     pub total_count: Option<usize>,
+    /// Optional title/body policy and admission observed by this request.
+    pub title_search: Option<crate::search::title_fusion::TitleSearchMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3001,6 +3019,13 @@ pub fn rrf_fuse_hits_with_coverage(
                 if coverage.is_some() {
                     *payload = hit.clone();
                     *certified = true;
+                } else if matches!(
+                    hit.match_type,
+                    MatchType::SemanticTitle | MatchType::SemanticTitleBody
+                ) {
+                    // Title provenance must survive a matching lexical hit.
+                    // This is not a body coverage-certificate assertion.
+                    *payload = hit.clone();
                 }
             })
             .or_insert_with(|| (hit.clone(), coverage.is_some()));
@@ -3262,6 +3287,7 @@ struct SemanticSearchState {
     filter_maps: SemanticFilterMaps,
     roles: Option<HashSet<u8>>,
     query_cache: QueryCache,
+    title_search: Option<Arc<titles::TitleSearchContext>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -5393,6 +5419,7 @@ impl SearchClient {
             filter_maps,
             roles,
             query_cache,
+            title_search: None,
         });
         if shard_count > 1 {
             tracing::info!(
@@ -5490,6 +5517,13 @@ impl SearchClient {
                 let state = guard.as_mut().ok_or_else(|| {
                     anyhow!("semantic search unavailable (no embedder or vector index)")
                 })?;
+                if state.title_search.is_some() {
+                    state.in_memory_two_tier_unavailable.mark_unavailable(
+                        tier_mode,
+                        SemanticProgressiveUnavailableReason::TitleFusionRequiresSinglePass,
+                    );
+                    return Ok(None);
+                }
                 let fast_owner_backed = state
                     .artifacts
                     .iter()
@@ -6181,6 +6215,11 @@ impl SearchClient {
                 let state = guard.as_mut().ok_or_else(|| {
                     anyhow!("semantic search unavailable (no embedder or vector index)")
                 })?;
+                if state.title_search.is_some() {
+                    state.progressive_context_unavailable =
+                        Some(SemanticProgressiveUnavailableReason::TitleFusionRequiresSinglePass);
+                    return Ok(None);
+                }
                 let owner_backed = state
                     .artifacts
                     .iter()
@@ -7018,6 +7057,7 @@ impl SearchClient {
             ann_stats: None,
             ann_unavailable_reason: None,
             total_count: None,
+            title_search: None,
         })
     }
 
@@ -7280,6 +7320,79 @@ impl SearchClient {
     /// hydration snapshot. The receipt is never read from shared last-query state.
     #[allow(clippy::too_many_arguments)]
     pub fn search_semantic_with_tier_and_coverage(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
+        approximate: bool,
+        tier_mode: SemanticTierMode,
+    ) -> Result<SemanticSearchWithCoverage> {
+        let result = self.search_semantic_with_metadata(
+            query,
+            filters,
+            limit,
+            offset,
+            field_mask,
+            approximate,
+            tier_mode,
+        )?;
+        Ok((result.hits, result.ann_stats, result.coverage))
+    }
+
+    /// Return the metadata of the exact title/body execution, without a shared
+    /// last-query slot that another caller could overwrite.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_semantic_with_metadata(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
+        approximate: bool,
+        tier_mode: SemanticTierMode,
+    ) -> Result<SemanticSearchOutcome> {
+        let titles = self
+            .semantic
+            .lock()
+            .map_err(|_| anyhow!("semantic lock poisoned"))?
+            .as_ref()
+            .and_then(|state| state.title_search.clone());
+        if let Some(titles) = titles
+            && !canonicalize_for_embedding(query).trim().is_empty()
+        {
+            return self.search_with_titles(
+                &titles,
+                query,
+                filters,
+                limit,
+                offset,
+                field_mask,
+                approximate,
+                tier_mode,
+            );
+        }
+        let (hits, ann_stats, coverage) = self.search_semantic_body_with_coverage(
+            query,
+            filters,
+            limit,
+            offset,
+            field_mask,
+            approximate,
+            tier_mode,
+        )?;
+        Ok(SemanticSearchOutcome {
+            hits,
+            ann_stats,
+            coverage,
+            titles: None,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_semantic_body_with_coverage(
         &self,
         query: &str,
         filters: SearchFilters,
@@ -7819,6 +7932,7 @@ impl SearchClient {
                 ann_stats: None,
                 ann_unavailable_reason: None,
                 total_count: None,
+                title_search: None,
             });
         }
 
@@ -7875,6 +7989,7 @@ impl SearchClient {
                 ann_stats: None,
                 ann_unavailable_reason: None,
                 total_count: tantivy_total,
+                title_search: None,
             });
         }
 
@@ -7893,6 +8008,7 @@ impl SearchClient {
                 ann_stats: None,
                 ann_unavailable_reason: None,
                 total_count: tantivy_total,
+                title_search: None,
             });
         }
 
@@ -7914,6 +8030,7 @@ impl SearchClient {
                 ann_stats: None,
                 ann_unavailable_reason: None,
                 total_count: tantivy_total,
+                title_search: None,
             });
         }
 
@@ -7969,6 +8086,7 @@ impl SearchClient {
                         ann_stats: None,
                         ann_unavailable_reason: None,
                         total_count: tantivy_total,
+                        title_search: None,
                     });
                 }
                 Err(error) => return Err(error),
@@ -8001,6 +8119,7 @@ impl SearchClient {
                 ann_stats: None,
                 ann_unavailable_reason: None,
                 total_count: fallback_tantivy_total,
+                title_search: None,
             })
         } else {
             // Keep original results even if sparse. A shorter wildcard page
@@ -8023,6 +8142,7 @@ impl SearchClient {
                 ann_stats: None,
                 ann_unavailable_reason: None,
                 total_count: tantivy_total,
+                title_search: None,
             })
         }
     }
@@ -8120,6 +8240,46 @@ impl SearchClient {
         approximate: bool,
         semantic_tier_mode: SemanticTierMode,
     ) -> Result<(SearchResult, Option<SemanticCoverageSnapshot>)> {
+        // Bind both legs to one privacy epoch. A forget completed between
+        // lexical retrieval and semantic admission must not release old
+        // lexical-only hits under the semantic leg's newer epoch.
+        let privacy = self
+            .sqlite_path
+            .as_deref()
+            .map(crate::search::privacy::PrivacySnapshot::for_database)
+            .transpose()?;
+        let result = self.search_hybrid_page(
+            lexical_query,
+            semantic_query,
+            filters,
+            limit,
+            offset,
+            sparse_threshold,
+            field_mask,
+            approximate,
+            semantic_tier_mode,
+        );
+        if let Some(privacy) = privacy {
+            // Validate error paths too, preserving typed privacy refusals
+            // before outer callers consider lexical fallback.
+            privacy.validate()?;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_hybrid_page(
+        &self,
+        lexical_query: &str,
+        semantic_query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        sparse_threshold: usize,
+        field_mask: FieldMask,
+        approximate: bool,
+        semantic_tier_mode: SemanticTierMode,
+    ) -> Result<(SearchResult, Option<SemanticCoverageSnapshot>)> {
         if semantic_query.trim().is_empty() {
             return self
                 .search_with_fallback(
@@ -8159,6 +8319,7 @@ impl SearchClient {
                     ann_stats: None,
                     ann_unavailable_reason: None,
                     total_count: None,
+                    title_search: None,
                 },
                 None,
             ));
@@ -8196,21 +8357,26 @@ impl SearchClient {
                     ann_stats: None,
                     ann_unavailable_reason: None,
                     total_count: None,
+                    title_search: None,
                 }
             }
             Err(err) => return Err(err),
         };
         let session_scoped = !filters.session_paths.is_empty();
-        let (semantic_hits, semantic_ann_stats, coverage) = self
-            .search_semantic_with_tier_and_coverage(
-                semantic_query,
-                filters,
-                budget.semantic_candidates,
-                0,
-                field_mask,
-                approximate,
-                semantic_tier_mode,
-            )?;
+        let SemanticSearchOutcome {
+            hits: semantic_hits,
+            ann_stats: semantic_ann_stats,
+            coverage,
+            titles: title_search,
+        } = self.search_semantic_with_metadata(
+            semantic_query,
+            filters,
+            budget.semantic_candidates,
+            0,
+            field_mask,
+            approximate,
+            semantic_tier_mode,
+        )?;
         let semantic_ann_unavailable_reason = if approximate && session_scoped {
             Some(SemanticAnnUnavailableReason::SessionScopeRequiresExact)
         } else if approximate {
@@ -8240,6 +8406,7 @@ impl SearchClient {
                 ann_stats: semantic_ann_stats,
                 ann_unavailable_reason: semantic_ann_unavailable_reason,
                 total_count: None,
+                title_search,
             },
             coverage,
         ))

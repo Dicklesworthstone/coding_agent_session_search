@@ -107,6 +107,16 @@ fn title_scope_index_present(storage: &FrankenStorage) -> Result<bool> {
         .is_empty())
 }
 
+/// Bounded admission for routine maintenance. Only explicit indexing prepares
+/// the archive-wide supporting index; background work never creates it.
+pub fn title_scope_index_ready(storage: &FrankenStorage) -> Result<bool> {
+    if !title_scope_index_present(storage)? {
+        return Ok(false);
+    }
+    ensure_title_scope_index(storage)?;
+    Ok(true)
+}
+
 fn ensure_title_scope_index(storage: &FrankenStorage) -> Result<()> {
     ensure!(
         title_scope_index_present(storage)?,

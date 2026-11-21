@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
 use coding_agent_search::indexer::semantic::{
     EmbeddingInput, SemanticIndexer, maintain_title_index, prepare_title_scope_index,
-    title_maintenance_needed,
+    title_maintenance_needed, title_scope_index_ready,
 };
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::search::embedder::Embedder;
@@ -529,5 +529,217 @@ fn gh540_publication_failure_retains_previous_generation_and_retries() -> Result
     let retried = maintain_title_index(&engine, &fixture.storage, &fixture.data_dir(), 1)?;
     assert!(retried.complete && retried.published);
     assert_eq!(retried.embedded_titles, 1);
+    Ok(())
+}
+
+fn cli_backfill(
+    fixture: &Fixture,
+    titles: bool,
+    batch_size: usize,
+    max_batches: u32,
+    scheduled: bool,
+) -> Result<serde_json::Value> {
+    let mut command = assert_cmd::cargo::cargo_bin_cmd!("cass");
+    command
+        .arg("--db")
+        .arg(fixture.directory.path().join("archive.db"))
+        .args(["models", "backfill", "--tier", "fast", "--embedder", "hash"])
+        .arg("--batch-conversations")
+        .arg(batch_size.to_string())
+        .arg("--max-batches")
+        .arg(max_batches.to_string())
+        .arg("--data-dir")
+        .arg(fixture.data_dir())
+        .arg("--json")
+        .env("CASS_SEMANTIC_TITLES", if titles { "1" } else { "0" })
+        .env("CASS_SEMANTIC_BACKFILL_FORCE", "1")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("RUST_MIN_STACK", "134217728")
+        .timeout(std::time::Duration::from_secs(60));
+    for name in [
+        "CASS_TITLE_FUSION",
+        "CASS_TITLE_WEIGHT",
+        "CASS_TITLE_BODY_CANDIDATES",
+        "CASS_TITLE_CANDIDATES",
+        "CASS_TITLE_TOTAL_CANDIDATES",
+        "CASS_TITLE_MAX_ADMISSION_TITLES",
+        "CASS_SCHEDULE_PRESERVE_CHECKPOINT",
+    ] {
+        command.env_remove(name);
+    }
+    if scheduled {
+        command.arg("--scheduled");
+    }
+    let output = command.output()?;
+    assert!(
+        output.status.success(),
+        "title backfill failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn cli_title_search(fixture: &Fixture, semantic: bool) -> Result<std::process::Output> {
+    let mut command = assert_cmd::cargo::cargo_bin_cmd!("cass");
+    command
+        .arg("--db")
+        .arg(fixture.directory.path().join("archive.db"))
+        .args([
+            "search",
+            "Mercury migration planning",
+            "--model",
+            "hash",
+            "--json",
+            "--no-maintenance",
+            "--data-dir",
+        ])
+        .arg(fixture.data_dir())
+        .env("CASS_SEMANTIC_TITLES", "1")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("RUST_MIN_STACK", "134217728")
+        .timeout(std::time::Duration::from_secs(60));
+    for name in [
+        "CASS_TITLE_FUSION",
+        "CASS_TITLE_WEIGHT",
+        "CASS_TITLE_BODY_CANDIDATES",
+        "CASS_TITLE_CANDIDATES",
+        "CASS_TITLE_TOTAL_CANDIDATES",
+        "CASS_TITLE_MAX_ADMISSION_TITLES",
+    ] {
+        command.env_remove(name);
+    }
+    if semantic {
+        command.args(["--mode", "semantic"]);
+    }
+    Ok(command.output()?)
+}
+
+#[test]
+fn gh540_cli_backfill_finishes_title_only_work_with_one_retained_model() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.seed("alpha", Some("Mercury migration planning"))?;
+    fixture.seed("beta", Some("Saturn deployment review"))?;
+    fixture.seed("gamma", Some("Neptune connection troubleshooting"))?;
+    let history = fixture.history()?;
+    fixture.storage.close_best_effort_in_place();
+
+    let body = cli_backfill(&fixture, false, 8, 8, false)?;
+    assert_eq!(body["published"], true);
+    assert!(body.get("titles").is_none());
+    assert!(load_title_manifest(&fixture.data_dir(), EMBEDDER)?.is_none());
+    let body_bytes = fs::read(vector_index_path(&fixture.data_dir(), EMBEDDER))?;
+
+    // Enabling titles after the body generation is complete must still start
+    // a bounded, durable title backfill. One conversation cannot finish three.
+    let first = cli_backfill(&fixture, true, 1, 1, false)?;
+    assert_eq!(first["unchanged"], true);
+    assert_eq!(first["titles"]["complete"], false);
+    assert_eq!(first["titles"]["examined_conversations"], 1);
+    assert_eq!(first["titles"]["indexed_titles"], 1);
+    assert_eq!(first["model_initializations"], 1);
+    assert_eq!(first["batches_completed"], 1);
+
+    let complete = cli_backfill(&fixture, true, 1, 8, false)?;
+    assert_eq!(complete["titles"]["complete"], true);
+    assert_eq!(complete["titles"]["indexed_titles"], 3);
+    assert_eq!(complete["model_initializations"], 1);
+    assert!(
+        complete["batches_completed"]
+            .as_u64()
+            .is_some_and(|count| count > 1)
+    );
+    assert_eq!(open(&fixture.data_dir())?.manifest().indexed_titles, 3);
+    assert_eq!(
+        fs::read(vector_index_path(&fixture.data_dir(), EMBEDDER))?,
+        body_bytes,
+        "title-only backfill must preserve the completed body artifact"
+    );
+    fixture.storage = FrankenStorage::open(&fixture.directory.path().join("archive.db"))?;
+    assert_eq!(
+        fixture.history()?,
+        history,
+        "titles must not create synthetic history"
+    );
+    assert!(title_scope_index_ready(&fixture.storage)?);
+    fixture.storage.close_best_effort_in_place();
+
+    let unchanged = cli_backfill(&fixture, true, 1, 8, false)?;
+    assert_eq!(unchanged["titles"]["unchanged"], true);
+    assert_eq!(unchanged["titles"]["embedded_titles"], 0);
+    assert_eq!(unchanged["batches_completed"], 1);
+
+    // --json uses the ordinary bounded setup worker, independently from the
+    // unbudgeted human path. Both must install the opt-in title context.
+    let output = cli_title_search(&fixture, true)?;
+    assert!(
+        output.status.success(),
+        "title search failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let search: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(search["_meta"]["title_search"]["policy"]["enabled"], true);
+    assert_eq!(search["_meta"]["title_search"]["indexed_titles"], 3);
+    assert!(
+        search["hits"]
+            .as_array()
+            .context("search hits")?
+            .iter()
+            .any(|hit| {
+                matches!(
+                    hit["match_type"].as_str(),
+                    Some("semantic_title" | "semantic_title_body")
+                )
+            })
+    );
+
+    // A SQL-only repair marker is still an authoritative privacy refusal.
+    // Even default hybrid mode must not substitute a successful lexical page.
+    let mut lexical = coding_agent_search::search::tantivy::TantivyIndex::open_or_create(
+        &coding_agent_search::search::tantivy::expected_index_dir(&fixture.data_dir()),
+    )?;
+    lexical.commit()?;
+    drop(lexical);
+    fixture.storage = FrankenStorage::open(&fixture.directory.path().join("archive.db"))?;
+    fixture.storage.raw().execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('forget_derived_rebuild_pending', '1')",
+    )?;
+    fixture.storage.close_best_effort_in_place();
+    let rejected = cli_title_search(&fixture, false)?;
+    assert!(
+        !rejected.status.success(),
+        "privacy refusal became lexical success"
+    );
+    let diagnostics = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        diagnostics.contains("forget-repair-pending"),
+        "{diagnostics}"
+    );
+    Ok(())
+}
+
+#[test]
+fn gh540_scheduled_title_backfill_requires_explicit_scope_setup() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.seed("scheduled", Some("Scheduled deployment review"))?;
+    assert!(!title_scope_index_ready(&fixture.storage)?);
+    fixture.storage.close_best_effort_in_place();
+
+    let scheduled = cli_backfill(&fixture, true, 8, 8, true)?;
+    assert_eq!(scheduled["titles"]["status"], "needs_setup");
+    assert_eq!(scheduled["titles"]["published"], false);
+    assert!(load_title_manifest(&fixture.data_dir(), EMBEDDER)?.is_none());
+    fixture.storage = FrankenStorage::open(&fixture.directory.path().join("archive.db"))?;
+    assert!(!title_scope_index_ready(&fixture.storage)?);
+    fixture.storage.close_best_effort_in_place();
+
+    let foreground = cli_backfill(&fixture, true, 8, 8, false)?;
+    assert_eq!(foreground["titles"]["complete"], true);
+    assert_eq!(foreground["titles"]["indexed_titles"], 1);
     Ok(())
 }

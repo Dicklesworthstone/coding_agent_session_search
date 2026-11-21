@@ -266,6 +266,56 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 - **Vector index**: Stored as `vector_index/index-<embedder>.fsvi` in the data directory.
 - **Lexical fail-open**: While the model is absent, `cass` returns lexical-only results and reports `fallback_mode="lexical"` in health/status; search never blocks on semantic assets.
 
+#### Opt-In Conversation Title Search
+
+Conversation titles can provide useful evidence when the messages themselves
+contain generic discussion. Enable `CASS_SEMANTIC_TITLES=1` during indexing and
+search to combine a separate title vector with each conversation's best body
+match. The default remains the existing body search.
+
+```bash
+# Uses the selected installed native model; this does not install a model.
+CASS_SEMANTIC_TITLES=1 cass index --semantic
+
+CASS_SEMANTIC_TITLES=1 cass search 'PostgreSQL query planner' --mode semantic --json
+CASS_SEMANTIC_TITLES=1 cass search 'PostgreSQL query planner' --mode hybrid --robot
+
+# Resume bounded title maintenance alongside the selected body backfill.
+CASS_SEMANTIC_TITLES=1 cass models backfill --tier quality --max-batches 4 --json
+```
+
+Titles use the same selected native MiniLM, multilingual MiniLM, or explicit
+hash model as their body space. External embedding providers are not supported
+for titles. A title-only edit updates the title artifact without re-embedding
+unchanged message bodies. Explicit semantic indexing prepares the required
+SQLite scope index; scheduled work reports `needs_setup` until that foreground
+setup has completed. Enabled background indexing subsequently maintains a
+bounded batch of up to 64 conversations when title artifacts already exist.
+
+The semantic leg combines title and body evidence per conversation. Its results
+still cite real archived messages, including an alternative message when the
+stored representative falls outside a requested role or time range. Agent,
+workspace, source, session-path and time filters apply before title top-k
+selection. Canonical edits, deletions and the durable forget fence invalidate
+stale title evidence. Searching never builds or repairs title artifacts.
+
+| Setting | Default | Effect |
+|---------|---------|--------|
+| `CASS_TITLE_FUSION` | `weighted` | Choose `weighted` cosine scores, `rrf` ranks, or `max` over active channels |
+| `CASS_TITLE_WEIGHT` | `0.25` | Title contribution from `0` (body only) through `1` (title only); changes do not require re-embedding |
+| `CASS_TITLE_BODY_CANDIDATES` | `1000` | Body candidate budget, from 1 to 1000 |
+| `CASS_TITLE_CANDIDATES` | `1000` | Title candidate budget, from 1 to 1000 |
+| `CASS_TITLE_TOTAL_CANDIDATES` | `2000` | Combined conversation budget, from 1 to 2000 |
+| `CASS_TITLE_MAX_ADMISSION_TITLES` | `100000` | Maximum titles admitted against canonical history per request; maximum 1000000 |
+
+Opted-in robot results include request-local `title_search` metadata with the
+policy, indexed and eligible title counts, stale exclusions, candidate bounds,
+and timings. `semantic_title` and `semantic_title_body` identify results with
+title evidence. This metadata establishes candidate validity and does not claim
+that every current conversation has an indexed title. Title and body artifacts
+have independent coverage. The offline hash regressions verify routing,
+filtering and lifecycle behavior; they do not measure neural relevance gains.
+
 #### Opt-In External Embeddings
 
 An OpenAI-compatible embedding service can own inference, including any GPU it supports. Select `external` explicitly and set `CASS_EXTERNAL_EMBEDDINGS=1` to consent to sending selected archive text during backfill and query text during semantic search. Configuring a URL alone sends nothing. Local models and hash embeddings keep their existing behavior.

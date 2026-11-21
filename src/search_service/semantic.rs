@@ -543,6 +543,10 @@ impl Semantic {
             context.filter_maps,
             context.roles,
         )?;
+        client.set_title_search_config(
+            &config.data_dir,
+            coding_agent_search::search::title_fusion::TitleSearchConfig::from_env()?,
+        )?;
         guard.check()?;
         self.client = Some(client);
         self.active_identity = Some(expected_id);
@@ -639,6 +643,7 @@ impl Session {
             .saturating_mul(3)
             .min(protocol::MAX_WINDOW);
         type SemanticPage = (Vec<SearchHit>, Value, Option<SemanticCoverageSnapshot>);
+        let mut title_search = None;
         let semantic = setup.and_then(|()| -> Result<SemanticPage> {
             let client = self
                 .semantic
@@ -646,7 +651,12 @@ impl Session {
                 .as_ref()
                 .context("semantic reader is not loaded")?;
             self.semantic.queries_attempted = self.semantic.queries_attempted.saturating_add(1);
-            let (hits, stats, coverage) = client.search_semantic_with_tier_and_coverage(
+            let coding_agent_search::search::query::SemanticSearchOutcome {
+                hits,
+                ann_stats: stats,
+                coverage,
+                titles,
+            } = client.search_semantic_with_metadata(
                 query,
                 search_filters(filters.clone()),
                 if mode == Mode::Hybrid {
@@ -669,6 +679,7 @@ impl Session {
             );
             let metadata = ann_metadata(approximate);
             self.semantic.check()?;
+            title_search = titles;
             self.semantic.calls_completed = self.semantic.calls_completed.saturating_add(1);
             Ok((hits, metadata, coverage))
         });
@@ -762,6 +773,15 @@ impl Session {
             }
             Ok((hits, ann, coverage)) => (hits, "semantic", ann, None, coverage),
             Err(error) => {
+                // Privacy refusals apply to the entire read, even when only
+                // SQLite carries a pending repair marker. Do not convert a
+                // title admission refusal into successful lexical fallback.
+                if error
+                    .downcast_ref::<coding_agent_search::search::privacy::PrivacyError>()
+                    .is_some()
+                {
+                    return Err(error);
+                }
                 let reason = format!("{error:#}");
                 // Keep the original failure actionable during backoff rather
                 // than replacing it with the retry gate's synthetic refusal.
@@ -847,6 +867,9 @@ impl Session {
         });
         if let Some(coverage) = coverage {
             reply["semantic_coverage"] = json!(coverage);
+        }
+        if let Some(titles) = title_search {
+            reply["title_search"] = json!(titles);
         }
         Ok(reply)
     }

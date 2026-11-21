@@ -84,6 +84,8 @@ pub fn vector_index_path(data_dir: &Path, embedder_id: &str) -> PathBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticProgressiveUnavailableReason {
+    /// Conversation title/body fusion selects one complete bounded result set.
+    TitleFusionRequiresSinglePass,
     /// Exact serving retains an opened FSVI owner, but the requested
     /// progressive/two-tier constructor cannot consume that owner without
     /// reopening a pathname and risking post-validation replacement.
@@ -112,6 +114,7 @@ impl SemanticProgressiveUnavailableReason {
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
+            Self::TitleFusionRequiresSinglePass => "title_fusion_requires_single_pass",
             Self::OwnerBackedReaderRequired => "owner_backed_reader_required",
             Self::MultipleExactShards => "multiple_exact_shards",
             Self::FastArtifactMissing => "fast_artifact_missing",
