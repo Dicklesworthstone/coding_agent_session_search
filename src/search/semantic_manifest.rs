@@ -40,6 +40,15 @@ pub use shards::{SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION, SemanticAr
 
 pub(crate) mod selection;
 
+/// Read the same portable link count used by semantic artifact admission.
+/// Maintenance callers use this to refuse aliases before replacing a sidecar.
+pub(crate) fn semantic_file_link_count(
+    file: &std::fs::File,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<Option<u64>> {
+    Ok(portable_file_identity(file, metadata)?.map(|identity| identity.link_count))
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};

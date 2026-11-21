@@ -10,7 +10,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use frankensearch::index::{HnswConfig, HnswIndex, VectorIndex};
 
-use crate::search::vector_index::VECTOR_INDEX_DIR;
+use crate::search::semantic_manifest::{
+    ArtifactRecord, SemanticCurrentPointerV1, SemanticManifest, TierKind,
+    semantic_shard_artifact_path_is_safe,
+};
+use crate::search::vector_index::{VECTOR_INDEX_DIR, vector_index_path};
 
 /// Why native retrieval was replaced by the complete exact cohort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -120,6 +124,188 @@ pub fn hnsw_index_path(data_dir: &Path, embedder_id: &str) -> PathBuf {
     data_dir
         .join(VECTOR_INDEX_DIR)
         .join(format!("hnsw-{embedder_id}.chsw"))
+}
+
+pub(crate) struct HnswMaintenancePath {
+    pub(crate) path: PathBuf,
+    pub(crate) relative_path: String,
+}
+
+fn portable_path_key(path: &Path, cwd: &Path) -> Vec<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect()
+}
+
+/// Maintain the accelerator selected by the same ledger as its vector source.
+/// Revocation changes readiness, not ownership of the declared path. Only an
+/// absent or differently bound declaration permits the conventional location.
+/// This resolves paths and checks file identities without opening SQLite.
+pub(crate) fn hnsw_maintenance_path(
+    data_dir: &Path,
+    db_path: &Path,
+    manifest: &SemanticManifest,
+    tier: TierKind,
+    artifact: &ArtifactRecord,
+) -> Result<HnswMaintenancePath> {
+    anyhow::ensure!(
+        artifact.tier == tier,
+        "semantic artifact tier does not match its ledger slot"
+    );
+    let relative_path = if let Some(record) = manifest
+        .hnsw
+        .as_ref()
+        .filter(|record| record.base_tier == tier && record.embedder_id == artifact.embedder_id)
+    {
+        record.index_path.clone()
+    } else {
+        hnsw_index_path(data_dir, &artifact.embedder_id)
+            .strip_prefix(data_dir)?
+            .to_string_lossy()
+            .into_owned()
+    };
+    anyhow::ensure!(
+        semantic_shard_artifact_path_is_safe(&relative_path),
+        "HNSW accelerator path is not a safe relative path: {relative_path:?}"
+    );
+    let path = data_dir.join(&relative_path);
+    // Independent title and immutable semantic publications have their own
+    // writers. Historical, unselected artifacts remain protected as well.
+    let mut components = Path::new(&relative_path).components();
+    let is_publication_namespace = components.next().is_some_and(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("vector_index")
+    }) && components.next().is_some_and(|component| {
+        let component = component.as_os_str().to_string_lossy();
+        ["titles", "served", "generations"]
+            .iter()
+            .any(|namespace| component.eq_ignore_ascii_case(namespace))
+    });
+    anyhow::ensure!(
+        !is_publication_namespace,
+        "HNSW accelerator path collides with a reserved semantic publication namespace: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        crate::search::semantic_manifest::selection::optional_ann_path_is_safe(data_dir, &path),
+        "HNSW accelerator path has an unsafe entry or parent: {}",
+        path.display()
+    );
+
+    // A manifest controls the accelerator location, not permission to replace
+    // its source vectors, canonical history, publication ledger or privacy fence.
+    let mut protected = vec![
+        db_path.to_path_buf(),
+        SemanticManifest::path(data_dir),
+        SemanticCurrentPointerV1::path(data_dir),
+        data_dir.join("vector_index/semantic_manifest.json.lock"),
+        data_dir.join("vector_index/semantic_shards.json"),
+        data_dir.join("vector_index/current.lock"),
+        data_dir.join("index-run.lock"),
+        data_dir.join("semantic-backfill-artifacts.lock"),
+        crate::search::privacy::state_path_for_database(db_path),
+    ];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = db_path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        protected.push(PathBuf::from(sidecar));
+    }
+    for record in [manifest.fast_tier.as_ref(), manifest.quality_tier.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if semantic_shard_artifact_path_is_safe(&record.index_path) {
+            protected.push(data_dir.join(&record.index_path));
+        }
+        protected.push(vector_index_path(data_dir, &record.embedder_id));
+    }
+    for certificate in manifest.coverage.values() {
+        for relative in [&certificate.artifact_path, &certificate.parent_path] {
+            if semantic_shard_artifact_path_is_safe(relative) {
+                protected.push(data_dir.join(relative));
+            }
+        }
+    }
+    let candidate_metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("inspecting HNSW accelerator path"),
+    };
+    if candidate_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.is_file())
+    {
+        let file =
+            crate::search::semantic_coverage::open_semantic_proof_file(data_dir, &relative_path)?;
+        let links =
+            crate::search::semantic_manifest::semantic_file_link_count(&file, &file.metadata()?)?;
+        anyhow::ensure!(
+            links.is_none_or(|links| links == 1),
+            "HNSW accelerator path is hard-linked to another artifact: {}",
+            path.display()
+        );
+    }
+    // Reserve names before they exist too, including aliases on case-insensitive
+    // filesystems. Existing-file identity checks below also cover parent aliases.
+    let cwd = std::env::current_dir()?;
+    let candidate_key = portable_path_key(&path, &cwd);
+    for protected_path in protected {
+        anyhow::ensure!(
+            candidate_key != portable_path_key(&protected_path, &cwd),
+            "HNSW accelerator path collides with protected archive data: {}",
+            protected_path.display()
+        );
+        let Some(candidate) = candidate_metadata
+            .as_ref()
+            .filter(|metadata| metadata.is_file())
+        else {
+            continue;
+        };
+        let protected_metadata = match std::fs::metadata(&protected_path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("inspecting protected archive path"),
+        };
+        #[cfg(unix)]
+        let aliases = {
+            use std::os::unix::fs::MetadataExt;
+            candidate.dev() == protected_metadata.dev()
+                && candidate.ino() == protected_metadata.ino()
+        };
+        #[cfg(not(unix))]
+        let aliases = {
+            let _ = (candidate, protected_metadata);
+            same_file::is_same_file(&path, &protected_path)?
+        };
+        anyhow::ensure!(
+            !aliases,
+            "HNSW accelerator path aliases protected archive data: {}",
+            protected_path.display()
+        );
+    }
+    Ok(HnswMaintenancePath {
+        path,
+        relative_path,
+    })
 }
 
 /// Admissibility of the persisted accelerator, using the runtime's native-only

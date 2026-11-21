@@ -6,11 +6,14 @@
 
 mod util;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use assert_cmd::cargo::cargo_bin;
+use coding_agent_search::search::semantic_manifest::{HnswRecord, SemanticManifest, TierKind};
+use frankensearch::index::{HnswConfig, HnswIndex, VectorIndex};
 use serde_json::Value;
 
 use util::timeout::spawn_with_timeout_or_diag;
@@ -120,6 +123,73 @@ fn build_hnsw(fixture: &Fixture, label: &str, extra: &[&str]) -> Result<(Output,
     let out = run(fixture, label, &args, MODELS_TIMEOUT);
     let value = json_stdout(&out, label)?;
     Ok((out, value))
+}
+
+fn load_manifest(data_dir: &Path) -> Result<SemanticManifest, String> {
+    SemanticManifest::load(data_dir)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "fixture semantic manifest is missing".to_string())
+}
+
+fn file_snapshot(root: &Path) -> Result<BTreeMap<PathBuf, (Vec<u8>, SystemTime)>, String> {
+    let mut files = BTreeMap::new();
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry.file_type().is_file() {
+            files.insert(
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .map_err(|error| error.to_string())?
+                    .to_path_buf(),
+                (
+                    std::fs::read(entry.path()).map_err(|error| error.to_string())?,
+                    entry
+                        .metadata()
+                        .map_err(|error| error.to_string())?
+                        .modified()
+                        .map_err(|error| error.to_string())?,
+                ),
+            );
+        }
+    }
+    Ok(files)
+}
+
+/// Publish a real native graph at a nonconventional manifest-selected path.
+fn declare_native_graph(fixture: &Fixture, relative: &str) -> Result<(PathBuf, PathBuf), String> {
+    let mut manifest = load_manifest(&fixture.data_dir)?;
+    let artifact = manifest
+        .fast_tier
+        .as_ref()
+        .filter(|artifact| artifact.ready)
+        .ok_or_else(|| "fixture has no published fast artifact".to_string())?
+        .clone();
+    let vector_path = fixture.data_dir.join(&artifact.index_path);
+    let vectors = VectorIndex::open_read_only(&vector_path).map_err(|error| error.to_string())?;
+    let graph_path = fixture.data_dir.join(relative);
+    let parent = graph_path
+        .parent()
+        .ok_or_else(|| "fixture graph has no parent".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    HnswIndex::build_from_vector_index(&vectors, HnswConfig::default())
+        .and_then(|graph| graph.save(&graph_path))
+        .map_err(|error| error.to_string())?;
+    manifest.publish_hnsw(HnswRecord {
+        base_tier: TierKind::Fast,
+        embedder_id: artifact.embedder_id,
+        ef_search: frankensearch::index::HNSW_DEFAULT_EF_SEARCH,
+        index_path: relative.to_string(),
+        size_bytes: std::fs::metadata(&graph_path)
+            .map_err(|error| error.to_string())?
+            .len(),
+        built_at_ms: chrono::Utc::now().timestamp_millis(),
+        ready: true,
+    });
+    manifest
+        .save(&fixture.data_dir)
+        .map_err(|error| error.to_string())?;
+    Ok((vector_path, graph_path))
 }
 
 fn check() -> Result<(), String> {
@@ -284,6 +354,383 @@ fn check() -> Result<(), String> {
 #[test]
 fn models_build_hnsw_builds_verifies_and_records_accelerator() -> Result<(), String> {
     check()
+}
+
+#[test]
+fn models_hnsw_maintenance_honors_declared_graph_path() -> Result<(), String> {
+    let fixture = semantic_fixture()?;
+    let (out, conventional) = build_hnsw(&fixture, "declared_hnsw_conventional_control", &[])?;
+    if !out.status.success() || str_at(&conventional, "state_after") != "native_valid" {
+        return Err(format!(
+            "conventional native control failed: {conventional}"
+        ));
+    }
+    let conventional_path = fixture.data_dir.join(str_at(&conventional, "hnsw_path"));
+    let conventional_bytes =
+        std::fs::read(&conventional_path).map_err(|error| error.to_string())?;
+    let selected_relative = "vector_index/alternate-accelerators/selected.chsw";
+    let (vector_path, selected_path) = declare_native_graph(&fixture, selected_relative)?;
+    let vector_bytes = std::fs::read(&vector_path).map_err(|error| error.to_string())?;
+    let before = file_snapshot(&fixture.data_dir.join("vector_index"))?;
+
+    let (out, inspected) = build_hnsw(&fixture, "declared_hnsw_check", &["--check"])?;
+    if !out.status.success()
+        || str_at(&inspected, "hnsw_path") != selected_relative
+        || str_at(&inspected, "state_before") != "native_valid"
+        || inspected["manifest_recorded"] != true
+        || file_snapshot(&fixture.data_dir.join("vector_index"))? != before
+    {
+        return Err(format!(
+            "--check must inspect the selected graph without writes: {inspected}"
+        ));
+    }
+    let (out, unchanged) = build_hnsw(&fixture, "declared_hnsw_unchanged", &[])?;
+    if !out.status.success()
+        || str_at(&unchanged, "hnsw_path") != selected_relative
+        || str_at(&unchanged, "action") != "unchanged"
+        || unchanged["manifest_published"] != false
+        || file_snapshot(&fixture.data_dir.join("vector_index"))? != before
+    {
+        return Err(format!(
+            "current selected graph must remain untouched: {unchanged}"
+        ));
+    }
+
+    // The index entry point must use the same path authority, including when
+    // no embedding work is needed and its HNSW maintenance runs separately.
+    let selected_before = std::fs::read(&selected_path).map_err(|error| error.to_string())?;
+    let record_before = manifest_hnsw(&fixture.data_dir)?;
+    let out = run(
+        &fixture,
+        "declared_hnsw_index_unchanged",
+        &[
+            "index",
+            "--semantic",
+            "--build-hnsw",
+            "--embedder",
+            "hash",
+            "--json",
+            "--no-progress-events",
+        ],
+        INDEX_TIMEOUT,
+    );
+    if !out.status.success()
+        || manifest_hnsw(&fixture.data_dir)? != record_before
+        || std::fs::read(&selected_path).map_err(|error| error.to_string())? != selected_before
+    {
+        return Err(format!(
+            "index maintenance changed the declared graph: {} {}",
+            text(&out.stdout),
+            text(&out.stderr)
+        ));
+    }
+
+    let (out, forced) = build_hnsw(&fixture, "declared_hnsw_force", &["--force"])?;
+    if !out.status.success()
+        || str_at(&forced, "hnsw_path") != selected_relative
+        || str_at(&forced, "action") != "rebuilt"
+        || str_at(&forced, "state_after") != "native_valid"
+    {
+        return Err(format!(
+            "--force must replace the selected native generation: {forced}"
+        ));
+    }
+
+    // A valid conventional graph must not hide damage to the selected one.
+    std::fs::write(&selected_path, b"truncated selected native metadata")
+        .map_err(|error| error.to_string())?;
+    let corrupted = file_snapshot(&fixture.data_dir.join("vector_index"))?;
+    let (out, inspected) = build_hnsw(&fixture, "declared_hnsw_check_corrupt", &["--check"])?;
+    if !out.status.success()
+        || str_at(&inspected, "hnsw_path") != selected_relative
+        || inspected["current"] != false
+        || file_snapshot(&fixture.data_dir.join("vector_index"))? != corrupted
+    {
+        return Err(format!(
+            "--check inspected an undeclared graph or repaired damage: {inspected}"
+        ));
+    }
+    let (out, repaired) = build_hnsw(&fixture, "declared_hnsw_repair", &[])?;
+    if !out.status.success()
+        || str_at(&repaired, "hnsw_path") != selected_relative
+        || str_at(&repaired, "action") != "rebuilt"
+        || str_at(&repaired, "state_after") != "native_valid"
+    {
+        return Err(format!(
+            "repair must retain the selected graph path: {repaired}"
+        ));
+    }
+
+    // A revoked declaration still owns its path. Explicit maintenance may
+    // re-record the verified graph, while --check leaves revocation intact.
+    let mut manifest = load_manifest(&fixture.data_dir)?;
+    manifest
+        .hnsw
+        .as_mut()
+        .ok_or("missing selected graph record")?
+        .ready = false;
+    manifest
+        .save(&fixture.data_dir)
+        .map_err(|error| error.to_string())?;
+    let revoked = file_snapshot(&fixture.data_dir.join("vector_index"))?;
+    let (out, inspected) = build_hnsw(&fixture, "declared_hnsw_revoked_check", &["--check"])?;
+    if !out.status.success()
+        || str_at(&inspected, "hnsw_path") != selected_relative
+        || inspected["current"] != true
+        || inspected["manifest_recorded"] != false
+        || file_snapshot(&fixture.data_dir.join("vector_index"))? != revoked
+    {
+        return Err(format!(
+            "revocation must not redirect read-only inspection: {inspected}"
+        ));
+    }
+    let graph_before = std::fs::read(&selected_path).map_err(|error| error.to_string())?;
+    let (out, restored) = build_hnsw(&fixture, "declared_hnsw_restore", &[])?;
+    if !out.status.success()
+        || str_at(&restored, "hnsw_path") != selected_relative
+        || str_at(&restored, "action") != "unchanged"
+        || restored["manifest_published"] != true
+        || std::fs::read(&selected_path).map_err(|error| error.to_string())? != graph_before
+        || std::fs::read(&conventional_path).map_err(|error| error.to_string())?
+            != conventional_bytes
+        || std::fs::read(&vector_path).map_err(|error| error.to_string())? != vector_bytes
+    {
+        return Err(format!(
+            "explicit re-recording must preserve native and source bytes: {restored}"
+        ));
+    }
+    let missing_relative = "vector_index/newly-declared/nested/native.chsw";
+    let missing_path = fixture.data_dir.join(missing_relative);
+    let missing_parent = missing_path.parent().ok_or("missing graph parent")?;
+    let mut manifest = load_manifest(&fixture.data_dir)?;
+    manifest
+        .hnsw
+        .as_mut()
+        .ok_or("missing selected graph record")?
+        .index_path = missing_relative.to_string();
+    manifest
+        .save(&fixture.data_dir)
+        .map_err(|error| error.to_string())?;
+    let before_missing_check = file_snapshot(&fixture.data_dir.join("vector_index"))?;
+    let (out, missing) = build_hnsw(&fixture, "declared_hnsw_missing_check", &["--check"])?;
+    if !out.status.success()
+        || str_at(&missing, "hnsw_path") != missing_relative
+        || str_at(&missing, "state_before") != "missing"
+        || missing_parent.exists()
+        || file_snapshot(&fixture.data_dir.join("vector_index"))? != before_missing_check
+    {
+        return Err(format!(
+            "checking a missing declared graph must not create its directory or inspect a decoy: {missing}"
+        ));
+    }
+    let (out, created) = build_hnsw(&fixture, "declared_hnsw_missing_create", &[])?;
+    if !out.status.success()
+        || str_at(&created, "hnsw_path") != missing_relative
+        || str_at(&created, "state_after") != "native_valid"
+        || !missing_path.is_file()
+        || std::fs::read(&conventional_path).map_err(|error| error.to_string())?
+            != conventional_bytes
+        || std::fs::read(&vector_path).map_err(|error| error.to_string())? != vector_bytes
+    {
+        return Err(format!(
+            "explicit maintenance must create the missing declared graph: {created}"
+        ));
+    }
+    let out = run(
+        &fixture,
+        "declared_hnsw_native_search",
+        &[
+            "search",
+            KEYWORD,
+            "--mode",
+            "semantic",
+            "--model",
+            "hash",
+            "--approximate",
+            "--robot",
+            "--robot-meta",
+            "--limit",
+            "5",
+        ],
+        MODELS_TIMEOUT,
+    );
+    let results = json_stdout(&out, "declared native search")?;
+    if !out.status.success()
+        || results
+            .pointer("/_meta/ann_stats")
+            .is_none_or(Value::is_null)
+        || results.pointer("/_meta/ann_unavailable_reason").is_some()
+    {
+        return Err(format!(
+            "maintained selected graph must serve native search: {results}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn models_hnsw_maintenance_refuses_unsafe_or_colliding_declarations() -> Result<(), String> {
+    let fixture = semantic_fixture()?;
+    let (vector_path, selected_path) =
+        declare_native_graph(&fixture, "vector_index/selected.chsw")?;
+    let manifest = load_manifest(&fixture.data_dir)?;
+    let vector_relative = manifest
+        .fast_tier
+        .as_ref()
+        .ok_or("missing fast artifact")?
+        .index_path
+        .clone();
+    let certificate = manifest
+        .coverage
+        .values()
+        .next()
+        .ok_or("missing coverage certificate")?;
+    let hardlink_relative = "vector_index/aliased-vector.chsw";
+    std::fs::hard_link(&vector_path, fixture.data_dir.join(hardlink_relative))
+        .map_err(|error| error.to_string())?;
+    let leaf_alias = "vector_index/aliased-graph.chsw";
+    std::os::unix::fs::symlink(&selected_path, fixture.data_dir.join(leaf_alias))
+        .map_err(|error| error.to_string())?;
+    let outside = fixture.home.join("outside-native");
+    std::fs::create_dir_all(&outside).map_err(|error| error.to_string())?;
+    let vectors = VectorIndex::open_read_only(&vector_path).map_err(|error| error.to_string())?;
+    HnswIndex::build_from_vector_index(&vectors, HnswConfig::default())
+        .and_then(|graph| graph.save(&outside.join("selected.chsw")))
+        .map_err(|error| error.to_string())?;
+    std::os::unix::fs::symlink(
+        &outside,
+        fixture.data_dir.join("vector_index/aliased-parent"),
+    )
+    .map_err(|error| error.to_string())?;
+    let title_root = fixture
+        .data_dir
+        .join("vector_index/titles/another-producer");
+    std::fs::create_dir_all(&title_root).map_err(|error| error.to_string())?;
+    // The alias is not among the body's registered identities. Its owner can
+    // be an independent title publication, so all hardlinked outputs are refused.
+    std::fs::hard_link(&selected_path, title_root.join("current.json"))
+        .map_err(|error| error.to_string())?;
+    // Neither file is selected by the mutable ledger. Their immutable parent
+    // namespaces still own them: an old proof and an actual native ANN graph
+    // must not become mutable maintenance outputs through a new declaration.
+    let old_proof_relative = "vector_index/served/unselected-proof.parents";
+    std::fs::copy(
+        fixture.data_dir.join(&certificate.parent_path),
+        fixture.data_dir.join(old_proof_relative),
+    )
+    .map_err(|error| error.to_string())?;
+    let old_generation_relative = "vector_index/generations/old-unselected/fast/native.chsw";
+    let old_generation_path = fixture.data_dir.join(old_generation_relative);
+    std::fs::create_dir_all(
+        old_generation_path
+            .parent()
+            .ok_or("old generation parent")?,
+    )
+    .map_err(|error| error.to_string())?;
+    HnswIndex::build_from_vector_index(&vectors, HnswConfig::default())
+        .and_then(|graph| graph.save(&old_generation_path))
+        .map_err(|error| error.to_string())?;
+    let db_path = fixture.data_dir.join("agent_search.db");
+    let archive_before = std::fs::read(&db_path).map_err(|error| error.to_string())?;
+    let outside_before = file_snapshot(&outside)?;
+    for relative in [
+        "../outside-native/selected.chsw".to_string(),
+        selected_path.to_string_lossy().into_owned(),
+        vector_relative,
+        certificate.parent_path.clone(),
+        "agent_search.db".to_string(),
+        "Agent_Search.DB".to_string(),
+        "vector_index/semantic_manifest.json".to_string(),
+        hardlink_relative.to_string(),
+        "vector_index/selected.chsw".to_string(),
+        "vector_index/titles/new-producer/new-graph.chsw".to_string(),
+        "Vector_Index/Titles/new-producer/new-graph.chsw".to_string(),
+        "vector_index/titles/another-producer/current.json".to_string(),
+        old_proof_relative.to_string(),
+        old_generation_relative.to_string(),
+        "Vector_Index/Served/unselected-proof.parents".to_string(),
+        "Vector_Index/Generations/old-unselected/fast/native.chsw".to_string(),
+        leaf_alias.to_string(),
+        "vector_index/aliased-parent/selected.chsw".to_string(),
+    ] {
+        let mut refused = manifest.clone();
+        refused
+            .hnsw
+            .as_mut()
+            .ok_or("missing graph record")?
+            .index_path = relative.clone();
+        refused
+            .save(&fixture.data_dir)
+            .map_err(|error| error.to_string())?;
+        let before = file_snapshot(&fixture.data_dir.join("vector_index"))?;
+        for args in [
+            vec!["models", "build-hnsw", "--json", "--check"],
+            vec!["models", "build-hnsw", "--json", "--force"],
+        ] {
+            let out = run(
+                &fixture,
+                "declared_hnsw_refused_path",
+                &args,
+                MODELS_TIMEOUT,
+            );
+            let rendered = format!("{}{}", text(&out.stdout), text(&out.stderr));
+            if out.status.code() != Some(5)
+                || !rendered.contains("HNSW accelerator")
+                || file_snapshot(&fixture.data_dir.join("vector_index"))? != before
+                || std::fs::read(&db_path).map_err(|error| error.to_string())? != archive_before
+                || file_snapshot(&outside)? != outside_before
+            {
+                return Err(format!(
+                    "unsafe declaration {relative:?} must refuse without altering archive or artifacts: {rendered}"
+                ));
+            }
+        }
+    }
+    // Global --db selects the canonical archive even for this database-free
+    // command. A manifest must not turn that alternate archive into ANN output.
+    let custom_db = fixture.data_dir.join("custom-history.sqlite3");
+    std::fs::copy(&db_path, &custom_db).map_err(|error| error.to_string())?;
+    let custom_db_arg = custom_db
+        .to_str()
+        .ok_or("custom database path is not UTF-8")?;
+    let mut refused = manifest.clone();
+    refused
+        .hnsw
+        .as_mut()
+        .ok_or("missing graph record")?
+        .index_path = "custom-history.sqlite3".to_string();
+    refused
+        .save(&fixture.data_dir)
+        .map_err(|error| error.to_string())?;
+    let before = file_snapshot(&fixture.data_dir.join("vector_index"))?;
+    for mode in ["--check", "--force"] {
+        let out = run(
+            &fixture,
+            "declared_hnsw_refused_custom_archive",
+            &[
+                "--db",
+                custom_db_arg,
+                "models",
+                "build-hnsw",
+                "--json",
+                mode,
+            ],
+            MODELS_TIMEOUT,
+        );
+        if out.status.code() != Some(5)
+            || std::fs::read(&custom_db).map_err(|error| error.to_string())? != archive_before
+            || std::fs::read(&db_path).map_err(|error| error.to_string())? != archive_before
+            || file_snapshot(&fixture.data_dir.join("vector_index"))? != before
+        {
+            return Err(format!(
+                "custom canonical archive must not become HNSW output: {} {}",
+                text(&out.stdout),
+                text(&out.stderr)
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[test]

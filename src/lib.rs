@@ -128361,7 +128361,14 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
             json,
         } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_models_build_hnsw(tier.as_deref(), check, force, data_dir, structured_format)
+            run_models_build_hnsw(
+                tier.as_deref(),
+                check,
+                force,
+                data_dir,
+                cli.db.clone(),
+                structured_format,
+            )
         }
         ModelsCommand::Remove {
             model,
@@ -130072,23 +130079,25 @@ fn run_models_build_hnsw(
     check: bool,
     force: bool,
     data_dir_override: Option<PathBuf>,
+    db_override: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::search::ann_index::{
-        HnswAcceleratorState, hnsw_index_path, inspect_hnsw_accelerator, maintain_hnsw_accelerator,
+        HnswAcceleratorState, hnsw_maintenance_path, inspect_hnsw_accelerator,
+        maintain_hnsw_accelerator,
     };
     use crate::search::semantic_manifest::{HnswRecord, SemanticManifest, TierKind};
     use crate::search::vector_index::VectorIndex as FsVectorIndex;
     use colored::Colorize;
 
-    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(&data_dir_override, db_override.as_ref());
+    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     // Keep the selected vector/manifest generation stable through native
     // admission and manifest publication. The lock does not open the archive;
     // --check remains a strictly read-only inspection.
     let _maintenance_guard = if check {
         None
     } else {
-        let db_path = data_dir.join("agent_search.db");
         Some(
             crate::indexer::acquire_search_asset_mutation_lock(
                 &data_dir,
@@ -130209,12 +130218,16 @@ fn run_models_build_hnsw(
         });
     }
     let vector_count = fs_index.record_count();
-    let ann_path = hnsw_index_path(&data_dir, &record.embedder_id);
-    let relative_ann_path = ann_path
-        .strip_prefix(&data_dir)
-        .unwrap_or(ann_path.as_path())
-        .to_string_lossy()
-        .to_string();
+    let selected_ann = hnsw_maintenance_path(&data_dir, &db_path, &manifest, tier, &record)
+        .map_err(|error| CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: format!("Cannot select HNSW accelerator for maintenance: {error:#}"),
+            hint: Some("Correct the semantic manifest's accelerator path before retrying".into()),
+            retryable: false,
+        })?;
+    let ann_path = selected_ann.path;
+    let relative_ann_path = selected_ann.relative_path;
     let manifest_records_current = manifest.hnsw.as_ref().is_some_and(|hnsw| {
         hnsw.ready
             && hnsw.base_tier.as_str().cmp(tier.as_str()).is_eq()

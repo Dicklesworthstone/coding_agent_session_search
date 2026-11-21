@@ -11049,8 +11049,12 @@ fn semantic_index_has_current_contract(data_dir: &Path, requested_embedder: &str
 /// Honor explicit ANN maintenance even when no embedding work was needed.
 /// The index-run lock is held by the caller. Only the published requested
 /// artifact may be accelerated; constructing a model is unnecessary here.
-fn maintain_requested_hnsw(data_dir: &Path, requested_embedder: &str) -> Result<usize> {
-    use crate::search::ann_index::{hnsw_index_path, maintain_hnsw_accelerator};
+fn maintain_requested_hnsw(
+    data_dir: &Path,
+    db_path: &Path,
+    requested_embedder: &str,
+) -> Result<usize> {
+    use crate::search::ann_index::{hnsw_maintenance_path, maintain_hnsw_accelerator};
     use crate::search::semantic_manifest::HnswRecord;
 
     let Some(mut manifest) = SemanticManifest::load(data_dir)? else {
@@ -11082,12 +11086,9 @@ fn maintain_requested_hnsw(data_dir: &Path, requested_embedder: &str) -> Result<
         "cannot build HNSW: published vector count does not match the selected semantic artifact"
     );
     let embedder_id = artifact.embedder_id.clone();
-    let ann_path = hnsw_index_path(data_dir, &embedder_id);
-    let relative_ann_path = ann_path
-        .strip_prefix(data_dir)
-        .context("HNSW path must remain inside the selected data directory")?
-        .to_string_lossy()
-        .into_owned();
+    let selected_ann = hnsw_maintenance_path(data_dir, db_path, &manifest, tier, artifact)?;
+    let ann_path = selected_ann.path;
+    let relative_ann_path = selected_ann.relative_path;
     let maintenance = maintain_hnsw_accelerator(
         &ann_path,
         &index,
@@ -20678,7 +20679,8 @@ fn run_index_with_storage_ownership(
                 0,
                 0,
             );
-            let vector_count = maintain_requested_hnsw(&opts.data_dir, &opts.embedder)?;
+            let vector_count =
+                maintain_requested_hnsw(&opts.data_dir, &opts.db_path, &opts.embedder)?;
             update_semantic_progress(
                 opts.progress.as_ref(),
                 &progress_bump,
@@ -21459,7 +21461,11 @@ fn run_index_with_storage_ownership(
                                 if let Some(progress) = opts_clone.progress.as_ref() {
                                     progress.set_phase_progress(INDEX_PHASE_SEMANTIC_HNSW, 0, 0);
                                 }
-                                maintain_requested_hnsw(&data_dir_for_semantic, &embedder_id)?;
+                                maintain_requested_hnsw(
+                                    &data_dir_for_semantic,
+                                    &opts_clone.db_path,
+                                    &embedder_id,
+                                )?;
                             }
                             record_semantic_watch_once_stats(opts_clone.progress.as_ref(), stats);
                         }
