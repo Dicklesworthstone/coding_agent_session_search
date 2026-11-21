@@ -171,6 +171,192 @@ fn cass_serve_searches_repeatedly_through_the_real_cli() -> anyhow::Result<()> {
 }
 
 #[test]
+fn gh564_tool_hits_survive_cli_projections_stdio_and_mcp() -> anyhow::Result<()> {
+    use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
+    use coding_agent_search::search::tantivy::{TantivyIndex, expected_index_dir};
+    use frankensearch::quill::cass::CassDocument;
+    use serde_json::{Value, json};
+
+    let temp = tempfile::tempdir()?;
+    let path = expected_index_dir(temp.path());
+    let mut writer = TantivyIndex::open_or_create(&path)?;
+    let query = "deploy cache stall";
+    let mut contents: Vec<String> = (1..=24)
+        .map(|step| format!("[Tool: Bash - deploy check {step}: did the cache stall]"))
+        .collect();
+    contents.extend((1..=4).map(|step| {
+        format!("note {step}: ordinary prose about release checks. After the deploy the cache had a stall on restart.")
+    }));
+    contents.extend([
+        "[Tool: Bash - deploy cache stall".into(),
+        "[Tool:]".into(),
+        "Acknowledged.".into(),
+        "System prompt: deploy cache stall".into(),
+    ]);
+    let documents: Vec<_> = contents
+        .into_iter()
+        .enumerate()
+        .map(|(index, content)| CassDocument {
+            agent: "claude_code".into(),
+            workspace: Some("/work".into()),
+            workspace_original: None,
+            source_path: format!("/history/tool-hit-{}.jsonl", index + 1),
+            msg_idx: 0,
+            created_at: Some(1_700_000_000_000 + index as i64),
+            title: Some(query.into()),
+            content,
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+            conversation_id: Some(index as i64 + 1),
+        })
+        .collect();
+    writer.add_prebuilt_documents_slice(&documents)?;
+    writer.commit()?;
+    drop(writer);
+    // All source texts fit in their stored preview; the fixture needs no
+    // canonical database to classify them before rendering.
+    let client = SearchClient::open(&path, None)?.expect("fixture reader");
+    let mut expected_pages = Vec::new();
+    for limit in [5, 50] {
+        let baseline = client.search(query, SearchFilters::default(), limit, 0, FieldMask::FULL)?;
+        assert_eq!(baseline.len(), limit.min(28));
+        let expected: Vec<i64> = baseline
+            .iter()
+            .map(|hit| hit.conversation_id.unwrap())
+            .collect();
+        assert!(expected.iter().all(|id| *id <= 28));
+        for fields in [
+            "minimal",
+            "conversation_id,content",
+            "conversation_id,snippet",
+        ] {
+            let child = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+                .args([
+                    "search",
+                    query,
+                    "--robot",
+                    "--no-maintenance",
+                    "--mode",
+                    "lexical",
+                    "--fields",
+                    fields,
+                    "--timeout",
+                    "10000",
+                    "--limit",
+                ])
+                .arg(limit.to_string())
+                .arg("--data-dir")
+                .arg(temp.path())
+                .env("CASS_AUTO_REFRESH", "0")
+                .env("CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS", "0")
+                .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let output = wait_with_output_timeout(
+                child,
+                Duration::from_secs(30),
+                "projected search timed out",
+            )?;
+            assert!(
+                output.status.success(),
+                "{fields}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let response: Value = serde_json::from_slice(&output.stdout)?;
+            let hits = response["hits"].as_array().expect("CLI hits");
+            let actual: Vec<i64> = hits
+                .iter()
+                .map(|hit| hit["conversation_id"].as_i64().unwrap())
+                .collect();
+            assert_eq!(actual, expected, "{fields}, limit={limit}");
+            if !fields.contains("content") {
+                assert!(hits.iter().all(|hit| hit.get("content").is_none()));
+            }
+        }
+        expected_pages.push((limit, expected));
+    }
+
+    for mcp in [false, true] {
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command
+            .args(["serve", "--stdio", "--data-dir"])
+            .arg(temp.path());
+        if mcp {
+            command.arg("--mcp");
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut input = child.stdin.take().expect("service stdin");
+        if mcp {
+            writeln!(
+                input,
+                "{}",
+                json!({
+                    "jsonrpc":"2.0", "id":"init", "method":"initialize",
+                    "params":{"protocolVersion":"2025-11-25", "capabilities":{},
+                        "clientInfo":{"name":"noise-regression","version":"1"}}
+                })
+            )?;
+            writeln!(
+                input,
+                "{}",
+                json!({"jsonrpc":"2.0", "method":"notifications/initialized"})
+            )?;
+        }
+        for (id, (limit, _)) in expected_pages.iter().enumerate() {
+            for pass in 0..2 {
+                let request = if mcp {
+                    json!({"jsonrpc":"2.0", "id":id * 2 + pass, "method":"tools/call",
+                        "params":{"name":"cass_search", "arguments":{"query":query,"limit":limit}}})
+                } else {
+                    json!({"op":"search", "id":id * 2 + pass, "query":query,"limit":limit})
+                };
+                writeln!(input, "{request}")?;
+            }
+        }
+        drop(input);
+        let output = wait_with_output_timeout(
+            child,
+            Duration::from_secs(30),
+            "noise regression service timed out",
+        )?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let replies = std::str::from_utf8(&output.stdout)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        let replies = if mcp { &replies[1..] } else { &replies[..] };
+        assert_eq!(replies.len(), expected_pages.len() * 2);
+        for (index, reply) in replies.iter().enumerate() {
+            let result = if mcp {
+                assert_eq!(reply["result"]["isError"], false, "{reply}");
+                &reply["result"]["structuredContent"]
+            } else {
+                assert_eq!(reply["ok"], true, "{reply}");
+                &reply["result"]
+            };
+            let actual: Vec<i64> = result["hits"]
+                .as_array()
+                .expect("service hits")
+                .iter()
+                .map(|hit| hit["conversation_id"].as_i64().unwrap())
+                .collect();
+            assert_eq!(actual, expected_pages[index / 2].1, "MCP={mcp}, {reply}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn multilingual_cli_stdio_and_mcp_share_the_v9_query_contract() -> anyhow::Result<()> {
     use coding_agent_search::search::tantivy::{TantivyIndex, expected_index_dir};
     use frankensearch::quill::cass::CassDocument;
@@ -179,7 +365,10 @@ fn multilingual_cli_stdio_and_mcp_share_the_v9_query_contract() -> anyhow::Resul
 
     let temp = tempfile::tempdir()?;
     let path = expected_index_dir(temp.path());
-    assert_eq!(path.file_name().and_then(|name| name.to_str()), Some("v9-quill"));
+    assert_eq!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("v9-quill")
+    );
     let mut writer = TantivyIndex::open_or_create(&path)?;
     let documents = [
         (1, "fixture", "Kérlek nézd"),
@@ -275,7 +464,11 @@ fn multilingual_cli_stdio_and_mcp_share_the_v9_query_contract() -> anyhow::Resul
             Duration::from_secs(30),
             "multilingual search worker did not finish",
         )?;
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let replies = std::str::from_utf8(&output.stdout)?
             .lines()
             .map(serde_json::from_str::<Value>)
@@ -293,9 +486,17 @@ fn multilingual_cli_stdio_and_mcp_share_the_v9_query_contract() -> anyhow::Resul
             let hits = result["hits"].as_array().expect("search hits");
             let actual = hits
                 .iter()
-                .map(|hit| hit["conversation_id"].as_i64().expect("conversation identity"))
+                .map(|hit| {
+                    hit["conversation_id"]
+                        .as_i64()
+                        .expect("conversation identity")
+                })
                 .collect::<BTreeSet<_>>();
-            assert_eq!(actual, expected.iter().copied().collect(), "MCP={mcp}, {query:?}");
+            assert_eq!(
+                actual,
+                expected.iter().copied().collect(),
+                "MCP={mcp}, {query:?}"
+            );
             assert_eq!(hits.len(), expected.len(), "duplicate hits for {query:?}");
             assert_eq!(result["count"], expected.len());
         }
@@ -336,13 +537,21 @@ fn multilingual_cli_stdio_and_mcp_share_the_v9_query_contract() -> anyhow::Resul
             Duration::from_secs(30),
             "multilingual CLI search did not finish",
         )?;
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let reply: Value = serde_json::from_slice(&output.stdout)?;
         assert_eq!(reply["budget"]["timed_out"], false, "{reply}");
         let hits = reply["hits"].as_array().expect("CLI search hits");
         let actual = hits
             .iter()
-            .map(|hit| hit["conversation_id"].as_i64().expect("conversation identity"))
+            .map(|hit| {
+                hit["conversation_id"]
+                    .as_i64()
+                    .expect("conversation identity")
+            })
             .collect::<BTreeSet<_>>();
         assert_eq!(actual, expected.iter().copied().collect(), "CLI {query:?}");
         assert_eq!(hits.len(), expected.len());

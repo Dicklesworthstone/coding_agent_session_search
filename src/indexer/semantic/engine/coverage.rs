@@ -26,14 +26,15 @@ pub(crate) struct SemanticBuildSnapshot {
 }
 
 impl SemanticBuildSnapshot {
-    /// Capture before selecting any canonical inputs. Unsupported external
-    /// producers/platforms and caller-owned transactions keep strict admission.
+    /// Capture before selecting any canonical inputs. Unknown producer contracts
+    /// and unsupported backing stores keep strict admission; caller-owned
+    /// transactions cannot certify uncommitted canonical data.
     pub(crate) fn capture(storage: &FrankenStorage, embedder_id: &str) -> Result<Option<Self>> {
         ensure!(
             !storage.raw().as_async().in_transaction(),
             "semantic maintenance requires committed canonical rows, not a caller-owned transaction"
         );
-        if crate::search::external_embedder::is_external_identity(embedder_id) {
+        if expected_vector_space_revision(embedder_id).is_none() {
             return Ok(None);
         }
         let Some(archive) = BackfillFilePair::archive(storage) else {

@@ -100,7 +100,8 @@ credentials or transcript bodies in the checkpoint.
 Network, HTTP, malformed-response and preflight errors are reported without
 response bodies, URLs, or credentials. Failures do not switch to MiniLM or
 hash. A corrupt external checkpoint manifest is refused, not reset to an empty
-ledger. Partial generations remain unavailable to external search.
+ledger. An unfinished generation is never published. A previously completed,
+certified generation can remain searchable while its replacement is built.
 
 ## Nightly operation
 
@@ -127,8 +128,25 @@ The supported external query surface is exact semantic search over the matching
 completed monolithic artifact. Both explicit `--model external` and the opt-in
 policy above are supported, including the bounded JSON/robot search worker.
 External vectors do not enter the local inference daemon or local query cache
-namespace. Missing/stale/mismatched artifacts and unfinished checkpoints are
-refused before endpoint preflight. Availability probes perform no HTTP.
+namespace. Missing or mismatched artifacts and unfinished first publications
+are refused before endpoint preflight. Availability probes perform no HTTP.
+
+On Unix, completed canonical backfills also seal an immutable vector file and
+its canonical provenance certificate. Appending messages then leaves the
+verified covered subset searchable: results report `semantic_coverage.status`
+as `partial` until another explicit backfill publishes the added messages.
+Every candidate is checked against the query's current canonical snapshot;
+deleted or rewritten passages cannot be returned using their old vectors.
+The durable `forget` repair fence continues to block readers until repair is
+complete. Endpoint, model, dimension and revision must still match exactly.
+
+Existing external artifacts without a certificate retain strict current-archive
+admission. Rerun the explicit backfill command once to reconcile them and publish
+the certificate; unchanged document identities reuse their stored vectors.
+This upgrade is not performed by a search. Platforms without the required file
+witnesses retain strict admission. Even with a certificate, archive or publication
+changes during the fixed-public-input preflight refuse that admission before
+the caller can send its query; a new request can admit the changed snapshot.
 The newer immutable-generation and progressive/two-tier serving paths still
 require their existing ownership/identity admission and remain fail-closed;
 this feature does not bypass those gates. No GPU throughput or quality gain
@@ -162,9 +180,11 @@ does it send fixed public probes, recheck admission, and embed the query. The
 HTTP provider, exact vector readers and filter maps remain in this process for
 subsequent queries; it does not re-embed canonical message bodies at query time.
 `unload` releases those owners. The next semantic request must admit them and
-run preflight again. A changed archive or guarded publication refuses reuse
-before the next query is sent; unload/reload is not permission to accept stale
-vectors. Complete the corresponding backfill before querying changed history.
+run preflight again. Certified readers retain their verified subset across
+ordinary ingest and adopt a newer completed publication on a later request.
+Their coverage receipt remains partial until that publication catches up.
+Uncertified readers still refuse reuse after the archive changes; unload/reload
+does not grant them partial-serving authority.
 
 Status reports `external_provider_selected`, the admitted safe `embedder_id`,
 and `local_model_loaded: false`. `neural` is null for an arbitrary external

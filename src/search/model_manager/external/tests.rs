@@ -224,7 +224,9 @@ fn external_publication_admits_the_cli_producer_identity_without_http() {
 
     // Match actual CLI publication, not the generic header contract string.
     assert_eq!(record.model_revision, config.identity());
-    assert_eq!(recorded_artifact(dir.path(), &config).unwrap(), record);
+    let admitted = recorded_artifact(dir.path(), &config).unwrap();
+    assert_eq!(admitted.record, record);
+    assert!(admitted.coverage.is_none());
     let result = load_with_config(
         dir.path(),
         &dir.path().join("missing.db"),

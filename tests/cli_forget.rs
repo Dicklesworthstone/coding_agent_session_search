@@ -2117,6 +2117,85 @@ fn a_failed_lexical_purge_is_repaired_by_retrying_the_same_forget() -> TestResul
 }
 
 #[test]
+fn gh565_forget_retries_with_retired_fallback_and_publishes_lexical_index() -> TestResult {
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let (archive, forgotten) = indexed_archive(&[])?;
+    let forgotten_str = forgotten.to_str().ok_or("non-utf8 fixture path")?;
+    assert!(!archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+    let args = [
+        "forget",
+        "--source-path",
+        forgotten_str,
+        "--apply",
+        "--json",
+    ];
+    let mut failing = archive.cmd();
+    failing
+        .env("CASS_FTS_SHADOW_MAX_MESSAGES", "1")
+        .env("CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE", "1");
+    let failed = archive.run_step(
+        "forget with oversized fallback and lexical failure",
+        failing,
+        &args,
+    )?;
+    assert_eq!(failed.status.code(), Some(5));
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    let envelope: Value = serde_json::from_str(
+        stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .ok_or("missing forget failure envelope")?,
+    )?;
+    assert_eq!(envelope["error"]["kind"], "lexical-rebuild");
+
+    let path = archive.data_dir.join("agent_search.db");
+    let storage = FrankenStorage::open_readonly(&path)?;
+    assert_eq!(storage.total_conversation_count()?, 1);
+    assert_eq!(storage.total_message_count()?, 2);
+    assert!(storage.forget_derived_rebuild_pending()?);
+    assert!(
+        storage
+            .raw()
+            .query("SELECT name FROM sqlite_master WHERE name = 'fts_messages' OR name LIKE 'fts_messages_%'")?
+            .is_empty(),
+        "forget must retire an oversized fallback before reaching lexical rebuilding"
+    );
+    storage.close_without_checkpoint()?;
+
+    let mut retry = archive.cmd();
+    retry.env("CASS_FTS_SHADOW_MAX_MESSAGES", "1");
+    let repaired = archive.run_step("retry forget with retired fallback", retry, &args)?;
+    assert!(
+        repaired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    let report: Value = serde_json::from_slice(&repaired.stdout)?;
+    assert_eq!(report["conversations_deleted"], 0);
+    assert_eq!(report["derived_rebuilt"], true);
+    let storage = FrankenStorage::open_readonly(&path)?;
+    assert!(!storage.forget_derived_rebuild_pending()?);
+    assert!(
+        storage
+            .raw()
+            .query("SELECT name FROM sqlite_master WHERE name = 'fts_messages' OR name LIKE 'fts_messages_%'")?
+            .is_empty(),
+        "a retry must not recreate the retired fallback"
+    );
+    storage.close_without_checkpoint()?;
+    assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+    assert!(
+        forgotten.is_file(),
+        "forget preserves the original source file"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_forgotten_source_stays_forgotten_until_the_file_changes() -> TestResult {
     let (archive, forgotten) = indexed_archive(&[])?;
     let forgotten_str = forgotten.to_str().ok_or("non-utf8 fixture path")?;
