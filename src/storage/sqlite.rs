@@ -23062,7 +23062,9 @@ impl FrankenStorage {
     ///
     /// GH #424: the keyset runs over `messages` alone and resolves the
     /// `conversations` / `agents` dimensions from in-memory maps; every chunk
-    /// commits on its own. See [`Self::rebuild_analytics_since_with_chunk_size`].
+    /// commits on its own. GH #565: full resets also commit bounded rowid
+    /// pages, and raw message pages observe a byte budget before hydration.
+    /// See [`Self::rebuild_analytics_since_with_chunk_size`].
     pub fn rebuild_analytics_since(&self, since_ms: Option<i64>) -> Result<AnalyticsRebuildResult> {
         self.rebuild_analytics_since_with_chunk_size(since_ms, ANALYTICS_REBUILD_CHUNK_SIZE)
     }
@@ -23079,9 +23081,9 @@ impl FrankenStorage {
         )
     }
 
-    fn reset_legacy_omp_analytics(
+    fn reset_analytics_for_full_rebuild(
         &self,
-        context: &str,
+        resume_context: Option<&str>,
         progress: Option<&dyn Fn(i64, i64)>,
         heartbeat: Option<&dyn Fn()>,
         control: Option<&dyn Fn() -> Result<()>>,
@@ -23140,28 +23142,33 @@ impl FrankenStorage {
                 schema == "main" && name == table && kind == "table"
             });
             let Some((_, _, _, without_rowid)) = layout else {
-                bail!("cannot reset legacy OMP analytics: missing ordinary table {table}");
+                bail!("cannot reset analytics: missing ordinary table {table}");
             };
             if *without_rowid != 0 {
                 bounded = false;
                 tracing::warn!(
                     target: "cass::analytics",
                     table,
-                    "legacy OMP analytics table is WITHOUT ROWID; retaining the unbounded transactional reset because fsqlite 0.3.18 lacks bounded primary-key delete seeks"
+                    "analytics table is WITHOUT ROWID; retaining the transactional reset because bounded rowid delete seeks are unavailable"
                 );
             }
         }
         checkpoint()?;
         let mut tx = self.conn.transaction()?;
         tx.execute_compat(
-            "DELETE FROM meta WHERE key IN (?1, ?2, ?3, ?4)",
+            "DELETE FROM meta WHERE key IN (?1, ?2, ?3)",
             fparams![
                 LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
                 LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
-                LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY,
-                LEGACY_OMP_ANALYTICS_REBUILT_META_KEY
+                LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY
             ],
         )?;
+        if resume_context.is_some() {
+            tx.execute_compat(
+                "DELETE FROM meta WHERE key = ?1",
+                fparams![LEGACY_OMP_ANALYTICS_REBUILT_META_KEY],
+            )?;
+        }
         if let Some(control) = control {
             control()?;
         }
@@ -23170,8 +23177,9 @@ impl FrankenStorage {
 
         if bounded {
             // Always take the first remaining keys, including negative IDs.
-            // Missing cursor authority makes interruption during clearing
-            // idempotent: reopen clears the remainder before rebuilding.
+            // Invalidate cursor authority before the first reset commit.
+            // Ordinary full rebuilds and interrupted migrations both clear
+            // the remainder before adding any new rollup deltas on restart.
             for (_, select_sql, delete_prefix) in TABLES {
                 loop {
                     checkpoint()?;
@@ -23183,10 +23191,7 @@ impl FrankenStorage {
                         break;
                     }
                     let deleted = delete_rows_by_i64_chunks(&tx, delete_prefix, &ids)?;
-                    anyhow::ensure!(
-                        deleted == ids.len(),
-                        "legacy OMP analytics reset lost selected rows"
-                    );
+                    anyhow::ensure!(deleted == ids.len(), "analytics reset lost selected rows");
                     if let Some(control) = control {
                         control()?;
                     }
@@ -23214,20 +23219,19 @@ impl FrankenStorage {
                 fparams![],
                 |row| row.get_typed(0),
             )?;
-            anyhow::ensure!(
-                remaining.is_empty(),
-                "legacy OMP analytics reset left rows in {table}"
-            );
+            anyhow::ensure!(remaining.is_empty(), "analytics reset left rows in {table}");
         }
-        for (key, value) in [
-            (LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY, context),
-            (LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY, "start"),
-            (LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY, "0"),
-        ] {
-            tx.execute_compat(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-                fparams![key, value],
-            )?;
+        if let Some(context) = resume_context {
+            for (key, value) in [
+                (LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY, context),
+                (LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY, "start"),
+                (LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY, "0"),
+            ] {
+                tx.execute_compat(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                    fparams![key, value],
+                )?;
+            }
         }
         if let Some(control) = control {
             control()?;
@@ -23475,48 +23479,33 @@ impl FrankenStorage {
         // the rebuild sees a partially rebuilt rollup instead of the old one;
         // an interrupted run leaves a prefix that the next full rebuild
         // simply re-derives.
-        if resume_cursor.is_none()
-            && let Some(context) = resume_context
-        {
-            self.reset_legacy_omp_analytics(context, progress, heartbeat, control)?;
+        if resume_cursor.is_none() && scope.is_none() {
+            self.reset_analytics_for_full_rebuild(resume_context, progress, heartbeat, control)?;
         }
-        if resume_cursor.is_none() && resume_context.is_none() {
+        if let Some((cutoff_day, cutoff_hour, _)) = scope {
             if let Some(control) = control {
                 control()?;
             }
             let mut tx = self.conn.transaction()?;
-            match scope {
-                None => {
-                    tx.execute("DELETE FROM message_metrics")?;
-                    tx.execute("DELETE FROM usage_hourly")?;
-                    tx.execute("DELETE FROM usage_daily")?;
-                    tx.execute("DELETE FROM usage_models_daily")?;
-                }
-                Some((cutoff_day, cutoff_hour, _)) => {
-                    tx.execute_compat(
-                        "DELETE FROM message_metrics WHERE day_id >= ?1",
-                        fparams![cutoff_day],
-                    )?;
-                    tx.execute_compat(
-                        "DELETE FROM usage_hourly WHERE hour_id >= ?1",
-                        fparams![cutoff_hour],
-                    )?;
-                    tx.execute_compat(
-                        "DELETE FROM usage_daily WHERE day_id >= ?1",
-                        fparams![cutoff_day],
-                    )?;
-                    tx.execute_compat(
-                        "DELETE FROM usage_models_daily WHERE day_id >= ?1",
-                        fparams![cutoff_day],
-                    )?;
-                }
-            }
-            // Any ordinary full or scoped rebuild changes the live
-            // message-metrics/usage surfaces outside the OMP cursor's
-            // transaction chain. Retaining that cursor would make a later
-            // migration resume add already-rebuilt rollup deltas again.
-            // Invalidate it atomically with this reset; the migration then
-            // restarts from a known-empty scope instead of double-counting.
+            tx.execute_compat(
+                "DELETE FROM message_metrics WHERE day_id >= ?1",
+                fparams![cutoff_day],
+            )?;
+            tx.execute_compat(
+                "DELETE FROM usage_hourly WHERE hour_id >= ?1",
+                fparams![cutoff_hour],
+            )?;
+            tx.execute_compat(
+                "DELETE FROM usage_daily WHERE day_id >= ?1",
+                fparams![cutoff_day],
+            )?;
+            tx.execute_compat(
+                "DELETE FROM usage_models_daily WHERE day_id >= ?1",
+                fparams![cutoff_day],
+            )?;
+            // A scoped rebuild changes the live derivatives outside the
+            // OMP cursor's transaction chain. Invalidate it atomically with
+            // this reset so migration cannot replay additive rollup deltas.
             tx.execute_compat(
                 "DELETE FROM meta WHERE key IN (?1, ?2, ?3)",
                 fparams![
@@ -23558,7 +23547,7 @@ impl FrankenStorage {
             }
             // Plan with byte lengths before hydrating raw payloads. A single
             // oversized native message is processed alone without truncation.
-            let fetch_limit = if resume_context.is_some() {
+            let fetch_limit = {
                 let lower = if first_page {
                     i64::MIN
                 } else {
@@ -23574,7 +23563,11 @@ impl FrankenStorage {
                      FROM messages WHERE id >= ?1 ORDER BY id LIMIT ?2",
                     fparams![
                         lower,
-                        chunk_size.min(LEGACY_OMP_ANALYTICS_CHUNK_SIZE as i64)
+                        if resume_context.is_some() {
+                            chunk_size.min(LEGACY_OMP_ANALYTICS_CHUNK_SIZE as i64)
+                        } else {
+                            chunk_size
+                        }
                     ],
                     |row| row.get_typed(0),
                 )?;
@@ -23582,7 +23575,7 @@ impl FrankenStorage {
                 let mut count = 0_i64;
                 for length in lengths {
                     let next = bytes.saturating_add(length.max(0));
-                    if count > 0 && next > LEGACY_OMP_ANALYTICS_PAGE_BYTES {
+                    if count > 0 && next > ANALYTICS_REBUILD_PAGE_BYTES {
                         break;
                     }
                     bytes = next;
@@ -23592,8 +23585,6 @@ impl FrankenStorage {
                     break;
                 }
                 count
-            } else {
-                chunk_size
             };
             if let Some(control) = control {
                 control()?;
@@ -25281,7 +25272,7 @@ fn sql_like_match_bytes(val: &[u8], pat: &[u8]) -> bool {
 const ANALYTICS_REBUILD_CHUNK_SIZE: usize = 10_000;
 /// Bound legacy repair's transaction and simultaneously materialized payloads.
 const LEGACY_OMP_ANALYTICS_CHUNK_SIZE: usize = 128;
-const LEGACY_OMP_ANALYTICS_PAGE_BYTES: i64 = 8 * 1024 * 1024;
+const ANALYTICS_REBUILD_PAGE_BYTES: i64 = 8 * 1024 * 1024;
 
 /// Per-conversation dimensions resolved once per analytics rebuild instead
 /// of being JOINed into every keyset chunk (GH #424).
@@ -31760,6 +31751,255 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         assert_eq!(orphan_metrics, 0);
     }
 
+    #[test]
+    #[serial]
+    fn gh565_forget_analytics_reset_commits_bounded_pages_and_restarts_clear() -> Result<()> {
+        #[derive(Debug, thiserror::Error)]
+        #[error("planted ordinary analytics reset interruption")]
+        struct Stop;
+
+        fn metric_count(storage: &FrankenStorage) -> Result<i64> {
+            Ok(storage.raw().query_row_map(
+                "SELECT COUNT(*) FROM message_metrics",
+                fparams![],
+                |row| row.get_typed(0),
+            )?)
+        }
+        fn cursor_count(storage: &FrankenStorage) -> Result<i64> {
+            Ok(storage.raw().query_row_map(
+                "SELECT COUNT(*) FROM meta WHERE key IN (?1, ?2, ?3)",
+                fparams![
+                    LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+                    LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
+                    LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY
+                ],
+                |row| row.get_typed(0),
+            )?)
+        }
+        fn canonical_rows(storage: &FrankenStorage) -> Result<Vec<Vec<SqliteValue>>> {
+            Ok(storage
+                .raw()
+                .query("SELECT id, conversation_id, idx, content FROM messages ORDER BY id")?
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect())
+        }
+
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "1");
+        let dir = TempDir::new()?;
+        let path = dir.path().join("forget-analytics-reset.db");
+        let storage = FrankenStorage::open(&path)?;
+        let agent = gh423_agent(&storage);
+        let mut conv = gh423_storage_snapshot();
+        let template = conv.messages[0].clone();
+        conv.messages = (0..130)
+            .map(|idx| {
+                let mut message = template.clone();
+                message.idx = idx;
+                message.created_at = Some(1_767_225_622_759 + idx * 86_400_000);
+                message.extra_json["id"] = serde_json::json!(format!("gh565-reset-{idx}"));
+                message.extra_json["codebuff_message_id"] =
+                    serde_json::json!(format!("gh565-reset-{idx}"));
+                message
+            })
+            .collect();
+        let mut forgotten = gh423_storage_snapshot();
+        forgotten.external_id = Some("gh565-forgotten-analytics".into());
+        forgotten.source_path = PathBuf::from("/fixture/gh565-forgotten-analytics.json");
+        forgotten.messages.truncate(1);
+        storage.insert_conversations_batched_with_analytics(
+            &[(agent, None, &conv), (agent, None, &forgotten)],
+            false,
+        )?;
+        let report = storage.forget_conversations_by_source_glob(
+            "/fixture/gh565-forgotten-analytics.json",
+            false,
+        )?;
+        assert_eq!(report.conversations_deleted, 1);
+        assert_eq!(metric_count(&storage)?, 130);
+        let canonical = canonical_rows(&storage)?;
+        assert_eq!(canonical.len(), 130);
+        for (key, value) in [
+            (
+                LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+                "obsolete-context",
+            ),
+            (LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY, "777"),
+            (LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY, "130"),
+        ] {
+            storage.raw().execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![key, value],
+            )?;
+        }
+
+        // The heartbeat observes committed state, not the inside of a DELETE.
+        // An unbounded ordinary reset never exposes this 128-row boundary.
+        let stop = std::cell::Cell::new(false);
+        let heartbeat = || {
+            if metric_count(&storage).expect("read committed reset metrics") == 2 {
+                let hourly: i64 = storage
+                    .raw()
+                    .query_row_map("SELECT COUNT(*) FROM usage_hourly", fparams![], |row| {
+                        row.get_typed(0)
+                    })
+                    .expect("read committed reset rollup");
+                assert_eq!(hourly, 130, "later tables have not been reset yet");
+                assert_eq!(cursor_count(&storage).expect("read retired cursor"), 0);
+                stop.set(true);
+            }
+        };
+        let control = || -> Result<()> { if stop.get() { Err(Stop.into()) } else { Ok(()) } };
+        let error = storage
+            .rebuild_analytics_since_with_chunk_size_and_progress(
+                None,
+                ANALYTICS_REBUILD_CHUNK_SIZE,
+                None,
+                Some(&heartbeat),
+                None,
+                Some(&control),
+            )
+            .expect_err("ordinary full rebuild must expose bounded reset commits");
+        assert!(error.downcast_ref::<Stop>().is_some());
+        assert_eq!(metric_count(&storage)?, 2);
+        assert_eq!(cursor_count(&storage)?, 0);
+        assert_eq!(canonical_rows(&storage)?, canonical);
+        assert!(storage.forget_derived_rebuild_pending()?);
+        assert!(crate::search::privacy::repair_pending(&path)?);
+        drop(storage);
+
+        let storage = FrankenStorage::open(&path)?;
+        assert_eq!(
+            metric_count(&storage)?,
+            2,
+            "the reset prefix survived reopen"
+        );
+        let rebuilt = storage.rebuild_analytics()?;
+        assert_eq!(rebuilt.message_metrics_rows, 130);
+        assert_eq!(metric_count(&storage)?, 130);
+        for table in ["usage_hourly", "usage_daily", "usage_models_daily"] {
+            let messages: i64 = storage.raw().query_row_map(
+                &format!("SELECT SUM(message_count) FROM {table}"),
+                fparams![],
+                |row| row.get_typed(0),
+            )?;
+            assert_eq!(messages, 130, "restart must clear stale rollups in {table}");
+        }
+        assert_eq!(
+            cursor_count(&storage)?,
+            0,
+            "ordinary rebuild creates no migration cursor"
+        );
+        assert_eq!(canonical_rows(&storage)?, canonical);
+        assert!(storage.forget_derived_rebuild_pending()?);
+        assert!(crate::search::privacy::repair_pending(&path)?);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn gh565_full_analytics_rebuild_observes_payload_budget_and_restarts_after_commit() -> Result<()>
+    {
+        #[derive(Debug, thiserror::Error)]
+        #[error("planted ordinary analytics page interruption")]
+        struct Stop;
+
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "1");
+        let dir = TempDir::new()?;
+        let path = dir.path().join("ordinary-analytics-payload.db");
+        let storage = FrankenStorage::open(&path)?;
+        let agent = gh423_agent(&storage);
+        let mut conv = gh423_storage_snapshot();
+        let mut tail = conv.messages[2].clone();
+        tail.idx = 3;
+        tail.extra_json["id"] = serde_json::json!("gh565-byte-tail");
+        tail.extra_json["codebuff_message_id"] = serde_json::json!("gh565-byte-tail");
+        conv.messages[0].content = "a".repeat(5 * 1024 * 1024);
+        conv.messages[1].content = "b".repeat(5 * 1024 * 1024);
+        conv.messages[2].content = "c".repeat(9 * 1024 * 1024);
+        conv.messages.push(tail);
+        let expected_chars: i64 = conv
+            .messages
+            .iter()
+            .map(|message| message.content.len() as i64)
+            .sum();
+        storage.insert_conversations_batched_with_analytics(&[(agent, None, &conv)], false)?;
+        drop(conv);
+
+        let stop = std::cell::Cell::new(false);
+        let committed = std::cell::RefCell::new(Vec::new());
+        let progress = |processed: i64, _total: i64| {
+            if processed > 0 {
+                committed.borrow_mut().push(processed);
+                stop.set(true);
+            }
+        };
+        let control = || -> Result<()> { if stop.get() { Err(Stop.into()) } else { Ok(()) } };
+        let error = storage
+            .rebuild_analytics_since_with_chunk_size_and_progress(
+                None,
+                ANALYTICS_REBUILD_CHUNK_SIZE,
+                Some(&progress),
+                None,
+                None,
+                Some(&control),
+            )
+            .expect_err("ordinary rebuild must stop after its first committed byte page");
+        assert!(error.downcast_ref::<Stop>().is_some());
+        assert_eq!(
+            *committed.borrow(),
+            vec![1],
+            "ordinary 10,000-row batches must honor the byte budget before hydration"
+        );
+        let partial_metrics: i64 = storage.raw().query_row_map(
+            "SELECT COUNT(*) FROM message_metrics",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(partial_metrics, 1);
+        drop(storage);
+
+        let storage = FrankenStorage::open(&path)?;
+        let completed = std::cell::RefCell::new(Vec::new());
+        let progress = |processed: i64, _total: i64| {
+            if processed > 0 {
+                completed.borrow_mut().push(processed);
+            }
+        };
+        let rebuilt = storage.rebuild_analytics_since_with_chunk_size_and_progress(
+            None,
+            ANALYTICS_REBUILD_CHUNK_SIZE,
+            Some(&progress),
+            None,
+            None,
+            None,
+        )?;
+        assert_eq!(*completed.borrow(), vec![1, 2, 3, 4]);
+        assert_eq!(rebuilt.message_metrics_rows, 4);
+        let totals: (i64, i64, i64) = storage.raw().query_row_map(
+            "SELECT COUNT(*), SUM(content_chars), SUM(tool_call_count) FROM message_metrics",
+            fparams![],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        )?;
+        assert_eq!(
+            totals,
+            (4, expected_chars, 4),
+            "oversized rows and the tail must survive without truncation"
+        );
+        for table in ["usage_hourly", "usage_daily", "usage_models_daily"] {
+            let messages: i64 = storage.raw().query_row_map(
+                &format!("SELECT SUM(message_count) FROM {table}"),
+                fparams![],
+                |row| row.get_typed(0),
+            )?;
+            assert_eq!(
+                messages, 4,
+                "restart must not replay the prior committed delta in {table}"
+            );
+        }
+        Ok(())
+    }
+
     /// GH #424: each message-metrics chunk and its cursor must commit as one
     /// unit. An interrupted OMP migration resumes after the last committed
     /// message without replaying additive usage rollups, while an unrelated
@@ -32226,7 +32466,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             Ok(())
         };
         let error = storage
-            .reset_legacy_omp_analytics(context, None, None, Some(&control))
+            .reset_analytics_for_full_rebuild(Some(context), None, None, Some(&control))
             .expect_err("fallback cancellation must roll back the table reset");
         assert!(
             error
@@ -32251,7 +32491,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             |row| row.get_typed(0),
         )?;
         assert_eq!(cursors, 0);
-        storage.reset_legacy_omp_analytics(context, None, None, None)?;
+        storage.reset_analytics_for_full_rebuild(Some(context), None, None, None)?;
         for table in [
             "message_metrics",
             "usage_hourly",
