@@ -367,6 +367,13 @@ fn main() -> anyhow::Result<()> {
 
     let parsed = match coding_agent_search::try_run_with_parsed_fast(parsed) {
         Ok(result) => {
+            // Fast commands skip the outer runtime, but selftest and health
+            // can still create thread-local bridge runtimes. Drain those on
+            // both success and failure before returning or process::exit:
+            // Windows cannot join their workers during CRT TLS destruction.
+            if !coding_agent_search::shutdown_thread_local_bridge_runtimes() {
+                eprintln!("warning: fast command bridge teardown exceeded its deadline");
+            }
             return match result {
                 Ok(()) => Ok(()),
                 Err(err) => handle_fatal_error(err),

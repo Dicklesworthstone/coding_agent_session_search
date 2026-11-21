@@ -1401,7 +1401,9 @@ fn health_binary_only_exit_code_ignores_archive_state() {
 /// The planted-negative archive path is a directory, which the ordinary
 /// health surface rejects as an unopenable database; selftest must still run
 /// a real in-memory FrankenSQLite write/read round-trip and leave that path
-/// untouched.
+/// untouched. Bead 126wy additionally requires the process to finish with the
+/// reported exit code: a passing payload alone missed the Windows TLS-teardown
+/// abort after the fast path initialized its SQLite bridge.
 #[test]
 fn selftest_is_archive_independent_and_exercises_the_database_engine() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1484,6 +1486,53 @@ fn selftest_is_archive_independent_and_exercises_the_database_engine() {
         payload.get("data_dir").is_none() && payload.get("db_path").is_none(),
         "selftest must not surface or resolve archive paths: {payload}"
     );
+
+    // Exercise the same real engine and process lifetime with output selected
+    // by the environment. Cleanup must not depend on an explicit JSON flag.
+    let inherited_json = isolated_cass_cmd(home)
+        .current_dir(home)
+        .timeout(Duration::from_secs(120))
+        .arg("--db")
+        .arg(&poisoned_db_path)
+        .arg("selftest")
+        .env("CASS_OUTPUT_FORMAT", "json")
+        .output()
+        .expect("run selftest with inherited JSON output");
+    assert_eq!(
+        inherited_json.status.code(),
+        Some(0),
+        "selftest must exit normally after its successful probe; stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&inherited_json.stdout),
+        String::from_utf8_lossy(&inherited_json.stderr)
+    );
+    assert!(inherited_json.stderr.is_empty());
+    let inherited_payload: Value =
+        serde_json::from_slice(&inherited_json.stdout).expect("inherited selftest json");
+    assert_eq!(inherited_payload["functional"], true);
+    assert_eq!(inherited_payload["archive_accessed"], false);
+    assert_eq!(inherited_payload["checks"], payload["checks"]);
+
+    let human = isolated_cass_cmd(home)
+        .current_dir(home)
+        .timeout(Duration::from_secs(120))
+        .env_remove("CASS_OUTPUT_FORMAT")
+        .env_remove("TOON_DEFAULT_FORMAT")
+        .arg("--db")
+        .arg(&poisoned_db_path)
+        .arg("selftest")
+        .output()
+        .expect("run human selftest");
+    assert_eq!(
+        human.status.code(),
+        Some(0),
+        "human selftest must exit normally after its successful probe; stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&human.stdout),
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert!(human.stderr.is_empty());
+    let human_output = String::from_utf8(human.stdout).expect("human selftest utf8");
+    assert!(human_output.contains("frankensqlite in-memory round-trip: pass"));
+    assert!(human_output.contains("configured archive accessed: no"));
     assert_eq!(
         fs::read(&sentinel_path).expect("read untouched archive sentinel"),
         b"archive sentinel",
