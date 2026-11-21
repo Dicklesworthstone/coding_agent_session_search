@@ -7354,6 +7354,42 @@ impl SearchClient {
         approximate: bool,
         tier_mode: SemanticTierMode,
     ) -> Result<SemanticSearchOutcome> {
+        // A certified vector generation proves candidate identity, not reader
+        // admission across forget. Fence before any query text can reach an
+        // external embedder, and again before releasing cached or hydrated
+        // results. Preserve privacy errors even when dispatch would otherwise
+        // return an ordinary semantic failure eligible for lexical fallback.
+        let privacy = self
+            .sqlite_path
+            .as_deref()
+            .map(crate::search::privacy::PrivacySnapshot::for_database)
+            .transpose()?;
+        let result = self.search_semantic_page_with_metadata(
+            query,
+            filters,
+            limit,
+            offset,
+            field_mask,
+            approximate,
+            tier_mode,
+        );
+        if let Some(privacy) = privacy {
+            privacy.validate()?;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_semantic_page_with_metadata(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
+        approximate: bool,
+        tier_mode: SemanticTierMode,
+    ) -> Result<SemanticSearchOutcome> {
         let titles = self
             .semantic
             .lock()

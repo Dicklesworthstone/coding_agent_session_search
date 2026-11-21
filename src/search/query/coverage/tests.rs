@@ -583,8 +583,8 @@ fn certified_semantic_raw_parent_changes_followed_by_ingest_cannot_rebind_old_sc
 }
 
 #[test]
-fn certified_semantic_changed_content_and_forgotten_messages_are_excluded_and_refilled()
--> Result<()> {
+fn certified_semantic_changed_content_and_deleted_messages_are_excluded_and_refilled() -> Result<()>
+{
     let fixture = Fixture::new(&[
         "retained semantic coverage matching first passage",
         "retained semantic coverage matching second passage",
@@ -595,14 +595,16 @@ fn certified_semantic_changed_content_and_forgotten_messages_are_excluded_and_re
         "UPDATE messages SET content = 'replaced unrelated canonical body' WHERE conversation_id = ?1",
         params![fixture.conversations[0].0],
     )?;
-    fixture.storage.forget_conversations_by_source_glob(
-        fixture.conversations[1]
-            .1
-            .source_path
-            .to_str()
-            .context("fixture path")?,
-        false,
-    )?;
+    // Simulate an uncoordinated canonical deletion to isolate missing-row
+    // exclusion and refill. A real forget deliberately fences every reader
+    // until derived repair finishes and is covered separately below.
+    assert_eq!(
+        fixture.storage.raw().execute_compat(
+            "DELETE FROM messages WHERE conversation_id = ?1",
+            params![fixture.conversations[1].0],
+        )?,
+        1
+    );
     let (hits, coverage) = search(&client, 1)?;
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].conversation_id, Some(fixture.conversations[2].0));
@@ -623,14 +625,15 @@ fn certified_semantic_row_id_reuse_never_transfers_a_vector_to_another_conversat
     let deleted = fixture.storage.fetch_messages(fixture.conversations[1].0)?[0]
         .id
         .context("fixture deleted message id")?;
-    fixture.storage.forget_conversations_by_source_glob(
-        fixture.conversations[1]
-            .1
-            .source_path
-            .to_str()
-            .context("fixture path")?,
-        false,
-    )?;
+    // Mutate canonical rows directly so the privacy fence from coordinated
+    // forget cannot mask this independent identity-reuse check.
+    assert_eq!(
+        fixture.storage.raw().execute_compat(
+            "DELETE FROM messages WHERE conversation_id = ?1",
+            params![fixture.conversations[1].0],
+        )?,
+        1
+    );
     let replacement = fixture.insert(
         "replacement-parent",
         "retained semantic coverage identical reused message",
@@ -658,6 +661,37 @@ fn certified_semantic_row_id_reuse_never_transfers_a_vector_to_another_conversat
     );
     assert_eq!(hits.len(), 1);
     assert_eq!(coverage.excluded_candidates, 1);
+    Ok(())
+}
+
+#[test]
+fn certified_semantic_pending_forget_fences_retained_readers() -> Result<()> {
+    let fixture = Fixture::new(&[
+        "retained semantic coverage forgotten passage",
+        "retained semantic coverage surviving passage",
+    ])?;
+    let client = fixture.client()?;
+    assert_eq!(search(&client, 10)?.0.len(), 2);
+    let forgotten = fixture.storage.forget_conversations_by_source_glob(
+        fixture.conversations[0]
+            .1
+            .source_path
+            .to_str()
+            .context("fixture path")?,
+        false,
+    )?;
+    assert_eq!(forgotten.conversations_deleted, 1);
+    assert!(fixture.storage.forget_derived_rebuild_pending()?);
+    let error = search(&client, 10)
+        .expect_err("a pending forget must refuse the retained native semantic reader");
+    assert_eq!(
+        error
+            .downcast_ref::<crate::search::privacy::PrivacyError>()
+            .context("native semantic search omitted the typed privacy refusal")?
+            .kind(),
+        "forget-repair-pending"
+    );
+    assert!(fixture.storage.forget_derived_rebuild_pending()?);
     Ok(())
 }
 

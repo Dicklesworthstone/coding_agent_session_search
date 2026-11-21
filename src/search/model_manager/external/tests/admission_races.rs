@@ -390,9 +390,20 @@ fn search_external(
     Vec<crate::search::query::SearchHit>,
     SemanticCoverageSnapshot,
 )> {
+    search_external_query(client, "private original admission corpus 1")
+}
+
+#[cfg(unix)]
+fn search_external_query(
+    client: &crate::search::query::SearchClient,
+    query: &str,
+) -> AnyResult<(
+    Vec<crate::search::query::SearchHit>,
+    SemanticCoverageSnapshot,
+)> {
     use crate::search::query::{FieldMask, SearchFilters, SemanticTierMode};
     let (hits, stats, coverage) = client.search_semantic_with_tier_and_coverage(
-        "private original admission corpus 1",
+        query,
         SearchFilters::default(),
         10,
         0,
@@ -542,10 +553,108 @@ fn certified_external_revisions_are_excluded_and_forget_fences_retained_readers(
     )?;
     assert!(storage.forget_derived_rebuild_pending()?);
     drop(storage);
-    let error = search_external(&retained).unwrap_err();
+    fixture.endpoint.seen.lock().unwrap().clear();
+    let fence_path = crate::search::privacy::state_path_for_database(&fixture.db);
+    let pending_fence = fs::read(&fence_path)?;
+    // Check both the previously cached query and a new query that would need
+    // network embedding. Neither may bypass a pending forget fence.
+    for query in ["private original admission corpus 1", PRIVATE_QUERY, " "] {
+        let error = search_external_query(&retained, query).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::search::privacy::PrivacyError>()
+                .context("semantic refusal must retain its typed privacy cause")?
+                .kind(),
+            "forget-repair-pending",
+            "covered serving must retain the canonical deletion privacy fence: {error:#}"
+        );
+    }
     assert!(
-        format!("{error:#}").contains("forget-repair-pending"),
-        "covered serving must retain the canonical deletion privacy fence: {error:#}"
+        fixture.endpoint.seen.lock().unwrap().is_empty(),
+        "pending forget must refuse before disclosing a new query to the endpoint"
+    );
+    assert_eq!(fs::read(fence_path)?, pending_fence);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn certified_external_forget_during_embedding_fences_inflight_results() -> AnyResult<()> {
+    use crate::storage::sqlite::ForgetConversationsFilter;
+
+    let fixture = Fixture::covered()?;
+    let retained = fixture.client()?;
+    assert_eq!(search_external(&retained)?.0.len(), 2);
+    fixture.endpoint.seen.lock().unwrap().clear();
+    let db = fixture.db.clone();
+    fixture.endpoint.arm(move || {
+        let storage = FrankenStorage::open(&db)?;
+        let report = storage.forget_conversations(
+            &ForgetConversationsFilter {
+                source_paths: &["/fixture/admission-1.jsonl".to_owned()],
+                ..Default::default()
+            },
+            false,
+        )?;
+        assert_eq!(report.conversations_deleted, 1);
+        assert!(storage.forget_derived_rebuild_pending()?);
+        Ok(())
+    });
+
+    // The endpoint has already received this query when deletion commits.
+    // Canonical filtering can remove the deleted hit, but the entire result
+    // still belongs to an invalidated admission and must not be released.
+    let error = search_external_query(&retained, PRIVATE_QUERY).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<crate::search::privacy::PrivacyError>()
+            .context("inflight query must retain its typed privacy refusal")?
+            .kind(),
+        "forget-repair-pending"
+    );
+    assert!(fixture.endpoint.mutation.lock().unwrap().is_none());
+    assert_eq!(
+        *fixture.endpoint.seen.lock().unwrap(),
+        vec![vec![PRIVATE_QUERY.to_owned()]],
+        "the interleaving must happen inside the real embedding request"
+    );
+    assert!(crate::search::privacy::repair_pending(&fixture.db)?);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn certified_external_completed_forget_epoch_fences_inflight_results() -> AnyResult<()> {
+    let fixture = Fixture::covered()?;
+    let retained = fixture.client()?;
+    assert_eq!(search_external(&retained)?.0.len(), 2);
+    fixture.endpoint.seen.lock().unwrap().clear();
+    let db = fixture.db.clone();
+    fixture.endpoint.arm(move || {
+        // Exercise the full reader-fence protocol while the provider is still
+        // computing the query. No data needs deletion for an admission epoch
+        // to become obsolete: completion must not revive an inflight request.
+        crate::search::privacy::begin_forget(&db)?;
+        crate::search::privacy::complete_forget(&db)?;
+        Ok(())
+    });
+
+    let error = search_external_query(&retained, PRIVATE_QUERY).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<crate::search::privacy::PrivacyError>()
+            .context("completed repair must not renew an inflight admission")?
+            .kind(),
+        "privacy-snapshot-invalidated"
+    );
+    assert!(fixture.endpoint.mutation.lock().unwrap().is_none());
+    assert!(!crate::search::privacy::repair_pending(&fixture.db)?);
+    let (hits, _) = search_external_query(&retained, PRIVATE_QUERY)?;
+    assert_eq!(hits.len(), 2, "a later request may admit the new epoch");
+    assert_eq!(
+        *fixture.endpoint.seen.lock().unwrap(),
+        vec![vec![PRIVATE_QUERY.to_owned()]],
+        "the next admitted request may reuse its query embedding cache"
     );
     Ok(())
 }
