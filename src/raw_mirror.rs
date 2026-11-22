@@ -4,6 +4,7 @@
 //! can activate the indexer's legacy raw-mirror fallback (GH #486). Enforce
 //! exclusions here too, before source access, mirror creation, locks or caches.
 
+mod codec;
 mod exclusions;
 #[path = "raw_mirror_cli.rs"]
 mod index_maintenance;
@@ -12,7 +13,7 @@ pub(crate) use index_maintenance::{
     maintain_for_index,
 };
 // Keep the policy next to the store's private validation/publication helpers.
-// The v1 codec and its existing test module remain byte-for-byte unchanged.
+// Legacy manifests keep their original serialized representation and hashes.
 mod store {
     include!("raw_mirror/store.rs");
     pub(super) mod policy {
@@ -58,11 +59,9 @@ pub fn capture_enabled() -> bool {
         .unwrap_or(true)
 }
 
-// GH #522: the v1 store already deduplicates complete chunks. The amplification
-// is the whole-file path below 8 MiB and the changing, up-to-4-MiB final chunk.
-// Use the SAME fixed_chunks_v1 codec with smaller chunks for append-oriented
-// transcript formats. This keeps old captures readable and bounds a recapture's
-// duplicate tail to less than 256 KiB, without assuming an unchanged prefix.
+// GH #522: small chunks bound the changing tail of append-oriented transcripts.
+// GH #562 adds per-chunk compression without changing these logical boundaries
+// or assuming an unchanged prefix. Legacy captures remain readable.
 const TRANSCRIPT_CHUNK_BYTES: usize = 256 * 1024;
 
 fn is_append_transcript(path: &std::path::Path) -> bool {

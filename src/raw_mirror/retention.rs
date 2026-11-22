@@ -90,6 +90,9 @@ fn content_chunks(manifest: &RawMirrorManifestFile) -> Vec<RawMirrorChunkRef> {
             blob_relative_path: manifest.blob_relative_path.clone(),
             blob_blake3: manifest.blob_blake3.clone(),
             blob_size_bytes: manifest.blob_size_bytes,
+            encoding: None,
+            content_blake3: None,
+            content_size_bytes: None,
         }],
     }
 }
@@ -108,13 +111,15 @@ fn preserved_prefix(root: &Path, old: &RawMirrorManifestFile, new: &RawMirrorMan
         raw_mirror_checkpoint()?;
         let l = left.get(i).ok_or_else(|| anyhow!("short old raw-mirror content"))?;
         let r = right.get(j).ok_or_else(|| anyhow!("short successor raw-mirror content"))?;
-        let remaining_left = l.blob_size_bytes.checked_sub(a).ok_or_else(|| anyhow!("invalid chunk offset"))?;
-        let remaining_right = r.blob_size_bytes.checked_sub(b).ok_or_else(|| anyhow!("invalid chunk offset"))?;
+        let left_size = raw_mirror_chunk_content_size(l);
+        let right_size = raw_mirror_chunk_content_size(r);
+        let remaining_left = left_size.checked_sub(a).ok_or_else(|| anyhow!("invalid chunk offset"))?;
+        let remaining_right = right_size.checked_sub(b).ok_or_else(|| anyhow!("invalid chunk offset"))?;
         if remaining_left == 0 { i += 1; a = 0; continue; }
         if remaining_right == 0 { j += 1; b = 0; continue; }
         let length = remaining_left.min(remaining_right).min(old.source_size_bytes - compared);
-        if a == 0 && b == 0 && l.blob_size_bytes == r.blob_size_bytes {
-            if l.blob_blake3 != r.blob_blake3 { return Ok(false); }
+        if a == 0 && b == 0 && left_size == right_size {
+            if raw_mirror_chunk_content_hash(l) != raw_mirror_chunk_content_hash(r) { return Ok(false); }
             compared += length;
             a += length;
             b += length;
@@ -122,10 +127,8 @@ fn preserved_prefix(root: &Path, old: &RawMirrorManifestFile, new: &RawMirrorMan
         }
         let old_path = root.join(&l.blob_relative_path);
         let new_path = root.join(&r.blob_relative_path);
-        let mut old_file =
-            raw_mirror_io("open_retention_prefix", &old_path, || File::open(&old_path))?;
-        let mut new_file =
-            raw_mirror_io("open_retention_prefix", &new_path, || File::open(&new_path))?;
+        let mut old_file = open_raw_mirror_chunk_reader(root, l)?;
+        let mut new_file = open_raw_mirror_chunk_reader(root, r)?;
         raw_mirror_io("seek_retention_prefix", &old_path, || {
             old_file.seek(SeekFrom::Start(a))
         })?;
@@ -155,7 +158,12 @@ fn ordinary_capture(manifest: &RawMirrorManifestFile) -> bool {
     manifest.verification.status == "captured"
         && manifest.verification.verifier == "cass_indexer"
         && manifest.encryption.state == "none"
-        && manifest.compression.state == "none"
+        && match manifest.content_storage.as_ref().map(|storage| storage.kind.as_str()) {
+            Some(RAW_MIRROR_FIXED_CHUNKS_V2_KIND) => {
+                manifest.compression.state == "per_chunk" && manifest.compression.algorithm.is_none()
+            }
+            _ => manifest.compression.state == "none",
+        }
 }
 
 fn verify_capture(root: &Path, manifest: &RawMirrorManifestFile, verified: &mut HashSet<String>) -> Result<()> {

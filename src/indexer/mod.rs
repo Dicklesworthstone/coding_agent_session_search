@@ -79321,7 +79321,7 @@ c.close()
         );
         assert_eq!(
             conv.metadata.pointer("/cass/raw_mirror/storage_kind"),
-            Some(&serde_json::json!("fixed_chunks_v1"))
+            Some(&serde_json::json!("fixed_chunks_v2"))
         );
         // A .jsonl transcript is captured in 256 KiB chunks (4c10a2a1).
         assert_eq!(

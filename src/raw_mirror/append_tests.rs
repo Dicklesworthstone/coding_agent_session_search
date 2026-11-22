@@ -56,7 +56,23 @@ fn read_capture(data: &Path, record: &RawMirrorCaptureRecord) -> Vec<u8> {
                     blake3::hash(&bytes).to_hex().as_str(),
                     chunk["blob_blake3"].as_str().unwrap()
                 );
-                content.extend(bytes);
+                let decoded = match chunk.get("encoding").and_then(Value::as_str) {
+                    None | Some("none") => bytes,
+                    Some("zstd") => zstd::bulk::decompress(
+                        &bytes,
+                        usize::try_from(chunk["content_size_bytes"].as_u64().unwrap()).unwrap(),
+                    )
+                    .expect("independent zstd readback"),
+                    Some(encoding) => panic!("unsupported fixture encoding: {encoding}"),
+                };
+                if let Some(size) = chunk.get("content_size_bytes").and_then(Value::as_u64) {
+                    assert_eq!(decoded.len() as u64, size);
+                    assert_eq!(
+                        blake3::hash(&decoded).to_hex().as_str(),
+                        chunk["content_blake3"].as_str().unwrap()
+                    );
+                }
+                content.extend(decoded);
             }
             content
         }
@@ -93,7 +109,7 @@ fn gh522_frequent_appends_bound_tail_amplification_and_preserve_every_capture() 
                 content.extend(appended);
             }
             let capture = capture_source_file(input(&data, &source)).unwrap();
-            assert_eq!(capture.storage_kind, "fixed_chunks_v1");
+            assert_eq!(capture.storage_kind, "fixed_chunks_v2");
             descriptor_bytes += capture.blob_size_bytes;
             let unchanged = capture_source_file(input(&data, &source)).unwrap();
             assert_eq!(unchanged.manifest_id, capture.manifest_id);
@@ -148,7 +164,7 @@ fn gh522_non_transcript_policy_and_old_whole_captures_remain_readable() {
     let legacy = store::capture_source_file(input(&data, &source)).unwrap();
     assert_eq!(legacy.storage_kind, "whole_blob_v1");
     let chunked = capture_source_file(input(&data, &source)).unwrap();
-    assert_eq!(chunked.storage_kind, "fixed_chunks_v1");
+    assert_eq!(chunked.storage_kind, "fixed_chunks_v2");
     assert_eq!(read_capture(&data, &legacy), content);
     assert_eq!(read_capture(&data, &chunked), content);
     let container = dir.path().join("session.json");

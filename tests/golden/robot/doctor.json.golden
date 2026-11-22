@@ -2604,7 +2604,7 @@
       "source_identity_scope": "manifest metadata records provider, source_id, origin_kind, origin_host, original path hash, and db_links back to archive conversations/messages",
       "db_link_contract": "db_links entries identify archived conversations without embedding raw session content in manifests",
       "case_insensitive_collision_behavior": "no original path segment is used as a storage directory; path identity is hashed from exact bytes, so case-folding filesystems cannot collide user paths",
-      "migration_contract": "schema_version and raw-mirror/vN keep future layouts side-by-side; v1 manifests without content_storage remain whole-blob captures, while new large-source manifests declare fixed_chunks_v1 metadata"
+      "migration_contract": "schema_version and raw-mirror/vN keep future layouts side-by-side; whole_blob_v1 and fixed_chunks_v1 captures remain readable without rewriting, while new chunked captures declare fixed_chunks_v2 with explicit per-chunk encoding and decoded content identity"
     },
     "policy": {
       "append_only": true,
@@ -2685,14 +2685,14 @@
         "optional": true,
         "allowed_states": [
           "none",
-          "compressed"
+          "per_chunk"
         ],
         "required_metadata_fields": [
           "state",
           "algorithm",
           "uncompressed_size_bytes"
         ],
-        "raw_content_hash_scope": "blob_blake3 always names the stored bytes; compression metadata must preserve the uncompressed byte count for future verification"
+        "raw_content_hash_scope": "blob_blake3 and blob_size_bytes always name stored bytes; fixed_chunks_v2 content_blake3 and content_size_bytes name decoded bytes, and full source verification hashes the reconstructed byte stream"
       },
       "encryption_policy": {
         "default_state": "none",
@@ -2734,7 +2734,7 @@
         "default_robot_json_includes_raw_content": false,
         "public_artifact_contract": "Pages, HTML exports, robot logs, and default support bundles must not include raw mirror bytes, exact source paths, prompts, attachment payloads, or decrypted/encrypted evidence blobs"
       },
-      "compression_contract": "v1 stores plain bytes by default; large sources use fixed_chunks_v1 content-addressed chunking without compression, while future compression must be declared in the compression envelope and preserve uncompressed size/hash metadata",
+      "compression_contract": "whole blobs and chunk descriptors remain plain; new fixed_chunks_v2 captures reuse verified plain chunks or store zstd when smaller, with per_chunk metadata and at most 4 MiB decoded per chunk; readers verify stored and decoded identities and preserve legacy capture bytes",
       "encryption_contract": "v1 stores unencrypted local evidence by default; future encryption must be explicit in the encryption envelope and must not weaken manifest integrity checks",
       "support_bundle_redaction_contract": "support bundles use redacted_original_path and original_path_blake3; raw bytes are not exported unless an operator explicitly asks for evidence export",
       "missing_upstream_semantics": "missing upstream provider files are distinct from missing cass mirror evidence; a verified mirror blob is preserved archive evidence even if the original source path was pruned"

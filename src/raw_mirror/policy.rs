@@ -1,5 +1,5 @@
-// Admission policy for the existing v1 codec. All writes remain under the
-// store's mutation lock; no source, manifest, or blob format is changed.
+// Admission policy for raw-mirror captures. All writes remain under the store's
+// mutation lock, and budgets account for the bytes actually stored on disk.
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -429,6 +429,9 @@ fn stage_blob(
             .ok_or_else(|| anyhow!("invalid computed raw-mirror digest"))?,
         blob_blake3: digest.clone(),
         blob_size_bytes: bytes.len() as u64,
+        encoding: None,
+        content_blake3: None,
+        content_size_bytes: None,
     };
     if seen.insert(digest.clone()) && !content_addressed_blob_is_verified(root, &reference)? {
         let path = staging.write(budget, "blob", bytes)?;
@@ -441,6 +444,52 @@ fn stage_blob(
     Ok(reference)
 }
 
+fn stage_source_chunk(
+    root: &Path,
+    staging: &mut Staging,
+    budget: &mut Budget<'_>,
+    bytes: &[u8],
+    seen: &mut HashSet<String>,
+    files: &mut Vec<CopyToTempResult>,
+) -> Result<RawMirrorChunkRef> {
+    let content_blake3 = blake3::hash(bytes).to_hex().to_string();
+    let plain = RawMirrorChunkRef {
+        blob_relative_path: raw_mirror_blob_relative_path(&content_blake3)
+            .ok_or_else(|| anyhow!("invalid computed raw-mirror content digest"))?,
+        blob_blake3: content_blake3.clone(),
+        blob_size_bytes: bytes.len() as u64,
+        encoding: None,
+        content_blake3: None,
+        content_size_bytes: None,
+    };
+    // A codec upgrade must not rewrite a previously preserved prefix just
+    // because its source grew. Reuse verified legacy plain bytes before
+    // considering compression, including identical chunks staged in this run.
+    let (mut reference, encoding) = if seen.contains(&content_blake3)
+        || content_addressed_blob_is_verified(root, &plain)?
+    {
+        seen.insert(content_blake3.clone());
+        (plain, "none")
+    } else {
+        let compressed = crate::raw_mirror::codec::compress_chunk(bytes)?;
+        if compressed.len() < bytes.len() {
+            (
+                stage_blob(root, staging, budget, &compressed, seen, files)?,
+                "zstd",
+            )
+        } else {
+            (
+                stage_blob(root, staging, budget, bytes, seen, files)?,
+                "none",
+            )
+        }
+    };
+    reference.encoding = Some(encoding.to_string());
+    reference.content_blake3 = Some(content_blake3);
+    reference.content_size_bytes = Some(bytes.len() as u64);
+    Ok(reference)
+}
+
 fn prepare_bounded(
     root: &Path,
     input: &RawMirrorCaptureInput<'_>,
@@ -450,9 +499,13 @@ fn prepare_bounded(
     staging: &mut Staging,
     budget: &mut Budget<'_>,
 ) -> Result<PreparedRawMirrorContent> {
+    anyhow::ensure!(
+        chunk_size > 0 && chunk_size <= crate::raw_mirror::codec::MAX_DECODED_CHUNK_BYTES,
+        "raw-mirror chunk size exceeds the bounded codec policy"
+    );
     let chunked = metadata.len() >= threshold;
     let count = metadata.len().div_ceil(chunk_size as u64);
-    if chunked && count > RAW_MIRROR_MANIFEST_MAX_BYTES / 256 {
+    if chunked && count > RAW_MIRROR_MANIFEST_MAX_BYTES / 512 {
         anyhow::bail!("raw-mirror source needs too many chunks for a bounded manifest");
     }
     let mut source = open_stable_source_file(input.source_path, metadata)?;
@@ -476,14 +529,25 @@ fn prepare_bounded(
             snapshot.read_exact(&mut buffer[..length])
         })?;
         hasher.update(&buffer[..length]);
-        chunks.push(stage_blob(
-            root,
-            staging,
-            budget,
-            &buffer[..length],
-            &mut seen,
-            &mut files,
-        )?);
+        chunks.push(if chunked {
+            stage_source_chunk(
+                root,
+                staging,
+                budget,
+                &buffer[..length],
+                &mut seen,
+                &mut files,
+            )?
+        } else {
+            stage_blob(
+                root,
+                staging,
+                budget,
+                &buffer[..length],
+                &mut seen,
+                &mut files,
+            )?
+        });
         remaining -= length as u64;
         if remaining == 0 {
             break;
@@ -499,7 +563,7 @@ fn prepare_bounded(
     let content_hash = hasher.finalize().to_hex().to_string();
     let (reference, content_storage) = if chunked {
         let storage = RawMirrorContentStorage {
-            kind: RAW_MIRROR_FIXED_CHUNKS_KIND.to_string(),
+            kind: RAW_MIRROR_FIXED_CHUNKS_V2_KIND.to_string(),
             content_hash_algorithm: RAW_MIRROR_HASH_ALGORITHM.to_string(),
             content_blake3: content_hash.clone(),
             content_size_bytes: metadata.len(),
@@ -662,6 +726,9 @@ pub(crate) fn capture(
     if chunk_size == 0 {
         anyhow::bail!("raw mirror chunk size must be greater than zero");
     }
+    if chunk_size > crate::raw_mirror::codec::MAX_DECODED_CHUNK_BYTES {
+        anyhow::bail!("raw mirror chunk size exceeds the bounded codec policy");
+    }
     let metadata = raw_mirror_symlink_metadata(input.source_path)
         .with_context(|| format!("stat raw mirror source {}", input.source_path.display()))?;
     if metadata.file_type().is_symlink() {
@@ -745,7 +812,16 @@ pub(crate) fn capture(
         source_size_bytes: record.source_size_bytes,
         content_storage: record.content_storage.clone(),
         compression: RawMirrorCompressionEnvelope {
-            state: "none".to_string(),
+            state: if record
+                .content_storage
+                .as_ref()
+                .is_some_and(|storage| storage.kind == RAW_MIRROR_FIXED_CHUNKS_V2_KIND)
+            {
+                "per_chunk"
+            } else {
+                "none"
+            }
+            .to_string(),
             algorithm: None,
             uncompressed_size_bytes: Some(record.source_size_bytes),
         },
@@ -849,6 +925,11 @@ pub(crate) fn capture(
 #[cfg(test)]
 mod tests {
     include!("policy_tests.rs");
+}
+
+#[cfg(test)]
+mod compression_tests {
+    include!("capture_compression_tests.rs");
 }
 
 pub(crate) fn capture_default(

@@ -52032,6 +52032,26 @@ fn doctor_raw_mirror_storage_metadata(
     )
 }
 
+fn doctor_raw_mirror_compression_supported(
+    compression: &DoctorRawMirrorCompressionEnvelope,
+    storage_kind: &str,
+    source_size_bytes: Option<u64>,
+) -> bool {
+    if compression.algorithm.is_some() {
+        return false;
+    }
+    match (storage_kind, compression.state.as_str()) {
+        ("whole_blob_v1" | "fixed_chunks_v1", "none") => compression
+            .uncompressed_size_bytes
+            .is_none_or(|size| source_size_bytes == Some(size)),
+        ("fixed_chunks_v2", "per_chunk") => {
+            source_size_bytes.is_some()
+                && compression.uncompressed_size_bytes == source_size_bytes
+        }
+        _ => false,
+    }
+}
+
 fn doctor_raw_mirror_none_state() -> String {
     "none".to_string()
 }
@@ -52059,7 +52079,7 @@ fn doctor_raw_mirror_layout_report() -> DoctorRawMirrorLayoutReport {
         source_identity_scope: "manifest metadata records provider, source_id, origin_kind, origin_host, original path hash, and db_links back to archive conversations/messages".to_string(),
         db_link_contract: "db_links entries identify archived conversations without embedding raw session content in manifests".to_string(),
         case_insensitive_collision_behavior: "no original path segment is used as a storage directory; path identity is hashed from exact bytes, so case-folding filesystems cannot collide user paths".to_string(),
-        migration_contract: "schema_version and raw-mirror/vN keep future layouts side-by-side; v1 manifests without content_storage remain whole-blob captures, while new large-source manifests declare fixed_chunks_v1 metadata".to_string(),
+        migration_contract: "schema_version and raw-mirror/vN keep future layouts side-by-side; whole_blob_v1 and fixed_chunks_v1 captures remain readable without rewriting, while new chunked captures declare fixed_chunks_v2 with explicit per-chunk encoding and decoded content identity".to_string(),
     }
 }
 
@@ -52141,13 +52161,13 @@ fn doctor_raw_mirror_policy_report() -> DoctorRawMirrorPolicyReport {
         compression_policy: DoctorRawMirrorCodecPolicyReport {
             default_state: "none",
             optional: true,
-            allowed_states: vec!["none", "compressed"],
+            allowed_states: vec!["none", "per_chunk"],
             required_metadata_fields: vec![
                 "state",
                 "algorithm",
                 "uncompressed_size_bytes",
             ],
-            raw_content_hash_scope: "blob_blake3 always names the stored bytes; compression metadata must preserve the uncompressed byte count for future verification",
+            raw_content_hash_scope: "blob_blake3 and blob_size_bytes always name stored bytes; fixed_chunks_v2 content_blake3 and content_size_bytes name decoded bytes, and full source verification hashes the reconstructed byte stream",
         },
         encryption_policy: DoctorRawMirrorEncryptionPolicyReport {
             default_state: "none",
@@ -52186,7 +52206,7 @@ fn doctor_raw_mirror_policy_report() -> DoctorRawMirrorPolicyReport {
             default_robot_json_includes_raw_content: false,
             public_artifact_contract: "Pages, HTML exports, robot logs, and default support bundles must not include raw mirror bytes, exact source paths, prompts, attachment payloads, or decrypted/encrypted evidence blobs".to_string(),
         },
-        compression_contract: "v1 stores plain bytes by default; large sources use fixed_chunks_v1 content-addressed chunking without compression, while future compression must be declared in the compression envelope and preserve uncompressed size/hash metadata".to_string(),
+        compression_contract: "whole blobs and chunk descriptors remain plain; new fixed_chunks_v2 captures reuse verified plain chunks or store zstd when smaller, with per_chunk metadata and at most 4 MiB decoded per chunk; readers verify stored and decoded identities and preserve legacy capture bytes".to_string(),
         encryption_contract: "v1 stores unencrypted local evidence by default; future encryption must be explicit in the encryption envelope and must not weaken manifest integrity checks".to_string(),
         support_bundle_redaction_contract: "support bundles use redacted_original_path and original_path_blake3; raw bytes are not exported unless an operator explicitly asks for evidence export".to_string(),
         missing_upstream_semantics: "missing upstream provider files are distinct from missing cass mirror evidence; a verified mirror blob is preserved archive evidence even if the original source path was pruned".to_string(),
@@ -52662,6 +52682,23 @@ fn doctor_verify_raw_mirror_manifest(
         }
     }
 
+    if !doctor_raw_mirror_compression_supported(
+        &manifest.compression,
+        &storage_kind,
+        manifest.source_size_bytes,
+    ) || manifest.encryption.state != "none"
+        || manifest.encryption.algorithm.is_some()
+        || manifest.encryption.key_id.is_some()
+        || manifest.encryption.envelope_version.is_some()
+    {
+        status = "invalid_manifest".to_string();
+        invalid_reason = Some(
+            "raw mirror compression or encryption envelope is unsupported or inconsistent"
+                .to_string(),
+        );
+        verified_stored_blobs.clear();
+    }
+
     let original_path_blake3 = doctor_raw_mirror_original_path_blake3(&manifest.original_path);
     if original_path_blake3 != manifest.original_path_blake3 {
         invalid_reason = Some("original_path_blake3 does not match original_path".to_string());
@@ -52974,16 +53011,21 @@ fn doctor_raw_mirror_amplification_version_from_manifest_path(
     if manifest.manifest_blake3.as_deref() != Some(computed_manifest_blake3.as_str()) {
         return None;
     }
+    let (storage_kind, _, _) = doctor_raw_mirror_storage_metadata(&manifest);
+    if !doctor_raw_mirror_compression_supported(
+        &manifest.compression,
+        &storage_kind,
+        manifest.source_size_bytes,
+    ) || manifest.encryption.state != "none"
+        || manifest.encryption.algorithm.is_some()
+        || manifest.encryption.key_id.is_some()
+        || manifest.encryption.envelope_version.is_some()
+    {
+        return None;
+    }
     let mut stored_blobs = vec![(manifest.blob_blake3.clone(), manifest.blob_size_bytes)];
     let expected_content_blake3 = if let Some(storage) = manifest.content_storage.as_ref() {
-        if storage.get("kind").and_then(serde_json::Value::as_str) != Some("fixed_chunks_v1")
-            || storage
-                .get("content_hash_algorithm")
-                .and_then(serde_json::Value::as_str)
-                != Some(DOCTOR_RAW_MIRROR_HASH_ALGORITHM)
-        {
-            return None;
-        }
+        crate::raw_mirror::validate_content_storage_metadata(storage).ok()?;
         let content_blake3 = storage
             .get("content_blake3")
             .and_then(serde_json::Value::as_str)?;
@@ -53017,15 +53059,19 @@ fn doctor_raw_mirror_amplification_version_from_manifest_path(
             let chunk_blob_size_bytes = chunk
                 .get("blob_size_bytes")
                 .and_then(serde_json::Value::as_u64)?;
+            let chunk_content_size_bytes = chunk
+                .get("content_size_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(chunk_blob_size_bytes);
             let is_last = index + 1 == chunks.len();
             if chunk_blob_size_bytes == 0
-                || chunk_blob_size_bytes > declared_chunk_size_bytes
-                || (!is_last && chunk_blob_size_bytes != declared_chunk_size_bytes)
+                || chunk_content_size_bytes > declared_chunk_size_bytes
+                || (!is_last && chunk_content_size_bytes != declared_chunk_size_bytes)
             {
                 return None;
             }
             reconstructed_size_bytes =
-                reconstructed_size_bytes.checked_add(chunk_blob_size_bytes)?;
+                reconstructed_size_bytes.checked_add(chunk_content_size_bytes)?;
             if doctor_raw_mirror_blob_relative_path(chunk_blake3)?.as_str() != chunk_relative_path {
                 return None;
             }
@@ -53252,15 +53298,34 @@ fn doctor_raw_mirror_estimated_verification_bytes(manifest_entries: &[(PathBuf, 
             continue;
         };
         estimated_bytes = estimated_bytes.saturating_add(manifest.blob_size_bytes);
-        if manifest.content_storage.is_some() {
-            // Chunked verification reads the manifest a second time through the
-            // raw-mirror validator. The descriptor is read three times total:
-            // once by doctor, then once for its raw checksum and once for typed
-            // descriptor parsing. Chunk bytes are streamed once in source order.
+        if let Some(storage) = &manifest.content_storage {
+            // Preserve the conservative descriptor allowance and cover both
+            // physical input and decoded hashing work. A valid compressed frame
+            // can be larger than its decoded content even though capture only
+            // chooses compression when it saves space.
+            let stored_chunk_bytes = storage
+                .get("chunks")
+                .and_then(serde_json::Value::as_array)
+                .map(|chunks| {
+                    chunks.iter().fold(0_u64, |total, chunk| {
+                        total.saturating_add(
+                            chunk
+                                .get("blob_size_bytes")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or_default(),
+                        )
+                    })
+                })
+                .unwrap_or_default();
             estimated_bytes = estimated_bytes
                 .saturating_add(metadata.len())
                 .saturating_add(manifest.blob_size_bytes.saturating_mul(2))
-                .saturating_add(manifest.source_size_bytes.unwrap_or_default());
+                .saturating_add(
+                    manifest
+                        .source_size_bytes
+                        .unwrap_or_default()
+                        .max(stored_chunk_bytes),
+                );
         }
     }
     estimated_bytes
@@ -53934,7 +53999,11 @@ fn build_doctor_archive_scan_context(data_dir: &Path, db_path: &Path) -> DoctorA
         }));
     }
     for manifest in &raw_mirror.manifests {
-        let compression_ok = matches!(manifest.compression_state.as_str(), "none" | "compressed");
+        let compression_ok = doctor_raw_mirror_compression_supported(
+            &manifest.compression,
+            &manifest.storage_kind,
+            manifest.source_size_bytes,
+        );
         let encryption_ok = matches!(manifest.encryption_state.as_str(), "none" | "encrypted");
         if !compression_ok || !encryption_ok {
             findings.push(doctor_archive_finding(DoctorArchiveFindingInput {
@@ -57573,9 +57642,14 @@ fn doctor_candidate_read_verified_raw_mirror_blob(
             manifest.manifest_id
         ));
     }
-    if manifest.compression_state != "none" || manifest.encryption_state != "none" {
+    if !doctor_raw_mirror_compression_supported(
+        &manifest.compression,
+        &manifest.storage_kind,
+        manifest.source_size_bytes,
+    ) || manifest.encryption_state != "none"
+    {
         return Err(format!(
-            "raw mirror manifest {} uses compression_state={} encryption_state={} and cannot be reconstructed by the v1 raw parser",
+            "raw mirror manifest {} uses unsupported compression_state={} encryption_state={} for reconstruction",
             manifest.manifest_id, manifest.compression_state, manifest.encryption_state
         ));
     }
@@ -84702,7 +84776,7 @@ paths = ["~/.claude/projects"]
         assert_eq!(report.summary.verified_blob_count, 5);
         let manifest = report.manifests.first().expect("chunked manifest report");
         assert_eq!(manifest.status, "verified");
-        assert_eq!(manifest.storage_kind, "fixed_chunks_v1");
+        assert_eq!(manifest.storage_kind, "fixed_chunks_v2");
         assert_eq!(manifest.chunk_count, 4);
         assert_eq!(
             manifest.source_content_blake3,
@@ -84718,7 +84792,7 @@ paths = ["~/.claude/projects"]
         let payload = serde_json::to_value(&report).expect("raw mirror report JSON");
         assert_eq!(
             payload["manifests"][0]["storage_kind"].as_str(),
-            Some("fixed_chunks_v1")
+            Some("fixed_chunks_v2")
         );
         assert_eq!(payload["manifests"][0]["chunk_count"].as_u64(), Some(4));
         assert!(
@@ -84731,7 +84805,115 @@ paths = ["~/.claude/projects"]
             std::fs::read(&source_path).expect("source remains untouched"),
             source_bytes
         );
-        assert_eq!(captured.storage_kind, "fixed_chunks_v1");
+        assert_eq!(captured.storage_kind, "fixed_chunks_v2");
+    }
+
+    #[test]
+    fn gh562_doctor_reconstructs_compressed_sources_and_refuses_later_blob_corruption() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("compressed-source.jsonl");
+        let source = b"{\"type\":\"message\",\"text\":\"preserved compressed private evidence\"}\n"
+            .repeat(1024);
+        std::fs::write(&source_path, &source).expect("write compressible source");
+        let captured = crate::raw_mirror::capture_source_file_with_chunk_policy(
+            crate::raw_mirror::RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            },
+            1,
+            4096,
+        )
+        .expect("capture compressed source");
+        let root = doctor_raw_mirror_root(&data_dir);
+        let manifest_path = root.join(&captured.manifest_relative_path);
+        let encoded_manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("manifest"))
+                .expect("manifest JSON");
+        let compressed_chunk = encoded_manifest["content_storage"]["chunks"]
+            .as_array()
+            .expect("chunks")
+            .iter()
+            .find(|chunk| chunk["encoding"] == "zstd")
+            .expect("fixture must exercise the real compressed reader");
+
+        let report = collect_doctor_raw_mirror_report_with_threshold(&data_dir, u64::MAX);
+        assert_eq!(report.status, "verified");
+        let manifest = report.manifests.first().expect("compressed report");
+        assert_eq!(manifest.storage_kind, "fixed_chunks_v2");
+        assert_eq!(manifest.compression_state, "per_chunk");
+        assert_eq!(manifest.compression.uncompressed_size_bytes, Some(source.len() as u64));
+        assert!(doctor_raw_mirror_compression_supported(
+            &manifest.compression,
+            &manifest.storage_kind,
+            manifest.source_size_bytes,
+        ));
+        assert_eq!(
+            doctor_candidate_read_verified_raw_mirror_blob(&data_dir, manifest)
+                .expect("reconstruct compressed evidence"),
+            source
+        );
+        let metadata = doctor_raw_mirror_amplification_version_from_manifest_path(
+            &data_dir,
+            &root,
+            &manifest_path,
+        )
+        .expect("metadata-only inventory admits supported compressed chunks");
+        let reported_physical_bytes: u64 = metadata.stored_blobs.iter().map(|(_, size)| size).sum();
+        assert!(reported_physical_bytes < source.len() as u64);
+        let json = serde_json::to_string(&report).expect("report JSON");
+        assert!(!json.contains("preserved compressed private evidence"));
+
+        let blob_path = root.join(
+            compressed_chunk["blob_relative_path"]
+                .as_str()
+                .expect("compressed blob path"),
+        );
+        let mut bytes = std::fs::read(&blob_path).expect("stored frame");
+        bytes[0] ^= 1;
+        std::fs::write(&blob_path, bytes).expect("corrupt physical compressed bytes");
+        assert!(
+            doctor_candidate_read_verified_raw_mirror_blob(&data_dir, manifest).is_err(),
+            "a retained verified report cannot authorize changed stored bytes"
+        );
+        let corrupted = collect_doctor_raw_mirror_report_with_threshold(&data_dir, u64::MAX);
+        assert_eq!(corrupted.status, "warn");
+        assert!(!doctor_raw_mirror_manifest_is_verified(&corrupted.manifests[0]));
+        assert_eq!(
+            std::fs::read(&source_path).expect("source untouched"),
+            source
+        );
+    }
+
+    #[test]
+    fn gh562_doctor_refuses_per_chunk_envelope_on_legacy_whole_blob() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("invalid-envelope.jsonl");
+        let bytes = b"{\"text\":\"unchanged evidence\"}\n";
+        let mut manifest =
+            raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
+        manifest.compression.state = "per_chunk".to_string();
+        manifest.manifest_blake3 = Some(doctor_raw_mirror_manifest_blake3(&manifest));
+        let (_, manifest_path) = write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
+        let report = collect_doctor_raw_mirror_report_with_threshold(&data_dir, u64::MAX);
+        let invalid = &report.manifests[0];
+        assert_eq!(invalid.status, "invalid_manifest");
+        assert!(!doctor_raw_mirror_manifest_is_verified(invalid));
+        assert!(doctor_candidate_read_verified_raw_mirror_blob(&data_dir, invalid).is_err());
+        assert!(
+            doctor_raw_mirror_amplification_version_from_manifest_path(
+                &data_dir,
+                &doctor_raw_mirror_root(&data_dir),
+                &manifest_path,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -84870,7 +85052,7 @@ paths = ["~/.claude/projects"]
         );
         assert_eq!(
             reclassified_receipt.raw_mirror_storage_kind.as_deref(),
-            Some("fixed_chunks_v1")
+            Some("fixed_chunks_v2")
         );
         assert_eq!(reclassified_receipt.raw_mirror_chunk_count, Some(3));
 

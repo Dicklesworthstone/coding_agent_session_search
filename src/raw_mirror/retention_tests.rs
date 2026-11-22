@@ -39,10 +39,7 @@ impl Fixture {
         raw_mirror_root(&self.data).join(&record.manifest_relative_path).exists()
     }
     fn bytes(&self, record: &RawMirrorCaptureRecord) -> Vec<u8> {
-        let root = raw_mirror_root(&self.data);
-        let manifest = read_validated_raw_mirror_manifest(&root, &record.manifest_id).unwrap();
-        verify_capture(&root, &manifest, &mut HashSet::new()).unwrap();
-        content_chunks(&manifest).iter().flat_map(|r| fs::read(root.join(&r.blob_relative_path)).unwrap()).collect()
+        read_source_bytes(&self.data, &record.manifest_id).unwrap()
     }
 }
 fn transcript(round: usize, size: usize) -> Vec<u8> {
@@ -76,6 +73,106 @@ fn eighty_index_intervals_have_bounded_growth_and_readable_latest_snapshots() {
     assert_eq!(fixture.bytes(records.last().unwrap()), bytes);
     assert!(fixture.exists(&records[78]));
     assert!(!fixture.exists(&records[0]));
+}
+
+#[test]
+fn gh562_legacy_whole_blob_retires_only_after_decoded_prefix_verification() {
+    let fixture = Fixture::new();
+    let original = transcript(0, 220 * 1024);
+    let link = RawMirrorDbLink {
+        conversation_id: Some(562),
+        message_count: Some(1),
+        source_path: None,
+        started_at_ms: Some(1),
+    };
+    let legacy = fixture.origin_record(&original, 1, "local", std::slice::from_ref(&link));
+    assert_eq!(legacy.storage_kind, "whole_blob_v1");
+
+    let mut appended = original.clone();
+    appended.extend(transcript(1, 80 * 1024));
+    fixture.record(&appended, 2);
+    appended.extend(transcript(2, 40 * 1024));
+    let latest = fixture.record(&appended, 3);
+    assert_eq!(latest.storage_kind, RAW_MIRROR_FIXED_CHUNKS_V2_KIND);
+    let root = raw_mirror_root(&fixture.data);
+    let manifest = read_validated_raw_mirror_manifest(&root, &latest.manifest_id).unwrap();
+    assert!(
+        manifest
+            .content_storage
+            .as_ref()
+            .unwrap()
+            .chunks
+            .iter()
+            .any(|chunk| {
+                chunk.encoding.as_deref() == Some("zstd")
+                    && chunk.blob_size_bytes < raw_mirror_chunk_content_size(chunk)
+            })
+    );
+    assert_eq!(fixture.bytes(&legacy), original);
+
+    let mut policy = fixture.policy();
+    policy.keep_latest = 1;
+    let report = maintain(&fixture.data, &policy, 10_000).unwrap();
+    assert_eq!(report.retired_manifests, 2);
+    assert!(!fixture.exists(&legacy));
+    assert_eq!(fixture.bytes(&latest), appended);
+    let retained = read_validated_raw_mirror_manifest(&root, &latest.manifest_id).unwrap();
+    assert!(retained.db_links.contains(&link));
+}
+
+#[test]
+fn gh562_compressed_rewrites_keep_unique_evidence_while_append_prefixes_retire() {
+    let fixture = Fixture::new();
+    let original = transcript(0, 400 * 1024);
+    let first = fixture.record(&original, 1);
+    let mut rewritten = original.clone();
+    rewritten[100] ^= 1;
+    let second = fixture.record(&rewritten, 2);
+    let mut appended = rewritten.clone();
+    appended.extend(transcript(1, 40 * 1024));
+    let latest = fixture.record(&appended, 3);
+    assert_eq!(first.storage_kind, RAW_MIRROR_FIXED_CHUNKS_V2_KIND);
+    assert_eq!(latest.storage_kind, RAW_MIRROR_FIXED_CHUNKS_V2_KIND);
+
+    let mut policy = fixture.policy();
+    policy.keep_latest = 1;
+    let report = maintain(&fixture.data, &policy, 10_000).unwrap();
+    assert_eq!(report.retired_manifests, 1);
+    assert!(fixture.exists(&first));
+    assert!(!fixture.exists(&second));
+    assert_eq!(fixture.bytes(&first), original);
+    assert_eq!(fixture.bytes(&latest), appended);
+}
+
+#[test]
+fn gh562_corrupt_compressed_successor_aborts_before_retiring_legacy_evidence() {
+    let fixture = Fixture::new();
+    let original = transcript(0, 220 * 1024);
+    let legacy = fixture.record(&original, 1);
+    let mut appended = original.clone();
+    appended.extend(transcript(1, 100 * 1024));
+    let latest = fixture.record(&appended, 2);
+    let root = raw_mirror_root(&fixture.data);
+    let manifest = read_validated_raw_mirror_manifest(&root, &latest.manifest_id).unwrap();
+    let chunk = manifest
+        .content_storage
+        .as_ref()
+        .unwrap()
+        .chunks
+        .last()
+        .unwrap();
+    assert_eq!(chunk.encoding.as_deref(), Some("zstd"));
+    let chunk_path = root.join(&chunk.blob_relative_path);
+    let mut encoded = fs::read(&chunk_path).unwrap();
+    encoded[0] ^= 1;
+    fs::write(&chunk_path, encoded).unwrap();
+
+    let mut policy = fixture.policy();
+    policy.keep_latest = 1;
+    assert!(maintain(&fixture.data, &policy, 10_000).is_err());
+    assert!(fixture.exists(&legacy));
+    assert!(fixture.exists(&latest));
+    assert_eq!(fixture.bytes(&legacy), original);
 }
 
 #[test]
@@ -255,7 +352,7 @@ fn legacy_whole_blob_prefix_can_retire_without_a_format_migration() {
     bytes.extend(transcript(2, 100 * 1024));
     let newest = fixture.record(&bytes, 3);
     assert_eq!(old.storage_kind, "whole_blob_v1");
-    assert_eq!(newest.storage_kind, "fixed_chunks_v1");
+    assert_eq!(newest.storage_kind, RAW_MIRROR_FIXED_CHUNKS_V2_KIND);
     assert_eq!(maintain(&fixture.data, &fixture.policy(), 1000).unwrap().retired_manifests, 1);
     assert!(!fixture.exists(&old));
     assert!(fixture.bytes(&newest).starts_with(&original));

@@ -18,16 +18,7 @@ fn transcript(round: usize, bytes: usize) -> Vec<u8> {
     result
 }
 fn contents(data: &Path, record: &RawMirrorCaptureRecord) -> Vec<u8> {
-    let root = raw_mirror_root(data);
-    let manifest = read_validated_raw_mirror_manifest(&root, &record.manifest_id).unwrap();
-    for reference in raw_mirror_manifest_blob_references(&manifest).unwrap() {
-        verify_existing_blob_reference(&root, &reference).unwrap();
-    }
-    match manifest.content_storage {
-        Some(storage) => storage.chunks.iter().flat_map(|chunk|
-            fs::read(root.join(&chunk.blob_relative_path)).unwrap()).collect(),
-        None => fs::read(root.join(manifest.blob_relative_path)).unwrap(),
-    }
+    read_source_bytes(data, &record.manifest_id).unwrap()
 }
 fn assert_staging_empty(data: &Path) {
     let tmp = raw_mirror_root(data).join("tmp");
@@ -82,7 +73,14 @@ fn partial_staging_is_removed_when_the_next_chunk_cannot_fit() {
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().join("data");
     let source = temp.path().join("session.jsonl");
-    fs::write(&source, transcript(0, 256 * 1024)).unwrap();
+    // Preserve the disk-pressure boundary after adding compression: text that
+    // now fits the cap would no longer exercise partial-staging cleanup.
+    let mut bytes = vec![0_u8; 256 * 1024];
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"raw-mirror partial staging pressure");
+    hasher.finalize_xof().fill(&mut bytes);
+    assert!(crate::raw_mirror::codec::compress_chunk(&bytes[..32 * 1024]).unwrap().len() >= 32 * 1024);
+    fs::write(&source, bytes).unwrap();
     let error = capture(input(&data, &source), 1, 32 * 1024, policy(100 * 1024)).unwrap_err();
     assert!(error.is::<RawMirrorCapturePaused>(), "{error:#}");
     assert_staging_empty(&data);
@@ -450,7 +448,7 @@ fn whole_blob_and_chunked_captures_remain_mutually_readable() {
     let legacy = super::super::capture_source_file_with_chunk_policy(input(&data, &source), 8 * 1024 * 1024, 4 * 1024 * 1024).unwrap();
     let bounded = capture(input(&data, &source), 1, 32 * 1024, policy(1024 * 1024)).unwrap();
     assert_eq!(legacy.storage_kind, "whole_blob_v1");
-    assert_eq!(bounded.storage_kind, "fixed_chunks_v1");
+    assert_eq!(bounded.storage_kind, "fixed_chunks_v2");
     assert_eq!(contents(&data, &legacy), original);
     assert_eq!(contents(&data, &bounded), original);
 }

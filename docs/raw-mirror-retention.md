@@ -4,12 +4,46 @@ Automatic mirror maintenance preserves source evidence under the policy below.
 It does not enable automatic age-based deletion of canonical conversations;
 `cass forget` remains an explicit operation with a read-only preview default.
 
-CASS retains the existing `whole_blob_v1` and `fixed_chunks_v1` formats. JSONL
-and NDJSON transcripts use 256 KiB chunks once they reach 256 KiB. Complete
-chunks are content-addressed and reused; an append replaces only its incomplete
-tail and adds new chunks and a manifest. Capture rechecks source stability and
-reads at most the source length admitted at the beginning, rather than chasing
-an actively appending writer to EOF.
+CASS reads existing `whole_blob_v1` and `fixed_chunks_v1` captures without
+rewriting them. New chunked captures use `fixed_chunks_v2`, with a separate
+encoding and original-content digest for each chunk. JSONL and NDJSON transcripts
+use 256 KiB chunks once they reach 256 KiB. Other chunked sources retain their
+4 MiB chunk limit. New chunks use zstd at level 3 when it reduces their stored
+size; incompressible chunks remain plain. An already-verified plain blob is
+reused before creating a compressed copy, so the first append after upgrading
+does not duplicate the old complete chunks.
+
+Complete chunks are content-addressed and reused; an append replaces only its
+incomplete tail and adds new chunks and a manifest. Capture rechecks source
+stability and reads at most the source length admitted at the beginning, rather
+than chasing an actively appending writer to EOF. Unchanged cache hits keep their
+existing capture, and small whole-file captures remain `whole_blob_v1`.
+
+## Compression and recovery
+
+The manifest and its chunk descriptor retain distinct stored-byte and
+original-content identities. `blob_blake3` and `blob_size_bytes` always describe
+the bytes physically stored under the content address. In `fixed_chunks_v2`,
+each chunk also declares `encoding` (`none` or `zstd`), `content_blake3`, and
+`content_size_bytes` for the original bytes. The whole-source content digest is
+unchanged by compression. Descriptors themselves remain uncompressed; the
+manifest's compression envelope reports `state: "per_chunk"` and the original
+source size.
+
+Verification checks both stored and decoded sizes and hashes. Each compressed
+chunk must contain exactly one complete zstd frame, with no trailing bytes or
+concatenated frames. Decoding enforces the declared output size and a 4 MiB
+window and decoded-chunk limit. Unknown encodings, truncated frames, oversized
+outputs and corrupt metadata are refused before the capture can support
+recovery or automatic retirement. Restore returns the exact original bytes,
+including binary source snapshots.
+
+The capture budget accounts for physical stored bytes, including the existing
+staging and metadata reservations. Compression can extend the useful capacity
+of a mirror, but the saving depends on its contents; already-compressed or
+incompressible sources may not shrink. Normal indexing does not recompress
+historical captures or change their retention protections. Older CASS versions
+that only support v1 captures cannot recover new v2 captures.
 
 ## Defaults and configuration
 
