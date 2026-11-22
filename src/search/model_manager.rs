@@ -2453,8 +2453,7 @@ mod tests {
             "test",
             || anyhow::bail!("canonical archive unavailable"),
         )
-        .err()
-        .expect("an unverifiable shard generation must not authorize legacy fallback");
+        .expect_err("an unverifiable shard generation must not authorize legacy fallback");
         assert!(
             error.contains("could not fingerprint the current DB"),
             "{error}"
@@ -2491,8 +2490,7 @@ mod tests {
                 Ok("fp-current".to_string())
             },
         )
-        .err()
-        .expect("a manifest replacement must not erase a selected cohort's failed admission");
+        .expect_err("a manifest replacement must not erase a selected cohort's failed admission");
         assert!(
             error.contains("selected semantic shard artifact is missing"),
             "{error}"
