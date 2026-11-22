@@ -1,7 +1,6 @@
 use regex::Regex;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -485,39 +484,12 @@ pub fn redact_swarm_text(input: &str) -> String {
 
 pub fn redact_swarm_json_value(value: &Value) -> Value {
     let engine = RedactionEngine::new(swarm_evidence_redaction_config());
-    // Scalar redaction first merges original canonical and swarm spans while
-    // retaining the specific evidence markers (gh#419). The key-aware policy
-    // then covers credentials split across an object key and a bare value:
-    // even a short value that matches no scalar pattern is hidden when its key
-    // names a credential.
-    let swarm_redacted = redact_swarm_json_value_with_engine(&engine, value);
-    crate::indexer::redact_secrets::redact_json(&swarm_redacted)
-}
-
-fn insert_redacted_swarm_entry(
-    object: &mut Map<String, Value>,
-    next_suffixes: &mut HashMap<String, usize>,
-    redacted_key: String,
-    value: Value,
-) {
-    if !object.contains_key(&redacted_key) {
-        object.insert(redacted_key, value);
-        return;
-    }
-
-    let next_suffix = next_suffixes.entry(redacted_key.clone()).or_insert(2);
-    let mut candidate = String::with_capacity(redacted_key.len() + 21);
-    loop {
-        candidate.clear();
-        candidate.push_str(&redacted_key);
-        candidate.push('#');
-        let _ = write!(&mut candidate, "{next_suffix}");
-        *next_suffix = next_suffix.saturating_add(1);
-        if !object.contains_key(&candidate) {
-            object.insert(candidate, value);
-            return;
-        }
-    }
+    // Inspect original keys and encoded JSON before a scalar rewrite can hide
+    // a field's credential semantics or consume a JSON quote's escape. The
+    // scalar policy still preserves precise swarm markers and RCH admission.
+    crate::indexer::redact_secrets::redact_json_with_text_redactor(value, &mut |text| {
+        redact_swarm_scalar_with_engine(&engine, text).output
+    })
 }
 
 /// Fixed markers for the original spans admitted by the swarm policy.
@@ -570,11 +542,14 @@ fn redact_swarm_original_scalar(engine: &RedactionEngine, input: &str) -> Redact
     // per-class accounting without retaining source secret bytes.
     redacted
         .changes
-        .extend(applied.into_iter().filter(|applied| *applied).map(|_| {
-            RedactionChange {
-                kind: RedactionKind::CustomPattern,
-            }
-        }));
+        .extend(
+            applied
+                .into_iter()
+                .filter(|applied| *applied)
+                .map(|_| RedactionChange {
+                    kind: RedactionKind::CustomPattern,
+                }),
+        );
     redacted
 }
 
@@ -715,32 +690,6 @@ fn redact_rch_command(engine: &RedactionEngine, input: &str) -> Option<RedactedS
         changes.extend(redacted.changes);
     }
     Some(RedactedString { output, changes })
-}
-
-fn redact_swarm_json_value_with_engine(engine: &RedactionEngine, value: &Value) -> Value {
-    match value {
-        Value::String(text) => Value::String(redact_swarm_scalar_with_engine(engine, text).output),
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(|item| redact_swarm_json_value_with_engine(engine, item))
-                .collect(),
-        ),
-        Value::Object(object) => {
-            let mut redacted = Map::with_capacity(object.len());
-            let mut next_suffixes = HashMap::new();
-            for (key, value) in object {
-                insert_redacted_swarm_entry(
-                    &mut redacted,
-                    &mut next_suffixes,
-                    redact_swarm_scalar_with_engine(engine, key).output,
-                    redact_swarm_json_value_with_engine(engine, value),
-                );
-            }
-            Value::Object(redacted)
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
-    }
 }
 
 static EMAIL_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
@@ -1273,6 +1222,121 @@ mod tests {
     }
 
     #[test]
+    fn swarm_json_preserves_original_field_privacy_and_collisions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let input = serde_json::json!({
+            "/home/alice/password": "tiny",
+            "/home/alice/token_count": 7,
+            "/home/alice/null_password": null,
+            "[REDACTED_PATH]#2": "preexisting",
+            "public_note": "kept",
+        });
+        let output = redact_swarm_json_value(&input);
+        let object = output
+            .as_object()
+            .ok_or("redacted JSON was not an object")?;
+        assert_eq!(object.len(), 5);
+        assert!(object.keys().all(|key| !key.contains("/home/alice")));
+        assert_eq!(output["public_note"], "kept");
+        let mut values = object.values().cloned().collect::<Vec<_>>();
+        values.sort_by_key(Value::to_string);
+        let mut expected = vec![
+            serde_json::json!("[REDACTED]"),
+            serde_json::json!(7),
+            Value::Null,
+            serde_json::json!("preexisting"),
+            serde_json::json!("kept"),
+        ];
+        expected.sort_by_key(Value::to_string);
+        assert_eq!(values, expected);
+        assert_eq!(redact_swarm_json_value(&output), output);
+        Ok(())
+    }
+
+    #[test]
+    fn swarm_json_decodes_original_strings_before_path_redaction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = serde_json::json!({
+            "password": "tiny",
+            "path": "/home/alice/private-client",
+            "public_note": "kept café 界",
+            "token_count": 7,
+            "nullable_password": null,
+        });
+        let scrubbed = serde_json::json!({
+            "password": "[REDACTED]",
+            "path": "[REDACTED_PATH]",
+            "public_note": "kept café 界",
+            "token_count": 7,
+            "nullable_password": null,
+        });
+        for wrappers in [0, 1, 3] {
+            let mut encoded = original.to_string();
+            let mut expected = scrubbed.to_string();
+            for _ in 0..wrappers {
+                encoded = serde_json::to_string(&encoded)?;
+                expected = serde_json::to_string(&expected)?;
+            }
+            let input = serde_json::json!({
+                "content": encoded,
+                "command_shape": "TOKEN=synthetic-marker-value",
+                "message_index": 7,
+            });
+            let expected = serde_json::json!({
+                "content": expected,
+                "command_shape": SWARM_SECRET_ENV_ASSIGNMENT_REDACTED,
+                "message_index": 7,
+            });
+            let output = redact_swarm_json_value(&input);
+            assert_eq!(output, expected, "encoded wrappers: {wrappers}");
+            assert_eq!(redact_swarm_json_value(&output), output);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn swarm_json_keeps_duplicate_key_and_encoded_depth_refusals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let duplicate =
+            r#"{"password":"tiny","path":"/home/alice/private-client","path":"public"}"#;
+        let input = serde_json::json!({
+            "content": serde_json::to_string(duplicate)?,
+            "public_note": "kept",
+        });
+        assert_eq!(
+            redact_swarm_json_value(&input),
+            serde_json::json!({
+                "content": serde_json::to_string("[REDACTED]")?,
+                "public_note": "kept",
+            })
+        );
+
+        // The common walker admits at most eight encoded JSON layers.
+        let mut expected = "[REDACTED]".to_owned();
+        for _ in 0..8 {
+            expected = serde_json::to_string(&expected)?;
+        }
+        for wrappers in [8, 9] {
+            let mut encoded = serde_json::json!({
+                "password": "tiny",
+                "path": "/home/alice/private-client",
+            })
+            .to_string();
+            for _ in 0..wrappers {
+                encoded = serde_json::to_string(&encoded)?;
+            }
+            let input = serde_json::json!({"content": encoded, "public_note": "kept"});
+            let output = redact_swarm_json_value(&input);
+            assert_eq!(
+                output,
+                serde_json::json!({"content": expected, "public_note": "kept"})
+            );
+            assert_eq!(redact_swarm_json_value(&output), output);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn swarm_redaction_scrubs_absolute_paths_with_spaces() {
         let configured_temp_path = std::env::temp_dir()
             .join("Secret Project")
@@ -1596,14 +1660,8 @@ mod tests {
                 ), // ubs:ignore — synthetic key-block redaction fixture, not a private key.
                 "[SECRET_ENV_REDACTED]\npublic=kept",
             ),
-            (
-                "TOKEN=/home/alice/Secret Project",
-                "[SECRET_ENV_REDACTED]",
-            ),
-            (
-                "Read /home/alice/Secret Project",
-                "Read [REDACTED_PATH]",
-            ),
+            ("TOKEN=/home/alice/Secret Project", "[SECRET_ENV_REDACTED]"),
+            ("Read /home/alice/Secret Project", "Read [REDACTED_PATH]"),
             (
                 "Use ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij now",
                 "Use [SECRET_REDACTED] now",
@@ -1675,8 +1733,7 @@ mod tests {
             let mut redactor = SwarmEvidenceRedactor::strict_default();
             assert_eq!(redactor.redact_command_argument(input), expected);
             assert_eq!(
-                redact_swarm_json_value(&serde_json::json!({"command_shape": input}))
-                    ["command_shape"],
+                redact_swarm_json_value(&serde_json::json!({"command_shape": input}))["command_shape"],
                 expected
             );
         }

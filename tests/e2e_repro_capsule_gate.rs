@@ -410,6 +410,98 @@ fn every_incident_kind_redacts_and_uses_share_safe_rerun() -> TestResult {
 }
 
 #[test]
+fn capsule_redacts_original_json_before_path_rewrites() -> TestResult {
+    let (_tmp, home, xdg_data) = isolated_home()?;
+    let fx = tempfile::Builder::new()
+        .prefix("cass-capsule-json-privacy-")
+        .disable_cleanup(true)
+        .tempdir()?;
+    let embedded = json!({
+        "password": "pw9",
+        "path": "/home/alice/private-client",
+        "public_note": "kept café 界",
+        "token_count": 7,
+    });
+    let fixture = json!({
+        "fixture_id": "original-json-privacy",
+        "sources": {"repro_capsule": {
+            "incident_kind": "search-miss",
+            "env": {
+                "/home/alice/password": "pw7",
+                "/home/alice/token_count": 7,
+                "[REDACTED_PATH]#2": "preexisting",
+                "encoded": serde_json::to_string(&embedded.to_string())?,
+                "command_shape": "TOKEN=synthetic-marker-value",
+                "public_note": "kept",
+            },
+        }},
+    });
+    let fixture_path = fx.path().join("original-json-privacy.inputs.json");
+    let fixture_bytes = serde_json::to_vec_pretty(&fixture)?;
+    std::fs::write(&fixture_path, &fixture_bytes)?;
+    let (payload, argv) = run_capsule(&home, &xdg_data, &capsule_argv(&fixture_path))?;
+    let serialized = serde_json::to_string(&payload)?;
+    for private in ["pw7", "pw9", "/home/alice", "synthetic-marker-value"] {
+        ensure(!serialized.contains(private), || {
+            format!("capsule leaked original structured credential or path: {private}")
+        })?;
+    }
+    let env = payload
+        .pointer("/capsule/env_summary")
+        .and_then(Value::as_object)
+        .ok_or("capsule env_summary was not an object")?;
+    ensure(env.len().eq(&6), || {
+        "colliding path keys lost a field".to_string()
+    })?;
+    ensure(
+        env.values().any(|value| value.as_i64().eq(&Some(7))),
+        || "safe numeric value was lost during key collision handling".to_string(),
+    )?;
+    ensure(
+        env.values()
+            .any(|value| value.as_str().eq(&Some("preexisting"))),
+        || "preexisting marker-key value was lost".to_string(),
+    )?;
+    ensure(
+        str_is(&payload, "/capsule/env_summary/public_note", "kept"),
+        || "public field changed".to_string(),
+    )?;
+    ensure(
+        str_is(
+            &payload,
+            "/capsule/env_summary/command_shape",
+            "[SECRET_ENV_REDACTED]",
+        ),
+        || "precise command marker was lost".to_string(),
+    )?;
+    let quoted = env
+        .get("encoded")
+        .and_then(Value::as_str)
+        .ok_or("encoded content changed JSON type")?;
+    let decoded_text: String = serde_json::from_str(quoted)?;
+    let decoded: Value = serde_json::from_str(&decoded_text)?;
+    ensure(
+        decoded.eq(&json!({
+            "password": "[REDACTED]",
+            "path": "[REDACTED_PATH]",
+            "public_note": "kept café 界",
+            "token_count": 7,
+        })),
+        || "encoded content lost credential privacy or public structure".to_string(),
+    )?;
+    ensure(std::fs::read(&fixture_path)?.eq(&fixture_bytes), || {
+        "capsule command changed its source fixture".to_string()
+    })?;
+    assert_safe_contract(&payload, &home)?;
+    log_scenario(
+        &argv,
+        &payload,
+        "original JSON privacy + path collisions preserved",
+    );
+    Ok(())
+}
+
+#[test]
 fn full_tier_opt_in_keeps_but_scrubs_session_text() -> TestResult {
     let (_tmp, home, xdg_data) = isolated_home()?;
     let fx = tempfile::TempDir::new()?;

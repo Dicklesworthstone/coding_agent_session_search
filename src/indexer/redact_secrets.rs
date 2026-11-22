@@ -278,11 +278,10 @@ pub(crate) fn redact_text_with_additional_patterns<'a, 'r>(
     additional_patterns: impl IntoIterator<Item = &'r Regex>,
     mut replacement: impl FnMut(&str) -> &'static str,
 ) -> Cow<'a, str> {
-    let mut streams: Vec<std::iter::Peekable<regex::Matches<'r, 'a>>> =
-        additional_patterns
-            .into_iter()
-            .map(|pattern| pattern.find_iter(input).peekable())
-            .collect();
+    let mut streams: Vec<std::iter::Peekable<regex::Matches<'r, 'a>>> = additional_patterns
+        .into_iter()
+        .map(|pattern| pattern.find_iter(input).peekable())
+        .collect();
     let matches = SECRET_REGEX_SET.matches(input);
     streams.extend(
         matches
@@ -486,7 +485,17 @@ impl<'de> serde::de::Visitor<'de> for EmbeddedJsonKeyCheck {
 /// - Arrays and objects are walked recursively.
 /// - Numbers, booleans, and null are left untouched.
 pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
-    redact_json_with(value, &mut |input| redact_text(input).into_owned(), 0)
+    redact_json_with_text_redactor(value, &mut |input| redact_text(input).into_owned())
+}
+
+/// Inspect original JSON keys and encoded values before applying a text policy.
+/// Rewriting first can hide a credential-bearing key or invalidate quote escapes.
+/// Keep all callers on the same field, duplicate-key, and encoded-depth rules.
+pub(crate) fn redact_json_with_text_redactor(
+    value: &serde_json::Value,
+    redact_plain_text: &mut impl FnMut(&str) -> String,
+) -> serde_json::Value {
+    redact_json_with(value, redact_plain_text, 0)
 }
 
 fn redact_json_with(
@@ -963,7 +972,7 @@ impl MemoizingRedactor {
     /// values and object keys are memoized independently.
     /// Arrays and objects themselves are not cached.
     pub(crate) fn redact_json(&mut self, value: &serde_json::Value) -> serde_json::Value {
-        redact_json_with(value, &mut |input| self.redact_text(input), 0)
+        redact_json_with_text_redactor(value, &mut |input| self.redact_text(input))
     }
 
     fn key_for(&self, input: &str) -> crate::indexer::memoization::MemoKey {
