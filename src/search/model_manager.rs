@@ -625,13 +625,18 @@ fn complete_shard_generation_candidate_exists(
     }))
 }
 
+struct AdmittedSemanticShardGeneration {
+    artifacts: Vec<SemanticIndexArtifact>,
+    db_fingerprint: String,
+}
+
 fn load_complete_shard_artifacts_for_storage(
     data_dir: &Path,
     storage: &FrankenStorage,
     embedder_id: &str,
     expected_dimension: usize,
     context_label: &'static str,
-) -> Result<Option<Vec<SemanticIndexArtifact>>, String> {
+) -> Result<Option<AdmittedSemanticShardGeneration>, String> {
     load_complete_shard_artifacts_with_fingerprint(
         data_dir,
         embedder_id,
@@ -647,7 +652,7 @@ fn load_complete_shard_artifacts_with_fingerprint(
     expected_dimension: usize,
     context_label: &'static str,
     fingerprint: impl FnOnce() -> anyhow::Result<String>,
-) -> Result<Option<Vec<SemanticIndexArtifact>>, String> {
+) -> Result<Option<AdmittedSemanticShardGeneration>, String> {
     // GH #452: a monolithic FSVI is not evidence that shards exist. Probe
     // metadata before computing a possible shard generation's fingerprint;
     // legacy callers already hold the canonical authority used for admission.
@@ -672,6 +677,12 @@ fn load_complete_shard_artifacts_with_fingerprint(
         expected_dimension,
         &db_fingerprint,
     )
+    .map(|artifacts| {
+        artifacts.map(|artifacts| AdmittedSemanticShardGeneration {
+            artifacts,
+            db_fingerprint,
+        })
+    })
     .map_err(|err| {
         format!("{context_label} shard admission failed: {err}; rebuild semantic vectors")
     })
@@ -1030,6 +1041,9 @@ fn load_hash_semantic_context_at_epoch(
         embedder.id(),
         &SemanticAvailability::HashFallback,
         crate::search::asset_state::SemanticPreference::HashFallback,
+        shard_artifacts
+            .as_ref()
+            .map(|generation| generation.db_fingerprint.as_str()),
     ) {
         return SemanticSetup {
             availability,
@@ -1049,8 +1063,8 @@ fn load_hash_semantic_context_at_epoch(
         }
     };
 
-    let artifacts = if let Some(artifacts) = shard_artifacts {
-        artifacts
+    let artifacts = if let Some(generation) = shard_artifacts {
+        generation.artifacts
     } else {
         let ann_path = hnsw_index_path(data_dir, embedder.id());
         let ann_path = select_existing_ann_candidate(ann_path);
@@ -1314,6 +1328,9 @@ fn load_semantic_context_at_epoch(
             embedder_id: config.embedder_id.clone(),
         },
         crate::search::asset_state::SemanticPreference::DefaultModel,
+        shard_artifacts
+            .as_ref()
+            .map(|generation| generation.db_fingerprint.as_str()),
     ) {
         return SemanticSetup {
             availability,
@@ -1333,8 +1350,8 @@ fn load_semantic_context_at_epoch(
         }
     };
 
-    let artifacts = if let Some(artifacts) = shard_artifacts {
-        artifacts
+    let artifacts = if let Some(generation) = shard_artifacts {
+        generation.artifacts
     } else {
         let ann_path = hnsw_index_path(data_dir, &config.embedder_id);
         let ann_path = select_existing_ann_candidate(ann_path);
@@ -1412,12 +1429,16 @@ fn load_semantic_context_at_epoch(
 /// Returns `Some(unavailable)` when serving must be refused; `None` when the
 /// assets are current (or when there is no manifest to contradict them, which
 /// preserves legacy manifest-less installs).
+/// Admitted shards carry the fingerprint of their selected cohort; a later
+/// shard publication must not vouch for different artifacts already selected
+/// by this loader, including a legacy monolithic fallback.
 fn refuse_stale_semantic_assets(
     data_dir: &Path,
     storage: &FrankenStorage,
     served_embedder_id: &str,
     availability_if_served: &SemanticAvailability,
     preference: crate::search::asset_state::SemanticPreference,
+    admitted_shard_fingerprint: Option<&str>,
 ) -> Option<SemanticAvailability> {
     let semantic_identity_tier = if served_embedder_id == HashEmbedder::default().id() {
         SemanticIdentityTier::Fast
@@ -1442,18 +1463,21 @@ fn refuse_stale_semantic_assets(
     let db_fingerprint = match crate::indexer::lexical_storage_fingerprint_for_storage(storage) {
         Ok(fingerprint) => fingerprint,
         Err(err) => {
-            // The archive answered the open but not the fingerprint queries;
-            // the filter-map load right after this will surface the real
-            // error, so do not invent a staleness verdict here.
-            tracing::debug!(
-                error = %format!("{err:#}"),
-                embedder = served_embedder_id,
-                "semantic staleness gate skipped: could not fingerprint current DB"
-            );
-            return None;
+            return Some(SemanticAvailability::LoadFailed {
+                context: format!(
+                    "semantic freshness check could not fingerprint the current DB: {err:#}"
+                ),
+            });
         }
     };
-    let state = crate::search::asset_state::semantic_state_from_availability(
+    if let Some(admitted_fingerprint) = admitted_shard_fingerprint {
+        return (admitted_fingerprint != db_fingerprint).then(|| SemanticAvailability::IndexStale {
+            embedder_id: served_embedder_id.to_string(),
+            reason: "admitted semantic shard generation no longer matches the current database; run 'cass index --semantic' to refresh it"
+                .to_string(),
+        });
+    }
+    let state = crate::search::asset_state::semantic_state_for_monolithic_serving(
         data_dir,
         availability_if_served,
         preference,
@@ -2316,6 +2340,30 @@ mod tests {
         }
     }
 
+    fn publish_hash_shard_generation(
+        data_dir: &Path,
+        db_fingerprint: &str,
+        relative_path: &str,
+    ) -> PathBuf {
+        let embedder = HashEmbedder::default();
+        let shard_path = data_dir.join(relative_path);
+        write_hash_vector_index(&shard_path, 1);
+        let mut record = semantic_shard_record(TierKind::Fast, embedder.id(), db_fingerprint, 0, 1);
+        record.dimension = embedder.dimension();
+        record.model_revision = crate::indexer::semantic::HASH_VECTOR_SPACE_REVISION.to_string();
+        record.index_path = relative_path.to_string();
+        record.size_bytes = std::fs::metadata(&shard_path)
+            .expect("stat hash shard")
+            .len();
+        SemanticShardManifest {
+            shards: vec![record],
+            ..Default::default()
+        }
+        .save(data_dir)
+        .expect("publish complete hash shard generation");
+        shard_path
+    }
+
     #[test]
     fn shard_candidate_probe_is_false_without_manifest() {
         let tmp = tempdir().unwrap();
@@ -2495,6 +2543,239 @@ mod tests {
             error.contains("selected semantic shard artifact is missing"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn later_shard_publication_cannot_authorize_a_selected_stale_monolith() {
+        use crate::search::asset_state::{SemanticPreference, semantic_state_from_availability};
+        use crate::search::semantic_manifest::SemanticManifest;
+
+        let tmp = tempdir().expect("publication race fixture");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("create cass db");
+        let authority = legacy::capture(&storage).expect("capture canonical authority");
+        let current = crate::indexer::lexical_storage_fingerprint_for_storage(&storage)
+            .expect("fingerprint current database");
+        let embedder = HashEmbedder::default();
+        let monolithic_path = vector_index_path(tmp.path(), embedder.id());
+        write_hash_vector_index(&monolithic_path, 1);
+        let mut manifest = SemanticManifest::load_or_default(tmp.path()).expect("manifest");
+        assert!(manifest.adopt_legacy_artifact(
+            TierKind::Fast,
+            embedder.id(),
+            "hash",
+            embedder.dimension(),
+            1,
+            1,
+            "older-archive",
+            "vector_index/index-fnv1a-384.fsvi",
+            1,
+        ));
+        manifest
+            .save(tmp.path())
+            .expect("publish stale monolith metadata");
+
+        // Follow the loader's real phases, publishing only after it selected
+        // legacy fallback. No thread scheduling or canonical DB change is needed.
+        let selected_shards = load_complete_shard_artifacts_for_storage(
+            tmp.path(),
+            &storage,
+            embedder.id(),
+            embedder.dimension(),
+            "test",
+        )
+        .expect("select artifacts before publication");
+        assert!(selected_shards.is_none());
+        let shard_path = publish_hash_shard_generation(
+            tmp.path(),
+            &current,
+            "vector_index/shards/hash/published-after-selection.fsvi",
+        );
+        legacy::validate(&storage, &authority)
+            .expect("sidecar publication leaves canonical authority unchanged");
+
+        let status = semantic_state_from_availability(
+            tmp.path(),
+            &SemanticAvailability::HashFallback,
+            SemanticPreference::HashFallback,
+            Some(&current),
+        );
+        assert!(
+            status.can_search,
+            "status sees the new current shard cohort"
+        );
+        assert_eq!(
+            status.vector_index_path.as_deref(),
+            Some(shard_path.as_path())
+        );
+        let refusal = refuse_stale_semantic_assets(
+            tmp.path(),
+            &storage,
+            embedder.id(),
+            &SemanticAvailability::HashFallback,
+            SemanticPreference::HashFallback,
+            selected_shards
+                .as_ref()
+                .map(|generation| generation.db_fingerprint.as_str()),
+        )
+        .expect("new shard readiness must not authorize the selected old monolith");
+        assert!(refusal.is_index_stale(), "{refusal:?}");
+        assert_eq!(
+            open_validated_semantic_artifact(
+                &monolithic_path,
+                None,
+                embedder.id(),
+                embedder.dimension(),
+            )
+            .expect("the stale monolith is readable, so admission must reject its freshness")
+            .fsvi_path(),
+            monolithic_path
+        );
+
+        drop(storage);
+        let setup = load_hash_semantic_context(tmp.path(), &db_path);
+        let context = setup
+            .context
+            .expect("a fresh loader can select the new shards");
+        assert!(matches!(
+            setup.availability,
+            SemanticAvailability::HashFallback
+        ));
+        assert_eq!(context.artifacts.len(), 1);
+        assert_eq!(context.artifacts[0].fsvi_path(), shard_path);
+    }
+
+    #[test]
+    fn admitted_shard_freshness_uses_its_retained_fingerprint_and_identity_marker() {
+        use crate::search::asset_state::{SemanticPreference, semantic_state_from_availability};
+
+        let tmp = tempdir().expect("retained cohort fixture");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("create cass db");
+        let current = crate::indexer::lexical_storage_fingerprint_for_storage(&storage)
+            .expect("fingerprint current database");
+        let embedder = HashEmbedder::default();
+        let old_path = publish_hash_shard_generation(
+            tmp.path(),
+            "older-archive",
+            "vector_index/shards/hash/old-cohort.fsvi",
+        );
+        let admitted = load_complete_shard_artifacts_with_fingerprint(
+            tmp.path(),
+            embedder.id(),
+            embedder.dimension(),
+            "test",
+            || Ok("older-archive".to_string()),
+        )
+        .expect("admit cohort against its original database fingerprint")
+        .expect("complete original cohort");
+        assert_eq!(admitted.db_fingerprint, "older-archive");
+        assert_eq!(admitted.artifacts[0].fsvi_path(), old_path);
+
+        let current_path = publish_hash_shard_generation(
+            tmp.path(),
+            &current,
+            "vector_index/shards/hash/current-cohort.fsvi",
+        );
+        let status = semantic_state_from_availability(
+            tmp.path(),
+            &SemanticAvailability::HashFallback,
+            SemanticPreference::HashFallback,
+            Some(&current),
+        );
+        assert!(status.can_search);
+        assert_eq!(
+            status.vector_index_path.as_deref(),
+            Some(current_path.as_path())
+        );
+        let refusal = refuse_stale_semantic_assets(
+            tmp.path(),
+            &storage,
+            embedder.id(),
+            &SemanticAvailability::HashFallback,
+            SemanticPreference::HashFallback,
+            Some(&admitted.db_fingerprint),
+        )
+        .expect("current on-disk metadata cannot refresh the already admitted old cohort");
+        assert!(refusal.is_index_stale(), "{refusal:?}");
+
+        let current_admission = load_complete_shard_artifacts_for_storage(
+            tmp.path(),
+            &storage,
+            embedder.id(),
+            embedder.dimension(),
+            "test",
+        )
+        .expect("admit current cohort")
+        .expect("complete current cohort");
+        assert_eq!(current_admission.db_fingerprint, current);
+        assert_eq!(current_admission.artifacts[0].fsvi_path(), current_path);
+        assert!(
+            refuse_stale_semantic_assets(
+                tmp.path(),
+                &storage,
+                embedder.id(),
+                &SemanticAvailability::HashFallback,
+                SemanticPreference::HashFallback,
+                Some(&current_admission.db_fingerprint),
+            )
+            .is_none()
+        );
+
+        storage
+            .mark_semantic_identity_rebuild_required(SemanticIdentityTier::Fast)
+            .expect("invalidate canonical filter identity");
+        let refusal = refuse_stale_semantic_assets(
+            tmp.path(),
+            &storage,
+            embedder.id(),
+            &SemanticAvailability::HashFallback,
+            SemanticPreference::HashFallback,
+            Some(&current_admission.db_fingerprint),
+        )
+        .expect("matching fingerprints must still honor canonical identity invalidation");
+        assert!(
+            matches!(refusal, SemanticAvailability::IndexStale { reason, .. }
+                if reason.contains("canonical agent/source identity changed"))
+        );
+    }
+
+    #[test]
+    fn freshness_fingerprint_failure_is_not_hidden_by_readable_filter_maps() {
+        use crate::search::asset_state::SemanticPreference;
+
+        let tmp = tempdir().expect("fingerprint failure fixture");
+        let storage = FrankenStorage::open(&tmp.path().join("cass.db")).expect("create cass db");
+        let authority = legacy::capture(&storage).expect("capture canonical authority");
+        let current = crate::indexer::lexical_storage_fingerprint_for_storage(&storage)
+            .expect("initial fingerprint succeeds");
+        storage
+            .raw()
+            .execute("PRAGMA foreign_keys = OFF")
+            .expect("allow fixture damage");
+        storage
+            .raw()
+            .execute("DROP TABLE messages")
+            .expect("make message fingerprint unavailable");
+        assert!(crate::indexer::lexical_storage_fingerprint_for_storage(&storage).is_err());
+        legacy::validate(&storage, &authority).expect("canonical authority remains readable");
+        SemanticFilterMaps::from_storage(&storage).expect("filter maps do not read messages");
+
+        for admitted_fingerprint in [None, Some(current.as_str())] {
+            let refusal = refuse_stale_semantic_assets(
+                tmp.path(),
+                &storage,
+                HashEmbedder::default().id(),
+                &SemanticAvailability::HashFallback,
+                SemanticPreference::HashFallback,
+                admitted_fingerprint,
+            )
+            .expect("unverifiable freshness must refuse both monoliths and admitted shards");
+            assert!(
+                matches!(refusal, SemanticAvailability::LoadFailed { context }
+                    if context.contains("could not fingerprint the current DB"))
+            );
+        }
     }
 
     #[test]

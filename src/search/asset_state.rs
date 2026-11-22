@@ -861,9 +861,7 @@ pub(crate) fn inspect_semantic_assets(
             // Preserve late observation for external and legacy availability.
             // A certificate can appear after the initial probe found none.
             FrankenStorage::open_readonly(db_path)
-                .map_err(|error| {
-                    format!("checking semantic identity invalidation marker: {error}")
-                })
+                .map_err(|error| format!("checking semantic identity invalidation marker: {error}"))
                 .and_then(|storage| {
                     crate::search::model_manager::observe_covered_semantic_artifact(
                         data_dir,
@@ -980,12 +978,47 @@ pub(crate) fn semantic_state_from_availability(
     preference: SemanticPreference,
     current_db_fingerprint: Option<&str>,
 ) -> SemanticAssetState {
+    semantic_state_from_availability_inner(
+        data_dir,
+        availability,
+        preference,
+        current_db_fingerprint,
+        true,
+    )
+}
+
+/// Evaluate the monolithic artifact selected by a serving loader. A complete
+/// shard cohort observed later may improve status, but cannot vouch for that
+/// different artifact. Shard serving checks its retained admission fingerprint.
+pub(crate) fn semantic_state_for_monolithic_serving(
+    data_dir: &Path,
+    availability: &SemanticAvailability,
+    preference: SemanticPreference,
+    current_db_fingerprint: Option<&str>,
+) -> SemanticAssetState {
+    semantic_state_from_availability_inner(
+        data_dir,
+        availability,
+        preference,
+        current_db_fingerprint,
+        false,
+    )
+}
+
+fn semantic_state_from_availability_inner(
+    data_dir: &Path,
+    availability: &SemanticAvailability,
+    preference: SemanticPreference,
+    current_db_fingerprint: Option<&str>,
+    include_complete_shards: bool,
+) -> SemanticAssetState {
     let (mut fast_tier, mut quality_tier, backlog, checkpoint) =
         semantic_manifest_progress(data_dir, current_db_fingerprint);
     let preference_surface = semantic_preference_surface(data_dir, preference);
     let base_embedder_id = semantic_embedder_id(availability, preference);
-    if let (Some(db_fingerprint), Some(embedder_id)) =
-        (current_db_fingerprint, base_embedder_id.as_deref())
+    if include_complete_shards
+        && let (Some(db_fingerprint), Some(embedder_id)) =
+            (current_db_fingerprint, base_embedder_id.as_deref())
     {
         promote_complete_shard_generation_state(
             data_dir,
@@ -4332,7 +4365,11 @@ mod tests {
         assert_eq!(semantic_artifact_admission_count() - before, 0);
         assert_eq!(mismatched.availability, "load_failed");
         assert!(!mismatched.can_search);
-        assert!(mismatched.summary.contains("does not match a ready artifact"));
+        assert!(
+            mismatched
+                .summary
+                .contains("does not match a ready artifact")
+        );
         Ok(())
     }
 
