@@ -423,32 +423,37 @@ fn semantic_artifact_candidate_exists(path: &Path) -> Result<bool, String> {
 
 fn matching_complete_shard_records(
     data_dir: &Path,
+    manifest: &SemanticShardManifest,
     tier: TierKind,
     embedder_id: &str,
     db_fingerprint: &str,
 ) -> Result<Option<Vec<SemanticShardRecord>>, String> {
-    let manifest = match SemanticShardManifest::load(data_dir) {
-        Ok(Some(manifest)) => manifest,
-        Ok(None) => return Ok(None),
-        Err(err) => return Err(format!("semantic shard manifest: {err}")),
-    };
+    if !shard_generation_declares_complete(manifest, tier, embedder_id, db_fingerprint) {
+        return Ok(None);
+    }
     let summary = manifest.summary(tier, embedder_id, db_fingerprint);
     if !summary.complete {
-        return Ok(None);
+        return Err(format!(
+            "selected {} semantic shard generation for {embedder_id} has invalid metadata",
+            tier.as_str()
+        ));
     }
 
     let mut records = manifest
         .shards
-        .into_iter()
+        .iter()
         .filter(|shard| shard.matches_generation(tier, embedder_id, db_fingerprint))
+        .cloned()
         .collect::<Vec<_>>();
     records.sort_by_key(|shard| shard.shard_index);
     if records.len() != usize::try_from(summary.shard_count).unwrap_or(usize::MAX) {
-        return Ok(None);
+        return Err(
+            "selected semantic shard generation has an inconsistent shard count".to_string(),
+        );
     }
 
     let Some(first) = records.first() else {
-        return Ok(None);
+        return Err("selected semantic shard generation is empty".to_string());
     };
     for (expected_index, shard) in records.iter().enumerate() {
         if shard.shard_index != u32::try_from(expected_index).unwrap_or(u32::MAX)
@@ -461,13 +466,22 @@ fn matching_complete_shard_records(
             || shard.dimension != first.dimension
             || shard.total_conversations != first.total_conversations
         {
-            return Ok(None);
+            return Err(format!(
+                "selected semantic shard {} has incompatible generation metadata",
+                shard.shard_index
+            ));
         }
         let Some(path) = semantic_sidecar_path(data_dir, &shard.index_path) else {
-            return Ok(None);
+            return Err(format!(
+                "selected semantic shard {} has an unsafe artifact path",
+                shard.shard_index
+            ));
         };
         if !semantic_artifact_candidate_exists(&path)? {
-            return Ok(None);
+            return Err(format!(
+                "selected semantic shard artifact is missing: {}",
+                path.display()
+            ));
         }
     }
 
@@ -476,13 +490,14 @@ fn matching_complete_shard_records(
 
 fn load_complete_shard_artifacts(
     data_dir: &Path,
+    manifest: &SemanticShardManifest,
     embedder_id: &str,
     expected_dimension: usize,
     db_fingerprint: &str,
 ) -> Result<Option<Vec<SemanticIndexArtifact>>, String> {
     for tier in [TierKind::Quality, TierKind::Fast] {
         let Some(records) =
-            matching_complete_shard_records(data_dir, tier, embedder_id, db_fingerprint)?
+            matching_complete_shard_records(data_dir, manifest, tier, embedder_id, db_fingerprint)?
         else {
             continue;
         };
@@ -490,7 +505,10 @@ fn load_complete_shard_artifacts(
         let mut artifacts = Vec::with_capacity(records.len());
         for shard in records {
             let Some(path) = semantic_sidecar_path(data_dir, &shard.index_path) else {
-                return Ok(None);
+                return Err(format!(
+                    "selected semantic shard {} has an unsafe artifact path",
+                    shard.shard_index
+                ));
             };
             let ann_path = if shard.ann_ready {
                 shard
@@ -549,20 +567,39 @@ fn select_existing_ann_candidate(path: PathBuf) -> Option<PathBuf> {
     }
 }
 
-fn complete_shard_generation_candidate_exists(data_dir: &Path, embedder_id: &str) -> bool {
-    let manifest = match SemanticShardManifest::load(data_dir) {
-        Ok(Some(manifest)) => manifest,
-        Ok(None) => return false,
-        Err(err) => {
-            tracing::debug!(
-                error = %err,
-                embedder = embedder_id,
-                "semantic shard candidate probe could not load manifest"
-            );
-            return false;
+fn shard_generation_declares_complete(
+    manifest: &SemanticShardManifest,
+    tier: TierKind,
+    embedder_id: &str,
+    db_fingerprint: &str,
+) -> bool {
+    let mut shard_count: Option<u32> = None;
+    let mut ready_records = 0_usize;
+    for shard in manifest
+        .shards
+        .iter()
+        .filter(|shard| shard.matches_generation(tier, embedder_id, db_fingerprint))
+    {
+        shard_count =
+            Some(shard_count.map_or(shard.shard_count, |count| count.min(shard.shard_count)));
+        if shard.ready && shard.mmap_ready {
+            ready_records += 1;
         }
-    };
+    }
 
+    // Selection precedes admission: enough published records to satisfy any
+    // declared count require a full validation even when their paths,
+    // identities, counts or indices are invalid.
+    // A genuinely partial publication may still use the legacy artifact.
+    ready_records > 0
+        && shard_count
+            .is_some_and(|count| ready_records >= usize::try_from(count).unwrap_or(usize::MAX))
+}
+
+fn complete_shard_generation_candidate_exists_in_manifest(
+    manifest: &SemanticShardManifest,
+    embedder_id: &str,
+) -> bool {
     let mut candidates = std::collections::HashSet::new();
     for shard in manifest
         .shards
@@ -572,9 +609,20 @@ fn complete_shard_generation_candidate_exists(data_dir: &Path, embedder_id: &str
         candidates.insert((shard.tier, shard.db_fingerprint.as_str()));
     }
 
-    candidates
-        .into_iter()
-        .any(|(tier, db_fingerprint)| manifest.summary(tier, embedder_id, db_fingerprint).complete)
+    candidates.into_iter().any(|(tier, db_fingerprint)| {
+        shard_generation_declares_complete(manifest, tier, embedder_id, db_fingerprint)
+    })
+}
+
+fn complete_shard_generation_candidate_exists(
+    data_dir: &Path,
+    embedder_id: &str,
+) -> Result<bool, String> {
+    let manifest = SemanticShardManifest::load(data_dir)
+        .map_err(|err| format!("semantic shard manifest: {err}; rebuild semantic vectors"))?;
+    Ok(manifest.is_some_and(|manifest| {
+        complete_shard_generation_candidate_exists_in_manifest(&manifest, embedder_id)
+    }))
 }
 
 fn load_complete_shard_artifacts_for_storage(
@@ -583,7 +631,7 @@ fn load_complete_shard_artifacts_for_storage(
     embedder_id: &str,
     expected_dimension: usize,
     context_label: &'static str,
-) -> Option<Vec<SemanticIndexArtifact>> {
+) -> Result<Option<Vec<SemanticIndexArtifact>>, String> {
     load_complete_shard_artifacts_with_fingerprint(
         data_dir,
         embedder_id,
@@ -599,39 +647,34 @@ fn load_complete_shard_artifacts_with_fingerprint(
     expected_dimension: usize,
     context_label: &'static str,
     fingerprint: impl FnOnce() -> anyhow::Result<String>,
-) -> Option<Vec<SemanticIndexArtifact>> {
+) -> Result<Option<Vec<SemanticIndexArtifact>>, String> {
     // GH #452: a monolithic FSVI is not evidence that shards exist. Probe
     // metadata before computing a possible shard generation's fingerprint;
     // legacy callers already hold the canonical authority used for admission.
-    if !complete_shard_generation_candidate_exists(data_dir, embedder_id) {
-        return None;
-    }
-    let db_fingerprint = match fingerprint() {
-        Ok(fingerprint) => fingerprint,
-        Err(err) => {
-            tracing::debug!(
-                error = %format!("{err:#}"),
-                embedder = embedder_id,
-                context = context_label,
-                "semantic shard context unavailable: failed to fingerprint current DB"
-            );
-            return None;
-        }
+    let Some(manifest) = SemanticShardManifest::load(data_dir)
+        .map_err(|err| format!("semantic shard manifest: {err}; rebuild semantic vectors"))?
+    else {
+        return Ok(None);
     };
-
-    match load_complete_shard_artifacts(data_dir, embedder_id, expected_dimension, &db_fingerprint)
-    {
-        Ok(artifacts) => artifacts,
-        Err(err) => {
-            tracing::debug!(
-                error = %err,
-                embedder = embedder_id,
-                context = context_label,
-                "semantic shard context unavailable"
-            );
-            None
-        }
+    if !complete_shard_generation_candidate_exists_in_manifest(&manifest, embedder_id) {
+        return Ok(None);
     }
+    let db_fingerprint = fingerprint().map_err(|err| {
+        format!("{context_label} shard admission could not fingerprint the current DB: {err:#}")
+    })?;
+
+    // Retain this manifest snapshot across fingerprinting and admission. A
+    // selected cohort that fails validation must never become legacy fallback.
+    load_complete_shard_artifacts(
+        data_dir,
+        &manifest,
+        embedder_id,
+        expected_dimension,
+        &db_fingerprint,
+    )
+    .map_err(|err| {
+        format!("{context_label} shard admission failed: {err}; rebuild semantic vectors")
+    })
 }
 
 /// Load semantic context with optional version mismatch checking.
@@ -915,11 +958,22 @@ fn load_hash_semantic_context_at_epoch(
             };
         }
     };
-    if !monolithic_present && !complete_shard_generation_candidate_exists(data_dir, embedder.id()) {
-        return SemanticSetup {
-            availability: SemanticAvailability::IndexMissing { index_path },
-            context: None,
-        };
+    if !monolithic_present {
+        match complete_shard_generation_candidate_exists(data_dir, embedder.id()) {
+            Ok(true) => {}
+            Ok(false) => {
+                return SemanticSetup {
+                    availability: SemanticAvailability::IndexMissing { index_path },
+                    context: None,
+                };
+            }
+            Err(context) => {
+                return SemanticSetup {
+                    availability: SemanticAvailability::LoadFailed { context },
+                    context: None,
+                };
+            }
+        }
     }
 
     let storage = match if strict_read_only {
@@ -948,13 +1002,21 @@ fn load_hash_semantic_context_at_epoch(
             };
         }
     };
-    let shard_artifacts = load_complete_shard_artifacts_for_storage(
+    let shard_artifacts = match load_complete_shard_artifacts_for_storage(
         data_dir,
         &storage,
         embedder.id(),
         embedder.dimension(),
         "hash semantic",
-    );
+    ) {
+        Ok(artifacts) => artifacts,
+        Err(context) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed { context },
+                context: None,
+            };
+        }
+    };
     if !monolithic_present && shard_artifacts.is_none() {
         return SemanticSetup {
             availability: SemanticAvailability::IndexMissing { index_path },
@@ -1178,13 +1240,22 @@ fn load_semantic_context_at_epoch(
             };
         }
     };
-    if !monolithic_present
-        && !complete_shard_generation_candidate_exists(data_dir, &config.embedder_id)
-    {
-        return SemanticSetup {
-            availability: SemanticAvailability::IndexMissing { index_path },
-            context: None,
-        };
+    if !monolithic_present {
+        match complete_shard_generation_candidate_exists(data_dir, &config.embedder_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                return SemanticSetup {
+                    availability: SemanticAvailability::IndexMissing { index_path },
+                    context: None,
+                };
+            }
+            Err(context) => {
+                return SemanticSetup {
+                    availability: SemanticAvailability::LoadFailed { context },
+                    context: None,
+                };
+            }
+        }
     }
 
     let storage = match if strict_read_only {
@@ -1213,13 +1284,21 @@ fn load_semantic_context_at_epoch(
             };
         }
     };
-    let shard_artifacts = load_complete_shard_artifacts_for_storage(
+    let shard_artifacts = match load_complete_shard_artifacts_for_storage(
         data_dir,
         &storage,
         &config.embedder_id,
         config.dimension,
         "semantic",
-    );
+    ) {
+        Ok(artifacts) => artifacts,
+        Err(context) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed { context },
+                context: None,
+            };
+        }
+    };
     if !monolithic_present && shard_artifacts.is_none() {
         return SemanticSetup {
             availability: SemanticAvailability::IndexMissing { index_path },
@@ -2241,7 +2320,8 @@ mod tests {
     fn shard_candidate_probe_is_false_without_manifest() {
         let tmp = tempdir().unwrap();
         assert!(
-            !complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384"),
+            !complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384")
+                .expect("probe missing manifest"),
             "missing shard manifest must not trigger a current-DB fingerprint"
         );
         assert!(
@@ -2252,12 +2332,13 @@ mod tests {
                 "test",
                 || panic!("missing shards must not open the archive for fingerprinting"),
             )
+            .expect("missing shards permit legacy fallback")
             .is_none()
         );
     }
 
     #[test]
-    fn shard_candidate_probe_is_false_for_unreadable_manifest() {
+    fn shard_candidate_probe_refuses_unreadable_manifest_without_fingerprinting() {
         let tmp = tempdir().unwrap();
         let path = SemanticShardManifest::path(tmp.path());
         std::fs::create_dir_all(path.parent().expect("manifest parent"))
@@ -2265,7 +2346,7 @@ mod tests {
         std::fs::write(&path, b"not json").expect("write invalid shard manifest");
 
         assert!(
-            !complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384"),
+            complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384").is_err(),
             "corrupt shard metadata must not trigger a query-time current-DB fingerprint"
         );
         assert!(
@@ -2276,7 +2357,8 @@ mod tests {
                 "test",
                 || panic!("invalid shards must not open the archive for fingerprinting"),
             )
-            .is_none()
+            .is_err(),
+            "unreadable metadata must not authorize legacy fallback"
         );
     }
 
@@ -2293,7 +2375,8 @@ mod tests {
         manifest.save(tmp.path()).expect("save shard manifest");
 
         assert!(
-            !complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384"),
+            !complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384")
+                .expect("probe partial and unrelated generations"),
             "incomplete or unrelated shard generations must not trigger a current-DB fingerprint"
         );
         assert!(
@@ -2304,6 +2387,7 @@ mod tests {
                 "test",
                 || panic!("incomplete or unrelated shards must not fingerprint the archive"),
             )
+            .expect("incomplete or unrelated shards permit legacy fallback")
             .is_none()
         );
     }
@@ -2321,7 +2405,8 @@ mod tests {
         manifest.save(tmp.path()).expect("save shard manifest");
 
         assert!(
-            complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384"),
+            complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384")
+                .expect("probe complete generation"),
             "complete candidate generations should allow the current-DB fingerprint check"
         );
         let fingerprint_calls = std::cell::Cell::new(0);
@@ -2336,7 +2421,7 @@ mod tests {
                     Ok("fp-current".to_string())
                 },
             )
-            .is_none(),
+            .is_err(),
             "metadata completeness alone must not admit missing shard artifacts"
         );
         assert_eq!(
@@ -2344,6 +2429,276 @@ mod tests {
             1,
             "a complete candidate must still fingerprint the current archive exactly once"
         );
+    }
+
+    #[test]
+    fn shard_candidate_fingerprint_failure_refuses_legacy_fallback() {
+        let tmp = tempdir().unwrap();
+        let mut manifest = SemanticShardManifest {
+            shards: vec![semantic_shard_record(
+                TierKind::Fast,
+                "fnv1a-384",
+                "fp-current",
+                0,
+                1,
+            )],
+            ..Default::default()
+        };
+        manifest.save(tmp.path()).expect("save shard manifest");
+
+        let error = load_complete_shard_artifacts_with_fingerprint(
+            tmp.path(),
+            "fnv1a-384",
+            384,
+            "test",
+            || anyhow::bail!("canonical archive unavailable"),
+        )
+        .err()
+        .expect("an unverifiable shard generation must not authorize legacy fallback");
+        assert!(
+            error.contains("could not fingerprint the current DB"),
+            "{error}"
+        );
+        assert!(error.contains("canonical archive unavailable"), "{error}");
+    }
+
+    #[test]
+    fn shard_admission_retains_the_selected_manifest_snapshot() {
+        let tmp = tempdir().unwrap();
+        let mut manifest = SemanticShardManifest {
+            shards: vec![semantic_shard_record(
+                TierKind::Fast,
+                "fnv1a-384",
+                "fp-current",
+                0,
+                1,
+            )],
+            ..Default::default()
+        };
+        manifest
+            .save(tmp.path())
+            .expect("save selected shard manifest");
+
+        let error = load_complete_shard_artifacts_with_fingerprint(
+            tmp.path(),
+            "fnv1a-384",
+            384,
+            "test",
+            || {
+                SemanticShardManifest::default()
+                    .save(tmp.path())
+                    .expect("replace on-disk manifest during fingerprinting");
+                Ok("fp-current".to_string())
+            },
+        )
+        .err()
+        .expect("a manifest replacement must not erase a selected cohort's failed admission");
+        assert!(
+            error.contains("selected semantic shard artifact is missing"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn load_hash_context_preserves_legacy_fallback_without_selected_shards() {
+        for scenario in ["absent", "unrelated", "incomplete", "older_generation"] {
+            let tmp = tempdir().unwrap();
+            let db_path = tmp.path().join("cass.db");
+            let storage = FrankenStorage::open(&db_path).expect("create cass db");
+            drop(storage);
+            let db_fingerprint = crate::indexer::lexical_storage_fingerprint_for_db(&db_path)
+                .expect("fingerprint cass db");
+            let embedder = HashEmbedder::default();
+            let monolithic_path = vector_index_path(tmp.path(), embedder.id());
+            write_hash_vector_index(&monolithic_path, 1);
+
+            if scenario != "absent" {
+                let (embedder_id, fingerprint, shard_count) = match scenario {
+                    "unrelated" => ("other-384", db_fingerprint.as_str(), 1),
+                    "incomplete" => (embedder.id(), db_fingerprint.as_str(), 2),
+                    "older_generation" => (embedder.id(), "fp-older-archive", 1),
+                    _ => unreachable!(),
+                };
+                let mut manifest = SemanticShardManifest {
+                    shards: vec![semantic_shard_record(
+                        TierKind::Fast,
+                        embedder_id,
+                        fingerprint,
+                        0,
+                        shard_count,
+                    )],
+                    ..Default::default()
+                };
+                manifest
+                    .save(tmp.path())
+                    .expect("save nonselected shard manifest");
+            }
+
+            let setup = load_hash_semantic_context(tmp.path(), &db_path);
+            assert!(
+                matches!(setup.availability, SemanticAvailability::HashFallback),
+                "{scenario}: {:?}",
+                setup.availability
+            );
+            let context = setup
+                .context
+                .expect("a nonselected cohort permits legacy serving");
+            assert_eq!(context.artifacts.len(), 1, "{scenario}");
+            assert_eq!(
+                context.artifacts[0].fsvi_path(),
+                monolithic_path,
+                "{scenario}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_hash_context_refuses_failed_selected_shards_instead_of_old_monolith() {
+        use crate::search::semantic_manifest::SemanticManifest;
+
+        for failure in [
+            "corrupt",
+            "missing",
+            "unsafe_path",
+            "wrong_dimension",
+            "wrong_revision",
+            "wrong_embedder",
+            "duplicate_index",
+            "inconsistent_count",
+            "inconsistent_revision",
+            "malformed_manifest",
+        ] {
+            let tmp = tempdir().unwrap();
+            let db_path = tmp.path().join("cass.db");
+            let storage = FrankenStorage::open(&db_path).expect("create cass db");
+            drop(storage);
+            let db_fingerprint = crate::indexer::lexical_storage_fingerprint_for_db(&db_path)
+                .expect("fingerprint cass db");
+            let embedder = HashEmbedder::default();
+            let monolithic_path = vector_index_path(tmp.path(), embedder.id());
+            write_hash_vector_index(&monolithic_path, 1);
+            assert!(
+                load_hash_semantic_context(tmp.path(), &db_path)
+                    .context
+                    .is_some(),
+                "{failure}: the fallback artifact must be independently loadable"
+            );
+
+            let mut legacy_manifest =
+                SemanticManifest::load_or_default(tmp.path()).expect("load legacy manifest");
+            assert!(legacy_manifest.adopt_legacy_artifact(
+                TierKind::Fast,
+                embedder.id(),
+                "hash",
+                embedder.dimension(),
+                1,
+                1,
+                "content-v1:999999:999999:999999",
+                "vector_index/index-fnv1a-384.fsvi",
+                1,
+            ));
+            legacy_manifest
+                .save(tmp.path())
+                .expect("save older monolithic generation");
+
+            let mut records = Vec::new();
+            for shard_index in 0..2 {
+                let mut record = semantic_shard_record(
+                    TierKind::Fast,
+                    embedder.id(),
+                    &db_fingerprint,
+                    shard_index,
+                    2,
+                );
+                record.model_revision = "hash".to_string();
+                let shard_path = tmp.path().join(&record.index_path);
+                if shard_index == 1 && failure == "missing" {
+                    // Keep the published record while leaving its artifact absent.
+                } else if shard_index == 1 && failure.starts_with("wrong_") {
+                    std::fs::create_dir_all(shard_path.parent().expect("shard parent"))
+                        .expect("create shard parent");
+                    let actual_embedder = if failure == "wrong_embedder" {
+                        "other-384"
+                    } else {
+                        embedder.id()
+                    };
+                    let actual_revision = if failure == "wrong_revision" {
+                        "legacy-hash-revision"
+                    } else {
+                        crate::indexer::semantic::HASH_VECTOR_SPACE_REVISION
+                    };
+                    let actual_dimension = if failure == "wrong_dimension" {
+                        embedder.dimension() / 2
+                    } else {
+                        embedder.dimension()
+                    };
+                    let mut writer = VectorIndex::create_with_revision(
+                        &shard_path,
+                        actual_embedder,
+                        actual_revision,
+                        actual_dimension,
+                        frankensearch::index::Quantization::F16,
+                    )
+                    .expect("create incompatible but readable shard");
+                    let mut vector = vec![0.0; actual_dimension];
+                    vector[0] = 1.0;
+                    writer
+                        .write_record("incompatible-doc", &vector)
+                        .expect("write incompatible shard");
+                    writer.finish().expect("finish incompatible shard");
+                } else {
+                    write_hash_vector_index(&shard_path, 1);
+                }
+                if shard_index == 1 {
+                    match failure {
+                        "corrupt" => std::fs::write(&shard_path, b"not an FSVI")
+                            .expect("corrupt selected shard"),
+                        "unsafe_path" => record.index_path = "../outside.fsvi".to_string(),
+                        "duplicate_index" => record.shard_index = 0,
+                        "inconsistent_count" => record.shard_count = 3,
+                        "inconsistent_revision" => {
+                            record.model_revision = "other-revision".to_string()
+                        }
+                        _ => {}
+                    }
+                }
+                records.push(record);
+            }
+            let mut manifest = SemanticShardManifest {
+                shards: records,
+                ..Default::default()
+            };
+            manifest
+                .save(tmp.path())
+                .expect("save current selected shard generation");
+            if failure == "malformed_manifest" {
+                std::fs::write(SemanticShardManifest::path(tmp.path()), b"not json")
+                    .expect("corrupt shard manifest");
+            }
+
+            let setup = load_hash_semantic_context(tmp.path(), &db_path);
+            assert!(
+                setup.context.is_none(),
+                "{failure}: failed selected shards must not serve the older monolith"
+            );
+            let SemanticAvailability::LoadFailed { context } = setup.availability else {
+                panic!(
+                    "{failure}: expected shard admission failure, got {:?}",
+                    setup.availability
+                );
+            };
+            assert!(context.contains("shard"), "{failure}: {context}");
+            assert!(
+                context.contains("rebuild semantic vectors"),
+                "{failure}: {context}"
+            );
+            if failure.starts_with("wrong_") {
+                assert!(
+                    context.contains("incompatible vector index"),
+                    "{failure}: {context}"
+                );
+            }
+        }
     }
 
     #[test]
