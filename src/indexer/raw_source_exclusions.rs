@@ -116,12 +116,44 @@ fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
 }
 
 fn sqlite_sidecar_source(path: &Path) -> Option<PathBuf> {
-    let file_name = path.file_name()?.to_str()?;
-    ["-wal", "-shm", "-journal"]
+    let file_name = path.file_name()?;
+    let suffix = ["-wal", "-shm", "-journal"]
         .into_iter()
-        .find_map(|suffix| file_name.strip_suffix(suffix))
-        .filter(|source| !source.is_empty())
-        .map(|source| path.with_file_name(source))
+        .find(|suffix| {
+            let bytes = file_name.as_encoded_bytes();
+            let tail = &bytes[bytes.len().saturating_sub(suffix.len())..];
+            #[cfg(windows)]
+            {
+                tail.eq_ignore_ascii_case(suffix.as_bytes())
+            }
+            #[cfg(not(windows))]
+            {
+                tail == suffix.as_bytes()
+            }
+        })
+        .filter(|suffix| file_name.len() > suffix.len())?;
+    // Sidecars can appear after the exclusion snapshot. Preserve the exact
+    // native container name so those new files cannot escape a permanent
+    // forget fence merely because a UTF-8 alias resolved to non-UTF8 bytes.
+    #[cfg(unix)]
+    let source = {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let bytes = file_name.as_bytes();
+        std::ffi::OsString::from_vec(bytes[..bytes.len() - suffix.len()].to_vec())
+    };
+    #[cfg(windows)]
+    let source = {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut units: Vec<u16> = file_name.encode_wide().collect();
+        units.truncate(units.len() - suffix.len());
+        std::ffi::OsString::from_wide(&units)
+    };
+    #[cfg(not(any(unix, windows)))]
+    let source = {
+        let file_name = file_name.to_str()?;
+        std::ffi::OsString::from(&file_name[..file_name.len() - suffix.len()])
+    };
+    Some(path.with_file_name(source))
 }
 
 #[cfg(test)]
@@ -186,6 +218,71 @@ mod tests {
         let missing = RawSourceExclusions::from_paths([alias.join("future/session")]);
         std::fs::write(physical.join("future"), b"newly available shared source")?;
         assert!(missing.excludes(&physical.join("future")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh566_late_sidecars_of_non_utf8_shared_stores_remain_excluded() -> Result<()> {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let database = temp
+            .path()
+            .join(OsString::from_vec(b"private-\xff.db".to_vec()));
+        let public = temp
+            .path()
+            .join(OsString::from_vec(b"public-\xfe.db".to_vec()));
+        std::fs::write(&database, b"forgotten private session")?;
+        std::fs::write(&public, b"retained public session")?;
+        let alias = temp.path().join("store-alias");
+        symlink(&database, &alias)?;
+
+        // Canonical conversation keys may use a UTF-8 alias whose target has
+        // a native filename. No sidecar exists when the forget snapshot loads,
+        // so later captures cannot rely on its saved sidecar inode identities.
+        let excluded = RawSourceExclusions::from_paths([alias.join("forgotten-session")]);
+        assert!(excluded.excludes(&database));
+        assert!(!excluded.excludes(&public));
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut private_name = database.as_os_str().to_owned();
+            private_name.push(suffix);
+            let private_sidecar = PathBuf::from(private_name);
+            let mut public_name = public.as_os_str().to_owned();
+            public_name.push(suffix);
+            let public_sidecar = PathBuf::from(public_name);
+            std::fs::write(&private_sidecar, b"forgotten bytes in a late sidecar")?;
+            std::fs::write(&public_sidecar, b"retained public sidecar")?;
+            let sidecar_alias = temp.path().join(format!("sidecar-alias{suffix}"));
+            symlink(&private_sidecar, &sidecar_alias)?;
+
+            assert!(excluded.excludes(&private_sidecar), "{suffix}");
+            assert!(excluded.excludes(&sidecar_alias), "{suffix} alias");
+            assert!(!excluded.excludes(&public_sidecar), "{suffix} sibling");
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gh566_late_sidecars_with_windows_case_aliases_remain_excluded() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let database = temp.path().join("private.db");
+        let public = temp.path().join("public.db");
+        std::fs::write(&database, b"forgotten private session")?;
+        std::fs::write(&public, b"retained public session")?;
+        let excluded = RawSourceExclusions::from_paths([database.join("forgotten-session")]);
+
+        for suffix in ["-WAL", "-sHm", "-JoUrNaL"] {
+            let private_sidecar = temp.path().join(format!("private.db{suffix}"));
+            let public_sidecar = temp.path().join(format!("public.db{suffix}"));
+            std::fs::write(&private_sidecar, b"forgotten bytes in a late sidecar")?;
+            std::fs::write(&public_sidecar, b"retained public sidecar")?;
+            assert!(excluded.excludes(&private_sidecar), "{suffix}");
+            assert!(!excluded.excludes(&public_sidecar), "{suffix} sibling");
+        }
         Ok(())
     }
 }
