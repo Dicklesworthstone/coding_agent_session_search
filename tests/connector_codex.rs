@@ -134,6 +134,160 @@ fn gh553_codex_recovers_a_complete_turn_after_a_torn_prefix() {
 }
 
 #[test]
+fn gh553_codex_enrichment_recovers_modern_records_after_a_torn_prefix() {
+    use franken_agent_detection::connectors::{SourceCompletion, SourceScanHooks};
+
+    let patch =
+        "*** Begin Patch\n*** Add File: recovered-caf\u{e9}.rs\n+fn recovered() {}\n*** End Patch";
+    let records = [
+        serde_json::json!({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"gh553-enrichment","cwd":"/synthetic/gh553"}}),
+        serde_json::json!({"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"alpha retained user"}]}}),
+        serde_json::json!({"type":"event_msg","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"agent_message","message":"charlie recovered assistant"}}),
+        serde_json::json!({"type":"event_msg","timestamp":"2026-01-01T00:00:03Z","payload":{"type":"tool_result","call_id":"call-1","output":"delta recovered tool result"}}),
+        serde_json::json!({"type":"response_item","timestamp":"2026-01-01T00:00:04Z","payload":{"type":"custom_tool_call","name":"apply_patch","call_id":"patch-1","input":patch}}),
+    ];
+
+    // Each suffix object is complete even when its damaged physical line has
+    // no final newline. The primary parser already retains the custom call;
+    // enrichment must add its input and the two event-only messages once.
+    for ending in ["\n", "\r\n", ""] {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("rollout-gh553-enrichment.jsonl");
+        let body = format!(
+            "{}\n{}\n{{\"payload\":\"torn{}{}{}{ending}",
+            records[0], records[1], records[2], records[3], records[4]
+        );
+        fs::write(&path, &body).unwrap();
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        let context = ScanContext::with_roots(
+            root.path().to_path_buf(),
+            vec![ScanRoot::local(path.clone())],
+            None,
+        );
+        let connector = CodexConnector::new();
+        for route in 0..3 {
+            let mut conversations = Vec::new();
+            let mut completions = 0;
+            match route {
+                0 => conversations = connector.scan(&context).unwrap(),
+                1 => connector
+                    .scan_with_callback(&context, &mut |conversation| {
+                        conversations.push(conversation);
+                        Ok(())
+                    })
+                    .unwrap(),
+                _ => {
+                    let mut complete = |completion: &SourceCompletion| {
+                        assert_eq!(completion.source.source_path, path);
+                        completions += 1;
+                        Ok(())
+                    };
+                    let mut hooks = SourceScanHooks {
+                        should_scan_source: None,
+                        on_source_complete: Some(&mut complete),
+                    };
+                    connector
+                        .scan_with_source_boundaries(&context, &mut hooks, &mut |conversation| {
+                            conversations.push(conversation);
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+            }
+            assert_eq!(conversations.len(), 1, "ending {ending:?}, route {route}");
+            let conversation = &conversations[0];
+            assert_eq!(conversation.source_path, path);
+            let messages = &conversation.messages;
+            assert_eq!(messages.len(), 4, "ending {ending:?}, route {route}");
+            assert_eq!(messages[0].content, "alpha retained user");
+            assert_eq!(messages[0].role, "user");
+            assert_eq!(messages[1].content, "charlie recovered assistant");
+            assert_eq!(messages[1].role, "assistant");
+            assert_eq!(
+                messages[2].content,
+                "[Tool output: call-1]\ndelta recovered tool result"
+            );
+            assert_eq!(messages[2].role, "tool");
+            assert_eq!(messages[3].content, format!("[Tool: apply_patch]\n{patch}"));
+            assert_eq!(messages[3].role, "assistant");
+            assert_eq!(messages[3].invocations.len(), 1);
+            let invocation = &messages[3].invocations[0];
+            assert_eq!(invocation.name, "apply_patch");
+            assert_eq!(invocation.call_id.as_deref(), Some("patch-1"));
+            assert_eq!(
+                invocation.arguments.as_ref(),
+                Some(&Value::String(patch.to_string()))
+            );
+            for (index, message) in messages.iter().enumerate() {
+                assert_eq!(message.idx, index as i64);
+            }
+            if route == 2 {
+                assert_eq!(completions, 1);
+            }
+            assert_eq!(fs::read_to_string(&path).unwrap(), body);
+            assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn gh553_codex_enrichment_rejects_nested_or_incomplete_suffix_records() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("rollout-gh553-rejected.jsonl");
+    let user = serde_json::json!({"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"retained user"}]}});
+    let assistant = serde_json::json!({"type":"event_msg","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"agent_message","message":"retained intact assistant"}});
+    let phantom = serde_json::json!({"type":"event_msg","timestamp":"2026-01-01T00:00:03Z","payload":{"type":"agent_message","message":"phantom assistant"}}).to_string();
+    let rejected = [
+        format!("{{\"nested\":{phantom}"),
+        format!("[{phantom}"),
+        format!("torn{phantom} trailing garbage"),
+        format!("torn{phantom}{{\"unknown\":true}}"),
+        format!("torn{}", &phantom[..phantom.len() / 2]),
+    ];
+    let body = format!("{user}\n{}\n{assistant}\n", rejected.join("\n"));
+    fs::write(&path, &body).unwrap();
+    let context = ScanContext::with_roots(
+        root.path().to_path_buf(),
+        vec![ScanRoot::local(path.clone())],
+        None,
+    );
+    let conversations = CodexConnector::new().scan(&context).unwrap();
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].messages.len(), 2);
+    assert_eq!(conversations[0].messages[0].content, "retained user");
+    assert_eq!(
+        conversations[0].messages[1].content,
+        "retained intact assistant"
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), body);
+}
+
+#[test]
+fn gh553_codex_enrichment_keeps_whitespace_in_the_recovery_budget() {
+    use franken_agent_detection::connectors::jsonl::MAX_JSONL_RECOVERY_LINE_BYTES;
+
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("rollout-gh553-over-budget.jsonl");
+    let phantom = serde_json::json!({"type":"event_msg","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"agent_message","message":"over-budget phantom"}});
+    let user = serde_json::json!({"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"retained user"}]}});
+    let body = format!(
+        "\u{feff}{}torn{phantom}\n{user}\n",
+        " ".repeat(MAX_JSONL_RECOVERY_LINE_BYTES)
+    );
+    fs::write(&path, &body).unwrap();
+    let context = ScanContext::with_roots(
+        root.path().to_path_buf(),
+        vec![ScanRoot::local(path.clone())],
+        None,
+    );
+    let conversations = CodexConnector::new().scan(&context).unwrap();
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].messages.len(), 1);
+    assert_eq!(conversations[0].messages[0].content, "retained user");
+    assert_eq!(fs::read_to_string(path).unwrap(), body);
+}
+
+#[test]
 fn codex_connector_reads_modern_envelope_jsonl() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/11/21");

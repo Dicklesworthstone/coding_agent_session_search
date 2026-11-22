@@ -13,6 +13,7 @@ use std::io::{self, BufRead, BufReader, Read};
 
 use anyhow::{Context, Result};
 use franken_agent_detection::connectors::codex as codex_rollouts;
+use franken_agent_detection::connectors::jsonl::recover_jsonl_suffix;
 use serde_json::Value;
 use tracing::warn;
 
@@ -253,97 +254,123 @@ fn augment_modern_codex_reader(
         bytes_read += count as u64;
         line_no += 1;
         let terminated = line.ends_with('\n');
-        let line = if line_no == 1 {
+        let text = if line_no == 1 {
             line.trim_start_matches('\u{feff}').trim()
         } else {
             line.trim()
         };
-        if line.is_empty() {
+        if text.is_empty() {
             continue;
         }
-        let raw = match serde_json::from_str::<Value>(line) {
-            Ok(value) => value,
-            Err(parse_err) if !terminated && parse_err.is_eof() => {
-                // GH #560: a dead writer can leave a cut final record forever.
-                // Recover its complete history only after the same activity
-                // checks used by indexing. Actual reader errors, truncation,
-                // and observable rewrites still fail the enclosing snapshot.
-                if crate::indexer::source_can_recover_incomplete_tail(&conversation.source_path) {
+        let (parsed, recovered) = match serde_json::from_str::<Value>(text) {
+            Ok(value) => (Some(value), Vec::new()),
+            Err(parse_err) => {
+                // GH #553: FAD recovers complete suffix records before its
+                // unfinished-tail policy. Enrichment must use that same
+                // bounded parser or event-only text and custom-tool input
+                // disappear after a torn prefix. Preserve physical whitespace
+                // and BOM bytes in its limits; strip only the line terminator.
+                let physical_line = line.strip_suffix('\n').map_or(line.as_str(), |line| {
+                    line.strip_suffix('\r').unwrap_or(line)
+                });
+                let recovery = recover_jsonl_suffix(physical_line);
+                if !recovery.records.is_empty() {
                     warn!(
                         source_path = %conversation.source_path.display(),
                         line_no,
-                        reason = "inactive_incomplete_tail",
-                        "codex rollout has an inactive incomplete final record; skipping that record",
+                        recovered_records = recovery.records.len(),
+                        discarded_bytes = recovery.discarded_bytes,
+                        "codex enrichment recovered complete records after a malformed prefix",
+                    );
+                    (None, recovery.records)
+                } else {
+                    if !terminated && parse_err.is_eof() {
+                        // GH #560: a dead writer can leave a cut final record forever.
+                        // Recover its complete history only after the same activity
+                        // checks used by indexing. Actual reader errors, truncation,
+                        // and observable rewrites still fail the enclosing snapshot.
+                        if crate::indexer::source_can_recover_incomplete_tail(
+                            &conversation.source_path,
+                        ) {
+                            warn!(
+                                source_path = %conversation.source_path.display(),
+                                line_no,
+                                reason = "inactive_incomplete_tail",
+                                "codex rollout has an inactive incomplete final record; skipping that record",
+                            );
+                            continue;
+                        }
+                        // A recent, held-open, or locked source remains retryable.
+                        // Compressed frame/reader failures are never recovered here.
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "incomplete Codex enrichment record at line {line_no}; retry this source"
+                            ),
+                        )
+                        .into());
+                    }
+                    // Per gauntlet finding CONF-cass-003: surface malformed JSONL lines
+                    // to tracing so operators can correlate `cass diag` reports against
+                    // unreadable Codex rollout entries. The line is still dropped to
+                    // preserve resilience; the warning is purely diagnostic.
+                    warn!(
+                        source_path = %conversation.source_path.display(),
+                        line_no = line_no,
+                        error = %parse_err,
+                        recovery_limited = recovery.limited,
+                        "codex rollout JSONL line failed to parse; skipping",
                     );
                     continue;
                 }
-                // A recent, held-open, or locked source remains retryable.
-                // Compressed frame/reader failures are never recovered here.
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "incomplete Codex enrichment record at line {line_no}; retry this source"
-                    ),
-                )
-                .into());
             }
-            Err(parse_err) => {
-                // Per gauntlet finding CONF-cass-003: surface malformed JSONL lines
-                // to tracing so operators can correlate `cass diag` reports against
-                // unreadable Codex rollout entries. The line is still dropped to
-                // preserve resilience; the warning is purely diagnostic.
-                warn!(
-                    source_path = %conversation.source_path.display(),
-                    line_no = line_no,
-                    error = %parse_err,
-                    "codex rollout JSONL line failed to parse; skipping",
-                );
+        };
+        for raw in parsed.into_iter().chain(recovered) {
+            let raw_signature = modern_codex_raw_signature(&raw);
+            let Some(message) = modern_codex_message(&raw) else {
+                continue;
+            };
+            let message_signature = modern_codex_message_signature(&message);
+            let existing_index = message_indices_by_raw_entry
+                .get(&raw_signature)
+                .copied()
+                .or_else(|| {
+                    modern_codex_message_call_ids(&message)
+                        .find_map(|call_id| message_indices_by_call_id.get(&call_id).copied())
+                })
+                .or_else(|| {
+                    message_indices_by_signature
+                        .get(&message_signature)
+                        .copied()
+                        .filter(|index| {
+                            compatible_tool_call_identity(&conversation.messages[*index], &message)
+                        })
+                });
+
+            if let Some(existing_index) = existing_index {
+                let existing = &mut conversation.messages[existing_index];
+                if merge_modern_codex_tool_call(existing, &message) {
+                    message_indices_by_signature
+                        .insert(modern_codex_message_signature(existing), existing_index);
+                    message_indices_by_call_id.extend(
+                        modern_codex_message_call_ids(existing)
+                            .map(|call_id| (call_id, existing_index)),
+                    );
+                }
+                message_indices_by_raw_entry.insert(raw_signature, existing_index);
                 continue;
             }
-        };
-        let raw_signature = modern_codex_raw_signature(&raw);
-        let Some(message) = modern_codex_message(&raw) else {
-            continue;
-        };
-        let message_signature = modern_codex_message_signature(&message);
-        let existing_index = message_indices_by_raw_entry
-            .get(&raw_signature)
-            .copied()
-            .or_else(|| {
-                modern_codex_message_call_ids(&message)
-                    .find_map(|call_id| message_indices_by_call_id.get(&call_id).copied())
-            })
-            .or_else(|| {
-                message_indices_by_signature
-                    .get(&message_signature)
-                    .copied()
-                    .filter(|index| {
-                        compatible_tool_call_identity(&conversation.messages[*index], &message)
-                    })
-            });
 
-        if let Some(existing_index) = existing_index {
-            let existing = &mut conversation.messages[existing_index];
-            if merge_modern_codex_tool_call(existing, &message) {
-                message_indices_by_signature
-                    .insert(modern_codex_message_signature(existing), existing_index);
-                message_indices_by_call_id.extend(
-                    modern_codex_message_call_ids(existing)
-                        .map(|call_id| (call_id, existing_index)),
-                );
-            }
-            message_indices_by_raw_entry.insert(raw_signature, existing_index);
-            continue;
+            let message_index = conversation.messages.len();
+            conversation.messages.push(message);
+            let stored = &conversation.messages[message_index];
+            message_indices_by_signature.insert(message_signature, message_index);
+            message_indices_by_call_id.extend(
+                modern_codex_message_call_ids(stored).map(|call_id| (call_id, message_index)),
+            );
+            message_indices_by_raw_entry.insert(raw_signature, message_index);
+            added = true;
         }
-
-        let message_index = conversation.messages.len();
-        conversation.messages.push(message);
-        let stored = &conversation.messages[message_index];
-        message_indices_by_signature.insert(message_signature, message_index);
-        message_indices_by_call_id
-            .extend(modern_codex_message_call_ids(stored).map(|call_id| (call_id, message_index)));
-        message_indices_by_raw_entry.insert(raw_signature, message_index);
-        added = true;
     }
 
     if added {
