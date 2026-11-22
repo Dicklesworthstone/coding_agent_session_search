@@ -242,17 +242,36 @@ pub(crate) fn shutdown_driver() -> bool {
 /// deliberate: a `Cx` carries cancellation and deadline state scoped to one
 /// request, and reusing one across independent engine calls would let an
 /// earlier cancellation silently poison a later unrelated call.
-fn drive<T, F>(call: impl FnOnce(Cx) -> F) -> T
+///
+/// Runtime startup is the outer result; an engine result in `T` keeps its
+/// concrete error type for the caller's existing recovery classification.
+fn drive<T, F>(call: impl FnOnce(Cx) -> F) -> Result<T>
 where
     F: Future<Output = T>,
 {
-    let runtime = DRIVER
-        .with(|slot| slot.borrow_mut().take())
-        .unwrap_or_else(|| {
-            RuntimeBuilder::current_thread()
-                .build()
-                .expect("failed to build Quill sync-bridge runtime")
-        });
+    drive_with_runtime_builder(RuntimeBuilder::current_thread, call)
+}
+
+/// Build lazily so cached calls do not allocate another runtime configuration.
+/// A startup refusal leaves the slot empty and never invokes the operation.
+/// Tests exercise this path with a real OS worker-stack allocation failure.
+fn drive_with_runtime_builder<T, F>(
+    builder: impl FnOnce() -> RuntimeBuilder,
+    call: impl FnOnce(Cx) -> F,
+) -> Result<T>
+where
+    F: Future<Output = T>,
+{
+    let runtime = match DRIVER.with(|slot| slot.borrow_mut().take()) {
+        Some(runtime) => runtime,
+        None => builder().build().map_err(|error| {
+            let diagnostic = format!(
+                "initializing the Quill sync-bridge runtime: {error}; \
+                 check available memory and process/thread limits, then retry"
+            );
+            anyhow::Error::new(error).context(diagnostic)
+        })?,
+    };
     // Restore the runtime on the way out even if the driven future panics.
     //
     // The slot is TAKEN for the duration of the call so a reentrant bridge call
@@ -295,7 +314,7 @@ where
             call(cx).await
         });
     drop(guard);
-    output
+    Ok(output)
 }
 
 /// Refresh a reader to the latest published snapshot.
@@ -309,7 +328,7 @@ where
 ///
 /// Returns an error when the current publication cannot be opened.
 pub fn refresh_reader(reader: &QuillSearchIndex) -> Result<bool> {
-    drive(|cx| async move { reader.refresh(&cx).await })
+    drive(|cx| async move { reader.refresh(&cx).await })?
         .map_err(|error| anyhow!("refreshing the Quill CASS reader: {error}"))
 }
 
@@ -329,7 +348,7 @@ pub fn refresh_reader(reader: &QuillSearchIndex) -> Result<bool> {
 /// other reason.
 pub fn refresh_reader_or_detect_republish(reader: &QuillSearchIndex) -> Result<Option<String>> {
     use frankensearch::quill::{QuillIndexError, SnapshotError};
-    match drive(|cx| async move { reader.refresh(&cx).await }) {
+    match drive(|cx| async move { reader.refresh(&cx).await })? {
         Ok(_) => Ok(None),
         Err(QuillIndexError::Snapshot(
             error @ (SnapshotError::KeeperGenerationRegression { .. }
@@ -395,7 +414,7 @@ pub fn search_paginated(
 ) -> Result<QuillLexicalPage> {
     let result = drive(|cx| async move {
         reader.search_preparsed_paginated(&cx, query, limit, offset, exact_count)
-    })
+    })?
     .map_err(|error| {
         // Preserve the engine type for recovery admission, while retaining the
         // full outer display for CLI callers that do not print the cause chain.
@@ -540,7 +559,7 @@ pub fn open_cass_reader(path: &Path) -> Result<QuillSearchIndex> {
             QuillSearchIndex::open_with_schema(&cx, path, CASS_SEMANTIC_SCHEMA, cass_quill_config())
                 .await
         }
-    })
+    })?
     .map_err(|error| anyhow!("opening Quill CASS reader at {}: {error}", path.display()))
 }
 
@@ -583,7 +602,7 @@ pub(crate) fn open_cass_reader_with_query_fuel_budget(
             )
             .await
         }
-    })
+    })?
     .map_err(|error| anyhow!("opening Quill CASS reader at {}: {error}", path.display()))
 }
 
@@ -1194,7 +1213,7 @@ impl QuillCassIndex {
                         .await
                 }
             }
-        })
+        })?
         .map_err(|error| {
             anyhow!(
                 "{} Quill CASS index at {}: {error}",
@@ -1264,7 +1283,7 @@ impl QuillCassIndex {
                 let index = &self.index;
                 async move { index.index_schema_documents(&cx, projected).await }
             })
-        })
+        })?
         .map_err(|error| {
             // Preserve the engine cause for retry classification without changing
             // the operator-facing diagnostic.
@@ -1302,7 +1321,7 @@ impl QuillCassIndex {
                 let index = &self.index;
                 async move { index.upsert_schema_documents(&cx, projected).await }
             })
-        })
+        })?
         .map_err(|error| {
             let diagnostic = format!("upserting CASS documents into Quill: {error}");
             anyhow::Error::new(error).context(diagnostic)
@@ -1327,7 +1346,7 @@ impl QuillCassIndex {
                 let ids = &ids;
                 async move { index.delete_documents(&cx, ids).await }
             })
-        })
+        })?
         .map_err(|error| anyhow!("removing revised CASS documents from Quill: {error}"))?;
         self.tick_heartbeat();
         Ok(())
@@ -1344,7 +1363,7 @@ impl QuillCassIndex {
                 let index = &self.index;
                 async move { index.commit(&cx).await }
             })
-        })
+        })?
         .map(|_| ())
         .map_err(|error| anyhow!("committing the Quill CASS index: {error}"))?;
         self.tick_heartbeat();
@@ -1360,7 +1379,7 @@ impl QuillCassIndex {
         drive(|cx| {
             let index = &self.index;
             async move { index.delete_all(&cx).await }
-        })
+        })?
         .map_err(|error| anyhow!("clearing the Quill CASS index: {error}"))
     }
 
@@ -1386,7 +1405,7 @@ impl QuillCassIndex {
                         .await
                     }
                 })
-            })
+            })?
             .map_err(|error| anyhow!("opening the Quill CASS reader: {error}"))?;
         self.tick_heartbeat();
         Ok(reader)
@@ -1693,7 +1712,7 @@ impl QuillCassIndex {
                 let index = &self.index;
                 async move { index.concat_merge_runs(&cx, planned, concurrency).await }
             })
-        });
+        })?;
         // Runs publish in plan order, so the published ones are a prefix: each
         // is one unit of completed work, as in the one-run path. A published
         // run's sources have left the manifest and its output has joined it.
@@ -1822,7 +1841,7 @@ impl QuillCassIndex {
                         .await
                 }
             })
-        })
+        })?
         .map(|_| ())
         .map_err(|error| {
             anyhow!(
@@ -1847,7 +1866,7 @@ impl QuillCassIndex {
                             .await
                     }
                 })
-            })
+            })?
             .map(|report| report.changed())
             .map_err(|error| anyhow!("compacting the Quill CASS index: {error}"))?;
         self.tick_heartbeat();
@@ -3850,7 +3869,80 @@ mod tests {
             // A second bridge call while the first future is being driven.
             index.doc_count()
         });
-        assert_eq!(nested.expect("nested doc count"), 0);
+        assert_eq!(
+            nested
+                .expect("initialize nested bridge")
+                .expect("nested doc count"),
+            0
+        );
+    }
+
+    /// Linux cannot reserve a worker stack larger than its user address
+    /// space. Exercise that real startup error without changing global limits
+    /// or replacing the runtime with a fake failure, then retry normal indexing.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn bridge_runtime_spawn_failure_is_recoverable() -> Result<()> {
+        assert!(
+            shutdown_driver(),
+            "clear any cached bridge before the refusal"
+        );
+        let operation_started = std::cell::Cell::new(false);
+        let failure = drive_with_runtime_builder(
+            || RuntimeBuilder::current_thread().thread_stack_size(1_usize << 60),
+            |_cx| {
+                operation_started.set(true);
+                async {}
+            },
+        );
+        let error = failure.expect_err("Linux must reject the impossible worker stack");
+        let runtime_error = error
+            .downcast_ref::<asupersync::error::Error>()
+            .expect("retain the concrete Asupersync startup error");
+        assert_eq!(runtime_error.kind(), asupersync::error::ErrorKind::Internal);
+        assert!(
+            runtime_error
+                .to_string()
+                .contains("failed to spawn worker thread"),
+            "{error:#}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("check available memory and process/thread limits, then retry"),
+            "{error:#}"
+        );
+        assert!(
+            !operation_started.get(),
+            "startup failure must not invoke the operation"
+        );
+        assert!(DRIVER.with(|slot| slot.borrow().is_none()));
+
+        // The failed initialization must not poison either retry or publication.
+        // Use the ordinary facade and a searchable document, not a success stub.
+        let directory = tempfile::tempdir()?;
+        let mut index = QuillCassIndex::open_or_create(directory.path())?;
+        index.add_cass_documents(&[sample(
+            "runtime-retry",
+            0,
+            "recoveredneedle after a runtime startup refusal",
+        )])?;
+        index.commit()?;
+        let reader = index.reader()?;
+        let parser = frankensearch::quill::query::CassQueryParser::new(CASS_SEMANTIC_SCHEMA)
+            .expect("CASS query parser");
+        let parsed = parser.parse(
+            "recoveredneedle",
+            &frankensearch::quill::query::CassQueryFilters::default(),
+        );
+        let page = search_paginated(&reader, &parsed.query, 10, 0, true)?;
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(page.total_count, Some(1));
+        assert_eq!(page.doc_count, 1);
+        drop(reader);
+        drop(index);
+        assert!(shutdown_driver(), "the retried bridge must drain");
+        Ok(())
     }
 
     #[test]
@@ -3897,7 +3989,7 @@ mod tests {
                     assert_eq!(restored.capabilities(), mapping.capabilities());
                     count
                 });
-                assert_eq!(nested, 1);
+                assert_eq!(nested.expect("initialize nested bridge"), 1);
                 assert_caller();
                 let reader = index.reader().expect("published reader");
                 let parser =
@@ -4516,6 +4608,7 @@ mod tests {
                 )
                 .await
             })
+            .expect("initialize reader bridge")
             .expect("open reader")
         };
         let parser = frankensearch::quill::query::CassQueryParser::new(CASS_SEMANTIC_SCHEMA)
