@@ -376,6 +376,120 @@ fn export_redaction_covers_tool_arguments_results_and_nested_metadata()
 }
 
 #[test]
+fn export_redaction_covers_multiline_and_overlapping_credential_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::Builder::new()
+        .prefix("cass-multiline-export-privacy-")
+        .disable_cleanup(true)
+        .tempdir()?;
+    let cases = [
+        (
+            "double-lf",
+            format!(
+                "DB_PASSWORD=\"synthetic-first-piece\n{EXPORT_PRIVACY_SECRET}\"\nmultiline-suffix-kept"
+            ),
+            EXPORT_PRIVACY_SECRET,
+            "[REDACTED]\nmultiline-suffix-kept",
+        ),
+        (
+            "single-crlf",
+            format!(
+                "AWS_SESSION_TOKEN='synthetic-first-piece\r\n{EXPORT_PRIVACY_SECRET}'\r\nmultiline-suffix-kept"
+            ),
+            EXPORT_PRIVACY_SECRET,
+            "[REDACTED]\r\nmultiline-suffix-kept",
+        ),
+        (
+            "aws-prefix",
+            format!(
+                "AWS_SECRET_ACCESS_KEY=\"{}\n{EXPORT_PRIVACY_SECRET}\"\nmultiline-suffix-kept",
+                "A".repeat(40)
+            ),
+            EXPORT_PRIVACY_SECRET,
+            "[REDACTED]\nmultiline-suffix-kept",
+        ),
+        (
+            "compact-overlap",
+            "awsSecretAccessKey=\"AKIAABCDEFGHIJKLMNOP abcdefghijklmnopqrst\nTAIL\"\nmultiline-suffix-kept"
+                .to_owned(),
+            "abcdefghijklmnopqrst",
+            "[REDACTED]\nmultiline-suffix-kept",
+        ),
+    ];
+    for (case, payload, sentinel, expected) in cases {
+        let session = root.path().join(format!("multiline-{case}.jsonl"));
+        let events = [
+            serde_json::json!({"type":"user","message":{"role":"user","content":"multiline-context-kept café 界"}}),
+            serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[
+                {"type":"tool_use","id":"call-multiline","name":"read_config","input":{"path":"fixture.env"}}
+            ]}}),
+            serde_json::json!({"type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"call-multiline","content":payload}
+            ]}}),
+        ];
+        let mut bytes = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut bytes, &event)?;
+            bytes.push(b'\n');
+        }
+        fs::write(&session, &bytes)?;
+        for include_secrets in [false, true] {
+            for format in ["markdown", "text", "json", "html"] {
+                let mut cmd = export_privacy_command(root.path());
+                cmd.arg("export")
+                    .arg(&session)
+                    .args(["--format", format, "--include-tools"]);
+                if include_secrets {
+                    cmd.arg("--include-secrets");
+                }
+                let output = cmd.output()?;
+                assert!(output.status.success(), "{case}/{format}: {output:?}");
+                let exported = String::from_utf8(output.stdout)?;
+                assert_eq!(
+                    exported.contains(sentinel),
+                    include_secrets,
+                    "{case}/{format}"
+                );
+                assert!(exported.contains("multiline-context-kept"));
+                assert!(exported.contains("multiline-suffix-kept"));
+                let stderr = String::from_utf8(output.stderr)?;
+                let announcement = stderr
+                    .lines()
+                    .find_map(|line| line.strip_prefix("note: export privacy: "))
+                    .ok_or("export privacy announcement missing")?;
+                let privacy: Value = serde_json::from_str(announcement)?;
+                assert_eq!(privacy["redaction_applied"], !include_secrets);
+                assert_eq!(privacy["sensitive_output"], include_secrets);
+                if format == "json" {
+                    let messages: Value = serde_json::from_str(&exported)?;
+                    assert_eq!(messages[1]["message"]["content"][0]["id"], "call-multiline");
+                    assert_eq!(
+                        messages[2]["message"]["content"][0]["content"].as_str(),
+                        Some(if include_secrets {
+                            payload.as_str()
+                        } else {
+                            expected
+                        })
+                    );
+                }
+            }
+            let (receipt, html) =
+                export_privacy_html(root.path(), &session, None, include_secrets, false)?;
+            assert_eq!(html.contains(sentinel), include_secrets, "{case}/export-html");
+            assert!(html.contains("multiline-context-kept"));
+            assert!(html.contains("multiline-suffix-kept"));
+            assert_eq!(receipt["privacy"]["redaction_applied"], !include_secrets);
+        }
+        assert_eq!(
+            fs::read(&session)?,
+            bytes,
+            "export changed the source session"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn gh551_export_redaction_covers_json_titles() -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::Builder::new()
         .prefix("cass-gh551-json-title-")

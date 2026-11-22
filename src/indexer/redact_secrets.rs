@@ -136,9 +136,19 @@ struct SecretPattern {
 // Unicode ones, so the ASCII form matches wherever the Unicode form did (plus a
 // token directly touching a non-ASCII letter): redaction can only get stricter.
 pub(crate) const AWS_ACCESS_KEY_PATTERN: &str = r"(?-u:\b)(?:AKIA|ASIA)[0-9A-Z]{16}(?-u:\b)";
-pub(crate) const AWS_SECRET_KEY_PATTERN: &str =
-    r#"(?i)aws(.{0,20})?(secret|access)?[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}['"]?"#;
-pub(crate) const AWS_SESSION_TOKEN_PATTERN: &str = r#"(?i)(?-u:\b)aws[_-]?(?:session|security)[_-]?token\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){8,}"|'(?:\\.|[^'\\\r\n]){8,}'|[^\s,;}\]]{8,})"#;
+// Quoted assignments can contain LF/CRLF and escaped newlines or quotes.
+// A truncated quoted value is sensitive through EOF, including a final escape.
+// Keep the established minimum lengths and unquoted alternatives.
+pub(crate) const AWS_SECRET_KEY_PATTERN: &str = concat!(
+    r"(?i)aws(.{0,20})?(secret|access)?[_-]?key\s*[:=]\s*",
+    r#"(?:"(?:\\(?s:.)|[^"\\]){40,}(?:"|(?:\\)?\z)|"#,
+    r#"'(?:\\(?s:.)|[^'\\]){40,}(?:'|(?:\\)?\z)|[A-Za-z0-9/+=]{40}['"]?)"#,
+);
+pub(crate) const AWS_SESSION_TOKEN_PATTERN: &str = concat!(
+    r"(?i)(?-u:\b)aws[_-]?(?:session|security)[_-]?token\s*[:=]\s*",
+    r#"(?:"(?:\\(?s:.)|[^"\\]){8,}(?:"|(?:\\)?\z)|"#,
+    r#"'(?:\\(?s:.)|[^'\\]){8,}(?:'|(?:\\)?\z)|[^\s,;}\]]{8,})"#,
+);
 pub(crate) const GITHUB_TOKEN_PATTERN: &str =
     r"(?-u:\b)(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,})(?-u:\b)";
 pub(crate) const OPENAI_API_KEY_PATTERN: &str =
@@ -161,7 +171,11 @@ pub(crate) const PRIVATE_KEY_BLOCK_PATTERN: &str = concat!(
 );
 pub(crate) const DATABASE_URL_PATTERN: &str =
     r#"(?i)(?-u:\b)(postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s'"]{8,}"#;
-pub(crate) const GENERIC_SECRET_ASSIGNMENT_PATTERN: &str = r#"(?i)(?-u:\b)(?:[A-Za-z0-9]*[_-])*(?:api[ _-]?(?:key|secret|token)|auth[ _-]?token|access[ _-]?(?:token|key)|secret[ _-]?key|session[ _-]?token|password|passwd|passphrase|token|secret|authorization)\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){4,}"|'(?:\\.|[^'\\\r\n]){4,}'|[^\s,;}\]]{8,})"#;
+pub(crate) const GENERIC_SECRET_ASSIGNMENT_PATTERN: &str = concat!(
+    r"(?i)(?-u:\b)(?:[A-Za-z0-9]*[_-])*(?:api[ _-]?(?:key|secret|token)|auth[ _-]?token|access[ _-]?(?:token|key)|secret[ _-]?key|session[ _-]?token|password|passwd|passphrase|token|secret|authorization)\s*[:=]\s*",
+    r#"(?:"(?:\\(?s:.)|[^"\\]){4,}(?:"|(?:\\)?\z)|"#,
+    r#"'(?:\\(?s:.)|[^'\\]){4,}(?:'|(?:\\)?\z)|[^\s,;}\]]{8,})"#,
+);
 pub(crate) const SLACK_TOKEN_PATTERN: &str = r"(?-u:\b)xox[bpsaor]-[A-Za-z0-9\-]{10,}";
 pub(crate) const STRIPE_KEY_PATTERN: &str = r"(?-u:\b)[spr]k_live_[A-Za-z0-9]{20,}";
 
@@ -257,23 +271,54 @@ pub fn redact_text(input: &str) -> Cow<'_, str> {
     apply_replacements(input, &matches)
 }
 
-/// Ordered per-pattern replacement passes for an input whose RegexSet
-/// prefilter already reported candidate matches. Shared by the plain
-/// [`redact_text`] path and the memoizing miss path so the candidate
-/// scan runs exactly once per input. Replacement order (ascending
-/// pattern index, sequential `replace_all`) is part of the frozen
-/// behavior contract — see `redact_text_reference` in the tests.
+/// Replace the union of secret spans found in the original input.
+///
+/// Re-running patterns on already-redacted text can erase an outer credential's
+/// label or shorten its value below a later pattern's threshold. Sweep ordered
+/// match streams instead: overlapping spans are redacted once, while adjacent
+/// independent matches keep separate placeholders. Only one pending match per
+/// selected pattern is retained, independent of the number of source matches.
 fn apply_replacements<'a>(input: &'a str, matches: &regex::SetMatches) -> Cow<'a, str> {
-    let mut output = Cow::Borrowed(input);
-    for idx in matches.iter() {
-        let replaced = SECRET_PATTERNS[idx]
-            .regex
-            .replace_all(output.as_ref(), REDACTED);
-        if let Cow::Owned(redacted) = replaced {
-            output = Cow::Owned(redacted);
+    let mut streams = matches
+        .iter()
+        .map(|idx| SECRET_PATTERNS[idx].regex.find_iter(input).peekable())
+        .collect::<Vec<_>>();
+    let mut output = String::with_capacity(input.len());
+    let mut copied_until = 0;
+    let mut pending: Option<std::ops::Range<usize>> = None;
+
+    loop {
+        let next = streams
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(idx, stream)| {
+                stream.peek().map(|found| (idx, found.start(), found.end()))
+            })
+            .min_by_key(|&(_, start, end)| (start, end));
+        let Some((idx, start, end)) = next else {
+            break;
+        };
+        let _ = streams[idx].next();
+        if let Some(range) = pending.as_mut()
+            && start < range.end
+        {
+            range.end = range.end.max(end);
+            continue;
+        }
+        if let Some(range) = pending.replace(start..end) {
+            output.push_str(&input[copied_until..range.start]);
+            output.push_str(REDACTED);
+            copied_until = range.end;
         }
     }
-    output
+
+    let Some(range) = pending else {
+        return Cow::Borrowed(input);
+    };
+    output.push_str(&input[copied_until..range.start]);
+    output.push_str(REDACTED);
+    output.push_str(&input[range.end..]);
+    Cow::Owned(output)
 }
 
 /// Insert a redacted JSON object entry without discarding an earlier value
@@ -583,11 +628,11 @@ fn redaction_enabled_from_values(modern: Option<&str>, legacy: Option<&str>) -> 
 /// regex tightened) automatically invalidates every prior cache entry
 /// — silent stale cross-version reuse is impossible by construction.
 ///
-/// The fingerprint is `redact-v1:<blake3-hex>` where the hash covers
-/// every pattern source string concatenated with NUL separators. The
-/// `v1` epoch lets future maintainers force a manual bump even when
-/// the regex source set hasn't changed (e.g. if the replacement
-/// constant changes from `[REDACTED]` to something else).
+/// The fingerprint is `redact-v2:<blake3-hex>` where the hash covers
+/// every pattern source string concatenated with NUL separators and the
+/// replacement marker. The `v2` epoch identifies original-span replacement:
+/// unlike sequential mutation, an earlier match cannot hide a later secret.
+/// Bump the epoch for algorithm changes even when the pattern set is unchanged.
 pub fn redaction_algorithm_fingerprint() -> String {
     static FINGERPRINT: Lazy<String> = Lazy::new(|| {
         let mut hasher = blake3::Hasher::new();
@@ -596,7 +641,7 @@ pub fn redaction_algorithm_fingerprint() -> String {
             hasher.update(&[0]);
         }
         hasher.update(REDACTED.as_bytes());
-        format!("redact-v1:{}", hasher.finalize().to_hex())
+        format!("redact-v2:{}", hasher.finalize().to_hex())
     });
     FINGERPRINT.clone()
 }
@@ -951,18 +996,11 @@ mod tests {
         }
     }
 
-    /// FROZEN reference implementation of the redaction algorithm as of
-    /// the 2026-08 redaction-perf campaign baseline. This is a verbatim
-    /// copy of the pre-optimization `redact_text` body (RegexSet
-    /// prefilter + ordered per-pattern `replace_all` passes). Every
-    /// optimization to the production paths (`redact_text`,
-    /// `MemoizingRedactor::redact_text`, `redact_json`) must stay
-    /// byte-identical to THIS function on arbitrary input — enforced by
-    /// `production_redaction_paths_match_frozen_reference` below. Do
-    /// not "modernize" this copy alongside a production change; it is
-    /// the fixed point the equivalence proof hangs on. (A deliberate
-    /// pattern-list change is the one legitimate reason to update it,
-    /// together with the algorithm fingerprint bump.)
+    /// Historical sequential implementation from the 2026-08 redaction-perf
+    /// baseline. Keep its body unchanged: the literal golden corpus still
+    /// checks established disjoint-match behavior, while the overlap regression
+    /// below demonstrates why v2 intentionally differs. Arbitrary overlapping
+    /// inputs are checked against the independent original-span oracle.
     fn redact_text_reference(input: &str) -> Cow<'_, str> {
         let matches = SECRET_REGEX_SET.matches(input);
         if !matches.matched_any() {
@@ -978,6 +1016,138 @@ mod tests {
             }
         }
         output
+    }
+
+    /// Independent test oracle: collect all original spans, sort/merge them,
+    /// then replace from the end. Production instead sweeps bounded streams
+    /// forward without retaining a match list proportional to input size.
+    fn redact_text_original_span_reference(input: &str) -> String {
+        let mut spans = SECRET_PATTERNS
+            .iter()
+            .flat_map(|pattern| pattern.regex.find_iter(input).map(|found| found.range()))
+            .collect::<Vec<_>>();
+        spans.sort_unstable_by_key(|range| (range.start, range.end));
+        let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+        for span in spans {
+            if let Some(previous) = merged.last_mut()
+                && span.start < previous.end
+            {
+                previous.end = previous.end.max(span.end);
+            } else {
+                merged.push(span);
+            }
+        }
+        let mut output = input.to_owned();
+        for span in merged.into_iter().rev() {
+            output.replace_range(span, REDACTED);
+        }
+        output
+    }
+
+    #[test]
+    fn quoted_secret_assignments_cover_multiline_escaped_and_truncated_values() {
+        let aws_snake = format!(
+            "AWS_SECRET_ACCESS_KEY=\"{}\nsynthetic-tail\"\nKEEP=public",
+            "A".repeat(40)
+        );
+        let aws_camel = format!(
+            "awsSecretAccessKey=\"{}\nsynthetic-tail\"\nKEEP=public",
+            "A".repeat(40)
+        );
+        let mut memo = MemoizingRedactor::with_capacity(32);
+        for (input, expected) in [
+            (
+                "DB_PASSWORD=\"first-private-line\nsecond-private-line\"\nKEEP=public",
+                "[REDACTED]\nKEEP=public",
+            ),
+            (
+                "DB_PASSWORD='first-private-line\r\nsecond-private-line'\r\nKEEP=public",
+                "[REDACTED]\r\nKEEP=public",
+            ),
+            (
+                "PASSWORD=\"before\\\"quoted\nsynthetic-tail\"; KEEP=public",
+                "[REDACTED]; KEEP=public",
+            ),
+            (
+                "PASSWORD=\"before\\\\\"\nKEEP=public",
+                "[REDACTED]\nKEEP=public",
+            ),
+            (
+                "MY_API_KEY=\"first-private-line\\\nsecond-private-line\"\nKEEP=public",
+                "[REDACTED]\nKEEP=public",
+            ),
+            (
+                "DB_PASSWORD=\"first-private-line\nunfinished-secret-line",
+                "[REDACTED]",
+            ),
+            (
+                "DB_PASSWORD='first-private-line\nunfinished-secret-line\\",
+                "[REDACTED]",
+            ),
+            (
+                "AWS_SESSION_TOKEN=\"first-private-line\nsecond-private-line\"\nKEEP=public",
+                "[REDACTED]\nKEEP=public",
+            ),
+            (aws_snake.as_str(), "[REDACTED]\nKEEP=public"),
+            (aws_camel.as_str(), "[REDACTED]\nKEEP=public"),
+            ("password='a'abcdefghij", "[REDACTED]"),
+        ] {
+            assert_eq!(redact_text(input), expected, "{input:?}");
+            assert_eq!(redact_text_original_span_reference(input), expected);
+            assert_eq!(memo.redact_text(input), expected);
+            assert_eq!(memo.redact_text(input), expected);
+            assert_eq!(redact_text(expected), expected);
+            let envelope = json!({"content": input, "message_index": 7});
+            let expected_envelope = json!({"content": expected, "message_index": 7});
+            assert_eq!(redact_json(&envelope), expected_envelope);
+            assert_eq!(memo.redact_json(&envelope), expected_envelope);
+        }
+        for input in [
+            "password=short",
+            "password=\"abc\"",
+            "DB_PASSWORD_LENGTH=\"first-public-line\nsecond-public-line\"",
+            "TOKENIZER=\"first-public-line\nsecond-public-line\"",
+            "ordinary \"first-public-line\nsecond-public-line\" prose",
+        ] {
+            assert!(matches!(redact_text(input), Cow::Borrowed(_)));
+            assert_eq!(redact_text(input), input);
+            assert_eq!(redact_text_reference(input), input);
+            assert_eq!(memo.redact_text(input), input);
+        }
+    }
+
+    #[test]
+    fn original_spans_prevent_provider_replacements_from_hiding_outer_credentials() {
+        let shrinking =
+            "awsSecretAccessKey=\"AKIAABCDEFGHIJKLMNOP abcdefghijklmnopqrst\nTAIL\"\nKEEP=public";
+        assert!(redact_text_reference(shrinking).contains("TAIL"));
+        let private_key = concat!(
+            "API_SECRET=-----BEGIN RSA PRIVATE KEY-----\n",
+            "SYNTHETIC_PRIVATE_BODY\n-----END RSA PRIVATE KEY-----\nKEEP=public"
+        ); // ubs:ignore — synthetic key-block redaction fixture, not a private key.
+        let provider_in_password = format!(
+            "PASSWORD=\"before ghp_{}\nsynthetic-tail\"\nKEEP=public",
+            "A".repeat(36)
+        );
+        let mut memo = MemoizingRedactor::with_capacity(16);
+        for input in [shrinking, private_key, provider_in_password.as_str()] {
+            assert_eq!(redact_text(input), "[REDACTED]\nKEEP=public");
+            assert_eq!(
+                redact_text_original_span_reference(input),
+                "[REDACTED]\nKEEP=public"
+            );
+            assert_eq!(memo.redact_text(input), "[REDACTED]\nKEEP=public");
+            assert_eq!(memo.redact_text(input), "[REDACTED]\nKEEP=public");
+            let unicode = format!("前🔐 {input} 界");
+            assert_eq!(redact_text(&unicode), "前🔐 [REDACTED]\nKEEP=public 界");
+        }
+        let adjacent = "password=\"abcd\"password=\"efgh\"";
+        assert_eq!(redact_text(adjacent), "[REDACTED][REDACTED]");
+        assert_eq!(redact_text_reference(adjacent), "[REDACTED][REDACTED]");
+        assert_eq!(
+            redact_text_original_span_reference(adjacent),
+            "[REDACTED][REDACTED]"
+        );
     }
 
     #[test]
@@ -1740,17 +1910,17 @@ mod tests {
     /// `MemoizingRedactor` instances whose algorithm fingerprints
     /// differ — entries from one cannot serve hits to the other,
     /// guaranteeing safe cross-version semantics. Pinning the
-    /// fingerprint structure (`redact-v1:<hex>`) guards against an
+    /// fingerprint structure (`redact-v2:<hex>`) guards against an
     /// accidental hash-format change that would silently break
     /// invalidation.
     #[test]
     fn memoizing_redactor_keys_isolate_by_algorithm_fingerprint() {
         let fingerprint = redaction_algorithm_fingerprint();
         assert!(
-            fingerprint.starts_with("redact-v1:"),
+            fingerprint.starts_with("redact-v2:"),
             "fingerprint must carry an explicit version epoch, got: {fingerprint}"
         );
-        let hex_part = fingerprint.strip_prefix("redact-v1:").unwrap();
+        let hex_part = fingerprint.strip_prefix("redact-v2:").unwrap();
         assert_eq!(
             hex_part.len(),
             64,
@@ -1922,7 +2092,7 @@ mod tests {
         // ContentAddressedMemoCaches share the same logger target.
         for record in first_audit.iter().chain(second_audit.iter()) {
             assert_eq!(record.key.algorithm, "redact_text");
-            assert!(record.key.algorithm_version.starts_with("redact-v1:"));
+            assert!(record.key.algorithm_version.starts_with("redact-v2:"));
         }
     }
 
@@ -2157,15 +2327,12 @@ mod tests {
         }
     }
 
-    /// Property-based equivalence gate for the redaction-perf campaign:
-    /// on inputs assembled from adversarial fragments (real secret
-    /// shapes, near-misses, whitespace variants, unicode, JSON-ish
-    /// punctuation), every production path must be byte-identical to
-    /// the FROZEN pre-optimization reference:
-    ///   redact_text == MemoizingRedactor (miss) == MemoizingRedactor
-    ///   (hit) == redact_text_reference.
+    /// Every production path must match an independent union of original
+    /// secret spans, including overlapping patterns, quoted multiline values,
+    /// adjacent credentials, near-misses, and Unicode boundaries. Sequential
+    /// replacement is deliberately not the oracle: it can hide a later match.
     #[test]
-    fn production_redaction_paths_match_frozen_reference() {
+    fn production_redaction_paths_match_original_span_reference() {
         use proptest::prelude::*;
 
         let fragment = proptest::sample::select(vec![
@@ -2180,6 +2347,11 @@ mod tests {
             "postgres://user:pass@host:5432/db",
             "api_key = \"abcdefgh12345678\"",
             "password:hunter2hunter2",
+            "PASSWORD=\"first-private-line\nsecond-private-line\"",
+            "AWS_SESSION_TOKEN='first-private-line\r\nsecond-private-line'",
+            "awsSecretAccessKey=\"AKIAABCDEFGHIJKLMNOP abcdefghijklmnopqrst\nTAIL\"",
+            "password=\"abcd\"password=\"efgh\"",
+            "PASSWORD=\"unterminated-private-line\nsynthetic-tail\\",
             "xoxb-123456789-abcdefghij",
             // concat! so push-protection does not treat the fixture as a live Stripe key
             concat!("sk_live_", "AAAABBBBCCCCDDDDEEEEFFFFGGGG"),
@@ -2209,7 +2381,7 @@ mod tests {
             proptest::test_runner::TestRunner::new(proptest::test_runner::Config::with_cases(512));
         runner
             .run(&input_strategy, |input| {
-                let reference = redact_text_reference(&input).into_owned();
+                let reference = redact_text_original_span_reference(&input);
                 let plain = redact_text(&input).into_owned();
                 prop_assert_eq!(&plain, &reference, "plain redact_text diverged");
                 let mut memo = MemoizingRedactor::with_capacity(64);
