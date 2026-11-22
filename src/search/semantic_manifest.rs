@@ -1143,6 +1143,18 @@ impl SemanticManifest {
 
     /// Record a completed artifact and clear the matching checkpoint.
     pub fn publish_artifact(&mut self, artifact: ArtifactRecord) {
+        // Mutable legacy paths and coarse metadata cannot prove that an ANN
+        // graph still describes the newly published vector bytes.
+        self.install_artifact(artifact, false);
+    }
+
+    fn install_artifact(&mut self, artifact: ArtifactRecord, retain_ann: bool) {
+        if let Some(hnsw) = self.hnsw.as_mut()
+            && hnsw.base_tier == artifact.tier
+            && !retain_ann
+        {
+            hnsw.ready = false;
+        }
         let previous = match artifact.tier {
             TierKind::Fast => self.fast_tier.as_ref(),
             TierKind::Quality => self.quality_tier.as_ref(),
@@ -1191,8 +1203,36 @@ impl SemanticManifest {
                     .to_owned(),
             });
         }
+        // Parent provenance and the canonical boundary may be refreshed while
+        // the exact vector owner remains unchanged. Only two valid coverage
+        // bindings can prove that the existing graph still has that owner;
+        // equal row IDs, lengths, or database fingerprints are insufficient.
+        let previous = match artifact.tier {
+            TierKind::Fast => self.fast_tier.as_ref(),
+            TierKind::Quality => self.quality_tier.as_ref(),
+        };
+        let retain_ann = self.hnsw.as_ref().is_some_and(|hnsw| {
+            hnsw.base_tier == artifact.tier && hnsw.embedder_id == artifact.embedder_id
+        }) && previous.is_some_and(|previous| {
+            previous.embedder_id == artifact.embedder_id
+                && previous.model_revision == artifact.model_revision
+                && previous.schema_version == artifact.schema_version
+                && previous.chunking_version == artifact.chunking_version
+                && previous.dimension == artifact.dimension
+                && previous.size_bytes == artifact.size_bytes
+                && self
+                    .coverage
+                    .get(&previous.embedder_id)
+                    .is_some_and(|prior| {
+                        prior.matches_artifact(previous)
+                            && prior.artifact_path == certificate.artifact_path
+                            && prior.artifact_sha256 == certificate.artifact_sha256
+                            && prior.doc_count == certificate.doc_count
+                            && prior.vector_space_revision == certificate.vector_space_revision
+                    })
+        });
         let embedder_id = artifact.embedder_id.clone();
-        self.publish_artifact(artifact);
+        self.install_artifact(artifact, retain_ann);
         self.coverage.insert(embedder_id, certificate);
         Ok(())
     }
@@ -5049,6 +5089,138 @@ mod tests {
         replacement.embedder_id = "replacement-embedder".to_owned();
         manifest.publish_artifact(replacement);
         assert!(manifest.coverage.is_empty());
+    }
+
+    #[test]
+    fn gh566_changed_certified_vector_owner_revokes_ann_at_publication() {
+        for change in ["vectors", "embedder", "model", "vector_space"] {
+            let (artifact, certificate) = gh458_covered_artifact(TierKind::Quality, 7);
+            let mut manifest = SemanticManifest::default();
+            manifest
+                .publish_covered_artifact(artifact.clone(), certificate.clone())
+                .unwrap();
+            let ann = test_hnsw();
+            manifest.publish_hnsw(ann.clone());
+            let mut replacement = artifact.clone();
+            let mut coverage = certificate.clone();
+            match change {
+                "vectors" => {
+                    // The IDs and their high-water mark, count, file length,
+                    // and coarse database fingerprint can all remain equal
+                    // while the vectors under those IDs change.
+                    coverage.artifact_sha256 = "d".repeat(64);
+                    coverage.artifact_path =
+                        format!("vector_index/served/{}.fsvi", coverage.artifact_sha256);
+                    replacement.index_path = coverage.artifact_path.clone();
+                }
+                "embedder" => replacement.embedder_id = "replacement-384".to_owned(),
+                "model" => replacement.model_revision = "replacement-model".to_owned(),
+                "vector_space" => coverage.vector_space_revision = "replacement-space".to_owned(),
+                _ => unreachable!(),
+            }
+            assert_eq!(replacement.doc_count, artifact.doc_count);
+            assert_eq!(coverage.max_message_id, certificate.max_message_id);
+            assert_eq!(replacement.size_bytes, artifact.size_bytes);
+            assert_eq!(replacement.db_fingerprint, artifact.db_fingerprint);
+            manifest
+                .publish_covered_artifact(replacement, coverage)
+                .unwrap();
+            let mut revoked = ann;
+            revoked.ready = false;
+            assert_eq!(manifest.hnsw, Some(revoked), "changed {change}");
+        }
+    }
+
+    #[test]
+    fn gh566_certified_metadata_refresh_retains_only_bound_ann() {
+        let (mut artifact, mut certificate) = gh458_covered_artifact(TierKind::Quality, 7);
+        let mut manifest = SemanticManifest::default();
+        manifest
+            .publish_covered_artifact(artifact.clone(), certificate.clone())
+            .unwrap();
+        let ann = test_hnsw();
+        manifest.publish_hnsw(ann.clone());
+        manifest
+            .publish_covered_artifact(artifact.clone(), certificate.clone())
+            .unwrap();
+        assert_eq!(manifest.hnsw, Some(ann.clone()));
+
+        // A newly verified parent/filter boundary need not change the vector
+        // bytes. The graph remains bound to the same immutable exact owner.
+        artifact.conversation_count += 1;
+        artifact.db_fingerprint = "metadata-refreshed".to_owned();
+        artifact.completed_at_ms += 1;
+        certificate.db_fingerprint = artifact.db_fingerprint.clone();
+        certificate.published_at_ms = artifact.completed_at_ms;
+        certificate.mutation_seq += 1;
+        certificate.parent_sha256 = "d".repeat(64);
+        certificate.parent_path =
+            format!("vector_index/served/{}.parents", certificate.parent_sha256);
+        manifest
+            .publish_covered_artifact(artifact.clone(), certificate.clone())
+            .unwrap();
+        assert_eq!(manifest.hnsw, Some(ann.clone()));
+
+        let mut revoked = ann.clone();
+        revoked.ready = false;
+        manifest.publish_hnsw(revoked.clone());
+        manifest
+            .publish_covered_artifact(artifact.clone(), certificate.clone())
+            .unwrap();
+        assert_eq!(manifest.hnsw, Some(revoked.clone()));
+
+        // A matching new certificate cannot authenticate an unbound old graph.
+        manifest.coverage.clear();
+        manifest.publish_hnsw(ann);
+        manifest
+            .publish_covered_artifact(artifact, certificate)
+            .unwrap();
+        assert_eq!(manifest.hnsw, Some(revoked));
+    }
+
+    #[test]
+    fn gh566_plain_publication_revokes_its_base_tier_even_if_metadata_matches() {
+        for replacement_embedder in ["minilm-384", "replacement-384"] {
+            let artifact = test_artifact(TierKind::Quality, true);
+            let mut manifest = SemanticManifest::default();
+            manifest.publish_artifact(artifact.clone());
+            let ann = test_hnsw();
+            manifest.publish_hnsw(ann.clone());
+            manifest.publish_artifact(test_artifact(TierKind::Fast, true));
+            assert_eq!(manifest.hnsw, Some(ann.clone()), "unrelated tier");
+
+            let mut replacement = artifact;
+            replacement.embedder_id = replacement_embedder.to_owned();
+            manifest.publish_artifact(replacement);
+            let mut revoked = ann;
+            revoked.ready = false;
+            assert_eq!(manifest.hnsw, Some(revoked));
+        }
+    }
+
+    #[test]
+    fn gh566_rejected_coverage_publication_preserves_ann_and_ledger() {
+        let (artifact, certificate) = gh458_covered_artifact(TierKind::Quality, 7);
+        let mut manifest = SemanticManifest::default();
+        manifest
+            .publish_covered_artifact(artifact.clone(), certificate.clone())
+            .unwrap();
+        manifest.publish_hnsw(test_hnsw());
+        let before = manifest.clone();
+        for invalid_binding in [false, true] {
+            let mut rejected = certificate.clone();
+            if invalid_binding {
+                rejected.published_at_ms += 1;
+            } else {
+                rejected.mutation_seq -= 1;
+            }
+            assert!(
+                manifest
+                    .publish_covered_artifact(artifact.clone(), rejected)
+                    .is_err()
+            );
+            assert_eq!(manifest, before);
+        }
     }
 
     #[test]

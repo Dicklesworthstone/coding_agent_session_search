@@ -42,6 +42,17 @@ same canonical read transaction. Missing, changed, forgotten, reidentified or
 reused messages are excluded. Hybrid fusion retains the validated semantic
 payload when its score contributes to a fused result.
 
+Public `forget` also fences the entire semantic reader. Each semantic context
+retains the archive privacy epoch captured before artifact loading. Queries
+validate it before execution, before returning cached or fresh results, and
+before each progressive callback. Final validation covers errors and empty
+pages as well as successful hits, so a privacy refusal cannot become an
+ordinary semantic fallback. A pending forget refuses all results; completion
+still invalidates the old context until it is explicitly reloaded. Ordinary
+ingestion does not advance this privacy epoch. The final validation is the
+result-admission boundary: a result admitted before a concurrent fence is
+published may finish delivery.
+
 The cached hydration connection retains its own canonical database-file witness.
 Opening seals the file and the original/canonical ancestor chains across the
 read-only constructor, including connections first opened for lexical queries.

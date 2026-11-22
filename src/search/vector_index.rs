@@ -17,6 +17,7 @@ use half::f16;
 
 pub use frankensearch::index::{Quantization, SearchParams, VectorIndex, VectorIndexWriter};
 
+use crate::search::privacy::PrivacySnapshot;
 use crate::search::query::SearchFilters;
 use crate::search::semantic_coverage::{
     SemanticParentReader, ensure_same_file_metadata, semantic_coverage_generation,
@@ -179,6 +180,7 @@ pub struct SemanticIndexArtifact {
     ann_unavailable_reason: Option<SemanticAnnUnavailableReason>,
     owner_backed_progressive_reader: bool,
     coverage: Option<Arc<CertifiedSemanticArtifact>>,
+    privacy: Option<PrivacySnapshot>,
 }
 
 /// Coverage observed in the same canonical snapshot as this query's hydrated
@@ -288,7 +290,29 @@ impl SemanticIndexArtifact {
             // capability true.
             owner_backed_progressive_reader: false,
             coverage: None,
+            privacy: None,
         })
+    }
+
+    /// Preserve the archive epoch captured before this owner was opened.
+    /// Attaching an already loaded artifact must never authorize it under a
+    /// later epoch, even if forgetting and derived repair have both finished.
+    pub(crate) fn with_privacy_snapshot(mut self, privacy: &PrivacySnapshot) -> Result<Self> {
+        privacy.validate()?;
+        if let Some(admitted) = &self.privacy {
+            admitted.validate()?;
+            anyhow::ensure!(
+                admitted == privacy,
+                "semantic artifact already belongs to another privacy admission"
+            );
+        } else {
+            self.privacy = Some(privacy.clone());
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn privacy_snapshot(&self) -> Option<&PrivacySnapshot> {
+        self.privacy.as_ref()
     }
 
     pub(crate) fn with_coverage(
@@ -372,6 +396,14 @@ impl SemanticIndexArtifact {
     #[must_use]
     pub fn ann_unavailable_reason(&self) -> Option<SemanticAnnUnavailableReason> {
         self.ann_unavailable_reason
+    }
+
+    /// Retain a failed path-admission diagnostic without giving the query
+    /// owner a pathname that it could later reopen as an optional accelerator.
+    pub(crate) fn with_rejected_ann_path(mut self) -> Self {
+        self.ann_path = None;
+        self.ann_unavailable_reason = Some(SemanticAnnUnavailableReason::SidecarOpenFailed);
+        self
     }
 
     /// Whether progressive/two-tier constructors can consume this retained

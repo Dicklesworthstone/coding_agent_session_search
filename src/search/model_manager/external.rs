@@ -255,6 +255,18 @@ pub(super) fn load_with_config(
     config: ExternalEmbeddingConfig,
     cancelled: CancelCheck,
 ) -> SemanticSetup {
+    with_semantic_privacy(db_path, || {
+        load_with_config_at_epoch(data_dir, db_path, strict_read_only, config, cancelled)
+    })
+}
+
+fn load_with_config_at_epoch(
+    data_dir: &Path,
+    db_path: &Path,
+    strict_read_only: bool,
+    config: ExternalEmbeddingConfig,
+    cancelled: CancelCheck,
+) -> SemanticSetup {
     let result = (|| {
         if let Some(availability) = selected_generation_owner_requirement(data_dir) {
             return Err(availability);

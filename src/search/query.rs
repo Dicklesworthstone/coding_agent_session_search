@@ -61,6 +61,7 @@ use crate::franken_sync::compat::OptionalExtension;
 use crate::franken_sync::compat::{ParamValue, RowExt, param_slice_to_values};
 #[cfg(test)]
 use crate::franken_sync::params;
+use crate::search::privacy::PrivacySnapshot;
 
 /// The database-file witness belongs to the hydration connection, including
 /// connections opened by lexical search before semantic context is attached.
@@ -3272,8 +3273,45 @@ fn open_fs_semantic_ann_index(
     }
 }
 
+#[derive(Clone)]
+struct SemanticPrivacySnapshot(Vec<PrivacySnapshot>);
+
+impl SemanticPrivacySnapshot {
+    fn capture(
+        database: Option<&Path>,
+        artifacts: &[SemanticIndexArtifact],
+        quality_artifact: Option<&SemanticIndexArtifact>,
+    ) -> Result<Self> {
+        let mut snapshots = database
+            .map(PrivacySnapshot::for_database)
+            .transpose()?
+            .into_iter()
+            .collect::<Vec<_>>();
+        for artifact in artifacts.iter().chain(quality_artifact) {
+            if let Some(admitted) = artifact.privacy_snapshot()
+                && !snapshots.contains(admitted)
+            {
+                snapshots.push(admitted.clone());
+            }
+        }
+        let privacy = Self(snapshots);
+        privacy.validate()?;
+        Ok(privacy)
+    }
+
+    fn validate(&self) -> Result<()> {
+        for snapshot in &self.0 {
+            snapshot.validate()?;
+        }
+        Ok(())
+    }
+}
+
 struct SemanticSearchState {
     context_token: Arc<()>,
+    /// Forget invalidates this entire retained generation, including cached
+    /// query vectors, even after derived repair clears the pending fence.
+    privacy: SemanticPrivacySnapshot,
     embedder: Arc<dyn Embedder>,
     artifacts: Arc<Vec<SemanticIndexArtifact>>,
     quality_artifact: Option<SemanticIndexArtifact>,
@@ -5370,6 +5408,11 @@ impl SearchClient {
             bail!("semantic context requires at least one vector index");
         }
 
+        let privacy = SemanticPrivacySnapshot::capture(
+            self.sqlite_path.as_deref(),
+            &artifacts,
+            quality_artifact.as_ref(),
+        )?;
         let capacity = NonZeroUsize::new(100).ok_or_else(|| anyhow!("invalid cache size"))?;
         let query_cache = QueryCache::new(embedder.as_ref(), capacity)?;
         let producer = query_cache.producer();
@@ -5404,8 +5447,10 @@ impl SearchClient {
             .semantic
             .lock()
             .map_err(|_| anyhow!("semantic lock poisoned"))?;
+        privacy.validate()?;
         *state_guard = Some(SemanticSearchState {
             context_token,
+            privacy,
             embedder,
             artifacts,
             quality_artifact,
@@ -5451,9 +5496,28 @@ impl SearchClient {
             .is_some_and(|state| Arc::ptr_eq(&state.context_token, context_token)))
     }
 
+    /// A fresh request must retain the generation's original privacy epoch.
+    /// Capturing a newer epoch here would revive old vectors after forget
+    /// completes, including legacy vectors whose numeric row IDs can be reused.
+    fn semantic_privacy_snapshot(&self) -> Result<SemanticPrivacySnapshot> {
+        let retained = self
+            .semantic
+            .lock()
+            .map_err(|_| anyhow!("semantic lock poisoned"))?
+            .as_ref()
+            .map(|state| state.privacy.clone());
+        if let Some(privacy) = retained {
+            privacy.validate()?;
+            return Ok(privacy);
+        }
+        // Even an empty query or missing semantic context must respect a
+        // pending fence rather than becoming an apparent successful fallback.
+        SemanticPrivacySnapshot::capture(self.sqlite_path.as_deref(), &[], None)
+    }
+
     fn semantic_query_embedding(&self, canonical: &str) -> Result<SemanticQueryEmbedding> {
         loop {
-            let (embedder, context_token, producer, cached) = {
+            let (embedder, context_token, privacy, producer, cached) = {
                 let mut guard = self
                     .semantic
                     .lock()
@@ -5464,6 +5528,7 @@ impl SearchClient {
                 (
                     Arc::clone(&state.embedder),
                     Arc::clone(&state.context_token),
+                    state.privacy.clone(),
                     state.query_cache.producer(),
                     state.query_cache.get_cached(canonical),
                 )
@@ -5471,11 +5536,15 @@ impl SearchClient {
 
             // Neither identity inspection nor inference holds the semantic
             // mutex. A lazy/custom producer must not block unload or reload.
+            privacy.validate()?;
             let outcome = if let Some(hit) = cached {
                 producer.validate(embedder.as_ref()).map(|()| hit)
             } else {
                 producer.embed(embedder.as_ref(), canonical)
             };
+            // A provider error must not hide a concurrent privacy fence
+            // or cause retry against a newly admitted semantic context.
+            privacy.validate()?;
 
             let mut guard = self
                 .semantic
@@ -7100,9 +7169,11 @@ impl SearchClient {
             SearchMode::Semantic | SearchMode::Hybrid => {}
         }
 
+        let privacy = self.semantic_privacy_snapshot()?;
+        let context_result = self.progressive_context();
+        privacy.validate()?;
         let progressive_context = {
-            self.progressive_context()?
-                .ok_or_else(|| anyhow!("progressive two-tier context unavailable"))?
+            context_result?.ok_or_else(|| anyhow!("progressive two-tier context unavailable"))?
         };
         let progressive_context_token = Arc::clone(&progressive_context.context_token);
 
@@ -7245,6 +7316,7 @@ impl SearchClient {
                         })
                     }
                 };
+                let event_result = privacy.validate().and(event_result);
 
                 match event_result {
                     Ok(event) => on_event(event),
@@ -7256,6 +7328,7 @@ impl SearchClient {
             })
             .await;
 
+        privacy.validate()?;
         if let Some(err) = phase_error {
             return Err(err);
         }
@@ -7355,15 +7428,9 @@ impl SearchClient {
         tier_mode: SemanticTierMode,
     ) -> Result<SemanticSearchOutcome> {
         // A certified vector generation proves candidate identity, not reader
-        // admission across forget. Fence before any query text can reach an
-        // external embedder, and again before releasing cached or hydrated
-        // results. Preserve privacy errors even when dispatch would otherwise
-        // return an ordinary semantic failure eligible for lexical fallback.
-        let privacy = self
-            .sqlite_path
-            .as_deref()
-            .map(crate::search::privacy::PrivacySnapshot::for_database)
-            .transpose()?;
+        // admission across forget. Retain the context's original epoch rather
+        // than renewing its authority after repair.
+        let privacy = self.semantic_privacy_snapshot()?;
         let result = self.search_semantic_page_with_metadata(
             query,
             filters,
@@ -7373,9 +7440,9 @@ impl SearchClient {
             approximate,
             tier_mode,
         );
-        if let Some(privacy) = privacy {
-            privacy.validate()?;
-        }
+        // Validate success, empty pages and errors alike. Privacy failures
+        // must remain typed refusals before callers consider fallback.
+        privacy.validate()?;
         result
     }
 

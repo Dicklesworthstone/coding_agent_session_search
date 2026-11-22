@@ -283,11 +283,17 @@ fn certified_semantic_warm_client_allows_append_but_refuses_database_path_change
     let replacement_retained = fixture.root.path().join("replacement-retained.db");
     std::fs::rename(&path, &replacement_retained)?;
     let missing = search(&client, 10).unwrap_err();
-    assert!(missing.to_string().contains("canonical archive"));
+    assert!(matches!(
+        missing.downcast_ref::<crate::search::privacy::PrivacyError>(),
+        Some(crate::search::privacy::PrivacyError::SnapshotInvalidated { .. })
+    ));
 
     std::os::unix::fs::symlink(&replacement_retained, &path)?;
     let alias = search(&client, 10).unwrap_err();
-    assert!(alias.to_string().contains("canonical archive ownership"));
+    assert!(matches!(
+        alias.downcast_ref::<crate::search::privacy::PrivacyError>(),
+        Some(crate::search::privacy::PrivacyError::SnapshotInvalidated { .. })
+    ));
     Ok(())
 }
 
@@ -384,6 +390,57 @@ fn certified_semantic_opening_retries_transient_sibling_churn_before_first_query
         );
         assert_eq!(search(&client, 10)?.1.generation, receipt.generation);
     }
+    Ok(())
+}
+
+#[test]
+fn certified_semantic_forget_during_hydration_discards_the_entire_page() -> Result<()> {
+    use crate::search::privacy::PrivacyError;
+    use crate::storage::sqlite::ForgetConversationsFilter;
+    let fixture = Fixture::new(&[
+        "retained semantic coverage private forgotten passage",
+        "retained semantic coverage surviving passage",
+    ])?;
+    assert_eq!(search(&fixture.client()?, 10)?.0.len(), 2);
+    let client = fixture.client()?;
+    let source = fixture.conversations[0]
+        .1
+        .source_path
+        .to_str()
+        .context("fixture source")?
+        .to_owned();
+    let deleted = Rc::new(Cell::new(false));
+    let observed = Rc::clone(&deleted);
+    let interleave = OpeningInterleaveGuard::new(move |path, _| {
+        if observed.get() {
+            return Ok(());
+        }
+        // Production has already embedded the query and found its candidates.
+        // Delete while the canonical hydration owner opens, after inference's
+        // own final fence check but before any page can be released.
+        let storage = FrankenStorage::open(path)?;
+        let report = storage.forget_conversations(
+            &ForgetConversationsFilter {
+                source_paths: std::slice::from_ref(&source),
+                ..Default::default()
+            },
+            false,
+        )?;
+        assert_eq!(report.conversations_deleted, 1);
+        assert!(storage.forget_derived_rebuild_pending()?);
+        observed.set(true);
+        Ok(())
+    });
+    let error = search(&client, 10).unwrap_err();
+    drop(interleave);
+    assert!(deleted.get(), "real canonical deletion must have run");
+    assert!(
+        matches!(
+            error.downcast_ref::<PrivacyError>(),
+            Some(PrivacyError::RepairPending { .. })
+        ),
+        "the final fence must win over both a surviving page and hydration errors: {error:#}"
+    );
     Ok(())
 }
 
@@ -615,6 +672,37 @@ fn certified_semantic_changed_content_and_deleted_messages_are_excluded_and_refi
 }
 
 #[test]
+fn certified_semantic_pending_forget_fences_retained_readers() -> Result<()> {
+    let fixture = Fixture::new(&[
+        "retained semantic coverage forgotten passage",
+        "retained semantic coverage surviving passage",
+    ])?;
+    let client = fixture.client()?;
+    assert_eq!(search(&client, 10)?.0.len(), 2);
+    let forgotten = fixture.storage.forget_conversations_by_source_glob(
+        fixture.conversations[0]
+            .1
+            .source_path
+            .to_str()
+            .context("fixture path")?,
+        false,
+    )?;
+    assert_eq!(forgotten.conversations_deleted, 1);
+    assert!(fixture.storage.forget_derived_rebuild_pending()?);
+    let error = search(&client, 10)
+        .expect_err("a pending forget must refuse the retained native semantic reader");
+    assert_eq!(
+        error
+            .downcast_ref::<crate::search::privacy::PrivacyError>()
+            .context("native semantic search omitted the typed privacy refusal")?
+            .kind(),
+        "forget-repair-pending"
+    );
+    assert!(fixture.storage.forget_derived_rebuild_pending()?);
+    Ok(())
+}
+
+#[test]
 fn certified_semantic_row_id_reuse_never_transfers_a_vector_to_another_conversation() -> Result<()>
 {
     let mut fixture = Fixture::new(&[
@@ -661,37 +749,6 @@ fn certified_semantic_row_id_reuse_never_transfers_a_vector_to_another_conversat
     );
     assert_eq!(hits.len(), 1);
     assert_eq!(coverage.excluded_candidates, 1);
-    Ok(())
-}
-
-#[test]
-fn certified_semantic_pending_forget_fences_retained_readers() -> Result<()> {
-    let fixture = Fixture::new(&[
-        "retained semantic coverage forgotten passage",
-        "retained semantic coverage surviving passage",
-    ])?;
-    let client = fixture.client()?;
-    assert_eq!(search(&client, 10)?.0.len(), 2);
-    let forgotten = fixture.storage.forget_conversations_by_source_glob(
-        fixture.conversations[0]
-            .1
-            .source_path
-            .to_str()
-            .context("fixture path")?,
-        false,
-    )?;
-    assert_eq!(forgotten.conversations_deleted, 1);
-    assert!(fixture.storage.forget_derived_rebuild_pending()?);
-    let error = search(&client, 10)
-        .expect_err("a pending forget must refuse the retained native semantic reader");
-    assert_eq!(
-        error
-            .downcast_ref::<crate::search::privacy::PrivacyError>()
-            .context("native semantic search omitted the typed privacy refusal")?
-            .kind(),
-        "forget-repair-pending"
-    );
-    assert!(fixture.storage.forget_derived_rebuild_pending()?);
     Ok(())
 }
 

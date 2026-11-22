@@ -29,6 +29,7 @@ use crate::search::model_download::{
     classify_model_cache_metadata,
 };
 use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
+use crate::search::privacy::PrivacySnapshot;
 use crate::search::semantic_manifest::{
     SemanticCurrentPointerV1, SemanticShardManifest, SemanticShardRecord, TierKind,
     semantic_shard_artifact_path_is_safe,
@@ -318,6 +319,36 @@ pub struct SemanticContext {
 pub struct SemanticSetup {
     pub availability: SemanticAvailability,
     pub context: Option<SemanticContext>,
+}
+
+/// Bind every loaded owner to the epoch observed before any artifact was
+/// opened. The context may wait in a UI worker or caller before attachment;
+/// retaining this seal prevents a later setter from renewing an obsolete one.
+fn with_semantic_privacy(db_path: &Path, load: impl FnOnce() -> SemanticSetup) -> SemanticSetup {
+    let result = (|| -> anyhow::Result<SemanticSetup> {
+        let privacy = PrivacySnapshot::for_database(db_path)?;
+        let mut setup = load();
+        privacy.validate()?;
+        if let Some(context) = setup.context.as_mut() {
+            context.artifacts = std::mem::take(&mut context.artifacts)
+                .into_iter()
+                .map(|artifact| artifact.with_privacy_snapshot(&privacy))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            context.quality_artifact = context
+                .quality_artifact
+                .take()
+                .map(|artifact| artifact.with_privacy_snapshot(&privacy))
+                .transpose()?;
+        }
+        privacy.validate()?;
+        Ok(setup)
+    })();
+    result.unwrap_or_else(|error| SemanticSetup {
+        availability: SemanticAvailability::LoadFailed {
+            context: format!("{error:#}"),
+        },
+        context: None,
+    })
 }
 
 const SEMANTIC_POINTER_PROBE_FAILED_REASON: &str = "semantic_pointer_probe_failed";
@@ -802,6 +833,16 @@ fn load_hash_semantic_context_inner(
     db_path: &Path,
     strict_read_only: bool,
 ) -> SemanticSetup {
+    with_semantic_privacy(db_path, || {
+        load_hash_semantic_context_at_epoch(data_dir, db_path, strict_read_only)
+    })
+}
+
+fn load_hash_semantic_context_at_epoch(
+    data_dir: &Path,
+    db_path: &Path,
+    strict_read_only: bool,
+) -> SemanticSetup {
     if let Some(availability) = selected_generation_owner_requirement(data_dir) {
         return SemanticSetup {
             availability,
@@ -950,6 +991,26 @@ pub fn load_semantic_context_no_version_check(data_dir: &Path, db_path: &Path) -
 }
 
 fn load_semantic_context_inner(
+    data_dir: &Path,
+    db_path: &Path,
+    check_for_updates: bool,
+    embedder_name: &str,
+    defer_embedder_load: bool,
+    strict_read_only: bool,
+) -> SemanticSetup {
+    with_semantic_privacy(db_path, || {
+        load_semantic_context_at_epoch(
+            data_dir,
+            db_path,
+            check_for_updates,
+            embedder_name,
+            defer_embedder_load,
+            strict_read_only,
+        )
+    })
+}
+
+fn load_semantic_context_at_epoch(
     data_dir: &Path,
     db_path: &Path,
     check_for_updates: bool,

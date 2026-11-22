@@ -416,6 +416,70 @@ fn search_external_query(
 }
 
 #[cfg(unix)]
+fn assert_privacy_error(error: &anyhow::Error, kind: &str) {
+    assert_eq!(
+        error
+            .downcast_ref::<crate::search::privacy::PrivacyError>()
+            .map(crate::search::privacy::PrivacyError::kind),
+        Some(kind),
+        "privacy must remain a typed refusal: {error:#}"
+    );
+}
+
+#[cfg(unix)]
+fn assert_progressive_privacy(
+    client: &Arc<crate::search::query::SearchClient>,
+    kind: &str,
+) -> AnyResult<()> {
+    use crate::search::query::{FieldMask, ProgressiveSearchRequest, SearchFilters, SearchMode};
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|error| anyhow::anyhow!("build privacy test runtime: {error}"))?;
+    for mode in [SearchMode::Semantic, SearchMode::Hybrid] {
+        let mut events = 0;
+        let error = runtime
+            .block_on(async {
+                let cx = frankensearch::Cx::for_request();
+                client
+                    .search_progressive_with_callback(
+                        ProgressiveSearchRequest {
+                            cx: &cx,
+                            query: PRIVATE_QUERY,
+                            filters: SearchFilters::default(),
+                            limit: 10,
+                            sparse_threshold: 0,
+                            field_mask: FieldMask::FULL,
+                            mode,
+                        },
+                        |_| events += 1,
+                    )
+                    .await
+            })
+            .unwrap_err();
+        assert_privacy_error(&error, kind);
+        assert_eq!(events, 0, "a fenced stream must emit no phase or fallback");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn finish_forget_repair(db: &Path, root: &Path) -> AnyResult<()> {
+    let storage = FrankenStorage::open(db)?;
+    assert!(storage.forget_derived_rebuild_pending()?);
+    storage.rebuild_search_fallback_after_forget()?;
+    storage.rebuild_analytics()?;
+    storage.rebuild_daily_stats_after_forget()?;
+    storage.rebuild_token_daily_stats_after_forget()?;
+    let remaining = storage.total_conversation_count()?;
+    drop(storage);
+    crate::indexer::rebuild_tantivy_from_db(db, root, remaining, None)?;
+    let storage = FrankenStorage::open(db)?;
+    storage.clear_forget_derived_rebuild_pending()?;
+    assert!(!storage.forget_derived_rebuild_pending()?);
+    Ok(())
+}
+
+#[cfg(unix)]
 #[test]
 fn certified_external_search_survives_append_and_adopts_completed_backfill() -> AnyResult<()> {
     let fixture = Fixture::covered()?;
@@ -558,7 +622,12 @@ fn certified_external_revisions_are_excluded_and_forget_fences_retained_readers(
     let pending_fence = fs::read(&fence_path)?;
     // Check both the previously cached query and a new query that would need
     // network embedding. Neither may bypass a pending forget fence.
-    for query in ["private original admission corpus 1", PRIVATE_QUERY, " "] {
+    for query in [
+        "private original admission corpus 1",
+        PRIVATE_QUERY,
+        " ",
+        "",
+    ] {
         let error = search_external_query(&retained, query).unwrap_err();
         assert_eq!(
             error
@@ -649,13 +718,222 @@ fn certified_external_completed_forget_epoch_fences_inflight_results() -> AnyRes
     );
     assert!(fixture.endpoint.mutation.lock().unwrap().is_none());
     assert!(!crate::search::privacy::repair_pending(&fixture.db)?);
-    let (hits, _) = search_external_query(&retained, PRIVATE_QUERY)?;
-    assert_eq!(hits.len(), 2, "a later request may admit the new epoch");
+    for query in [
+        "private original admission corpus 1",
+        PRIVATE_QUERY,
+        " ",
+        "",
+    ] {
+        let error = search_external_query(&retained, query).unwrap_err();
+        assert_privacy_error(&error, "privacy-snapshot-invalidated");
+    }
     assert_eq!(
         *fixture.endpoint.seen.lock().unwrap(),
         vec![vec![PRIVATE_QUERY.to_owned()]],
-        "the next admitted request may reuse its query embedding cache"
+        "a completed epoch must not renew retained state or disclose another query"
     );
+
+    let setup = fixture.load(true);
+    let context = setup
+        .context
+        .with_context(|| format!("post-epoch admission: {:?}", setup.availability))?;
+    retained.set_semantic_artifacts_context(
+        context.embedder,
+        context.artifacts,
+        context.quality_artifact,
+        context.filter_maps,
+        context.roles,
+    )?;
+    // Admission uses only public preflight inputs. Count query inference after
+    // that explicit reload so its fresh cache must prove cold and warm serving.
+    fixture.endpoint.seen.lock().unwrap().clear();
+    let (cold_hits, _) = search_external_query(&retained, PRIVATE_QUERY)?;
+    let (cached_hits, _) = search_external_query(&retained, PRIVATE_QUERY)?;
+    assert_eq!(
+        cold_hits.len(),
+        2,
+        "an explicit reload admits the new epoch"
+    );
+    assert_eq!(
+        cached_hits.len(),
+        2,
+        "the newly admitted cache remains usable"
+    );
+    assert_eq!(
+        *fixture.endpoint.seen.lock().unwrap(),
+        vec![vec![PRIVATE_QUERY.to_owned()]],
+        "a fresh context must embed once before reusing its own query cache"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn certified_external_completed_forget_invalidates_retained_context_until_reload() -> AnyResult<()>
+{
+    use crate::storage::sqlite::ForgetConversationsFilter;
+    let fixture = Fixture::covered()?;
+    let retained = Arc::new(fixture.client()?);
+    assert_eq!(search_external(&retained)?.0.len(), 2);
+    let storage = FrankenStorage::open(&fixture.db)?;
+    let report = storage.forget_conversations(
+        &ForgetConversationsFilter {
+            source_paths: &["/fixture/admission-1.jsonl".to_owned()],
+            ..Default::default()
+        },
+        false,
+    )?;
+    assert_eq!(report.conversations_deleted, 1);
+    drop(storage);
+    assert_progressive_privacy(&retained, "forget-repair-pending")?;
+    finish_forget_repair(&fixture.db, fixture.dir.path())?;
+    fixture.endpoint.seen.lock().unwrap().clear();
+
+    for query in ["private original admission corpus 1", PRIVATE_QUERY, ""] {
+        let error = search_external_query(&retained, query).unwrap_err();
+        assert_privacy_error(&error, "privacy-snapshot-invalidated");
+    }
+    assert_progressive_privacy(&retained, "privacy-snapshot-invalidated")?;
+    assert!(
+        fixture.endpoint.seen.lock().unwrap().is_empty(),
+        "completed repair must not revive a retained context or disclose a new query"
+    );
+
+    let setup = fixture.load(true);
+    let context = setup
+        .context
+        .with_context(|| format!("post-forget admission: {:?}", setup.availability))?;
+    retained.set_semantic_artifacts_context(
+        context.embedder,
+        context.artifacts,
+        context.quality_artifact,
+        context.filter_maps,
+        context.roles,
+    )?;
+    let (hits, coverage) = search_external(&retained)?;
+    assert_eq!(hits.len(), 1, "explicit reload preserves surviving history");
+    assert_eq!(hits[0].source_path, "/fixture/admission-2.jsonl");
+    assert!(
+        !hits[0]
+            .content
+            .contains("private original admission corpus 1")
+    );
+    assert_eq!(coverage.status, "partial");
+    assert_eq!(coverage.excluded_candidates, 1);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn external_context_loaded_before_forget_cannot_attach_after_completed_repair() -> AnyResult<()> {
+    use crate::search::query::{SearchClient, SearchClientOptions};
+    use crate::storage::sqlite::ForgetConversationsFilter;
+    for certified in [false, true] {
+        let fixture = if certified {
+            Fixture::covered()?
+        } else {
+            Fixture::new()?
+        };
+        let setup = fixture.load(true);
+        let context = setup
+            .context
+            .with_context(|| format!("original context: {:?}", setup.availability))?;
+        fixture.endpoint.assert_only_public_preflight();
+        let storage = FrankenStorage::open(&fixture.db)?;
+        let report = storage.forget_conversations(
+            &ForgetConversationsFilter {
+                source_paths: &["/fixture/admission-1.jsonl".to_owned()],
+                ..Default::default()
+            },
+            false,
+        )?;
+        assert_eq!(report.conversations_deleted, 1);
+        drop(storage);
+        finish_forget_repair(&fixture.db, fixture.dir.path())?;
+        fixture.endpoint.seen.lock().unwrap().clear();
+
+        // The client itself is new. The only retained pre-forget authority is
+        // the context loaded above, as when a UI worker finishes after repair.
+        let client = SearchClient::open_semantic(
+            &fixture.db,
+            SearchClientOptions {
+                enable_reload: false,
+                enable_warm: false,
+                strict_read_only: true,
+            },
+        )?
+        .context("post-forget client")?;
+        let error = client
+            .set_semantic_artifacts_context(
+                context.embedder,
+                context.artifacts,
+                context.quality_artifact,
+                context.filter_maps,
+                context.roles,
+            )
+            .unwrap_err();
+        assert_privacy_error(&error, "privacy-snapshot-invalidated");
+        assert!(fixture.endpoint.seen.lock().unwrap().is_empty());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn certified_external_forget_during_query_embedding_discards_results_and_artifact_errors()
+-> AnyResult<()> {
+    use crate::storage::sqlite::ForgetConversationsFilter;
+    for complete in [false, true] {
+        let fixture = Fixture::covered()?;
+        let retained = fixture.client()?;
+        fixture.endpoint.seen.lock().unwrap().clear();
+        let db = fixture.db.clone();
+        let root = fixture.dir.path().to_path_buf();
+        let vector_path = root.join(&fixture.record.index_path);
+        fixture.endpoint.arm(move || {
+            let storage = FrankenStorage::open(&db)?;
+            let report = storage.forget_conversations(
+                &ForgetConversationsFilter {
+                    source_paths: &["/fixture/admission-1.jsonl".to_owned()],
+                    ..Default::default()
+                },
+                false,
+            )?;
+            assert_eq!(report.conversations_deleted, 1);
+            drop(storage);
+            if complete {
+                finish_forget_repair(&db, &root)?;
+            }
+            // A simultaneous damaged artifact is normally a semantic fallback
+            // condition. It must not mask the deletion fence's typed refusal.
+            let mut bytes = fs::read(&vector_path)?;
+            *bytes
+                .last_mut()
+                .context("nonempty certified vector artifact")? ^= 1;
+            fs::write(vector_path, bytes)?;
+            Ok(())
+        });
+        let error = search_external(&retained).unwrap_err();
+        let kind = if complete {
+            "privacy-snapshot-invalidated"
+        } else {
+            "forget-repair-pending"
+        };
+        assert_privacy_error(&error, kind);
+        assert!(fixture.endpoint.mutation.lock().unwrap().is_none());
+        assert_eq!(
+            *fixture.endpoint.seen.lock().unwrap(),
+            vec![vec!["private original admission corpus 1".to_owned()]],
+            "the real embedding request must interleave with canonical deletion"
+        );
+        let error = search_external_query(&retained, PRIVATE_QUERY).unwrap_err();
+        assert_privacy_error(&error, kind);
+        assert_eq!(
+            fixture.endpoint.seen.lock().unwrap().len(),
+            1,
+            "no query may be sent after the fence was observed"
+        );
+    }
     Ok(())
 }
 

@@ -224,10 +224,12 @@ pub(super) fn load_context(
     }
     .map_err(|error| format!("semantic archive: {error}"))?;
     let snapshot = archive_snapshot(&storage, &certificate)?;
-    let ann_path = if ann_declared_ready {
-        declared_ann_path.filter(|path| {
-            crate::search::semantic_manifest::selection::optional_ann_path_is_safe(data_dir, path)
-        })
+    let ann_rejected = ann_declared_ready
+        && declared_ann_path.as_ref().is_none_or(|path| {
+            !crate::search::semantic_manifest::selection::optional_ann_path_is_safe(data_dir, path)
+        });
+    let ann_path = if ann_declared_ready && !ann_rejected {
+        declared_ann_path
     } else {
         None
     };
@@ -240,6 +242,11 @@ pub(super) fn load_context(
         ann_path,
     )
     .map_err(|error| format!("semantic coverage admission: {error:#}"))?;
+    let artifact = if ann_rejected {
+        artifact.with_rejected_ann_path()
+    } else {
+        artifact
+    };
     let filter_maps = SemanticFilterMaps::from_storage(&storage)
         .map_err(|error| format!("semantic filter maps: {error}"))?;
     Ok(Some(SemanticContext {

@@ -836,7 +836,13 @@ pub(crate) fn inspect_semantic_assets(
         && let Some(embedder_id) = semantic_embedder_id(&availability, preference)
     {
         let observation = FrankenStorage::open_readonly(db_path)
-            .map_err(|error| error.to_string())
+            .map_err(|error| {
+                // Coverage inspection precedes the legacy identity-marker
+                // check, but both need this canonical metadata connection.
+                // Preserve the fail-closed diagnostic when the earlier
+                // `db_available` observation is no longer valid.
+                format!("checking semantic identity invalidation marker: {error}")
+            })
             .and_then(|storage| {
                 crate::search::model_manager::observe_covered_semantic_artifact(
                     data_dir,

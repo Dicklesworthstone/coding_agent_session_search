@@ -10,8 +10,8 @@
 //! Part of bead: coding_agent_session_search-2vvg
 
 use chrono::{SecondsFormat, Utc};
-use coding_agent_search::search::ann_index::hnsw_index_path;
-use frankensearch::index::VectorIndex;
+use coding_agent_search::search::semantic_manifest::SemanticManifest;
+use frankensearch::index::{HnswConfig, HnswIndex, VectorIndex};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -118,25 +118,31 @@ fn has_hnsw_index(data_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn first_vector_index_path(data_dir: &Path) -> PathBuf {
-    let vector_dir = data_dir.join("vector_index");
-    let mut paths = fs::read_dir(&vector_dir)
-        .expect("read vector index directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "fsvi"))
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths
-        .into_iter()
-        .next()
-        .expect("semantic indexing must publish an FSVI")
+fn selected_vector_index_path(data_dir: &Path) -> PathBuf {
+    let manifest = SemanticManifest::load(data_dir)
+        .expect("read semantic selection ledger")
+        .expect("semantic indexing must publish a ledger");
+    let record = manifest.fast_tier.expect("published hash tier");
+    assert!(record.ready, "fixture must select a ready hash artifact");
+    if let Some(certificate) = manifest.coverage.get(&record.embedder_id) {
+        assert!(
+            certificate.matches_artifact(&record),
+            "fixture must target the authenticated serving copy, not its mutable builder"
+        );
+    }
+    data_dir.join(record.index_path)
 }
 
 fn selected_hnsw_index_path(data_dir: &Path) -> PathBuf {
-    let exact_path = first_vector_index_path(data_dir);
-    let exact = VectorIndex::open(&exact_path).expect("open selected exact FSVI");
-    hnsw_index_path(data_dir, exact.embedder_id())
+    let manifest = SemanticManifest::load(data_dir)
+        .expect("read semantic selection ledger")
+        .expect("semantic indexing must publish a ledger");
+    let record = manifest.fast_tier.expect("published hash tier");
+    let ann = manifest.hnsw.expect("fixture must declare an ANN");
+    assert!(ann.ready, "fixture must select a ready ANN");
+    assert_eq!(ann.base_tier, record.tier);
+    assert_eq!(ann.embedder_id, record.embedder_id);
+    data_dir.join(ann.index_path)
 }
 
 fn write_same_doc_ids_different_vectors(source_path: &Path, replacement_path: &Path) {
@@ -1065,7 +1071,7 @@ fn fsvi_symlink_is_rejected_by_readiness_and_serving_without_mutation() {
         "install_fsvi_symlink",
         Some("Move the exact bytes to an unselected target and alias the selected name"),
     );
-    let selected_path = first_vector_index_path(&data_dir);
+    let selected_path = selected_vector_index_path(&data_dir);
     let target_path = selected_path.with_file_name("unselected-exact-target.fsvi");
     fs::rename(&selected_path, &target_path).expect("move exact FSVI to alias target");
     symlink(&target_path, &selected_path).expect("create selected final-component FSVI symlink");
@@ -1178,6 +1184,109 @@ fn fsvi_symlink_is_rejected_by_readiness_and_serving_without_mutation() {
         Some("Verify readiness and serving did not rewrite either alias role"),
         ps,
     );
+    tracker.complete();
+}
+
+/// An invalid exact owner cannot use ANN degradation to bypass its certificate,
+/// even when the old mutable builder file is still readable.
+#[cfg(unix)]
+#[test]
+fn certified_fsvi_payload_mutation_is_rejected_without_builder_fallback() {
+    let tracker =
+        tracker_for("certified_fsvi_payload_mutation_is_rejected_without_builder_fallback");
+    let tmp = tempfile::TempDir::new().expect("certified FSVI fixture");
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
+    make_codex_session(
+        &codex_home,
+        "2024/11/20",
+        "rollout-certified-fsvi.jsonl",
+        "only authenticated exact vectors may supply semantic scores",
+        1732118400000,
+    );
+    let phase = tracker.start("build_exact_source", None);
+    command_env
+        .cass_assert_command()
+        .args([
+            "index",
+            "--full",
+            "--semantic",
+            "--build-hnsw",
+            "--embedder",
+            "hash",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .assert()
+        .success();
+    tracker.end("build_exact_source", None, phase);
+
+    let selected = selected_vector_index_path(&data_dir);
+    let exact = VectorIndex::open(&selected).expect("open certified exact vectors");
+    let builder = coding_agent_search::search::vector_index::vector_index_path(
+        &data_dir,
+        exact.embedder_id(),
+    );
+    assert_ne!(selected, builder, "fixture must select a certified copy");
+    assert!(builder.is_file(), "an unselected fallback bait must remain");
+    drop(exact);
+    let changed = home.join("changed-exact.fsvi");
+    write_same_doc_ids_different_vectors(&selected, &changed);
+    fs::copy(&changed, &selected).expect("alter the authenticated exact vector payload");
+    let artifacts_before = artifact_tree_snapshot(&data_dir.join("vector_index"));
+
+    let phase = tracker.start("reject_changed_exact_owner", None);
+    let status = command_env
+        .cass_assert_command()
+        .args(["status", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_SEMANTIC_EMBEDDER", "hash")
+        .output()
+        .expect("probe changed exact owner");
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["semantic"]["availability"], "load_failed");
+    assert_eq!(status["semantic"]["can_search"], false);
+    assert!(
+        status["semantic"]["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("digest mismatch")),
+        "readiness must reject the altered certified payload: {status}"
+    );
+    let search = command_env
+        .cass_assert_command()
+        .args([
+            "search",
+            "--robot",
+            "--mode",
+            "semantic",
+            "--model",
+            "hash",
+            "--approximate",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .arg("authenticated exact vectors")
+        .output()
+        .expect("attempt changed exact owner search");
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&search.stdout),
+        String::from_utf8_lossy(&search.stderr)
+    );
+    assert!(!search.status.success(), "{diagnostic}");
+    assert!(diagnostic.contains("digest mismatch"), "{diagnostic}");
+    assert_eq!(
+        artifact_tree_snapshot(&data_dir.join("vector_index")),
+        artifacts_before,
+        "rejection must preserve the exact owner, builder, ANN, and certificate"
+    );
+    tracker.end("reject_changed_exact_owner", None, phase);
     tracker.complete();
 }
 
@@ -1692,18 +1801,38 @@ fn approximate_stale_same_doc_ids_falls_back_exact_without_mutation() {
     );
 
     let ps = tracker.start(
-        "install_stale_exact_source",
-        Some("Replace only vector payloads behind the exact same ordered document IDs"),
+        "install_stale_ann",
+        Some("Build the selected ANN from different vectors with the same ordered document IDs"),
     );
-    let selected_exact = first_vector_index_path(&data_dir);
+    let selected_exact = selected_vector_index_path(&data_dir);
+    let selected_ann = selected_hnsw_index_path(&data_dir);
+    let exact_before = fs::read(&selected_exact).expect("read certified exact FSVI");
     let replacement_exact = home.join("same-doc-ids-different-vectors.fsvi");
     write_same_doc_ids_different_vectors(&selected_exact, &replacement_exact);
-    fs::copy(&replacement_exact, &selected_exact).expect("install different-vector exact FSVI");
+    let replacement = VectorIndex::open(&replacement_exact).expect("open alternate ANN source");
+    HnswIndex::build_from_vector_index(&replacement, HnswConfig::default())
+        .expect("build same-ID different-vector ANN")
+        .save(&selected_ann)
+        .expect("install stale selected ANN");
+    assert!(
+        HnswIndex::try_load_native(&selected_ann, &replacement)
+            .expect("verify stale ANN fixture")
+            .is_some(),
+        "fixture must be a valid native graph for its alternate vectors"
+    );
+    let exact = VectorIndex::open(&selected_exact).expect("open certified exact FSVI");
+    assert!(
+        HnswIndex::try_load_native(&selected_ann, &exact)
+            .expect("compare ANN to the selected exact source")
+            .is_none(),
+        "same document IDs must not transfer an ANN to different vector bytes"
+    );
+    assert_eq!(fs::read(&selected_exact).unwrap(), exact_before);
     let vector_dir = data_dir.join("vector_index");
     let artifacts_before = artifact_tree_snapshot(&vector_dir);
     tracker.end(
-        "install_stale_exact_source",
-        Some("Replace only vector payloads behind the exact same ordered document IDs"),
+        "install_stale_ann",
+        Some("Build the selected ANN from different vectors with the same ordered document IDs"),
         ps,
     );
 
@@ -1803,7 +1932,7 @@ fn exercise_invalid_ann_fresh_process_fallback(case: InvalidAnnInstallation) {
 
     let ps = tracker.start(
         "build_exact_source",
-        Some("Build the authoritative exact FSVI without an ANN"),
+        Some("Build the authoritative exact FSVI and a selected native ANN"),
     );
     make_codex_session(
         &codex_home,
@@ -1818,6 +1947,7 @@ fn exercise_invalid_ann_fresh_process_fallback(case: InvalidAnnInstallation) {
             "index",
             "--full",
             "--semantic",
+            "--build-hnsw",
             "--embedder",
             "hash",
             "--data-dir",
@@ -1827,13 +1957,21 @@ fn exercise_invalid_ann_fresh_process_fallback(case: InvalidAnnInstallation) {
         .success();
     tracker.end(
         "build_exact_source",
-        Some("Build the authoritative exact FSVI without an ANN"),
+        Some("Build the authoritative exact FSVI and a selected native ANN"),
         ps,
     );
 
-    let exact_path = first_vector_index_path(&data_dir);
+    let exact_path = selected_vector_index_path(&data_dir);
     let ann_path = selected_hnsw_index_path(&data_dir);
-    assert!(!ann_path.exists(), "fixture must start without an ANN");
+    let exact = VectorIndex::open(&exact_path).expect("open selected exact FSVI");
+    assert!(
+        HnswIndex::try_load_native(&ann_path, &exact)
+            .expect("inspect selected fixture ANN")
+            .is_some(),
+        "fixture must start with a valid selected native graph"
+    );
+    fs::rename(&ann_path, ann_path.with_extension("parked"))
+        .expect("retain native ANN metadata before installing an invalid entry");
     let ps = tracker.start(
         "install_invalid_ann",
         Some("Install a selected but inadmissible optional ANN artifact"),
