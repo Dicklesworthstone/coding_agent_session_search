@@ -47,6 +47,9 @@ toon = { version = "=0.2.4", package = "tru" }
 tempfile = "3.27.0"
 wait-timeout = "0.2.1"
 rmp-serde = "1.3.1"  # MessagePack for binary metadata serialization (Opt 3.1)
+# Raw-mirror capture and recovery encode/decode bounded zstd chunks in production.
+# Reuse the codec already resolved for FAD's compressed Codex rollouts.
+zstd = { version = "0.13", default-features = false }
 toml = "1.1.2"
 directories = "6.0.0"
 which = "8.0.2"
@@ -266,9 +269,6 @@ arbitrary = { version = "1", features = ["derive"] }
 serde_yaml = "0.9.34"
 rand = "0.10"
 rand_chacha = "0.10"
-# GH513 writes rollouts the way Codex compresses them; production reads them
-# through franken-agent-detection's codex-zstd feature.
-zstd = { version = "0.13", default-features = false }
 # GH470 measures native model input tokens without padding or silent truncation.
 # Reuse the tokenizer and regex backend already resolved by native MiniLM.
 tokenizers = { version = "*", default-features = false, features = ["fancy-regex"] }
