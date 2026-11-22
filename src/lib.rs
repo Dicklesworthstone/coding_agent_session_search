@@ -33453,6 +33453,16 @@ where
     }
 }
 
+fn search_timeout_error(budget_ms: u64, phase: &str) -> CliError {
+    CliError {
+        code: 10,
+        kind: CliErrorKind::Timeout.kind_str(),
+        message: format!("Operation timed out after {budget_ms}ms ({phase})"),
+        hint: Some("Increase --timeout value or simplify query".to_string()),
+        retryable: true,
+    }
+}
+
 /// Deterministic slowdown for bounded-search E2E coverage. Production callers
 /// never set this test-only environment variable.
 fn maybe_test_search_delay() {
@@ -33656,6 +33666,35 @@ fn lexical_engine_invariant_hint(error: &anyhow::Error) -> Option<String> {
     })
 }
 
+/// Preserve the same actionable engine failure on human, robot and fallback
+/// paths. A fuel ceiling can be retried with a smaller query or a larger
+/// budget; a posting-cursor invariant needs a repaired generation (GH #567).
+fn lexical_search_cli_error(error: &anyhow::Error, message: String) -> CliError {
+    let invariant_hint = lexical_engine_invariant_hint(error);
+    let retryable = invariant_hint.is_none();
+    let hint = if crate::search::quill_bridge::is_query_fuel_exhausted(error) {
+        Some(format!(
+            "the lexical engine hit its per-query work ceiling (usually a long, \
+             stopword-heavy query on an archive with many index segments); retry \
+             with fewer or rarer terms, raise {} above {}, or run 'cass index' \
+             (its maintenance pass consolidates segments in place; 'cass index \
+             --full' rebuilds from scratch and needs the headroom doctor's \
+             full_rebuild_readiness reports)",
+            crate::search::quill_bridge::CASS_QUILL_QUERY_FUEL_BUDGET_ENV,
+            crate::search::quill_bridge::cass_quill_config().query_fuel_budget
+        ))
+    } else {
+        invariant_hint
+    };
+    CliError {
+        code: 9,
+        kind: CliErrorKind::Search.kind_str(),
+        message,
+        hint,
+        retryable,
+    }
+}
+
 #[cfg(test)]
 mod lexical_engine_invariant_hint_tests {
     use super::*;
@@ -33713,35 +33752,7 @@ fn execute_search_operation(
                 search_sparse_threshold,
                 field_mask,
             )
-            .map_err(|error| {
-                // GH #441: a lexical-only search has no semantic leg to
-                // degrade to, so name the two real remedies instead of a bare
-                // engine error.
-                let fuel_exhausted = crate::search::quill_bridge::is_query_fuel_exhausted(&error);
-                let invariant_hint = lexical_engine_invariant_hint(&error);
-                let retryable = invariant_hint.is_none();
-                let hint = if fuel_exhausted {
-                    Some(format!(
-                        "the lexical engine hit its per-query work ceiling (usually a long, \
-                         stopword-heavy query on an archive with many index segments); retry \
-                         with fewer or rarer terms, raise {} above {}, or run 'cass index' \
-                         (its maintenance pass consolidates segments in place; 'cass index \
-                         --full' rebuilds from scratch and needs the headroom doctor's \
-                         full_rebuild_readiness reports)",
-                        crate::search::quill_bridge::CASS_QUILL_QUERY_FUEL_BUDGET_ENV,
-                        crate::search::quill_bridge::cass_quill_config().query_fuel_budget
-                    ))
-                } else {
-                    invariant_hint
-                };
-                CliError {
-                    code: 9,
-                    kind: CliErrorKind::Search.kind_str(),
-                    message: format!("search failed: {error}"),
-                    hint,
-                    retryable,
-                }
-            })?,
+            .map_err(|error| lexical_search_cli_error(&error, format!("search failed: {error}")))?,
         SearchMode::Semantic => {
             let outcome = client
                 .search_semantic_with_metadata(
@@ -33856,16 +33867,12 @@ fn execute_search_operation(
                             field_mask,
                         )
                         .map_err(|fallback_error| {
-                            let invariant_hint = lexical_engine_invariant_hint(&fallback_error);
-                            CliError {
-                                code: 9,
-                                kind: CliErrorKind::Search.kind_str(),
-                                message: format!(
+                            lexical_search_cli_error(
+                                &fallback_error,
+                                format!(
                                     "hybrid search failed ({error}); lexical fallback failed: {fallback_error}"
                                 ),
-                                retryable: invariant_hint.is_none(),
-                                hint: invariant_hint,
-                            }
+                            )
                         })?
                 } else if message.contains("unavailable") || message.contains("no embedder") {
                     return Err(CliError {
@@ -34340,12 +34347,17 @@ fn run_cli_search(
         } else {
             None
         });
-    let search_budget = effective_robot.map(|_| {
-        crate::robot_budget_envelope::RobotBudget::with_start(
-            search_budget_ms(timeout_ms),
-            start_time,
-        )
-    });
+    // A human read-only request has the same in-flight deadline as a robot
+    // request when a timeout was resolved from argv, environment or config.
+    // Mutating human setup stays on the caller: timing out a detached worker
+    // must never leave a repair or persistent process running (GH #568).
+    let search_budget = (effective_robot.is_some() || (no_maintenance && timeout_ms.is_some()))
+        .then(|| {
+            crate::robot_budget_envelope::RobotBudget::with_start(
+                search_budget_ms(timeout_ms),
+                start_time,
+            )
+        });
     let mut skipped_sections = Vec::<String>::new();
     let mut session_paths_timed_out = false;
 
@@ -34540,6 +34552,13 @@ fn run_cli_search(
     });
 
     let output_early_timeout = |mut skipped_sections: Vec<String>| {
+        let budget = search_budget.as_ref().expect("bounded search has a budget");
+        let Some(format) = effective_robot else {
+            return Err(search_timeout_error(
+                budget.total_ms(),
+                "during search setup",
+            ));
+        };
         for (requested, section) in [
             (semantic_opts.rerank, "reranking"),
             (explain, "explanation"),
@@ -34552,8 +34571,8 @@ fn run_cli_search(
         }
         output_search_budget_partial(
             query,
-            effective_robot.expect("bounded search is robot-only"),
-            search_budget.as_ref().expect("robot search has a budget"),
+            format,
+            budget,
             skipped_sections,
             search_retry.clone(),
             (
@@ -35134,7 +35153,10 @@ fn run_cli_search(
     let result = if let Some((result, realized_mode_meta)) = bounded_result {
         mode_meta = realized_mode_meta;
         result
-    } else if search_budget.is_some() {
+    } else if let Some(budget) = search_budget.as_ref() {
+        if effective_robot.is_none() {
+            return Err(search_timeout_error(budget.total_ms(), "during search"));
+        }
         if semantic_requested {
             mode_meta.semantic_work_completed = false;
         }
@@ -35151,16 +35173,7 @@ fn run_cli_search(
                     search_sparse_threshold,
                     field_mask,
                 )
-                .map_err(|e| {
-                    let invariant_hint = lexical_engine_invariant_hint(&e);
-                    CliError {
-                        code: 9,
-                        kind: CliErrorKind::Search.kind_str(),
-                        message: format!("search failed: {e}"),
-                        retryable: invariant_hint.is_none(),
-                        hint: invariant_hint,
-                    }
-                })?,
+                .map_err(|e| lexical_search_cli_error(&e, format!("search failed: {e}")))?,
             SearchMode::Semantic => {
                 // The former `semantic` Cargo feature (and its `-baseline`
                 // refusal arm for the ONNX-era AVX2 hazard, cass#256) was retired
@@ -35282,16 +35295,12 @@ fn run_cli_search(
                             field_mask,
                         )
                         .map_err(|fallback_err| {
-                            let invariant_hint = lexical_engine_invariant_hint(&fallback_err);
-                            CliError {
-                                code: 9,
-                                kind: CliErrorKind::Search.kind_str(),
-                                message: format!(
+                            lexical_search_cli_error(
+                                &fallback_err,
+                                format!(
                                     "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
                                 ),
-                                retryable: invariant_hint.is_none(),
-                                hint: invariant_hint,
-                            }
+                            )
                         })?
                     } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
                         return Err(CliError {
@@ -35718,11 +35727,22 @@ fn run_cli_search(
     // spawning background index runs as a side effect of this warning.
     let human_freshness =
         if effective_robot.is_none() && state_meta.is_none() && state_meta_budget_available {
-            state_index_freshness(&state_meta_json_for_strict_read(
-                &data_dir,
-                &db_path,
-                DEFAULT_STALE_THRESHOLD_SECS,
-            ))
+            let worker_data_dir = data_dir.clone();
+            let worker_db_path = db_path.clone();
+            let probe = move || {
+                Ok(state_index_freshness(&state_meta_json_for_strict_read(
+                    &worker_data_dir,
+                    &worker_db_path,
+                    DEFAULT_STALE_THRESHOLD_SECS,
+                )))
+            };
+            if let Some(budget) = search_budget.as_ref() {
+                run_read_only_search_worker(budget.remaining_ms(), probe)?.ok_or_else(|| {
+                    search_timeout_error(budget.total_ms(), "during search freshness")
+                })?
+            } else {
+                probe()?
+            }
         } else {
             None
         };
@@ -35871,6 +35891,16 @@ fn run_cli_search(
     } else {
         None
     };
+
+    if is_human_search
+        && let Some(budget) = search_budget.as_ref()
+        && budget.is_exhausted()
+    {
+        return Err(search_timeout_error(
+            budget.total_ms(),
+            "before search output",
+        ));
+    }
 
     if let Some(format) = effective_robot {
         let expanded_trust_fields = expand_field_presets(&fields);
@@ -36333,8 +36363,9 @@ fn run_cli_pack(
     }
     let render_format = resolve_pack_render_format(robot_format, display_format)?;
     let structured_pack = !matches!(render_format, PackRenderFormat::Markdown);
+    let bounded_pack = structured_pack || timeout_ms.is_some();
     let pack_budget = crate::robot_budget_envelope::RobotBudget::with_start(
-        if structured_pack || timeout_ms.is_some() {
+        if bounded_pack {
             pack_budget_ms(timeout_ms)
         } else {
             u64::MAX
@@ -36436,7 +36467,7 @@ fn run_cli_pack(
     if let Some(ref sessions_from_arg) = sessions_from {
         match read_session_paths_bounded(
             sessions_from_arg,
-            structured_pack.then(|| pack_budget.remaining_ms()),
+            bounded_pack.then(|| pack_budget.remaining_ms()),
         )? {
             BoundedSessionPaths::Complete(session_paths) => {
                 session_scope_empty = session_paths.is_empty();
@@ -36467,7 +36498,7 @@ fn run_cli_pack(
         None,
     );
 
-    let setup = if structured_pack && !hard_deadline_reached {
+    let setup = if bounded_pack && !hard_deadline_reached {
         let worker_data_dir = data_dir.clone();
         let worker_db_path = db_path.clone();
         let worker_index_path = index_path.clone();
@@ -36483,7 +36514,7 @@ fn run_cli_pack(
                 true,
             )
             .map_err(|mut error| {
-                if error.kind == "maintenance-required" {
+                if structured_pack && error.kind == "maintenance-required" {
                     error.hint = Some(format!(
                         "Run `cass --db {} index --full --json --data-dir {}` in a mutating workflow, then retry this pack. Structured pack output does not repair archive assets.",
                         shell_quote_arg(&worker_db_path.display().to_string()),
@@ -36493,7 +36524,7 @@ fn run_cli_pack(
                 error
             })
         })?
-    } else if structured_pack {
+    } else if bounded_pack {
         None
     } else {
         Some(open_cli_search_setup(
@@ -36533,21 +36564,11 @@ fn run_cli_pack(
         );
     }
 
-    let timeout_duration = timeout_ms.map(Duration::from_millis);
-    if !structured_pack
-        && let Some(timeout) = timeout_duration
-        && start_time.elapsed() >= timeout
-    {
-        return Err(CliError {
-            code: 10,
-            kind: CliErrorKind::Timeout.kind_str(),
-            message: format!(
-                "Operation timed out after {}ms (before pack search started)",
-                timeout.as_millis()
-            ),
-            hint: Some("Increase --timeout value or simplify query".to_string()),
-            retryable: true,
-        });
+    if !structured_pack && bounded_pack && (hard_deadline_reached || pack_budget.is_exhausted()) {
+        return Err(search_timeout_error(
+            pack_budget.total_ms(),
+            "during pack setup",
+        ));
     }
 
     let candidate_limit = if limit == 0 {
@@ -36558,7 +36579,13 @@ fn run_cli_pack(
     let search_sparse_threshold = sparse_threshold_for_visible_limit(3, candidate_limit, false);
     let result = if session_scope_empty {
         empty_search_result()
-    } else if structured_pack && (hard_deadline_reached || pack_budget.is_exhausted()) {
+    } else if bounded_pack && (hard_deadline_reached || pack_budget.is_exhausted()) {
+        if !structured_pack {
+            return Err(search_timeout_error(
+                pack_budget.total_ms(),
+                "before pack search",
+            ));
+        }
         hard_deadline_reached = true;
         if !skipped_sections.iter().any(|section| section == "search") {
             skipped_sections.push("search".to_string());
@@ -36579,25 +36606,25 @@ fn run_cli_pack(
                     FieldMask::FULL,
                 )
                 .map_err(|error| {
-                    let invariant_hint = lexical_engine_invariant_hint(&error);
-                    CliError {
-                        code: 9,
-                        kind: CliErrorKind::Search.kind_str(),
-                        message: format!("pack search failed: {error}"),
-                        retryable: invariant_hint.is_none(),
-                        hint: invariant_hint.or_else(|| {
-                            Some(
-                                "Try `cass search <query> --robot --robot-meta` to inspect the search path."
-                                    .to_string(),
-                            )
-                        }),
-                    }
+                    let mut failure =
+                        lexical_search_cli_error(&error, format!("pack search failed: {error}"));
+                    failure.hint.get_or_insert_with(|| {
+                        "Try `cass search <query> --robot --robot-meta` to inspect the search path."
+                            .to_string()
+                    });
+                    failure
                 })
         };
-        if structured_pack {
+        if bounded_pack {
             match run_read_only_search_worker(pack_budget.remaining_ms(), search_task)? {
                 Some(result) => result,
                 None => {
+                    if !structured_pack {
+                        return Err(search_timeout_error(
+                            pack_budget.total_ms(),
+                            "during pack search",
+                        ));
+                    }
                     hard_deadline_reached = true;
                     skipped_sections.push("search".to_string());
                     empty_search_result()
@@ -36644,7 +36671,7 @@ fn run_cli_pack(
         include_skill_content,
     };
     let candidate_count = plan_request.candidates.len();
-    let mut plan = if structured_pack {
+    let mut plan = if bounded_pack {
         if pack_budget.is_exhausted() {
             hard_deadline_reached = true;
             skipped_sections.push("pack_planning".to_string());
@@ -36699,6 +36726,12 @@ fn run_cli_pack(
         );
         plan
     };
+    if !structured_pack && bounded_pack && (hard_deadline_reached || pack_budget.is_exhausted()) {
+        return Err(search_timeout_error(
+            pack_budget.total_ms(),
+            "during pack planning",
+        ));
+    }
     if skipped_sections
         .iter()
         .any(|section| section == "pack_planning")
@@ -36807,7 +36840,7 @@ fn run_cli_pack(
         },
     };
 
-    if !structured_pack {
+    if !bounded_pack {
         let correlation = crate::search::trust_correlation::build_for_cwd();
         let rendered = render_cli_pack_with_output_budget(
             plan,
@@ -36854,6 +36887,12 @@ fn run_cli_pack(
         budget_fallback_answer_pack(&limits, candidate_count).map_err(pack_invalid_limit_error)?;
 
     let render_result = if pack_budget.is_exhausted() {
+        if !structured_pack {
+            return Err(search_timeout_error(
+                pack_budget.total_ms(),
+                "before pack rendering",
+            ));
+        }
         hard_deadline_reached = true;
         if !skipped_sections
             .iter()
@@ -36890,6 +36929,12 @@ fn run_cli_pack(
         match receiver.recv_timeout(Duration::from_millis(pack_budget.remaining_ms().max(1))) {
             Ok(result) => result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if !structured_pack {
+                    return Err(search_timeout_error(
+                        pack_budget.total_ms(),
+                        "during pack rendering",
+                    ));
+                }
                 hard_deadline_reached = true;
                 if !skipped_sections
                     .iter()
@@ -36920,6 +36965,12 @@ fn run_cli_pack(
         }
     };
     let rendered = render_result?;
+    if !structured_pack && pack_budget.is_exhausted() {
+        return Err(search_timeout_error(
+            pack_budget.total_ms(),
+            "before pack output",
+        ));
+    }
     if fields.is_some() && matches!(render_format, PackRenderFormat::Jsonl) {
         eprintln!("Warning: --fields is ignored for pack JSONL output.");
     }
@@ -52149,8 +52200,7 @@ fn doctor_raw_mirror_compression_supported(
             .uncompressed_size_bytes
             .is_none_or(|size| source_size_bytes == Some(size)),
         ("fixed_chunks_v2", "per_chunk") => {
-            source_size_bytes.is_some()
-                && compression.uncompressed_size_bytes == source_size_bytes
+            source_size_bytes.is_some() && compression.uncompressed_size_bytes == source_size_bytes
         }
         _ => false,
     }
@@ -58190,10 +58240,7 @@ fn doctor_connector_reparse_rejects_path_escapes_before_staging() {
     manifest.provider = "codex".to_string();
     manifest.origin_kind = "local".to_string();
     manifest.manifest_id = "contained-manifest".to_string();
-    manifest.original_path = original_root
-        .join("../escaped.jsonl")
-        .display()
-        .to_string();
+    manifest.original_path = original_root.join("../escaped.jsonl").display().to_string();
 
     let error = reparse
         .conversations(&manifest, b"private evidence")
@@ -58294,10 +58341,7 @@ fn doctor_connector_reparse_keeps_identity_and_never_overwrites_staged_sources()
         "verified mirrored question"
     );
     assert_eq!(conversation.messages[1].role, "assistant");
-    assert_eq!(
-        conversation.messages[1].content,
-        "verified mirrored answer"
-    );
+    assert_eq!(conversation.messages[1].content, "verified mirrored answer");
     assert_eq!(
         conversation.metadata["cass"]["origin"]["source_id"],
         "local"
@@ -58314,7 +58358,10 @@ fn doctor_connector_reparse_keeps_identity_and_never_overwrites_staged_sources()
         .join(&manifest.manifest_id)
         .join("root")
         .join(&relative);
-    assert_eq!(std::fs::read(&staged).expect("read staged mirror"), mirrored);
+    assert_eq!(
+        std::fs::read(&staged).expect("read staged mirror"),
+        mirrored
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -85156,7 +85203,10 @@ paths = ["~/.claude/projects"]
         let manifest = report.manifests.first().expect("compressed report");
         assert_eq!(manifest.storage_kind, "fixed_chunks_v2");
         assert_eq!(manifest.compression_state, "per_chunk");
-        assert_eq!(manifest.compression.uncompressed_size_bytes, Some(source.len() as u64));
+        assert_eq!(
+            manifest.compression.uncompressed_size_bytes,
+            Some(source.len() as u64)
+        );
         assert!(doctor_raw_mirror_compression_supported(
             &manifest.compression,
             &manifest.storage_kind,
@@ -85192,7 +85242,9 @@ paths = ["~/.claude/projects"]
         );
         let corrupted = collect_doctor_raw_mirror_report_with_threshold(&data_dir, u64::MAX);
         assert_eq!(corrupted.status, "warn");
-        assert!(!doctor_raw_mirror_manifest_is_verified(&corrupted.manifests[0]));
+        assert!(!doctor_raw_mirror_manifest_is_verified(
+            &corrupted.manifests[0]
+        ));
         assert_eq!(
             std::fs::read(&source_path).expect("source untouched"),
             source

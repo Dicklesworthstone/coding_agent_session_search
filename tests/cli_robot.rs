@@ -6946,6 +6946,89 @@ fn pack_timeout_budget_from_baseline(
     Ok((budget_ms, budget_ms.saturating_mul(3)))
 }
 
+/// GH #568: Markdown packs must use the same bounded read-only stages as
+/// structured packs, but report an error instead of a partial evidence pack.
+#[test]
+fn human_pack_deadline_bounds_setup_search_planning_and_rendering() -> Result<(), Box<dyn Error>> {
+    let data_dir = isolated_search_demo_data()?;
+    util::prepare_copied_search_fixture(data_dir.path())?;
+    let (budget_ms, stall_ms) = pack_timeout_budget_from_baseline(data_dir.path())?;
+    for (hook, phase) in [
+        ("CASS_TEST_SEARCH_SETUP_SLOW_MS", "pack setup"),
+        ("CASS_TEST_PACK_SLOW_MS", "pack search"),
+        ("CASS_TEST_PACK_PLAN_SLOW_MS", "pack planning"),
+        ("CASS_TEST_PACK_RENDER_SLOW_MS", "pack rendering"),
+    ] {
+        let started = std::time::Instant::now();
+        let output = base_cmd()
+            .env_remove("CASS_OUTPUT_FORMAT")
+            .env_remove("TOON_DEFAULT_FORMAT")
+            .env(hook, stall_ms.to_string())
+            .timeout(std::time::Duration::from_millis(stall_ms + budget_ms))
+            .args([
+                "--color=never",
+                "pack",
+                "hello",
+                "--mode",
+                "lexical",
+                "--timeout",
+                &budget_ms.to_string(),
+                "--data-dir",
+                data_dir.path().to_str().ok_or("non-utf8 data dir")?,
+            ])
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(10), "{hook}: {stderr}");
+        assert!(
+            output.stdout.is_empty(),
+            "{hook}: timed-out Markdown invented output"
+        );
+        assert!(
+            stderr.contains("timed out") && stderr.contains(phase),
+            "{hook}: {stderr}"
+        );
+        assert!(
+            stderr.contains("Hint:") && stderr.contains("--timeout"),
+            "{hook}: {stderr}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(budget_ms * 2),
+            "{hook}: waited for the injected {stall_ms}ms stall"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn human_pack_zero_timeout_overrides_environment_deadline() -> Result<(), Box<dyn Error>> {
+    let data_dir = isolated_search_demo_data()?;
+    util::prepare_copied_search_fixture(data_dir.path())?;
+    let output = base_cmd()
+        .env_remove("CASS_OUTPUT_FORMAT")
+        .env_remove("TOON_DEFAULT_FORMAT")
+        .env("CASS_SEARCH_TIMEOUT_MS", "1")
+        .env("CASS_TEST_PACK_SLOW_MS", "50")
+        .args([
+            "--color=never",
+            "pack",
+            "hello",
+            "--mode",
+            "lexical",
+            "--timeout",
+            "0",
+            "--data-dir",
+            data_dir.path().to_str().ok_or("non-utf8 data dir")?,
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("# hello"));
+    Ok(())
+}
+
 /// Wall time of one unstalled `cass pack hello --mode lexical` on `data_dir`,
 /// measured right before a stalled run so the stalled run's guard is relative
 /// to the worker's speed at that moment rather than to a fixed number.

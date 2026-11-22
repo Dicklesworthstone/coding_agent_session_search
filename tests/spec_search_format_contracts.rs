@@ -27,6 +27,8 @@ use coding_agent_search::{Cli, Commands, search::query::SearchMode};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
+mod util;
+
 type TestResult = Result<(), Box<dyn Error>>;
 
 fn test_error(message: impl Into<String>) -> Box<dyn Error> {
@@ -124,6 +126,239 @@ fn run_search(data_dir: &Path, args: &[&str]) -> Result<String, Box<dyn Error>> 
         )));
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Keep the human deadline probes independent of the operator's output format,
+/// search defaults and test hooks. An explicit data directory and strict reads
+/// keep all timed work on the admitted fixture.
+fn human_read_only_search_command(data_dir: &Path, config_root: &Path) -> Command {
+    let mut command = Command::new(util::cass_bin());
+    command
+        .current_dir(config_root)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("XDG_CONFIG_HOME", config_root)
+        .env("RUST_LOG", "off")
+        .args([
+            "--color=never",
+            "search",
+            "hello",
+            "--no-maintenance",
+            "--no-daemon",
+            "--limit",
+            "1",
+            "--data-dir",
+        ])
+        .arg(data_dir);
+    for variable in [
+        "CASS_OUTPUT_FORMAT",
+        "TOON_DEFAULT_FORMAT",
+        "CASS_DB_PATH",
+        "CASS_SEARCH_TIMEOUT_MS",
+        "CASS_SEARCH_TIMEOUT",
+        "CASS_SEARCH_BUDGET_MS",
+        "CASS_SEARCH_MODE",
+        "CASS_SEMANTIC_EMBEDDER",
+        "CASS_QUILL_QUERY_FUEL_BUDGET",
+        "CASS_TEST_SEARCH_SLOW_MS",
+        "CASS_TEST_SEARCH_SETUP_SLOW_MS",
+        "CASS_TEST_SEARCH_SEMANTIC_SETUP_SLOW_MS",
+        "CASS_TEST_SEARCH_DIRECT_SEMANTIC_SETUP_SLOW_MS",
+        "CASS_TEST_SEARCH_META_SLOW_MS",
+        "CASS_TEST_SEARCH_TRUST_SLOW_MS",
+        "CASS_TEST_SEMANTIC_DISPATCH_BUDGET_PHASE",
+    ] {
+        command.env_remove(variable);
+    }
+    command
+}
+
+/// Calibrate against the same real archive before injecting a slow operation.
+/// This keeps the query-stage cases from accidentally timing out in setup on a
+/// slow debug host, while still distinguishing a deadline from a completed stall.
+fn human_search_deadline_budget(
+    data_dir: &Path,
+    config_root: &Path,
+) -> Result<(u64, u64), Box<dyn Error>> {
+    let started = Instant::now();
+    let output = human_read_only_search_command(data_dir, config_root)
+        .args(["--mode", "lexical", "--display", "lines"])
+        .timeout(Duration::from_secs(90))
+        .output()?;
+    let baseline_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    ensure(
+        output.status.success() && !output.stdout.is_empty(),
+        format!(
+            "human search deadline fixture must produce real hits before timing: status={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    let budget_ms = baseline_ms.saturating_mul(3).max(2_000);
+    Ok((budget_ms, budget_ms.saturating_mul(3)))
+}
+
+#[test]
+fn human_search_deadlines_bound_setup_and_query_for_every_timeout_source() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    util::prepare_copied_search_fixture(&data_dir)?;
+    let (budget_ms, stall_ms) = human_search_deadline_budget(&data_dir, tmp.path())?;
+
+    for delay in ["CASS_TEST_SEARCH_SETUP_SLOW_MS", "CASS_TEST_SEARCH_SLOW_MS"] {
+        for (source, display) in [
+            ("flag", None),
+            ("env", Some("table")),
+            ("alias", Some("lines")),
+            ("config", Some("markdown")),
+        ] {
+            let config_root = tmp.path().join(format!("{delay}-{source}"));
+            fs::create_dir_all(&config_root)?;
+            let mut command = human_read_only_search_command(&data_dir, &config_root);
+            command
+                .args(["--mode", "lexical"])
+                .env(delay, stall_ms.to_string())
+                .timeout(Duration::from_millis(stall_ms.saturating_mul(2)));
+            if let Some(display) = display {
+                command.args(["--display", display]);
+            }
+            match source {
+                "flag" => {
+                    command.args(["--timeout", &budget_ms.to_string()]);
+                }
+                "env" => {
+                    command.env("CASS_SEARCH_TIMEOUT_MS", budget_ms.to_string());
+                }
+                "alias" => {
+                    command.env("CASS_SEARCH_TIMEOUT", budget_ms.to_string());
+                }
+                "config" => {
+                    fs::create_dir_all(config_root.join("cass"))?;
+                    fs::write(
+                        config_root.join("cass/cass.toml"),
+                        format!("[search]\ntimeout_ms = {budget_ms}\n"),
+                    )?;
+                }
+                _ => unreachable!("fixed timeout sources"),
+            }
+            let started = Instant::now();
+            let output = command.output()?;
+            let wall_time = started.elapsed();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            ensure(
+                output.status.code() == Some(10),
+                format!(
+                    "{source} deadline during {delay} must return timeout, not successful results: status={}; stderr={stderr}",
+                    output.status
+                ),
+            )?;
+            ensure(
+                output.stdout.is_empty(),
+                format!("{source} deadline during {delay} emitted incomplete human results"),
+            )?;
+            ensure(
+                stderr.contains("timed out")
+                    && stderr.contains("Hint:")
+                    && !stderr.contains("No results found"),
+                format!("{source} deadline during {delay} lost timeout guidance: {stderr}"),
+            )?;
+            ensure(
+                wall_time < Duration::from_millis(budget_ms.saturating_mul(2)),
+                format!(
+                    "{source} {budget_ms}ms deadline waited for the {stall_ms}ms {delay} stall: {wall_time:?}"
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn human_search_explicit_zero_timeout_overrides_a_positive_default() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    util::prepare_copied_search_fixture(&data_dir)?;
+    let started = Instant::now();
+    let output = human_read_only_search_command(&data_dir, tmp.path())
+        .env("CASS_SEARCH_TIMEOUT_MS", "1")
+        .env("CASS_TEST_SEARCH_SLOW_MS", "150")
+        .args(["--timeout", "0", "--mode", "lexical", "--display", "lines"])
+        .timeout(Duration::from_secs(90))
+        .output()?;
+    ensure(
+        output.status.success() && !output.stdout.is_empty(),
+        format!(
+            "--timeout 0 must disable the positive default and return hits: status={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    ensure(
+        started.elapsed() >= Duration::from_millis(150),
+        "zero-timeout positive control did not execute the slow search",
+    )
+}
+
+#[test]
+fn lexical_fuel_exhaustion_has_the_same_remedy_in_human_and_json_search() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    util::prepare_copied_search_fixture(&data_dir)?;
+    human_search_deadline_budget(&data_dir, tmp.path())?;
+
+    for (label, args) in [
+        ("default", Vec::<&str>::new()),
+        ("lexical", vec!["--mode", "lexical"]),
+        ("lines", vec!["--mode", "lexical", "--display", "lines"]),
+        ("hybrid fallback", vec!["--mode", "hybrid"]),
+    ] {
+        let output = human_read_only_search_command(&data_dir, tmp.path())
+            .env("CASS_QUILL_QUERY_FUEL_BUDGET", "1")
+            .args(args)
+            .timeout(Duration::from_secs(90))
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        ensure(
+            output.status.code() == Some(9) && output.stdout.is_empty(),
+            format!(
+                "{label} fuel exhaustion must fail without hits: status={}; stderr={stderr}",
+                output.status
+            ),
+        )?;
+        for required in ["Hint:", "CASS_QUILL_QUERY_FUEL_BUDGET", "cass index"] {
+            ensure(
+                stderr.contains(required),
+                format!("{label} fuel exhaustion omitted {required}: {stderr}"),
+            )?;
+        }
+    }
+
+    let output = human_read_only_search_command(&data_dir, tmp.path())
+        .env("CASS_QUILL_QUERY_FUEL_BUDGET", "1")
+        .args(["--mode", "lexical", "--json"])
+        .timeout(Duration::from_secs(90))
+        .output()?;
+    ensure(
+        output.status.code() == Some(9) && output.stdout.is_empty(),
+        format!(
+            "JSON fuel exhaustion must keep its error contract: status={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr)?;
+    ensure(
+        error["error"]["kind"] == "search" && error["error"]["retryable"] == true,
+        format!("JSON fuel exhaustion changed its error kind or retryability: {error}"),
+    )?;
+    let hint = error["error"]["hint"]
+        .as_str()
+        .ok_or_else(|| test_error("JSON fuel exhaustion omitted its hint"))?;
+    ensure(
+        hint.contains("CASS_QUILL_QUERY_FUEL_BUDGET") && hint.contains("cass index"),
+        format!("JSON fuel exhaustion lost its remedy: {hint}"),
+    )
 }
 
 /// Split stdout into non-empty trimmed lines (the unit consumers parse).

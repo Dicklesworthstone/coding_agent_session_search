@@ -1397,7 +1397,7 @@ Errors are structured, actionable, and include recovery hints. A real sample fro
 | 70 | `cass index` stalled and aborted (kind `index-stalled` envelope on stderr) | Inspect `cass status --json`, then rerun `cass index` |
 | 130 | Interrupted (SIGINT) | Rerun; `cass sources setup --resume` continues an interrupted setup |
 
-Search/pack timeouts are not exit 8: on expiry `search` and `pack` exit 0 with `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "recommended_next_probe": "<command>", ...}}`, and `--robot-format sessions` instead fails with exit 10, kind `timeout`. Explicit `--mode semantic` is the other exception: when the remaining budget cannot admit semantic setup or dispatch, search fails with exit 10, kind `timeout`, `retryable: true`, and a `semantic_budget checkpoint=...` message, rather than returning an empty or lexical result. Hybrid (explicit or default) instead falls back to lexical and reports `semantic_budget_limited`.
+Structured search/pack timeouts are not exit 8: on expiry `search` and `pack` exit 0 with `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "recommended_next_probe": "<command>", ...}}`, and `--robot-format sessions` instead fails with exit 10, kind `timeout`. Human-readable `search --no-maintenance` and Markdown `pack` return exit 10 with timeout guidance and no result output when their configured deadline expires. Explicit `--mode semantic` also fails with exit 10, kind `timeout`, `retryable: true`, and a `semantic_budget checkpoint=...` message when the remaining budget cannot admit semantic setup or dispatch, rather than returning an empty or lexical result. Hybrid (explicit or default) instead falls back to lexical and reports `semantic_budget_limited`.
 
 **Codes ≥ 10 are domain-specific** and the numeric value alone is ambiguous (e.g. code 10 maps to either `config` or `timeout` kinds depending on context). Agents should branch on `err.kind` from the JSON error envelope — not on the numeric code — when handling codes ≥ 10. See the Error Handling section above for the canonical `kind` list.
 
@@ -1666,7 +1666,7 @@ cass index --full --json --robot-trace-ingest 2>/tmp/cass-ingest-trace.jsonl
 | `--fields minimal\|summary\|<list>` | Reduce payload size |
 | `--max-content-length N` | Truncate content fields to N chars |
 | `--max-tokens N` | Apply an approximate token budget to robot output |
-| `--timeout N` | Timeout in milliseconds. On expiry `search`/`pack` still exit 0 and emit `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "recommended_next_probe": "<command>", ...}}`; `--robot-format sessions` fails with exit 10, kind `timeout` |
+| `--timeout N` | Timeout in milliseconds. Structured `search`/`pack` emit a partial result with `budget.timed_out: true`; human `search --no-maintenance`, Markdown `pack`, and `--robot-format sessions` fail with exit 10, kind `timeout`. `0` disables an explicit timeout |
 | `--cursor <token>` | Cursor-based pagination (from `_meta.next_cursor`) |
 | `--request-id ID` | Echoed in response for correlation |
 | `--aggregate agent,workspace,date` | Server-side aggregations |
