@@ -1641,6 +1641,79 @@ fn structured_pack_shortens_large_evidence_without_losing_verified_citations() {
 }
 
 #[test]
+fn structured_pack_compacts_json_before_discarding_short_cited_evidence() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("compact_pack");
+    fs::create_dir_all(&data_dir).unwrap();
+    seed_codex_session(
+        &codex_home,
+        "rollout-compact-pack.jsonl",
+        "packcompactneedle preserve complete cited evidence with Unicode 界😀",
+    );
+    run_fresh_index(home, &data_dir);
+    let archive_before = data_tree_snapshot(&data_dir);
+    let sources_before = data_tree_snapshot(&codex_home);
+    let mut reference = None;
+    for (budget, require_evidence) in [(12_000usize, true), (1_200, false), (1_200, true)] {
+        let mut command = cass_cmd(home);
+        command
+            .args([
+                "pack",
+                "packcompactneedle",
+                "--json",
+                "--mode",
+                "lexical",
+                "--limit",
+                "1",
+                "--max-evidence",
+                "1",
+                "--max-tokens",
+                &budget.to_string(),
+                "--freshness-policy",
+                "allow-stale",
+                "--data-dir",
+            ])
+            .arg(&data_dir);
+        if require_evidence {
+            command.arg("--require-evidence");
+        }
+        let output = command.timeout(Duration::from_secs(20)).output().unwrap();
+        assert!(
+            output.status.success(),
+            "budget={budget} require_evidence={require_evidence}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.chars().count().div_ceil(4) <= budget + budget / 20);
+        let payload: Value = serde_json::from_str(&text).unwrap();
+        let evidence = payload["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(payload["realized"]["selected_evidence_count"], 1);
+        assert_eq!(payload["omitted"]["count"], 0);
+        assert_eq!(payload["_meta"]["format"], "json");
+        assert_eq!(evidence[0]["excerpt_truncated"], false);
+        assert_eq!(evidence[0]["citation"]["verified"], true);
+        let mut stable = evidence[0].clone();
+        stable["citation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("freshness_age_seconds");
+        if let Some(expected) = &reference {
+            assert_eq!(&stable, expected, "budgeting must preserve the full evidence");
+            assert_eq!(text.lines().count(), 1, "tight JSON uses compact encoding");
+        } else {
+            assert!(text.lines().count() > 1, "ample JSON remains pretty-printed");
+            assert!(text.chars().count().div_ceil(4) > 1_200 + 1_200 / 20);
+            reference = Some(stable);
+        }
+        assert_eq!(archive_before, data_tree_snapshot(&data_dir));
+        assert_eq!(sources_before, data_tree_snapshot(&codex_home));
+    }
+}
+
+#[test]
 fn pack_final_output_budget_bounds_all_formats_and_refuses_oversized_metadata() {
     let temp = TempDir::new().unwrap();
     let home = temp.path();

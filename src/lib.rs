@@ -36966,7 +36966,19 @@ fn render_cli_pack_with_output_budget(
                     PackRenderFormat::CompactJson => RobotFormat::Compact,
                     _ => RobotFormat::Toon,
                 };
-                encode_structured_value(value, format)?
+                if matches!(request.format, PackRenderFormat::Json) {
+                    let pretty = encode_structured_value(value.clone(), format)?;
+                    // Keep the complete payload before spending the evidence
+                    // budget on indentation. Include the newline that the
+                    // final admission below adds to either JSON encoding.
+                    if pretty.chars().count().saturating_add(1).div_ceil(4) <= token_limit {
+                        pretty
+                    } else {
+                        encode_structured_value(value, RobotFormat::Compact)?
+                    }
+                } else {
+                    encode_structured_value(value, format)?
+                }
             }
             PackRenderFormat::Jsonl | PackRenderFormat::Markdown => {
                 render_answer_pack_with_correlation(&plan, &request, correlation)
@@ -37454,7 +37466,27 @@ mod pack_field_mask_tests {
             )
             .unwrap();
             assert_eq!(exact, output);
-            boundary.diagnostics.budget.max_output_tokens_with_overflow = tokens - 1;
+            let minimum_tokens = if matches!(format, PackRenderFormat::Json) {
+                let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+                let compact = format!("{}\n", serde_json::to_string(&value).unwrap());
+                let compact_tokens = compact.chars().count().div_ceil(4);
+                assert!(compact_tokens < tokens);
+                boundary.diagnostics.budget.max_output_tokens_with_overflow = compact_tokens;
+                let exact_compact = render_cli_pack_with_output_budget(
+                    boundary.clone(),
+                    request.clone(),
+                    None,
+                    false,
+                    Instant::now(),
+                    &correlation,
+                )
+                .unwrap();
+                assert_eq!(exact_compact, compact);
+                compact_tokens
+            } else {
+                tokens
+            };
+            boundary.diagnostics.budget.max_output_tokens_with_overflow = minimum_tokens - 1;
             let error = render_cli_pack_with_output_budget(
                 boundary,
                 request,
@@ -37467,6 +37499,78 @@ mod pack_field_mask_tests {
             assert_eq!(error.kind, "pack-budget-too-small");
             assert_eq!(error.code, 2);
             assert!(!error.retryable);
+        }
+    }
+
+    #[test]
+    fn pack_json_budget_preserves_evidence_before_indentation() {
+        use crate::search::pack_planner::{
+            PackCandidate, PackPlanRequest, PackRenderFormat, PackRenderRequest,
+        };
+        let hit = crate::search::query::SearchHit {
+            title: String::new(),
+            snippet: String::new(),
+            source_path: "/sessions/pack-budget.jsonl".to_string(),
+            content: "Useful quoted \"matrix\" evidence with Unicode 界😀 and a newline\n".to_string(),
+            content_hash: 7,
+            conversation_id: Some(42),
+            line_number: Some(3),
+            score: 1.0,
+            agent: "codex".to_string(),
+            workspace: "/project".to_string(),
+            workspace_original: None,
+            created_at: None,
+            match_type: crate::search::query::MatchType::Exact,
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+        let candidate = PackCandidate::from_search_hit(&hit, 1, 0);
+        let plan = crate::search::pack_planner::plan_answer_pack(PackPlanRequest {
+            candidates: vec![candidate],
+            ..PackPlanRequest::default()
+        })
+        .unwrap();
+        assert_eq!(plan.evidence.len(), 1);
+        let mut request = PackRenderRequest {
+            format: PackRenderFormat::Json,
+            query_text: "matrix".to_string(),
+            ..PackRenderRequest::default()
+        };
+        request.budget.timed_out = true;
+        let correlation = crate::search::trust_correlation::CorrelationIndex::default();
+        let pretty = render_cli_pack_with_output_budget(
+            plan.clone(),
+            request.clone(),
+            None,
+            true,
+            Instant::now(),
+            &correlation,
+        )
+        .unwrap();
+        let expected: serde_json::Value = serde_json::from_str(&pretty).unwrap();
+        let compact = format!("{}\n", serde_json::to_string(&expected).unwrap());
+        let token_limit = compact.chars().count().div_ceil(4);
+        assert!(pretty.chars().count().div_ceil(4) > token_limit);
+        let mut bounded_plan = plan;
+        bounded_plan.diagnostics.budget.max_output_tokens_with_overflow = token_limit;
+        for require_evidence in [false, true] {
+            let actual = render_cli_pack_with_output_budget(
+                bounded_plan.clone(),
+                request.clone(),
+                None,
+                require_evidence,
+                Instant::now(),
+                &correlation,
+            )
+            .unwrap();
+            assert_eq!(actual, compact);
+            let value: serde_json::Value = serde_json::from_str(&actual).unwrap();
+            assert_eq!(value, expected);
+            assert_eq!(value["evidence"][0]["excerpt"], hit.content);
+            assert_eq!(value["evidence"][0]["excerpt_truncated"], false);
+            assert_eq!(value["omitted"]["count"], 0);
+            assert_eq!(value["_meta"]["format"], "json");
         }
     }
 

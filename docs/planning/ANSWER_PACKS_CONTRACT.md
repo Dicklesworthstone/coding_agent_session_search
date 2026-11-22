@@ -585,8 +585,12 @@ Empty search results are success by default:
 
 ## Format Contracts
 
-JSON is pretty-printed by default. Compact JSON is a single-line object with the
-same fields. TOON encodes the same payload with the existing `toon` crate path.
+JSON is pretty-printed by default. When indentation would exceed the complete
+output token budget, JSON uses compact encoding before shortening or dropping
+evidence. This changes only whitespace: the selected fields, citations, excerpts
+and `json` format identity are preserved. Explicit compact JSON is always a
+single-line object with the same fields. TOON encodes the same payload with the
+existing `toon` crate path.
 
 JSONL emits one object per line:
 
