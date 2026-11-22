@@ -756,9 +756,9 @@ for those conversations. Treat gap names such as `remote_source_unavailable`,
 mirror intact, then run the recommended `cass sources sync --json` (all configured remote sources; `--source <name>` narrows it) or
 source-specific sync command after reviewing the reported evidence.
 
-Raw-mirror retention is explicit and audited. Use `cass mirror prune
---older-than 90d --json` or `cass mirror prune --max-size 100GB --json` to get a
-dry-run plan; add `--apply` only after reviewing the scope and totals. Preview
+To review a manual raw-mirror retention plan, use `cass mirror prune
+--older-than 90d --json` or `cass mirror prune --max-size 100GB --json`. Add
+`--apply` after reviewing the scope and totals. Preview
 `entries` contain at most 1,000 manifest/blob details; `omitted_entry_count`
 reports additional candidates. Planned counts and bytes cover the entire plan,
 including omitted details. Use provider/path selectors to inspect a narrower
@@ -789,6 +789,13 @@ transcript share their complete chunks with the newest one, so retiring them
 frees only their superseded tail chunks; for a file that was rewritten rather
 than appended to, it also drops the earlier versions.
 
+Indexing also runs automatic retention for the default archive. It keeps the
+latest two captures per source file, honors a six-hour hold-down and the
+`keep`, `pinned`, and `recovery` tags, and only retires an older capture when a
+protected capture contains its verified byte-for-byte prefix. Automatic
+retirement uses the same audit log. Set `CASS_RAW_MIRROR_AUTO_PRUNE=0` to leave
+retention to manual commands.
+
 A capture stages its copy under `raw-mirror/v1/tmp/capture.<pid>.<ts>.<n>` and
 holds the mirror lock until it publishes. A capture that is killed, for example
 by a `timeout` around `cass index`, leaves that directory behind. An unscoped
@@ -813,11 +820,18 @@ NDJSON transcripts of 256 KiB or more in 256 KiB chunks, and other sources of
 8 MiB or more, such as SQLite stores, in 4 MiB chunks. A growing transcript
 reuses every unchanged complete chunk, so an index run after an append stores
 only its changed tail chunk and a manifest, and SQLite sources reuse unchanged
-4 MiB byte regions. Each historical snapshot remains byte-exact without
-writing another full-file blob. Existing whole-blob manifests remain readable;
-`cass doctor --json` reports `storage_kind`, `chunk_count`, the full-source
-digest, and verifies every referenced chunk before treating a snapshot as
-recovery authority.
+4 MiB byte regions. New chunks use zstd when it reduces their stored size.
+Chunks that do not shrink are stored as-is. Existing whole-blob and plain
+chunked captures remain readable. `cass doctor --json` reports `storage_kind`,
+`chunk_count` and the full-source digest, and verifies every referenced chunk
+before treating a snapshot as recovery authority.
+
+`CASS_RAW_MIRROR_MAX_BYTES` defaults to 8 GiB and counts stored file bytes,
+including manifests and capture caches. `CASS_RAW_MIRROR_MIN_FREE_BYTES`
+defaults to 2 GiB of free disk space. When a budget refuses a capture,
+indexing can still proceed and `cass status --json` reports the refusal under
+`raw_mirror_capture`. Review the budget and free space before changing
+retention settings.
 
 #### Configuration File
 
