@@ -57915,6 +57915,14 @@ impl DoctorConnectorReparse {
         if manifest.origin_kind != "local" {
             return Err(format!("its origin is {}, not local", manifest.origin_kind));
         }
+        let mut manifest_components = Path::new(&manifest.manifest_id).components();
+        if !matches!(
+            (manifest_components.next(), manifest_components.next()),
+            (Some(std::path::Component::Normal(name)), None)
+                if name == std::ffi::OsStr::new(&manifest.manifest_id)
+        ) {
+            return Err("its manifest id is not a single safe path component".to_string());
+        }
         let provider = match doctor_normalized_provider_slug(&manifest.provider).as_str() {
             // The connector registry keys Claude Code as `claude`.
             "claude_code" => "claude".to_string(),
@@ -57949,6 +57957,15 @@ impl DoctorConnectorReparse {
                 "it is outside every root the {provider} connector detects"
             ));
         };
+        // A lexical prefix alone admits paths such as root/../outside.
+        // The original source may no longer exist, so validate components
+        // instead of canonicalizing it or following its current filesystem.
+        if relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err("its source path escapes the detected connector root".to_string());
+        }
         let staged_dir = self.scratch.path().join(&manifest.manifest_id);
         let staged_root = staged_dir.join("root");
         let staged = staged_root.join(relative);
@@ -57956,7 +57973,17 @@ impl DoctorConnectorReparse {
             .parent()
             .ok_or_else(|| "its staged copy has no parent directory".to_string())?;
         std::fs::create_dir_all(parent)
-            .and_then(|()| std::fs::write(&staged, bytes))
+            .and_then(|()| {
+                let mut options = OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(&staged)?;
+                file.write_all(bytes)
+            })
             .map_err(|err| format!("staging a copy for its connector failed: {err}"))?;
         let ctx = crate::connectors::ScanContext::with_roots(
             staged_dir.join("data"),
@@ -57981,6 +58008,12 @@ impl DoctorConnectorReparse {
                     canonical_root
                         .as_deref()
                         .and_then(|root| conversation.source_path.strip_prefix(root).ok())
+                })
+                .filter(|relative| {
+                    relative.components().next().is_some()
+                        && relative.components().all(|component| {
+                            matches!(component, std::path::Component::Normal(_))
+                        })
                 })
                 .map(Path::to_path_buf)
                 .ok_or_else(|| {
@@ -58029,6 +58062,178 @@ fn doctor_connector_reparse_reports_why_a_source_keeps_the_line_salvage() {
     assert!(
         outside.contains("outside every root the codex connector detects"),
         "{outside}"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_connector_reparse_rejects_path_escapes_before_staging() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let original_root = dir.path().join("original-codex");
+    let mut reparse = DoctorConnectorReparse::new(dir.path()).expect("scratch directory");
+    reparse.providers.insert(
+        "codex".to_string(),
+        Some((
+            Box::new(crate::connectors::codex::CodexConnector::new()),
+            vec![original_root.clone()],
+        )),
+    );
+    let mut manifest = doctor_raw_mirror_invalid_manifest_report(
+        dir.path(),
+        &dir.path().join("manifest.json"),
+        String::new(),
+    );
+    manifest.provider = "codex".to_string();
+    manifest.origin_kind = "local".to_string();
+    manifest.manifest_id = "contained-manifest".to_string();
+    manifest.original_path = original_root
+        .join("../escaped.jsonl")
+        .display()
+        .to_string();
+
+    let error = reparse
+        .conversations(&manifest, b"private evidence")
+        .unwrap_err();
+    assert!(error.contains("source path escapes"), "{error}");
+    assert!(
+        std::fs::read_dir(reparse.scratch.path())
+            .expect("read scratch directory")
+            .next()
+            .is_none(),
+        "rejected source paths must create no staged directories or files"
+    );
+    assert!(!dir.path().join("escaped.jsonl").exists());
+
+    manifest.original_path = original_root
+        .join("sessions/rollout-contained.jsonl")
+        .display()
+        .to_string();
+    for unsafe_id in [
+        "",
+        ".",
+        "..",
+        "../escaped",
+        "nested/id",
+        "/absolute",
+        "valid/.",
+    ] {
+        manifest.manifest_id = unsafe_id.to_string();
+        let error = reparse
+            .conversations(&manifest, b"private evidence")
+            .unwrap_err();
+        assert!(error.contains("manifest id"), "{unsafe_id:?}: {error}");
+        assert!(
+            std::fs::read_dir(reparse.scratch.path())
+                .expect("read scratch directory")
+                .next()
+                .is_none(),
+            "rejected manifest ids must create no staged directories or files"
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_connector_reparse_keeps_identity_and_never_overwrites_staged_sources() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let original_root = dir.path().join("original-codex");
+    let relative = Path::new("sessions")
+        .join("2026/04/23")
+        .join("rollout-contained.jsonl");
+    let original = original_root.join(&relative);
+    std::fs::create_dir_all(original.parent().expect("original parent"))
+        .expect("create original parent");
+    let original_sentinel = b"original source must not be read or overwritten";
+    std::fs::write(&original, original_sentinel).expect("write original sentinel");
+    let mirrored = br#"{"type":"session_meta","timestamp":"2026-04-23T10:00:00Z","payload":{"id":"contained-session","cwd":"/synthetic/doctor-staging","cli_version":"0.42.0"}}
+{"type":"response_item","timestamp":"2026-04-23T10:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"verified mirrored question"}]}}
+{"type":"response_item","timestamp":"2026-04-23T10:00:02Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"verified mirrored answer"}]}}
+"#;
+    let mut reparse = DoctorConnectorReparse::new(dir.path()).expect("scratch directory");
+    reparse.providers.insert(
+        "codex".to_string(),
+        Some((
+            Box::new(crate::connectors::codex::CodexConnector::new()),
+            vec![original_root],
+        )),
+    );
+    let mut manifest = doctor_raw_mirror_invalid_manifest_report(
+        dir.path(),
+        &dir.path().join("manifest.json"),
+        String::new(),
+    );
+    manifest.provider = "codex".to_string();
+    manifest.origin_kind = "local".to_string();
+    manifest.manifest_id = "contained-manifest".to_string();
+    manifest.original_path = original.display().to_string();
+
+    let conversations = reparse
+        .conversations(&manifest, mirrored)
+        .expect("real Codex connector parses the staged mirror");
+    assert_eq!(conversations.len(), 1);
+    let conversation = &conversations[0];
+    let expected_external_id = Path::new("2026/04/23").join("rollout-contained");
+    assert_eq!(
+        conversation.external_id.as_deref().map(Path::new),
+        Some(expected_external_id.as_path())
+    );
+    assert_eq!(conversation.source_path, original);
+    assert_eq!(conversation.agent_slug, "codex");
+    assert_eq!(
+        conversation.title.as_deref(),
+        Some("verified mirrored question")
+    );
+    assert_eq!(conversation.messages.len(), 2);
+    assert_eq!(conversation.messages[0].role, "user");
+    assert_eq!(
+        conversation.messages[0].content,
+        "verified mirrored question"
+    );
+    assert_eq!(conversation.messages[1].role, "assistant");
+    assert_eq!(
+        conversation.messages[1].content,
+        "verified mirrored answer"
+    );
+    assert_eq!(
+        conversation.metadata["cass"]["origin"]["source_id"],
+        "local"
+    );
+    assert_eq!(conversation.metadata["cass"]["origin"]["kind"], "local");
+    assert_eq!(
+        std::fs::read(&original).expect("read untouched original"),
+        original_sentinel
+    );
+
+    let staged = reparse
+        .scratch
+        .path()
+        .join(&manifest.manifest_id)
+        .join("root")
+        .join(&relative);
+    assert_eq!(std::fs::read(&staged).expect("read staged mirror"), mirrored);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&staged)
+                .expect("staged metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    let error = reparse
+        .conversations(&manifest, b"must not replace the staged mirror")
+        .unwrap_err();
+    assert!(error.contains("staging a copy"), "{error}");
+    assert_eq!(
+        std::fs::read(&staged).expect("read preserved staged mirror"),
+        mirrored
+    );
+    assert_eq!(
+        std::fs::read(&original).expect("read preserved original"),
+        original_sentinel
     );
 }
 
