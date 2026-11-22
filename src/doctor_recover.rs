@@ -240,38 +240,44 @@ struct ReconstructedSession {
 
 /// Compute the on-disk output path for a reconstructed session.
 ///
-/// We deliberately do NOT write back over the original `source_path`: the
-/// recovery target is an operator-chosen directory so nothing existing is
-/// clobbered. Each session is keyed by its `external_id` when present (stable,
-/// collision-free across machines) and otherwise by its conversation id, with
-/// the original file name preserved as a `.jsonl` suffix for readability.
+/// Canonical conversation IDs distinguish sources, agents and external IDs
+/// whose readable hints collide after sanitizing or case folding. Bounded
+/// hints preserve readability without exceeding common filename limits.
 fn reconstruction_output_path(
     target_dir: &Path,
     conversation_id: i64,
     external_id: Option<&str>,
     source_path: &Path,
 ) -> PathBuf {
-    let stem = external_id
+    let external_hint = external_id
         .map(sanitize_path_component)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("conversation-{conversation_id}"));
+        .filter(|s| !s.is_empty());
     // Preserve a hint of the original file name without trusting it as a path.
     let original_hint = source_path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .map(|s| sanitize_path_component(&s))
         .filter(|s| !s.is_empty());
-    let file_name = match original_hint {
-        Some(hint) if hint != stem => format!("{stem}__{hint}.jsonl"),
-        _ => format!("{stem}.jsonl"),
-    };
+    let mut file_name = format!("conversation-{conversation_id}");
+    if let Some(hint) = &external_hint {
+        file_name.push_str("__");
+        file_name.push_str(hint);
+    }
+    if let Some(hint) = original_hint
+        && Some(&hint) != external_hint.as_ref()
+    {
+        file_name.push_str("__");
+        file_name.push_str(&hint);
+    }
+    file_name.push_str(".jsonl");
     target_dir.join(file_name)
 }
 
-/// Replace path-unsafe characters so reconstructed file names never escape the
-/// recovery dir or collide on case-insensitive filesystems.
+/// Bound each ASCII hint to 64 bytes and remove path separators. Hints are
+/// descriptive only; the canonical ID supplies the filename's unique prefix.
 fn sanitize_path_component(raw: &str) -> String {
     raw.chars()
+        .take(64)
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
                 c
@@ -282,6 +288,102 @@ fn sanitize_path_component(raw: &str) -> String {
         .collect::<String>()
         .trim_matches('.')
         .to_string()
+}
+
+#[derive(Debug)]
+enum ReconstructionPublication {
+    Published,
+    DestinationConflict { staged_path: Option<PathBuf> },
+}
+
+/// Preserve every line and the existing one-newline-per-line policy without
+/// allocating a second whole-session buffer.
+fn publish_reconstructed_session(
+    path: &Path,
+    lines: &[String],
+) -> std::io::Result<ReconstructionPublication> {
+    use std::io::Write as _;
+
+    publish_reconstruction(path, |file| {
+        let mut writer = std::io::BufWriter::new(file);
+        for line in lines {
+            writer.write_all(line.as_bytes())?;
+            writer.write_all(b"\n")?;
+        }
+        writer.flush()
+    })
+}
+
+/// Publish only a completed private stage, without opening the final path for
+/// writing. Failed stages remain private evidence with a non-JSONL suffix.
+fn publish_reconstruction(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<ReconstructionPublication> {
+    // Avoid duplicate evidence files on ordinary retries, including dangling
+    // symlinks. This check is only an optimization: persist_noclobber below is
+    // the authority if another writer creates the destination after this check.
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            return Ok(ReconstructionPublication::DestinationConflict { staged_path: None });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // Same-directory staging keeps publication on one filesystem. Tempfile
+    // creates owner-only files on Unix; disabling cleanup retains evidence on
+    // every error path without ever presenting a partial final session.
+    let mut staged = tempfile::Builder::new()
+        .prefix(".cass-recovery-")
+        .suffix(".partial")
+        .disable_cleanup(true)
+        .tempfile_in(parent)?;
+    let staged_path = staged.path().to_path_buf();
+    let retain_error = |operation: &str, error: std::io::Error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "{operation}: {error}; staged recovery evidence retained at {}",
+                staged_path.display()
+            ),
+        )
+    };
+    write(staged.as_file_mut()).map_err(|error| retain_error("writing session stage", error))?;
+    staged
+        .as_file()
+        .sync_all()
+        .map_err(|error| retain_error("syncing session stage", error))?;
+    match staged.persist_noclobber(path) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Ok(ReconstructionPublication::DestinationConflict {
+                staged_path: Some(staged_path),
+            });
+        }
+        Err(error) => {
+            return Err(retain_error(
+                "publishing session without replacing existing files",
+                error.error,
+            ));
+        }
+    }
+    #[cfg(unix)]
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "complete session was published to {}, but directory durability could not be confirmed: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+    Ok(ReconstructionPublication::Published)
 }
 
 /// Rebuild the source JSONL tree from the canonical archive's preserved events.
@@ -346,6 +448,7 @@ pub fn run_doctor_recover_from_archive(
     let mut results: Vec<ReconstructedSession> = Vec::new();
     let mut written = 0usize;
     let mut skipped = 0usize;
+    let mut conflicted = 0usize;
     let mut unreadable_rows = 0usize;
     let mut quarantined_rows = 0usize;
     let mut coerced_rows = 0usize;
@@ -470,9 +573,7 @@ pub fn run_doctor_recover_from_archive(
                 &conversation.source_path,
             );
 
-            let mut body = lines.join("\n");
-            body.push('\n');
-            std::fs::write(&out_path, body.as_bytes()).map_err(|e| {
+            let publication = publish_reconstructed_session(&out_path, &lines).map_err(|e| {
                 io_error(
                     format!(
                         "writing reconstructed session to {}: {e}",
@@ -481,6 +582,30 @@ pub fn run_doctor_recover_from_archive(
                     None,
                 )
             })?;
+            if let ReconstructionPublication::DestinationConflict { staged_path } = publication {
+                skipped += 1;
+                conflicted += 1;
+                let mut reason = format!(
+                    "recovery destination already exists: {}; existing bytes were left unchanged; choose a new recovery directory",
+                    out_path.display()
+                );
+                if let Some(path) = staged_path {
+                    reason.push_str(&format!(
+                        "; completed staging evidence retained at {}",
+                        path.display()
+                    ));
+                }
+                results.push(ReconstructedSession {
+                    conversation_id: Some(conversation_id),
+                    external_id: conversation.external_id.clone(),
+                    relative_or_source_path: source_path_display,
+                    written_path: None,
+                    line_count: 0,
+                    skipped_reason: Some(reason),
+                    coercions,
+                });
+                continue;
+            }
 
             written += 1;
             total_lines += lines.len();
@@ -507,6 +632,16 @@ pub fn run_doctor_recover_from_archive(
         }
     }
 
+    let next_action = if conflicted == 0 {
+        format!(
+            "Re-ingest the recovered tree with: cass index --full --data-dir <fresh-data-dir> (point the source scan at {})",
+            target_dir.display()
+        )
+    } else {
+        format!(
+            "{conflicted} session(s) were not recovered by this run because their destinations already exist; those files were preserved. Recover into an empty target directory to obtain those sessions before re-ingesting the recovered tree with cass index --full --data-dir <fresh-data-dir>."
+        )
+    };
     let envelope = serde_json::json!({
         "schema_version": 1,
         "doctor_contract_version": 1,
@@ -517,6 +652,7 @@ pub fn run_doctor_recover_from_archive(
         "conversations_total_error": total_count_error,
         "sessions_written": written,
         "sessions_skipped": skipped,
+        "sessions_conflicted": conflicted,
         // #391: rows the strict reader would have aborted the export on.
         "rows_unreadable": unreadable_rows,
         "rows_quarantined": quarantined_rows,
@@ -534,10 +670,7 @@ pub fn run_doctor_recover_from_archive(
                 "coercions": r.coercions,
             }))
             .collect::<Vec<_>>(),
-        "next_action": format!(
-            "Re-ingest the recovered tree with: cass index --full --data-dir <fresh-data-dir> (point the source scan at {})",
-            target_dir.display()
-        ),
+        "next_action": next_action,
         "note": "Reconstructed verbatim from the canonical archive's preserved extra_json/extra_bin envelopes. The corrupt archive was opened read-only and never mutated; no stock-sqlite .recover was required.",
     });
 
@@ -550,7 +683,12 @@ pub fn run_doctor_recover_from_archive(
         );
         if skipped > 0 {
             println!(
-                "  {skipped} conversation(s) were skipped (no preserved events, unreadable, or quarantined)."
+                "  {skipped} conversation(s) were skipped (no preserved events, unreadable, quarantined, or existing recovery destinations)."
+            );
+        }
+        if conflicted > 0 {
+            println!(
+                "  {conflicted} existing destination(s) were left unchanged. Choose a new recovery directory to recover those sessions (see --json for paths)."
             );
         }
         if unreadable_rows > 0 || quarantined_rows > 0 || coerced_rows > 0 {
@@ -558,10 +696,14 @@ pub fn run_doctor_recover_from_archive(
                 "  Damaged canonical rows tolerated: {unreadable_rows} unreadable, {quarantined_rows} quarantined (identity columns mis-typed), {coerced_rows} with coerced column types (see --json for details)."
             );
         }
-        println!(
-            "Next: re-ingest with 'cass index --full' over {} into a fresh data dir.",
-            target_dir.display()
-        );
+        if conflicted > 0 {
+            println!("Next: {next_action}");
+        } else {
+            println!(
+                "Next: re-ingest with 'cass index --full' over {} into a fresh data dir.",
+                target_dir.display()
+            );
+        }
     }
     Ok(())
 }
@@ -1984,13 +2126,253 @@ mod tests {
         );
         assert!(out.starts_with(target));
         let name = out.file_name().unwrap().to_string_lossy();
-        assert!(name.starts_with("sess-abc"));
+        assert!(name.starts_with("conversation-7__sess-abc"));
         assert!(name.ends_with(".jsonl"));
         // A malicious external_id can never escape the recovery dir.
         let evil =
             reconstruction_output_path(target, 7, Some("../../etc/passwd"), Path::new("x.jsonl"));
         assert!(evil.starts_with(target));
         assert_eq!(evil.parent().unwrap(), target);
+    }
+
+    #[test]
+    fn reconstruction_output_paths_keep_distinct_canonical_conversations() {
+        let target = Path::new("recover");
+        // External IDs are unique per source and agent, not across the archive.
+        let local = reconstruction_output_path(
+            target,
+            7,
+            Some("shared-session"),
+            Path::new("/local/same.jsonl"),
+        );
+        let remote = reconstruction_output_path(
+            target,
+            8,
+            Some("shared-session"),
+            Path::new("/remote/same.jsonl"),
+        );
+        assert_ne!(local, remote, "a second source must retain its own session");
+
+        let slash =
+            reconstruction_output_path(target, 9, Some("branch/a"), Path::new("same.jsonl"));
+        let question =
+            reconstruction_output_path(target, 10, Some("branch?a"), Path::new("same.jsonl"));
+        assert_ne!(slash, question, "sanitizing hints must not merge sessions");
+
+        let upper =
+            reconstruction_output_path(target, 11, Some("SESSION"), Path::new("same.jsonl"));
+        let lower =
+            reconstruction_output_path(target, 12, Some("session"), Path::new("same.jsonl"));
+        assert_ne!(
+            upper.to_string_lossy().to_ascii_lowercase(),
+            lower.to_string_lossy().to_ascii_lowercase(),
+            "case-insensitive filesystems must retain both conversations"
+        );
+    }
+
+    #[test]
+    fn reconstruction_output_path_bounds_untrusted_filename_hints() {
+        let target = Path::new("recover");
+        let external_id = "id".repeat(4096);
+        let original = format!("{}.jsonl", "source".repeat(4096));
+        let out =
+            reconstruction_output_path(target, i64::MAX, Some(&external_id), Path::new(&original));
+        assert_eq!(out.parent(), Some(target));
+        let name = out.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.len() <= 200,
+            "bounded filename, got {} bytes",
+            name.len()
+        );
+        assert!(
+            name.contains(&i64::MAX.to_string()),
+            "identity is never truncated"
+        );
+        assert!(name.ends_with(".jsonl"));
+    }
+
+    #[test]
+    fn recovery_publication_preserves_verbatim_lines_and_private_permissions() -> std::io::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let output = temp.path().join("session.jsonl");
+        let lines = vec![
+            r#" { "text": "verbatim δ", "escape": "\n" } "#.to_string(),
+            String::new(),
+            "{\"last\": true}\r".to_string(),
+        ];
+        assert!(matches!(
+            publish_reconstructed_session(&output, &lines)?,
+            ReconstructionPublication::Published
+        ));
+        assert_eq!(
+            std::fs::read(&output)?,
+            " { \"text\": \"verbatim δ\", \"escape\": \"\\n\" } \n\n{\"last\": true}\r\n"
+                .as_bytes()
+        );
+        assert_eq!(std::fs::read_dir(temp.path())?.count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(&output)?.permissions().mode() & 0o077, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_publication_refuses_existing_files_hardlinks_and_directories() -> std::io::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let existing = temp.path().join("existing.jsonl");
+        let alias = temp.path().join("hardlink.jsonl");
+        let directory = temp.path().join("directory.jsonl");
+        std::fs::write(&existing, b"operator-owned evidence\n")?;
+        std::fs::hard_link(&existing, &alias)?;
+        std::fs::create_dir(&directory)?;
+        for path in [&existing, &alias, &directory] {
+            assert!(matches!(
+                publish_reconstructed_session(path, &["replacement".to_string()])?,
+                ReconstructionPublication::DestinationConflict { staged_path: None }
+            ));
+        }
+        assert_eq!(std::fs::read(&existing)?, b"operator-owned evidence\n");
+        assert_eq!(std::fs::read(&alias)?, b"operator-owned evidence\n");
+        assert!(directory.is_dir());
+        assert_eq!(
+            std::fs::read_dir(temp.path())?.count(),
+            3,
+            "no retry stages"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_publication_refuses_live_and_dangling_symlinks() -> std::io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let original = temp.path().join("original.jsonl");
+        let missing = temp.path().join("missing.jsonl");
+        std::fs::write(&original, b"original source bytes\n")?;
+        for (name, target) in [("live.jsonl", &original), ("dangling.jsonl", &missing)] {
+            let output = temp.path().join(name);
+            symlink(target, &output)?;
+            assert!(matches!(
+                publish_reconstructed_session(&output, &["replacement".to_string()])?,
+                ReconstructionPublication::DestinationConflict { staged_path: None }
+            ));
+            assert_eq!(std::fs::read_link(&output)?, *target);
+        }
+        assert_eq!(std::fs::read(&original)?, b"original source bytes\n");
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(temp.path())?.count(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_publication_retains_partial_stage_without_final_file() -> std::io::Result<()> {
+        use std::io::Write as _;
+
+        let temp = tempfile::tempdir()?;
+        let output = temp.path().join("session.jsonl");
+        let error = publish_reconstruction(&output, |file| {
+            file.write_all(b"partial recovery evidence")?;
+            Err(std::io::Error::other("injected session write failure"))
+        })
+        .expect_err("a failed session write cannot be published");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.to_string().contains("injected session write failure"));
+        assert_eq!(
+            std::fs::symlink_metadata(&output).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let retained: Vec<_> = std::fs::read_dir(temp.path())?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<_>>()?;
+        assert_eq!(
+            retained.len(),
+            1,
+            "failed evidence is retained, not deleted"
+        );
+        let stage = &retained[0];
+        assert_eq!(
+            stage.extension().and_then(|part| part.to_str()),
+            Some("partial")
+        );
+        assert!(
+            stage
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".cass-recovery-")
+        );
+        assert!(error.to_string().contains(&stage.display().to_string()));
+        assert_eq!(std::fs::read(stage)?, b"partial recovery evidence");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(stage)?.permissions().mode() & 0o077, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_publication_race_keeps_one_complete_file_and_conflict_evidence()
+    -> std::io::Result<()> {
+        use std::io::Write as _;
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir()?;
+        let output = temp.path().join("session.jsonl");
+        let barrier = Arc::new(Barrier::new(2));
+        let writers = (*b"ab").map(|marker| {
+            let output = output.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let payload = vec![marker; 65_536];
+                let result = publish_reconstruction(&output, |file| {
+                    file.write_all(&payload)?;
+                    // Both writers have passed preflight and staged their full
+                    // bytes before either is allowed to publish.
+                    barrier.wait();
+                    Ok(())
+                });
+                (marker, result)
+            })
+        });
+        let mut winner = None;
+        let mut conflicts = 0;
+        for writer in writers {
+            let (marker, result) = writer.join().expect("recovery writer");
+            match result? {
+                ReconstructionPublication::Published => {
+                    assert!(winner.replace(marker).is_none(), "only one publisher");
+                }
+                ReconstructionPublication::DestinationConflict {
+                    staged_path: Some(stage),
+                } => {
+                    conflicts += 1;
+                    assert_eq!(std::fs::read(&stage)?, vec![marker; 65_536]);
+                    assert_eq!(
+                        stage.extension().and_then(|part| part.to_str()),
+                        Some("partial")
+                    );
+                }
+                other => {
+                    return Err(std::io::Error::other(format!(
+                        "both writers passed preflight: {other:?}"
+                    )));
+                }
+            }
+        }
+        assert_eq!(conflicts, 1);
+        assert_eq!(
+            std::fs::read(&output)?,
+            vec![winner.expect("one winner"); 65_536]
+        );
+        assert_eq!(std::fs::read_dir(temp.path())?.count(), 2);
+        Ok(())
     }
 
     #[test]

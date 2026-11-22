@@ -625,6 +625,7 @@ fn complete_shard_generation_candidate_exists(
     }))
 }
 
+#[derive(Debug)]
 struct AdmittedSemanticShardGeneration {
     artifacts: Vec<SemanticIndexArtifact>,
     db_fingerprint: String,

@@ -9041,6 +9041,177 @@ fn recover_from_archive_reports_quarantined_and_coerced_rows() {
     );
 }
 
+#[test]
+fn recover_from_archive_keeps_colliding_sessions_and_reports_existing_destinations() {
+    use coding_agent_search::franken_sync::params;
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let data_dir = temp.path().join("data");
+    let target = temp.path().join("recovered");
+    fs::create_dir_all(&home).expect("home");
+    fs::create_dir_all(&data_dir).expect("data dir");
+    fs::create_dir_all(&target).expect("recovery dir");
+    let db_path = data_dir.join("agent_search.db");
+    let mut expected = BTreeMap::new();
+    let blocked_id;
+    {
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let conn = storage.raw();
+        conn.execute_compat(
+            "INSERT INTO agents(slug, name, version, kind, created_at, updated_at) \
+             VALUES('claude', 'Claude Code', NULL, 'cli', 1000, 1000)",
+            params![],
+        )
+        .expect("insert agent");
+        let agent_id: i64 = conn
+            .query_row_map("SELECT last_insert_rowid()", params![], |row| {
+                row.get_typed::<i64>(0)
+            })
+            .expect("agent id");
+        conn.execute_compat(
+            "INSERT INTO sources(id, kind, host_label, created_at, updated_at) \
+             VALUES('recovery-remote', 'ssh', 'remote', 1000, 1000)",
+            params![],
+        )
+        .expect("insert remote source");
+
+        // The first row is blocked by an operator-owned file. The remaining
+        // rows must still be recovered, even when their readable hints collide.
+        for (source, external_id, source_path) in [
+            ("local", "blocked-session", "/orig/existing.jsonl"),
+            ("local", "shared-session", "/local/same.jsonl"),
+            ("recovery-remote", "shared-session", "/remote/same.jsonl"),
+            ("local", "branch/a", "/orig/same.jsonl"),
+            ("local", "branch?a", "/orig/same.jsonl"),
+        ] {
+            conn.execute_compat(
+                "INSERT INTO conversations(agent_id, source_id, external_id, source_path, started_at) \
+                 VALUES(?1, ?2, ?3, ?4, 1000)",
+                params![agent_id, source, external_id, source_path],
+            )
+            .expect("insert conversation");
+            let cid: i64 = conn
+                .query_row_map("SELECT last_insert_rowid()", params![], |row| {
+                    row.get_typed::<i64>(0)
+                })
+                .expect("conversation id");
+            let raw = format!(r#"{{ "type": "user", "uuid": "u{cid}", "text": "verbatim δ" }}"#);
+            let wrapper = json!({ "__cass_historical_raw_json__": raw }).to_string();
+            conn.execute_compat(
+                "INSERT INTO messages(conversation_id, idx, role, created_at, content, extra_json) \
+                 VALUES(?1, 0, 'user', 1000, 'verbatim δ', ?2)",
+                params![cid, wrapper],
+            )
+            .expect("insert preserved message");
+            expected.insert(cid, format!("{raw}\n"));
+        }
+        blocked_id = *expected.keys().next().expect("first conversation");
+    }
+
+    let blocked_path = target.join(format!(
+        "conversation-{blocked_id}__blocked-session__existing.jsonl"
+    ));
+    let operator_bytes = b"operator-owned recovery evidence\n";
+    fs::write(&blocked_path, operator_bytes).expect("existing evidence");
+    let mut recovered_paths = BTreeMap::new();
+
+    for (written, conflicts) in [(4, 1), (0, 5)] {
+        let out = cass_cmd(&home)
+            .args([
+                "doctor",
+                "--recover-from-archive",
+                target.to_str().expect("utf8"),
+                "--json",
+                "--data-dir",
+                data_dir.to_str().expect("utf8"),
+                "--db",
+                db_path.to_str().expect("utf8"),
+            ])
+            .output()
+            .expect("run recover");
+        assert!(
+            out.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let envelope: Value = serde_json::from_slice(&out.stdout).expect("recovery JSON");
+        assert_eq!(envelope["sessions_written"], json!(written), "{envelope:#}");
+        assert_eq!(envelope["lines_written"], json!(written), "{envelope:#}");
+        assert_eq!(
+            envelope["sessions_skipped"],
+            json!(conflicts),
+            "{envelope:#}"
+        );
+        assert_eq!(
+            envelope["sessions_conflicted"],
+            json!(conflicts),
+            "{envelope:#}"
+        );
+        assert!(
+            envelope["next_action"].as_str().is_some_and(|action| {
+                action.contains(&format!(
+                    "{conflicts} session(s) were not recovered by this run"
+                )) && action.contains("empty target directory")
+            }),
+            "{envelope:#}"
+        );
+        let sessions = envelope["sessions"].as_array().expect("sessions");
+        assert_eq!(sessions.len(), expected.len(), "{envelope:#}");
+        for session in sessions {
+            let cid = session["conversation_id"]
+                .as_i64()
+                .expect("conversation id");
+            if let Some(path) = session["written_path"].as_str() {
+                assert_ne!(cid, blocked_id, "operator-owned file must be refused");
+                assert!(session["skipped_reason"].is_null(), "{session:#}");
+                assert_eq!(
+                    fs::read(path).expect("recovered bytes"),
+                    expected[&cid].as_bytes()
+                );
+                assert!(
+                    recovered_paths
+                        .insert(cid, Path::new(path).to_path_buf())
+                        .is_none()
+                );
+            } else {
+                assert_eq!(session["line_count"], json!(0), "{session:#}");
+                assert!(
+                    session["skipped_reason"].as_str().is_some_and(|reason| {
+                        reason.starts_with("recovery destination already exists")
+                    }),
+                    "{session:#}"
+                );
+            }
+        }
+        assert_eq!(
+            fs::read(&blocked_path).expect("preserved evidence"),
+            operator_bytes
+        );
+        assert_eq!(fs::read_dir(&target).expect("recovery files").count(), 5);
+    }
+
+    assert_eq!(
+        recovered_paths.len(),
+        4,
+        "one separate file per unblocked row"
+    );
+    let unique_paths: std::collections::BTreeSet<_> = recovered_paths.values().collect();
+    assert_eq!(
+        unique_paths.len(),
+        4,
+        "source and sanitized-ID collisions stay distinct"
+    );
+    for (cid, path) in recovered_paths {
+        assert_eq!(
+            fs::read(path).expect("retry preserved bytes"),
+            expected[&cid].as_bytes()
+        );
+    }
+}
+
 /// f3grf: indexing one Claude Code session leaves exactly one raw-mirror
 /// manifest, linked to its conversation, so a fresh install's doctor has no
 /// unlinked evidence to warn about. On main 387ff6bf the pre-parse capture
