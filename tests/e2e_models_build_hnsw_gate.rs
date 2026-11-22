@@ -733,6 +733,212 @@ fn models_hnsw_maintenance_refuses_unsafe_or_colliding_declarations() -> Result<
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn models_hnsw_maintenance_reserves_missing_archive_aliases() -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let fixture = semantic_fixture()?;
+    declare_native_graph(&fixture, "vector_index/existing-selected.chsw")?;
+    let writer_lease_path = fixture.data_dir.join("agent_search.db.cass-index-run.lock");
+    let writer_lease = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&writer_lease_path)
+        .map_err(|error| error.to_string())?;
+    writer_lease.lock().map_err(|error| error.to_string())?;
+    let lease_metadata = writer_lease.metadata().map_err(|error| error.to_string())?;
+    let assert_writer_lease_held = || -> Result<(), String> {
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&writer_lease_path)
+            .map_err(|error| error.to_string())?;
+        let metadata = contender.metadata().map_err(|error| error.to_string())?;
+        if (metadata.dev(), metadata.ino()) != (lease_metadata.dev(), lease_metadata.ino()) {
+            return Err("HNSW maintenance replaced the held archive writer lease inode".into());
+        }
+        match contender.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) => Ok(()),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.to_string()),
+            Ok(()) => Err("a competing handle acquired the still-held archive writer lease".into()),
+        }
+    };
+    assert_writer_lease_held()?;
+    let unrelated_db = fixture.home.join("unrelated-uncreated.sqlite3");
+    let unrelated_arg = unrelated_db.to_str().ok_or("non-UTF-8 control path")?;
+    let control = run(
+        &fixture,
+        "declared_hnsw_unrelated_missing_archive_control",
+        &[
+            "--db",
+            unrelated_arg,
+            "models",
+            "build-hnsw",
+            "--json",
+            "--check",
+        ],
+        MODELS_TIMEOUT,
+    );
+    let control_json = json_stdout(&control, "unrelated missing archive control")?;
+    if !control.status.success()
+        || str_at(&control_json, "state_before") != "native_valid"
+        || unrelated_db.exists()
+    {
+        return Err(format!(
+            "unrelated missing archive must permit read-only checking: {control_json}"
+        ));
+    }
+
+    let parent_alias = fixture.home.join("archive-parent-alias");
+    std::os::unix::fs::symlink(&fixture.data_dir, &parent_alias)
+        .map_err(|error| error.to_string())?;
+    let filename = "uncreated-custom-archive.sqlite3";
+    let reserved = fixture.data_dir.join(filename);
+    let absolute_alias = fixture.home.join("archive-absolute-link.sqlite3");
+    std::os::unix::fs::symlink(&reserved, &absolute_alias).map_err(|error| error.to_string())?;
+    let relative_alias = fixture.home.join("archive-relative-link.sqlite3");
+    std::os::unix::fs::symlink(Path::new("cass-data").join(filename), &relative_alias)
+        .map_err(|error| error.to_string())?;
+    let chain_alias = fixture.home.join("archive-link-chain.sqlite3");
+    std::os::unix::fs::symlink(&relative_alias, &chain_alias).map_err(|error| error.to_string())?;
+
+    let links_before = [
+        &parent_alias,
+        &absolute_alias,
+        &relative_alias,
+        &chain_alias,
+    ]
+    .into_iter()
+    .map(|path| {
+        std::fs::read_link(path)
+            .map(|target| (path.clone(), target))
+            .map_err(|error| error.to_string())
+    })
+    .collect::<Result<Vec<_>, String>>()?;
+    let archive_snapshot = || -> Result<Vec<Option<Vec<u8>>>, String> {
+        [
+            "agent_search.db",
+            "agent_search.db-wal",
+            "agent_search.db-shm",
+            "agent_search.db-journal",
+            "agent_search.db.cass-index-run.lock",
+        ]
+        .into_iter()
+        .map(|name| match std::fs::read(fixture.data_dir.join(name)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.to_string()),
+        })
+        .collect()
+    };
+    let archive_before = archive_snapshot()?;
+    let custom_archives = [
+        parent_alias.join(filename),
+        absolute_alias,
+        relative_alias,
+        chain_alias,
+        fixture
+            .home
+            .join("not-created/../archive-relative-link.sqlite3"),
+    ];
+    for suffix in ["", "-wal", "-shm", "-journal", ".cass-index-run.lock"] {
+        let output_relative = format!("{filename}{suffix}");
+        let protected_output = fixture.data_dir.join(&output_relative);
+        let mut manifest = load_manifest(&fixture.data_dir)?;
+        manifest
+            .hnsw
+            .as_mut()
+            .ok_or("missing graph record")?
+            .index_path = output_relative;
+        manifest
+            .save(&fixture.data_dir)
+            .map_err(|error| error.to_string())?;
+        let semantic_before = file_snapshot(&fixture.data_dir.join("vector_index"))?;
+        for custom_archive in &custom_archives {
+            let custom_arg = custom_archive.to_str().ok_or("non-UTF-8 archive alias")?;
+            for mode in ["--check", "--force"] {
+                let out = run(
+                    &fixture,
+                    "declared_hnsw_refused_missing_archive_alias",
+                    &["--db", custom_arg, "models", "build-hnsw", "--json", mode],
+                    MODELS_TIMEOUT,
+                );
+                let rendered = format!("{}{}", text(&out.stdout), text(&out.stderr));
+                if out.status.code() != Some(5)
+                    || !rendered.contains("collides with protected archive data")
+                    || protected_output
+                        .try_exists()
+                        .map_err(|error| error.to_string())?
+                    || reserved.try_exists().map_err(|error| error.to_string())?
+                    || file_snapshot(&fixture.data_dir.join("vector_index"))? != semantic_before
+                    || archive_snapshot()? != archive_before
+                {
+                    return Err(format!(
+                        "{mode} for suffix {suffix:?} via {custom_archive:?} must preserve reserved archive and semantic artifacts: {rendered}"
+                    ));
+                }
+                for (path, target) in &links_before {
+                    if std::fs::read_link(path).map_err(|error| error.to_string())? != *target {
+                        return Err(format!("archive alias changed: {path:?}"));
+                    }
+                }
+            }
+        }
+    }
+    // Existing archive sidecars must also survive an alternate database
+    // filename. A lexical suffix on the alias does not name the target WAL.
+    let existing_target = fixture.data_dir.join("agent_search.db");
+    let existing_alias = fixture.home.join("existing-archive-link.sqlite3");
+    std::os::unix::fs::symlink(&existing_target, &existing_alias)
+        .map_err(|error| error.to_string())?;
+    let existing_arg = existing_alias
+        .to_str()
+        .ok_or("non-UTF-8 existing archive alias")?;
+    for suffix in ["", "-wal", "-shm", "-journal", ".cass-index-run.lock"] {
+        let mut manifest = load_manifest(&fixture.data_dir)?;
+        manifest
+            .hnsw
+            .as_mut()
+            .ok_or("missing graph record")?
+            .index_path = format!("agent_search.db{suffix}");
+        manifest
+            .save(&fixture.data_dir)
+            .map_err(|error| error.to_string())?;
+        let semantic_before = file_snapshot(&fixture.data_dir.join("vector_index"))?;
+        for mode in ["--check", "--force"] {
+            let out = run(
+                &fixture,
+                "declared_hnsw_refused_existing_archive_alias",
+                &["--db", existing_arg, "models", "build-hnsw", "--json", mode],
+                MODELS_TIMEOUT,
+            );
+            let rendered = format!("{}{}", text(&out.stdout), text(&out.stderr));
+            if out.status.code() != Some(5)
+                || file_snapshot(&fixture.data_dir.join("vector_index"))? != semantic_before
+                || archive_snapshot()? != archive_before
+                || std::fs::read_link(&existing_alias).map_err(|error| error.to_string())?
+                    != existing_target
+            {
+                return Err(format!(
+                    "{mode} must preserve existing archive and sidecar {suffix:?} through its alias: {rendered}"
+                ));
+            }
+        }
+    }
+    assert_writer_lease_held()?;
+    drop(writer_lease);
+    let after_release = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&writer_lease_path)
+        .map_err(|error| error.to_string())?;
+    after_release
+        .try_lock()
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[test]
 fn index_build_hnsw_maintains_already_published_vectors() -> Result<(), String> {
     let fixture = semantic_fixture()?;

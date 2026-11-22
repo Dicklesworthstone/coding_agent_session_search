@@ -131,26 +131,62 @@ pub(crate) struct HnswMaintenancePath {
     pub(crate) relative_path: String,
 }
 
-fn portable_path_key(path: &Path, cwd: &Path) -> Vec<String> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                normalized.pop();
+fn maintenance_path_identity(path: &Path, cwd: &Path) -> Result<PathBuf> {
+    let absolute = cwd.join(path);
+    let mut pending: std::collections::VecDeque<_> = absolute
+        .components()
+        .map(|component| component.as_os_str().to_os_string())
+        .collect();
+    let mut resolved = PathBuf::new();
+    let mut links = 0;
+    // canonicalize alone cannot reserve a missing archive reached through a
+    // dangling symlink. Follow existing links even when their targets are
+    // absent, preserving link/.. semantics and refusing cycles or unreadable
+    // identities instead of treating them as unrelated output names.
+    while let Some(part) = pending.pop_front() {
+        for component in Path::new(&part).components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    resolved.pop();
+                }
+                std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                    resolved.push(component.as_os_str());
+                }
+                std::path::Component::Normal(_) => {
+                    resolved.push(component.as_os_str());
+                    match std::fs::symlink_metadata(&resolved) {
+                        Ok(metadata) if metadata.file_type().is_symlink() => {
+                            anyhow::ensure!(
+                                links < 40,
+                                "HNSW path identity exceeds the symbolic-link resolution limit"
+                            );
+                            links += 1;
+                            let target = std::fs::read_link(&resolved)
+                                .context("reading protected HNSW path identity link")?;
+                            resolved.pop();
+                            for component in target.components().rev() {
+                                pending.push_front(component.as_os_str().to_os_string());
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(error).context("inspecting protected HNSW path identity");
+                        }
+                    }
+                }
             }
-            std::path::Component::CurDir => {}
-            other => normalized.push(other.as_os_str()),
         }
     }
-    normalized
+    Ok(crate::normalize_path_identity(&resolved))
+}
+
+fn portable_path_key(path: &Path, cwd: &Path) -> Result<Vec<String>> {
+    Ok(maintenance_path_identity(path, cwd)?
         .components()
         .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
-        .collect()
+        .collect())
 }
 
 /// Maintain the accelerator selected by the same ledger as its vector source.
@@ -212,6 +248,8 @@ pub(crate) fn hnsw_maintenance_path(
 
     // A manifest controls the accelerator location, not permission to replace
     // its source vectors, canonical history, publication ledger or privacy fence.
+    let cwd = std::env::current_dir()?;
+    let database_identity = maintenance_path_identity(db_path, &cwd)?;
     let mut protected = vec![
         db_path.to_path_buf(),
         SemanticManifest::path(data_dir),
@@ -222,11 +260,20 @@ pub(crate) fn hnsw_maintenance_path(
         data_dir.join("index-run.lock"),
         data_dir.join("semantic-backfill-artifacts.lock"),
         crate::search::privacy::state_path_for_database(db_path),
+        crate::search::privacy::state_path_for_database(&database_identity),
     ];
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let mut sidecar = db_path.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        protected.push(PathBuf::from(sidecar));
+    // Engines may derive sidecar names from the resolved database filename.
+    // Reserve both spellings; appending a suffix to an alias alone misses the
+    // target's WAL/SHM/journal when the database itself is a symbolic link.
+    for database in [db_path, database_identity.as_path()] {
+        // The writer lease owns its open inode. Replacing this pathname with
+        // an accelerator would let another writer acquire a fresh inode while
+        // the first writer still holds the original exclusive lock.
+        for suffix in ["-wal", "-shm", "-journal", ".cass-index-run.lock"] {
+            let mut sidecar = database.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            protected.push(PathBuf::from(sidecar));
+        }
     }
     for record in [manifest.fast_tier.as_ref(), manifest.quality_tier.as_ref()]
         .into_iter()
@@ -263,13 +310,12 @@ pub(crate) fn hnsw_maintenance_path(
             path.display()
         );
     }
-    // Reserve names before they exist too, including aliases on case-insensitive
-    // filesystems. Existing-file identity checks below also cover parent aliases.
-    let cwd = std::env::current_dir()?;
-    let candidate_key = portable_path_key(&path, &cwd);
+    // Reserve names before they exist, including aliases through existing or
+    // dangling links and case-insensitive spellings.
+    let candidate_key = portable_path_key(&path, &cwd)?;
     for protected_path in protected {
         anyhow::ensure!(
-            candidate_key != portable_path_key(&protected_path, &cwd),
+            candidate_key != portable_path_key(&protected_path, &cwd)?,
             "HNSW accelerator path collides with protected archive data: {}",
             protected_path.display()
         );
@@ -503,6 +549,66 @@ mod tests {
     fn hnsw_index_path_uses_expected_layout() {
         let p = hnsw_index_path(Path::new("/tmp/cass"), "minilm-384");
         assert!(p.ends_with("vector_index/hnsw-minilm-384.chsw"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn protected_path_identity_follows_missing_targets_and_relative_link_chains() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        fs::create_dir(root.join("data"))?;
+        let target = root.join("data/uncreated/archive.sqlite3");
+        let directory_alias = root.join("directory-alias");
+        std::os::unix::fs::symlink("data/uncreated", &directory_alias)?;
+        let leaf_alias = root.join("leaf-alias");
+        std::os::unix::fs::symlink("directory-alias/archive.sqlite3", &leaf_alias)?;
+        let chain_alias = root.join("chain-alias");
+        std::os::unix::fs::symlink(&leaf_alias, &chain_alias)?;
+        let expected = portable_path_key(&target, root)?;
+        for alias in [
+            directory_alias.join("archive.sqlite3"),
+            leaf_alias,
+            chain_alias,
+            root.join("not-created/../leaf-alias"),
+        ] {
+            assert_eq!(portable_path_key(&alias, root)?, expected);
+        }
+        assert_ne!(
+            portable_path_key(&root.join("other.sqlite3"), root)?,
+            expected
+        );
+        fs::create_dir_all(root.join("different/nested"))?;
+        std::os::unix::fs::symlink("different/nested", root.join("existing-link"))?;
+        assert_eq!(
+            portable_path_key(&root.join("existing-link/../missing.sqlite3"), root)?,
+            portable_path_key(&root.join("different/missing.sqlite3"), root)?
+        );
+        assert!(!target.exists());
+        fs::create_dir(root.join("data/uncreated"))?;
+        fs::write(&target, b"canonical archive control")?;
+        assert_eq!(portable_path_key(&target, root)?, expected);
+        assert_eq!(
+            portable_path_key(&root.join("chain-alias"), root)?,
+            expected
+        );
+        assert_eq!(fs::read(target)?, b"canonical archive control");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn protected_path_identity_refuses_symbolic_link_cycles() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::os::unix::fs::symlink(&second, &first)?;
+        std::os::unix::fs::symlink(&first, &second)?;
+        let error = portable_path_key(&first, temp.path()).expect_err("cycle must be refused");
+        assert!(error.to_string().contains("resolution limit"));
+        assert!(portable_path_key(&first.join("missing.sqlite3"), temp.path()).is_err());
+        assert!(fs::symlink_metadata(first)?.file_type().is_symlink());
+        assert!(fs::symlink_metadata(second)?.file_type().is_symlink());
+        Ok(())
     }
 
     #[test]
