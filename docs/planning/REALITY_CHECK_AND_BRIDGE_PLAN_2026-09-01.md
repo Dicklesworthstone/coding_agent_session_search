@@ -1,4 +1,351 @@
-# Reality Check and Bridge Plan — refreshed 2026-11-04
+# Reality Check and Bridge Plan — refreshed 2026-11-21
+
+## Assessment: 2026-11-21 (GreenCondor)
+
+**CASS delivers a real, useful history-search product. It does not yet deliver
+the complete reliability, privacy, semantic lifecycle and resource behavior in
+its vision, and current main is not release-qualified.** The central problem is
+no longer missing command scaffolding. It is making implemented paths remain
+correct together, under ordinary ingestion, retained readers, deletion, restart,
+large archives and real platform constraints.
+
+This refresh supersedes the older shipping and infrastructure premises below.
+The latest public release is **v0.11.0, published November 5**, not v0.10.0.
+GitHub, Homebrew and Scoop agree on that version; crates.io still serves 0.7.0.
+The installed Linux executable is byte-identical to the published artifact.
+Those facts do not establish that the next source candidate is safe to ship.
+
+### Scope, identities and evidence rules
+
+- Read completely: suite `/data/projects/AGENTS.md` (663 lines), project
+  `AGENTS.md` (1,391) and `README.md` (4,162). The governing files and README
+  were unchanged through the four incoming source commits described below.
+- Reviewed the previous bridge assessment, original project/semantic/Pages
+  plan goals, current semantic publication/progressive/external contracts,
+  persistent service and transcript contracts, resident admission, raw-mirror
+  policy, answer-pack conformance, TUI architecture and doctor release
+  checklist. Historical plans are inventoried context; this does not claim
+  every line of every historical plan or retained artifact was reread.
+- Initial tracked source: `fd0bbecb14c4ae3a78de3fb79aeee7eb7eee2224`, **304
+  commits after v0.11.0**. A detached QA checkout at
+  `/data/projects/cass-reality-check-20261121-greencondor` freezes that source.
+  Source-content digest for its requested Rust gate:
+  `46daffd5daf4181833d094585e63c548b9a57f34ce630a72d50ea7cd673f86da`.
+  The source identity is retained in `gate.receipt`.
+- Main advanced through `466378db` (semantic request privacy fence),
+  `8085df84` (fast-command bridge teardown), `743c547c` (rolled-back index
+  writability probe), and `46537d8c` (retained semantic privacy epochs and ANN
+  association). Their code and stated limits were reviewed. They contain real
+  fixes, but their commit messages explicitly leave native validation and/or
+  strict UBS incomplete. Neither an older failure count nor a future pass on
+  `fd0bbecb` qualifies these newer bytes.
+- Live GitHub release metadata, package manifests, the 34 open GitHub issue
+  bodies and the durable work graph were inspected. Issue reports are
+  attributed evidence, distinct from independently executed probes.
+- Receipts are retained privately under
+  `/data/tmp/cass-reality-check-20261121/`. Each journey command retains argv,
+  exit, elapsed time, stdout and stderr. The independent verifier retains exact
+  expected counts and negative assertions. Synthetic credentials are inert;
+  no owner archive or real provider log was used or modified.
+- All executed checks go through DSR. Rust compilation/test requests use
+  `scripts/gate.sh` through RCH with remote execution required. No Actions
+  workflow was created, enabled, dispatched, rerun or used as evidence. No
+  browser was launched on the shared development machine. No gate, golden,
+  dependency pin, source file or peer implementation was changed for this audit.
+
+The status vocabulary below is deliberately scoped: **WORKING-R** means
+independently observed in the released Linux fixture; **IMPLEMENTED / UNPROVEN**
+means source exists but this run has not established its complete behavior;
+**PARTIAL** names an actual missing integration or qualification obligation.
+An empty test selection, queued job, ignored case, process failure or host health
+check cannot become a product pass.
+
+### What ran, and what it proves
+
+The downloaded Linux amd64 release archive has SHA-256
+`d7b3804847c0b39dd3831e82e4a40d85549147147196810805638f211c5c9812`.
+Its extracted executable and `/home/ubuntu/.local/bin/cass` both hash to
+`03351c3c350d543f5374184a682ee27c1158153e4f3034f76fe1acceef87208e`.
+The API reports build commit `unknown`; the live artifact digest establishes
+release identity instead of inferring a build from its version string.
+
+The fresh DSR journey used **45 Claude conversations, 3,816 messages**, including
+one 3,000-message conversation, title-free Boolean controls, a 60-day-old
+conversation and planted credentials. Only the Claude connector was enabled in
+a private configuration; no home-directory or Codex-home variable was replaced.
+It ran **35 commands and 61 assertions: 59 passed, two failed**.
+
+| Outcome | Executed evidence and limit |
+|---|---|
+| First index and canonical storage | Exactly 45 conversations / 3,816 messages; health becomes healthy. Initial indexing took 2.80 s on this small fixture. |
+| Ordinary retrieval | Exact marker and large-conversation hits; AND/OR precedence, grouping, NOT and phrase controls return the prescribed counts; age and wrong-agent negatives exclude the right records. |
+| Repeat and append | No-op preserves both counts; one append preserves conversation count and adds exactly one searchable message. Stock `sqlite3 -readonly` returns `quick_check=ok`, 45 / 3,817. This is bounded interoperability, not damaged-archive recovery. |
+| Agent workflow | `view`, `expand`, a nonempty cited pack, timeline, read-only doctor, source inventory and scheduler preview complete; malformed dates return exit 2. No destructive forget or cleanup apply was run. |
+| Missing-model behavior | Default hybrid realizes lexical and reports it; explicit semantic returns exit 15. This does not test neural relevance. |
+| Export privacy | A conventional GitHub-token fixture is redacted. A planted `DB_PASSWORD=...` value remains in **both HTML and Markdown**. These two assertions fail, independently reproducing the shipped GH547 defect. The DSR aggregate correctly stays RED. |
+
+Sampled lexical/Boolean one-shot calls took 63.5–66.8 ms wall time. This tiny
+corpus does not establish the README engine-latency claim at archive scale, a
+hard RSS bound, or an improvement over another build. The first journey used a
+management-only `--source-path` form for a deletion preview and got usage exit 2;
+the corrected complete run uses the release's `--source-glob` selector. That
+first harness mismatch is retained and is not a product-regression claim.
+
+Separately, DSR executed the existing production Pages worker targets:
+
+```text
+node --test tests/pages/crypto-worker-admission.test.mjs \
+  tests/pages_crypto_prefetch.mjs tests/pages/crypto-worker-unlock.test.mjs
+51 passed; 0 failed; 0 skipped; exit 0
+```
+
+Those tests cover real WebCrypto AES-GCM/HKDF, DEFLATE, HTTP/worker behavior and
+the bounded admission/cancellation paths. Argon2 scheduling includes controlled
+test doubles. This does not prove native Argon2-WASM, browser SQLite-WASM,
+Playwright unlock/recovery/revocation, offline rendering or mobile memory usage.
+`dsr-pages.json` and its hashed full log preserve this distinction.
+
+The frozen-source Rust gate requests full library tests, all-target Clippy,
+robot/bookmarks/metamorphic/Pages/service/index integrations, progressive
+fast-reuse/rank-evidence regressions, goldens, docs truth and scoped strict UBS.
+Its RCH job remained **queued without starting**. A fresh read-only admission
+check denied every worker for occupied slots, disk reservation/headroom limits,
+disabled status or memory pressure. Only this assessment's wrapper
+`rchw-22062d23-10e0-44f3-a41d-acd5e7b08a16` (queue ID
+`9253469360607992213`) was cancelled. RCH returned
+`cancelled_before_start`, exit 130, zero released slots. There is no compiler or
+runtime stage result. The admission outcome is infrastructure evidence, not a
+Rust failure or success. The DSR aggregate and full terminal log retain that
+unexecuted qualification attempt.
+
+The terminal gate log records `STAGE=rch EXIT=130`; identity, freshness, fmt,
+Clippy, library/integration/bin tests, goldens, docs truth and UBS stages are
+all `EXIT=missing`. The outer gate/DSR check returns exit 1, as it should.
+RCH's final lease state is finished with terminal acknowledgement. No local
+Rust fallback, worker-policy change or resource-floor override was used.
+
+### Current source: substantial implementation with unresolved composition
+
+The FAD registry and CASS wrappers are real; 34 connectors are advertised and
+registered. Production canonical storage uses FrankenSQLite and the synchronous
+bridge; `rusqlite` is a dev-only oracle dependency. The storage family remains
+uniformly pinned at 0.4.12. Quill and native model/ANN surfaces come through the
+exact Frankensearch git contract, with the explicit legacy-v9 adapter. There is
+no basis for describing this as an unfinished parser or search-engine skeleton.
+A keyword and Rust-AST scan found no `todo!()` / `unimplemented!()` production
+scaffolding; the notable Codex TODO names a second full parse, a cost issue.
+
+That architecture is not complete integration. Native progressive library
+readers and hydration/refill exist, but ordinary vector artifacts still initialize
+`owner_backed_progressive_reader=false`; the normal CLI/TUI cannot infer full
+progressive capability from those APIs. Status deliberately reports
+`hnsw_ready=false` rather than certifying a sidecar it has not admitted. Default
+indexing still admits one writer; enabling engine concurrent mode does not prove
+a whole-job concurrent-write benefit. The source's five largest central files
+contain roughly 350,000 lines, concentrating verification and shared-edit risk;
+this is context for targeted ownership, not a reason to launch a refactor campaign.
+
+The newest issue, [GH566](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/566),
+reports **9,527 library passes, 27 failures and 86 ignored** at the exact frozen
+revision, plus semantic, index/reconciliation, exclusion, OpenClaw, pack/schema
+and golden failures. Its retained-reader forget case reportedly returns a
+forgotten private hit. This run has not independently executed those Rust tests.
+Later `466378db` and `46537d8c` specifically address that privacy boundary;
+`743c547c` addresses writable-preflight epoch churn. These fixes remain
+**implemented / unqualified**, rather than either absent or proved green.
+
+### Numbered vision checklist and coverage
+
+Bead suffixes below all use `coding_agent_session_search-`. Source locations
+identify the actual owning path, not proof that every path passes today.
+
+| # | Concrete README / plan goal | Current reality | Code / evidence | Existing or added coverage |
+|---|---|---|---|---|
+| 1 | Discover all 34 advertised providers | Real registry; complete native provider acceptance UNPROVEN | `src/connectors/mod.rs`, FAD pin; released capabilities inventory | `cooow`, `.24`, provider owners; `bonsai-durable-stores-j977x` is a requested extension, not a missing promised 35th connector |
+| 2 | Batch/watch/quarantine preserve provider semantics | PARTIAL qualification, especially explicit SQLite/WAL selection | `ConnectorKind`, source-boundary adapters, GH543 report | GH538; `openclaw-target-freshness-wiq1p` |
+| 3 | Durable pure-Rust canonical SQLite archive | WORKING-R on synthetic lifecycle; engine/large-archive proof remains | `src/franken_sync.rs`, `src/storage/sqlite.rs`; stock readback | `.65`, `scohn`, engine owners |
+| 4 | Stable identity, append/no-op/dedup/forget | WORKING-R append/no-op and preview; retained-reader deletion remains critical | canonical unique identities, privacy fences; GH566 | `fx9fd`, `fenc7`, `gh565-forget-memory`, `release-regressions-32lfj` |
+| 5 | Routine indexing cost follows its obligation | PARTIAL; reuse exists but repeated reads and ID-span overhead are reported | diagnostics pre-scan, source ledger, Quill shard leases | `.86`, GH558; added `codex-prescan-reuse-iuc85`, `append-source-cost-mqddv`, `lexical-docid-space-wkv2j` |
+| 6 | Host-safe indexing and durable resume | PARTIAL; controls/checkpoints are real, not hard RSS quotas | `responsiveness`, lexical replay/checkpoint/publish; GH496 | `.46`, `.72`, `gm63q`, `se525` |
+| 7 | Preserve raw source evidence with explicit retention | PARTIAL; chunked capture/audited retention real, coverage and compression gaps remain | `src/raw_mirror*`; GH542/GH562 | `.26`, `.69`; `raw-mirror-paused-truth-i4cmb`, `mirror-chunk-compression-29ux5` |
+| 8 | Archive-first diagnosis/repair/restore preserves authority | Real candidates/fingerprints/backups; damaged-owner recovery UNPROVEN | doctor v2 paths/release checklist | `scohn`, `.2`–`.6`, `.73`; `doctor-bundle-memory-0md5q` |
+| 9 | Complete versioned logical archive round trip | IMPLEMENTED / UNPROVEN here; v3 preserves allocation history | logical codec/export/import/verify; `docs/LOGICAL_ARCHIVE.md` | `.34`, `svhcf`, `p94yt` |
+| 10 | Correct lexical Boolean/phrase/wildcard/filter retrieval | WORKING-R sampled grammar; accented v9 fix exists but not freshly qualified | Quill bridge; `search_frankensearch_integration`, service cases | `.11`, `.68`; `accented-lexical-proof-82z2k` |
+| 11 | Missing/corrupt lexical assets rebuild atomically | Real off-live replay/publish pipeline; freshness/recovery regressions reported | indexer publish/checkpoint and validation; GH566 | `h3jnv`, `.46`, `.48`, `dnluu`, `release-regressions-32lfj` |
+| 12 | Default hybrid fails open truthfully when models are absent | WORKING-R missing-model case | requested/realized metadata and explicit semantic refusal | `.11`, `ds7uy.4` |
+| 13 | Useful local neural search with opt-in model acquisition | IMPLEMENTED; no fresh model-backed execution in this run | native MiniLM, model manager, immutable embedding identity | `jyfuq.2`, `bzurv`, `.33` |
+| 14 | Real progressive fast-to-quality delivery | PARTIAL; owner-backed library capability does not activate ordinary clients | progressive hydration; artifact owner capability false | `ds7uy.1`–`.5`, `jyfuq` |
+| 15 | Semantic generations stay useful and correct through ingest | PARTIAL; certified subsets and per-embedder catch-up exist; hydration/privacy tests reported red | semantic coverage, external ownership, latest epoch-fence fixes | `962e8`, `gh561-external-coverage`, `ds7uy.*`, GH566 |
+| 16 | Native ANN stays correct across shards/WAL/restarts | PARTIAL; exact fallback differs from accelerated qualification | `ann_index`, manifest-selected maintenance at fd0bbecb | `ds7uy.3.3`, `of9i7`, `wfm4e`, `ann-maintenance-path-ie22v` |
+| 17 | Persistent service avoids repeated one-shot setup | Real stdio/MCP/one-shot/semantic service; scale benefit UNPROVEN here | `src/search_service*`, retained pools; transcript paging | `.32`, `o9ixv`, `3rz35` |
+| 18 | Bounded robot reads preserve actual input semantics | WORKING-R sampled errors/filter/fallback; resource bounds remain scoped | effective metadata, timeout/error policy | `.11`, `.68`, budget owners; `verbose-routing-jxoha` |
+| 19 | Stable JSON discovery, errors and goldens | PARTIAL; current golden/schema regressions reported | capabilities/introspect and golden targets | `.69`, `.85`, GH566 |
+| 20 | Deterministic cited private answer packs | WORKING-R one cited pack; contract matrix still contains Planned/Partial rows | answer-pack planner/rendering/conformance | `.20`, GH566 pack-budget case |
+| 21 | Trust distinguishes provenance from claim proof | PARTIAL by explicit contract; live likely/unverified/stale differ from trusted | trust scoring/correlation; README vocabulary | guided/swarm/trust owners |
+| 22 | Useful bounded live swarm cockpit | PARTIAL; Git/JSONL/Mail/RCH providers real; evidence provider unwired | swarm collector; unknown counts remain unknown | `.16`–`.18`, `oh96l`, `gnrxb` |
+| 23 | Guided operations execute advertised safe adapters | Real repair/onboarding/support adapters; all intents are not automatic mutation | guide runner and live-proof targets | `.19`, `5u82n` |
+| 24 | Responsive TUI details/views/recording | Extensive code; real terminal/platform/privacy acceptance incomplete | `src/ui/app.rs`, macro/asciicast/export paths | `.22`, `.54`, `tyvd1`, `pa4y2`, `jm6ah` |
+| 25 | Persistent CLI/TUI bookmarks | IMPLEMENTED / UNPROVEN in this run | FrankenSQLite bookmark store and Alt+E | bookmarks CLI regressions, `.26` |
+| 26 | Correct bounded analytics/dashboard | PARTIAL; real rollups, remaining engine memory and source classification | analytics, `src/storage/sqlite.rs`; GH565 rollup case | `.21`, `xn5a4`, `xcqqa`, `rril3`, GH566 |
+| 27 | Sharing-safe HTML/generic export and encryption | RELEASED DEFECT: prefixed password leaks; current fixes await qualification | actual HTML/Markdown files; credential redactor | `.84`, GH547/GH551, `nd6pc`, TUI privacy owners |
+| 28 | Private Pages export with password/recovery/revoke/rotate | Real implementation; 51 worker tests pass, browser journey UNPROVEN here | crypto worker/key lifecycle | `.23`, `70o8f`, `browser-e2e-lane-bnueb` |
+| 29 | Pages offline/mobile behavior within documented limits | PARTIAL; ciphertext bounds do not cap full plaintext/SQLite-WASM RSS | viewer/database/crypto worker contracts | `.23`, `.26`, browser lane |
+| 30 | Real additive multi-machine sync with provenance | IMPLEMENTED; no fresh fleet transport exercise | SSH/rsync/scp/SFTP, local mirror and reingest | `av59c`, `.24`; fixture success is not fleet success |
+| 31 | Watch/scheduler keep history fresh | PARTIAL; schedules/backoff real, idle writable descriptors can defer complete history | active writer probe, source receipts, background refresh | GH538, `v6ysi`, `0m49m`; `quiet-writer-freshness-12p1f` |
+| 32 | Concurrent storage improves actual whole indexing jobs | UNPROVEN benefit; default indexer remains one writer | engine concurrent mode and experimental persist path | `.29`; integrity precedes throughput claims |
+| 33 | Current verified multi-platform distribution | v0.11.0 shipped; next-candidate native/runtime/browser gates incomplete | live release assets/Homebrew/Scoop; crates 0.7.0 | `.25`, `yrjna`, `ytp3b`, `zztql`, GH566 |
+| 34 | Honest performance and coherent current contracts | PARTIAL; expensive obligation costs and historical task premises remain | timing fields, exact dependency contracts, current reports | `.26`, `.69`, `.86`, `.72`, existing perf owners |
+
+### Blockers and the answer to “would completing existing beads finish it?”
+
+**Before this pass: no complete delivery assurance.** All 34 original vision
+rows had broad umbrella coverage at this granularity; no wholly untracked
+top-level vision was found. However,
+fourteen current issue numbers had no explicit title/description/external-ref
+match in the durable tracker. That is a coverage finding, not a claim that
+fourteen features lacked implementation. Some source repairs already exist.
+The uncovered issue-specific obligations included published data omissions,
+resource scaling, raw recovery visibility and current regression acceptance.
+
+**After this pass: the actionable observed gaps are represented, but ticking
+statuses still would not establish full vision delivery.** Native complete
+semantic lifecycle, representative archive recovery/RSS, actual fleet transport,
+browser/mobile behavior and exact-artifact delivery require their named populated
+probes. Optional historical ideas need explicit retained-scope decisions rather
+than automatic promotion into release blockers. New feature requests (Bonsai,
+messages-only storage, compression) do not retroactively make the advertised
+34-provider product nonexistent.
+
+The most consequential blockers are:
+
+1. **Privacy across surfaces and time.** The published prefixed-secret export
+   leak is independently reproduced. Main has TUI password/macro/filename work
+   and semantic forget-fence work in progress. A request fence must survive
+   cached/blank queries, embedding/hydration interleavings, completed repair and
+   retained old owners; new owners after explicit reload provide the positive
+   control. No passing ordinary search can stand in for that lifecycle proof.
+2. **Current-source regression acceptance.** GH566's exact-source failures and
+   newly landed fixes need terminal native execution. Some expected-output
+   failures may be stale tests; each needs a demonstrated public contract, not
+   an automatic baseline refresh. The mandatory strict scanner remains separate.
+3. **Routine work and memory at the actual archive shape.** GH555/GH557 report
+   rereading unchanged history; GH556 reports sparse ID waste; GH565 reports
+   >40 GB and >76 GB forget paths. Source batching/governors and small synthetic
+   passes do not prove the owner-scale limits. The owner archive on this
+   controller remains relocated, so this pass supplies no owner canary.
+4. **Semantic lifecycle integration.** Certified generation reuse, current-source
+   hydration, ANN association, model identity and progressive client routing
+   remain different obligations. Hash fixtures and library APIs do not prove
+   neural relevance, ANN acceleration or normal CLI/TUI delivery.
+5. **Native/platform/browser execution and publication.** Current actual CASS
+   DSR routing admits Linux but rejects the macOS writable-storage probe. The
+   release notes report a narrow earlier Windows 11 synthetic smoke, not full
+   archive coverage. Node worker tests cannot close the browser lane.
+
+### Bridge plan: outcomes, ownership and exact stopping conditions
+
+| Priority | Specific next work | Falsifiable acceptance | Ownership / topology |
+|---|---|---|---|
+| P0 | Qualify and finish retained semantic privacy fences and export/TUI redaction | Forgotten/revised content and query text cannot escape through old cached/native/external/progressive owners; explicit reload serves retained valid siblings; planted prefixed/JSON/multiline credentials absent from every default export and filename/macro surface | Existing GH561/fenc7/GH547/GH551/nd6pc/TUI owners; aggregate `release-regressions-32lfj` blocks `.25` |
+| P0 | Restore the reported complete candidate regression set | Execute GH566's exact named library/integration/golden negatives on one frozen source; preserve old release failures/ignored cases separately; semantically review intentional contract changes | Existing `55wh0`, `kwxai`, `dnluu`, GH565, new GH554; no peer closure from this report |
+| P1 | Prove authoritative lexical publication and source freshness | Full/incremental/no-op/force and interrupted/restarted runs preserve IDs, report fresh authority truthfully and reject same-count canonical edits; explicit OpenClaw WAL refresh ignores another source's timestamp | GH472, `.46`, `.48`, `h3jnv`; `openclaw-target-freshness-wiq1p` |
+| P1 | Remove unnecessary source/archive-sized work | At fixed small delta across source/archive sizes, record source/mirror/DB/index bytes plus whole-command CPU/wall/RSS; unchanged, changed, truncated, replaced and malformed sources keep their existing correctness/privacy outcomes | `.86`, GH558; new GH555/GH557/GH556; live baseline and candidate in the same invocation |
+| P1 | Complete quiet-writer freshness safely | A complete quiet prefix becomes searchable with an idle writer still open; actual write races/partial tails/replacement/advisory-lock cases stay safe and retryable | `v6ysi`, writer-probe owners; `quiet-writer-freshness-12p1f` |
+| P1 | Bound forget/doctor/semantic work without hiding obligations | Run representative copied-archive and external-cap probes; canonical and derived counts/digests/authority survive interruption; distinguish largest atomic conversation from whole-process RSS | GH565, `.72`, `se525`, `xn5a4`; `doctor-bundle-memory-0md5q` |
+| P1 | Make raw-evidence coverage truthful | Below/at/above-cap and resumed capture report bounded per-run skipped counts/bytes and stale/unknown state without walking provider trees on health reads | Existing `CaptureRunGuard`; `raw-mirror-paused-truth-i4cmb` |
+| P1 | Qualify exact model/ANN/title generations | Real installed MiniLM, vector WAL/shards, cold/warm/restart, edits/deletes/ingest, manifest-selected custom graph and missing/corrupt graph negatives; same-model title ablation reports gains and losses | `ds7uy.*`, `jyfuq`, `962e8`, `of9i7`, `ie22v`, `.87`; optional title work does not replace release repair |
+| P1 | Finish native platform/fleet/browser acceptance | Exact binaries and source/lock/model identities; current DSR-host health; full named native smoke; actual SSH add/sync/repeat/append/unreachable/reingest; all browser specs counted including skips | `.25`, `av59c`, browser lane, `ytp3b`; no new automation stack |
+| P2 | Qualify landed accented-query and compact doctor fixes | Reopen released v9 without rebuild; reject unsupported operands instead of browse-all; populated doctor receipts reference one complete forensic inventory without quadratic cloning | `accented-lexical-proof-82z2k`, `doctor-bundle-memory-0md5q` |
+| P2 | Complete verbosity and historical contract disposition | Public parser/dispatch tests prove local verbose details; every remaining answer-pack/swarm/Pages MUST is implemented/proved or explicitly decided, without deleting ambitions to claim completion | `verbose-routing-jxoha`, `.20`, `.23`, `.26`, `.69` |
+| P2–P3 | Deliver requested extensions after core safety | Byte-exact bounded mixed-compression restore; validated Bonsai v1/v2 identity and injected-context handling; owner decision before any messages-only destructive storage mode | `mirror-chunk-compression-29ux5`, `bonsai-durable-stores-j977x`, `messages-only-scope-vhfsx` |
+
+No new measurement framework is required. Reuse the existing source ledger,
+privacy epochs, generation owners, gate receipts, browser lane and live-fleet
+harness. Code and its regression tests stay in one implementation bead. The
+aggregate GH566 bead is a genuine observed cross-subsystem qualification gate,
+not a separate closure for merely writing the implementation's tests.
+
+### Beads, ambition and refinement results
+
+Initial durable graph: **2,502 issues: 2,296 closed, 71 open, 101 in progress,
+34 blocked**. Fourteen scoped records now cover GH542, GH543, GH545, GH546,
+GH548, GH549, GH550, GH554, GH555, GH556, GH557, GH562, GH563 and GH566.
+The generation checkpoint is **2,516 total / 220 unfinished**. This is not a
+product completion percentage. Existing bead owners, status and acceptance were
+preserved; no implementation bead was closed or reassigned.
+
+`br doctor` reports a healthy materialization with warnings: stale merge anchor,
+duplicate br executables, missing ignore patterns, an obsolete configuration key,
+retained recovery artifacts, and nine blocked beads whose dependency blockers
+are already closed/absent. Those warnings explain tracker friction; clearing
+them is not a product capability win. `bv`'s first snapshot reports no cycles,
+147 actionable unfinished items and 172 stale items. Triage still ranks an old
+release-decision premise highly, illustrating why graph scores need current
+product evidence.
+
+Three ambition reviews materially improved this plan:
+
+1. Compare current source with the actual shipped v0.11.0 artifact and current
+   channel manifests, replacing the obsolete “nothing since v0.10.0 shipped”
+   premise. Prioritize removing current regressions rather than accumulating
+   another historical release blocker.
+2. Unify the source-read, raw-mirror and sparse-ID reports around verified
+   obligations. Reuse one durable source identity/cursor where safe, and measure
+   the complete command rather than optimizing one parser or ANN lookup in
+   isolation. Append cursors must invalidate on edits/replacement/truncation.
+3. Treat retained authority as a lifetime property: request, generation and
+   privacy epochs must compose through deletion and repair. Couple safety tests
+   to old-owner refusal and new-owner success; no token count or generation
+   percentage substitutes for this externally visible result.
+
+The frozen skill generation and refinement prompts are retained verbatim in
+`phase-templates.txt` beside the receipts. Five plan-space passes covered:
+
+1. **Coverage:** map all 34 numbered goals and all 34 open issue bodies; create
+   issue-specific records for the fourteen unmatched references. Distinguish
+   core defect, landed-but-unqualified repair, extension and scope question.
+2. **Ownership/dependencies:** preserve current implementation owners, add seven
+   blocking edges around observed GH566 regressions and artifact certification,
+   and eight related links for overlapping performance/freshness work. Optional
+   compression/Bonsai/projection work does not block the maintenance release.
+3. **Negative controls:** refine retained privacy across completed repair,
+   cache/provider/hydration interleavings; source alias/virtual-store exclusions;
+   unsupported query operands; raw-mirror corruption and decompression bounds.
+4. **Execution/resource discipline:** bind exact source and executable identity,
+   require positive terminal counts, keep tests with implementation, retain
+   DSR-only platform/browser routes and unchanged gates. Annotate existing raw
+   capture, compact-reference and tokenizer repairs rather than duplicate them.
+5. **Convergence:** recheck issue coverage, duplicate ownership, scope, evidence
+   classes and graph cycles. No further implementation node is justified by
+   that review. Source qualification, published defects and future work remain
+   visibly open; an assessment publication does not close them.
+
+### Final validation checkpoint
+
+The report and scoped tracker updates are the deliverables of this assessment.
+Production fixes remain with their implementation owners. The released Linux
+journey is RED on two prefixed-secret assertions; Pages worker tests pass 51/51;
+the requested source-bound Rust gate did not execute. These outcomes are recorded
+separately rather than collapsed into a green project verdict.
+
+`br dep cycles --json` reports zero cycles after the structural batch. Final
+`bv --robot-triage` sees 85 open, 101 in progress, 34 blocked, 220 unfinished
+and 160 actionable items. `bv --robot-insights` computes its other metrics but
+skips cycle enumeration above 2,000 nodes; its empty Cycles array is therefore
+not an independent cycle proof. The explicit `br` result supplies that check.
+All fourteen new records remain open and self-contained, and all 34 open GitHub
+issue numbers now have an explicit work-graph reference. Existing statuses and
+acceptance criteria remain intact. Metadata whitespace/JSONL review and scoped
+publication complete this assessment; they do not certify the pending Rust,
+model, fleet, browser or platform claims. A manual UBS preflight on these two
+metadata paths returns exit 3, “nothing scanned”, because Markdown and JSONL
+are unsupported; that is not a scanner pass. The installed runner is newer than
+the project pin. Repeating with the privately retained v5.4.4 runner whose
+SHA-256 matches `scripts/gate.sh` gives the same explicit no-scan result. No
+`UBS_ALLOW_NO_SCAN` override or scanner-policy change was used. This assessment
+changes no production code.
+
+---
 
 ## Assessment: 2026-11-04 (ChartreuseOwl)
 
