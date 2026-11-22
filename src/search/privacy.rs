@@ -179,6 +179,35 @@ fn write_state(path: &Path, state: State) -> Result<()> {
     sync_parent_directory(path).map_err(|error| unavailable(path, error))
 }
 
+/// Forget repairs the derived assets beside the configured database. A file
+/// alias in another directory would repair only that directory's index while
+/// deleting from the target archive. Publishing or clearing just one fence
+/// cannot protect both sets of readers, so refuse before admitting deletion.
+/// Directory aliases and filename aliases in the same physical directory use
+/// one fence and remain supported. This is a routing check, not a witness for
+/// the identity of a database connection the caller opened earlier.
+fn mutation_fence(database: &Path) -> Result<PathBuf> {
+    let logical_fence = state_path_for_database(database);
+    let Some(resolved) = resolve_if_present(database, &logical_fence)? else {
+        return Ok(logical_fence);
+    };
+    let configured_parent = fs::canonicalize(parent_directory(database))
+        .map_err(|error| unavailable(&logical_fence, error))?;
+    if configured_parent != parent_directory(&resolved) {
+        return Err(unavailable(
+            &logical_fence,
+            format!(
+                "cannot apply or complete forget through database alias {}: its index directory \
+                 differs from the canonical archive's. Reopen using --db {} and that archive's \
+                 data directory, then retry forget so deletion and derived repair share one fence",
+                database.display(),
+                resolved.display(),
+            ),
+        ));
+    }
+    Ok(state_path_for_database(&resolved))
+}
+
 /// A reader's admitted privacy epoch. Capture it before opening retained
 /// assets, validate after opening, and validate again before returning data.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,7 +215,8 @@ pub struct PrivacySnapshot {
     path: Option<PathBuf>,
     epoch: u64,
     /// An aliased asset must observe both its configured archive's fence and
-    /// the target archive's fence. Writers may publish beside either address.
+    /// the target archive's fence. Older writers may have published beside
+    /// either address, even when those directories are distinct.
     alias_fence: Option<(PathBuf, u64)>,
     /// Bind aliases before opening retained assets and detect a retargeted alias
     /// before releasing results from the retained reader.
@@ -296,7 +326,7 @@ pub fn begin_forget(database: &Path) -> Result<()> {
     if database == Path::new(":memory:") {
         return Ok(());
     }
-    let path = state_path_for_database(database);
+    let path = mutation_fence(database)?;
     let current = read_state(&path)?;
     if current.pending {
         // A prior attempt may have failed its final directory fsync after
@@ -322,7 +352,16 @@ pub fn repair_pending(database: &Path) -> Result<bool> {
     if database == Path::new(":memory:") {
         return Ok(false);
     }
-    Ok(read_state(&state_path_for_database(database))?.pending)
+    let logical_fence = state_path_for_database(database);
+    let logical_pending = read_state(&logical_fence)?.pending;
+    let target_pending = match resolve_if_present(database, &logical_fence)? {
+        Some(resolved) => {
+            let target_fence = state_path_for_database(&resolved);
+            target_fence != logical_fence && read_state(&target_fence)?.pending
+        }
+        None => false,
+    };
+    Ok(logical_pending || target_pending)
 }
 
 /// Clear pending only after canonical-derived and lexical repairs complete.
@@ -331,7 +370,7 @@ pub fn complete_forget(database: &Path) -> Result<()> {
     if database == Path::new(":memory:") {
         return Ok(());
     }
-    let path = state_path_for_database(database);
+    let path = mutation_fence(database)?;
     let mut current = read_state(&path)?;
     if !current.pending {
         return Ok(());
@@ -624,9 +663,18 @@ mod tests {
         target_repaired.validate()?;
         assert_eq!(fs::read(state_path_for_database(&db))?, target_bytes);
 
-        // Resolving the alias must not discard the configured-path fence:
-        // the existing writer protocol can publish through that address too.
-        begin_forget(&alias)?;
+        // Resolving the alias must not discard a configured-path fence left
+        // by an older writer. New mutations through this alias are refused.
+        let logical_fence = state_path_for_database(&alias);
+        write_state(
+            &logical_fence,
+            State {
+                version: STATE_VERSION,
+                epoch: 1,
+                pending: true,
+            },
+        )?;
+        assert!(repair_pending(&alias)?);
         assert_eq!(
             kind(&target_repaired.validate().unwrap_err()),
             "forget-repair-pending"
@@ -635,7 +683,14 @@ mod tests {
             kind(&PrivacySnapshot::for_database(&alias).unwrap_err()),
             "forget-repair-pending"
         );
-        complete_forget(&alias)?;
+        write_state(
+            &logical_fence,
+            State {
+                version: STATE_VERSION,
+                epoch: 1,
+                pending: false,
+            },
+        )?;
         assert_eq!(
             kind(&target_repaired.validate().unwrap_err()),
             "privacy-snapshot-invalidated"
@@ -646,6 +701,158 @@ mod tests {
         assert_eq!(fs::read(state_path_for_database(&alias))?, logical_bytes);
         assert_eq!(fs::read(state_path_for_database(&db))?, target_bytes);
         assert_eq!(fs::read(&db)?, contents);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forget_cross_directory_alias_refuses_before_admitting_deletion_or_clearing_repair()
+    -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+        let database = root.path().join("archive/agent_search.db");
+        let alias = root.path().join("configured/archive.db");
+        fs::create_dir_all(parent_directory(&database))?;
+        fs::create_dir_all(parent_directory(&alias))?;
+        let contents = b"canonical archive identity and retained history";
+        fs::write(&database, contents)?;
+        symlink("../archive/agent_search.db", &alias)?;
+        let canonical = fs::canonicalize(&database)?;
+        let target_reader = PrivacySnapshot::for_database(&database)?;
+        let alias_reader = PrivacySnapshot::for_database(&alias)?;
+        let index_reader =
+            PrivacySnapshot::for_index(&parent_directory(&database).join("index/v9-quill"))?;
+
+        for mutation in [begin_forget, complete_forget] {
+            let error = mutation(&alias).expect_err("alias-only repair cannot protect the target");
+            assert_eq!(kind(&error), "privacy-state-unavailable");
+            let message = error.to_string();
+            assert!(message.contains("Reopen using --db"), "{message}");
+            assert!(
+                message.contains(canonical.to_string_lossy().as_ref()),
+                "{message}"
+            );
+            assert!(!state_path_for_database(&database).exists());
+            assert!(!state_path_for_database(&alias).exists());
+            assert!(!parent_directory(&database).join("index").exists());
+            assert!(!parent_directory(&alias).join("index").exists());
+            assert_eq!(fs::read(&database)?, contents);
+            assert_eq!(
+                fs::read_link(&alias)?,
+                Path::new("../archive/agent_search.db")
+            );
+            target_reader.validate()?;
+            alias_reader.validate()?;
+            index_reader.validate()?;
+        }
+        assert!(!repair_pending(&alias)?);
+
+        // The named remedy protects both canonical and aliased database
+        // readers, plus the canonical database-free lexical reader.
+        begin_forget(&canonical)?;
+        assert!(repair_pending(&database)?);
+        assert!(repair_pending(&alias)?);
+        for reader in [&target_reader, &alias_reader, &index_reader] {
+            assert_eq!(
+                kind(&reader.validate().unwrap_err()),
+                "forget-repair-pending"
+            );
+        }
+        let pending = fs::read(state_path_for_database(&database))?;
+        assert_eq!(
+            kind(&complete_forget(&alias).unwrap_err()),
+            "privacy-state-unavailable"
+        );
+        assert_eq!(fs::read(state_path_for_database(&database))?, pending);
+        assert!(repair_pending(&alias)?);
+        assert!(!state_path_for_database(&alias).exists());
+
+        complete_forget(&canonical)?;
+        assert!(!repair_pending(&alias)?);
+        for reader in [target_reader, alias_reader, index_reader] {
+            assert_eq!(
+                kind(&reader.validate().unwrap_err()),
+                "privacy-snapshot-invalidated"
+            );
+        }
+        PrivacySnapshot::for_database(&database)?.validate()?;
+        PrivacySnapshot::for_database(&alias)?.validate()?;
+        PrivacySnapshot::for_index(&parent_directory(&database).join("index/v9-quill"))?
+            .validate()?;
+        assert_eq!(fs::read(&database)?, contents);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forget_filename_and_directory_aliases_share_one_canonical_fence() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+        let directory = root.path().join("archive");
+        fs::create_dir(&directory)?;
+        let database = directory.join("agent_search.db");
+        let filename_alias = directory.join("same-parent.db");
+        let directory_alias = root.path().join("current");
+        let contents = b"one archive and one derived-assets directory";
+        fs::write(&database, contents)?;
+        symlink("agent_search.db", &filename_alias)?;
+        symlink("archive", &directory_alias)?;
+
+        for alias in [filename_alias, directory_alias.join("./agent_search.db")] {
+            let before = PrivacySnapshot::for_database(&database)?;
+            let alias_before = PrivacySnapshot::for_database(&alias)?;
+            begin_forget(&alias)?;
+            assert!(repair_pending(&database)?);
+            assert!(repair_pending(&alias)?);
+            assert_eq!(
+                fs::read(state_path_for_database(&database))?,
+                fs::read(state_path_for_database(&alias))?
+            );
+            for reader in [&before, &alias_before] {
+                assert_eq!(
+                    kind(&reader.validate().unwrap_err()),
+                    "forget-repair-pending"
+                );
+            }
+            complete_forget(&alias)?;
+            assert!(!repair_pending(&database)?);
+            assert!(!repair_pending(&alias)?);
+            for reader in [before, alias_before] {
+                assert_eq!(
+                    kind(&reader.validate().unwrap_err()),
+                    "privacy-snapshot-invalidated"
+                );
+            }
+            PrivacySnapshot::for_database(&alias)?.validate()?;
+            assert_eq!(fs::read(&database)?, contents);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forget_alias_pending_probe_refuses_unreadable_target_state() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::Builder::new().disable_cleanup(true).tempdir()?;
+        let database = root.path().join("archive/agent_search.db");
+        let alias = root.path().join("configured/archive.db");
+        fs::create_dir_all(parent_directory(&database))?;
+        fs::create_dir_all(parent_directory(&alias))?;
+        fs::write(&database, b"archive identity")?;
+        symlink(&database, &alias)?;
+        let fence = state_path_for_database(&database);
+        fs::create_dir_all(parent_directory(&fence))?;
+        let malformed = b"{incomplete privacy state";
+        fs::write(&fence, malformed)?;
+        assert_eq!(
+            kind(&repair_pending(&alias).unwrap_err()),
+            "privacy-state-unavailable"
+        );
+        assert_eq!(fs::read(&fence)?, malformed);
+        assert!(!state_path_for_database(&alias).exists());
         Ok(())
     }
 
