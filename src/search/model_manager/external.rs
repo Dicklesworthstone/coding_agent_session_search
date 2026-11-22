@@ -185,6 +185,9 @@ fn revalidate_after_preflight(
             error: error.to_string(),
         }
     })?;
+    if let Some(authority) = artifact.legacy_authority() {
+        legacy::validate(&storage, authority).map_err(failed)?;
+    }
     let fingerprint = admit_archive(&storage, publication)?;
     let record = &publication.record;
     let coverage_changed = if let Some(certificate) = &publication.coverage {
@@ -272,13 +275,14 @@ fn load_with_config_at_epoch(
             return Err(availability);
         }
         let publication = recorded_artifact(data_dir, &config)?;
-        // Preserve legacy file admission before opening the archive. Certified
-        // files additionally need the current canonical coverage snapshot.
-        let legacy_artifact = if publication.coverage.is_none() {
-            Some(open_recorded(data_dir, &config, &publication, None)?)
-        } else {
-            None
-        };
+        // Preserve the cheap missing-file verdict, but capture canonical
+        // authority before opening a retained legacy owner or its filter maps.
+        if publication.coverage.is_none() {
+            let path = vector_index_path(data_dir, &config.identity());
+            if !semantic_artifact_candidate_exists(&path).map_err(failed)? {
+                return Err(SemanticAvailability::IndexMissing { index_path: path });
+            }
+        }
         let storage = if strict_read_only {
             FrankenStorage::open_strict_readonly(db_path)
         } else {
@@ -288,9 +292,15 @@ fn load_with_config_at_epoch(
             db_path: db_path.to_path_buf(),
             error: error.to_string(),
         })?;
+        let legacy_authority = publication
+            .coverage
+            .is_none()
+            .then(|| legacy::capture(&storage))
+            .transpose()
+            .map_err(failed)?;
         let admitted_fingerprint = admit_archive(&storage, &publication)?;
-        let artifact = if let Some(artifact) = legacy_artifact {
-            artifact
+        let artifact = if legacy_authority.is_some() {
+            open_recorded(data_dir, &config, &publication, None)?
         } else {
             let certificate = publication
                 .coverage
@@ -301,6 +311,14 @@ fn load_with_config_at_epoch(
         };
         let filter_maps = SemanticFilterMaps::from_storage(&storage)
             .map_err(|error| failed(format!("external filter maps: {error}")))?;
+        let artifact = if let Some(authority) = &legacy_authority {
+            legacy::validate(&storage, authority).map_err(failed)?;
+            artifact
+                .with_legacy_authority(authority)
+                .map_err(|error| failed(format!("external legacy semantic authority: {error:#}")))?
+        } else {
+            artifact
+        };
         drop(storage);
         // No user query is passed to this constructor. Its only traffic is the
         // fixed public preflight. A failure never loads local MiniLM or hash.

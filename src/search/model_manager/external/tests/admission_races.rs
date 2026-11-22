@@ -178,10 +178,29 @@ struct Fixture {
 }
 
 fn add_conversation(storage: &FrankenStorage, ordinal: u32) -> AnyResult<()> {
+    add_conversation_with_agent(
+        storage,
+        ordinal,
+        "codex",
+        format!("/fixture/admission-{ordinal}.jsonl").into(),
+    )
+}
+
+fn add_conversation_with_agent(
+    storage: &FrankenStorage,
+    ordinal: u32,
+    agent_slug: &str,
+    source_path: PathBuf,
+) -> AnyResult<()> {
     let agent = storage.ensure_agent(&Agent {
         id: None,
-        slug: "codex".into(),
-        name: "Codex".into(),
+        slug: agent_slug.into(),
+        name: if agent_slug == "codex" {
+            "Codex"
+        } else {
+            "Pi Agent"
+        }
+        .into(),
         version: None,
         kind: AgentKind::Cli,
     })?;
@@ -190,11 +209,11 @@ fn add_conversation(storage: &FrankenStorage, ordinal: u32) -> AnyResult<()> {
         None,
         &Conversation {
             id: None,
-            agent_slug: "codex".into(),
+            agent_slug: agent_slug.into(),
             workspace: None,
             external_id: Some(format!("admission-{ordinal}")),
             title: None,
-            source_path: format!("/fixture/admission-{ordinal}.jsonl").into(),
+            source_path,
             started_at: Some(1),
             ended_at: Some(2),
             approx_tokens: None,
@@ -272,10 +291,14 @@ impl Fixture {
     }
 
     fn new() -> AnyResult<Self> {
+        Self::with_legacy_agent("codex", "/fixture/admission-1.jsonl".into())
+    }
+
+    fn with_legacy_agent(agent_slug: &str, source_path: PathBuf) -> AnyResult<Self> {
         let dir = tempfile::tempdir()?;
         let db = dir.path().join("agent_search.db");
         let storage = FrankenStorage::open(&db)?;
-        add_conversation(&storage, 1)?;
+        add_conversation_with_agent(&storage, 1, agent_slug, source_path)?;
         storage.complete_semantic_identity_rebuild(SemanticIdentityTier::Quality)?;
         let endpoint = Endpoint::start()?;
         let config = &endpoint.config;
@@ -1205,6 +1228,104 @@ fn canonical_identity_invalidation_during_preflight_is_not_ignored() -> AnyResul
     fixture.endpoint.assert_only_public_preflight();
     let current = FrankenStorage::open_strict_readonly(&fixture.db)?;
     assert!(current.semantic_identity_rebuild_required(SemanticIdentityTier::Quality)?);
+    Ok(())
+}
+
+#[test]
+#[serial_test::serial]
+fn completed_identity_rebuild_during_external_preflight_cannot_renew_legacy_owner() -> AnyResult<()>
+{
+    let fixture = Fixture::with_legacy_agent(
+        "pi_agent",
+        "/fixture/home/.omp/profiles/work/agent/sessions/project/admission-1.jsonl".into(),
+    )?;
+    let storage = FrankenStorage::open_strict_readonly(&fixture.db)?;
+    let authority = storage
+        .semantic_archive_state()?
+        .context("original legacy authority")?;
+    drop(storage);
+    let manifest_before = fs::read(SemanticManifest::path(fixture.dir.path()))?;
+    let path = vector_index_path(fixture.dir.path(), &fixture.endpoint.config.identity());
+    let vectors_before = fs::read(&path)?;
+    let db = fixture.db.clone();
+    let config = fixture.endpoint.config.clone();
+    let fingerprint = fixture.record.db_fingerprint.clone();
+    let original_authority = authority.clone();
+    fixture.endpoint.arm(move || {
+        let storage = FrankenStorage::open(&db)?;
+        assert_eq!(
+            storage
+                .reclassify_legacy_omp_conversations()?
+                .conversations_reclassified,
+            1,
+        );
+        let messages = storage.fetch_messages_for_embedding()?;
+        assert_eq!(messages.len(), 1);
+        let index = VectorIndex::open_read_only(&path)?;
+        let mut doc = crate::search::vector_index::parse_semantic_doc_id(index.doc_id_at(0)?)
+            .context("original legacy identity")?;
+        let current_agent = u32::try_from(messages[0].agent_id)?;
+        assert_ne!(doc.agent_id, current_agent);
+        doc.agent_id = current_agent;
+        let staged = path.with_file_name("reclassified-external.fsvi");
+        let mut writer = VectorIndex::create_with_revision(
+            &staged,
+            &config.identity(),
+            crate::search::external_embedder::EXTERNAL_VECTOR_SPACE_REVISION,
+            config.dimension(),
+            Quantization::F16,
+        )?;
+        let mut vector = vec![0.0_f32; config.dimension()];
+        vector[0] = 1.0;
+        writer.write_record(&doc.to_doc_id_string(), &vector)?;
+        writer.finish()?;
+        // Preserve the retained old file while installing rebuilt identities.
+        // The legacy publication shape stays identical, including file size.
+        assert_eq!(fs::metadata(&path)?.len(), fs::metadata(&staged)?.len());
+        fs::rename(&path, path.with_file_name("before-reclassification.fsvi"))?;
+        fs::rename(staged, &path)?;
+        storage.complete_semantic_identity_rebuild(SemanticIdentityTier::Quality)?;
+        assert!(!storage.semantic_identity_rebuild_required(SemanticIdentityTier::Quality)?);
+        assert!(storage.semantic_invalidations_after(&original_authority)?);
+        assert_eq!(
+            crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?,
+            fingerprint,
+            "reidentity must preserve the existing count/max-ID fingerprint",
+        );
+        Ok(())
+    });
+
+    let rejected = fixture.load(true);
+    assert!(rejected.context.is_none());
+    match rejected.availability {
+        SemanticAvailability::LoadFailed { context } => assert!(
+            context.contains("legacy semantic authority changed"),
+            "wrong preflight refusal: {context}",
+        ),
+        other => panic!("retained legacy authority was not rejected: {other:?}"),
+    }
+    fixture.endpoint.assert_only_public_preflight();
+    assert_eq!(
+        fs::read(SemanticManifest::path(fixture.dir.path()))?,
+        manifest_before,
+    );
+    let current_vectors =
+        vector_index_path(fixture.dir.path(), &fixture.endpoint.config.identity());
+    assert_ne!(fs::read(current_vectors)?, vectors_before);
+    let current = FrankenStorage::open_strict_readonly(&fixture.db)?;
+    let current_authority = current
+        .semantic_archive_state()?
+        .context("reclassified legacy authority")?;
+    assert_ne!(current_authority, authority);
+    drop(current);
+    let fresh = fixture.load(true);
+    let context = fresh
+        .context
+        .with_context(|| format!("fresh legacy admission: {:?}", fresh.availability))?;
+    assert_eq!(
+        context.artifacts[0].legacy_authority(),
+        Some(&current_authority)
+    );
     Ok(())
 }
 

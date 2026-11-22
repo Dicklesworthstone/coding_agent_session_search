@@ -239,7 +239,11 @@ impl SearchClient {
         let Some(artifact) = artifact.filter(|artifact| artifact.coverage_certificate().is_some())
         else {
             return self
-                .hydrate_semantic_hits_with_ids(results, field_mask)
+                .hydrate_semantic_hits_with_authority(
+                    results,
+                    field_mask,
+                    artifact.and_then(SemanticIndexArtifact::legacy_authority),
+                )
                 .map(|hits| (hits, None));
         };
         artifact.verify_coverage_file()?;

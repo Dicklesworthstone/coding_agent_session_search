@@ -24,7 +24,7 @@ use crate::search::semantic_coverage::{
 };
 use crate::search::semantic_manifest::SemanticCoverageCertificate;
 use crate::sources::provenance::{LOCAL_SOURCE_ID, SourceFilter, SourceKind};
-use crate::storage::sqlite::FrankenStorage;
+use crate::storage::sqlite::{FrankenStorage, SemanticArchiveState};
 
 /// Directory under the cass data dir where vector artifacts are stored.
 pub const VECTOR_INDEX_DIR: &str = "vector_index";
@@ -181,6 +181,7 @@ pub struct SemanticIndexArtifact {
     owner_backed_progressive_reader: bool,
     coverage: Option<Arc<CertifiedSemanticArtifact>>,
     privacy: Option<PrivacySnapshot>,
+    legacy_authority: Option<SemanticArchiveState>,
 }
 
 /// Coverage observed in the same canonical snapshot as this query's hydrated
@@ -291,6 +292,7 @@ impl SemanticIndexArtifact {
             owner_backed_progressive_reader: false,
             coverage: None,
             privacy: None,
+            legacy_authority: None,
         })
     }
 
@@ -313,6 +315,31 @@ impl SemanticIndexArtifact {
 
     pub(crate) fn privacy_snapshot(&self) -> Option<&PrivacySnapshot> {
         self.privacy.as_ref()
+    }
+
+    /// Preserve the canonical identity boundary observed before a legacy
+    /// owner was opened. A later rebuild must not renew this reader's seal.
+    pub(crate) fn with_legacy_authority(
+        mut self,
+        authority: &SemanticArchiveState,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            self.coverage.is_none(),
+            "certified semantic artifacts retain their own canonical authority"
+        );
+        if let Some(admitted) = &self.legacy_authority {
+            anyhow::ensure!(
+                admitted == authority,
+                "legacy semantic artifact already belongs to another canonical authority"
+            );
+        } else {
+            self.legacy_authority = Some(authority.clone());
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn legacy_authority(&self) -> Option<&SemanticArchiveState> {
+        self.legacy_authority.as_ref()
     }
 
     pub(crate) fn with_coverage(

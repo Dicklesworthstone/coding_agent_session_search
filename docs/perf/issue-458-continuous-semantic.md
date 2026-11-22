@@ -53,6 +53,18 @@ ingestion does not advance this privacy epoch. The final validation is the
 result-admission boundary: a result admitted before a concurrent fence is
 published may finish delivery.
 
+Uncertified legacy owners also retain the canonical archive identity and
+mutation boundary observed before their vectors and filter maps were loaded.
+Every semantic request checks the durable invalidation journal against that
+original boundary, including cached embeddings, empty results, progressive
+callbacks and the whole hybrid request. A supported canonical reidentity or
+destructive update revokes the entire legacy generation; completing a rebuild
+marker cannot revive it. Admission and final result checks use fresh read
+snapshots, while hydration checks inside its own canonical transaction.
+Append-only ingestion preserves an unchanged legacy reader. Missing authority
+refuses admission and requires rebuilding; certified owners retain their finer
+candidate-level validation instead of this whole-generation revocation.
+
 The cached hydration connection retains its own canonical database-file witness.
 Opening seals the file and the original/canonical ancestor chains across the
 read-only constructor, including connections first opened for lexical queries.

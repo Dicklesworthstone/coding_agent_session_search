@@ -117,14 +117,23 @@ fn external_query_refuses_foreign_same_dimension_and_wrong_revision_headers() {
         .to_doc_id_string();
         writer.write_record(&doc_id, &vector).unwrap();
         writer.finish().unwrap();
+        // Legacy serving captures canonical authority before opening a
+        // retained vector owner. Supply a real archive so this fixture reaches
+        // and proves the foreign-header refusal, without any endpoint traffic.
+        let db_path = dir.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let mut record = publication(dir.path(), &config);
+        record.db_fingerprint =
+            crate::indexer::lexical_storage_fingerprint_for_storage(&storage).unwrap();
+        drop(storage);
         let mut manifest = SemanticManifest {
-            quality_tier: Some(publication(dir.path(), &config)),
+            quality_tier: Some(record),
             ..SemanticManifest::default()
         };
         manifest.save(dir.path()).unwrap();
         let result = load_with_config(
             dir.path(),
-            &dir.path().join("missing.db"),
+            &db_path,
             true,
             config,
             Arc::new(|| panic!("foreign vectors must be refused before preflight")),

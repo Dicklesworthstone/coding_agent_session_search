@@ -11,6 +11,7 @@
 
 mod coverage;
 mod external;
+mod legacy;
 
 pub use coverage::covered_semantic_record;
 pub(crate) use coverage::observe_covered_semantic_artifact;
@@ -573,26 +574,19 @@ fn complete_shard_generation_candidate_exists(data_dir: &Path, embedder_id: &str
         .any(|(tier, db_fingerprint)| manifest.summary(tier, embedder_id, db_fingerprint).complete)
 }
 
-fn load_complete_shard_artifacts_for_current_db(
+fn load_complete_shard_artifacts_for_storage(
     data_dir: &Path,
-    db_path: &Path,
+    storage: &FrankenStorage,
     embedder_id: &str,
     expected_dimension: usize,
     context_label: &'static str,
-    strict_read_only: bool,
 ) -> Option<Vec<SemanticIndexArtifact>> {
     load_complete_shard_artifacts_with_fingerprint(
         data_dir,
         embedder_id,
         expected_dimension,
         context_label,
-        || {
-            if strict_read_only {
-                crate::indexer::lexical_storage_fingerprint_for_db_strict(db_path)
-            } else {
-                crate::indexer::lexical_storage_fingerprint_for_db(db_path)
-            }
-        },
+        || crate::indexer::lexical_storage_fingerprint_for_storage(storage),
     )
 }
 
@@ -604,8 +598,8 @@ fn load_complete_shard_artifacts_with_fingerprint(
     fingerprint: impl FnOnce() -> anyhow::Result<String>,
 ) -> Option<Vec<SemanticIndexArtifact>> {
     // GH #452: a monolithic FSVI is not evidence that shards exist. Probe
-    // metadata before opening the archive solely to fingerprint a possible
-    // shard generation; the normal staleness/filter-map path opens it later.
+    // metadata before computing a possible shard generation's fingerprint;
+    // legacy callers already hold the canonical authority used for admission.
     if !complete_shard_generation_candidate_exists(data_dir, embedder_id) {
         return None;
     }
@@ -882,15 +876,7 @@ fn load_hash_semantic_context_at_epoch(
             };
         }
     };
-    let shard_artifacts = load_complete_shard_artifacts_for_current_db(
-        data_dir,
-        db_path,
-        embedder.id(),
-        embedder.dimension(),
-        "hash semantic",
-        strict_read_only,
-    );
-    if !monolithic_present && shard_artifacts.is_none() {
+    if !monolithic_present && !complete_shard_generation_candidate_exists(data_dir, embedder.id()) {
         return SemanticSetup {
             availability: SemanticAvailability::IndexMissing { index_path },
             context: None,
@@ -913,6 +899,29 @@ fn load_hash_semantic_context_at_epoch(
             };
         }
     };
+
+    let legacy_authority = match legacy::capture(&storage) {
+        Ok(authority) => authority,
+        Err(context) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed { context },
+                context: None,
+            };
+        }
+    };
+    let shard_artifacts = load_complete_shard_artifacts_for_storage(
+        data_dir,
+        &storage,
+        embedder.id(),
+        embedder.dimension(),
+        "hash semantic",
+    );
+    if !monolithic_present && shard_artifacts.is_none() {
+        return SemanticSetup {
+            availability: SemanticAvailability::IndexMissing { index_path },
+            context: None,
+        };
+    }
 
     if let Some(availability) = refuse_stale_semantic_assets(
         data_dir,
@@ -960,6 +969,15 @@ fn load_hash_semantic_context_at_epoch(
         }
     };
 
+    let artifacts = match legacy::seal(&storage, &legacy_authority, artifacts) {
+        Ok(artifacts) => artifacts,
+        Err(context) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed { context },
+                context: None,
+            };
+        }
+    };
     let roles = Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]));
     let embedder = Arc::new(embedder) as Arc<dyn Embedder>;
 
@@ -1121,15 +1139,9 @@ fn load_semantic_context_at_epoch(
             };
         }
     };
-    let shard_artifacts = load_complete_shard_artifacts_for_current_db(
-        data_dir,
-        db_path,
-        &config.embedder_id,
-        config.dimension,
-        "semantic",
-        strict_read_only,
-    );
-    if !monolithic_present && shard_artifacts.is_none() {
+    if !monolithic_present
+        && !complete_shard_generation_candidate_exists(data_dir, &config.embedder_id)
+    {
         return SemanticSetup {
             availability: SemanticAvailability::IndexMissing { index_path },
             context: None,
@@ -1152,6 +1164,29 @@ fn load_semantic_context_at_epoch(
             };
         }
     };
+
+    let legacy_authority = match legacy::capture(&storage) {
+        Ok(authority) => authority,
+        Err(context) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed { context },
+                context: None,
+            };
+        }
+    };
+    let shard_artifacts = load_complete_shard_artifacts_for_storage(
+        data_dir,
+        &storage,
+        &config.embedder_id,
+        config.dimension,
+        "semantic",
+    );
+    if !monolithic_present && shard_artifacts.is_none() {
+        return SemanticSetup {
+            availability: SemanticAvailability::IndexMissing { index_path },
+            context: None,
+        };
+    }
 
     if let Some(availability) = refuse_stale_semantic_assets(
         data_dir,
@@ -1219,6 +1254,15 @@ fn load_semantic_context_at_epoch(
         }
     };
 
+    let artifacts = match legacy::seal(&storage, &legacy_authority, artifacts) {
+        Ok(artifacts) => artifacts,
+        Err(context) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed { context },
+                context: None,
+            };
+        }
+    };
     let roles = Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]));
 
     SemanticSetup {
