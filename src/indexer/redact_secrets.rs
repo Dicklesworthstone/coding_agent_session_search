@@ -271,18 +271,46 @@ pub fn redact_text(input: &str) -> Cow<'_, str> {
     apply_replacements(input, &matches)
 }
 
-/// Replace the union of secret spans found in the original input.
-///
-/// Re-running patterns on already-redacted text can erase an outer credential's
-/// label or shorten its value below a later pattern's threshold. Sweep ordered
-/// match streams instead: overlapping spans are redacted once, while adjacent
-/// independent matches keep separate placeholders. Only one pending match per
-/// selected pattern is retained, independent of the number of source matches.
+/// Redact the union of canonical credentials and caller-supplied original
+/// matches. Replacements are fixed markers selected from each complete span.
+pub(crate) fn redact_text_with_additional_patterns<'a, 'r>(
+    input: &'a str,
+    additional_patterns: impl IntoIterator<Item = &'r Regex>,
+    mut replacement: impl FnMut(&str) -> &'static str,
+) -> Cow<'a, str> {
+    let mut streams: Vec<std::iter::Peekable<regex::Matches<'r, 'a>>> =
+        additional_patterns
+            .into_iter()
+            .map(|pattern| pattern.find_iter(input).peekable())
+            .collect();
+    let matches = SECRET_REGEX_SET.matches(input);
+    streams.extend(
+        matches
+            .iter()
+            .map(|idx| SECRET_PATTERNS[idx].regex.find_iter(input).peekable()),
+    );
+    apply_match_streams(input, streams, &mut replacement)
+}
+
 fn apply_replacements<'a>(input: &'a str, matches: &regex::SetMatches) -> Cow<'a, str> {
-    let mut streams = matches
+    let streams = matches
         .iter()
         .map(|idx| SECRET_PATTERNS[idx].regex.find_iter(input).peekable())
-        .collect::<Vec<_>>();
+        .collect();
+    apply_match_streams(input, streams, &mut |_| REDACTED)
+}
+
+/// Replace strictly overlapping original matches with one marker. Keep only
+/// one pending match per canonical or additional pattern, regardless of input
+/// size; adjacent independent matches retain separate markers.
+fn apply_match_streams<'a, 'r>(
+    input: &'a str,
+    mut streams: Vec<std::iter::Peekable<regex::Matches<'r, 'a>>>,
+    replacement: &mut impl FnMut(&str) -> &'static str,
+) -> Cow<'a, str> {
+    if streams.iter_mut().all(|stream| stream.peek().is_none()) {
+        return Cow::Borrowed(input);
+    }
     let mut output = String::with_capacity(input.len());
     let mut copied_until = 0;
     let mut pending: Option<std::ops::Range<usize>> = None;
@@ -307,7 +335,7 @@ fn apply_replacements<'a>(input: &'a str, matches: &regex::SetMatches) -> Cow<'a
         }
         if let Some(range) = pending.replace(start..end) {
             output.push_str(&input[copied_until..range.start]);
-            output.push_str(REDACTED);
+            output.push_str(replacement(&input[range.start..range.end]));
             copied_until = range.end;
         }
     }
@@ -316,7 +344,7 @@ fn apply_replacements<'a>(input: &'a str, matches: &regex::SetMatches) -> Cow<'a
         return Cow::Borrowed(input);
     };
     output.push_str(&input[copied_until..range.start]);
-    output.push_str(REDACTED);
+    output.push_str(replacement(&input[range.start..range.end]));
     output.push_str(&input[range.end..]);
     Cow::Owned(output)
 }

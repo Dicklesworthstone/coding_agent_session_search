@@ -453,7 +453,7 @@ fn swarm_evidence_redaction_config_for_temp_root(temp_dir: &Path) -> RedactionCo
     config.custom_patterns.push(CustomPattern {
         name: "secret_env_assignment".to_string(),
         pattern: Regex::new(
-            r#"(?i)\b(?:TOKEN|SECRET|KEY|PASSWORD|PASS|CREDENTIAL|AUTH|[A-Z_][A-Z0-9_]*(?:TOKEN|SECRET|KEY|PASSWORD|PASS|CREDENTIAL|AUTH)[A-Z0-9_]*)=(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s]+)"#,
+            r#"(?i)\b(?:TOKEN|SECRET|KEY|PASSWORD|PASS|CREDENTIAL|AUTH|[A-Z_][A-Z0-9_]*(?:TOKEN|SECRET|KEY|PASSWORD|PASS|CREDENTIAL|AUTH)[A-Z0-9_]*)=(?:"(?:\\(?s:.)|[^"\\])*(?:"|(?:\\)?\z)|'(?:\\(?s:.)|[^'\\])*(?:'|(?:\\)?\z)|[^\s]+)"#,
         )
         .expect("swarm secret env redaction regex must compile"),
         replacement: SWARM_SECRET_ENV_ASSIGNMENT_REDACTED.to_string(),
@@ -485,17 +485,11 @@ pub fn redact_swarm_text(input: &str) -> String {
 
 pub fn redact_swarm_json_value(value: &Value) -> Value {
     let engine = RedactionEngine::new(swarm_evidence_redaction_config());
-    // Order mirrors the scalar path (gh#419): swarm-specific patterns first so
-    // an inline assignment inside a string scalar -- `command`, `argv`, an
-    // evidence line -- keeps its precise marker instead of collapsing to the
-    // floor's generic "[REDACTED]".
-    //
-    // The canonical key-aware JSON policy still runs, just second, because it
-    // covers a case the scalar pass structurally cannot: credentials split
-    // across an object key and a bare value, where the value alone
-    // ("hunter2") matches no assignment pattern and only the key says it is a
-    // secret. Running it last keeps that guarantee while letting the specific
-    // rules label what they can actually see.
+    // Scalar redaction first merges original canonical and swarm spans while
+    // retaining the specific evidence markers (gh#419). The key-aware policy
+    // then covers credentials split across an object key and a bare value:
+    // even a short value that matches no scalar pattern is hidden when its key
+    // names a credential.
     let swarm_redacted = redact_swarm_json_value_with_engine(&engine, value);
     crate::indexer::redact_secrets::redact_json(&swarm_redacted)
 }
@@ -526,24 +520,73 @@ fn insert_redacted_swarm_entry(
     }
 }
 
-/// Apply the swarm-specific path, identity, and PII policy before the canonical
-/// ingestion-time secret floor. Swarm output includes live operational data
-/// that did not necessarily pass through ingestion, so relying on the former
-/// privacy transforms alone would leak supported secret classes such as
-/// private-key blocks, raw JWTs, service tokens, and credential URLs.
+/// Fixed markers for the original spans admitted by the swarm policy.
+fn swarm_pattern_marker(name: &str) -> Option<&'static str> {
+    match name {
+        "absolute_path_with_spaces" | "absolute_path" => Some("[REDACTED_PATH]"),
+        "secret_env_assignment" => Some(SWARM_SECRET_ENV_ASSIGNMENT_REDACTED),
+        "bearer_secret" => Some("Bearer [SECRET_REDACTED]"),
+        "api_key_literal" => Some(SWARM_SECRET_LITERAL_REDACTED),
+        _ => None,
+    }
+}
+
+/// Preserve complete original credential and private-path spans before any
+/// rewrite can erase a recognizer's prefix. Select one fixed marker for each
+/// union; never retain a partially transformed credential.
+fn redact_swarm_original_scalar(engine: &RedactionEngine, input: &str) -> RedactedString {
+    let patterns = &engine.config.custom_patterns;
+    let canonical_class = patterns.len();
+    let mut applied = vec![false; canonical_class + 1];
+    let admitted = crate::indexer::redact_secrets::redact_text_with_additional_patterns(
+        input,
+        patterns
+            .iter()
+            .filter(|pattern| pattern.enabled && swarm_pattern_marker(&pattern.name).is_some())
+            .map(|pattern| &pattern.pattern),
+        |span| {
+            for (idx, pattern) in patterns.iter().enumerate() {
+                if !pattern.enabled {
+                    continue;
+                }
+                let Some(marker) = swarm_pattern_marker(&pattern.name) else {
+                    continue;
+                };
+                if pattern
+                    .pattern
+                    .find(span)
+                    .is_some_and(|found| found.start() == 0)
+                {
+                    applied[idx] = true;
+                    return marker;
+                }
+            }
+            applied[canonical_class] = true;
+            "[REDACTED]"
+        },
+    );
+    let mut redacted = engine.redact_text(admitted.as_ref());
+    // Count each emitted pattern class once, matching the existing report's
+    // per-class accounting without retaining source secret bytes.
+    redacted
+        .changes
+        .extend(applied.into_iter().filter(|applied| *applied).map(|_| {
+            RedactionChange {
+                kind: RedactionKind::CustomPattern,
+            }
+        }));
+    redacted
+}
+
+/// Admit original credential/path spans, then apply the remaining identity and
+/// PII transforms and a final canonical secret floor. Swarm evidence includes
+/// live operational data that did not necessarily pass through ingestion.
 fn redact_swarm_scalar_with_engine(engine: &RedactionEngine, input: &str) -> RedactedString {
-    // Swarm-specific patterns run FIRST so their precise markers survive
-    // ([SECRET_ENV_REDACTED], [SECRET_REDACTED], [REDACTED_PATH], ...), then the
-    // canonical floor catches whatever those rules do not cover.
-    //
-    // Running the floor first collapsed every class to its generic "[REDACTED]":
-    // it rewrote `TOKEN=...` before the swarm engine could see it, so
-    // `secret_env_assignment` and `api_key_literal` had nothing left to match and
-    // their markers never appeared (gh#419). Secrets were still scrubbed either
-    // way -- the floor is a safety net, not the labeller -- but the evidence
-    // report lost the ability to say *what kind* of secret had been there.
-    let mut redacted =
-        redact_rch_command(engine, input).unwrap_or_else(|| engine.redact_text(input));
+    // Parse the original RCH command before redaction can hide unsafe shell
+    // syntax. Both decoded words and ordinary scalars then merge canonical and
+    // swarm matches from their original bytes, retaining the precise markers.
+    let mut redacted = redact_rch_command(engine, input)
+        .unwrap_or_else(|| redact_swarm_original_scalar(engine, input));
     let floored = crate::indexer::redact_secrets::redact_text(&redacted.output).into_owned();
     if floored != redacted.output {
         redacted.output = floored;
@@ -647,7 +690,7 @@ fn redact_rch_command(engine: &RedactionEngine, input: &str) -> Option<RedactedS
     let mut output = String::from("rch exec -- env");
     let mut changes = Vec::new();
     for (idx, word) in words.into_iter().enumerate() {
-        let mut redacted = engine.redact_text(&word);
+        let mut redacted = redact_swarm_original_scalar(engine, &word);
         if redacted.output != word
             && redacted
                 .output
@@ -1512,6 +1555,130 @@ mod tests {
                     "redacted command leaked {fragment:?}: {redacted:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn swarm_original_spans_preserve_secret_markers_and_public_suffixes() {
+        let cases = [
+            (
+                "TOKEN=\"FIRST_SECRET_LINE\nSECOND_SECRET_LINE\" public=kept",
+                "[SECRET_ENV_REDACTED] public=kept",
+            ),
+            (
+                "PASS='FIRST_SECRET_LINE\r\nSECOND_SECRET_LINE' public=kept",
+                "[SECRET_ENV_REDACTED] public=kept",
+            ),
+            (
+                "KEY=\"FIRST_SECRET_LINE\\\nSECOND_SECRET_LINE\" public=kept",
+                "[SECRET_ENV_REDACTED] public=kept",
+            ),
+            (
+                "TOKEN=\"FIRST_SECRET_LINE\nSECOND_SECRET_LINE\\",
+                "[SECRET_ENV_REDACTED]",
+            ),
+            (
+                "awsSecretAccessKey=\"AKIAABCDEFGHIJKLMNOP abcdefghijklmnopqrst\nTAIL\" public=kept",
+                "[SECRET_ENV_REDACTED] public=kept",
+            ),
+            (
+                concat!(
+                    "API_SECRET=-----BEGIN RSA PRIVATE KEY-----\n",
+                    "FIRST_PRIVATE_PART\n-----END RSA PRIVATE KEY-----\npublic=kept"
+                ), // ubs:ignore — synthetic key-block redaction fixture, not a private key.
+                "[SECRET_ENV_REDACTED]\npublic=kept",
+            ),
+            (
+                concat!(
+                    "awsSecretAccessKey=\"-----BEGIN RSA PRIVATE KEY-----\n",
+                    "FIRST_PRIVATE_PART\" tail\nSECOND_PRIVATE_PART\n",
+                    "-----END RSA PRIVATE KEY-----\npublic=kept"
+                ), // ubs:ignore — synthetic key-block redaction fixture, not a private key.
+                "[SECRET_ENV_REDACTED]\npublic=kept",
+            ),
+            (
+                "TOKEN=/home/alice/Secret Project",
+                "[SECRET_ENV_REDACTED]",
+            ),
+            (
+                "Read /home/alice/Secret Project",
+                "Read [REDACTED_PATH]",
+            ),
+            (
+                "Use ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij now",
+                "Use [SECRET_REDACTED] now",
+            ),
+            (
+                "Authorization: Bearer abcdefghijklmnopqrstuvwxyz1234",
+                "Authorization: Bearer [SECRET_REDACTED]",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(redact_swarm_text(input), expected, "{input:?}");
+            assert_eq!(redact_swarm_text(expected), expected);
+            let mut report_redactor = SwarmEvidenceRedactor::strict_default();
+            assert_eq!(report_redactor.redact_command_argument(input), expected);
+            assert!(report_redactor.report().redaction_applied);
+            assert!(report_redactor.report().command_arguments_scrubbed > 0);
+            let json = serde_json::json!({
+                "command_shape": input,
+                "password": "short",
+                "token_count": 7,
+                "public_note": "kept",
+            });
+            let redacted = redact_swarm_json_value(&json);
+            assert_eq!(redacted["command_shape"], expected);
+            assert_eq!(redacted["password"], "[REDACTED]");
+            assert_eq!(redacted["token_count"], 7);
+            assert_eq!(redacted["public_note"], "kept");
+        }
+        let input = "PUBLIC_TEXT=\"first\nsecond\" build=passed";
+        let engine = RedactionEngine::new(swarm_evidence_redaction_config());
+        let redacted = redact_swarm_scalar_with_engine(&engine, input);
+        assert_eq!(redacted.output, input);
+        assert!(redacted.changes.is_empty());
+    }
+
+    #[test]
+    fn swarm_original_spans_preserve_rch_admission_before_redaction() {
+        for (input, expected) in [
+            (
+                "rch exec -- env TOKEN='abcd'efgh cargo test",
+                "rch exec -- env [SECRET_ENV_REDACTED] cargo test",
+            ),
+            (
+                "rch exec -- env CARGO_TARGET_DIR='/home/alice/Secret Project' cargo test",
+                "rch exec -- env CARGO_TARGET_DIR=[REDACTED_PATH] cargo test",
+            ),
+            (
+                "rch exec -- env cargo test 'awsSecretAccessKey:\"AKIAABCDEFGHIJKLMNOP abcdefghijklmnopqrst TAIL\"'",
+                "rch exec -- env cargo test [REDACTED]",
+            ),
+            (
+                "rch exec -- env TOKEN=\"FIRST_SECRET_LINE\nSECOND_SECRET_LINE\" cargo test",
+                "[REDACTED_COMMAND]",
+            ),
+            (
+                "rch exec -- env TOKEN=longsecret; echo public cargo test",
+                "[REDACTED_COMMAND]",
+            ),
+            (
+                "rch exec -- env TOKEN='secret$VALUE' cargo test",
+                "[REDACTED_COMMAND]",
+            ),
+            (
+                "rch exec -- env TOKEN=\"secret cargo test",
+                "[REDACTED_COMMAND]",
+            ),
+        ] {
+            assert_eq!(redact_swarm_text(input), expected, "{input:?}");
+            let mut redactor = SwarmEvidenceRedactor::strict_default();
+            assert_eq!(redactor.redact_command_argument(input), expected);
+            assert_eq!(
+                redact_swarm_json_value(&serde_json::json!({"command_shape": input}))
+                    ["command_shape"],
+                expected
+            );
         }
     }
 
