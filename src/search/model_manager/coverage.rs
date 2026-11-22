@@ -112,6 +112,16 @@ pub(super) fn archive_snapshot(
     ))
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static SEMANTIC_ARTIFACT_ADMISSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn semantic_artifact_admission_count() -> usize {
+    SEMANTIC_ARTIFACT_ADMISSIONS.with(std::cell::Cell::get)
+}
+
 pub(super) fn authenticate_artifact(
     data_dir: &Path,
     record: &ArtifactRecord,
@@ -120,6 +130,8 @@ pub(super) fn authenticate_artifact(
     snapshot: SemanticCoverageSnapshot,
     ann_path: Option<PathBuf>,
 ) -> anyhow::Result<SemanticIndexArtifact> {
+    #[cfg(all(test, unix))]
+    SEMANTIC_ARTIFACT_ADMISSIONS.with(|count| count.set(count.get().saturating_add(1)));
     anyhow::ensure!(
         cfg!(unix)
             && certificate.matches_artifact(record)
@@ -258,6 +270,7 @@ pub(super) fn load_context(
     }))
 }
 
+#[cfg(test)]
 pub(super) fn probe(data_dir: &Path, embedder_id: &str, dimension: usize) -> Result<bool, String> {
     let Some((record, certificate)) = covered_semantic_record(data_dir, embedder_id)? else {
         return Ok(false);
@@ -287,6 +300,35 @@ pub(crate) fn observe_covered_semantic_artifact(
     let Some(selected) = select_covered_semantic_record(data_dir, embedder_id)? else {
         return Ok(None);
     };
+    let dimension = selected.record.dimension;
+    observe_selected_artifact(data_dir, storage, selected, dimension).map(Some)
+}
+
+/// Combine canonical coverage and exact file admission in one readiness probe.
+/// A missing certificate leaves legacy admission and identity-marker checks to
+/// the caller. Once selected, a malformed proof is an error, never a fallback.
+/// The expected dimension comes from the requested embedder, not the manifest.
+pub(crate) fn observe_covered_semantic_artifact_for_readiness(
+    data_dir: &Path,
+    db_path: &Path,
+    embedder_id: &str,
+    dimension: usize,
+) -> Result<Option<CoveredSemanticObservation>, String> {
+    let Some(selected) = select_covered_semantic_record(data_dir, embedder_id)? else {
+        return Ok(None);
+    };
+    let storage = FrankenStorage::open_readonly(db_path).map_err(|error| {
+        format!("checking semantic identity invalidation marker: {error}")
+    })?;
+    observe_selected_artifact(data_dir, &storage, selected, dimension).map(Some)
+}
+
+fn observe_selected_artifact(
+    data_dir: &Path,
+    storage: &FrankenStorage,
+    selected: CoveredSemanticSelection,
+    dimension: usize,
+) -> Result<CoveredSemanticObservation, String> {
     let CoveredSemanticSelection {
         record,
         certificate,
@@ -298,14 +340,14 @@ pub(crate) fn observe_covered_semantic_artifact(
         data_dir,
         &record,
         certificate,
-        record.dimension,
+        dimension,
         snapshot.clone(),
         None,
     )
     .map_err(|error| format!("semantic coverage admission: {error:#}"))?;
-    Ok(Some(CoveredSemanticObservation {
+    Ok(CoveredSemanticObservation {
         record,
         coverage: snapshot,
         ann_path: declared_ann_path,
-    }))
+    })
 }

@@ -15,6 +15,9 @@ mod legacy;
 
 pub use coverage::covered_semantic_record;
 pub(crate) use coverage::observe_covered_semantic_artifact;
+pub(super) use coverage::observe_covered_semantic_artifact_for_readiness;
+#[cfg(all(test, unix))]
+pub(super) use coverage::semantic_artifact_admission_count;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -709,13 +712,41 @@ pub fn load_semantic_context_for_embedder_deferred_strict(
 /// Probe semantic availability without loading the embedder or DB-backed
 /// filter maps. The selected FSVI is opened through the same exact-artifact
 /// policy as serving so status cannot advertise an artifact a query rejects.
+#[cfg(test)]
 pub(crate) fn probe_semantic_availability(data_dir: &Path) -> SemanticAvailability {
     probe_semantic_availability_for_embedder(data_dir, active_policy_embedder_name())
 }
 
+#[cfg(test)]
 pub(crate) fn probe_semantic_availability_for_embedder(
     data_dir: &Path,
     embedder_name: &str,
+) -> SemanticAvailability {
+    probe_semantic_availability_for_embedder_with_coverage_probe(
+        data_dir,
+        embedder_name,
+        &mut coverage::probe,
+    )
+}
+
+/// Readiness supplies canonical coverage admission here so a certified local
+/// artifact is authenticated once. Model-cache gating still runs first; the
+/// external backend keeps its existing independent admission path.
+pub(super) fn probe_semantic_availability_with_coverage_probe(
+    data_dir: &Path,
+    coverage_probe: &mut impl FnMut(&Path, &str, usize) -> Result<bool, String>,
+) -> SemanticAvailability {
+    probe_semantic_availability_for_embedder_with_coverage_probe(
+        data_dir,
+        active_policy_embedder_name(),
+        coverage_probe,
+    )
+}
+
+fn probe_semantic_availability_for_embedder_with_coverage_probe(
+    data_dir: &Path,
+    embedder_name: &str,
+    coverage_probe: &mut impl FnMut(&Path, &str, usize) -> Result<bool, String>,
 ) -> SemanticAvailability {
     if embedder_name
         .trim()
@@ -758,7 +789,7 @@ pub(crate) fn probe_semantic_availability_for_embedder(
         return availability;
     }
 
-    match coverage::probe(data_dir, &config.embedder_id, config.dimension) {
+    match coverage_probe(data_dir, &config.embedder_id, config.dimension) {
         Ok(true) => {
             return SemanticAvailability::Ready {
                 embedder_id: config.embedder_id,
@@ -787,12 +818,20 @@ pub(crate) fn probe_semantic_availability_for_embedder(
 
 /// Probe hash semantic availability without opening the DB. The selected FSVI
 /// is admitted through the same exact-artifact policy as serving.
+#[cfg(test)]
 pub(crate) fn probe_hash_semantic_availability(data_dir: &Path) -> SemanticAvailability {
+    probe_hash_semantic_availability_with_coverage_probe(data_dir, &mut coverage::probe)
+}
+
+pub(super) fn probe_hash_semantic_availability_with_coverage_probe(
+    data_dir: &Path,
+    coverage_probe: &mut impl FnMut(&Path, &str, usize) -> Result<bool, String>,
+) -> SemanticAvailability {
     if let Some(availability) = selected_generation_owner_requirement(data_dir) {
         return availability;
     }
     let embedder = HashEmbedder::default();
-    match coverage::probe(data_dir, embedder.id(), embedder.dimension()) {
+    match coverage_probe(data_dir, embedder.id(), embedder.dimension()) {
         Ok(true) => return SemanticAvailability::HashFallback,
         Ok(false) => {}
         Err(context) => return SemanticAvailability::LoadFailed { context },

@@ -26,7 +26,9 @@ use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::model_manager::{
-    SemanticAvailability, probe_hash_semantic_availability, probe_semantic_availability,
+    SemanticAvailability, observe_covered_semantic_artifact_for_readiness,
+    probe_hash_semantic_availability_with_coverage_probe,
+    probe_semantic_availability_with_coverage_probe,
 };
 use crate::search::policy::{
     CHUNKING_STRATEGY_VERSION, CliSemanticOverrides, SEMANTIC_SCHEMA_VERSION, SemanticPolicy,
@@ -828,28 +830,48 @@ pub(crate) fn inspect_semantic_assets(
         );
     }
 
+    // The old sequence authenticated every certified vector and parent twice:
+    // once in the availability probe and again for canonical coverage. Let the
+    // local/hash probe perform the canonical admission once, after model-cache
+    // gating, and retain its exact record and ANN declaration for projection.
+    let mut covered = None;
+    let mut coverage_probe = |data_dir: &Path, embedder_id: &str, dimension: usize| {
+        covered = observe_covered_semantic_artifact_for_readiness(
+            data_dir,
+            db_path,
+            embedder_id,
+            dimension,
+        )?;
+        Ok(covered.is_some())
+    };
     let availability = match preference {
-        SemanticPreference::DefaultModel => probe_semantic_availability(data_dir),
-        SemanticPreference::HashFallback => probe_hash_semantic_availability(data_dir),
+        SemanticPreference::DefaultModel => {
+            probe_semantic_availability_with_coverage_probe(data_dir, &mut coverage_probe)
+        }
+        SemanticPreference::HashFallback => {
+            probe_hash_semantic_availability_with_coverage_probe(data_dir, &mut coverage_probe)
+        }
     };
     if availability.can_search()
         && let Some(embedder_id) = semantic_embedder_id(&availability, preference)
     {
-        let observation = FrankenStorage::open_readonly(db_path)
-            .map_err(|error| {
-                // Coverage inspection precedes the legacy identity-marker
-                // check, but both need this canonical metadata connection.
-                // Preserve the fail-closed diagnostic when the earlier
-                // `db_available` observation is no longer valid.
-                format!("checking semantic identity invalidation marker: {error}")
-            })
-            .and_then(|storage| {
-                crate::search::model_manager::observe_covered_semantic_artifact(
-                    data_dir,
-                    &storage,
-                    &embedder_id,
-                )
-            });
+        let observation = if let Some(observation) = covered {
+            Ok(Some(observation))
+        } else {
+            // Preserve late observation for external and legacy availability.
+            // A certificate can appear after the initial probe found none.
+            FrankenStorage::open_readonly(db_path)
+                .map_err(|error| {
+                    format!("checking semantic identity invalidation marker: {error}")
+                })
+                .and_then(|storage| {
+                    crate::search::model_manager::observe_covered_semantic_artifact(
+                        data_dir,
+                        &storage,
+                        &embedder_id,
+                    )
+                })
+        };
         match observation {
             Ok(Some(observation)) => {
                 let record = observation.record;
@@ -4044,6 +4066,274 @@ mod tests {
         assert_eq!(snapshot.semantic.status, "not_inspected");
         assert_eq!(snapshot.semantic.availability, "not_inspected");
         assert_eq!(snapshot.semantic.fallback_mode, Some("lexical"));
+    }
+
+    #[test]
+    fn absent_coverage_does_not_open_the_canonical_database() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let db_path = root.path().join("not-a-database");
+        std::fs::create_dir(&db_path)?;
+        let embedder = HashEmbedder::default();
+        assert!(
+            observe_covered_semantic_artifact_for_readiness(
+                root.path(),
+                &db_path,
+                embedder.id(),
+                embedder.dimension(),
+            )
+            .map_err(anyhow::Error::msg)?
+            .is_none()
+        );
+        assert!(db_path.is_dir());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn insert_readiness_conversation(
+        data_dir: &Path,
+        storage: &FrankenStorage,
+        agent: i64,
+        name: &str,
+        content: &str,
+    ) -> Result<()> {
+        use crate::model::types::{Conversation, Message, MessageRole};
+
+        storage.insert_conversation_tree(
+            agent,
+            None,
+            &Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some(name.to_owned()),
+                title: Some(name.to_owned()),
+                source_path: data_dir.join(format!("{name}.jsonl")),
+                started_at: None,
+                ended_at: None,
+                approx_tokens: None,
+                metadata_json: serde_json::json!({}),
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::Agent,
+                    author: None,
+                    created_at: None,
+                    content: content.to_owned(),
+                    extra_json: serde_json::json!({}),
+                    snippets: Vec::new(),
+                }],
+                source_id: "local".into(),
+                origin_host: None,
+            },
+        )?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn certified_readiness_fixture() -> Result<(tempfile::TempDir, FrankenStorage, i64)> {
+        use crate::indexer::semantic::{SemanticBackfillStoragePlan, SemanticIndexer};
+        use crate::indexer::semantic_progress::SemanticProgressSink;
+        use crate::model::types::{Agent, AgentKind};
+
+        let root = tempfile::tempdir()?;
+        let storage = FrankenStorage::open(&root.path().join("agent_search.db"))?;
+        let agent = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        insert_readiness_conversation(
+            root.path(),
+            &storage,
+            agent,
+            "published",
+            "retained certified semantic readiness passage",
+        )?;
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let mut manifest = SemanticManifest::load_or_default(root.path())?;
+        let outcome = indexer.run_backfill_from_storage_with_sink(
+            &storage,
+            root.path(),
+            &mut manifest,
+            SemanticBackfillStoragePlan {
+                tier: TierKind::Fast,
+                db_fingerprint: crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?,
+                model_revision: "hash".into(),
+                max_conversations: usize::MAX,
+            },
+            &SemanticProgressSink::disabled(),
+        )?;
+        assert!(outcome.published);
+        assert!(manifest.coverage.contains_key(indexer.embedder_id()));
+        Ok((root, storage, agent))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn certified_readiness_admits_once_and_keeps_append_coverage() -> Result<()> {
+        use crate::search::model_manager::{
+            observe_covered_semantic_artifact, probe_hash_semantic_availability,
+            semantic_artifact_admission_count,
+        };
+
+        let (root, storage, agent) = certified_readiness_fixture()?;
+        let embedder = HashEmbedder::default();
+        let declared_ann = "vector_index/readiness-selected.chsw";
+        std::fs::write(root.path().join(declared_ann), b"unadmitted ANN fixture")?;
+        let mut manifest = SemanticManifest::load_or_default(root.path())?;
+        manifest.hnsw = Some(crate::search::semantic_manifest::HnswRecord {
+            base_tier: TierKind::Fast,
+            embedder_id: embedder.id().to_owned(),
+            ef_search: 32,
+            index_path: declared_ann.to_owned(),
+            size_bytes: 22,
+            built_at_ms: 0,
+            ready: false,
+        });
+        manifest.save(root.path())?;
+        // Live negative control: the former readiness sequence performs two
+        // full authentications on the very same populated publication.
+        let before = semantic_artifact_admission_count();
+        assert!(probe_hash_semantic_availability(root.path()).can_search());
+        let incumbent = observe_covered_semantic_artifact(root.path(), &storage, embedder.id())
+            .map_err(anyhow::Error::msg)?
+            .context("incumbent coverage")?;
+        assert_eq!(semantic_artifact_admission_count() - before, 2);
+
+        let inspect = || {
+            inspect_semantic_assets(
+                root.path(),
+                &root.path().join("agent_search.db"),
+                SemanticPreference::HashFallback,
+                None,
+                true,
+            )
+        };
+        let before = semantic_artifact_admission_count();
+        let current = inspect();
+        assert_eq!(semantic_artifact_admission_count() - before, 1);
+        assert_eq!(current.status, "ready");
+        assert!(current.can_search);
+        assert_eq!(current.fast_tier.coverage, Some(incumbent.coverage.clone()));
+        assert_eq!(
+            current.vector_index_path,
+            Some(root.path().join(&incumbent.record.index_path))
+        );
+        assert_eq!(current.hnsw_path, incumbent.ann_path);
+        assert_eq!(current.hnsw_path, Some(root.path().join(declared_ann)));
+        assert!(current.hnsw_present);
+        assert!(!current.hnsw_ready);
+
+        insert_readiness_conversation(
+            root.path(),
+            &storage,
+            agent,
+            "appended",
+            "new canonical passage awaiting semantic catch-up",
+        )?;
+        let before = semantic_artifact_admission_count();
+        let partial = inspect();
+        assert_eq!(semantic_artifact_admission_count() - before, 1);
+        assert_eq!(partial.status, "partial");
+        assert_eq!(partial.availability, "partial_coverage");
+        assert!(partial.can_search);
+        assert_eq!(partial.fallback_mode, None);
+        let coverage = partial.fast_tier.coverage.context("partial coverage")?;
+        assert_eq!(coverage.generation, incumbent.coverage.generation);
+        assert!(coverage.current_mutation_seq > coverage.published_mutation_seq);
+        assert!(coverage.current_max_message_id > coverage.published_max_message_id);
+        assert_eq!(partial.vector_index_path, current.vector_index_path);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn certified_readiness_rejects_alias_and_corrupt_replacement() -> Result<()> {
+        use crate::search::model_manager::covered_semantic_record;
+
+        let (root, _storage, _) = certified_readiness_fixture()?;
+        let (record, _) = covered_semantic_record(root.path(), HashEmbedder::default().id())
+            .map_err(anyhow::Error::msg)?
+            .context("certified publication")?;
+        let selected = root.path().join(&record.index_path);
+        let original = std::fs::read(&selected)?;
+        let original_modified = std::fs::metadata(&selected)?.modified()?;
+        let retained = selected.with_extension("retained");
+        std::fs::rename(&selected, &retained)?;
+        std::os::unix::fs::symlink(&retained, &selected)?;
+        let inspect = || {
+            inspect_semantic_assets(
+                root.path(),
+                &root.path().join("agent_search.db"),
+                SemanticPreference::HashFallback,
+                None,
+                true,
+            )
+        };
+        let alias = inspect();
+        assert_eq!(alias.availability, "load_failed");
+        assert!(!alias.can_search);
+        assert!(alias.summary.contains("symlink"));
+
+        // Preserve both the rejected alias and the authentic bytes. Install a
+        // same-length, same-mtime replacement to exercise digest admission.
+        std::fs::rename(&selected, selected.with_extension("rejected-link"))?;
+        let mut changed = original.clone();
+        let middle = changed.len() / 2;
+        changed[middle] ^= 1;
+        std::fs::write(&selected, &changed)?;
+        std::fs::File::open(&selected)?.set_modified(original_modified)?;
+        let corrupt = inspect();
+        assert_eq!(corrupt.availability, "load_failed");
+        assert!(!corrupt.can_search);
+        assert!(corrupt.summary.contains("digest mismatch"));
+        assert_eq!(std::fs::read(&retained)?, original);
+        assert_eq!(std::fs::read(&selected)?, changed);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn certified_readiness_rejects_incompatible_selected_manifest_without_fallback() -> Result<()> {
+        use crate::search::model_manager::semantic_artifact_admission_count;
+
+        let (root, _storage, _) = certified_readiness_fixture()?;
+        let mut manifest = SemanticManifest::load_or_default(root.path())?;
+        let mut record = manifest.fast_tier.clone().context("fast tier")?;
+        record.dimension += 1;
+        manifest.fast_tier = Some(record.clone());
+        manifest.save(root.path())?;
+        let inspect = || {
+            inspect_semantic_assets(
+                root.path(),
+                &root.path().join("agent_search.db"),
+                SemanticPreference::HashFallback,
+                None,
+                true,
+            )
+        };
+        let before = semantic_artifact_admission_count();
+        let incompatible = inspect();
+        assert_eq!(semantic_artifact_admission_count() - before, 1);
+        assert_eq!(incompatible.availability, "load_failed");
+        assert!(!incompatible.can_search);
+        assert!(incompatible.summary.contains("dimension mismatch"));
+
+        // A selected publication that no longer matches its certificate must
+        // not fall back to the still-present conventional mutable hash index.
+        record.dimension -= 1;
+        record.doc_count += 1;
+        manifest.fast_tier = Some(record);
+        manifest.save(root.path())?;
+        let before = semantic_artifact_admission_count();
+        let mismatched = inspect();
+        assert_eq!(semantic_artifact_admission_count() - before, 0);
+        assert_eq!(mismatched.availability, "load_failed");
+        assert!(!mismatched.can_search);
+        assert!(mismatched.summary.contains("does not match a ready artifact"));
+        Ok(())
     }
 
     #[test]
