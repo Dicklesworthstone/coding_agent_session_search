@@ -175,7 +175,7 @@ impl SourceSnapshot {
         // A newline appended after the parser's snapshot, or a replacement at
         // the same path, cannot turn an incomplete read into a complete one.
         self.validate(path)?;
-        Ok(last == [b'\n'])
+        Ok(last == *b"\n")
     }
 
     pub(super) fn guard_complete_delivery(

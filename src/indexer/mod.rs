@@ -10984,12 +10984,6 @@ fn semantic_indexing_now_ms() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-fn system_time_to_epoch_millis(time: SystemTime) -> Option<i64> {
-    time.duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-}
-
 fn semantic_tier_for_embedder_id(embedder_id: &str) -> Option<SemanticTierKind> {
     match embedder_id {
         "minilm-384" | "multilingual-minilm-384" => Some(SemanticTierKind::Quality),

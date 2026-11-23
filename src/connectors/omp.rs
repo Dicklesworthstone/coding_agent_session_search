@@ -1103,7 +1103,14 @@ mod tests {
             Some(Platform::Macos),
         );
         let ctx = ScanContext::with_roots(temp.path().join("cass-state"), vec![root], None);
-        let cases: Vec<(&str, Box<dyn Connector>, PathBuf, Option<&str>)> = vec![
+        // (session id, connector, expected source path, expected profile)
+        type Case = (
+            &'static str,
+            Box<dyn Connector>,
+            PathBuf,
+            Option<&'static str>,
+        );
+        let cases: Vec<Case> = vec![
             (
                 "pi-session",
                 Box::new(super::super::pi_agent::PiAgentConnector::new()),
