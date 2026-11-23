@@ -349,6 +349,264 @@ pub(crate) fn select_export_records<'a>(
         })
 }
 
+/// Project one conversation turn without retaining its source envelope.
+///
+/// This is an export-only view: callers keep the source records and canonical
+/// rows unchanged. An allowlist is essential here because removing a top-level
+/// tool field would leave arguments/results in nested metadata in JSON exports.
+/// `source_index` is the original record position, not a renumbered output row;
+/// `message_index` is the one-based canonical follow-up ordinal, present only
+/// when the archive supplied a valid zero-based message index.
+pub(crate) fn messages_only_record(
+    source_index: usize,
+    raw: &Value,
+    archived: Option<&Message>,
+) -> Option<Value> {
+    project_messages_only_record(source_index, raw, archived, false)
+}
+
+/// Project a trusted loader's flattened content when original blocks are lost.
+/// This choice belongs to the caller, never to a field in an untrusted record.
+pub(crate) fn messages_only_flattened_record(source_index: usize, raw: &Value) -> Option<Value> {
+    project_messages_only_record(source_index, raw, None, true)
+}
+
+fn project_messages_only_record(
+    source_index: usize,
+    raw: &Value,
+    archived: Option<&Message>,
+    flattened_source: bool,
+) -> Option<Value> {
+    let raw_role = crate::extract_role(raw);
+    // Selection can replace an injected skill with a system placeholder.
+    // Never reconstruct its omitted original from an archived user-role row.
+    if !matches!(raw_role.as_str(), "user" | "assistant") {
+        return None;
+    }
+    let role = archived.map_or_else(
+        || raw_role,
+        |message| crate::role_to_export_string(&message.role),
+    );
+    if !matches!(role.as_str(), "user" | "assistant") {
+        return None;
+    }
+
+    // Searchable archive text may flatten a mixed text/tool message. Recover
+    // its preserved content blocks before selecting prose, including legacy
+    // raw-line envelopes. A recognized tool-only content value is final: do
+    // not fall back to flattened text when it produces no visible message.
+    let preserved = archived
+        .and_then(|message| {
+            crate::storage::sqlite::message_extra_to_source_jsonl_line(&message.extra_json)
+        })
+        .and_then(|line| serde_json::from_str::<Value>(&line).ok());
+    let preserved_source = preserved.as_ref().filter(|event| {
+        crate::extract_role(event) == role && messages_only_content(event).is_some()
+    });
+    let is_cline_sdk =
+        |extra: &Value| extra.pointer("/cass/cline_sdk").and_then(Value::as_bool) == Some(true);
+    if preserved_source.is_none()
+        && (preserved.as_ref().is_some_and(is_cline_sdk)
+            || archived.is_some_and(|message| is_cline_sdk(&message.extra_json)))
+    {
+        // Cline SDK's compact archive metadata loses the original block
+        // boundaries and does not distinguish prose from unmarked reasoning,
+        // file contents or mixed tool results. Even tool_call_count == 0 is
+        // insufficient evidence. Keep this unrecoverable turn in the archive
+        // but omit it from the strict view instead of presenting tool data as
+        // a prompt or reply.
+        return None;
+    }
+    let source = preserved_source.unwrap_or(raw);
+    let source_content = messages_only_content(source)?;
+    let mut content = messages_only_text(source_content);
+    let legacy_prefix = (flattened_source || (archived.is_some() && preserved_source.is_none()))
+        && source_content.is_string()
+        && {
+            let prefix = messages_only_legacy_prefix(&content);
+            let shortened = prefix.len() != content.len();
+            if shortened {
+                content = prefix.to_string();
+            }
+            // Pi's ordinary renderer may have already removed the same
+            // flattened suffix. Compare only to label the loss; never copy
+            // anything from the original canonical text back into this view.
+            shortened
+                || archived.is_some_and(|message| {
+                    let original_prefix = messages_only_legacy_prefix(&message.content);
+                    original_prefix.len() != message.content.len()
+                        && original_prefix.starts_with(&content)
+                })
+        };
+    if content.trim().is_empty() {
+        return None;
+    }
+
+    let mut projected = serde_json::json!({
+        "role": role,
+        "content": content,
+        "source_index": source_index,
+    });
+    if legacy_prefix {
+        projected["content_projection"] = Value::from("legacy-visible-prefix");
+    }
+    if let Some(message_index) = archived
+        .and_then(|message| message.idx.checked_add(1))
+        .filter(|index| *index > 0)
+    {
+        projected["message_index"] = Value::from(message_index);
+    }
+    if let Some(timestamp) = archived
+        .and_then(|message| message.created_at)
+        .or_else(|| crate::extract_message_timestamp(source))
+        .or_else(|| crate::extract_message_timestamp(raw))
+    {
+        projected["timestamp"] = Value::from(timestamp);
+    }
+    if let Some(id) = messages_only_body(source)
+        .and_then(|body| body.get("id"))
+        .or_else(|| source.get("id"))
+        .or_else(|| source.get("uuid"))
+        .filter(|id| id.is_string() || id.is_number())
+    {
+        projected["id"] = id.clone();
+    }
+    Some(projected)
+}
+
+fn messages_only_legacy_prefix(content: &str) -> &str {
+    // Some older connectors retained only flattened search text. Once a tool
+    // description/argument or reasoning segment begins, its newlines cannot
+    // be distinguished from later prose without the original content blocks.
+    // Preserve only the known prefix; never guess a boundary that could copy
+    // tool data back into the export. Structured/string source envelopes are
+    // exempt so literal discussions of these markers remain intact.
+    let prefix = crate::without_flattened_tool_suffix(content);
+    let mut offset = 0;
+    for line in prefix.split_inclusive('\n') {
+        let text = line.trim_start();
+        if text.starts_with("[Tool:")
+            || text.starts_with("[Tool Output]")
+            || text.starts_with("[Patch]")
+            || text.starts_with("[Thinking]")
+            || text.starts_with("[Reasoning]")
+        {
+            return prefix[..offset].trim_end_matches(['\r', '\n']);
+        }
+        offset += line.len();
+    }
+    prefix
+}
+
+fn messages_only_content(record: &Value) -> Option<&Value> {
+    let body = messages_only_body(record)?;
+    if messages_only_nonprose_envelope(body) {
+        // A role-less tool envelope can sit inside a user event. Keep it as a
+        // typed, non-text block so the preserved source is recognized and its
+        // empty projection cannot fall back to flattened canonical tool text.
+        Some(body)
+    } else {
+        body.get("content")
+    }
+}
+
+fn messages_only_nonprose_envelope(body: &Value) -> bool {
+    matches!(
+        body.get("type").and_then(Value::as_str),
+        Some(
+            "tool"
+                | "tool_use"
+                | "tool_result"
+                | "tool_call"
+                | "toolCall"
+                | "toolResult"
+                | "function_call"
+                | "function_call_output"
+                | "custom_tool_call"
+                | "custom_tool_call_output"
+                | "thinking"
+                | "reasoning"
+                | "patch"
+        )
+    )
+}
+
+fn messages_only_body(record: &Value) -> Option<&Value> {
+    // Follow the role extractor's envelope precedence. A second envelope must
+    // not smuggle its content into a record classified by a different role.
+    if let Some(role) = record.get("role").and_then(Value::as_str) {
+        if record.get("content").is_none() {
+            // Cursor agent transcripts put the role on the outer event but
+            // the content on a role-less message object. This is the same
+            // turn, unlike an explicitly conflicting nested envelope.
+            for key in ["message", "payload"] {
+                if let Some(body) = record.get(key)
+                    && (body.get("content").is_some() || messages_only_nonprose_envelope(body))
+                    && body
+                        .get("role")
+                        .and_then(Value::as_str)
+                        .is_none_or(|nested| {
+                            crate::normalized_export_role(nested)
+                                == crate::normalized_export_role(role)
+                        })
+                    && (matches!(
+                        body.get("type").and_then(Value::as_str),
+                        None | Some("message" | "user" | "assistant")
+                    ) || messages_only_nonprose_envelope(body))
+                {
+                    return Some(body);
+                }
+            }
+        }
+        return Some(record);
+    }
+    for key in ["message", "payload"] {
+        if let Some(body) = record.get(key)
+            && body.get("role").is_some_and(Value::is_string)
+        {
+            return Some(body);
+        }
+    }
+    if matches!(
+        record.get("type").and_then(Value::as_str),
+        Some("user" | "assistant")
+    ) {
+        if record.get("content").is_some() {
+            return Some(record);
+        }
+        for key in ["message", "payload"] {
+            if let Some(body) = record.get(key)
+                && (body.get("content").is_some() || messages_only_nonprose_envelope(body))
+                && (matches!(
+                    body.get("type").and_then(Value::as_str),
+                    None | Some("message" | "user" | "assistant")
+                ) || messages_only_nonprose_envelope(body))
+            {
+                return Some(body);
+            }
+        }
+    }
+    None
+}
+
+fn messages_only_text(content: &Value) -> String {
+    // The ordinary no-tools renderer also retains reasoning blocks. This
+    // stricter view contains just prompts and replies, so use only text blocks
+    // and never recursively flatten tool results, thinking or attachments.
+    if let Some(blocks) = content.as_array() {
+        blocks
+            .iter()
+            .filter_map(crate::export_text_block)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        crate::export_text_block(content)
+            .unwrap_or_default()
+            .to_string()
+    }
+}
+
 /// Convert the selected source records after the caller redacts credentials.
 pub(crate) fn html_messages_from_raw<'a>(
     raw_messages: impl IntoIterator<Item = (usize, &'a Value)>,
@@ -822,6 +1080,383 @@ fn truncate_text(text: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn messages_only_projects_mixed_turns_without_raw_tool_metadata() {
+        let raw = serde_json::json!({
+            "type": "assistant",
+            "uuid": "turn-7",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Before café 界"},
+                    {"type": "tool_use", "id": "call-7", "name": "Read", "input": {"path": "PRIVATE_ARGUMENT"}},
+                    {"type": "thinking", "thinking": "PRIVATE_REASONING"},
+                    {"type": "tool_result", "content": "PRIVATE_RESULT"},
+                    {"type": "image", "source": {"data": "PRIVATE_ATTACHMENT"}},
+                    {"type": "text", "text": "After [Tool: literal prose]"}
+                ]
+            },
+            "metadata": {"tool_result": "PRIVATE_METADATA"}
+        });
+        let before = raw.clone();
+        let projected = messages_only_record(7, &raw, None).expect("ordinary assistant text");
+        assert_eq!(
+            projected,
+            serde_json::json!({
+                "role": "assistant",
+                "content": "Before café 界\nAfter [Tool: literal prose]",
+                "source_index": 7,
+                "id": "turn-7",
+                "timestamp": 1767225601000_i64
+            })
+        );
+        assert!(!projected.to_string().contains("PRIVATE_"));
+        assert_eq!(raw, before, "projection must not rewrite the source record");
+    }
+
+    #[test]
+    fn messages_only_omits_non_conversation_and_tool_only_records() {
+        for raw in [
+            serde_json::json!({"role": "system", "content": "internal instructions"}),
+            serde_json::json!({"role": "tool", "content": "a file read"}),
+            serde_json::json!({"message": {"role": "toolResult", "content": "tool output"}}),
+            serde_json::json!({"type": "session_meta", "payload": {"content": "metadata"}}),
+            serde_json::json!({"role": "unknown", "content": "unknown content"}),
+            serde_json::json!({"role": "assistant", "content": [{"type": "thinking", "thinking": "private"}]}),
+            serde_json::json!({"role": "user", "content": {"type": "tool_result", "content": "result"}}),
+            serde_json::json!({"role": "user", "type": "tool_result", "content": "result"}),
+            serde_json::json!({"type": "user", "message": {"type": "tool_result", "content": "result"}}),
+            serde_json::json!({"role": "user", "message": {"type": "tool_result", "content": "result"}}),
+            serde_json::json!({"role": "assistant", "content": [{"type": "toolCall", "name": "Read", "arguments": {"text": "argument"}}]}),
+            serde_json::json!({"role": "user", "content": " \n\t"}),
+        ] {
+            assert!(messages_only_record(2, &raw, None).is_none(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn messages_only_preserves_text_block_shapes_and_original_positions() {
+        let records = [
+            serde_json::json!({"type": "session"}),
+            serde_json::json!({"role": "user", "content": "first prompt"}),
+            serde_json::json!({"role": "tool", "content": "omitted"}),
+            serde_json::json!({"type": "response_item", "payload": {
+                "role": "assistant", "id": "codex-response", "content": [
+                    {"type": "output_text", "text": "first reply"},
+                    "plain array text",
+                    {"text": "untyped text"}
+                ]
+            }}),
+            serde_json::json!({"role": "user", "content": {"type": "input_text", "text": "follow-up"}}),
+        ];
+        let selected: Vec<_> = records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, raw)| messages_only_record(index, raw, None))
+            .collect();
+        assert_eq!(selected.len(), 3);
+        assert_eq!(selected[0]["source_index"], 1);
+        assert_eq!(selected[1]["source_index"], 3);
+        assert_eq!(selected[2]["source_index"], 4);
+        assert_eq!(selected[1]["id"], "codex-response");
+        assert_eq!(
+            selected[1]["content"],
+            "first reply\nplain array text\nuntyped text"
+        );
+        assert_eq!(selected[2]["content"], "follow-up");
+        assert!(
+            selected
+                .iter()
+                .all(|record| record.get("message_index").is_none())
+        );
+    }
+
+    #[test]
+    fn messages_only_archive_uses_preserved_blocks_and_canonical_identity() {
+        let source_event = serde_json::json!({
+            "type": "message", "id": "pi-reply", "timestamp": 1767225601000_i64,
+            "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "Before"},
+                {"type": "toolCall", "name": "Read", "arguments": {"path": "PRIVATE_ARGUMENT"}},
+                {"type": "thinking", "thinking": "PRIVATE_THINKING"},
+                {"type": "text", "text": "After"}
+            ]}
+        });
+        let raw = serde_json::json!({
+            "role": "assistant",
+            "content": "Before\n[Tool: Read] PRIVATE_ARGUMENT\n[Thinking] PRIVATE_THINKING\nAfter"
+        });
+        for extra_json in [
+            source_event.clone(),
+            serde_json::json!({"__cass_historical_raw_json__": source_event.to_string()}),
+        ] {
+            let archived = Message {
+                id: Some(900),
+                idx: 42,
+                role: crate::model::types::MessageRole::Agent,
+                author: None,
+                created_at: Some(1767225602000_i64),
+                content: raw["content"].as_str().unwrap().to_string(),
+                extra_json,
+                snippets: Vec::new(),
+            };
+            let projected = messages_only_record(6, &raw, Some(&archived)).expect("archive prose");
+            assert_eq!(
+                projected,
+                serde_json::json!({
+                    "role": "assistant", "content": "Before\nAfter", "source_index": 6,
+                    "message_index": 43, "id": "pi-reply", "timestamp": 1767225602000_i64
+                })
+            );
+            assert!(!projected.to_string().contains("PRIVATE_"));
+            assert!(archived.content.contains("PRIVATE_ARGUMENT"));
+        }
+    }
+
+    #[test]
+    fn messages_only_archive_cannot_restore_hidden_tools_or_host_context() {
+        let raw = serde_json::json!({"role": "user", "content": "flattened tool result"});
+        let mut archived = Message {
+            id: None,
+            idx: 8,
+            role: crate::model::types::MessageRole::User,
+            author: None,
+            created_at: None,
+            content: "flattened tool result".to_string(),
+            extra_json: serde_json::json!({
+                "type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call", "content": "flattened tool result"}
+                ]}
+            }),
+            snippets: Vec::new(),
+        };
+        assert!(messages_only_record(8, &raw, Some(&archived)).is_none());
+        for preserved in [
+            serde_json::json!({"type": "user", "message": {
+                "type": "tool_result", "content": "flattened tool result"
+            }}),
+            serde_json::json!({"role": "user", "message": {
+                "type": "tool_result", "content": "flattened tool result"
+            }}),
+            serde_json::json!({"role": "user", "type": "tool_result", "content": "flattened tool result"}),
+            serde_json::json!({"type": "user", "payload": {
+                "type": "function_call_output", "output": "flattened tool result"
+            }}),
+        ] {
+            archived.extra_json = preserved;
+            assert!(messages_only_record(8, &raw, Some(&archived)).is_none());
+        }
+        archived.role = crate::model::types::MessageRole::System;
+        archived.extra_json = serde_json::json!({"role": "user", "content": "host context"});
+        assert!(messages_only_record(8, &raw, Some(&archived)).is_none());
+
+        archived.role = crate::model::types::MessageRole::User;
+        archived.extra_json = serde_json::json!({"role": "user", "content": "PRIVATE_SKILL_BODY"});
+        let placeholder =
+            serde_json::json!({"role": "system", "content": "[Skill loaded: example]"});
+        assert!(messages_only_record(8, &placeholder, Some(&archived)).is_none());
+    }
+
+    #[test]
+    fn messages_only_content_and_identity_follow_the_role_envelope() {
+        let nested = serde_json::json!({
+            "content": "PRIVATE_OUTER_METADATA",
+            "message": {"role": "user", "id": "actual-user", "content": "ordinary prompt"},
+            "payload": {"role": "tool", "content": "PRIVATE_OTHER_ENVELOPE"}
+        });
+        let result = messages_only_record(3, &nested, None).expect("nested user message");
+        assert_eq!(result["content"], "ordinary prompt");
+        assert_eq!(result["id"], "actual-user");
+        assert!(!result.to_string().contains("PRIVATE_"));
+
+        let outer = serde_json::json!({
+            "role": "assistant", "id": "actual-assistant", "content": "ordinary reply",
+            "message": {"role": "tool", "id": "PRIVATE_TOOL_ID", "content": "PRIVATE_TOOL_RESULT"}
+        });
+        let result = messages_only_record(4, &outer, None).expect("outer assistant message");
+        assert_eq!(result["content"], "ordinary reply");
+        assert_eq!(result["id"], "actual-assistant");
+        assert!(!result.to_string().contains("PRIVATE_"));
+
+        let absent = serde_json::json!({
+            "role": "assistant", "message": {"role": "tool", "content": "PRIVATE_FALLBACK"}
+        });
+        assert!(messages_only_record(5, &absent, None).is_none());
+
+        let cursor = serde_json::json!({"role": "assistant", "message": {"content": [
+            {"type": "text", "text": "Cursor narrative"},
+            {"type": "tool_use", "name": "Read", "input": {"description": "PRIVATE_CURSOR_TOOL"}}
+        ]}});
+        let result = messages_only_record(6, &cursor, None).expect("Cursor text envelope");
+        assert_eq!(result["content"], "Cursor narrative");
+        assert!(!result.to_string().contains("PRIVATE_"));
+        let typed_tool = serde_json::json!({
+            "role": "assistant", "message": {"type": "tool_result", "content": "PRIVATE_TOOL_RESULT"}
+        });
+        assert!(messages_only_record(7, &typed_tool, None).is_none());
+    }
+
+    #[test]
+    fn messages_only_selection_and_redaction_do_not_restore_omitted_archive_data() {
+        let mut records = [
+            serde_json::json!({"role": "user", "content":
+                "Base directory for this skill: /private/example\nPRIVATE_SKILL_BODY"}),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "text", "text": "Ordinary reply password=synthetic-projection-secret"},
+                {"type": "tool_use", "name": "Read", "input": {"path": "PRIVATE_TOOL_ARGUMENT"}}
+            ]}),
+        ];
+        let archived: Vec<_> = records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| Message {
+                id: None,
+                idx: index as i64,
+                role: if index == 0 {
+                    crate::model::types::MessageRole::User
+                } else {
+                    crate::model::types::MessageRole::Agent
+                },
+                author: None,
+                created_at: None,
+                content: crate::extract_text_content(record),
+                extra_json: record.clone(),
+                snippets: Vec::new(),
+            })
+            .collect();
+        let archive_before = serde_json::to_value(&archived).unwrap();
+        let mut messages: Vec<_> =
+            select_export_records(&mut records, Some(&archived), ExportInjections::default())
+                .filter_map(|(index, raw)| messages_only_record(index, raw, archived.get(index)))
+                .collect();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["source_index"], 1);
+        assert_eq!(messages[0]["message_index"], 2);
+        let mut privacy = ExportPrivacy::new(false);
+        privacy.redact_messages(&mut messages);
+        assert_eq!(messages[0]["content"], "Ordinary reply [REDACTED]");
+        assert_eq!(privacy.metadata()["redaction_applied"], true);
+        assert!(
+            !serde_json::to_string(&messages)
+                .unwrap()
+                .contains("PRIVATE_")
+        );
+        assert_eq!(serde_json::to_value(&archived).unwrap(), archive_before);
+    }
+
+    #[test]
+    fn messages_only_legacy_archive_retains_only_a_proven_text_prefix() {
+        for suffix in [
+            "[Tool: Read] PRIVATE_ARGUMENT\nPRIVATE_CONTINUATION\nlater prose cannot be distinguished",
+            "[Tool: Read - PRIVATE_ARGUMENT\nPRIVATE_CONTINUATION]\nlater prose cannot be distinguished",
+            "[Tool Output]\nPRIVATE_RESULT\nlater prose cannot be distinguished",
+            "[Patch]\nPRIVATE_PATCH\nlater prose cannot be distinguished",
+            "[Thinking] PRIVATE_REASONING\nlater prose cannot be distinguished",
+            "[Reasoning] PRIVATE_REASONING\nlater prose cannot be distinguished",
+        ] {
+            let text = format!("Ordinary prefix café 界\n{suffix}");
+            let raw = serde_json::json!({"role": "assistant", "content": text});
+            let mut archived = Message {
+                id: None,
+                idx: 12,
+                role: crate::model::types::MessageRole::Agent,
+                author: None,
+                created_at: None,
+                content: text.clone(),
+                extra_json: Value::Null,
+                snippets: Vec::new(),
+            };
+            let projected =
+                messages_only_record(12, &raw, Some(&archived)).expect("known prose prefix");
+            assert_eq!(projected["content"], "Ordinary prefix café 界");
+            assert_eq!(projected["content_projection"], "legacy-visible-prefix");
+            assert_eq!(projected["message_index"], 13);
+            assert_eq!(archived.content, text);
+
+            let already_rendered =
+                serde_json::json!({"role": "assistant", "content": "Ordinary prefix café 界"});
+            let projected = messages_only_record(12, &already_rendered, Some(&archived))
+                .expect("already rendered prefix");
+            assert_eq!(projected["content"], "Ordinary prefix café 界");
+            assert_eq!(projected["content_projection"], "legacy-visible-prefix");
+
+            let tool_only = serde_json::json!({"role": "assistant", "content": suffix});
+            archived.content = suffix.to_string();
+            assert!(messages_only_record(12, &tool_only, Some(&archived)).is_none());
+
+            // Original string envelopes have intact text boundaries, including
+            // literal examples of tool markers; they must not be truncated.
+            archived.content = text.clone();
+            archived.extra_json = raw.clone();
+            let exact =
+                messages_only_record(12, &raw, Some(&archived)).expect("preserved source string");
+            assert_eq!(exact["content"], text);
+            assert!(exact.get("content_projection").is_none());
+            let direct = messages_only_record(12, &raw, None).expect("direct source string");
+            assert_eq!(direct["content"], text);
+            assert!(direct.get("content_projection").is_none());
+
+            let flattened = messages_only_flattened_record(12, &raw)
+                .expect("explicitly flattened loader prefix");
+            assert_eq!(flattened["content"], "Ordinary prefix café 界");
+            assert_eq!(flattened["content_projection"], "legacy-visible-prefix");
+            assert_eq!(flattened["source_index"], 12);
+            assert!(flattened.get("message_index").is_none());
+            assert!(messages_only_flattened_record(12, &tool_only).is_none());
+        }
+    }
+
+    #[test]
+    fn messages_only_omits_cline_sdk_archive_rows_without_recoverable_blocks() {
+        for role in [
+            crate::model::types::MessageRole::User,
+            crate::model::types::MessageRole::Agent,
+        ] {
+            let role_name = crate::role_to_export_string(&role);
+            let raw = serde_json::json!({
+                "role": role_name, "content": "Ordinary prose\nPRIVATE_UNMARKED_CONTENT"
+            });
+            let compact = serde_json::json!({"cass": {
+                "cline_sdk": true, "role": role_name, "tool_call_count": 0
+            }});
+            let mut archived = Message {
+                id: None,
+                idx: 9,
+                role,
+                author: None,
+                created_at: None,
+                content: "Ordinary prose\nPRIVATE_UNMARKED_CONTENT".to_string(),
+                extra_json: compact.clone(),
+                snippets: Vec::new(),
+            };
+            for extra in [
+                compact.clone(),
+                serde_json::json!({"__cass_historical_raw_json__": compact.to_string()}),
+            ] {
+                archived.extra_json = extra;
+                assert!(messages_only_record(9, &raw, Some(&archived)).is_none());
+            }
+
+            // If an intact original envelope is available, it is authoritative
+            // and can recover prose on both sides of otherwise hidden data.
+            archived.extra_json = serde_json::json!({
+                "role": role_name, "cass": {"cline_sdk": true}, "content": [
+                    {"type": "text", "text": "Ordinary prose"},
+                    {"type": "tool_result", "content": "PRIVATE_UNMARKED_CONTENT"},
+                    {"type": "thinking", "thinking": "PRIVATE_REASONING"},
+                    {"type": "text", "text": "Later prose"}
+                ]
+            });
+            let recovered =
+                messages_only_record(9, &raw, Some(&archived)).expect("original source blocks");
+            assert_eq!(recovered["content"], "Ordinary prose\nLater prose");
+            assert_eq!(recovered["message_index"], 10);
+            assert!(!recovered.to_string().contains("PRIVATE_"));
+            assert_eq!(archived.content, "Ordinary prose\nPRIVATE_UNMARKED_CONTENT");
+        }
+    }
 
     #[test]
     fn pi_tool_title_detection_keeps_visible_literal_text() {

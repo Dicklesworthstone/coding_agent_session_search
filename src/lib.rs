@@ -1420,6 +1420,9 @@ pub enum Commands {
         /// Include tool use details in export
         #[arg(long)]
         include_tools: bool,
+        /// Export only user prompts and assistant prose, preserving the full archive.
+        #[arg(long, conflicts_with_all = ["include_tools", "include_skills", "include_system_reminders"])]
+        messages_only: bool,
         #[command(flatten)]
         injections: crate::export::ExportInjections,
         /// Include credentials from the source text (sensitive output).
@@ -1464,6 +1467,10 @@ pub enum Commands {
             default_missing_value = "true"
         )]
         include_tools: bool,
+
+        /// Export only user prompts and assistant prose, preserving the full archive.
+        #[arg(long, conflicts_with_all = ["include_tools", "include_skills", "include_system_reminders"])]
+        messages_only: bool,
 
         /// Show message timestamps; `--show-timestamps=false` hides them
         /// (default: true)
@@ -9487,6 +9494,7 @@ async fn execute_cli(
                     output,
                     clipboard,
                     include_tools,
+                    messages_only,
                     injections,
                     include_secrets,
                 } => {
@@ -9500,6 +9508,7 @@ async fn execute_cli(
                         include_tools,
                         injections,
                         include_secrets,
+                        messages_only,
                     )?;
                 }
                 Commands::ExportHtml {
@@ -9510,6 +9519,7 @@ async fn execute_cli(
                     encrypt,
                     password_stdin,
                     include_tools,
+                    messages_only,
                     show_timestamps,
                     no_cdns,
                     injections,
@@ -9539,6 +9549,7 @@ async fn execute_cli(
                         explain,
                         open,
                         structured_format,
+                        messages_only,
                     )?;
                 }
                 Commands::Expand {
@@ -110903,6 +110914,7 @@ mod gh427_tolerant_jsonl_tests {
             true,
             crate::export::ExportInjections::INCLUDE_ALL,
             false,
+            false,
         )
         .expect("export must retain tool results before Pi control records");
         let exported: Vec<serde_json::Value> =
@@ -110932,6 +110944,7 @@ mod gh427_tolerant_jsonl_tests {
             true,
             crate::export::ExportInjections::INCLUDE_ALL,
             false,
+            false,
         )
         .expect("JSON export must retain the recovered complete tool result");
         let exported: Vec<serde_json::Value> =
@@ -110955,6 +110968,7 @@ mod gh427_tolerant_jsonl_tests {
             false,
             true,
             crate::export::ExportInjections::INCLUDE_ALL,
+            false,
             false,
         )
         .unwrap();
@@ -116853,6 +116867,7 @@ fn path_exists_or_virtual_opencode_sqlite_session(path: &Path, allow_direct_file
 #[allow(clippy::type_complexity)]
 fn load_opencode_sqlite_session_for_export(
     path: &Path,
+    messages_only: bool,
 ) -> anyhow::Result<(
     Option<String>,
     Option<i64>,
@@ -116905,6 +116920,9 @@ fn load_opencode_sqlite_session_for_export(
         if let Some(author) = &msg.author {
             msg_json["model"] = serde_json::Value::from(author.clone());
         }
+        if messages_only && let Some(id) = msg.extra.get("message_id") {
+            msg_json["id"] = id.clone();
+        }
         messages.push(msg_json);
     }
 
@@ -116916,6 +116934,7 @@ fn load_opencode_sqlite_session_for_export(
 #[allow(clippy::type_complexity)]
 fn load_opencode_session_for_export(
     session_path: &Path,
+    messages_only: bool,
 ) -> anyhow::Result<(
     Option<String>,
     Option<i64>,
@@ -117154,12 +117173,35 @@ fn load_opencode_session_for_export(
             message_ts_max = Some(message_ts_max.map_or(ts, |current| current.max(ts)));
         }
 
+        // Retain part boundaries for the prose-only view. Flattening first
+        // would make tool output indistinguishable from a normal reply and
+        // could discard prose that follows a tool or reasoning block.
+        let export_content = if messages_only {
+            serde_json::Value::Array(
+                parts
+                    .iter()
+                    .map(|part| {
+                        if part.part_type.as_deref() == Some("text") {
+                            serde_json::json!({"type": "text", "text": part.text})
+                        } else {
+                            serde_json::json!({"type": part.part_type})
+                        }
+                    })
+                    .collect(),
+            )
+        } else {
+            serde_json::Value::String(assembled_content)
+        };
+
         // Build JSON value matching expected format for formatters
         let mut msg_json = serde_json::json!({
             "role": role,
-            "content": assembled_content,
+            "content": export_content,
             "model": msg_info.model_id,
         });
+        if messages_only {
+            msg_json["id"] = serde_json::Value::from(msg_info.id);
+        }
         if let Some(ts) = timestamp {
             msg_json["timestamp"] = serde_json::Value::from(ts);
         }
@@ -118198,10 +118240,12 @@ fn run_export(
     include_tools: bool,
     injections: crate::export::ExportInjections,
     include_secrets: bool,
+    messages_only: bool,
 ) -> CliResult<()> {
     use std::fs::File;
     use std::io::Write;
 
+    let include_tools = include_tools && !messages_only;
     if let Some(source_id) = source_id {
         validate_followup_source_id(source_id, "cass export")?;
     }
@@ -118231,6 +118275,7 @@ fn run_export(
 
     let mut messages: Vec<serde_json::Value>;
     let mut archived_messages = None;
+    let mut flattened_direct_content = false;
     let indexed_title = indexed_view
         .as_ref()
         .and_then(|view| view.convo.title.clone());
@@ -118239,7 +118284,7 @@ fn run_export(
     let mut _session_end: Option<i64>;
     let prefer_direct_file = prefers_direct_jsonl_file(path, source_id);
     let project_archive = |view: &crate::ui::data::ConversationView| {
-        if include_tools || format == ConvExportFormat::Json {
+        if include_tools || (format == ConvExportFormat::Json && !messages_only) {
             conversation_view_to_raw_messages(view)
         } else {
             conversation_view_to_rendered_raw_messages(view, false)
@@ -118278,12 +118323,13 @@ fn run_export(
         archived_messages = Some(view.messages.as_slice());
     } else if allow_direct_file && detect_opencode_sqlite_session(path) {
         // OpenCode SQLite-backed session: path is db_path/session_id (#149)
-        match load_opencode_sqlite_session_for_export(path) {
+        match load_opencode_sqlite_session_for_export(path, messages_only) {
             Ok((title, start, end, msgs)) => {
                 session_title = title;
                 session_start = start;
                 _session_end = end;
                 messages = msgs;
+                flattened_direct_content = true;
             }
             Err(e) => {
                 return Err(CliError {
@@ -118298,7 +118344,7 @@ fn run_export(
             }
         }
     } else if allow_direct_file && detect_opencode_session(path) {
-        match load_opencode_session_for_export(path) {
+        match load_opencode_session_for_export(path, messages_only) {
             Ok((title, start, end, msgs)) => {
                 session_title = title;
                 session_start = start;
@@ -118366,27 +118412,53 @@ fn run_export(
         .as_ref()
         .map(|view| view.messages.as_slice())
         .unwrap_or_default();
-    if session_title.as_deref().is_some_and(|title| {
-        injections.excludes_title(title, &messages, archived_title_context)
-            || (!include_tools
-                && format != ConvExportFormat::Json
-                && archived_messages.is_some()
-                && indexed_view.as_ref().is_some_and(|view| {
-                    crate::export::archived_title_has_hidden_pi_tools(title, view, &messages)
-                }))
-    }) {
+    if messages_only
+        || session_title.as_deref().is_some_and(|title| {
+            injections.excludes_title(title, &messages, archived_title_context)
+                || (!include_tools
+                    && format != ConvExportFormat::Json
+                    && archived_messages.is_some()
+                    && indexed_view.as_ref().is_some_and(|view| {
+                        crate::export::archived_title_has_hidden_pi_tools(title, view, &messages)
+                    }))
+        })
+    {
         session_title = None;
     }
+    let input_records = messages.len();
     let mut messages: Vec<_> =
         crate::export::select_export_records(&mut messages, archived_messages, injections)
-            .map(|(_, record)| std::mem::take(record))
+            .filter_map(|(index, record)| {
+                if messages_only {
+                    if flattened_direct_content {
+                        crate::export::messages_only_flattened_record(index, record)
+                    } else {
+                        crate::export::messages_only_record(
+                            index,
+                            record,
+                            archived_messages.and_then(|messages| messages.get(index)),
+                        )
+                    }
+                } else {
+                    Some(std::mem::take(record))
+                }
+            })
             .collect();
+    let projection = messages_only.then(|| {
+        serde_json::json!({
+            "mode": "messages-only",
+            "canonical_history_preserved": true,
+            "input_records": input_records,
+            "retained_messages": messages.len(),
+            "omitted_records": input_records.saturating_sub(messages.len()),
+        })
+    });
 
     let mut privacy = crate::export::ExportPrivacy::new(include_secrets);
     privacy.redact_messages(&mut messages);
     privacy.redact_optional_text(&mut session_title);
 
-    if messages.is_empty() {
+    if messages.is_empty() && !messages_only {
         return Err(CliError {
             code: 9,
             kind: CliErrorKind::EmptySession.kind_str(),
@@ -118417,12 +118489,25 @@ fn run_export(
     }
 
     privacy.announce();
+    if let Some(projection) = &projection {
+        eprintln!("note: export projection: {projection}");
+    }
     let formatted = match format {
         ConvExportFormat::Markdown => {
             format_as_markdown(&messages, &session_title, session_start, include_tools)
         }
         ConvExportFormat::Text => format_as_text(&messages, include_tools),
-        ConvExportFormat::Json => serde_json::to_string_pretty(&messages).unwrap_or_default(),
+        ConvExportFormat::Json => {
+            if let Some(projection) = projection {
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "projection": projection,
+                    "messages": messages,
+                }))
+                .unwrap_or_default()
+            } else {
+                serde_json::to_string_pretty(&messages).unwrap_or_default()
+            }
+        }
         ConvExportFormat::Html => {
             format_as_html(&messages, &session_title, session_start, include_tools)
         }
@@ -118741,6 +118826,7 @@ fn run_export_html(
     explain: bool,
     open: bool,
     output_format: Option<RobotFormat>,
+    messages_only: bool,
 ) -> CliResult<()> {
     use chrono::TimeZone;
     use html_export::{
@@ -118749,6 +118835,7 @@ fn run_export_html(
     };
     use std::io;
 
+    let include_tools = include_tools && !messages_only;
     if let Some(source_id) = source_id {
         validate_followup_source_id(source_id, "cass export-html")?;
     }
@@ -118894,6 +118981,7 @@ fn run_export_html(
     // --- Load session messages ---
     let mut raw_messages: Vec<serde_json::Value>;
     let mut archived_messages = None;
+    let mut flattened_direct_content = false;
     let indexed_title = indexed_view
         .as_ref()
         .and_then(|view| view.convo.title.clone());
@@ -118983,12 +119071,13 @@ fn run_export_html(
 
         if allow_direct_file && detect_opencode_sqlite_session(session_path) {
             // OpenCode SQLite-backed session: path is db_path/session_id (#149)
-            match load_opencode_sqlite_session_for_export(session_path) {
+            match load_opencode_sqlite_session_for_export(session_path, messages_only) {
                 Ok((title, start, end, msgs)) => {
                     session_title = title;
                     session_start = start;
                     session_end = end;
                     raw_messages = msgs;
+                    flattened_direct_content = true;
                     agent_name = Some("opencode".to_string());
                 }
                 Err(e) => {
@@ -119007,7 +119096,7 @@ fn run_export_html(
                 }
             }
         } else if allow_direct_file && detect_opencode_session(session_path) {
-            match load_opencode_session_for_export(session_path) {
+            match load_opencode_session_for_export(session_path, messages_only) {
                 Ok((title, start, end, msgs)) => {
                     session_title = title;
                     session_start = start;
@@ -119070,14 +119159,20 @@ fn run_export_html(
         .as_ref()
         .map(|view| view.messages.as_slice())
         .unwrap_or_default();
-    if session_title.as_deref().is_some_and(|title| {
-        injections.excludes_title(title, &raw_messages, archived_title_context)
-            || (!include_tools
-                && archived_messages.is_some()
-                && indexed_view.as_ref().is_some_and(|view| {
-                    crate::export::archived_title_has_hidden_pi_tools(title, view, &raw_messages)
-                }))
-    }) {
+    if messages_only
+        || session_title.as_deref().is_some_and(|title| {
+            injections.excludes_title(title, &raw_messages, archived_title_context)
+                || (!include_tools
+                    && archived_messages.is_some()
+                    && indexed_view.as_ref().is_some_and(|view| {
+                        crate::export::archived_title_has_hidden_pi_tools(
+                            title,
+                            view,
+                            &raw_messages,
+                        )
+                    }))
+        })
+    {
         session_title = None;
     }
 
@@ -119086,17 +119181,38 @@ fn run_export_html(
     privacy.redact_optional_text(&mut workspace);
     privacy.redact_optional_text(&mut agent_name);
 
+    let input_records = raw_messages.len();
     let selected_records: Vec<_> =
         crate::export::select_export_records(&mut raw_messages, archived_messages, injections)
-            .map(|(index, message)| {
+            .filter_map(|(index, message)| {
+                if messages_only {
+                    *message = if flattened_direct_content {
+                        crate::export::messages_only_flattened_record(index, message)
+                    } else {
+                        crate::export::messages_only_record(
+                            index,
+                            message,
+                            archived_messages.and_then(|messages| messages.get(index)),
+                        )
+                    }?;
+                }
                 privacy.redact_message(message);
-                (index, &*message)
+                Some((index, &*message))
             })
             .collect();
+    let projection = messages_only.then(|| {
+        serde_json::json!({
+            "mode": "messages-only",
+            "canonical_history_preserved": true,
+            "input_records": input_records,
+            "retained_messages": selected_records.len(),
+            "omitted_records": input_records.saturating_sub(selected_records.len()),
+        })
+    });
     let messages: Vec<Message> =
         crate::export::html_messages_from_raw(selected_records.iter().copied(), include_tools);
 
-    if selected_records.is_empty() {
+    if selected_records.is_empty() && !messages_only {
         let err = CliError {
             code: 9,
             kind: CliErrorKind::EmptySession.kind_str(),
@@ -119235,7 +119351,7 @@ fn run_export_html(
 
     // --- Explain mode ---
     if explain {
-        let plan = serde_json::json!({
+        let mut plan = serde_json::json!({
             "plan": {
                 "session_path": session_path.display().to_string(),
                 "agent": agent_name,
@@ -119253,6 +119369,9 @@ fn run_export_html(
             "warnings": [],
             "privacy": privacy.metadata()
         });
+        if let Some(projection) = &projection {
+            plan["projection"] = projection.clone();
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&plan).unwrap_or_else(|_| "{}".to_string())
@@ -119262,7 +119381,7 @@ fn run_export_html(
 
     // --- Dry run mode ---
     if dry_run {
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "dry_run": true,
             "valid": true,
             "session_path": session_path.display().to_string(),
@@ -119272,6 +119391,9 @@ fn run_export_html(
             "estimated_size_bytes": estimated_size,
             "privacy": privacy.metadata()
         });
+        if let Some(projection) = &projection {
+            result["projection"] = projection.clone();
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
@@ -119295,6 +119417,9 @@ fn run_export_html(
     };
 
     privacy.announce();
+    if let Some(projection) = &projection {
+        eprintln!("note: export projection: {projection}");
+    }
 
     // --- Export ---
     let exporter = HtmlExporter::with_options(export_options);
@@ -119405,7 +119530,7 @@ fn run_export_html(
     });
 
     if let Some(_fmt) = structured_format {
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "success": true,
             "privacy": privacy.metadata(),
             "exported": {
@@ -119420,6 +119545,9 @@ fn run_export_html(
                 "title": session_title
             }
         });
+        if let Some(projection) = projection {
+            result["projection"] = projection;
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
@@ -120014,6 +120142,70 @@ mod opencode_export_tests {
     use tempfile::TempDir;
 
     #[test]
+    fn messages_only_opencode_export_preserves_prose_after_non_text_parts() {
+        let temp = TempDir::new().expect("tempdir");
+        let storage = temp.path().join("storage");
+        let session_dir = storage.join("session/project-1");
+        let message_dir = storage.join("message/session-1");
+        let part_dir = storage.join("part/m1");
+        for directory in [&session_dir, &message_dir, &part_dir] {
+            fs::create_dir_all(directory).expect("create OpenCode storage");
+        }
+        let session_path = session_dir.join("session-1.json");
+        fs::write(&session_path, json!({"id": "session-1"}).to_string()).expect("write session");
+        fs::write(
+            message_dir.join("m1.json"),
+            json!({"id": "m1", "role": "assistant"}).to_string(),
+        )
+        .expect("write message");
+        let mut sources = Vec::new();
+        for (index, mut part) in [
+            json!({"type": "text", "text": "Before"}),
+            json!({"type": "tool", "state": {"output": "TOOL_PRIVATE"}}),
+            json!({"type": "reasoning", "text": "REASONING_PRIVATE"}),
+            json!({"type": "patch", "text": "PATCH_PRIVATE"}),
+            json!({"type": "text", "text": "After"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            part["messageID"] = json!("m1");
+            part["index"] = json!(index);
+            let path = part_dir.join(format!("part-{index}.json"));
+            let bytes = part.to_string().into_bytes();
+            fs::write(&path, &bytes).expect("write part");
+            sources.push((path, bytes));
+        }
+
+        let (_, _, _, ordinary) =
+            load_opencode_session_for_export(&session_path, false).expect("ordinary export");
+        assert!(
+            ordinary[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("TOOL_PRIVATE")
+        );
+        assert!(ordinary[0]["content"].as_str().unwrap().contains("After"));
+
+        let (_, _, _, structured) =
+            load_opencode_session_for_export(&session_path, true).expect("prose export");
+        let projected = crate::export::messages_only_record(0, &structured[0], None)
+            .expect("assistant prose retained");
+        assert_eq!(projected["content"], "Before\nAfter");
+        assert_eq!(projected["id"], "m1");
+        assert_eq!(projected["source_index"], 0);
+        assert!(projected.get("message_index").is_none());
+        assert!(projected.get("content_projection").is_none());
+        let output = projected.to_string();
+        for omitted in ["TOOL_PRIVATE", "REASONING_PRIVATE", "PATCH_PRIVATE"] {
+            assert!(!output.contains(omitted));
+        }
+        for (path, original) in sources {
+            assert_eq!(fs::read(path).expect("source remains readable"), original);
+        }
+    }
+
+    #[test]
     fn load_opencode_export_ignores_missing_message_timestamps() {
         let temp = TempDir::new().expect("tempdir");
         let storage = temp.path().join("storage");
@@ -120084,7 +120276,7 @@ mod opencode_export_tests {
         .expect("write part m2");
 
         let (_title, start, end, messages) =
-            load_opencode_session_for_export(&session_path).expect("load opencode export");
+            load_opencode_session_for_export(&session_path, false).expect("load opencode export");
 
         // Bounds should come from the real timestamp, never from a synthetic 0 value.
         assert_eq!(start, Some(1_733_000_000_000));
@@ -120153,7 +120345,7 @@ mod opencode_export_tests {
         }
 
         let (_title, _start, _end, messages) =
-            load_opencode_session_for_export(&session_path).expect("load opencode export");
+            load_opencode_session_for_export(&session_path, false).expect("load opencode export");
 
         let contents: Vec<_> = messages
             .iter()
@@ -120217,7 +120409,7 @@ mod opencode_export_tests {
         }
 
         let (_title, _start, _end, messages) =
-            load_opencode_session_for_export(&session_path).expect("load opencode export");
+            load_opencode_session_for_export(&session_path, false).expect("load opencode export");
 
         assert_eq!(messages.len(), 1);
         assert_eq!(
@@ -120282,7 +120474,7 @@ mod opencode_export_tests {
         }
 
         let (_title, _start, _end, messages) =
-            load_opencode_session_for_export(&session_path).expect("load opencode export");
+            load_opencode_session_for_export(&session_path, false).expect("load opencode export");
 
         assert_eq!(messages.len(), 1);
         assert_eq!(
@@ -120459,6 +120651,7 @@ mod export_timestamp_tests {
             false,
             false,
             None,
+            false,
         )
         .expect_err("reader failure should fail explicitly");
 
@@ -120502,6 +120695,7 @@ mod export_timestamp_tests {
             false,
             false,
             None,
+            false,
         )
         .expect("intact records should still export");
 
@@ -120549,6 +120743,7 @@ mod export_timestamp_tests {
             false,
             false,
             None,
+            false,
         )
         .expect("export should choose a fresh filename instead of following symlink");
 
@@ -120671,6 +120866,7 @@ mod export_timestamp_tests {
             false,
             false,
             None,
+            false,
         )
         .expect_err("invalid virtual sqlite session should fail after path acceptance");
 
@@ -121904,6 +122100,7 @@ mod indexed_conversation_fallback_tests {
             false,
             crate::export::ExportInjections::INCLUDE_ALL,
             false, // include_secrets
+            false, // messages_only
         )
         .expect("run export");
 
@@ -121975,6 +122172,7 @@ mod indexed_conversation_fallback_tests {
             false,
             crate::export::ExportInjections::INCLUDE_ALL,
             false, // include_secrets
+            false, // messages_only
         )
         .expect("export should prefer the local JSONL file over stale indexed content");
 
@@ -122061,6 +122259,7 @@ mod indexed_conversation_fallback_tests {
             false,
             false,
             Some(RobotFormat::Json),
+            false,
         )
         .expect("html export should prefer the local JSONL file over stale indexed content");
 
@@ -122112,6 +122311,7 @@ mod indexed_conversation_fallback_tests {
             false,
             false,
             Some(RobotFormat::Json),
+            false,
         )
         .expect(
             "html export should infer metadata from the local session path when no index exists",
@@ -122163,6 +122363,7 @@ mod indexed_conversation_fallback_tests {
             false,
             false,
             Some(RobotFormat::Json),
+            false,
         )
         .expect("html export should infer copilot metadata from the local session path");
 
@@ -122532,6 +122733,7 @@ This is not JSONL.
             false,
             crate::export::ExportInjections::INCLUDE_ALL,
             false, // include_secrets
+            false, // messages_only
         )
         .expect("export should fall back to indexed content when the local JSONL is invalid");
 
@@ -122603,6 +122805,7 @@ This should stay behind the indexed export.
             false,
             crate::export::ExportInjections::INCLUDE_ALL,
             false, // include_secrets
+            false, // messages_only
         )
         .expect("export should prefer indexed content for local markdown-backed sessions");
 
@@ -122680,6 +122883,7 @@ This should stay behind the indexed export.
             false,
             false,
             Some(RobotFormat::Json),
+            false,
         )
         .expect("html export should fall back to indexed content when the local JSONL is invalid");
 
@@ -122761,6 +122965,7 @@ This should stay behind the indexed html export.
             false,
             false,
             Some(RobotFormat::Json),
+            false,
         )
         .expect("html export should prefer indexed content for local markdown-backed sessions");
 
@@ -123079,6 +123284,7 @@ This should stay behind the indexed html export.
             false,
             false,
             Some(RobotFormat::Json),
+            false,
         )
         .expect("export arbitrary-path OMP HTML without tools");
 
@@ -123226,6 +123432,7 @@ This should stay behind the indexed html export.
                 false,
                 false,
                 Some(RobotFormat::Json),
+                false,
             )
             .expect("export indexed OMP HTML without tools");
 
@@ -123251,6 +123458,7 @@ This should stay behind the indexed html export.
                         false,
                         include_tools,
                         Default::default(),
+                        false,
                         false,
                     )
                     .expect("export indexed OMP transcript");
@@ -123432,6 +123640,7 @@ This should stay behind the indexed html export.
                 false,
                 false,
                 Some(RobotFormat::Json),
+                false,
             )
             .expect("export OMP HTML");
             std::fs::read_to_string(output_dir.join(filename)).expect("read OMP HTML")
@@ -123476,6 +123685,7 @@ This should stay behind the indexed html export.
                 false,
                 false,
                 Default::default(),
+                false,
                 false,
             )
             .expect("export OMP transcript without tools");

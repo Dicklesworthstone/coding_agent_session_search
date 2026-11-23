@@ -475,7 +475,11 @@ fn export_redaction_covers_multiline_and_overlapping_credential_values()
             }
             let (receipt, html) =
                 export_privacy_html(root.path(), &session, None, include_secrets, false)?;
-            assert_eq!(html.contains(sentinel), include_secrets, "{case}/export-html");
+            assert_eq!(
+                html.contains(sentinel),
+                include_secrets,
+                "{case}/export-html"
+            );
             assert!(html.contains("multiline-context-kept"));
             assert!(html.contains("multiline-suffix-kept"));
             assert_eq!(receipt["privacy"]["redaction_applied"], !include_secrets);
@@ -1003,6 +1007,268 @@ fn export_redaction_covers_unredacted_archive_with_never_created_source()
     assert!(!absent.exists());
     assert_eq!(fs::read(&db_path)?, db_before);
     assert_eq!(fs::read(&wal_path).ok(), wal_before);
+    Ok(())
+}
+
+#[test]
+fn messages_only_export_keeps_prose_and_source_identity_without_mutating_history()
+-> Result<(), Box<dyn std::error::Error>> {
+    use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use coding_agent_search::storage::sqlite::SqliteStorage;
+
+    let root = tempfile::Builder::new()
+        .prefix("cass-messages-only-export-")
+        .disable_cleanup(true)
+        .tempdir()?;
+    let raw = root.path().join("direct.jsonl");
+    let archived_path = root.path().join("unavailable-source.jsonl");
+    let db_path = root.path().join("data/agent_search.db");
+    fs::create_dir_all(root.path().join("data"))?;
+    let records = [
+        serde_json::json!({"role":"system", "content":"PRIVATE_SYSTEM_INSTRUCTIONS"}),
+        serde_json::json!({"role":"user", "id":"prompt-1", "content":"Ordinary prompt café 界"}),
+        serde_json::json!({"type":"assistant", "uuid":"reply-1", "message":{
+            "role":"assistant", "content":[
+                {"type":"text", "text":"Ordinary reply before"},
+                {"type":"tool_use", "id":"call-1", "name":"Read", "input":{"path":"PRIVATE_TOOL_ARGUMENT"}},
+                {"type":"thinking", "thinking":"PRIVATE_REASONING"},
+                {"type":"text", "text":"Ordinary reply after"}
+            ]
+        }, "metadata":{"tool_result":"PRIVATE_NESTED_METADATA"}}),
+        serde_json::json!({"type":"user", "message":{"role":"user", "content":[
+            {"type":"tool_result", "tool_use_id":"call-1", "content":"PRIVATE_RESULT_BODY"}
+        ]}}),
+        serde_json::json!({"role":"tool", "content":"PRIVATE_FILE_CONTENTS"}),
+        serde_json::json!({"role":"assistant", "content":[
+            {"type":"toolCall", "name":"Read", "arguments":{"text":"PRIVATE_TOOL_ONLY"}}
+        ]}),
+        serde_json::json!({"role":"assistant", "content":"Ordinary final reply"}),
+    ];
+    let mut source_bytes = Vec::new();
+    for record in &records {
+        serde_json::to_writer(&mut source_bytes, record)?;
+        source_bytes.push(b'\n');
+    }
+    fs::write(&raw, &source_bytes)?;
+    let roles = [
+        MessageRole::System,
+        MessageRole::User,
+        MessageRole::Agent,
+        MessageRole::User,
+        MessageRole::Tool,
+        MessageRole::Agent,
+        MessageRole::Agent,
+    ];
+    let storage = SqliteStorage::open(&db_path)?;
+    let agent = storage.ensure_agent(&Agent {
+        id: None,
+        slug: "claude_code".into(),
+        name: "Claude Code".into(),
+        version: None,
+        kind: AgentKind::Cli,
+    })?;
+    storage.insert_conversation_tree(
+        agent,
+        None,
+        &Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("messages-only-export".into()),
+            title: Some("PRIVATE_TITLE_FROM_TOOL".into()),
+            source_path: archived_path.clone(),
+            started_at: None,
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: records.iter().zip(roles).enumerate().map(|(index, (record, role))| Message {
+                id: None,
+                idx: index as i64,
+                role,
+                author: None,
+                created_at: Some(1767225600000_i64 + index as i64),
+                content: if index == 2 {
+                    "Ordinary reply before\n[Tool: Read] PRIVATE_TOOL_ARGUMENT\nOrdinary reply after".into()
+                } else {
+                    record["content"].as_str().unwrap_or("PRIVATE_FLATTENED_TOOL").into()
+                },
+                extra_json: record.clone(),
+                snippets: Vec::new(),
+            }).collect(),
+            source_id: "local".into(),
+            origin_host: None,
+        },
+    )?;
+    drop(storage);
+    let db_before = fs::read(&db_path)?;
+    let wal_path = db_path.with_extension("db-wal");
+    let wal_before = fs::read(&wal_path).ok();
+    let expected_projection = serde_json::json!({
+        "mode":"messages-only", "canonical_history_preserved":true,
+        "input_records":7, "retained_messages":3, "omitted_records":4
+    });
+    for (path, archive_only) in [(&raw, false), (&archived_path, true)] {
+        for format in ["json", "markdown", "text", "html", "export-html"] {
+            let mut cmd = export_privacy_command(root.path());
+            if format == "export-html" {
+                cmd.arg("export-html")
+                    .arg(path)
+                    .arg("--output-dir")
+                    .arg(root.path().join(format!("html-{archive_only}")))
+                    .arg("--json");
+            } else {
+                cmd.arg("export").arg(path).args(["--format", format]);
+            }
+            cmd.arg("--messages-only");
+            if archive_only {
+                cmd.args(["--source", "local"]);
+            }
+            let output = cmd.output()?;
+            assert!(
+                output.status.success(),
+                "{format}, archive={archive_only}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let rendered = match format {
+                "json" => {
+                    let payload: Value = serde_json::from_slice(&output.stdout)?;
+                    assert_eq!(payload["projection"], expected_projection);
+                    let messages = payload["messages"]
+                        .as_array()
+                        .ok_or("normalized messages")?;
+                    assert_eq!(messages.len(), 3);
+                    for (message, original_index) in messages.iter().zip([1, 2, 6]) {
+                        assert_eq!(message["source_index"], original_index);
+                        if archive_only {
+                            assert_eq!(message["message_index"], original_index + 1);
+                        } else {
+                            assert!(message.get("message_index").is_none());
+                        }
+                        assert!(matches!(
+                            message["role"].as_str(),
+                            Some("user" | "assistant")
+                        ));
+                        assert!(message["content"].is_string());
+                        assert!(message.get("message").is_none());
+                        assert!(message.get("metadata").is_none());
+                    }
+                    assert_eq!(messages[0]["id"], "prompt-1");
+                    assert_eq!(messages[1]["id"], "reply-1");
+                    String::from_utf8(output.stdout)?
+                }
+                "export-html" => {
+                    let receipt: Value = serde_json::from_slice(&output.stdout)?;
+                    assert_eq!(receipt["projection"], expected_projection);
+                    let path = receipt["exported"]["output_path"]
+                        .as_str()
+                        .ok_or("HTML path")?;
+                    assert!(!path.to_ascii_lowercase().contains("private_title"));
+                    fs::read_to_string(path)?
+                }
+                _ => {
+                    let stderr = String::from_utf8(output.stderr)?;
+                    assert!(
+                        stderr.contains("messages-only"),
+                        "projection must be announced"
+                    );
+                    String::from_utf8(output.stdout)?
+                }
+            };
+            for text in [
+                "Ordinary prompt café 界",
+                "Ordinary reply before",
+                "Ordinary reply after",
+                "Ordinary final reply",
+            ] {
+                assert!(rendered.contains(text), "{format}: missing {text}");
+            }
+            assert!(
+                !rendered.contains("PRIVATE_"),
+                "{format}: omitted content leaked"
+            );
+        }
+        // The opt-in view must not change ordinary JSON's complete-record array.
+        let mut default = export_privacy_command(root.path());
+        default.arg("export").arg(path).args(["--format", "json"]);
+        if archive_only {
+            default.args(["--source", "local"]);
+        }
+        let output = default.output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let full: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(full.as_array().ok_or("default raw array")?.len(), 7);
+        assert!(full.to_string().contains("PRIVATE_TOOL_ARGUMENT"));
+    }
+    assert_eq!(fs::read(raw)?, source_bytes);
+    assert!(!archived_path.exists());
+    assert_eq!(fs::read(db_path)?, db_before);
+    assert_eq!(fs::read(wal_path).ok(), wal_before);
+    Ok(())
+}
+
+#[test]
+fn messages_only_reports_an_empty_projection_without_erasing_source_records()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::Builder::new()
+        .prefix("cass-messages-only-empty-")
+        .disable_cleanup(true)
+        .tempdir()?;
+    let session = root.path().join("tool-only.jsonl");
+    let original = concat!(
+        "{\"role\":\"system\",\"content\":\"OMITTED_SYSTEM\"}\n",
+        "{\"role\":\"tool\",\"content\":\"OMITTED_TOOL\"}\n",
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"path\":\"OMITTED_ARGUMENT\"}}]}\n"
+    );
+    fs::write(&session, original)?;
+    let output = export_privacy_command(root.path())
+        .arg("export")
+        .arg(&session)
+        .args(["--messages-only", "--format", "json"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        payload["projection"],
+        serde_json::json!({
+            "mode":"messages-only", "canonical_history_preserved":true,
+            "input_records":3, "retained_messages":0, "omitted_records":3
+        })
+    );
+    assert_eq!(payload["messages"], serde_json::json!([]));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("OMITTED_"));
+    assert_eq!(fs::read_to_string(session)?, original);
+    Ok(())
+}
+
+#[test]
+fn messages_only_rejects_conflicting_export_options() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::Builder::new()
+        .prefix("cass-messages-only-conflicts-")
+        .disable_cleanup(true)
+        .tempdir()?;
+    for command in ["export", "export-html"] {
+        for option in [
+            "--include-tools",
+            "--include-skills",
+            "--include-system-reminders",
+        ] {
+            let output = export_privacy_command(root.path())
+                .args([command, "absent.jsonl", "--messages-only", option])
+                .output()?;
+            assert!(!output.status.success(), "{command} must reject {option}");
+            let stderr = String::from_utf8(output.stderr)?;
+            assert!(stderr.contains("messages-only"), "{stderr}");
+            assert!(stderr.contains(option), "{stderr}");
+        }
+    }
     Ok(())
 }
 

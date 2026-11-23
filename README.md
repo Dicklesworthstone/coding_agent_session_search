@@ -1432,6 +1432,11 @@ cass sessions --workspace /path/to/project --json --limit 5
 cass export /path/to/session.jsonl --format markdown -o conversation.md
 cass export /path/to/session.jsonl --format json --include-tools
 
+# Export just user prompts and assistant replies
+cass export /path/to/session.jsonl --messages-only --format json
+cass export /path/to/session.jsonl --messages-only -o conversation.md
+cass export-html /path/to/session.jsonl --messages-only --json
+
 # Export as self-contained HTML with encryption (recommended for sharing)
 cass export-html /path/to/session.jsonl                     # To Downloads folder
 printf '%s\n' "pwd" | cass export-html session.jsonl --encrypt --password-stdin
@@ -1449,6 +1454,43 @@ cass timeline --today --json --group-by hour
 cass timeline --since 7d --agent claude --json
 # → Grouped activity counts, useful for understanding work patterns
 ```
+
+`--messages-only` is an optional export projection for Markdown, text, JSON and
+HTML, including `export-html`. It keeps user prompts and assistant prose while
+omitting system turns, tool calls/results, reasoning blocks and non-text
+attachments. Mixed messages retain their text blocks in source order. This
+option does not change canonical rows, raw mirrors, source logs or indexing
+policy; it also works from an indexed conversation whose source file is gone.
+It conflicts with explicit `--include-tools`, `--include-skills` and
+`--include-system-reminders`. Credential redaction still applies unless
+`--include-secrets` is explicitly requested.
+
+Messages-only JSON uses an envelope with `messages` and `projection`. The
+projection reports `input_records`, `retained_messages`, `omitted_records` and
+`canonical_history_preserved: true`; these counts describe records, so removing
+tool blocks from a retained mixed message does not add an omitted record.
+Ordinary JSON exports keep their existing array shape. Every retained message
+has its original zero-based `source_index`; archived messages also have their
+one-based canonical `message_index` for `view --message-index` and
+`expand --message-index`. Available source IDs and timestamps are preserved.
+HTML JSON receipts, dry runs and explain plans include the same projection
+counts, and other formats report them on stderr. A transcript containing only
+omitted records produces an empty messages-only export with explicit counts.
+
+Legacy archives sometimes retain only flattened text rather than the original
+mixed content blocks. In that case the projection conservatively keeps text
+before the first recognized tool or reasoning marker. This also applies to
+direct OpenCode SQLite exports, whose connector supplies flattened content.
+Direct OpenCode file exports preserve part boundaries and retain prose after
+tool or reasoning parts. Retained JSON prefixes
+carry `content_projection: "legacy-visible-prefix"`; prose interleaved after
+that marker cannot be reconstructed safely. Explicit text blocks in preserved
+source records are kept as written, including ordinary discussion of such
+markers. Known Cline SDK archive rows without a preserved source envelope are
+omitted because their flattened text has no reliable boundaries between prose,
+reasoning, attachments and tool results. The omission count includes these
+rows. Export titles are derived from retained prompts so an omitted tool
+result cannot reappear in the title or generated filename.
 
 ### Aggregation & Analytics
 

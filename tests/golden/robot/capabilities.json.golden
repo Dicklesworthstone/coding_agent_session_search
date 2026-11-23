@@ -2530,6 +2530,16 @@
           ]
         },
         {
+          "name": "messages-only",
+          "description": "Export only user prompts and assistant prose, preserving the full archive",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "include-skills",
           "description": "Include skill content in export (default: stripped for privacy)",
           "arg_type": "flag",
@@ -2611,6 +2621,16 @@
           "value_type": "enum",
           "required": false,
           "default": "true",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "messages-only",
+          "description": "Export only user prompts and assistant prose, preserving the full archive",
+          "arg_type": "flag",
+          "required": false,
           "enum_values": [
             "true",
             "false"
