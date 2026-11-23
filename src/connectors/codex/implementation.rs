@@ -217,27 +217,35 @@ fn augment_modern_codex_reader(
     progress_tick: Option<&(dyn Fn() + Send + Sync)>,
     reader: &mut impl BufRead,
 ) -> Result<u64> {
-    let mut message_indices_by_signature: HashMap<ModernCodexMessageSignature, usize> =
-        conversation
-            .messages
-            .iter()
-            .enumerate()
-            .map(|(index, message)| (modern_codex_message_signature(message), index))
-            .collect();
-    let mut message_indices_by_call_id: HashMap<String, usize> = conversation
-        .messages
-        .iter()
-        .enumerate()
-        .flat_map(|(index, message)| {
-            modern_codex_message_call_ids(message).map(move |call_id| (call_id, index))
-        })
-        .collect();
-    let mut message_indices_by_raw_entry: HashMap<[u8; 32], usize> = conversation
-        .messages
-        .iter()
-        .enumerate()
-        .map(|(index, message)| (modern_codex_raw_signature(&message.extra), index))
-        .collect();
+    // The primary parser keeps exact output text but compacts raw extras on
+    // large rollouts. Match source occurrences against this initial inventory;
+    // newly enriched rows must never replenish it.
+    let mut message_indices_by_signature = HashMap::new();
+    let mut message_indices_by_call_id = HashMap::new();
+    let mut message_indices_by_raw_entry = HashMap::new();
+    let mut remaining_tool_outputs_by_raw_entry: HashMap<[u8; 32], usize> = HashMap::new();
+    let mut remaining_compacted_tool_outputs: HashMap<ModernCodexMessageSignature, usize> =
+        HashMap::new();
+    for (index, message) in conversation.messages.iter().enumerate() {
+        let signature = modern_codex_message_signature(message);
+        let raw_signature = modern_codex_raw_signature(&message.extra);
+        if message.role == "tool" && message.author.is_none() && message.invocations.is_empty() {
+            if primary_codex_tool_output(&message.extra).is_some() {
+                *remaining_tool_outputs_by_raw_entry
+                    .entry(raw_signature)
+                    .or_default() += 1;
+            } else if is_compacted_codex_message_extra(&message.extra) {
+                *remaining_compacted_tool_outputs
+                    .entry(signature.clone())
+                    .or_default() += 1;
+            }
+        }
+        message_indices_by_signature.insert(signature, index);
+        message_indices_by_call_id.extend(
+            modern_codex_message_call_ids(message).map(|call_id| (call_id, index)),
+        );
+        message_indices_by_raw_entry.insert(raw_signature, index);
+    }
     let mut added = false;
     let mut line = String::new();
     let mut bytes_read = 0_u64;
@@ -328,25 +336,57 @@ fn augment_modern_codex_reader(
         };
         for raw in parsed.into_iter().chain(recovered) {
             let raw_signature = modern_codex_raw_signature(&raw);
+            let unmatched_primary_output = if let Some(output) = primary_codex_tool_output(&raw) {
+                // Each initial row covers only one source occurrence, even
+                // when several results have identical text, time, or raw JSON.
+                if consume_tool_output_occurrence(
+                    remaining_tool_outputs_by_raw_entry.get_mut(&raw_signature),
+                ) {
+                    continue;
+                }
+                let signature = ModernCodexMessageSignature {
+                    role: "tool".to_string(),
+                    author: None,
+                    created_at: raw.get("timestamp").and_then(parse_timestamp),
+                    content_hash: *blake3::hash(output.as_bytes()).as_bytes(),
+                };
+                if consume_tool_output_occurrence(
+                    remaining_compacted_tool_outputs.get_mut(&signature),
+                ) {
+                    continue;
+                }
+                true
+            } else {
+                false
+            };
             let Some(message) = modern_codex_message(&raw) else {
                 continue;
             };
             let message_signature = modern_codex_message_signature(&message);
-            let existing_index = message_indices_by_raw_entry
-                .get(&raw_signature)
-                .copied()
-                .or_else(|| {
-                    modern_codex_message_call_ids(&message)
-                        .find_map(|call_id| message_indices_by_call_id.get(&call_id).copied())
-                })
-                .or_else(|| {
-                    message_indices_by_signature
-                        .get(&message_signature)
-                        .copied()
-                        .filter(|index| {
-                            compatible_tool_call_identity(&conversation.messages[*index], &message)
-                        })
-                });
+            let existing_index = if unmatched_primary_output {
+                // Exhausting the initial inventory means this is another
+                // occurrence. Learned raw/text aliases must not swallow it.
+                None
+            } else {
+                message_indices_by_raw_entry
+                    .get(&raw_signature)
+                    .copied()
+                    .or_else(|| {
+                        modern_codex_message_call_ids(&message)
+                            .find_map(|call_id| message_indices_by_call_id.get(&call_id).copied())
+                    })
+                    .or_else(|| {
+                        message_indices_by_signature
+                            .get(&message_signature)
+                            .copied()
+                            .filter(|index| {
+                                compatible_tool_call_identity(
+                                    &conversation.messages[*index],
+                                    &message,
+                                )
+                            })
+                    })
+            };
 
             if let Some(existing_index) = existing_index {
                 let existing = &mut conversation.messages[existing_index];
@@ -699,6 +739,39 @@ fn modern_codex_message_signature(message: &NormalizedMessage) -> ModernCodexMes
         author: message.author.clone(),
         created_at: message.created_at,
         content_hash: *blake3::hash(message.content.as_bytes()).as_bytes(),
+    }
+}
+
+/// This response form is emitted by both parsers with different display text.
+/// Match the primary parser's exact string, before labels or truncation. It
+/// drops blank outputs; event-only results must remain eligible for enrichment.
+fn primary_codex_tool_output(raw: &Value) -> Option<&str> {
+    if raw.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+    let payload = raw.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("function_call_output") {
+        return None;
+    }
+    payload
+        .get("output")
+        .and_then(Value::as_str)
+        .filter(|output| !output.trim().is_empty())
+}
+
+fn is_compacted_codex_message_extra(extra: &Value) -> bool {
+    extra.as_object().is_some_and(|extra| {
+        extra.is_empty() || (extra.len() == 1 && extra.get("cass").is_some_and(Value::is_object))
+    })
+}
+
+fn consume_tool_output_occurrence(remaining: Option<&mut usize>) -> bool {
+    match remaining {
+        Some(remaining) if *remaining > 0 => {
+            *remaining -= 1;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1073,6 +1146,121 @@ mod tests {
         augment_modern_codex_messages(&mut conversation, None)?;
         assert_eq!(serde_json::to_value(&conversation)?, snapshot);
         assert_eq!(std::fs::read(&path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn compacted_tool_outputs_keep_exact_primary_rows_and_are_replay_stable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-compacted-outputs.jsonl");
+        let repeated_output = " \tunchanged café 🦀\r\n ";
+        let long_output = format!("  {}\n", "🦀".repeat(MAX_INDEXED_TOOL_OUTPUT_CHARS + 1));
+        let records = [
+            response(serde_json::json!({
+                "type": "function_call_output", "call_id": "first", "output": repeated_output
+            })),
+            response(serde_json::json!({
+                "type": "function_call_output", "call_id": "second", "output": repeated_output
+            })),
+            response(serde_json::json!({
+                "type": "function_call_output", "call_id": "long", "output": long_output
+            })),
+        ];
+        let body = records
+            .iter()
+            .map(|raw| format!("{raw}\n"))
+            .collect::<String>();
+        std::fs::write(&path, &body)?;
+        let mut conversation = conversation_at(&path);
+        for (index, raw) in records.iter().enumerate() {
+            let mut canonical = modern_codex_message(raw).expect("tool output");
+            canonical.idx = index as i64;
+            // These are the primary parser's exact text and two compact forms.
+            canonical.content = raw["payload"]["output"].as_str().unwrap().to_string();
+            canonical.extra = if index == 1 {
+                serde_json::json!({"cass": {"model": "fixture-model"}})
+            } else {
+                serde_json::json!({})
+            };
+            conversation.messages.push(canonical);
+        }
+        let snapshot = serde_json::to_value(&conversation)?;
+        for _ in 0..2 {
+            augment_modern_codex_messages(&mut conversation, None)?;
+            assert_eq!(
+                serde_json::to_value(&conversation)?,
+                snapshot,
+                "retain every primary row, including long text, metadata, and ordinals"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&path)?, body);
+        Ok(())
+    }
+
+    #[test]
+    fn tool_output_matching_consumes_initial_occurrences_once_and_keeps_events() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-output-occurrences.jsonl");
+        let output = "shared output";
+        let first = response(serde_json::json!({
+            "type": "function_call_output", "call_id": "first", "output": output
+        }));
+        let distinct = response(serde_json::json!({
+            "type": "function_call_output", "call_id": "distinct", "output": output
+        }));
+        let event = |call_id| {
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-06-28T10:00:06.000Z",
+                "payload": {"type": "tool_result", "call_id": call_id, "output": output}
+            })
+        };
+        // Events arrive while compact inventory is still available. Three
+        // identical native records and a distinct ID require four native rows.
+        let body = format!(
+            "{}\n{}\n{first}\n{first}\n{first}\n{distinct}\n",
+            event("event-first"),
+            event("event-second")
+        );
+        std::fs::write(&path, &body)?;
+        let mut conversation = conversation_at(&path);
+        for compacted in [true, false] {
+            let mut canonical = modern_codex_message(&first).expect("tool output");
+            canonical.idx = conversation.messages.len() as i64;
+            canonical.content = output.to_string();
+            if compacted {
+                canonical.extra = serde_json::json!({});
+            }
+            conversation.messages.push(canonical);
+        }
+
+        augment_modern_codex_messages(&mut conversation, None)?;
+        assert_eq!(conversation.messages.len(), 6);
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .filter(|message| message.content == output)
+                .count(),
+            2,
+            "both original primary occurrences remain"
+        );
+        for call_id in ["first", "distinct", "event-first", "event-second"] {
+            let expected = format!("[Tool output: {call_id}]\n{output}");
+            assert_eq!(
+                conversation
+                    .messages
+                    .iter()
+                    .filter(|message| message.content == expected)
+                    .count(),
+                1,
+                "one additional occurrence for {call_id}"
+            );
+        }
+        let snapshot = serde_json::to_value(&conversation)?;
+        augment_modern_codex_messages(&mut conversation, None)?;
+        assert_eq!(serde_json::to_value(&conversation)?, snapshot);
+        assert_eq!(std::fs::read_to_string(&path)?, body);
         Ok(())
     }
 

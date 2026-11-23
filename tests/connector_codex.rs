@@ -10,6 +10,131 @@ fn codex_real_fixture_home() -> PathBuf {
 }
 
 #[test]
+fn codex_tool_output_rows_survive_the_real_large_session_compaction_threshold() {
+    use franken_agent_detection::connectors::{SourceCompletion, SourceScanHooks};
+    use std::io::Write;
+
+    const COMPACT_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("rollout-compacted-outputs.jsonl");
+    let output = " \tunchanged café 🦀\r\n ";
+    let long_output = format!("  {}\n", "🦀".repeat(128 * 1024 + 1));
+    let repeated = serde_json::json!({
+        "type": "response_item", "timestamp": "2026-06-28T10:00:02Z",
+        "payload": {"type": "function_call_output", "call_id": "first", "output": output}
+    });
+    let records = [
+        serde_json::json!({"type":"session_meta","timestamp":"2026-06-28T10:00:00Z","payload":{"id":"compacted-outputs","cwd":"/synthetic/compacted-outputs"}}),
+        serde_json::json!({"type":"response_item","timestamp":"2026-06-28T10:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"retain every tool result"}]}}),
+        repeated.clone(),
+        repeated,
+        serde_json::json!({"type":"response_item","timestamp":"2026-06-28T10:00:02Z","payload":{"type":"function_call_output","call_id":"distinct","output":output}}),
+        serde_json::json!({"type":"response_item","timestamp":"2026-06-28T10:00:03Z","payload":{"type":"function_call_output","call_id":"long","output":long_output}}),
+        serde_json::json!({"type":"event_msg","timestamp":"2026-06-28T10:00:04Z","payload":{"type":"tool_result","call_id":"event-first","output":output}}),
+        serde_json::json!({"type":"event_msg","timestamp":"2026-06-28T10:00:04Z","payload":{"type":"tool_result","call_id":"event-second","output":output}}),
+    ];
+    let body = records
+        .iter()
+        .map(|raw| format!("{raw}\n"))
+        .collect::<String>();
+    fs::write(&path, &body).unwrap();
+    let context = ScanContext::with_roots(
+        root.path().to_path_buf(),
+        vec![ScanRoot::local(path.clone())],
+        None,
+    );
+    let connector = CodexConnector::new();
+    let small = connector.scan(&context).unwrap();
+    assert_eq!(small.len(), 1);
+    let messages = &small[0].messages;
+    assert_eq!(messages.len(), 7);
+    assert_eq!(messages[0].content, "retain every tool result");
+    for message in &messages[1..4] {
+        assert_eq!(message.content, output);
+    }
+    assert_eq!(messages[4].content, long_output);
+    for message in &messages[1..5] {
+        assert_eq!(
+            message.extra.pointer("/payload/type").and_then(Value::as_str),
+            Some("function_call_output")
+        );
+    }
+    for (index, call_id) in [(5, "event-first"), (6, "event-second")] {
+        assert_eq!(
+            messages[index].content,
+            format!("[Tool output: {call_id}]\n{}", output.trim())
+        );
+    }
+
+    // Cross the upstream threshold without one giant JSON value or changing
+    // any message. Unknown records are ignored by both parser passes.
+    let small_len = fs::metadata(&path).unwrap().len();
+    assert!(small_len < COMPACT_THRESHOLD_BYTES);
+    let padding = format!(
+        "{{\"type\":\"fixture_padding\",\"padding\":\"{}\"}}\n",
+        "x".repeat(64 * 1024)
+    );
+    let padding_count = (COMPACT_THRESHOLD_BYTES - small_len).div_ceil(padding.len() as u64);
+    let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    for _ in 0..padding_count {
+        writer.write_all(padding.as_bytes()).unwrap();
+    }
+    drop(writer);
+    let before = fs::metadata(&path).unwrap();
+    assert!(before.len() >= COMPACT_THRESHOLD_BYTES);
+    let mut large = Vec::new();
+    let mut completions = 0;
+    {
+        let mut complete = |completion: &SourceCompletion| {
+            assert_eq!(completion.source.source_path, path);
+            completions += 1;
+            Ok(())
+        };
+        let mut hooks = SourceScanHooks {
+            should_scan_source: None,
+            on_source_complete: Some(&mut complete),
+        };
+        connector
+            .scan_with_source_boundaries(&context, &mut hooks, &mut |conversation| {
+                large.push(conversation);
+                Ok(())
+            })
+            .unwrap();
+    }
+    assert_eq!(large.len(), 1);
+    assert_eq!(completions, 1);
+    assert_eq!(large[0].source_path, path);
+    assert_eq!(large[0].messages.len(), 7);
+    for message in &large[0].messages[1..5] {
+        assert_eq!(
+            message.extra,
+            serde_json::json!({}),
+            "exercise real primary-parser compaction, not a simulated extra"
+        );
+    }
+    for message in &large[0].messages[5..] {
+        assert_eq!(
+            message.extra.pointer("/payload/type").and_then(Value::as_str),
+            Some("tool_result")
+        );
+    }
+    let without_extra = |mut messages: Value| {
+        for message in messages.as_array_mut().unwrap() {
+            message.as_object_mut().unwrap().remove("extra");
+        }
+        messages
+    };
+    assert_eq!(
+        without_extra(serde_json::to_value(&large[0].messages).unwrap()),
+        without_extra(serde_json::to_value(&small[0].messages).unwrap()),
+        "compaction must preserve exact text, occurrence count, and message identity"
+    );
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!(after.len(), before.len());
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+}
+
+#[test]
 fn gh560_inactive_cut_tail_keeps_complete_turns_and_can_later_finish() {
     use franken_agent_detection::connectors::{SourceCompletion, SourceScanHooks};
     use std::io::Write;
