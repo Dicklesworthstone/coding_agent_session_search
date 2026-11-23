@@ -42398,8 +42398,10 @@ pub mod persist {
     ///
     /// Extracts provenance from `metadata.cass.origin` if present, otherwise defaults to local.
     ///
-    /// Applies secret redaction to message content and extra_json before storage
-    /// (security fix for #112: tool-result secrets were persisted unredacted).
+    /// Applies the shared text and embedded-JSON secret policy to message content,
+    /// titles, snippets, and metadata before storage (#112, #551). A tool's JSON
+    /// output retains the same field-name protection when a connector exposes it
+    /// as text instead of structured metadata.
     pub fn map_to_internal(conv: &NormalizedConversation) -> Conversation {
         map_to_internal_with_redactor(conv, None)
     }
@@ -42545,9 +42547,9 @@ pub mod persist {
         }
         let content = if should_redact {
             if let Some(r) = redactor.as_mut() {
-                r.redact_text(&m.content)
+                r.redact_content(&m.content)
             } else {
-                super::redact_secrets::redact_text(&m.content).into_owned()
+                super::redact_secrets::redact_content(&m.content)
             }
         } else {
             m.content.clone()
@@ -42581,9 +42583,9 @@ pub mod persist {
                     snippet_text: s.snippet_text.as_ref().map(|snippet_text| {
                         if should_redact {
                             if let Some(r) = redactor.as_mut() {
-                                r.redact_text(snippet_text)
+                                r.redact_content(snippet_text)
                             } else {
-                                super::redact_secrets::redact_text(snippet_text).into_owned()
+                                super::redact_secrets::redact_content(snippet_text)
                             }
                         } else {
                             snippet_text.clone()
@@ -42612,9 +42614,9 @@ pub mod persist {
             title: if should_redact {
                 conv.title.as_ref().map(|t| {
                     if let Some(r) = redactor.as_mut() {
-                        r.redact_text(t)
+                        r.redact_content(t)
                     } else {
-                        super::redact_secrets::redact_text(t).into_owned()
+                        super::redact_secrets::redact_content(t)
                     }
                 })
             } else {
@@ -43976,6 +43978,112 @@ pub mod persist {
                 .collect::<Vec<_>>();
             preserved_values.sort_unstable();
             assert_eq!(preserved_values, ["first", "second"]);
+        }
+
+        #[test]
+        #[serial]
+        fn gh551_persisted_text_uses_json_field_redaction_in_every_mapping_path() {
+            let _redact_guard = set_env("CASS_INDEX_REDACTION", "full");
+            let content =
+                r#" { "ok": true, "registration_token": "tinytok", "label": "visible λ" } "#;
+            let title = r#"{"passphrase":"titlepw","name":"Visible title"}"#;
+            let snippet = r#"{"cookie":"sniptok","code":"let value = 1;"}"#;
+            let conv = NormalizedConversation {
+                agent_slug: "codex".into(),
+                external_id: Some("gh551-persisted-json".into()),
+                title: Some(title.into()),
+                workspace: Some(PathBuf::from("/workspace/json-redaction")),
+                source_path: PathBuf::from("/logs/json-redaction.jsonl"),
+                started_at: Some(1_000),
+                ended_at: Some(2_000),
+                metadata: serde_json::json!({"body": content, "count": 2}),
+                messages: vec![NormalizedMessage {
+                    idx: 7,
+                    role: "tool".into(),
+                    author: Some("fixture-tool".into()),
+                    created_at: Some(1_500),
+                    content: content.into(),
+                    extra: serde_json::json!({"body": content, "count": 2}),
+                    snippets: vec![crate::connectors::NormalizedSnippet {
+                        file_path: Some(PathBuf::from("config.json")),
+                        start_line: Some(3),
+                        end_line: Some(5),
+                        language: Some("json".into()),
+                        snippet_text: Some(snippet.into()),
+                    }],
+                    invocations: Vec::new(),
+                }],
+            };
+            let plain = map_to_internal(&conv);
+            let mut redactor = super::super::redact_secrets::MemoizingRedactor::with_capacity(8);
+            let memoized = map_to_internal_with_redactor(&conv, Some(&mut redactor));
+            let warm = map_to_internal_with_redactor(&conv, Some(&mut redactor));
+            let parallel = rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap()
+                .install(|| {
+                    map_to_internal_with_message_parallelism(
+                        &conv,
+                        None,
+                        PersistHeartbeat::NONE,
+                        true,
+                    )
+                });
+            for mapped in [&plain, &memoized, &warm, &parallel] {
+                let message = &mapped.messages[0];
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&message.content).unwrap(),
+                    serde_json::json!({
+                        "ok": true,
+                        "registration_token": "[REDACTED]",
+                        "label": "visible λ"
+                    })
+                );
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(mapped.title.as_ref().unwrap())
+                        .unwrap(),
+                    serde_json::json!({"passphrase": "[REDACTED]", "name": "Visible title"})
+                );
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(
+                        message.snippets[0].snippet_text.as_ref().unwrap()
+                    )
+                    .unwrap(),
+                    serde_json::json!({"cookie": "[REDACTED]", "code": "let value = 1;"})
+                );
+                assert_eq!(mapped.source_path, conv.source_path);
+                assert_eq!(mapped.external_id, conv.external_id);
+                assert_eq!(message.idx, 7);
+                assert_eq!(message.created_at, Some(1_500));
+                assert_eq!(message.snippets[0].start_line, Some(3));
+                assert_eq!(message.snippets[0].end_line, Some(5));
+                assert_eq!(
+                    serde_json::to_value(mapped).unwrap(),
+                    serde_json::to_value(&plain).unwrap()
+                );
+            }
+
+            // The documented index-time opt-out still preserves raw bytes.
+            // Export applies its independent sharing policy later.
+            let _disabled_guard = set_env("CASS_INDEX_REDACTION", "off");
+            for mapped in [
+                map_to_internal(&conv),
+                map_to_internal_with_redactor(&conv, Some(&mut redactor)),
+            ] {
+                assert_eq!(mapped.title.as_deref(), Some(title));
+                assert_eq!(mapped.messages[0].content, content);
+                assert_eq!(
+                    mapped.messages[0].snippets[0].snippet_text.as_deref(),
+                    Some(snippet)
+                );
+                assert_eq!(mapped.metadata_json, conv.metadata);
+                assert_eq!(mapped.messages[0].extra_json, conv.messages[0].extra);
+            }
+            assert_eq!(
+                conv.messages[0].content, content,
+                "mapping changed its input"
+            );
         }
 
         #[test]
@@ -46822,6 +46930,7 @@ pub mod persist {
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
             let _defer_guard = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
             let _redact_guard = set_env("CASS_REDACT_SECRETS", "1");
+            let _policy_guard = set_env("CASS_INDEX_REDACTION", "full");
 
             let dir = tempfile::TempDir::new().unwrap();
             let data_dir = dir.path().join("data");
@@ -46865,16 +46974,66 @@ pub mod persist {
                 }],
             };
 
+            // Opaque values have no provider prefix or assignment syntax. Only
+            // the JSON field policy can protect these persisted text surfaces.
+            let json_secret = "opaqueingestmarker";
+            let title_secret = "opaquetitlemarker";
+            let snippet_secret = "opaquesnippetmarker";
+            let json_canary = "embeddedjsoncanary0007";
+            let mut json_conv = conv.clone();
+            json_conv.external_id = Some("incremental-json-redaction".into());
+            json_conv.source_path = PathBuf::from("/logs/json-session.jsonl");
+            json_conv.title = Some(
+                serde_json::json!({"name": "JSON title", "passphrase": title_secret}).to_string(),
+            );
+            json_conv.messages[0].content = serde_json::json!({
+                "ok": true,
+                "marker": json_canary,
+                "registration_token": json_secret
+            })
+            .to_string();
+            json_conv.messages[0].snippets = vec![crate::connectors::NormalizedSnippet {
+                file_path: Some(PathBuf::from("config.json")),
+                start_line: Some(3),
+                end_line: Some(5),
+                language: Some("json".into()),
+                snippet_text: Some(
+                    serde_json::json!({"cookie": snippet_secret, "enabled": true}).to_string(),
+                ),
+            }];
+
             persist_conversations_batched(
                 &storage,
                 Some(&mut t_index),
-                &[conv],
+                &[conv, json_conv],
                 LexicalPopulationStrategy::IncrementalInline,
                 false,
             )
             .expect("incremental persistence should succeed");
             t_index.commit().unwrap();
             drop(t_index);
+
+            let stored: (String, String, String) = storage
+                .raw()
+                .query_row_map(
+                    "SELECT c.title, m.content, s.snippet_text FROM conversations c \
+                     JOIN messages m ON m.conversation_id = c.id \
+                     JOIN snippets s ON s.message_id = m.id WHERE c.external_id = ?1",
+                    &[ParamValue::from("incremental-json-redaction")],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+                )
+                .expect("canonical JSON fields and snippet must be persisted");
+            for (text, secret, field) in [
+                (&stored.0, title_secret, "passphrase"),
+                (&stored.1, json_secret, "registration_token"),
+                (&stored.2, snippet_secret, "cookie"),
+            ] {
+                assert!(!text.contains(secret), "canonical {field} leaked its value");
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(text).unwrap()[field],
+                    "[REDACTED]"
+                );
+            }
 
             let stable_hit = |client: &SearchClient| {
                 let leaked = client
@@ -46928,15 +47087,48 @@ pub mod persist {
                 )
             };
 
+            let json_hit = |client: &SearchClient| {
+                for secret in [json_secret, title_secret, snippet_secret] {
+                    assert!(
+                        client
+                            .search(secret, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                            .unwrap()
+                            .is_empty(),
+                        "a credential field's opaque value must not be searchable"
+                    );
+                }
+                let hits = client
+                    .search(
+                        json_canary,
+                        SearchFilters::default(),
+                        10,
+                        0,
+                        FieldMask::FULL,
+                    )
+                    .unwrap();
+                assert_eq!(hits.len(), 1, "benign JSON fields must remain searchable");
+                let hit = &hits[0];
+                for text in [&hit.title, &hit.content, &hit.snippet] {
+                    assert!(
+                        ![json_secret, title_secret, snippet_secret]
+                            .iter()
+                            .any(|secret| text.contains(*secret))
+                    );
+                }
+                assert!(hit.content.contains("[REDACTED]"));
+                (hit.title.clone(), hit.content.clone(), hit.snippet.clone())
+            };
+
             let incremental_client = SearchClient::open(&index_path, None)
                 .unwrap()
                 .expect("incremental lexical reader");
             let incremental_hit = stable_hit(&incremental_client);
+            let incremental_json_hit = json_hit(&incremental_client);
             drop(incremental_client);
 
             let rebuild = crate::indexer::rebuild_tantivy_from_db(&db_path, &data_dir, 1, None)
                 .expect("canonical lexical rebuild should succeed");
-            assert_eq!(rebuild.indexed_docs, 1);
+            assert_eq!(rebuild.indexed_docs, 2);
 
             let rebuilt_client = SearchClient::open(&index_path, None)
                 .unwrap()
@@ -46946,6 +47138,7 @@ pub mod persist {
                 incremental_hit, rebuilt_hit,
                 "incremental and canonical-rebuild hits must agree on stable fields"
             );
+            assert_eq!(incremental_json_hit, json_hit(&rebuilt_client));
         }
 
         #[test]

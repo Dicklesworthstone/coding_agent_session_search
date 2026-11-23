@@ -488,6 +488,46 @@ pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
     redact_json_with_text_redactor(value, &mut |input| redact_text(input).into_owned())
 }
 
+/// Redact transcript text with the same credential-field and encoded-JSON
+/// policy as metadata, without wrapping the input in a temporary JSON value.
+pub(crate) fn redact_content(input: &str) -> String {
+    redact_content_with_text_redactor(input, &mut |text| redact_text(text).into_owned())
+}
+
+/// Apply a caller's plain-text policy while retaining the shared structured
+/// credential policy and encoded-depth limit.
+pub(crate) fn redact_content_with_text_redactor(
+    input: &str,
+    redact_plain_text: &mut impl FnMut(&str) -> String,
+) -> String {
+    let trimmed = input.trim();
+    if !matches!(trimmed.as_bytes().first(), Some(b'{' | b'[' | b'"'))
+        || serde_json::from_str::<EmbeddedJsonKeyCheck>(trimmed).is_err()
+    {
+        // Plain transcript content can begin with a log label or timestamp.
+        // Only a complete JSON value opts in to structured interpretation.
+        return redact_plain_text(input);
+    }
+    // Decoding can shorten a raw credential below a pattern's minimum length,
+    // and walking fields can erase a header whose original match crossed them.
+    // Retain the original whole-string policy as a separate safety obligation.
+    let original_plain = redact_plain_text(input);
+    let structured = redact_json_string(input, redact_plain_text, 0);
+    if original_plain == input {
+        return structured;
+    }
+    if structured == input {
+        return original_plain;
+    }
+    let combined = redact_plain_text(&structured);
+    if combined == original_plain {
+        return combined;
+    }
+    // The two policies changed different representations. Without original
+    // span proof, a complete sensitive payload is safer hidden in full.
+    REDACTED.to_owned()
+}
+
 /// Inspect original JSON keys and encoded values before applying a text policy.
 /// Rewriting first can hide a credential-bearing key or invalidate quote escapes.
 /// Keep all callers on the same field, duplicate-key, and encoded-depth rules.
@@ -665,10 +705,10 @@ fn redaction_enabled_from_values(modern: Option<&str>, legacy: Option<&str>) -> 
 /// regex tightened) automatically invalidates every prior cache entry
 /// — silent stale cross-version reuse is impossible by construction.
 ///
-/// The fingerprint is `redact-v2:<blake3-hex>` where the hash covers
+/// The fingerprint is `redact-v3:<blake3-hex>` where the hash covers
 /// every pattern source string concatenated with NUL separators and the
-/// replacement marker. The `v2` epoch identifies original-span replacement:
-/// unlike sequential mutation, an earlier match cannot hide a later secret.
+/// replacement marker. The `v3` epoch adds structured transcript content
+/// to the original-span replacement policy introduced by `v2`.
 /// Bump the epoch for algorithm changes even when the pattern set is unchanged.
 pub fn redaction_algorithm_fingerprint() -> String {
     static FINGERPRINT: Lazy<String> = Lazy::new(|| {
@@ -678,7 +718,7 @@ pub fn redaction_algorithm_fingerprint() -> String {
             hasher.update(&[0]);
         }
         hasher.update(REDACTED.as_bytes());
-        format!("redact-v2:{}", hasher.finalize().to_hex())
+        format!("redact-v3:{}", hasher.finalize().to_hex())
     });
     FINGERPRINT.clone()
 }
@@ -965,6 +1005,12 @@ impl MemoizingRedactor {
                 "redact memo quarantine"
             ),
         }
+    }
+
+    /// Structured transcript text keeps the same field policy as metadata;
+    /// only the plain-text leaves participate in the existing bounded cache.
+    pub(crate) fn redact_content(&mut self, input: &str) -> String {
+        redact_content_with_text_redactor(input, &mut |text| self.redact_text(text))
     }
 
     /// Memoized counterpart to the shared JSON redactor. Field semantics and
@@ -1545,6 +1591,91 @@ mod tests {
     }
 
     #[test]
+    fn structured_content_entry_points_share_json_policy() -> Result<(), serde_json::Error> {
+        let mut memo = MemoizingRedactor::with_capacity(8);
+        for input in [
+            r#"{"registration_token":"tiny","token_count":42}"#,
+            r#"{"nested":[{"passphrase":"short"}]}"#,
+            "ordinary café 界",
+        ] {
+            let expected = redact_json(&json!(input));
+            assert_eq!(json!(redact_content(input)), expected);
+            assert_eq!(json!(memo.redact_content(input)), expected);
+            assert_eq!(json!(memo.redact_content(input)), expected);
+            let encoded = serde_json::to_string(input)?;
+            assert_eq!(
+                json!(redact_content(&encoded)),
+                redact_json(&json!(encoded))
+            );
+        }
+        let assignment = "DB_PASSWORD=synthetic-assignment";
+        assert_eq!(redact_content(assignment), REDACTED);
+        assert_eq!(memo.redact_content(assignment), REDACTED);
+        let encoded_assignment = serde_json::to_string(assignment)?;
+        assert_eq!(redact_content(&encoded_assignment), REDACTED);
+        assert_eq!(memo.redact_content(&encoded_assignment), REDACTED);
+        Ok(())
+    }
+
+    #[test]
+    fn structured_content_preserves_cross_field_plaintext_secret_spans()
+    -> Result<(), serde_json::Error> {
+        let input = concat!(
+            r#"{"head":"-----BEGIN PRIVATE KEY-----","#,
+            r#""tail":"synthetic-private-body","#,
+            r#""end":"-----END PRIVATE KEY-----","safe":42}"#,
+        );
+        assert!(!redact_text(input).contains("synthetic-private-body"));
+        assert_eq!(redact_content(input), REDACTED);
+        let mut memo = MemoizingRedactor::with_capacity(8);
+        assert_eq!(memo.redact_content(input), REDACTED);
+        assert_eq!(memo.redact_content(input), REDACTED);
+        let encoded = serde_json::to_string(input)?;
+        assert_eq!(redact_content(&encoded), REDACTED);
+        assert_eq!(memo.redact_content(&encoded), REDACTED);
+
+        let single_field = json!({
+            "key": "-----BEGIN PRIVATE KEY-----\nsynthetic-private-body\n-----END PRIVATE KEY-----",
+            "safe": 42
+        });
+        assert_eq!(
+            redact_content(&single_field.to_string()),
+            json!({"key": REDACTED, "safe": 42}).to_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn structured_content_preserves_original_encoded_secret_matches() {
+        let input = r#"{"s":"password=\u0061\u0062, SAFE"}"#;
+        let expected = redact_text(input).into_owned();
+        assert_ne!(expected, input);
+        assert_eq!(redact_content(input), expected);
+        let mut memo = MemoizingRedactor::with_capacity(8);
+        assert_eq!(memo.redact_content(input), expected);
+
+        let with_field_secret =
+            r#"{"s":"password=\u0061\u0062, SAFE","registration_token":"tiny"}"#;
+        assert_eq!(redact_content(with_field_secret), REDACTED);
+        assert_eq!(memo.redact_content(with_field_secret), REDACTED);
+    }
+
+    #[test]
+    fn structured_content_preserves_plain_log_prefixes() {
+        let mut memo = MemoizingRedactor::with_capacity(8);
+        for input in [
+            "[2026-11-22 22:35:42] Build succeeded",
+            "[INFO] Build succeeded",
+            "{ not JSON } but ordinary source code",
+            "{\"safe\":true} followed by commentary",
+            "\"ordinary quoted prose\" with a suffix",
+        ] {
+            assert_eq!(redact_content(input), input);
+            assert_eq!(memo.redact_content(input), input);
+        }
+    }
+
+    #[test]
     fn gh551_embedded_json_uses_sensitive_field_policy() -> Result<(), Box<dyn std::error::Error>> {
         let embedded = r#" {
             "ok": true,
@@ -1947,17 +2078,17 @@ mod tests {
     /// `MemoizingRedactor` instances whose algorithm fingerprints
     /// differ — entries from one cannot serve hits to the other,
     /// guaranteeing safe cross-version semantics. Pinning the
-    /// fingerprint structure (`redact-v2:<hex>`) guards against an
+    /// fingerprint structure (`redact-v3:<hex>`) guards against an
     /// accidental hash-format change that would silently break
     /// invalidation.
     #[test]
     fn memoizing_redactor_keys_isolate_by_algorithm_fingerprint() {
         let fingerprint = redaction_algorithm_fingerprint();
         assert!(
-            fingerprint.starts_with("redact-v2:"),
+            fingerprint.starts_with("redact-v3:"),
             "fingerprint must carry an explicit version epoch, got: {fingerprint}"
         );
-        let hex_part = fingerprint.strip_prefix("redact-v2:").unwrap();
+        let hex_part = fingerprint.strip_prefix("redact-v3:").unwrap();
         assert_eq!(
             hex_part.len(),
             64,
@@ -2129,7 +2260,7 @@ mod tests {
         // ContentAddressedMemoCaches share the same logger target.
         for record in first_audit.iter().chain(second_audit.iter()) {
             assert_eq!(record.key.algorithm, "redact_text");
-            assert!(record.key.algorithm_version.starts_with("redact-v2:"));
+            assert!(record.key.algorithm_version.starts_with("redact-v3:"));
         }
     }
 
