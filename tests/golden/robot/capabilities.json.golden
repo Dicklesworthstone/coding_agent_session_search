@@ -80,7 +80,8 @@
     "goose",
     "crush",
     "hermes",
-    "shelley"
+    "shelley",
+    "zcode"
   ],
   "global_flags": [
     {
@@ -4462,6 +4463,19 @@
     {
       "name": "CASS_AIDER_DATA_ROOT",
       "description": "Override Aider session discovery root."
+    },
+    {
+      "name": "ZCODE_SESSION_DB_PATH",
+      "description": "Override the ZCode CLI/Desktop session database; takes precedence over ZCODE_SESSION_DB and storage configuration."
+    },
+    {
+      "name": "ZCODE_SESSION_DB",
+      "description": "Fallback ZCode session database override when ZCODE_SESSION_DB_PATH is unset."
+    },
+    {
+      "name": "ZCODE_STORAGE_DIR",
+      "default": "~/.zcode",
+      "description": "ZCode storage base. cli/config.json storage.sessionDbPath takes precedence over the default cli/db/db.sqlite beneath this base."
     },
     {
       "name": "CASS_OMP_DATA_ROOT",

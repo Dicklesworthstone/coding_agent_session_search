@@ -229,12 +229,18 @@ fn shell_single_quote_arg(value: &str) -> String {
 
 /// Local discovery does not imply that a mixed application container is safe
 /// to copy to another machine. Also recognize old probe reports whose generic
-/// path classifier called the Grok Bot directory an unknown provider.
+/// path classifier called the Grok Bot or ZCode directory an unknown provider.
 pub(crate) fn remote_probe_source_allowed(agent: &str, path: &str) -> bool {
-    if matches!(agent, "grok_bot" | "grok-bot") {
+    if matches!(agent, "grok_bot" | "grok-bot" | "zcode") {
         return false;
     }
     let path = path.replace('\\', "/");
+    if path
+        .split('/')
+        .any(|component| component.eq_ignore_ascii_case(".zcode"))
+    {
+        return false;
+    }
     // FAD also probes Muse's authentication file to detect a local install.
     // Neither that file nor its containing configuration tree is session data.
     // Apply the path boundary even to old reports classified as "unknown".
@@ -730,6 +736,11 @@ fn infer_agent_type(path: &str) -> String {
         "copilot".to_string()
     } else if path.contains(".continue") {
         "continue".to_string()
+    } else if path
+        .split(['/', '\\'])
+        .any(|component| component.eq_ignore_ascii_case(".zcode"))
+    {
+        "zcode".to_string()
     } else if path.contains("sourcegraph.amp") || path.contains("/amp/") || path.ends_with("/amp") {
         "amp".to_string()
     } else if path.contains(".clawdbot") {
@@ -1600,10 +1611,51 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    fn gh573_remote_probe_excludes_zcode_containers_and_old_unknown_reports() {
+        let paths = collect_probe_dirs(vec![
+            (
+                "zcode",
+                vec!["~/.zcode/cli/db/db.sqlite".into(), "/custom/history".into()],
+            ),
+            (
+                "unknown",
+                vec![r"C:\Users\test\.zcode\cli\db\db.sqlite".into()],
+            ),
+            ("codex", vec!["~/.codex/sessions".into()]),
+        ]);
+        assert_eq!(paths, vec!["~/.codex/sessions"]);
+        assert!(!build_probe_script().contains(".zcode"));
+        assert!(remote_probe_source_allowed(
+            "unknown",
+            "~/.zcode-other/history"
+        ));
+
+        let parsed = parse_probe_output(
+            "laptop",
+            "===PROBE_START===\nAGENT_DATA=/Users/test/.zcode/cli/db/db.sqlite|1|1\nAGENT_DATA=/Users/test/.codex/sessions|2|3\n===PROBE_END===",
+            1,
+        );
+        let generator = super::super::config::SourceConfigGenerator::new();
+        assert_eq!(
+            generator.generate_source("laptop", &parsed).paths,
+            vec!["/Users/test/.codex/sessions"]
+        );
+    }
+
+    #[test]
     fn infer_agent_type_covers_all_dynamic_agents() {
         // Ensure infer_agent_type handles all agents from franken_agent_detection
         assert_eq!(infer_agent_type("~/.goose/sessions"), "goose");
         assert_eq!(infer_agent_type("~/.continue/sessions"), "continue");
+        assert_eq!(infer_agent_type("~/.zcode/cli/db/db.sqlite"), "zcode");
+        assert_eq!(
+            infer_agent_type(r"C:\Users\test\.zcode\cli\db\db.sqlite"),
+            "zcode"
+        );
+        assert_eq!(
+            infer_agent_type("~/.zcode-other/cli/db/db.sqlite"),
+            "unknown"
+        );
         assert_eq!(infer_agent_type("~/.clawdbot/sessions"), "clawdbot");
         assert_eq!(infer_agent_type("~/.factory/sessions"), "factory");
         assert_eq!(infer_agent_type("~/.vibe/logs/session"), "vibe");

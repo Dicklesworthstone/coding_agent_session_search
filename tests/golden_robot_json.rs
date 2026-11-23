@@ -58,6 +58,12 @@ fn cass_cmd(test_home: &std::path::Path) -> Command {
         .env("CLAUDE_HOME", claude_home)
         .env("GEMINI_HOME", gemini_home)
         .env("OPENCODE_STORAGE_ROOT", opencode_root)
+        .env(
+            "ZCODE_SESSION_DB_PATH",
+            test_home.join("zcode-missing.sqlite"),
+        )
+        .env_remove("ZCODE_SESSION_DB")
+        .env_remove("ZCODE_STORAGE_DIR")
         .env("CASS_AIDER_DATA_ROOT", aider_root)
         // WS-A.6: the Pi family connectors honor these overrides ahead of
         // the synthetic HOME. On 2026-09-01 a fleet worker's real

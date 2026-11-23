@@ -1,10 +1,10 @@
 //! INV-cass-19 — `cass diag --json::connectors` enumeration completeness.
 //!
-//! cass advertises support for **33 coding-agent providers**: aider, amp,
-//! antigravity, chatgpt, claude_code, clawdbot, cline, codebuff, codex, copilot,
+//! cass advertises support for **35 coding-agent providers**: aider, amp,
+//! antigravity, chatgpt, claude_code, clawdbot, cline, codebuff, codex, continue, copilot,
 //! copilot_cli, crush, cursor, devin, factory, gemini, goose, grok, grok_bot, hermes,
 //! kimi, kiro, muse, openclaw, omp, opencode, openhands, pi_agent, pi_durable,
-//! prime_agent, qwen, shelley, vibe. Each is a separate
+//! prime_agent, qwen, shelley, vibe, zcode. Each is a separate
 //! `src/connectors/*.rs` re-export of a `franken_agent_detection::Connector`
 //! implementation, and `cass diag --json` exposes the per-connector detection
 //! state agents and operators use to triage source coverage.
@@ -29,7 +29,7 @@
 //! Two invariants:
 //!
 //!   1. The set of connector names emitted by `cass diag --json::
-//!      connectors[].name` exactly equals the documented set of 33.
+//!      connectors[].name` exactly equals the documented set of 35.
 //!      Equality is checked via `symmetric_difference` so the
 //!      diagnostic shows exactly what's missing or extra in either
 //!      direction.
@@ -60,7 +60,7 @@ fn ensure(condition: bool, message: impl Into<String>) -> TestResult {
     }
 }
 
-/// The canonical set of 33 documented provider connectors. Sourced from the
+/// The canonical set of 35 documented provider connectors. Sourced from the
 /// runtime registry `franken_agent_detection::get_connector_factories()` (as
 /// surfaced by `cass capabilities --json` / `cass diag --json`) under the
 /// franken-agent-detection features cass enables in Cargo.toml. A peer adding a
@@ -75,6 +75,7 @@ const DOCUMENTED_CONNECTOR_NAMES: &[&str] = &[
     "cline",
     "codebuff",
     "codex",
+    "continue",
     "copilot",
     "copilot_cli",
     "crush",
@@ -99,6 +100,7 @@ const DOCUMENTED_CONNECTOR_NAMES: &[&str] = &[
     "qwen",
     "shelley",
     "vibe",
+    "zcode",
 ];
 
 fn run_diag_json() -> Result<Value, Box<dyn Error>> {

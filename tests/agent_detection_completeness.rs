@@ -7,7 +7,7 @@
 //! 2. Connector detection round-trip works correctly
 //! 3. Probe script generation uses FAD paths dynamically
 //! 4. Agent counts are consistent across all APIs
-//! 5. Detection-only connectors (continue, windsurf) are properly handled
+//! 5. Detection-only connectors (windsurf) are properly handled
 
 use coding_agent_search::indexer::get_connector_factories;
 use std::collections::HashSet;
@@ -51,7 +51,7 @@ fn probe_slugs() -> HashSet<String> {
 
 /// Detection-only connectors: have probe paths and detection entries but
 /// no parser implementation (no entry in `get_connector_factories()`).
-const DETECTION_ONLY: &[&str] = &["continue", "windsurf"];
+const DETECTION_ONLY: &[&str] = &["windsurf"];
 
 /// Extract a function body from source code, including the braces.
 fn extract_function_body(source: &str, fn_prefix: &str) -> String {
@@ -137,6 +137,7 @@ fn connector_factories_all_instantiate_and_detect() {
         "factory",
         "omp",
         "openclaw",
+        "continue",
         "copilot",
         "grok",
         "muse",
@@ -158,7 +159,7 @@ fn feature_gated_connectors_available() {
     let slugs = factory_fad_slugs();
     for gated in [
         "chatgpt", "cursor", "opencode", "crush", "goose", "hermes", "devin", "shelley",
-        "grok_bot", "codebuff",
+        "grok_bot", "codebuff", "zcode",
     ] {
         assert!(
             slugs.contains(gated),
@@ -166,7 +167,7 @@ fn feature_gated_connectors_available() {
              Check Cargo.toml enables the feature for franken-agent-detection"
         );
     }
-    assert_eq!(slugs.len(), 33, "Expected 33 connector factories");
+    assert_eq!(slugs.len(), 35, "Expected 35 connector factories");
 }
 
 // ---------------------------------------------------------------------------
@@ -221,11 +222,12 @@ fn probe_paths_cover_all_factory_connectors() {
 fn probe_paths_are_tilde_relative() {
     let paths = franken_agent_detection::default_probe_paths_tilde();
     for (slug, paths) in &paths {
-        if matches!(*slug, "shelley" | "pi_durable") {
+        if matches!(*slug, "shelley" | "pi_durable" | "zcode") {
             // A live SQLite database and WAL cannot yet be copied as a
             // consistent remote bundle (GH #415; Pi durable stores, FAD #28).
-            // Local detection remains available, but advertising remote paths
-            // would be unsafe.
+            // ZCode also co-locates credentials and runtime prompt snapshots
+            // with transcripts (GH #573). Local detection remains available,
+            // but advertising these containers as remote paths is unsafe.
             assert!(
                 paths.is_empty(),
                 "{slug} remote probes must remain disabled"

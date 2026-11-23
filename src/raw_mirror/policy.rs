@@ -810,7 +810,7 @@ pub(crate) fn capture(
     chunk_size: usize,
     policy: RawMirrorRetentionPolicy,
 ) -> Result<RawMirrorCaptureRecord> {
-    if matches!(input.provider, "shelley" | "grok_bot" | "pi_durable") {
+    if crate::raw_mirror::is_sensitive_container_provider(input.provider) {
         anyhow::bail!(
             "disabled_sensitive_container: {} source files cannot be raw-mirrored",
             input.provider
@@ -837,6 +837,11 @@ pub(crate) fn capture(
         anyhow::bail!(
             "refusing to raw-mirror non-file source {}",
             input.source_path.display()
+        );
+    }
+    if crate::raw_mirror::zcode_source_is_sensitive(input.source_path)? {
+        anyhow::bail!(
+            "disabled_sensitive_container: ZCode database and store files cannot be raw-mirrored"
         );
     }
     let root = ensure_raw_mirror_root(input.data_dir)?;

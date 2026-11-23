@@ -116,6 +116,10 @@ impl WatchSourceLedger {
             if let Some(progress) = progress {
                 progress.tick_activity();
             }
+            if should_skip_foreign_zcode_source(connector_name, &source.source_path) {
+                filtered.set(true);
+                return false;
+            }
             filtered.set(
                 scan_path_exclusions_active()
                     && !crate::connectors::source_dependencies::can_reuse_with_path_exclusions(

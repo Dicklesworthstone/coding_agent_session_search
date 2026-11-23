@@ -465,7 +465,7 @@ cass export-html session.jsonl --json
 ```
 
 ### 🔗 Universal Connectors
-Ingests history from 34 local agent connectors, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
+Ingests history from 35 local agent connectors, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
 - **Codex**: `~/.codex/sessions` and `~/.codex/archived_sessions` (Rollout JSONL, plain or zstd-compressed `.jsonl.zst`)
 - **Cline**: VS Code global storage (Task directories)
 - **Gemini CLI**: `~/.gemini/tmp` (Chat JSON)
@@ -502,6 +502,7 @@ Ingests history from 34 local agent connectors, normalizing them into a unified 
 - **Codebuff / Freebuff (`codebuff`)**: `~/.config/manicode/projects/<project>/chats/<chat-id>/chat-messages.json` with its `run-state.json` (override with `CASS_CODEBUFF_DATA_ROOT`). Both products write the same Manicode store and no chat records which binary wrote it, so their sessions share one lineage identity, `codebuff` (filter with `--agent codebuff`). Messages are reconciled by their native IDs, so an edited message updates in place instead of duplicating.
 - **Kiro CLI (`kiro`)**: `~/.kiro/sessions/cli/<session-uuid>.jsonl` (append-only event log: prompts, assistant messages, tool results) with the matching `<session-uuid>.json` snapshot read for session ID, working directory, title, timestamps and model.
 - **Continue (`continue`)**: `~/.continue/sessions/<id>.json`, one JSON snapshot per session holding its current ordered history (IDE extension and CLI). `CONTINUE_GLOBAL_DIR` moves the store, as it does for Continue itself.
+- **ZCode CLI / Desktop (`zcode`)**: reads `~/.zcode/cli/db/db.sqlite` (Windows: `%USERPROFILE%\.zcode\cli\db\db.sqlite`) with structural validation that distinguishes ZCode from OpenCode. Overrides, in precedence order: `ZCODE_SESSION_DB_PATH`, `ZCODE_SESSION_DB`, `storage.sessionDbPath` in `<storage>/cli/config.json`, then `<storage>/cli/db/db.sqlite`; `<storage>` is `ZCODE_STORAGE_DIR` or `~/.zcode`. Indexes visible prompts, assistant text, reasoning and tool calls in recorded sequence, preserves direct token usage, excludes soft-deleted sessions and injected system reminders, and honors `CASS_SKIP_SUBAGENTS=1`. Watch mode follows database, WAL, SHM and rollback-journal changes. Raw mirroring and automatic remote copying are disabled because the database also contains local settings and internal prompt snapshots. Rollout logs, desktop logs, credentials, provider configuration and certificates are never indexed. `cass resume` is not supported for ZCode.
 
 Claude Code Desktop sidecars preserve title, workspace, model, and session IDs,
 but not necessarily the full conversation body. If Claude Code has culled an old
@@ -2722,7 +2723,7 @@ classDiagram
  CodexConnector ..> NormalizedConversation : emits
  CursorConnector ..> NormalizedConversation : emits
 
- note "34 connectors are registered at runtime; cass capabilities --json lists them"
+ note "35 connectors are registered at runtime; cass capabilities --json lists them"
 ```
 
 - **Polymorphic Scanning**: The indexer runs connector factories in parallel via rayon, creating fresh `Box<dyn Connector>` instances that are unaware of each other's underlying file formats (JSONL, SQLite, specialized JSON).
@@ -2750,7 +2751,7 @@ flowchart LR
  classDef pastel4 fill:#fff7e6,stroke:#f2c27f,color:#4d350f;
  classDef pastel5 fill:#ffeef2,stroke:#f5b0c2,color:#4d1f2c;
 
- subgraph Sources["Local Sources (34 connectors)"]
+ subgraph Sources["Local Sources (35 connectors)"]
  A1[Claude Code]:::pastel
  A2[Codex]:::pastel
  A3[Cursor]:::pastel
@@ -4097,7 +4098,7 @@ uniform SQLite 0.4.12 versions, a single resolution per package, and registry so
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.12` (tag v0.4.12 = `26aa19afcbd5afdb01658a10bb33417ad0b513be`). Carries 0.4.12's fixes for explicit-transaction inserts corrupting a table b-tree (bd-obwsy, the 0.4.10 advisory), AUTOINCREMENT after ROLLBACK (bd-gwoit) and stock-truncated empty WALs (bd-yxqs9), plus 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs, 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes, 0.4.7's large multi-row INSERT index fix (bd-2eebi), serialized-DDL race fix (bd-4iaoi), GH#503 shadow-autoindex repair open, bounded page plane and first-`sqlite_master` full-file read fix, and 0.4.9's prompt stale-WAL-index refusal for strict read-only opens (48c6cf6b2) and first-write recovery from stock SQLite's empty WAL index (GH#443 / cass GH#509). The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. `src/franken_sync.rs` keeps cass's synchronous call shape through a current-thread asupersync `block_on` bridge. |
-| `franken-agent-detection` | git `830d9720d71372a2002a42d10431f2d75a0b16d0` (package version 0.3.10; host-approved inactive Codex tail recovery, GH#560; bounded complete-record recovery after torn Pi/OMP, Codex and Claude JSONL prefixes, GH#553; structured ChatGPT voice transcripts and stable message identities, GH#552; narrow OpenClaw explicit-file isolation, historical sessions, opaque mirror discovery, and physical-store migration backports; native qualification pending; `build.rs` checks the repository, revision and version), features `codex-zstd` (compressed Codex rollouts), `pi-durable` and `pi-sqlite` (Pi durable-harness stores, `pi_agent_rust` SQLite sessions) |
+| `franken-agent-detection` | git `a0dd013a8c1e374d6a80949637e5e51cbb45550b` (package version 0.3.10; native ZCode session indexing and OpenCode disambiguation, GH#573; host-approved inactive Codex tail recovery, GH#560; bounded complete-record recovery after torn Pi/OMP, Codex and Claude JSONL prefixes, GH#553; structured ChatGPT voice transcripts and stable message identities, GH#552; narrow OpenClaw explicit-file isolation, historical sessions, opaque mirror discovery, and physical-store migration backports; native qualification pending; `build.rs` checks the repository, revision and version), features `zcode` (native ZCode SQLite sessions, without raw mirroring), `codex-zstd` (compressed Codex rollouts), `pi-durable` and `pi-sqlite` (Pi durable-harness stores, `pi_agent_rust` SQLite sessions) |
 | `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x names in its public API) |
 | `frankensearch` | `=0.7.1` at Git revision `d3d58a9f788e67b9cc0956efbf657f3257ab89e4`, with the entire Frankensearch family from that revision. Carries GH #548 tokenizer-aligned queries, complete bounded positional prefixes, the explicit `cass::legacy_v9` adapter and a concat-merge term merge without per-term allocations (the merge inside each run of the end-of-rebuild fold). CASS retains v9 paths, sentinels and every write/delete identity; upstream v10 defaults remain unchanged. Features remain `hash`, `cass-compat`, `quill`, `ann`, `native`; `cass-compat` enables `lexical-tantivy`, the retained Tantivy-backed differential oracle. The new APIs are not yet in a registry release. |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |

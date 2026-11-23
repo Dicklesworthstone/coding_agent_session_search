@@ -248,6 +248,7 @@ const INPUT_AUTOCOMPLETE_AGENT_HINTS: &[&str] = &[
     "prime_agent",
     "qwen",
     "vibe",
+    "zcode",
 ];
 const PANEL_RATIO_MIN: f64 = 0.25;
 const PANEL_RATIO_MAX: f64 = 0.75;
@@ -3107,6 +3108,7 @@ fn legacy_agent_color(agent: &str) -> ftui::PackedRgba {
         "goose" => ftui::PackedRgba::rgb(210, 170, 110), // tan/bronze
         "kimi" => ftui::PackedRgba::rgb(190, 220, 80), // yellow-green
         "qwen" => ftui::PackedRgba::rgb(80, 210, 180), // mint
+        "zcode" => ftui::PackedRgba::rgb(120, 180, 255), // light blue
         _ => ftui::PackedRgba::rgb(169, 169, 169),     // gray fallback
     }
 }

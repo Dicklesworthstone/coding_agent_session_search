@@ -59,6 +59,35 @@ pub fn capture_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// These stores mix conversations with settings, credentials or internal
+/// prompts. Every raw capture and repair path must reject the whole container.
+pub(crate) fn is_sensitive_container_provider(provider: &str) -> bool {
+    matches!(provider, "shelley" | "grok_bot" | "pi_durable" | "zcode")
+}
+
+/// The provider label is not a sufficient privacy boundary: explicit source
+/// roots can reach another reader's pre-parse fallback. Check the physical
+/// store's ZCode marker too, including future schemas and database sidecars.
+/// Any unreadable SQLite identity fails closed instead of copying unknown data.
+pub(crate) fn zcode_source_is_sensitive(path: &std::path::Path) -> anyhow::Result<bool> {
+    if crate::connectors::zcode::owns_path(path) {
+        return Ok(true);
+    }
+    let database = if let Some(name) = path.file_name()
+        && let Some(suffix) = ["-wal", "-shm", "-journal"]
+            .into_iter()
+            .find(|suffix| name.as_encoded_bytes().ends_with(suffix.as_bytes()))
+    {
+        let name = name.to_str().ok_or_else(|| {
+            anyhow::anyhow!("cannot verify raw-mirror privacy for a non-UTF-8 database sidecar")
+        })?;
+        path.with_file_name(&name[..name.len() - suffix.len()])
+    } else {
+        path.to_path_buf()
+    };
+    franken_agent_detection::connectors::zcode::is_zcode_container(&database)
+}
+
 // GH #522: small chunks bound the changing tail of append-oriented transcripts.
 // GH #562 adds per-chunk compression without changing these logical boundaries
 // or assuming an unchanged prefix. Legacy captures remain readable.

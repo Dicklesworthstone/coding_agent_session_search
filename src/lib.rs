@@ -29617,6 +29617,9 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES=<N>  max estimated output bytes per lexical merge run (default 1073741824 = 1 GiB)".to_string(),
             "  CASS_MUSE_DATA_ROOT=<path>               Muse Code data root (default ~/.local/share/muse)".to_string(),
             "  CASS_OMP_DATA_ROOT=<path>                OMP-only archive/store root override".to_string(),
+            "  ZCODE_SESSION_DB_PATH=<path>            ZCode SQLite session database (highest-priority override)".to_string(),
+            "  ZCODE_SESSION_DB=<path>                 fallback ZCode session database override".to_string(),
+            "  ZCODE_STORAGE_DIR=<path>                ZCode storage base (default ~/.zcode); cli/config.json storage.sessionDbPath precedes cli/db/db.sqlite".to_string(),
             "  CASS_QUILL_QUERY_FUEL_BUDGET=<N>         deterministic per-query work ceiling for Quill lexical queries (default 10000000)".to_string(),
             "  CASS_REDACT_MEMO_CAPACITY=<N>            per-worker redaction memo cache entry cap during batched persist (default 4096)".to_string(),
             "  CASS_REDACT_SECRETS=0|1                  legacy redaction toggle (default 1; CASS_INDEX_REDACTION takes precedence)".to_string(),
@@ -36889,7 +36892,10 @@ fn run_cli_pack(
 
     let lexical_admitted = client.is_some() && !strict_semantic;
     if !session_scope_empty
-        && matches!(mode_meta.realized, SearchMode::Semantic | SearchMode::Hybrid)
+        && matches!(
+            mode_meta.realized,
+            SearchMode::Semantic | SearchMode::Hybrid
+        )
     {
         let setup_snapshot = bounded_pack.then(|| BudgetSnapshot::capture(&pack_budget));
         match semantic_budget_action(&mode_meta, setup_snapshot) {
@@ -55985,12 +55991,13 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
         source_path.as_deref(),
     );
 
-    if matches!(provider.as_str(), "shelley" | "grok_bot" | "pi_durable") {
+    if crate::raw_mirror::is_sensitive_container_provider(&provider) {
         receipt.action = "disabled_sensitive_container".to_string();
         receipt.warnings.push(
             match provider.as_str() {
                 "shelley" => "Shelley stores credentials and application settings alongside conversations. Raw mirror capture and linking are disabled; index the original local database directly with CASS_SHELLEY_DB or a local source path.",
                 "grok_bot" => "Grok Bot replicas mix chat with secret and approval payloads. Raw mirror capture and linking are disabled; index the original local replica directly with CASS_GROK_BOT_DATA_ROOT.",
+                "zcode" => "ZCode databases mix conversations with local settings and runtime prompt snapshots. Raw mirror capture and linking are disabled; index the original database with ZCODE_SESSION_DB_PATH or a local source path.",
                 _ => "Pi durable stores keep system prompts, agent instructions, task checkpoints and application documents alongside conversations. Raw mirror capture and linking are disabled; index the original store directly (default <agent dir>/experimental/durable-sessions, agent dir from PI_CODING_AGENT_DIR) or a local source path.",
             }
             .to_string(),
@@ -56027,6 +56034,31 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
             "archive row source_path is relative; doctor refuses to resolve it against the current working directory".to_string(),
         );
         return receipt;
+    }
+
+    // An explicit source can have been classified under another provider.
+    // Check its physical identity before hashing, linking or recapturing it.
+    if crate::connectors::zcode::owns_path(path)
+        || fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+    {
+        match crate::raw_mirror::zcode_source_is_sensitive(path) {
+            Ok(true) => {
+                receipt.action = "disabled_sensitive_container".to_string();
+                receipt.warnings.push(
+                    "ZCode store identity forbids raw mirror capture and linking, regardless of the archived provider label.".to_string(),
+                );
+                return receipt;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                receipt.action = "source_content_unverified_db_projection_only".to_string();
+                receipt.db_projection_only = true;
+                receipt.warnings.push(format!(
+                    "raw-mirror container privacy could not be verified; source bytes were not copied or linked: {error}"
+                ));
+                return receipt;
+            }
+        }
     }
 
     let source_key = doctor_raw_mirror_backfill_source_key(
@@ -86030,7 +86062,7 @@ paths = ["~/.claude/projects"]
         std::fs::write(&source_path, bytes).unwrap();
         let before = std::fs::metadata(&source_path).unwrap().modified().unwrap();
         let mut cache = HashMap::new();
-        for provider in ["shelley", "grok_bot", "pi_durable"] {
+        for provider in ["shelley", "grok_bot", "pi_durable", "zcode"] {
             for origin in ["local", "ssh"] {
                 for apply in [false, true] {
                     let candidate = DoctorRawMirrorBackfillCandidate {
@@ -86060,6 +86092,7 @@ paths = ["~/.claude/projects"]
                     let variable = match provider {
                         "shelley" => "CASS_SHELLEY_DB",
                         "grok_bot" => "CASS_GROK_BOT_DATA_ROOT",
+                        "zcode" => "ZCODE_SESSION_DB_PATH",
                         _ => "PI_CODING_AGENT_DIR",
                     };
                     assert!(
@@ -86107,6 +86140,57 @@ paths = ["~/.claude/projects"]
         );
         assert_eq!(receipt.action, "would_capture_live_source");
         assert!(doctor_raw_mirror_backfill_receipt_would_mutate(&receipt));
+    }
+
+    #[test]
+    fn gh573_doctor_refuses_zcode_marker_under_another_provider_label() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("copied-history.sqlite3");
+        let connection =
+            crate::franken_sync::Connection::open(source_path.to_string_lossy().as_ref())?;
+        connection.execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             CREATE TABLE zcode_database_identity (id TEXT PRIMARY KEY);
+             CREATE TABLE local_setting (value TEXT);
+             INSERT INTO local_setting VALUES ('private-settings-must-not-be-copied');",
+        )?;
+        connection.close()?;
+        let bytes = std::fs::read(&source_path)?;
+        let modified = std::fs::metadata(&source_path)?.modified()?;
+        let mut cache = HashMap::new();
+        for provider in ["opencode", "claude_code"] {
+            for apply in [false, true] {
+                let candidate = DoctorRawMirrorBackfillCandidate {
+                    conversation_id: 17,
+                    provider: provider.into(),
+                    source_path: Some(source_path.display().to_string()),
+                    source_id: "local".into(),
+                    origin_host: None,
+                    origin_kind: Some("local".into()),
+                    started_at_ms: None,
+                    message_count: 1,
+                };
+                let receipt = doctor_raw_mirror_backfill_candidate_receipt(
+                    &data_dir,
+                    &candidate,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &mut cache,
+                    apply,
+                );
+                assert_eq!(receipt.action, "disabled_sensitive_container");
+                assert!(!doctor_raw_mirror_backfill_receipt_would_mutate(&receipt));
+                assert!(!receipt.raw_source_captured);
+                assert!(!receipt.raw_mirror_db_linked);
+                assert!(receipt.source_stat_snapshot.is_none());
+            }
+        }
+        assert!(cache.is_empty());
+        assert!(!data_dir.exists());
+        assert_eq!(std::fs::read(&source_path)?, bytes);
+        assert_eq!(std::fs::metadata(&source_path)?.modified()?, modified);
+        Ok(())
     }
 
     #[test]
@@ -102032,6 +102116,21 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "CASS_AIDER_DATA_ROOT",
             None,
             "Override Aider session discovery root.",
+        ),
+        env_var_capability(
+            "ZCODE_SESSION_DB_PATH",
+            None,
+            "Override the ZCode CLI/Desktop session database; takes precedence over ZCODE_SESSION_DB and storage configuration.",
+        ),
+        env_var_capability(
+            "ZCODE_SESSION_DB",
+            None,
+            "Fallback ZCode session database override when ZCODE_SESSION_DB_PATH is unset.",
+        ),
+        env_var_capability(
+            "ZCODE_STORAGE_DIR",
+            Some("~/.zcode"),
+            "ZCode storage base. cli/config.json storage.sessionDbPath takes precedence over the default cli/db/db.sqlite beneath this base.",
         ),
         env_var_capability(
             "CASS_OMP_DATA_ROOT",

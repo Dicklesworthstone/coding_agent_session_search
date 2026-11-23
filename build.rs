@@ -197,9 +197,10 @@ const CONTRACTS: &[DependencyContract] = &[
         // message identity without taking unrelated newer connector changes.
         // GH#553 adds bounded complete-record recovery after torn JSONL prefixes.
         // GH#560 adds host-approved inactive-tail recovery to the primary Codex parser.
+        // GH#573 adds native ZCode SQLite sessions on the same runtime family.
         // Keep the source contract exact until a registry release carries them.
         expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "830d9720d71372a2002a42d10431f2d75a0b16d0",
+        expected_rev: "a0dd013a8c1e374d6a80949637e5e51cbb45550b",
         expected_version: "0.3.10",
         // Match the always-on SQLite transcript readers in Cargo.toml. Their
         // features are required even for --no-default-features CASS builds.
@@ -220,6 +221,7 @@ const CONTRACTS: &[DependencyContract] = &[
             "pi-durable",
             "pi-sqlite",
             "shelley",
+            "zcode",
         ],
         expected_default_features: None,
         repo_rel: "../franken_agent_detection",

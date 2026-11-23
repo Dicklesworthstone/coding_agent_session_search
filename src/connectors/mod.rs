@@ -288,6 +288,7 @@ pub mod openhands;
 pub mod pi_agent;
 pub mod qwen;
 pub mod vibe;
+pub mod zcode;
 
 /// Constructor function used by the runtime connector registry.
 pub type ConnectorFactory = fn() -> Box<dyn Connector + Send>;

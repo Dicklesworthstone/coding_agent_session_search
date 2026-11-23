@@ -4299,7 +4299,7 @@ mod tests {
         let bytes = br#"{"schemaVersion":1,"value":{"entries":[{"kind":"secret-request","content":"excluded-secret"}]}}"#;
         fs::write(&source, bytes).unwrap();
         let modified = fs::metadata(&source).unwrap().modified().unwrap();
-        for provider in ["grok_bot", "shelley", "pi_durable"] {
+        for provider in ["grok_bot", "shelley", "pi_durable", "zcode"] {
             for source_path in [&source, &temp.path().join("missing.blob")] {
                 let result = capture_source_file(RawMirrorCaptureInput {
                     data_dir: &data_dir,
@@ -4335,6 +4335,66 @@ mod tests {
             !control.already_present,
             "ordinary providers remain capturable"
         );
+    }
+
+    #[test]
+    fn gh573_zcode_identity_refuses_other_provider_capture_and_future_schema() -> Result<()> {
+        use crate::franken_sync::Connection;
+
+        let temp = tempfile::tempdir()?;
+        let data_dir = temp.path().join("archive");
+        let source = temp.path().join("custom-history");
+        let connection = Connection::open(source.to_string_lossy().as_ref())?;
+        connection.execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             CREATE TABLE zcode_database_identity (id TEXT PRIMARY KEY);
+             CREATE TABLE local_setting (value TEXT);
+             INSERT INTO local_setting VALUES ('private-setting-must-not-be-mirrored');",
+        )?;
+        drop(connection);
+        let bytes = fs::read(&source)?;
+        // This is deliberately not a currently supported session schema.
+        // The privacy boundary depends only on the identity table.
+        for provider in ["opencode", "claude", "unknown"] {
+            let result = crate::raw_mirror::capture_source_file(RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider,
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source,
+                db_links: &[],
+            });
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .starts_with("disabled_sensitive_container:"),
+                "another connector's pre-parse fallback must not copy ZCode"
+            );
+            assert!(!data_dir.exists());
+        }
+
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut filename = source.as_os_str().to_os_string();
+            filename.push(suffix);
+            let sidecar = PathBuf::from(filename);
+            fs::write(&sidecar, b"private-database-sidecar")?;
+            let result = crate::raw_mirror::capture_source_file(RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "opencode",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &sidecar,
+                db_links: &[],
+            });
+            // An unreadable owner is refused too: no guessed safe identity.
+            assert!(result.is_err());
+            assert!(!data_dir.exists());
+        }
+        assert_eq!(fs::read(&source)?, bytes);
+        Ok(())
     }
 
     #[test]

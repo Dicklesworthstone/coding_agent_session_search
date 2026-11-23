@@ -478,6 +478,7 @@ impl ThemePalette {
             "goose" => (colors::AGENT_GOOSE_BG, PackedRgba::rgb(210, 170, 110)),       // Tan/bronze
             "kimi" => (colors::AGENT_KIMI_BG, PackedRgba::rgb(190, 220, 80)), // Yellow-green
             "qwen" => (colors::AGENT_QWEN_BG, PackedRgba::rgb(80, 210, 180)), // Mint
+            "zcode" => (PackedRgba::rgb(18, 29, 48), PackedRgba::rgb(120, 180, 255)), // Light blue
             _ => (colors::BG_DEEP, colors::ACCENT_PRIMARY),
         };
 
@@ -517,6 +518,7 @@ impl ThemePalette {
             "goose" => "◍",
             "kimi" => "✧",
             "qwen" => "◒",
+            "zcode" => "Z",
             _ => "•",
         }
     }
@@ -1663,6 +1665,7 @@ mod tests {
         "hermes",
         "kimi",
         "qwen",
+        "zcode",
     ];
 
     #[test]

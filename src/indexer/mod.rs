@@ -80,7 +80,7 @@ use crate::connectors::{
     cursor::CursorConnector, factory::FactoryConnector, gemini::GeminiConnector,
     grok::GrokConnector, kimi::KimiConnector, muse::MuseConnector, omp::OmpConnector,
     openclaw::OpenClawConnector, opencode::OpenCodeConnector, pi_agent::PiAgentConnector,
-    qwen::QwenConnector, vibe::VibeConnector,
+    qwen::QwenConnector, vibe::VibeConnector, zcode::ZCodeConnector,
 };
 use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
 use crate::model::conversation_packet::{
@@ -268,6 +268,13 @@ fn should_skip_excluded_source(source_path: &Path) -> bool {
         );
     }
     excluded
+}
+
+/// GH #573: broad user-configured roots can reach ZCode's private rollout
+/// logs through another provider's recursive reader. Its native reader alone
+/// may admit conversations from that store, including relocated stores.
+fn should_skip_foreign_zcode_source(provider: &str, source_path: &Path) -> bool {
+    provider != "zcode" && crate::connectors::zcode::owns_path(source_path)
 }
 
 /// Prospective workspace exclusions (GH #537) are a completed ingest policy,
@@ -12061,13 +12068,12 @@ fn can_skip_absent_explicit_watch_once_index_run(opts: &IndexOptions) -> bool {
     );
     // A provider can checkpoint and remove a selected WAL before this run.
     // Ordinary missing transcript hooks stay cheap, but a surviving native
-    // OpenClaw database must be reconciled when an enabled root owns it.
-    let claimed_openclaw_database = db_schema_current
+    // OpenClaw or ZCode database must be reconciled when an enabled root owns it.
+    let claimed_database = db_schema_current
         && opts.watch_once_paths.as_ref().is_some_and(|paths| {
-            if !paths
-                .iter()
-                .any(|path| openclaw_database_for_sidecar(path).is_some())
-            {
+            if !paths.iter().any(|path| {
+                openclaw_database_for_sidecar(path).is_some() || is_database_watch_sidecar(path)
+            }) {
                 return false;
             }
             // This is a read-only preflight; do not sync source config into
@@ -12081,10 +12087,12 @@ fn can_skip_absent_explicit_watch_once_index_run(opts: &IndexOptions) -> bool {
             let roots = build_watch_roots(additional_scan_roots);
             classify_paths(paths.clone(), &roots, true)
                 .iter()
-                .any(|(kind, _, _, _)| *kind == ConnectorKind::OpenClaw)
+                .any(|(kind, _, _, _)| {
+                    matches!(kind, ConnectorKind::OpenClaw | ConnectorKind::ZCode)
+                })
         });
     let _ = storage.close();
-    if !db_schema_current || claimed_openclaw_database {
+    if !db_schema_current || claimed_database {
         return false;
     }
 
@@ -15671,6 +15679,10 @@ fn scan_with_durable_source_boundaries(
             *flush_error.borrow_mut() = Some(error);
             return false;
         }
+        if should_skip_foreign_zcode_source(sender.borrow().connector_name, &source.source_path) {
+            filtered.set(true);
+            return false;
+        }
         // Some connectors exclude complete source files before this hook. An
         // unrelated exclusion does not make an admitted transcript partial.
         // Keep conservative behavior for unknown/partial-source filters; the
@@ -16153,7 +16165,11 @@ where
                     if should_skip_subagent(&conversation) {
                         return Ok(None);
                     }
-                    if should_skip_excluded_source(&conversation.source_path) {
+                    if should_skip_foreign_zcode_source(
+                        &conversation.agent_slug,
+                        &conversation.source_path,
+                    ) || should_skip_excluded_source(&conversation.source_path)
+                    {
                         ingest_diagnostics.observe_excluded_source(&conversation.source_path);
                         return Ok(None);
                     }
@@ -16281,7 +16297,11 @@ where
                     if should_skip_subagent(&conversation) {
                         return Ok(None);
                     }
-                    if should_skip_excluded_source(&conversation.source_path) {
+                    if should_skip_foreign_zcode_source(
+                        &conversation.agent_slug,
+                        &conversation.source_path,
+                    ) || should_skip_excluded_source(&conversation.source_path)
+                    {
                         ingest_diagnostics.observe_excluded_source(&conversation.source_path);
                         return Ok(None);
                     }
@@ -17675,7 +17695,11 @@ where
                         if should_skip_subagent(&conversation) {
                             return Ok(());
                         }
-                        if should_skip_excluded_source(&conversation.source_path) {
+                        if should_skip_foreign_zcode_source(
+                            &conversation.agent_slug,
+                            &conversation.source_path,
+                        ) || should_skip_excluded_source(&conversation.source_path)
+                        {
                             ingest_diagnostics.observe_excluded_source(&conversation.source_path);
                             return Ok(());
                         }
@@ -17757,7 +17781,11 @@ where
                             if should_skip_subagent(&conversation) {
                                 return Ok(());
                             }
-                            if should_skip_excluded_source(&conversation.source_path) {
+                            if should_skip_foreign_zcode_source(
+                                &conversation.agent_slug,
+                                &conversation.source_path,
+                            ) || should_skip_excluded_source(&conversation.source_path)
+                            {
                                 ingest_diagnostics.observe_excluded_source(&conversation.source_path);
                                 return Ok(());
                             }
@@ -18007,7 +18035,12 @@ fn connector_local_scan_since_ts_from_state(
 }
 
 fn connector_activity_time_lower_bound(name: &str, since_ts: Option<i64>) -> Option<i64> {
-    if name == "devin" {
+    if name == "zcode" {
+        // A ZCode database commit can publish rows whose provider timestamps
+        // predate the last index run (imports, resumed turns, delayed writes).
+        // The indexer's wall clock cannot bound this shared mutable store.
+        None
+    } else if name == "devin" {
         // Devin persists activity in whole seconds. A commit in the watermark's
         // second must remain eligible after the existing millisecond overlap.
         // Keep this separate from watch scheduling, where delayed commits need
@@ -18123,6 +18156,7 @@ pub(crate) fn mirrored_root_owners(root: &ScanRoot) -> Option<&'static [&'static
             "antigravity" | "antigravity-cli" => Some(&["antigravity"][..]),
             ".vibe" => Some(&["vibe"][..]),
             ".continue" => Some(&["continue"][..]),
+            ".zcode" => Some(&["zcode"][..]),
             ".goose" => Some(&["goose"][..]),
             "opencode" => Some(&["opencode"][..]),
             ".aider.chat.history.md" => Some(&["aider"][..]),
@@ -18132,8 +18166,13 @@ pub(crate) fn mirrored_root_owners(root: &ScanRoot) -> Option<&'static [&'static
         })
 }
 
-/// Whether `connector` scans `root`; see [`mirrored_root_owners`].
+/// Whether `connector` scans `root`; see [`mirrored_root_owners`]. ZCode's
+/// local store also holds rollout logs and credentials, so only its schema-
+/// aware reader may inspect an explicitly configured root within that store.
 fn mirrored_root_may_hold(connector: &str, root: &ScanRoot) -> bool {
+    if root.origin.kind == SourceKind::Local && crate::connectors::zcode::owns_path(&root.path) {
+        return connector == "zcode";
+    }
     mirrored_root_owners(root).is_none_or(|owners| owners.contains(&connector))
 }
 
@@ -32949,6 +32988,10 @@ fn targeted_quarantine_retry_inner(
     source: Option<&QuarantineRetrySource>,
 ) -> Result<quarantine_retry::AttemptResult> {
     let source = source.context("quarantine retry source metadata is missing")?;
+    anyhow::ensure!(
+        !should_skip_foreign_zcode_source(&source.provider, &source.source_path),
+        "ZCode private sources cannot be retried through another connector"
+    );
     if !source.source_path.is_file() {
         anyhow::bail!(
             "quarantine retry source is not a readable file: {}",
@@ -33423,7 +33466,7 @@ pub use crate::connectors::get_connector_factories;
 ///
 /// Includes:
 /// 1. Local roots detected by connectors
-/// 2. Remote mirror roots (assigned to ALL connectors since we don't know the mapping)
+/// 2. Configured roots assigned to connectors that may own their stores
 fn build_watch_roots(additional_scan_roots: Vec<ScanRoot>) -> Vec<(ConnectorKind, ScanRoot)> {
     let factories = configured_connector_factories();
     let mut roots = Vec::new();
@@ -33592,6 +33635,7 @@ impl ConnectorKind {
             "codebuff" => Some(Self::Codebuff),
             "pi_durable" => Some(Self::PiDurable),
             "continue" => Some(Self::Continue),
+            "zcode" => Some(Self::ZCode),
             _ => None,
         }
     }
@@ -33652,6 +33696,7 @@ impl ConnectorKind {
             Self::Codebuff => "codebuff",
             Self::PiDurable => "pi_durable",
             Self::Continue => "continue",
+            Self::ZCode => "zcode",
         }
     }
 
@@ -33696,6 +33741,7 @@ impl ConnectorKind {
             Self::Codebuff => Box::new(crate::connectors::codebuff::CodebuffConnector::new()),
             Self::PiDurable => Box::new(franken_agent_detection::PiDurableConnector::new()),
             Self::Continue => Box::new(crate::connectors::continue_dev::ContinueConnector::new()),
+            Self::ZCode => Box::new(ZCodeConnector::new()),
         }
     }
 }
@@ -34436,12 +34482,69 @@ fn is_database_watch_root(kind: ConnectorKind, root: &ScanRoot) -> bool {
 
 fn is_database_watch_path(kind: ConnectorKind, path: &Path) -> bool {
     kind == ConnectorKind::Shelley
+        || (kind == ConnectorKind::ZCode && explicit_watch_once_file_may_be_database(kind, path))
         || (kind == ConnectorKind::Devin
             && path.extension().is_some_and(|extension| extension == "db"))
         || (kind == ConnectorKind::OpenClaw
             && path
                 .file_name()
                 .is_some_and(|name| name == "openclaw-agent.sqlite"))
+}
+
+/// Watch rollback-journal commits as well as WAL commits. Keep the archive's
+/// WAL-specific footprint helpers separate from external provider discovery.
+fn database_watch_sidecar_paths(database: &Path) -> [PathBuf; 3] {
+    let [wal, shm] = database_sidecar_paths(database);
+    [wal, shm, database_path_with_suffix(database, "-journal")]
+}
+
+fn is_database_watch_sidecar(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        ["-wal", "-shm", "-journal"]
+            .iter()
+            .any(|suffix| name.as_encoded_bytes().ends_with(suffix.as_bytes()))
+    })
+}
+
+fn zcode_database_candidates(root: &ScanRoot) -> Vec<PathBuf> {
+    let path = root
+        .mirrored_store(&[".zcode", "cli", "db"])
+        .unwrap_or_else(|| root.path.clone());
+    ZCodeConnector::db_paths_for_root(&path)
+}
+
+/// Use the same shallow paths as the parser, without inspecting unrelated
+/// .zcode contents such as credentials, rollout logs or the desktop task DB.
+fn zcode_watch_database_paths(roots: &[(ConnectorKind, ScanRoot)]) -> BTreeSet<PathBuf> {
+    let mut databases = BTreeSet::new();
+    for (kind, root) in roots {
+        if *kind != ConnectorKind::ZCode {
+            continue;
+        }
+        for database in zcode_database_candidates(root) {
+            if database.is_file()
+                && explicit_watch_once_file_may_be_database(ConnectorKind::ZCode, &database)
+            {
+                if let Ok(canonical) = dunce::canonicalize(&database) {
+                    databases.insert(canonical);
+                }
+                databases.insert(database);
+            }
+        }
+    }
+    databases
+}
+
+fn zcode_database_for_watch_path(path: &Path, databases: &BTreeSet<PathBuf>) -> Option<PathBuf> {
+    databases
+        .iter()
+        .find(|database| {
+            path == database.as_path()
+                || database_watch_sidecar_paths(database)
+                    .iter()
+                    .any(|sidecar| sidecar == path)
+        })
+        .cloned()
 }
 
 /// Return only the native OpenClaw sidecar's surviving owner. This identifies
@@ -34459,12 +34562,16 @@ fn openclaw_database_for_sidecar(path: &Path) -> Option<PathBuf> {
         .then(|| dunce::canonicalize(&database).unwrap_or(database))
 }
 
-/// Shelley and Devin take an explicit file root as their database and fail the
+/// Database readers take an explicit file root as their database and fail the
 /// whole scan on anything else. So `--watch-once <file>` under a directory root
 /// hands them the file only when it is a SQLite database. An unhinted Codex
 /// rollout under a shared configured source used to fail the run (GH #524).
 fn explicit_watch_once_file_may_be_database(kind: ConnectorKind, path: &Path) -> bool {
-    if !matches!(kind, ConnectorKind::Shelley | ConnectorKind::Devin) || !path.is_file() {
+    if !matches!(
+        kind,
+        ConnectorKind::Shelley | ConnectorKind::Devin | ConnectorKind::ZCode
+    ) || !path.is_file()
+    {
         return true;
     }
     let mut header = [0_u8; 16];
@@ -34493,8 +34600,8 @@ fn database_root_poller(
     let files: HashSet<PathBuf> = databases
         .iter()
         .flat_map(|database| {
-            let [wal, shm] = database_sidecar_paths(database);
-            [database.clone(), wal, shm]
+            let [wal, shm, journal] = database_watch_sidecar_paths(database);
+            [database.clone(), wal, shm, journal]
         })
         .collect();
     let directories: BTreeSet<&Path> = databases
@@ -34549,7 +34656,10 @@ fn database_root_poller(
 }
 
 fn watch_scan_lower_bound(kind: ConnectorKind, since_ts: Option<i64>) -> Option<i64> {
-    if matches!(kind, ConnectorKind::Devin | ConnectorKind::Shelley) {
+    if matches!(
+        kind,
+        ConnectorKind::Devin | ConnectorKind::Shelley | ConnectorKind::ZCode
+    ) {
         // Database providers filter by activity time, which can precede
         // the WAL commit that triggered this scan. Filesystem event times cannot
         // bound it, even after rounding to seconds. Re-read the changed store and
@@ -34801,6 +34911,14 @@ fn refresh_watch_root_registrations<W: Watcher>(
         .collect();
     let mut discovery_retries = BTreeSet::new();
     for (kind, root) in roots {
+        if *kind == ConnectorKind::ZCode {
+            for database in zcode_database_candidates(root) {
+                if database != root.path {
+                    registration_roots.push((*kind, root.with_path(database)));
+                }
+            }
+            continue;
+        }
         if *kind != ConnectorKind::OpenClaw {
             continue;
         }
@@ -36804,7 +36922,11 @@ fn reindex_paths_with_semantic_delta(
                 if should_skip_subagent(&conversation) {
                     return Ok(false);
                 }
-                if should_skip_excluded_source(&conversation.source_path) {
+                if should_skip_foreign_zcode_source(
+                    &conversation.agent_slug,
+                    &conversation.source_path,
+                ) || should_skip_excluded_source(&conversation.source_path)
+                {
                     ingest_diagnostics.observe_excluded_source(&conversation.source_path);
                     return Ok(false);
                 }
@@ -39045,6 +39167,8 @@ enum ConnectorKind {
     PiDurable,
     #[serde(rename = "ct", alias = "Continue")]
     Continue,
+    #[serde(rename = "zc", alias = "ZCode")]
+    ZCode,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -39420,6 +39544,7 @@ fn classify_paths(
 ) -> Vec<(ConnectorKind, ScanRoot, Option<i64>, Option<i64>)> {
     // Key -> (Root, MinTS, MaxTS)
     let mut batch_map: BatchClassificationMap = HashMap::new();
+    let zcode_databases = zcode_watch_database_paths(roots);
     // Keep provenance on the original roots while comparing both sides in
     // the same path namespace, including macOS /var aliases and linked roots.
     let match_root_paths: Vec<PathBuf> = roots
@@ -39471,15 +39596,24 @@ fn classify_paths(
                 .flatten()
         });
         let openclaw_database = openclaw_database_for_sidecar(p);
+        let zcode_database = zcode_database_for_watch_path(p, &zcode_databases);
+        let surviving_database = openclaw_database
+            .as_ref()
+            .map(|database| (ConnectorKind::OpenClaw, database))
+            .or_else(|| {
+                zcode_database
+                    .as_ref()
+                    .map(|database| (ConnectorKind::ZCode, database))
+            });
         let mut metadata_from_database = false;
         let metadata = std::fs::metadata(p).or_else(|error| {
-            if prefer_explicit_paths
-                && error.kind() == std::io::ErrorKind::NotFound
-                && let Some(database) = &openclaw_database
+            if error.kind() == std::io::ErrorKind::NotFound
+                && let Some((kind, database)) = surviving_database
+                && (prefer_explicit_paths || kind == ConnectorKind::ZCode)
             {
                 // A checkpoint can remove WAL/SHM after the caller selected
-                // it. Only OpenClaw may use this owner's metadata below; a
-                // missing path must not revive another provider's scan/hint.
+                // it; rollback-journal deletion is itself a ZCode commit
+                // event. Only the owning reader may borrow its DB metadata.
                 metadata_from_database = true;
                 std::fs::metadata(database)
             } else {
@@ -39503,7 +39637,9 @@ fn classify_paths(
                 .zip(&match_root_paths)
                 .zip(&alternate_root_paths)
             {
-                if metadata_from_database && *kind != ConnectorKind::OpenClaw {
+                if metadata_from_database
+                    && surviving_database.is_none_or(|(owner, _)| owner != *kind)
+                {
                     continue;
                 }
                 if let Some(hinted_kind) = hinted_kind
@@ -39511,21 +39647,26 @@ fn classify_paths(
                 {
                     continue;
                 }
+                let source_path = match kind {
+                    ConnectorKind::OpenClaw => openclaw_database.as_ref().unwrap_or(p),
+                    ConnectorKind::ZCode => {
+                        let Some(database) = zcode_database.as_ref() else {
+                            continue;
+                        };
+                        database
+                    }
+                    _ => p,
+                };
                 if prefer_explicit_paths
                     && !is_database_watch_root(*kind, root)
-                    && !explicit_watch_once_file_may_be_database(*kind, p)
+                    && !explicit_watch_once_file_may_be_database(*kind, source_path)
                 {
                     continue;
                 }
-                let source_path = if *kind == ConnectorKind::OpenClaw {
-                    openclaw_database.as_ref().unwrap_or(p)
-                } else {
-                    p
-                };
                 let under = |candidate: &PathBuf| {
                     source_path.starts_with(candidate)
                         || (is_database_watch_root(*kind, root)
-                            && database_sidecar_paths(candidate).contains(source_path))
+                            && database_watch_sidecar_paths(candidate).contains(source_path))
                 };
                 if under(match_root_path) || alternate_root_path.as_ref().is_some_and(under) {
                     // Aliases can make a physical descendant's configured
@@ -39554,7 +39695,25 @@ fn classify_paths(
             }
             let matched_root = !matching_roots.is_empty();
             for (kind, root, match_root_path, _) in matching_roots {
-                let scan_path = if prefer_explicit_paths && !is_database_watch_root(kind, root) {
+                let scan_path = if kind == ConnectorKind::ZCode
+                    && let Some(database) = &zcode_database
+                {
+                    // A shared root can contain multiple stores. A database
+                    // event selects only its owner. Preserve the configured
+                    // spelling used by the initial scan, including symlinks,
+                    // so virtual per-session source paths retain identity.
+                    let canonical_database = dunce::canonicalize(database).ok();
+                    zcode_database_candidates(root)
+                        .into_iter()
+                        .find(|candidate| {
+                            candidate == database
+                                || canonical_database.as_ref().is_some_and(|canonical| {
+                                    dunce::canonicalize(candidate)
+                                        .is_ok_and(|candidate| &candidate == canonical)
+                                })
+                        })
+                        .unwrap_or_else(|| database.clone())
+                } else if prefer_explicit_paths && !is_database_watch_root(kind, root) {
                     explicit_watch_once_scan_path(kind, &requested, p)
                 } else {
                     match_root_path.clone()
@@ -39627,11 +39786,14 @@ fn watch_event_should_trigger_reindex(event: &notify::Event) -> bool {
         notify::event::EventKind::Create(_)
         | notify::event::EventKind::Any
         | notify::event::EventKind::Other => true,
-        // Incremental watch indexing is append-only today: once a path is gone,
-        // classify_paths() cannot derive a scan window from it and the ingest
-        // path cannot delete the stale conversation rows it previously indexed.
-        // Treat remove events as noise until delete-aware rebuilds exist.
-        notify::event::EventKind::Remove(_) => false,
+        // A removed database sidecar can signal a committed transaction or a
+        // checkpoint. Classification still requires a surviving owned DB.
+        // Ordinary removed transcripts remain noise: incremental watch ingest
+        // cannot delete their stale conversation rows.
+        notify::event::EventKind::Remove(_) => event
+            .paths
+            .iter()
+            .any(|path| is_database_watch_sidecar(path)),
         notify::event::EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)) => false,
         notify::event::EventKind::Modify(_) => true,
     }
@@ -40104,6 +40266,9 @@ fn capture_connector_sources_before_parse(
             }
             let mut observed_sources = Vec::with_capacity(sources.len());
             for source in sources {
+                if should_skip_foreign_zcode_source(provider, &source.source_path) {
+                    continue;
+                }
                 if should_skip_active_session_source_before_parse(
                     active_source_filter,
                     source.origin.kind,
@@ -40212,7 +40377,9 @@ fn capture_discovered_source_file_before_parse(
     source: &crate::connectors::DiscoveredSourceFile,
     raw_source_exclusions: &RawSourceExclusions,
 ) {
-    if !crate::raw_mirror::capture_enabled() {
+    if !crate::raw_mirror::capture_enabled()
+        || crate::raw_mirror::is_sensitive_container_provider(provider)
+    {
         return;
     }
     if let Err(reason) = validate_discovered_source_path(source) {
@@ -40397,6 +40564,9 @@ fn capture_scan_root_file_before_parse(
     active_source_filter: &ActiveSessionSourceFilter,
     raw_source_exclusions: &RawSourceExclusions,
 ) -> bool {
+    if crate::raw_mirror::is_sensitive_container_provider(provider) {
+        return false;
+    }
     if !root.path.is_file() {
         return false;
     }
@@ -40463,7 +40633,9 @@ fn attach_raw_mirror_capture(
 ) {
     // GH #506: CASS_RAW_MIRROR=off leaves the conversation without raw-mirror
     // metadata; the archive rows are written as usual.
-    if !crate::raw_mirror::capture_enabled() {
+    if !crate::raw_mirror::capture_enabled()
+        || crate::raw_mirror::is_sensitive_container_provider(&conv.agent_slug)
+    {
         return;
     }
     if should_skip_raw_mirror_capture_for_logical_source(&conv.source_path) {
@@ -73824,6 +73996,96 @@ c.close()
     }
 
     #[test]
+    fn gh573_zcode_batch_and_watch_accept_delayed_provider_timestamps() {
+        for since in [
+            None,
+            Some(0),
+            Some(1),
+            Some(1_700_000_000_999),
+            Some(i64::MAX),
+        ] {
+            assert_eq!(connector_activity_time_lower_bound("zcode", since), None);
+            assert_eq!(watch_scan_lower_bound(ConnectorKind::ZCode, since), None);
+            assert_eq!(connector_activity_time_lower_bound("codex", since), since);
+            assert_eq!(watch_scan_lower_bound(ConnectorKind::Codex, since), since);
+        }
+    }
+
+    #[test]
+    fn gh573_zcode_watch_selects_only_owned_database_and_surviving_sidecars() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["db.sqlite", "custom-history.sqlite3", "history"] {
+            let database = tmp.path().join(name);
+            fs::write(&database, b"SQLite format 3\0").unwrap();
+            let root = ScanRoot::remote(
+                database.clone(),
+                Origin::remote_with_host("zcode-source", "zcode-host"),
+                Some(Platform::Windows),
+            );
+            let roots = vec![(ConnectorKind::ZCode, root.clone())];
+            for event in
+                std::iter::once(database.clone()).chain(database_watch_sidecar_paths(&database))
+            {
+                // Sidecars deliberately do not exist: checkpoint/commit
+                // removal must still rescan their surviving owner.
+                for explicit in [false, true] {
+                    let classified = classify_paths(vec![event.clone()], &roots, explicit);
+                    assert_eq!(classified.len(), 1, "{}", event.display());
+                    assert_eq!(classified[0].0, ConnectorKind::ZCode);
+                    assert_eq!(
+                        dunce::canonicalize(&classified[0].1.path).unwrap(),
+                        dunce::canonicalize(&database).unwrap()
+                    );
+                    assert_eq!(classified[0].1.origin, root.origin);
+                    assert_eq!(classified[0].1.platform, root.platform);
+                }
+            }
+            for suffix in ["-wal-extra", "2-wal", ".jsonl"] {
+                let neighbor = tmp.path().join(format!("{name}{suffix}"));
+                fs::write(&neighbor, b"unrelated source").unwrap();
+                for explicit in [false, true] {
+                    assert!(classify_paths(vec![neighbor.clone()], &roots, explicit).is_empty());
+                }
+            }
+        }
+
+        let broad = tmp.path().join(".zcode");
+        let database = broad.join("cli/db/db.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"SQLite format 3\0").unwrap();
+        let private = broad.join("cli/rollout/private.jsonl");
+        fs::create_dir_all(private.parent().unwrap()).unwrap();
+        fs::write(&private, b"private model IO").unwrap();
+        let roots = vec![(ConnectorKind::ZCode, ScanRoot::local(broad))];
+        assert!(classify_paths(vec![private], &roots, false).is_empty());
+        let classified = classify_paths(vec![database.clone()], &roots, false);
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].1.path, database);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh573_zcode_watch_keeps_configured_source_identity_through_symlinks() {
+        let tmp = TempDir::new().unwrap();
+        let physical = tmp.path().join("physical");
+        fs::create_dir_all(&physical).unwrap();
+        let database = physical.join("db.sqlite");
+        fs::write(&database, b"SQLite format 3\0").unwrap();
+        let configured = tmp.path().join("configured");
+        std::os::unix::fs::symlink(&physical, &configured).unwrap();
+        let root = ScanRoot::local(configured.clone());
+        let roots = vec![(ConnectorKind::ZCode, root.clone())];
+        let wal = database_path_with_suffix(&database, "-wal");
+        fs::write(&wal, b"WAL event").unwrap();
+        for explicit in [false, true] {
+            let classified = classify_paths(vec![wal.clone()], &roots, explicit);
+            assert_eq!(classified.len(), 1);
+            assert_eq!(classified[0].1.path, configured.join("db.sqlite"));
+            assert_eq!(classified[0].1.origin, root.origin);
+        }
+    }
+
+    #[test]
     fn gh415_shelley_watch_accepts_old_timestamps_and_only_its_database_sidecars() {
         let tmp = TempDir::new().unwrap();
         assert_eq!(watch_scan_lower_bound(ConnectorKind::Shelley, None), None);
@@ -75905,6 +76167,17 @@ c.close()
             !watch_event_should_trigger_reindex(&event),
             "remove events should be ignored until watch mode can remove stale indexed rows"
         );
+    }
+
+    #[test]
+    fn gh573_watch_event_filter_keeps_database_sidecar_removal() {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let event = notify::Event::new(notify::event::EventKind::Remove(
+                notify::event::RemoveKind::File,
+            ))
+            .add_path(PathBuf::from(format!("/tmp/custom.sqlite3{suffix}")));
+            assert!(watch_event_should_trigger_reindex(&event), "{suffix}");
+        }
     }
 
     #[test]
@@ -80428,7 +80701,7 @@ c.close()
             )
             .with_mirrored_source_path(path)
         };
-        let cases: [(&str, &[&str]); 18] = [
+        let cases: [(&str, &[&str]); 20] = [
             ("~/.claude/projects", &["claude"]),
             ("~/.codex/sessions", &["codex"]),
             ("~/.openclaw", &["openclaw"]),
@@ -80450,6 +80723,8 @@ c.close()
                 &["cline"],
             ),
             (r"C:\Users\u\.claude\projects", &["claude"]),
+            ("~/.zcode/cli/db/db.sqlite", &["zcode"]),
+            (r"C:\Users\u\.zcode\cli\db", &["zcode"]),
         ];
         for (path, owners) in cases {
             let root = remote(path);
@@ -80462,6 +80737,7 @@ c.close()
                 "gemini",
                 "cline",
                 "openclaw",
+                "zcode",
             ] {
                 assert_eq!(
                     mirrored_root_may_hold(connector, &root),
@@ -80501,6 +80777,27 @@ c.close()
             assert!(mirrored_root_may_hold("claude", &root));
             assert!(mirrored_root_may_hold("factory", &root));
         }
+    }
+
+    #[test]
+    fn gh573_local_zcode_roots_exclude_broad_transcript_readers() {
+        for path in [
+            "/home/u/.zcode",
+            "/home/u/.zcode/cli",
+            "/home/u/.zcode/cli/db/db.sqlite",
+            "/home/u/.zcode/cli/rollout/private.jsonl",
+        ] {
+            let root = ScanRoot::local(PathBuf::from(path));
+            assert!(mirrored_root_may_hold("zcode", &root));
+            for connector in ["claude", "codex", "opencode", "pi_agent"] {
+                assert!(
+                    !mirrored_root_may_hold(connector, &root),
+                    "{connector}: {path}"
+                );
+            }
+        }
+        let unrelated = ScanRoot::local(PathBuf::from("/home/u/.zcode-backup"));
+        assert!(mirrored_root_may_hold("claude", &unrelated));
     }
 
     #[test]

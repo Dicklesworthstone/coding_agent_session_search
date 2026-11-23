@@ -167,7 +167,7 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 | `frankensqlite` (`fsqlite`) | Pure-Rust SQLite reimplementation — primary storage backend |
 | `rusqlite` | Dev-dependency only: C-SQLite interop fixtures in tests. Production never links it (historical salvage uses the external `sqlite3` CLI) |
 | `frankensearch` | Unified search engine: lexical BM25 + semantic + RRF fusion |
-| `franken_agent_detection` | Agent session auto-detection across 34 providers |
+| `franken_agent_detection` | Agent session auto-detection across 35 providers |
 | `frankentorch` (via `frankensearch`) | Pure-Rust native MiniLM embeddings and reranking |
 | `frankenhnsw` (via `frankensearch`) | HNSW approximate nearest neighbors |
 | `half` + `wide` + `memmap2` | f16 quantized vectors, portable SIMD, memory-mapped I/O |
@@ -190,7 +190,7 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 **Optional local sibling checkouts** (under `/data/projects/`, via commented local patches only):
 - `frankensqlite` — Pure-Rust SQLite with BEGIN CONCURRENT (MVCC multi-writer)
 - `frankensearch` — Unified search: BM25 lexical + semantic embeddings + RRF fusion + reranking
-- `franken_agent_detection` — Auto-discovers agent sessions from 34 providers
+- `franken_agent_detection` — Auto-discovers agent sessions from 35 providers
 - `frankentui` (`ftui` + `ftui-extras` + `ftui-runtime` + `ftui-tty`) — Terminal UI framework
 - `asupersync` — Async runtime (multi-thread, fs, spawn_blocking, signals)
 - `toon` — Token-optimized serialization
@@ -206,7 +206,7 @@ b-tree, bd-obwsy; 0.4.9 and the shipped v0.10.0's 0.4.6 are affected),
 ROLLBACK returning reserved AUTOINCREMENT rowids (bd-gwoit), reading a WAL
 a stock writer truncated to zero bytes as empty (bd-yxqs9, GH#519), and
 explicit-rowid writes to a table holding the largest rowid (9308c4bb6).
-FAD `=0.3.10` (git rev `830d9720d71372a2002a42d10431f2d75a0b16d0` for host-approved inactive Codex tail recovery (GH#560), bounded complete-record recovery after torn Pi/OMP, Codex and Claude JSONL prefixes (GH#553), GH#552 structured ChatGPT voice transcripts and stable message identities, GH#520 remote-mirror source identity, Continue connector, and narrow OpenClaw explicit-file scope (GH#350/GH#543), historical native-session reconciliation, opaque mirror discovery, and physical-store migration backports) asks for fsqlite `^0.4.1`, so it accepts the family, and exposes early SQLite bridge shutdown
+FAD `=0.3.10` (git rev `a0dd013a8c1e374d6a80949637e5e51cbb45550b` for native ZCode indexing (GH#573), host-approved inactive Codex tail recovery (GH#560), bounded complete-record recovery after torn Pi/OMP, Codex and Claude JSONL prefixes (GH#553), GH#552 structured ChatGPT voice transcripts and stable message identities, GH#520 remote-mirror source identity, Continue connector, and narrow OpenClaw explicit-file scope (GH#350/GH#543), historical native-session reconciliation, opaque mirror discovery, and physical-store migration backports) asks for fsqlite `^0.4.1`, so it accepts the family, and exposes early SQLite bridge shutdown
 for Windows process teardown (GH#519).
 The OpenClaw backport changes only its connector source file; package and
 dependency constraints are unchanged. Its native Rust/CLI qualification remains
@@ -240,7 +240,7 @@ The strict family guard requires uniform 0.4.12 registry versions.
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` (`fsqlite`) / `fsqlite-types` and the whole SQLite family | crates.io `=0.4.12` (tag v0.4.12 = `26aa19afcbd5afdb01658a10bb33417ad0b513be`); `build.rs` refuses a mixed family. Carries 0.4.12's bd-obwsy (the 0.4.10 advisory), bd-gwoit, bd-yxqs9 and largest-rowid explicit-write (9308c4bb6) fixes, plus 0.4.1's GH#462 reserved-page WAL repair, 0.4.2's derived WAL-index recovery for read-only opens (GH#477), 0.4.4's durable pending-freelist repairs, 0.4.6's page-referenced-twice (bd-b5vmw) and lost-index-entry (bd-11sz4) fixes, 0.4.7's large multi-row INSERT index fix (bd-2eebi), serialized-DDL race fix (bd-4iaoi), GH#503 shadow-autoindex repair open, bounded published-page plane (5s1la) and first-`sqlite_master` full-file read fix (k2k20), and 0.4.9's prompt stale-WAL-index refusal (48c6cf6b2) and stock-empty-WAL-index first-write fix (4b48c95d8, cass GH#509). CASS runtime qualification of 0.4.12 passed (gi7k7). 0.4.6 included upstream's likely fix (fd8c16a94) for a long-lived connection left refusing every BEGIN (2l1b0.75, frankensqlite GH#429), not yet verified on the owner-archive scenario; the legacy OMP analytics phase keeps its own fresh writer regardless |
-| `franken-agent-detection` | `=0.3.10` at git rev `830d9720d71372a2002a42d10431f2d75a0b16d0` (GH#560 host-approved inactive Codex tail recovery; GH#553 bounded complete-record recovery after torn Pi/OMP, Codex and Claude JSONL prefixes; GH#552 structured ChatGPT voice transcripts and stable message identities; OpenClaw explicit JSONL file isolation (GH#350/GH#543), historical native-session reconciliation, opaque mirror discovery, and physical-store migration deduplication, native qualification pending; GH#520 remote-mirror source identity, Continue `continue` and Kiro CLI `kiro` connectors, early SQLite connector runtime shutdown and full OpenCode read-error chains, GH#519), features `pi-durable` and `pi-sqlite` (the `pi_durable` connector for Pi's durable-harness stores, FAD#28; `pi_agent_rust` SQLite sessions; Pi compaction/branch provenance, FAD#27) and `codex-zstd` (reads Codex rollouts compressed to `rollout-*.jsonl.zst` by Codex's `local_thread_store_compression`, with the id of their plain form, GH#513; indexes native Codebuff transcripts, whose timestamps are a locale time of day, with each instant taken from the message ID, and keeps indexing a store's other chats when one transcript does not parse, GH#511; indexes OpenCode 2.x sessions from `session_v2`/`session_message`, GH#504; decodes OpenClaw zstd-compressed transcript events; indexes Claude Code prompts typed mid-turn, GH#500; honors `CASS_EXCLUDE_PATHS` in the Codex and Pi-family connectors, GH#486, and resolves `..`, relative and symlink-alias spellings of an entry, 0f1k0; caps session reads while reading, and lets cass set the Codex rollout budget so `CASS_CODEX_MAX_SOURCE_BYTES` above 100 MiB works) |
+| `franken-agent-detection` | `=0.3.10` at git rev `a0dd013a8c1e374d6a80949637e5e51cbb45550b` (GH#573 native ZCode indexing and OpenCode disambiguation on the same SQLite/runtime family; GH#560 host-approved inactive Codex tail recovery; GH#553 bounded complete-record recovery after torn Pi/OMP, Codex and Claude JSONL prefixes; GH#552 structured ChatGPT voice transcripts and stable message identities; OpenClaw explicit JSONL file isolation (GH#350/GH#543), historical native-session reconciliation, opaque mirror discovery, and physical-store migration deduplication, native qualification pending; GH#520 remote-mirror source identity, Continue `continue` and Kiro CLI `kiro` connectors, early SQLite connector runtime shutdown and full OpenCode read-error chains, GH#519), features `zcode` (native ZCode session SQLite; no raw mirroring), `pi-durable` and `pi-sqlite` (the `pi_durable` connector for Pi's durable-harness stores, FAD#28; `pi_agent_rust` SQLite sessions; Pi compaction/branch provenance, FAD#27) and `codex-zstd` (reads Codex rollouts compressed to `rollout-*.jsonl.zst` by Codex's `local_thread_store_compression`, with the id of their plain form, GH#513; indexes native Codebuff transcripts, whose timestamps are a locale time of day, with each instant taken from the message ID, and keeps indexing a store's other chats when one transcript does not parse, GH#511; indexes OpenCode 2.x sessions from `session_v2`/`session_message`, GH#504; decodes OpenClaw zstd-compressed transcript events; indexes Claude Code prompts typed mid-turn, GH#500; honors `CASS_EXCLUDE_PATHS` in the Codex and Pi-family connectors, GH#486, and resolves `..`, relative and symlink-alias spellings of an entry, 0f1k0; caps session reads while reading, and lets cass set the Codex rollout budget so `CASS_CODEX_MAX_SOURCE_BYTES` above 100 MiB works) |
 | `asupersync` | crates.io `=0.5.0` (the line fsqlite 0.4.x requires) |
 | `frankensearch` | `=0.7.1` at Git revision `d3d58a9f788e67b9cc0956efbf657f3257ab89e4`; the complete Frankensearch family must resolve from that one revision. GH #548 adds tokenizer-aligned normalization and complete bounded positional prefixes. CASS explicitly selects `cass::legacy_v9` for schema markers, paths, projection, upserts, deletes and reconcile canaries, preserving existing indexes while upstream v10 defaults remain unchanged. Keep the exact source contract in Cargo.toml, Cargo.lock, build.rs, README and integration tests synchronized; do not substitute the same-version registry package, which lacks these APIs. Features remain `hash`, `cass-compat`, `quill`, `ann`, `native`. A registry publication carrying the new APIs is required before returning CASS to registry-only dependencies. |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |
@@ -689,6 +689,7 @@ cass robot-docs guide         # LLM-optimized docs
 | Qwen Code | `qwen.rs` | JSONL |
 | Factory (Droid) | `factory.rs` | JSONL |
 | OpenHands | `openhands.rs` | JSON event stream |
+| ZCode CLI / Desktop | FAD `zcode` (feature `zcode`) | schema-admitted SQLite (`db.sqlite`), no raw mirroring |
 | Antigravity | `antigravity.rs` | JSONL / SQLite |
 | Grok Build | `grok.rs` | ACP updates JSONL |
 | Goose | `goose.rs` | SQLite (`sessions.db`, v1.20+) / legacy per-session JSONL |
@@ -702,7 +703,7 @@ cass robot-docs guide         # LLM-optimized docs
 | Kiro CLI | FAD `kiro` | event-log JSONL + JSON snapshot |
 | Continue | FAD `continue` | JSON session snapshots |
 
-All 34 connectors registered at runtime are listed by `cass capabilities --json` under `connectors`.
+All 35 connectors registered at runtime are listed by `cass capabilities --json` under `connectors`.
 
 ### HTML Export (Robot Mode)
 

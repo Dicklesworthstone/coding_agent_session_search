@@ -189,6 +189,11 @@
       "name": "shelley",
       "path": "(not detected)",
       "found": false
+    },
+    {
+      "name": "zcode",
+      "path": "(not detected)",
+      "found": false
     }
   ],
   "quarantine": {
