@@ -444,15 +444,105 @@ fn stage_blob(
     Ok(reference)
 }
 
+struct ReusableSourceChunk {
+    reference: RawMirrorChunkRef,
+    fingerprint: RawMirrorStoredBlobFingerprint,
+}
+
+/// Previous source bytes are never trusted here. The caller still reads and
+/// hashes every byte of the new source. Only an unchanged, previously verified
+/// stored chunk may avoid another read or compression pass (GH #557).
+fn reusable_source_chunks(
+    root: &Path,
+    key: &RawMirrorBlobCacheKey,
+) -> Option<HashMap<String, ReusableSourceChunk>> {
+    if !raw_mirror_blob_cache_key_is_strong(key) {
+        return None;
+    }
+    let source_key = raw_mirror_blob_source_key(key);
+    let cached = BLOB_CAPTURE_CACHE
+        .get()
+        .and_then(|cache| cache.lock().ok()?.get(&source_key).cloned())
+        .or_else(|| read_persisted_raw_mirror_blob_cache_for_source(root, key))?;
+    if raw_mirror_blob_source_key(&cached.cache_key) != source_key
+        || !raw_mirror_blob_cache_key_is_strong(&cached.cache_key)
+    {
+        return None;
+    }
+    validate_raw_mirror_blob_record(&cached.record).ok()?;
+    let storage = cached.record.content_storage.as_ref()?;
+    // The advisory cache checksum alone cannot establish the mapping from
+    // compressed bytes to decoded content. Bind that mapping to a real,
+    // content-addressed descriptor before trusting any stored chunk witness.
+    let descriptor = RawMirrorChunkRef {
+        blob_relative_path: raw_mirror_blob_relative_path(&cached.record.blob_blake3)?,
+        blob_blake3: cached.record.blob_blake3.clone(),
+        blob_size_bytes: cached.record.blob_size_bytes,
+        encoding: None,
+        content_blake3: None,
+        content_size_bytes: None,
+    };
+    let bytes =
+        read_bounded_raw_mirror_blob(root, &descriptor, RAW_MIRROR_MANIFEST_MAX_BYTES).ok()?;
+    let observed: RawMirrorContentStorage = serde_json::from_slice(&bytes).ok()?;
+    if &observed != storage {
+        return None;
+    }
+    let fingerprints: HashMap<_, _> = cached
+        .stored_blob_fingerprints
+        .into_iter()
+        .map(|fingerprint| (fingerprint.blob_relative_path.clone(), fingerprint))
+        .collect();
+    let mut chunks = HashMap::new();
+    for mut reference in observed.chunks {
+        let Some(fingerprint) = fingerprints.get(&reference.blob_relative_path) else {
+            continue;
+        };
+        let digest = raw_mirror_chunk_content_hash(&reference).to_owned();
+        let size = raw_mirror_chunk_content_size(&reference);
+        // A v1 plain chunk remains readable inside a new v2 descriptor, with
+        // its content identity made explicit and its stored bytes unchanged.
+        reference.encoding.get_or_insert_with(|| "none".to_string());
+        reference.content_blake3 = Some(digest.clone());
+        reference.content_size_bytes = Some(size);
+        chunks.entry(digest).or_insert_with(|| ReusableSourceChunk {
+            reference,
+            fingerprint: fingerprint.clone(),
+        });
+    }
+    Some(chunks)
+}
+
 fn stage_source_chunk(
     root: &Path,
     staging: &mut Staging,
     budget: &mut Budget<'_>,
     bytes: &[u8],
+    reusable: &HashMap<String, ReusableSourceChunk>,
     seen: &mut HashSet<String>,
     files: &mut Vec<CopyToTempResult>,
 ) -> Result<RawMirrorChunkRef> {
     let content_blake3 = blake3::hash(bytes).to_hex().to_string();
+    if let Some(previous) = reusable.get(&content_blake3)
+        && raw_mirror_chunk_content_size(&previous.reference) == bytes.len() as u64
+    {
+        let verified = if raw_mirror_stored_blob_fingerprint(root, &previous.reference)
+            .is_some_and(|current| current == previous.fingerprint)
+        {
+            true
+        } else if content_addressed_blob_is_verified(root, &previous.reference)? {
+            // Changed metadata requires both stored and decoded verification;
+            // missing chunks fall through to capture from the current source.
+            stream_verified_raw_mirror_chunk(root, &previous.reference, |_| Ok(()))?;
+            true
+        } else {
+            false
+        };
+        if verified {
+            seen.insert(previous.reference.blob_blake3.clone());
+            return Ok(previous.reference.clone());
+        }
+    }
     let plain = RawMirrorChunkRef {
         blob_relative_path: raw_mirror_blob_relative_path(&content_blake3)
             .ok_or_else(|| anyhow!("invalid computed raw-mirror content digest"))?,
@@ -465,25 +555,24 @@ fn stage_source_chunk(
     // A codec upgrade must not rewrite a previously preserved prefix just
     // because its source grew. Reuse verified legacy plain bytes before
     // considering compression, including identical chunks staged in this run.
-    let (mut reference, encoding) = if seen.contains(&content_blake3)
-        || content_addressed_blob_is_verified(root, &plain)?
-    {
-        seen.insert(content_blake3.clone());
-        (plain, "none")
-    } else {
-        let compressed = crate::raw_mirror::codec::compress_chunk(bytes)?;
-        if compressed.len() < bytes.len() {
-            (
-                stage_blob(root, staging, budget, &compressed, seen, files)?,
-                "zstd",
-            )
+    let (mut reference, encoding) =
+        if seen.contains(&content_blake3) || content_addressed_blob_is_verified(root, &plain)? {
+            seen.insert(content_blake3.clone());
+            (plain, "none")
         } else {
-            (
-                stage_blob(root, staging, budget, bytes, seen, files)?,
-                "none",
-            )
-        }
-    };
+            let compressed = crate::raw_mirror::codec::compress_chunk(bytes)?;
+            if compressed.len() < bytes.len() {
+                (
+                    stage_blob(root, staging, budget, &compressed, seen, files)?,
+                    "zstd",
+                )
+            } else {
+                (
+                    stage_blob(root, staging, budget, bytes, seen, files)?,
+                    "none",
+                )
+            }
+        };
     reference.encoding = Some(encoding.to_string());
     reference.content_blake3 = Some(content_blake3);
     reference.content_size_bytes = Some(bytes.len() as u64);
@@ -508,6 +597,12 @@ fn prepare_bounded(
     if chunked && count > RAW_MIRROR_MANIFEST_MAX_BYTES / 512 {
         anyhow::bail!("raw-mirror source needs too many chunks for a bounded manifest");
     }
+    let reusable = if chunked {
+        let key = raw_mirror_blob_cache_key(input, metadata, threshold, chunk_size);
+        reusable_source_chunks(root, &key).unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
     let mut source = open_stable_source_file(input.source_path, metadata)?;
     // Never chase a concurrently appending writer to EOF. Truncation, append,
     // in-place rewrites and replacement still fail the existing stability test.
@@ -535,6 +630,7 @@ fn prepare_bounded(
                 staging,
                 budget,
                 &buffer[..length],
+                &reusable,
                 &mut seen,
                 &mut files,
             )?
@@ -947,7 +1043,7 @@ pub(crate) fn capture_default(
 mod retention {
     include!("retention.rs");
 }
+pub(crate) use retention::maintain_while_index_owned;
 pub use retention::{
     RawMirrorAutomaticRetention, RawMirrorMaintenanceReport, maintain_before_index,
 };
-pub(crate) use retention::maintain_while_index_owned;

@@ -2711,6 +2711,17 @@ fn read_persisted_raw_mirror_blob_cache(
     root: &Path,
     key: &RawMirrorBlobCacheKey,
 ) -> Option<CachedRawMirrorBlobRecord> {
+    read_persisted_raw_mirror_blob_cache_for_source(root, key)
+        .filter(|entry| entry.cache_key == *key)
+}
+
+/// A previous capture may still certify immutable blobs after its source
+/// changes. This lookup binds the source namespace, but does not authorize
+/// reuse of source bytes: that requires the exact key check above.
+fn read_persisted_raw_mirror_blob_cache_for_source(
+    root: &Path,
+    key: &RawMirrorBlobCacheKey,
+) -> Option<CachedRawMirrorBlobRecord> {
     let path = raw_mirror_blob_cache_path(root, key)?;
     if raw_mirror_path_has_symlink_below_root(root, &path) {
         return None;
@@ -2730,7 +2741,9 @@ fn read_persisted_raw_mirror_blob_cache(
         return None;
     }
     let persisted: PersistedRawMirrorBlobCache = serde_json::from_slice(&bytes).ok()?;
-    if persisted.version != 1 || persisted.entry.cache_key != *key {
+    if persisted.version != 1
+        || raw_mirror_blob_source_key(&persisted.entry.cache_key) != raw_mirror_blob_source_key(key)
+    {
         return None;
     }
     let entry_bytes = serde_json::to_vec(&persisted.entry).ok()?;
@@ -2879,26 +2892,38 @@ fn raw_mirror_stored_blob_fingerprints(
         if !seen.insert(reference.blob_relative_path.clone()) {
             continue;
         }
-        let path = root.join(&reference.blob_relative_path);
-        if raw_mirror_path_has_symlink_below_root(root, &path) {
-            return None;
-        }
-        let metadata = raw_mirror_symlink_metadata(&path).ok()?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || metadata.len() != reference.blob_size_bytes
-        {
-            return None;
-        }
-        fingerprints.push(RawMirrorStoredBlobFingerprint {
-            blob_relative_path: reference.blob_relative_path,
-            file_identity: source_identity_token(&metadata)?,
-            size_bytes: metadata.len(),
-            modified_ns: metadata.modified().ok().and_then(system_time_to_ns)?,
-            change_time_ns: source_change_time_ns(&metadata)?,
-        });
+        fingerprints.push(raw_mirror_stored_blob_fingerprint(root, &reference)?);
     }
     Some(fingerprints)
+}
+
+fn raw_mirror_stored_blob_fingerprint(
+    root: &Path,
+    reference: &RawMirrorChunkRef,
+) -> Option<RawMirrorStoredBlobFingerprint> {
+    if raw_mirror_blob_relative_path(&reference.blob_blake3).as_deref()
+        != Some(reference.blob_relative_path.as_str())
+    {
+        return None;
+    }
+    let path = root.join(&reference.blob_relative_path);
+    if raw_mirror_path_has_symlink_below_root(root, &path) {
+        return None;
+    }
+    let metadata = raw_mirror_symlink_metadata(&path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() != reference.blob_size_bytes
+    {
+        return None;
+    }
+    Some(RawMirrorStoredBlobFingerprint {
+        blob_relative_path: reference.blob_relative_path.clone(),
+        file_identity: source_identity_token(&metadata)?,
+        size_bytes: metadata.len(),
+        modified_ns: metadata.modified().ok().and_then(system_time_to_ns)?,
+        change_time_ns: source_change_time_ns(&metadata)?,
+    })
 }
 
 fn cached_raw_mirror_blob_record_is_verified(
@@ -3075,8 +3100,7 @@ fn validate_raw_mirror_chunk_encoding(chunk: &RawMirrorChunkRef, version_two: bo
                     "raw mirror chunk has invalid decoded content metadata"
                 ));
             }
-            if encoding == "none"
-                && (size != chunk.blob_size_bytes || digest != chunk.blob_blake3)
+            if encoding == "none" && (size != chunk.blob_size_bytes || digest != chunk.blob_blake3)
             {
                 return Err(anyhow!(
                     "plain raw mirror chunk has conflicting content identity"
@@ -3110,7 +3134,9 @@ fn validate_raw_mirror_content_storage(storage: &RawMirrorContentStorage) -> Res
         || (version_two
             && storage.chunk_size_bytes > crate::raw_mirror::codec::MAX_DECODED_CHUNK_BYTES as u64)
     {
-        return Err(anyhow!("raw mirror fixed-chunk storage metadata is invalid"));
+        return Err(anyhow!(
+            "raw mirror fixed-chunk storage metadata is invalid"
+        ));
     }
     let mut content_size_bytes = 0_u64;
     for (index, chunk) in storage.chunks.iter().enumerate() {
@@ -3295,7 +3321,9 @@ fn read_bounded_raw_mirror_blob(
     if bytes.len() as u64 != reference.blob_size_bytes
         || blake3::hash(&bytes).to_hex().as_str() != reference.blob_blake3
     {
-        return Err(anyhow!("raw mirror blob has the wrong stored size or digest"));
+        return Err(anyhow!(
+            "raw mirror blob has the wrong stored size or digest"
+        ));
     }
     Ok(bytes)
 }
@@ -3334,7 +3362,9 @@ fn stream_verified_raw_mirror_chunk(
     let mut observed_chunk_bytes = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let read = raw_mirror_io("read_decoded_chunk", &chunk_path, || reader.read(&mut buffer))?;
+        let read = raw_mirror_io("read_decoded_chunk", &chunk_path, || {
+            reader.read(&mut buffer)
+        })?;
         if read == 0 {
             break;
         }
@@ -3342,7 +3372,9 @@ fn stream_verified_raw_mirror_chunk(
             .checked_add(read as u64)
             .ok_or_else(|| anyhow!("raw mirror decoded size overflow"))?;
         if observed_chunk_bytes > raw_mirror_chunk_content_size(chunk) {
-            return Err(anyhow!("raw mirror chunk exceeds its recorded decoded size"));
+            return Err(anyhow!(
+                "raw mirror chunk exceeds its recorded decoded size"
+            ));
         }
         chunk_hasher.update(&buffer[..read]);
         consume(&buffer[..read])?;
