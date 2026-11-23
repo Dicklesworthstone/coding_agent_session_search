@@ -925,6 +925,10 @@ pub(crate) struct OpenedLexicalIndex {
     pub(crate) path: PathBuf,
     pub(crate) reader: Option<(frankensearch::quill::QuillSearchIndex, Fields)>,
     pub(crate) federated_readers: Option<Vec<(frankensearch::quill::QuillSearchIndex, Fields)>>,
+    /// Capture before opening retained readers. Structural validation is also
+    /// used by forget repair while the fence is pending, so retain admission
+    /// failures for the search consumer instead of preventing that repair.
+    pub(crate) privacy: Result<Option<super::privacy::PrivacySnapshot>>,
 }
 
 impl std::fmt::Debug for OpenedLexicalIndex {
@@ -975,11 +979,16 @@ pub(crate) fn opened_lexical_index_summary(
 }
 
 pub(crate) fn open_validated_lexical_index(index_path: &Path) -> Result<OpenedLexicalIndex> {
+    let privacy = super::privacy::PrivacySnapshot::for_index(index_path);
     if let Some(readers) = open_federated_search_readers(index_path)? {
         return Ok(OpenedLexicalIndex {
             path: index_path.to_path_buf(),
             reader: None,
             federated_readers: Some(readers),
+            privacy: privacy.and_then(|snapshot| {
+                snapshot.validate()?;
+                Ok(Some(snapshot))
+            }),
         });
     }
 
@@ -994,6 +1003,10 @@ pub(crate) fn open_validated_lexical_index(index_path: &Path) -> Result<OpenedLe
         path: index_path.to_path_buf(),
         reader: Some((reader, cass_field_handles())),
         federated_readers: None,
+        privacy: privacy.and_then(|snapshot| {
+            snapshot.validate()?;
+            Ok(Some(snapshot))
+        }),
     })
 }
 

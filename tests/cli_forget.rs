@@ -2233,6 +2233,10 @@ fn a_failed_lexical_purge_is_a_typed_error_and_the_next_index_completes_it() -> 
 
 #[test]
 fn a_failed_lexical_purge_is_repaired_by_retrying_the_same_forget() -> TestResult {
+    use coding_agent_search::search::privacy::PrivacyError;
+    use coding_agent_search::search::query::{
+        FieldMask, SearchClient, SearchClientOptions, SearchFilters,
+    };
     use coding_agent_search::storage::sqlite::FrankenStorage;
 
     let (archive, forgotten) = indexed_archive(&[])?;
@@ -2265,6 +2269,58 @@ fn a_failed_lexical_purge_is_repaired_by_retrying_the_same_forget() -> TestResul
     );
     assert!(!archive.search_hit_paths(SIBLING_MARKER)?.is_empty());
     assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+
+    let index_path = coding_agent_search::search::tantivy::index_dir(&archive.data_dir)?;
+    let database = archive.data_dir.join("agent_search.db");
+    let mut readers = Vec::new();
+    for reload in [false, true] {
+        for with_database in [false, true] {
+            let client = SearchClient::open_with_options(
+                &index_path,
+                with_database.then_some(database.as_path()),
+                SearchClientOptions {
+                    enable_reload: reload,
+                    enable_warm: false,
+                    strict_read_only: true,
+                },
+            )?
+            .ok_or("negative control: no lexical reader")?;
+            for _ in 0..2 {
+                let hits = client.search(
+                    FORGOTTEN_MARKER,
+                    SearchFilters::default(),
+                    1,
+                    0,
+                    FieldMask::FULL,
+                )?;
+                assert_eq!(hits.len(), 1);
+                assert!(hits[0].content.contains(FORGOTTEN_MARKER));
+            }
+            assert!(
+                client.cache_stats().cache_hits > 0,
+                "cache control must run"
+            );
+            let kept = client
+                .search(
+                    KEPT_MARKER,
+                    SearchFilters::default(),
+                    10,
+                    0,
+                    FieldMask::FULL,
+                )?
+                .into_iter()
+                .map(|hit| {
+                    (
+                        hit.source_path,
+                        hit.conversation_id,
+                        hit.line_number,
+                        hit.content,
+                    )
+                })
+                .collect::<Vec<_>>();
+            readers.push((reload, with_database, client, kept));
+        }
+    }
 
     // A fresh process must retry the derived rebuild even after the first
     // attempt deleted every canonical match. Keeping the failpoint enabled
@@ -2306,6 +2362,39 @@ fn a_failed_lexical_purge_is_repaired_by_retrying_the_same_forget() -> TestResul
             storage.forget_derived_rebuild_pending()?,
             "a failed batch must remain repairable"
         );
+        for (reload, with_database, client, _) in &readers {
+            let outcomes = [
+                client.search(
+                    FORGOTTEN_MARKER,
+                    SearchFilters::default(),
+                    1,
+                    0,
+                    FieldMask::FULL,
+                ),
+                client.search("", SearchFilters::default(), 0, 0, FieldMask::FULL),
+                client
+                    .search_with_fallback(
+                        "absentprivacycanary",
+                        SearchFilters::default(),
+                        0,
+                        0,
+                        3,
+                        FieldMask::FULL,
+                    )
+                    .map(|result| result.hits),
+                client.browse_by_date(SearchFilters::default(), 0, 0, true, FieldMask::FULL),
+            ];
+            for outcome in outcomes {
+                let error = outcome.expect_err("pending forget must fence every lexical read");
+                assert!(
+                    matches!(
+                        error.downcast_ref::<PrivacyError>(),
+                        Some(PrivacyError::RepairPending { .. })
+                    ),
+                    "reload={reload} with_database={with_database}: {error:#}"
+                );
+            }
+        }
     }
 
     let repaired = archive.forget_selected(&selectors, true)?;
@@ -2327,6 +2416,53 @@ fn a_failed_lexical_purge_is_repaired_by_retrying_the_same_forget() -> TestResul
     assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
     assert!(archive.search_hit_paths(SIBLING_MARKER)?.is_empty());
     assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+
+    for (reload, with_database, client, kept_before) in &readers {
+        let outcome = client.search(
+            FORGOTTEN_MARKER,
+            SearchFilters::default(),
+            1,
+            0,
+            FieldMask::FULL,
+        );
+        if *reload {
+            assert!(
+                outcome?.is_empty(),
+                "reopening must retire cached forgotten text"
+            );
+            let kept = client
+                .search(
+                    KEPT_MARKER,
+                    SearchFilters::default(),
+                    10,
+                    0,
+                    FieldMask::FULL,
+                )?
+                .into_iter()
+                .map(|hit| {
+                    (
+                        hit.source_path,
+                        hit.conversation_id,
+                        hit.line_number,
+                        hit.content,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kept, *kept_before,
+                "retained message identity must survive repair"
+            );
+        } else {
+            let error = outcome.expect_err("repair must not renew a pinned reader's old epoch");
+            assert!(
+                matches!(
+                    error.downcast_ref::<PrivacyError>(),
+                    Some(PrivacyError::SnapshotInvalidated { .. })
+                ),
+                "with_database={with_database}: {error:#}"
+            );
+        }
+    }
 
     archive.index(&["--full"])?;
     assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());

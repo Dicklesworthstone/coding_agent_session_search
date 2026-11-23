@@ -4296,6 +4296,10 @@ static FEDERATED_SEARCH_READERS: Lazy<RwLock<HashMap<String, Arc<Vec<FederatedIn
 #[derive(Default)]
 struct LexicalReaderSlot {
     index_path: Option<PathBuf>,
+    observes_index_privacy: bool,
+    /// A retained reader and its cached hits keep the epoch from admission.
+    /// Reopening the complete generation is the only way to renew it.
+    privacy: RwLock<Vec<PrivacySnapshot>>,
     current: RwLock<
         Option<(
             frankensearch::quill::QuillSearchIndex,
@@ -4311,9 +4315,13 @@ impl LexicalReaderSlot {
             frankensearch::quill::QuillSearchIndex,
             crate::search::quill_bridge::QuillCassFields,
         )>,
+        index_privacy: Option<PrivacySnapshot>,
+        database_privacy: Option<PrivacySnapshot>,
     ) -> Self {
         Self {
             index_path: Some(index_path),
+            observes_index_privacy: index_privacy.is_some(),
+            privacy: RwLock::new(index_privacy.into_iter().chain(database_privacy).collect()),
             current: RwLock::new(reader),
         }
     }
@@ -4825,6 +4833,7 @@ impl SearchClient {
                 path: db_path.to_path_buf(),
                 reader: None,
                 federated_readers: None,
+                privacy: Ok(None),
             },
             Some(db_path),
             options,
@@ -4840,6 +4849,8 @@ impl SearchClient {
         db_path: Option<&Path>,
         options: SearchClientOptions,
     ) -> Result<Option<Self>> {
+        let privacy = PrivacySnapshot::for_index(index_path)?;
+        let database_privacy = db_path.map(PrivacySnapshot::for_database).transpose()?;
         let tantivy = crate::search::quill_bridge::open_cass_reader(index_path)
             .map(|reader| {
                 (
@@ -4866,15 +4877,20 @@ impl SearchClient {
             );
         }
 
-        Self::from_opened_lexical_index(
+        let outcome = Self::from_opened_lexical_index(
             crate::search::tantivy::OpenedLexicalIndex {
                 path: index_path.to_path_buf(),
                 reader: tantivy,
                 federated_readers,
+                privacy: Ok(Some(privacy)),
             },
             db_path,
             options,
-        )
+        );
+        if let Some(snapshot) = database_privacy {
+            snapshot.validate()?;
+        }
+        outcome
     }
 
     /// Consume the reader used by lexical admission without opening its path
@@ -4889,7 +4905,15 @@ impl SearchClient {
             path: index_path,
             reader: tantivy,
             federated_readers,
+            privacy,
         } = index;
+        let index_privacy = privacy?;
+        if let Some(snapshot) = &index_privacy {
+            snapshot.validate()?;
+        }
+        // The canonical connection remains lazy. Admit it before any fallback
+        // can open it, including clients with no readable lexical generation.
+        let database_privacy = db_path.map(PrivacySnapshot::for_database).transpose()?;
         let federated_readers =
             federated_readers
                 .filter(|readers| !readers.is_empty())
@@ -4941,7 +4965,7 @@ impl SearchClient {
         }
 
         Ok(Some(Self {
-            reader: LexicalReaderSlot::new(index_path, tantivy),
+            reader: LexicalReaderSlot::new(index_path, tantivy, index_privacy, database_privacy),
             sqlite: Mutex::new(None),
             sqlite_path,
             strict_read_only: options.strict_read_only,
@@ -4993,6 +5017,20 @@ impl SearchClient {
     }
 
     pub fn search(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
+    ) -> Result<Vec<SearchHit>> {
+        let privacy = self.lexical_admission_snapshot()?;
+        let outcome = self.search_admitted(query, filters, limit, offset, field_mask);
+        Self::validate_lexical_privacy(&privacy)?;
+        outcome
+    }
+
+    fn search_admitted(
         &self,
         query: &str,
         filters: SearchFilters,
@@ -7717,6 +7755,19 @@ impl SearchClient {
         &self,
         request: CassLexicalLayerBRequest<'_>,
     ) -> std::result::Result<CassLexicalLayerBPage, CassLexicalLayerBError> {
+        let privacy = self
+            .lexical_admission_snapshot()
+            .map_err(CassLexicalLayerBError::Hydration)?;
+        let outcome = self.project_cass_lexical_layer_b_page_admitted(request);
+        Self::validate_lexical_privacy(&privacy).map_err(CassLexicalLayerBError::Hydration)?;
+        outcome
+    }
+
+    #[cfg(any(test, feature = "cass-layer-b-conformance"))]
+    fn project_cass_lexical_layer_b_page_admitted(
+        &self,
+        request: CassLexicalLayerBRequest<'_>,
+    ) -> std::result::Result<CassLexicalLayerBPage, CassLexicalLayerBError> {
         if request.candidates.len() > CASS_LEXICAL_LAYER_B_CANDIDATE_MAX {
             return Err(CassLexicalLayerBError::CandidateBoundExceeded {
                 actual: request.candidates.len(),
@@ -8001,9 +8052,31 @@ impl SearchClient {
         sparse_threshold: usize,
         field_mask: FieldMask,
     ) -> Result<SearchResult> {
+        let privacy = self.lexical_admission_snapshot()?;
+        let outcome = self.search_with_fallback_admitted(
+            query,
+            filters,
+            limit,
+            offset,
+            sparse_threshold,
+            field_mask,
+        );
+        Self::validate_lexical_privacy(&privacy)?;
+        outcome
+    }
+
+    fn search_with_fallback_admitted(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        sparse_threshold: usize,
+        field_mask: FieldMask,
+    ) -> Result<SearchResult> {
         self.record_wildcard_fallback_skip(None);
         // First, try the normal search
-        let hits = self.search(query, filters.clone(), limit, offset, field_mask)?;
+        let hits = self.search_admitted(query, filters.clone(), limit, offset, field_mask)?;
         let baseline_stats = self.cache_stats();
         // Capture the exact Tantivy total when the query path could collect it cheaply.
         let tantivy_total = self
@@ -8143,7 +8216,8 @@ impl SearchClient {
         );
 
         let mut fallback_hits =
-            match self.search(&wildcard_query, filters.clone(), limit, offset, field_mask) {
+            match self.search_admitted(&wildcard_query, filters.clone(), limit, offset, field_mask)
+            {
                 Ok(fallback_hits) => fallback_hits,
                 // The retry only refines a search that already succeeded. A
                 // `*term*` dictionary walk can exhaust the query fuel the plain
@@ -8339,6 +8413,7 @@ impl SearchClient {
         // the authority of lexical hits already collected by this request.
         // A purely lexical request does not depend on an attached semantic
         // generation, but still observes its own current privacy fence.
+        let lexical_privacy = self.lexical_admission_snapshot()?;
         let admission = if semantic_query.trim().is_empty() {
             SemanticAdmissionSnapshot::capture(self, &[], None)?
         } else {
@@ -8358,6 +8433,7 @@ impl SearchClient {
         // Validate error paths too, preserving typed privacy refusals before
         // outer callers consider lexical fallback. This is a fresh canonical
         // snapshot after all hydration transactions have ended.
+        Self::validate_lexical_privacy(&lexical_privacy)?;
         admission.validate(self)?;
         result
     }
@@ -10342,12 +10418,17 @@ impl SearchClient {
         newest_first: bool,
         field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
-        let sqlite_guard = self.sqlite_guard()?;
-        if let Some(conn) = sqlite_guard.as_ref() {
-            self.browse_by_date_sqlite(conn, filters, limit, offset, newest_first, field_mask)
-        } else {
-            Ok(Vec::new())
-        }
+        let privacy = self.lexical_admission_snapshot()?;
+        let outcome = (|| {
+            let sqlite_guard = self.sqlite_guard()?;
+            if let Some(conn) = sqlite_guard.as_ref() {
+                self.browse_by_date_sqlite(conn, filters, limit, offset, newest_first, field_mask)
+            } else {
+                Ok(Vec::new())
+            }
+        })();
+        Self::validate_lexical_privacy(&privacy)?;
+        outcome
     }
 
     fn browse_by_date_sqlite(
@@ -11080,6 +11161,90 @@ impl SearchClient {
         self.reader.is_some() || self.federated_readers().is_some()
     }
 
+    fn validate_lexical_privacy(privacy: &[PrivacySnapshot]) -> Result<()> {
+        for snapshot in privacy {
+            snapshot.validate()?;
+        }
+        Ok(())
+    }
+
+    fn capture_lexical_privacy(&self) -> Result<Vec<PrivacySnapshot>> {
+        let mut privacy = Vec::new();
+        if self.reader.observes_index_privacy
+            && let Some(path) = &self.reader.index_path
+        {
+            privacy.push(PrivacySnapshot::for_index(path)?);
+        }
+        if let Some(path) = &self.sqlite_path {
+            privacy.push(PrivacySnapshot::for_database(path)?);
+        }
+        Self::validate_lexical_privacy(&privacy)?;
+        Ok(privacy)
+    }
+
+    /// Privacy revocation outranks the ordinary reload throttle and pinned
+    /// cache policy. Pending or unreadable fences always refuse. A reloading
+    /// client may renew an expired epoch only by reopening its complete
+    /// lexical generation and discarding retained hydration/cache state.
+    fn lexical_admission_snapshot(&self) -> Result<Vec<PrivacySnapshot>> {
+        let privacy = self.reader.privacy.read().clone();
+        let Err(error) = Self::validate_lexical_privacy(&privacy) else {
+            return Ok(privacy);
+        };
+        if !self.reload_on_search
+            || !matches!(
+                error.downcast_ref::<crate::search::privacy::PrivacyError>(),
+                Some(crate::search::privacy::PrivacyError::SnapshotInvalidated { .. })
+            )
+        {
+            return Err(error);
+        }
+
+        // Ordinary generation reloads hold this same lock. Publishing new
+        // readers, clearing caches and renewing their admission must not
+        // interleave with another reopen from a different privacy epoch.
+        let mut reloaded = self.last_reload.lock().unwrap_or_else(|e| e.into_inner());
+        let privacy = self.reader.privacy.read().clone();
+        if Self::validate_lexical_privacy(&privacy).is_ok() {
+            return Ok(privacy);
+        }
+        if self.has_tantivy() {
+            self.reopen_republished_lexical_index()?;
+        } else {
+            let privacy = self.capture_lexical_privacy()?;
+            self.clear_retained_lexical_state()?;
+            Self::validate_lexical_privacy(&privacy)?;
+            *self.reader.privacy.write() = privacy;
+        }
+        *reloaded = Some(Instant::now());
+        let privacy = self.reader.privacy.read().clone();
+        Self::validate_lexical_privacy(&privacy)?;
+        Ok(privacy)
+    }
+
+    fn clear_retained_lexical_state(&self) -> Result<()> {
+        if let Some(mut connection) = self
+            .sqlite
+            .lock()
+            .map_err(|_| anyhow!("sqlite lock poisoned"))?
+            .take()
+        {
+            connection
+                .close_without_checkpoint_sync()
+                .map_err(|error| anyhow!("closing invalidated search hydration owner: {error}"))?;
+        }
+        self.reload_epoch.fetch_add(1, Ordering::SeqCst);
+        self.prefix_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self
+            .last_generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        Ok(())
+    }
+
     fn refresh_lexical_generation(&self) -> Result<()> {
         if let Some((reader, _)) = self.reader.get() {
             // A reload can replace the reader after a generation directory
@@ -11163,6 +11328,7 @@ impl SearchClient {
     /// number, so the prefix cache is cleared here rather than left to
     /// `track_generation`.
     fn reopen_republished_lexical_index(&self) -> Result<()> {
+        let privacy = self.capture_lexical_privacy()?;
         let Some(index_path) = self.reader.index_path.clone() else {
             return Err(anyhow!(
                 "the lexical index was republished and this search client has no path to reopen it from"
@@ -11209,6 +11375,7 @@ impl SearchClient {
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .ok_or_else(|| anyhow!("the lexical reopen worker returned no readers"))?;
+        Self::validate_lexical_privacy(&privacy)?;
         *self.reader.current.write() = single.map(|reader| {
             (
                 reader,
@@ -11227,14 +11394,12 @@ impl SearchClient {
                     .remove(&self.cache_namespace);
             }
         }
-        if let Ok(mut cache) = self.prefix_cache.lock() {
-            self.reload_epoch.fetch_add(1, Ordering::SeqCst);
-            cache.clear();
-        }
-        *self
-            .last_generation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+        // Advance the cache epoch after replacing readers. An overlapping
+        // request that still holds an old reader must never populate the
+        // newly admitted cache, even if its final privacy check will refuse.
+        self.clear_retained_lexical_state()?;
+        Self::validate_lexical_privacy(&privacy)?;
+        *self.reader.privacy.write() = privacy;
         Ok(())
     }
 
@@ -13068,7 +13233,12 @@ mod tests {
                 )
             });
         let client = SearchClient {
-            reader: LexicalReaderSlot::new(dir.path().to_path_buf(), reader),
+            reader: LexicalReaderSlot::new(
+                dir.path().to_path_buf(),
+                reader,
+                Some(PrivacySnapshot::for_index(dir.path())?),
+                None,
+            ),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -15009,7 +15179,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: LexicalReaderSlot::new(dir.path().to_path_buf(), reader),
+            reader: LexicalReaderSlot::new(
+                dir.path().to_path_buf(),
+                reader,
+                Some(PrivacySnapshot::for_index(dir.path())?),
+                None,
+            ),
             sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -20557,6 +20732,7 @@ mod tests {
                         crate::search::quill_bridge::QuillCassFields::compiled(),
                     )),
                     federated_readers: None,
+                    privacy: PrivacySnapshot::for_index(dir.path()).map(Some),
                 },
                 None,
                 SearchClientOptions::default(),
@@ -21439,6 +21615,7 @@ mod tests {
                 path: directory.path().to_path_buf(),
                 reader: None,
                 federated_readers: Some(vec![(reader_a, fields), (reader_b, fields)]),
+                privacy: PrivacySnapshot::for_index(directory.path()).map(Some),
             },
             None,
             SearchClientOptions {
@@ -22858,7 +23035,10 @@ mod tests {
         assert_eq!(forgotten.messages_matched, 1);
         storage.rebuild_fts()?;
 
-        let cold = SearchClient::open_with_options(
+        // Storage deletion deliberately leaves the privacy fence pending.
+        // Rebuilding FTS alone does not finish every derived obligation, so
+        // both fresh and already-open readers must refuse until full repair.
+        let cold_error = SearchClient::open_with_options(
             fixture._dir.path(),
             Some(db_path),
             SearchClientOptions {
@@ -22866,26 +23046,102 @@ mod tests {
                 enable_warm: false,
                 strict_read_only: true,
             },
-        )?
-        .expect("canonical fixture remains available");
-        assert!(!cold.has_tantivy());
-        let expected = cold.search("semantic", SearchFilters::default(), 1, 0, FieldMask::FULL)?;
-        assert_eq!(expected.len(), 1);
-        assert_ne!(expected[0].source_path, forgotten_path);
+        )
+        .err()
+        .expect("fresh canonical readers must not admit a partial forget repair");
+        assert!(matches!(
+            cold_error.downcast_ref::<crate::search::privacy::PrivacyError>(),
+            Some(crate::search::privacy::PrivacyError::RepairPending { .. })
+        ));
         for _ in 0..2 {
-            let actual = fixture.client.search(
-                "semantic",
+            let error = fixture
+                .client
+                .search("semantic", SearchFilters::default(), 1, 0, FieldMask::FULL)
+                .expect_err("an old SQLite reader must never return forgotten cached rows");
+            assert!(matches!(
+                error.downcast_ref::<crate::search::privacy::PrivacyError>(),
+                Some(crate::search::privacy::PrivacyError::RepairPending { .. })
+            ));
+            assert_eq!(fixture.client.cache_stats().cache_hits, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_privacy_seals_opened_owners_and_fences_empty_results() -> Result<()> {
+        use crate::search::privacy::{PrivacyError, begin_forget, complete_forget};
+
+        let directory = TempDir::new()?;
+        let database = directory.path().join("agent_search.db");
+        let index_path = crate::search::tantivy::index_dir(directory.path())?;
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        index.commit()?;
+        drop(index);
+        let options = SearchClientOptions {
+            enable_reload: false,
+            enable_warm: false,
+            strict_read_only: true,
+        };
+        let pinned = SearchClient::open_with_options(&index_path, None, options)?
+            .context("the empty lexical generation must be usable")?;
+        assert!(
+            pinned
+                .search("", SearchFilters::default(), 0, 0, FieldMask::FULL)?
+                .is_empty()
+        );
+        let preopened = crate::search::tantivy::open_validated_lexical_index(&index_path)?;
+
+        begin_forget(&database)?;
+        let error = pinned
+            .search("", SearchFilters::default(), 0, 0, FieldMask::FULL)
+            .expect_err("an empty generation must not bypass a pending forget fence");
+        assert!(matches!(
+            error.downcast_ref::<PrivacyError>(),
+            Some(PrivacyError::RepairPending { .. })
+        ));
+        let error = SearchClient::open_with_options(&index_path, None, options)
+            .err()
+            .context("fresh database-free readers must refuse pending repair")?;
+        assert!(matches!(
+            error.downcast_ref::<PrivacyError>(),
+            Some(PrivacyError::RepairPending { .. })
+        ));
+        // Forget needs structural validation before it can clear its fence.
+        // Such an open may validate bytes but must not become a search owner.
+        let during_repair = crate::search::tantivy::open_validated_lexical_index(&index_path)?;
+        complete_forget(&database)?;
+        for (opened, expected_kind) in [
+            (preopened, "privacy-snapshot-invalidated"),
+            (during_repair, "forget-repair-pending"),
+        ] {
+            let error = SearchClient::from_opened_lexical_index(opened, None, options)
+                .err()
+                .context("handoff must preserve the owner's original privacy admission")?;
+            assert_eq!(
+                error.downcast_ref::<PrivacyError>().map(PrivacyError::kind),
+                Some(expected_kind)
+            );
+        }
+        let error = pinned
+            .search(
+                "absentcanary",
                 SearchFilters::default(),
                 1,
                 0,
                 FieldMask::FULL,
-            )?;
-            assert_eq!(
-                serde_json::to_value(&actual)?,
-                serde_json::to_value(&expected)?
-            );
-            assert_eq!(fixture.client.cache_stats().cache_hits, 0);
-        }
+            )
+            .expect_err("completed repair must not revive the pinned empty generation");
+        assert!(matches!(
+            error.downcast_ref::<PrivacyError>(),
+            Some(PrivacyError::SnapshotInvalidated { .. })
+        ));
+        let fresh = SearchClient::open_with_options(&index_path, None, options)?
+            .context("fresh post-repair admission must succeed")?;
+        assert!(
+            fresh
+                .search("", SearchFilters::default(), 0, 0, FieldMask::FULL)?
+                .is_empty()
+        );
         Ok(())
     }
 

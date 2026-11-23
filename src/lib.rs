@@ -32149,6 +32149,90 @@ mod search_lexical_self_heal_tests {
     }
 
     #[test]
+    fn retained_lexical_cli_queries_preserve_privacy_refusals() {
+        use crate::search::query::{SearchClientOptions, SearchMode, SemanticTierMode};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        build_standalone_lexical_index_without_checkpoint(data_dir, "privacyneedle");
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        let client = std::sync::Arc::new(
+            SearchClient::open_with_options(
+                &index_path,
+                None,
+                SearchClientOptions {
+                    enable_reload: false,
+                    enable_warm: false,
+                    strict_read_only: true,
+                },
+            )
+            .expect("open pinned lexical client")
+            .expect("lexical generation"),
+        );
+        let search = || {
+            execute_search_operation(
+                std::sync::Arc::clone(&client),
+                "privacyneedle".to_string(),
+                SearchFilters::default(),
+                10,
+                0,
+                0,
+                FieldMask::new(false, false, true, false),
+                false,
+                SemanticTierMode::Single,
+                SearchModeMeta::new(SearchMode::Lexical, false),
+            )
+        };
+        assert_eq!(search().expect("positive control").0.hits.len(), 1);
+
+        crate::search::privacy::begin_forget(&db_path).expect("start privacy fence");
+        let pending = search().err().expect("pending repair must refuse queries");
+        assert_eq!((pending.code, pending.kind), (9, "forget-repair-pending"));
+        assert!(!pending.retryable);
+        assert!(pending.hint.is_none());
+
+        crate::search::privacy::complete_forget(&db_path).expect("complete fence transition");
+        let invalidated = search()
+            .err()
+            .expect("completing repair must not renew a pinned reader");
+        assert_eq!(
+            (invalidated.code, invalidated.kind),
+            (9, "privacy-snapshot-invalidated")
+        );
+        assert!(invalidated.retryable);
+        assert!(invalidated.hint.is_none());
+    }
+
+    #[test]
+    fn semantic_cli_setup_preserves_pending_privacy_refusal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        let open = || {
+            open_cli_search_setup(
+                data_dir,
+                &db_path,
+                &index_path,
+                Some(crate::search::query::SearchMode::Semantic),
+                None,
+                Instant::now(),
+                true,
+                true,
+            )
+        };
+        assert!(open().is_ok(), "positive control before forget");
+        crate::search::privacy::begin_forget(&db_path).expect("start privacy fence");
+        let error = open()
+            .err()
+            .expect("semantic-only setup must respect pending privacy repair");
+        assert_eq!((error.code, error.kind), (9, "forget-repair-pending"));
+        assert!(!error.retryable);
+        assert!(error.hint.is_none());
+    }
+
+    #[test]
     fn gh452_strict_search_setup_opens_the_admitted_reader_once() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
@@ -33869,6 +33953,9 @@ fn lexical_engine_invariant_hint(error: &anyhow::Error) -> Option<String> {
 /// paths. A fuel ceiling can be retried with a smaller query or a larger
 /// budget; a posting-cursor invariant needs a repaired generation (GH #567).
 fn lexical_search_cli_error(error: &anyhow::Error, message: String) -> CliError {
+    if let Some(privacy) = privacy_search_cli_error(error) {
+        return privacy;
+    }
     let invariant_hint = lexical_engine_invariant_hint(error);
     let retryable = invariant_hint.is_none();
     let hint = if crate::search::quill_bridge::is_query_fuel_exhausted(error) {
@@ -34324,6 +34411,7 @@ fn open_cli_search_setup(
                 path: index_path.to_path_buf(),
                 reader: None,
                 federated_readers: None,
+                privacy: Ok(None),
             }),
         )
     } else if no_maintenance {
@@ -34357,12 +34445,14 @@ fn open_cli_search_setup(
         None => SearchClient::open_with_options(index_path, Some(db_path), options),
     };
     let client = std::sync::Arc::new(
-        client.map_err(|error| CliError {
-            code: 9,
-            kind: CliErrorKind::OpenIndex.kind_str(),
-            message: format!("failed to open index: {error}"),
-            hint: Some("try cass index --full".to_string()),
-            retryable: true,
+        client.map_err(|error| {
+            privacy_search_cli_error(&error).unwrap_or_else(|| CliError {
+                code: 9,
+                kind: CliErrorKind::OpenIndex.kind_str(),
+                message: format!("failed to open index: {error}"),
+                hint: Some("try cass index --full".to_string()),
+                retryable: true,
+            })
         })?
         .ok_or_else(|| {
             let (message, hint) = if rebuild_active && !lexical_initialized {
