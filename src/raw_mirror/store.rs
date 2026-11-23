@@ -3988,6 +3988,12 @@ mod tests {
         let completed = Arc::new(AtomicU64::new(0));
         let progress = Arc::clone(&completed);
         let record = tracing::subscriber::with_default(subscriber, || -> Result<_> {
+            // Other tests install scoped subscribers concurrently, and one of
+            // them can recompute the global level and callsite interest from a
+            // dispatcher list that predates this one, which silently drops the
+            // TRACE events below. Recompute them with this subscriber in place,
+            // as the other tracing-capture tests in this crate do.
+            tracing::callsite::rebuild_interest_cache();
             let _observer = observe_raw_mirror_io(
                 Arc::new(move || {
                     progress.fetch_add(1, Ordering::Relaxed);
