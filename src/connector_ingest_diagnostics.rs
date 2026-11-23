@@ -34,7 +34,7 @@
 //! valid records continue through normal ingest.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Read};
+use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 
 use crate::franken_sync::compat::{ConnectionExt, OpenFlags, open_with_flags};
@@ -114,6 +114,9 @@ pub enum IngestFailureKind {
     /// The source is larger than the connector's per-source read budget, so it
     /// was not indexed; raising the budget admits it on the next run.
     SourceOverReadBudget,
+    /// The supplemental JSONL inspection reached its own resource bound.
+    /// This limits diagnostic coverage, not the connector's ingestion.
+    DiagnosticBudgetExhausted,
     /// The store uses a layout or format version this build's connector does
     /// not read (a newer Pi durable schema, a Pi Session Store V2 sidecar).
     /// It was not indexed from that store, and the store is left untouched.
@@ -137,6 +140,7 @@ impl IngestFailureKind {
             IngestFailureKind::UnreadableSource => "unreadable-source",
             IngestFailureKind::UnparseableSource => "unparseable-source",
             IngestFailureKind::SourceOverReadBudget => "source-over-read-budget",
+            IngestFailureKind::DiagnosticBudgetExhausted => "diagnostic-budget-exhausted",
             IngestFailureKind::UnsupportedStoreFormat => "unsupported-store-format",
         }
     }
@@ -354,6 +358,15 @@ fn classify_kind(
                  indexed; raise the budget (Codex: CASS_CODEX_MAX_SOURCE_BYTES, up to 1073741824 \
                  bytes), then re-index"
             ),
+        ),
+        IngestFailureKind::DiagnosticBudgetExhausted => (
+            IngestSeverity::Warning,
+            false,
+            SourceIngestDisposition::Discovered,
+            "supplemental JSONL inspection reached its bounded budget; connector ingestion \
+             proceeds independently. Diagnostic coverage is incomplete; preserve the original \
+             source for deeper inspection and consult the connector's indexing outcome"
+                .to_string(),
         ),
         IngestFailureKind::UnsupportedStoreFormat => (
             IngestSeverity::Warning,
@@ -593,6 +606,93 @@ fn is_jsonl_path(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
 }
 
+/// Supplemental diagnostics must not bypass a connector's bounded parser or
+/// allocate a whole transcript-sized record. These are inspection limits, not
+/// source-admission limits: a valid larger source can still be fully indexed.
+#[derive(Clone, Copy)]
+struct JsonlInspectionLimits {
+    source_bytes: u64,
+    record_bytes: usize,
+    malformed_findings: usize,
+}
+
+impl Default for JsonlInspectionLimits {
+    fn default() -> Self {
+        Self {
+            source_bytes: 100 * 1024 * 1024,
+            record_bytes: 1024 * 1024,
+            malformed_findings: 128,
+        }
+    }
+}
+
+fn open_jsonl_for_inspection(path: &Path) -> io::Result<(std::fs::File, std::fs::Metadata)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Discovery is not a lock: a regular file can become a FIFO before
+        // this open. Inspect the actual handle before reading any bytes.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "JSONL diagnostic source is not a regular file",
+        ));
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "JSONL diagnostic source is not a regular file",
+        ));
+    }
+    Ok((file, metadata))
+}
+
+struct InspectedJsonlLine {
+    bytes_read: u64,
+    had_newline: bool,
+    oversized: bool,
+}
+
+/// Retain at most `max_bytes`, including the line ending. Once a record is
+/// too large, drain it through the same bounded reader so the next complete
+/// record can still be inspected; never interpret its retained prefix as JSON.
+fn read_inspection_line(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+    max_bytes: usize,
+) -> io::Result<InspectedJsonlLine> {
+    line.clear();
+    let mut result = InspectedJsonlLine {
+        bytes_read: 0,
+        had_newline: false,
+        oversized: false,
+    };
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(result);
+        }
+        let newline = available.iter().position(|&byte| byte == b'\n');
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        let retained = consumed.min(max_bytes.saturating_sub(line.len()));
+        line.extend_from_slice(&available[..retained]);
+        result.oversized |= retained < consumed;
+        result.bytes_read = result.bytes_read.saturating_add(consumed as u64);
+        reader.consume(consumed);
+        if newline.is_some() {
+            result.had_newline = true;
+            return Ok(result);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ObservedSource {
     disposition: SourceIngestDisposition,
@@ -610,6 +710,9 @@ pub struct ConnectorIngestRun {
     provider: String,
     sources: BTreeMap<PathBuf, ObservedSource>,
     diagnostics: Vec<ConnectorIngestDiagnostic>,
+    /// Preserve native source identities until their final disposition is
+    /// known. The display paths in serialized diagnostics can be lossy.
+    inspection_budget_diagnostics: Vec<(PathBuf, usize)>,
     /// Quarantine output belongs to CASS, even when the scan data dir is a
     /// remote mirror or an explicit source root.
     quarantine_data_dir: PathBuf,
@@ -692,6 +795,7 @@ impl ConnectorIngestRun {
                 })
                 .collect(),
             diagnostics: Vec::new(),
+            inspection_budget_diagnostics: Vec::new(),
             quarantine_data_dir: data_dir.to_path_buf(),
             scan_data_dir: ctx.data_dir.clone(),
             durable_stores,
@@ -920,6 +1024,16 @@ impl ConnectorIngestRun {
             self.inspect_pending_jsonl_source(&path);
         }
         self.inspect_unproductive_durable_stores();
+        for (path, diagnostic_index) in &self.inspection_budget_diagnostics {
+            if let Some(source) = self.sources.get(path)
+                && let Some(diagnostic) = self.diagnostics.get_mut(*diagnostic_index)
+            {
+                // Inspection can happen before the connector delivers its
+                // conversation. Project its final outcome without treating an
+                // incomplete supplemental inspection as an ingestion failure.
+                diagnostic.disposition = source.disposition;
+            }
+        }
         let mut summary = ProviderIngestSummary::default();
         for source in self.sources.values() {
             summary.record(source.disposition);
@@ -999,42 +1113,54 @@ impl ConnectorIngestRun {
     }
 
     fn inspect_jsonl(&mut self, data_dir: &Path, path: &Path, parser_provider: &str) {
+        self.inspect_jsonl_with_limits(
+            data_dir,
+            path,
+            parser_provider,
+            JsonlInspectionLimits::default(),
+        );
+    }
+
+    fn inspect_jsonl_with_limits(
+        &mut self,
+        data_dir: &Path,
+        path: &Path,
+        parser_provider: &str,
+        limits: JsonlInspectionLimits,
+    ) {
         if !is_jsonl_path(path) {
             return;
         }
-        let file = match std::fs::File::open(path) {
-            Ok(file) => file,
+        let (file, metadata) = match open_jsonl_for_inspection(path) {
+            Ok(opened) => opened,
             Err(error) => {
                 self.observe_scan_error(path, error.to_string());
                 return;
             }
         };
-        let read_bytes = if parser_provider == "codex" {
+        if parser_provider == "codex" {
             // Diagnostics may run before or after source admission. Do not
             // read a body beyond the connector budget or invent corruption
             // evidence when its policy is invalid. Its scan reports the cause.
             let Ok(limit) = crate::connectors::codex::source_read_budget(path) else {
                 return;
             };
-            let metadata = match file.metadata() {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    self.observe_scan_error(path, error);
-                    return;
-                }
-            };
-            if !metadata.is_file() || metadata.len() > limit {
+            if metadata.len() > limit {
                 return;
             }
-            // Do not follow an active writer past the admitted opened prefix.
-            // The connector separately checks source stability across parsing.
-            metadata.len()
-        } else {
-            u64::MAX
-        };
+        }
+        // Every provider is bounded to the opened prefix. An append must not
+        // keep this supplemental pass alive indefinitely, and a parser's own
+        // budget must not be defeated by its diagnostic observer.
+        let read_bytes = metadata.len().min(limits.source_bytes);
         let mut reader = std::io::BufReader::new(file.take(read_bytes));
         let mut raw_line = Vec::new();
         let mut line_number = 0u64;
+        let mut inspected_bytes = 0u64;
+        let mut oversized_records = 0u64;
+        let mut first_uninspected_line = None;
+        let mut malformed_findings = 0usize;
+        let mut findings_limited = false;
         let source_path = path.display().to_string();
         let supports_suffix_recovery = matches!(
             parser_provider,
@@ -1053,19 +1179,35 @@ impl ConnectorIngestRun {
                     | "vibe"
             );
         loop {
-            raw_line.clear();
-            let bytes_read = match reader.read_until(b'\n', &mut raw_line) {
-                Ok(bytes_read) => bytes_read,
+            if malformed_findings >= limits.malformed_findings && inspected_bytes < read_bytes {
+                findings_limited = true;
+                first_uninspected_line.get_or_insert(line_number.saturating_add(1));
+                break;
+            }
+            let line = match read_inspection_line(&mut reader, &mut raw_line, limits.record_bytes) {
+                Ok(line) => line,
                 Err(error) => {
                     self.observe_scan_error(path, error);
                     break;
                 }
             };
-            if bytes_read == 0 {
+            if line.bytes_read == 0 {
                 break;
             }
             line_number = line_number.saturating_add(1);
-            let had_newline = raw_line.last() == Some(&b'\n');
+            inspected_bytes = inspected_bytes.saturating_add(line.bytes_read);
+            if line.oversized {
+                oversized_records = oversized_records.saturating_add(1);
+                first_uninspected_line.get_or_insert(line_number);
+                continue;
+            }
+            let had_newline = line.had_newline;
+            if !had_newline && inspected_bytes == read_bytes && metadata.len() > read_bytes {
+                // This is the observer's window boundary, not evidence that
+                // the provider wrote a truncated or malformed record.
+                first_uninspected_line.get_or_insert(line_number);
+                break;
+            }
             if had_newline {
                 raw_line.pop();
                 if raw_line.last() == Some(&b'\r') {
@@ -1097,6 +1239,7 @@ impl ConnectorIngestRun {
             } else {
                 IngestFailureKind::MalformedJsonLine
             };
+            malformed_findings = malformed_findings.saturating_add(1);
             // These providers use FAD's shared suffix recovery. Other JSONL
             // connectors retain their existing whole-line quarantine policy.
             let recovery = text
@@ -1137,6 +1280,32 @@ impl ConnectorIngestRun {
                     "failed to persist connector line quarantine record"
                 );
             }
+        }
+        if oversized_records > 0 || findings_limited || metadata.len() > read_bytes {
+            let mut diagnostic = classify(
+                &self.provider,
+                &source_path,
+                IngestFailureKind::DiagnosticBudgetExhausted,
+            )
+            .with_detail(format!(
+                "source_bytes={}; read_prefix_bytes={inspected_bytes}; \
+                 source_limit_bytes={}; record_limit_bytes={}; \
+                 oversized_records_not_validated={oversized_records}; \
+                 malformed_findings_limit={}; findings_limit_reached={findings_limited}",
+                metadata.len(),
+                limits.source_bytes,
+                limits.record_bytes,
+                limits.malformed_findings,
+            ));
+            diagnostic.line_or_row = first_uninspected_line;
+            // Diagnostic limits do not certify malformed input, withhold a
+            // source, or change a successfully delivered conversation's status.
+            if let Some(source) = self.sources.get(path) {
+                diagnostic.disposition = source.disposition;
+            }
+            self.inspection_budget_diagnostics
+                .push((path.to_path_buf(), self.diagnostics.len()));
+            self.diagnostics.push(diagnostic);
         }
     }
 
@@ -1408,6 +1577,7 @@ mod tests {
             IngestFailureKind::UnreadableSource,
             IngestFailureKind::UnparseableSource,
             IngestFailureKind::SourceOverReadBudget,
+            IngestFailureKind::DiagnosticBudgetExhausted,
             IngestFailureKind::UnsupportedStoreFormat,
         ];
         let destructive = ["rm ", "--delete", "--purge", "reset", "drop ", "rm -rf"];
@@ -1569,6 +1739,7 @@ mod tests {
             IngestFailureKind::SourceChanged,
             IngestFailureKind::UnfinishedSource,
             IngestFailureKind::SourceMissing,
+            IngestFailureKind::DiagnosticBudgetExhausted,
         ];
         verify_eq!(
             serde_json::to_value(failure_kinds)?,
@@ -1585,7 +1756,8 @@ mod tests {
                 "source-over-read-budget",
                 "source-changed",
                 "unfinished-source",
-                "source-missing"
+                "source-missing",
+                "diagnostic-budget-exhausted"
             ])
         );
         for (k, w) in [
@@ -1613,6 +1785,10 @@ mod tests {
             (IngestFailureKind::SourceChanged, "source-changed"),
             (IngestFailureKind::UnfinishedSource, "unfinished-source"),
             (IngestFailureKind::SourceMissing, "source-missing"),
+            (
+                IngestFailureKind::DiagnosticBudgetExhausted,
+                "diagnostic-budget-exhausted",
+            ),
             (
                 IngestFailureKind::SourceOverReadBudget,
                 "source-over-read-budget",
@@ -1666,6 +1842,345 @@ mod tests {
         .max()
         .ok_or_else(|| std::io::Error::other("severity sample must be non-empty"))?;
         verify_eq!(worst, IngestSeverity::Error);
+        Ok(())
+    }
+
+    #[test]
+    fn jsonl_inspection_limits_preserve_real_claude_ingestion_and_later_findings() -> TestResult {
+        for malformed_sibling in [false, true] {
+            let temp = tempdir()?;
+            let project = temp.path().join("projects/bounded");
+            std::fs::create_dir_all(&project)?;
+            let path = project.join("session.jsonl");
+            let content = format!(
+                "boundeddiagnosticcanary{}",
+                "x".repeat(JsonlInspectionLimits::default().record_bytes),
+            );
+            let record = json!({
+                "type": "user", "uuid": "bounded-message", "sessionId": "bounded-session",
+                "timestamp": "2026-11-23T10:00:00Z", "cwd": "/work/bounded",
+                "message": {"role": "user", "content": content},
+            });
+            let body = format!(
+                "{record}\n{}",
+                if malformed_sibling { "{broken}\n" } else { "" }
+            );
+            std::fs::write(&path, &body)?;
+            let ctx = ScanContext::with_roots(
+                temp.path().to_path_buf(),
+                vec![ScanRoot::local(temp.path().to_path_buf())],
+                None,
+            );
+            let connector = crate::connectors::claude_code::ClaudeCodeConnector::new();
+            let sources = connector.discover_source_files(&ctx)?;
+            verify_eq!(sources.len(), 1);
+            let mut run = ConnectorIngestRun::begin("claude", temp.path(), &ctx, &sources);
+            let mut conversations = connector.scan(&ctx)?;
+            verify_eq!(conversations.len(), 1);
+            verify_eq!(conversations[0].messages.len(), 1);
+            verify_eq!(conversations[0].messages[0].content, content);
+            run.observe_conversation(&mut conversations[0]);
+            let report = run.finish();
+            verify_eq!(report.summary.total(), 1);
+            verify_eq!(report.summary.indexed, u64::from(!malformed_sibling));
+            verify_eq!(
+                report.summary.partially_indexed,
+                u64::from(malformed_sibling)
+            );
+            verify_eq!(report.summary.skipped, 0);
+            let limited = report
+                .diagnostics
+                .iter()
+                .find(|finding| {
+                    finding.failure_kind == IngestFailureKind::DiagnosticBudgetExhausted
+                })
+                .ok_or("missing incomplete-inspection warning")?;
+            verify_eq!(limited.line_or_row, Some(1));
+            verify_eq!(limited.severity, IngestSeverity::Warning);
+            verify!(!limited.retryable);
+            verify_eq!(
+                limited.disposition,
+                if malformed_sibling {
+                    SourceIngestDisposition::PartiallyIndexed
+                } else {
+                    SourceIngestDisposition::Indexed
+                },
+            );
+            verify!(
+                limited
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| { detail.contains("oversized_records_not_validated=1") })
+            );
+            let quarantine = temp.path().join("quarantine/connector_ingest_lines.json");
+            if malformed_sibling {
+                verify_eq!(report.diagnostics.len(), 2);
+                let malformed = &report.diagnostics[0];
+                verify_eq!(malformed.failure_kind, IngestFailureKind::MalformedJsonLine);
+                verify_eq!(malformed.line_or_row, Some(2));
+                let state: serde_json::Value = serde_json::from_slice(&std::fs::read(quarantine)?)?;
+                let entries = state["entries"]
+                    .as_object()
+                    .ok_or("missing quarantine entries")?;
+                verify_eq!(entries.len(), 1);
+                let entry = entries.values().next().ok_or("missing malformed line")?;
+                verify_eq!(entry["line_number"], 2);
+                verify_eq!(entry["payload_bytes"], b"{broken}".len());
+                verify_eq!(
+                    entry["payload_blake3"],
+                    blake3::hash(b"{broken}").to_hex().to_string(),
+                );
+            } else {
+                verify_eq!(report.diagnostics.len(), 1);
+                verify!(
+                    !quarantine.exists(),
+                    "an uninspected valid record is not quarantined"
+                );
+            }
+            verify!(!serde_json::to_string(&report)?.contains("boundeddiagnosticcanary"));
+            verify_eq!(std::fs::read_to_string(&path)?, body);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn jsonl_inspection_source_window_does_not_invent_a_truncated_record() -> TestResult {
+        let temp = tempdir()?;
+        let path = temp.path().join("window.jsonl");
+        let body = b"{\"ok\":1}\n{\"still_valid\":2}\n";
+        std::fs::write(&path, body)?;
+        let ctx = ScanContext::with_roots(temp.path().to_path_buf(), Vec::new(), None);
+        for source_bytes in [9, 10, 13, body.len() as u64] {
+            let mut run = ConnectorIngestRun::begin("claude", temp.path(), &ctx, &[]);
+            run.inspect_jsonl_with_limits(
+                temp.path(),
+                &path,
+                "claude_code",
+                JsonlInspectionLimits {
+                    source_bytes,
+                    record_bytes: 64,
+                    malformed_findings: 4,
+                },
+            );
+            if source_bytes == body.len() as u64 {
+                verify!(run.diagnostics.is_empty());
+            } else {
+                verify_eq!(run.diagnostics.len(), 1);
+                verify_eq!(
+                    run.diagnostics[0].failure_kind,
+                    IngestFailureKind::DiagnosticBudgetExhausted,
+                );
+                verify!(run.diagnostics[0].detail.as_deref().is_some_and(|detail| {
+                    detail.contains(&format!("read_prefix_bytes={source_bytes};"))
+                }));
+            }
+            verify!(
+                !temp
+                    .path()
+                    .join("quarantine/connector_ingest_lines.json")
+                    .exists()
+            );
+        }
+        verify_eq!(std::fs::read(&path)?, body);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_inspection_budget_outcomes_preserve_native_source_identity() -> TestResult {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempdir()?;
+        let indexed = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"native-\x80.jsonl".to_vec()));
+        let skipped = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"native-\x81.jsonl".to_vec()));
+        verify_ne!(indexed, skipped);
+        verify_eq!(indexed.display().to_string(), skipped.display().to_string());
+        let body = format!(
+            "{{\"message\":\"{}\"}}\n",
+            "x".repeat(JsonlInspectionLimits::default().record_bytes),
+        );
+        let root = ScanRoot::local(temp.path().to_path_buf());
+        let sources: Vec<_> = [&indexed, &skipped]
+            .into_iter()
+            .map(|path| {
+                DiscoveredSourceFile::new(
+                    "claude_code",
+                    &root,
+                    path.clone(),
+                    DiscoveredSourceRole::PrimarySessionLog,
+                    true,
+                )
+            })
+            .collect();
+        for path in [&indexed, &skipped] {
+            std::fs::write(path, &body)?;
+        }
+        let ctx = ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+        let mut run = ConnectorIngestRun::begin("claude", temp.path(), &ctx, &sources);
+        run.observe_reused_sources([indexed]);
+        run.observe_excluded_source(&skipped);
+        let report = run.finish();
+        verify_eq!(report.summary.indexed, 1);
+        verify_eq!(report.summary.skipped, 1);
+        verify_eq!(report.diagnostics.len(), 2);
+        verify_eq!(
+            report.diagnostics[0].disposition,
+            SourceIngestDisposition::Indexed
+        );
+        verify_eq!(
+            report.diagnostics[1].disposition,
+            SourceIngestDisposition::Skipped
+        );
+        verify!(report.diagnostics.iter().all(|finding| {
+            finding.failure_kind == IngestFailureKind::DiagnosticBudgetExhausted
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn jsonl_inspection_caps_malformed_findings_without_hiding_the_limit() -> TestResult {
+        let temp = tempdir()?;
+        let path = temp.path().join("many-malformed.jsonl");
+        let body = b"{first}\n{second}\n{third}\n{fourth}\n{fifth}\n";
+        std::fs::write(&path, body)?;
+        let ctx = ScanContext::with_roots(temp.path().to_path_buf(), Vec::new(), None);
+        let mut run = ConnectorIngestRun::begin("claude", temp.path(), &ctx, &[]);
+        run.inspect_jsonl_with_limits(
+            temp.path(),
+            &path,
+            "claude_code",
+            JsonlInspectionLimits {
+                source_bytes: 1024,
+                record_bytes: 64,
+                malformed_findings: 3,
+            },
+        );
+        verify_eq!(run.diagnostics.len(), 4);
+        for (index, finding) in run.diagnostics[..3].iter().enumerate() {
+            verify_eq!(finding.failure_kind, IngestFailureKind::MalformedJsonLine);
+            verify_eq!(finding.line_or_row, Some(index as u64 + 1));
+        }
+        let limited = &run.diagnostics[3];
+        verify_eq!(
+            limited.failure_kind,
+            IngestFailureKind::DiagnosticBudgetExhausted
+        );
+        verify_eq!(limited.line_or_row, Some(4));
+        verify!(limited.detail.as_deref().is_some_and(|detail| {
+            detail.contains("malformed_findings_limit=3; findings_limit_reached=true")
+        }));
+        let state: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            temp.path().join("quarantine/connector_ingest_lines.json"),
+        )?)?;
+        verify_eq!(
+            state["entries"]
+                .as_object()
+                .ok_or("missing quarantine entries")?
+                .len(),
+            3
+        );
+        verify_eq!(std::fs::read(&path)?, body);
+        Ok(())
+    }
+
+    #[test]
+    fn jsonl_inspection_reader_bounds_memory_and_preserves_line_boundaries() -> TestResult {
+        let temp = tempdir()?;
+        let path = temp.path().join("reader.jsonl");
+        let body = b"1234567\n1234567890123456789012345678901234567890\n{}\nlast";
+        std::fs::write(&path, body)?;
+        let file = std::fs::File::open(&path)?;
+        let mut reader = std::io::BufReader::with_capacity(3, file);
+        let mut line = Vec::new();
+        for (bytes_read, had_newline, oversized, retained) in [
+            (8, true, false, b"1234567\n".as_slice()),
+            (41, true, true, b"12345678".as_slice()),
+            (3, true, false, b"{}\n".as_slice()),
+            (4, false, false, b"last".as_slice()),
+            (0, false, false, b"".as_slice()),
+        ] {
+            let result = read_inspection_line(&mut reader, &mut line, 8)?;
+            verify_eq!(result.bytes_read, bytes_read);
+            verify_eq!(result.had_newline, had_newline);
+            verify_eq!(result.oversized, oversized);
+            verify_eq!(line, retained);
+            verify!(line.capacity() <= 8, "record allocation exceeded the bound");
+        }
+        verify_eq!(std::fs::read(&path)?, body);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_inspection_rejects_non_regular_replacements_without_blocking() -> TestResult {
+        use std::os::unix::fs::FileTypeExt;
+
+        const CHILD: &str = "CASS_TEST_JSONL_DIAGNOSTIC_FIFO_CHILD";
+        if dotenvy::var(CHILD).as_deref() != Ok("1") {
+            let output = assert_cmd::Command::new(std::env::current_exe()?)
+                .args([
+                    "jsonl_inspection_rejects_non_regular_replacements_without_blocking",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .timeout(std::time::Duration::from_secs(10))
+                .output()?;
+            verify!(
+                output.status.success(),
+                "FIFO inspection child failed: {output:?}"
+            );
+            verify!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return Ok(());
+        }
+        for (deferred, use_alias) in [(false, false), (false, true), (true, false), (true, true)] {
+            let temp = tempdir()?;
+            let path = temp.path().join("replaced.jsonl");
+            let body = b"{\"ok\":true}\n";
+            std::fs::write(&path, body)?;
+            let root = ScanRoot::local(temp.path().to_path_buf());
+            let source = DiscoveredSourceFile::new(
+                "claude_code",
+                &root,
+                path.clone(),
+                DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            );
+            let ctx = ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+            let retained = temp.path().join("retained.jsonl");
+            std::fs::rename(&path, &retained)?;
+            let fifo = if use_alias {
+                temp.path().join("pipe")
+            } else {
+                path.clone()
+            };
+            verify!(
+                std::process::Command::new("mkfifo")
+                    .arg(&fifo)
+                    .status()?
+                    .success()
+            );
+            if use_alias {
+                std::os::unix::fs::symlink(&fifo, &path)?;
+            }
+            let run = if deferred {
+                ConnectorIngestRun::begin_deferred_jsonl("claude", temp.path(), &ctx, &[source])
+            } else {
+                ConnectorIngestRun::begin("claude", temp.path(), &ctx, &[source])
+            };
+            let report = run.finish();
+            verify_eq!(report.summary.skipped, 1);
+            verify_eq!(report.diagnostics.len(), 1);
+            verify_eq!(
+                report.diagnostics[0].failure_kind,
+                IngestFailureKind::UnreadableSource
+            );
+            verify_eq!(std::fs::read(&retained)?, body);
+            verify!(std::fs::symlink_metadata(&fifo)?.file_type().is_fifo());
+        }
         Ok(())
     }
 
@@ -1902,12 +2417,8 @@ mod tests {
             })
             .collect();
         let ctx = ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
-        let mut run = ConnectorIngestRun::begin_deferred_jsonl(
-            "claude",
-            temp.path(),
-            &ctx,
-            &sources,
-        );
+        let mut run =
+            ConnectorIngestRun::begin_deferred_jsonl("claude", temp.path(), &ctx, &sources);
         // The absent path is an I/O sentinel for this observer test. The
         // indexer integration tests separately exercise actual ledger reuse.
         run.observe_reused_sources([reused.clone(), reused.clone()]);
@@ -2008,12 +2519,14 @@ mod tests {
                 reports[1].diagnostics[0].failure_kind,
                 IngestFailureKind::MalformedJsonLine
             );
-            let expected_findings =
-                if matches!(outcome, "source_changed" | "scan_error" | "productive_then_failure") {
-                    2
-                } else {
-                    1
-                };
+            let expected_findings = if matches!(
+                outcome,
+                "source_changed" | "scan_error" | "productive_then_failure"
+            ) {
+                2
+            } else {
+                1
+            };
             verify_eq!(reports[1].diagnostics.len(), expected_findings);
             if matches!(outcome, "productive" | "productive_then_failure") {
                 verify_eq!(reports[1].summary.partially_indexed, 1);
@@ -2114,12 +2627,8 @@ mod tests {
                     true,
                 );
                 let ctx = ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
-                let mut run = ConnectorIngestRun::begin_deferred_jsonl(
-                    "codex",
-                    temp.path(),
-                    &ctx,
-                    &[source],
-                );
+                let mut run =
+                    ConnectorIngestRun::begin_deferred_jsonl("codex", temp.path(), &ctx, &[source]);
                 let mut conversation = NormalizedConversation {
                     agent_slug: "codex".into(),
                     external_id: Some("delivered-with-scan-failure".into()),
