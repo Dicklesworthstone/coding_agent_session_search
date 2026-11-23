@@ -12166,6 +12166,7 @@ impl FrankenStorage {
 
         let mut tx = self.conn.transaction()?;
         let mut purge = AgentArchivePurgeResult::default();
+        let mut deleted_agent_ids = HashSet::new();
         for &agent_id in agent_ids {
             let deleted_conversation_ids: Vec<i64> = tx.query_map_collect(
                 "SELECT id FROM conversations WHERE agent_id = ?1 ORDER BY id",
@@ -12203,7 +12204,7 @@ impl FrankenStorage {
                 "DELETE FROM conversations WHERE agent_id = ?1",
                 fparams![agent_id],
             )?;
-            tx.execute_compat(
+            let deleted = tx.execute_compat(
                 "DELETE FROM agents
                  WHERE id = ?1
                    AND NOT EXISTS (
@@ -12211,6 +12212,9 @@ impl FrankenStorage {
                    )",
                 fparams![agent_id],
             )?;
+            if deleted > 0 {
+                deleted_agent_ids.insert(agent_id);
+            }
             purge.conversations_deleted += deleted_conversation_ids.len();
             purge.messages_deleted += messages_deleted.max(0) as usize;
         }
@@ -12218,6 +12222,14 @@ impl FrankenStorage {
             clear_semantic_embed_watermark_after_deletion(&tx)?;
         }
         tx.commit()?;
+        if !deleted_agent_ids.is_empty() {
+            // Every metadata variant can cache the same agent ID. Evict all
+            // of them only after deletion commits, including shared ephemeral
+            // writers, so a later ensure cannot return a missing or reused ID.
+            self.ensured_agents
+                .lock()
+                .retain(|_, id| !deleted_agent_ids.contains(id));
+        }
 
         Ok(purge)
     }
@@ -50078,6 +50090,122 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         storage
             .insert_conversation_tree(agent_id, None, &conversation)
             .unwrap();
+    }
+
+    #[test]
+    fn purge_agent_archive_data_allows_reimport_through_the_same_storage() -> Result<()> {
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("agent_search.db"))?;
+        seed_agent_purge_conversation(&storage, "shelley", "before-purge");
+        seed_agent_purge_conversation(&storage, "codex", "survivor");
+
+        let survivor = storage
+            .ensured_agents
+            .lock()
+            .iter()
+            .find(|(key, _)| key.slug == "codex")
+            .map(|(key, id)| (key.clone(), *id))
+            .context("surviving agent cache entry")?;
+        let variant = Agent {
+            id: None,
+            slug: "shelley".into(),
+            name: "Shelley CLI".into(),
+            version: Some("2".into()),
+            kind: AgentKind::Cli,
+        };
+        let removed_id = storage.ensure_agent(&variant)?;
+        let shared_cache = Arc::clone(&storage.ensured_agents);
+        assert_eq!(
+            shared_cache
+                .lock()
+                .values()
+                .filter(|&&id| id == removed_id)
+                .count(),
+            2,
+            "both metadata variants must be warmed before purging"
+        );
+
+        let purge = storage.purge_agent_archive_data("shelley")?;
+        assert_eq!((purge.conversations_deleted, purge.messages_deleted), (1, 2));
+        assert!(
+            shared_cache.lock().values().all(|&id| id != removed_id),
+            "a shared writer must not retain either deleted-agent cache entry"
+        );
+        assert_eq!(storage.cached_agent_id(&survivor.0), Some(survivor.1));
+
+        seed_agent_purge_conversation(&storage, "shelley", "after-purge");
+        let replacement_id = storage.ensure_agent(&variant)?;
+        let restored: (String, String) = storage.raw().query_row_map(
+            "SELECT a.slug, a.name FROM conversations c
+             JOIN agents a ON a.id = c.agent_id
+             WHERE c.external_id = ?1",
+            fparams!["shelley-after-purge"],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )?;
+        assert_eq!(restored, ("shelley".into(), "Shelley CLI".into()));
+        assert_eq!(
+            storage.cached_agent_id(&EnsuredAgentKey::from_agent(&variant)),
+            Some(replacement_id)
+        );
+        assert_eq!(storage.total_conversation_count()?, 2);
+        assert_eq!(storage.total_message_count()?, 4);
+
+        let empty_agent = Agent {
+            slug: "empty-provider".into(),
+            name: "Empty provider".into(),
+            ..variant
+        };
+        let empty_id = storage.ensure_agent(&empty_agent)?;
+        let noop = storage.purge_agent_archive_data("empty-provider")?;
+        assert_eq!((noop.conversations_deleted, noop.messages_deleted), (0, 0));
+        assert_eq!(
+            storage.cached_agent_id(&EnsuredAgentKey::from_agent(&empty_agent)),
+            Some(empty_id),
+            "an agent which was not deleted must retain its cache entry"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn purge_agent_archive_data_cannot_rebind_reimport_to_a_reused_agent_id() -> Result<()> {
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("agent_search.db"))?;
+        seed_agent_purge_conversation(&storage, "openclaw", "before-purge");
+        let removed_id: i64 = storage.raw().query_row_map(
+            "SELECT id FROM agents WHERE slug = ?1",
+            fparams!["openclaw"],
+            |row| row.get_typed(0),
+        )?;
+        let purge = storage.purge_agent_archive_data("openclaw")?;
+        assert_eq!((purge.conversations_deleted, purge.messages_deleted), (1, 2));
+
+        // Force reuse rather than depending on the engine's rowid allocator.
+        // A stale cache would satisfy the foreign key while silently assigning
+        // the re-imported OpenClaw conversation to Codex.
+        storage.raw().execute_compat(
+            "INSERT INTO agents(id, slug, name, kind, created_at, updated_at)
+             VALUES(?1, 'codex', 'codex', 'cli', 0, 0)",
+            fparams![removed_id],
+        )?;
+        seed_agent_purge_conversation(&storage, "codex", "new-id-owner");
+        seed_agent_purge_conversation(&storage, "openclaw", "after-purge");
+
+        let identities: Vec<(String, String, i64)> = storage.raw().query_map_collect(
+            "SELECT c.external_id, a.slug, a.id FROM conversations c
+             JOIN agents a ON a.id = c.agent_id ORDER BY c.external_id",
+            fparams![],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        )?;
+        assert_eq!(identities.len(), 2);
+        assert_eq!(
+            identities[0],
+            ("codex-new-id-owner".into(), "codex".into(), removed_id)
+        );
+        assert_eq!(identities[1].0, "openclaw-after-purge");
+        assert_eq!(identities[1].1, "openclaw");
+        assert_ne!(identities[1].2, removed_id);
+        assert_eq!(storage.total_message_count()?, 4);
+        Ok(())
     }
 
     #[test]
