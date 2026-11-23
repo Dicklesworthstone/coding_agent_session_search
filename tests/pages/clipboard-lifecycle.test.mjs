@@ -493,27 +493,92 @@ test("plain archive loading is cancelled before a late database import materiali
 
 test("lock revokes production database initialization before a late WASM runtime returns", async () => {
   const booting = deferred(), runtime = deferred();
+  let runtimeStarts = 0;
   const f = await authFixture({ productionDatabase: true, initializeWasm: async () => {
-    booting.resolve(); await runtime.promise;
+    if (runtimeStarts++ === 0) {
+      booting.resolve();
+      await runtime.promise;
+    }
   } });
   const bytes = new Uint8Array([9, 8, 7]);
   const stale = f.api.handleDecryptSuccess({ dbBytes: bytes });
   await booting.promise;
-  const lock = f.api.lockArchive({ broadcast: false });
-  assert.equal(f.database.isDatabaseReady(), false);
-  runtime.resolve();
-  await Promise.all([lock, stale]);
-  assert.equal(f.database.isDatabaseReady(), false);
-  assert.deepEqual(f.dbCalls, [], "cancelled startup must not construct a native handle");
-  assert.deepEqual([...bytes], [0, 0, 0]);
-  assert.throws(() => f.database.queryAll("SELECT 1"), /not initialized/i);
-  // A current generation remains usable after the cancelled attempt settles.
-  await f.database.initDatabase(new Uint8Array([1, 2, 3]));
-  assert.equal(f.database.isDatabaseReady(), true);
-  const relock = f.api.lockArchive({ broadcast: false });
-  assert.equal(f.database.isDatabaseReady(), false, "close must happen before lock yields");
-  assert.deepEqual(f.dbCalls, [["native-open"], ["native-close"]]);
-  await relock;
+  try {
+    const lock = f.api.lockArchive({ broadcast: false });
+    assert.equal(f.database.isDatabaseReady(), false);
+    assert.deepEqual([...bytes], [0, 0, 0], "lock must wipe pending plaintext before WASM settles");
+    assert.throws(() => f.database.queryAll("SELECT 1"), /not initialized/i);
+    await lock;
+
+    // A new unlock must not wait for the obsolete runtime download/startup.
+    f.api.beginAppInitAttempt();
+    f.window.cassSession = { dek: AUTH_DEK };
+    const replacement = new Uint8Array([1, 2, 3]);
+    await f.database.initDatabase(replacement);
+    assert.equal(f.database.isDatabaseReady(), true);
+    assert.deepEqual([...replacement], [0, 0, 0]);
+    assert.equal(runtimeStarts, 2);
+    assert.deepEqual(f.dbCalls, [["native-open"]]);
+
+    runtime.resolve();
+    await stale;
+    assert.equal(f.database.isDatabaseReady(), true, "stale startup must not replace or close the new database");
+    assert.equal(f.window.cassSession.dek, AUTH_DEK);
+    assert.deepEqual(f.dbCalls, [["native-open"]], "cancelled startup must not construct a native handle");
+    const relock = f.api.lockArchive({ broadcast: false });
+    assert.equal(f.database.isDatabaseReady(), false, "close must happen before lock yields");
+    assert.deepEqual(f.dbCalls, [["native-open"], ["native-close"]]);
+    await relock;
+  } finally {
+    runtime.resolve();
+    await stale;
+  }
+});
+
+test("cancelled startup completion cannot release a replacement database admission", async () => {
+  const booting = [deferred(), deferred()];
+  const runtimes = [deferred(), deferred()];
+  let runtimeStarts = 0;
+  const f = await authFixture({ productionDatabase: true, initializeWasm: async () => {
+    const index = runtimeStarts++;
+    assert.ok(index < runtimes.length, "a duplicate initialization must not start another runtime");
+    booting[index].resolve();
+    await runtimes[index].promise;
+  } });
+  const staleBytes = new Uint8Array([9, 8, 7]);
+  const stale = assert.rejects(f.database.initDatabase(staleBytes), /cancelled/i);
+  const currentBytes = new Uint8Array([1, 2, 3]);
+  let current = null;
+  try {
+    await booting[0].promise;
+    f.database.closeDatabase();
+    assert.deepEqual([...staleBytes], [0, 0, 0]);
+
+    current = f.database.initDatabase(currentBytes);
+    // Observe an unexpected early rejection instead of hanging on booting[1].
+    await Promise.race([
+      booting[1].promise,
+      current.then(() => { throw new Error("replacement settled before its runtime was ready"); }),
+    ]);
+    runtimes[0].resolve();
+    await stale;
+    assert.equal(f.database.isDatabaseReady(), false);
+    assert.deepEqual([...currentBytes], [1, 2, 3], "stale cleanup must not wipe the replacement");
+    const duplicate = new Uint8Array([4, 5, 6]);
+    await assert.rejects(f.database.initDatabase(duplicate), /already in progress/i);
+    assert.deepEqual([...duplicate], [0, 0, 0], "refused input still transfers cleanup ownership");
+    assert.equal(runtimeStarts, 2);
+
+    runtimes[1].resolve();
+    await current;
+    assert.equal(f.database.isDatabaseReady(), true);
+    assert.deepEqual([...currentBytes], [0, 0, 0]);
+    assert.deepEqual(f.dbCalls, [["native-open"]]);
+  } finally {
+    for (const runtime of runtimes) runtime.resolve();
+    await Promise.allSettled([stale, current]);
+    f.database.closeDatabase();
+  }
 });
 
 test("worker failure synchronously closes the production database without a viewer listener", async () => {

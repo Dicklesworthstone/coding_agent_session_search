@@ -14,7 +14,7 @@
 let sqlite3 = null;
 let db = null;
 let isInitialized = false;
-let initializationPromise = null;
+let initializationAttempt = null;
 let lifecycleGeneration = 0;
 
 // sqlite3.h's stable sqlite3_deserialize() flags. The official JS wrapper
@@ -71,22 +71,21 @@ export async function initDatabase(dbBytes) {
     throw new TypeError("Database payload must be a Uint8Array");
   }
 
-  let pending = null;
+  let attempt = null;
   try {
     checkedDatabaseAllocationSize(dbBytes.byteLength);
     if (isInitialized) {
       console.warn("[DB] Already initialized");
       return;
     }
-    if (initializationPromise) {
+    if (initializationAttempt) {
       throw new Error("Database initialization is already in progress");
     }
 
     console.log("[DB] Initializing sqlite-wasm...");
-    const generation = ++lifecycleGeneration;
-    pending = initializeDatabase(dbBytes, generation);
-    initializationPromise = pending;
-    await pending;
+    attempt = { generation: ++lifecycleGeneration, bytes: dbBytes };
+    initializationAttempt = attempt;
+    await initializeDatabase(dbBytes, attempt.generation);
   } finally {
     try {
       dbBytes.fill(0);
@@ -94,8 +93,10 @@ export async function initDatabase(dbBytes) {
       // A caller which violated the ownership contract may have detached
       // the view; never let cleanup obscure the initialization result.
     }
-    if (pending && initializationPromise === pending) {
-      initializationPromise = null;
+    // A cancelled startup can settle after its replacement was admitted.
+    // Only the attempt that owns admission may release it.
+    if (attempt && initializationAttempt === attempt) {
+      initializationAttempt = null;
     }
   }
 }
@@ -1244,6 +1245,17 @@ export function checkMemoryPressure() {
  */
 export function closeDatabase() {
   lifecycleGeneration += 1;
+  // Retire admission synchronously: a pending WASM startup belongs to the old
+  // generation and must neither retain plaintext nor block a fresh unlock.
+  const cancelledAttempt = initializationAttempt;
+  initializationAttempt = null;
+  if (cancelledAttempt) {
+    try {
+      cancelledAttempt.bytes.fill(0);
+    } catch {
+      // A detached view is already inaccessible; continue revoking authority.
+    }
+  }
   if (db) {
     try {
       db.close();
