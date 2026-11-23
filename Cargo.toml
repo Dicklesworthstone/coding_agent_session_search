@@ -198,7 +198,7 @@ dialoguer = "0.12.0"
 
 # SFTP fallback for sync when rsync is unavailable
 ssh2 = "0.9.5"
-argon2 = "0.5.3"
+argon2 = "0.6.0"
 hkdf = "0.13"  # Must match sha2 0.11 / aes-gcm 0.11 (digest 0.11 family); see comment above.
 zeroize = { version = "1.8.2", features = ["derive"] }
 flate2 = "1.1.9"

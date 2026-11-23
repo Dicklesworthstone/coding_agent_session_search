@@ -12,10 +12,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
 };
 use anyhow::{Context, Result, bail};
-use argon2::{
-    Algorithm, Argon2, Params, Version,
-    password_hash::{SaltString, rand_core::OsRng as PasswordHashOsRng},
-};
+use argon2::{Algorithm, Argon2, Params, Version};
 use base64::prelude::*;
 use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
 use rand::Rng;
@@ -42,6 +39,9 @@ pub const MAX_CHUNK_SIZE: usize = 32 * 1024 * 1024;
 /// Length alone cannot prove entropy; callers should normally use
 /// [`crate::pages::qr::RecoverySecret::generate`] to obtain 256 random bits.
 pub const MIN_RECOVERY_SECRET_BYTES: usize = 24;
+
+/// Random bytes behind a password slot's salt (the PHC recommended size).
+const PASSWORD_SALT_RANDOM_BYTES: usize = 16;
 
 const MAX_ARCHIVE_CHUNKS: u64 = u32::MAX as u64;
 const AES_GCM_TAG_SIZE: u64 = 16;
@@ -539,9 +539,13 @@ impl EncryptionEngine {
 
         let slot_id = key_slot_id_for_len(self.key_slots.len())?;
 
-        // Generate salt
-        let salt = SaltString::generate(&mut PasswordHashOsRng);
-        let salt_bytes = salt.as_str().as_bytes();
+        // Generate salt: 16 random bytes as unpadded standard base64, the same
+        // 22-character ASCII form `password_hash::SaltString::generate` gave
+        // before argon2 0.6 dropped it. Those ASCII bytes are the Argon2 salt.
+        let mut raw_salt = [0u8; PASSWORD_SALT_RANDOM_BYTES];
+        rand::rng().fill_bytes(&mut raw_salt);
+        let salt = BASE64_STANDARD_NO_PAD.encode(raw_salt);
+        let salt_bytes = salt.as_bytes();
 
         // Derive KEK from password
         let kek = derive_kek_argon2id(password, salt_bytes)?;
@@ -1944,6 +1948,31 @@ mod tests {
             .unwrap();
 
         (temp_dir, output_dir, config)
+    }
+
+    /// argon2 0.6 removed `SaltString`. A password slot's salt keeps the
+    /// shape it had: 22 unpadded standard-base64 ASCII characters encoding 16
+    /// random bytes, stored base64-encoded, and fresh for every slot.
+    #[test]
+    fn password_slot_salt_keeps_the_salt_string_shape() {
+        let mut engine = EncryptionEngine::new(1024).unwrap();
+        engine.add_password_slot("first").unwrap();
+        engine.add_password_slot("second").unwrap();
+        let salts: Vec<Vec<u8>> = engine
+            .key_slots
+            .iter()
+            .map(|slot| BASE64_STANDARD.decode(&slot.salt).unwrap())
+            .collect();
+        for salt in &salts {
+            assert_eq!(salt.len(), 22, "{salt:?}");
+            assert!(
+                salt.iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/')),
+                "{salt:?}"
+            );
+            assert_eq!(BASE64_STANDARD_NO_PAD.decode(salt).unwrap().len(), 16);
+        }
+        assert_ne!(salts[0], salts[1]);
     }
 
     #[test]
