@@ -769,7 +769,7 @@ pub fn load_semantic_context_for_embedder_deferred_strict(
 /// policy as serving so status cannot advertise an artifact a query rejects.
 #[cfg(test)]
 pub(crate) fn probe_semantic_availability(data_dir: &Path) -> SemanticAvailability {
-    probe_semantic_availability_for_embedder(data_dir, active_policy_embedder_name())
+    probe_semantic_availability_for_embedder(data_dir, active_policy_probe_embedder_name())
 }
 
 #[cfg(test)]
@@ -793,7 +793,7 @@ pub(super) fn probe_semantic_availability_with_coverage_probe(
 ) -> SemanticAvailability {
     probe_semantic_availability_for_embedder_with_coverage_probe(
         data_dir,
-        active_policy_embedder_name(),
+        active_policy_probe_embedder_name(),
         coverage_probe,
     )
 }
@@ -1531,6 +1531,25 @@ fn active_policy_embedder_name() -> &'static str {
     FastEmbedder::canonical_name(&semantic_policy.quality_tier_embedder).unwrap_or("unsupported")
 }
 
+/// Readiness probes name the external backend when the policy selects it
+/// (`CASS_SEMANTIC_EMBEDDER=external`). Mapping it through the native-model
+/// aliases turned it into "unsupported", so status reported "unsupported
+/// semantic embedder: unsupported" instead of the external backend's own
+/// admission result, such as missing consent (GH #561). The external probe
+/// sends no HTTP.
+fn active_policy_probe_embedder_name() -> &'static str {
+    let semantic_policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
+    probe_embedder_name_for_policy(&semantic_policy.quality_tier_embedder)
+}
+
+fn probe_embedder_name_for_policy(quality_tier_embedder: &str) -> &'static str {
+    if crate::search::embedder_registry::selects_external(Some(quality_tier_embedder)) {
+        crate::search::external_embedder::EXTERNAL_EMBEDDER
+    } else {
+        FastEmbedder::canonical_name(quality_tier_embedder).unwrap_or("unsupported")
+    }
+}
+
 fn semantic_availability_from_cache_state(
     embedder_id: &str,
     model_dir: &Path,
@@ -1697,6 +1716,41 @@ mod tests {
         assert!(!ready.has_update());
         assert!(ready.can_search());
         assert_eq!(ready.status_label(), "SEM");
+    }
+
+    /// GH #561: a policy that selects the external backend must probe that
+    /// backend, not the native-model alias table, so status reports the
+    /// external admission result instead of "unsupported semantic embedder:
+    /// unsupported".
+    #[test]
+    fn gh561_policy_selected_external_probe_reaches_external_admission() {
+        use crate::search::external_embedder::EXTERNAL_EMBEDDER;
+        for selected in ["external", " External "] {
+            assert_eq!(probe_embedder_name_for_policy(selected), EXTERNAL_EMBEDDER);
+        }
+        assert_eq!(probe_embedder_name_for_policy("fastembed"), "minilm");
+        assert_eq!(
+            probe_embedder_name_for_policy("multilingual"),
+            "multilingual-minilm"
+        );
+        assert_eq!(probe_embedder_name_for_policy("not-a-model"), "unsupported");
+
+        // Without consent the external probe refuses with its own reason; with
+        // it, an empty data dir has no publication. Neither is the alias error.
+        let tmp = tempdir().unwrap();
+        let availability = probe_semantic_availability_for_embedder(
+            tmp.path(),
+            probe_embedder_name_for_policy("external"),
+        );
+        assert!(
+            !matches!(
+                &availability,
+                SemanticAvailability::LoadFailed { context }
+                    if context.contains("unsupported semantic embedder")
+            ),
+            "external selection must reach external admission: {availability:?}"
+        );
+        assert!(!availability.can_search(), "{availability:?}");
     }
 
     #[test]
