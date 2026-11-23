@@ -1339,17 +1339,34 @@ impl QuillCassIndex {
             return Ok(());
         }
         self.commit()?;
+        self.delete_committed_cass_document_ids(document_ids)
+            .map(|_| ())
+    }
+
+    /// Remove exact identities from the already committed generation without
+    /// an intervening commit, compaction, or tier merge. A caller that checked
+    /// a native content witness must delete the same resolved physical row;
+    /// pending writes are an error rather than permission to change authority.
+    pub fn delete_committed_cass_document_ids(&mut self, document_ids: &[String]) -> Result<usize> {
+        if document_ids.is_empty() {
+            return Ok(0);
+        }
+        anyhow::ensure!(
+            !self.index.has_uncommitted_changes(),
+            "witnessed CASS deletion requires a fully committed generation"
+        );
         let ids: Vec<&str> = document_ids.iter().map(String::as_str).collect();
-        self.with_engine_liveness(|| {
-            drive(|cx| {
-                let index = &self.index;
-                let ids = &ids;
-                async move { index.delete_documents(&cx, ids).await }
-            })
-        })?
-        .map_err(|error| anyhow!("removing revised CASS documents from Quill: {error}"))?;
+        let deleted = self
+            .with_engine_liveness(|| {
+                drive(|cx| {
+                    let index = &self.index;
+                    let ids = &ids;
+                    async move { index.delete_documents(&cx, ids).await }
+                })
+            })?
+            .map_err(|error| anyhow!("removing revised CASS documents from Quill: {error}"))?;
         self.tick_heartbeat();
-        Ok(())
+        Ok(deleted)
     }
 
     /// Publish everything staged since the last commit.

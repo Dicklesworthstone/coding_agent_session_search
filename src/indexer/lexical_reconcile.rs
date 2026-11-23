@@ -19,17 +19,19 @@
 //! 5. verify every projected document's native content witness, exact endpoint
 //!    canaries and the replay live-doc count before clearing the checkpoint.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use frankensearch::quill::cass::CassDocument;
+use frankensearch::quill::cass::legacy_v9::cass_document_identity;
+use frankensearch::quill::cass::{CassConversationKey, CassDocument, CassDocumentRef};
 use serde::{Deserialize, Serialize};
 
 use crate::model::types::Message;
 use crate::search::asset_state::SearchMaintenanceMode;
 use crate::search::tantivy::{TantivyIndex, expected_index_dir};
+use crate::sources::provenance::LOCAL_SOURCE_ID;
 use crate::storage::sqlite::{FrankenStorage, LexicalRebuildConversationRow};
 
 pub(super) mod canary;
@@ -39,6 +41,102 @@ pub(super) mod snapshot;
 const CHECKPOINT_MAX_BYTES: u64 = 64 * 1024;
 const RECONCILE_BATCH_MAX_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 const RECONCILE_BATCH_MAX_MESSAGES: usize = 16_384;
+const LEGACY_CLEANUP_MAX_IDENTITIES: usize = 256;
+const LEGACY_CLEANUP_MAX_ID_BYTES: usize = 64 * 1024;
+
+fn legacy_local_identity_max_bytes(document: &CassDocument) -> Result<usize> {
+    // The v9 key contains three separators and at most twenty decimal bytes
+    // each for a signed conversation ID and an unsigned message index. Allow
+    // for geometric String growth when splitting; actual retained capacities
+    // are checked separately before any batch mutation.
+    document
+        .source_path
+        .len()
+        .checked_add(LOCAL_SOURCE_ID.len() + 3 + 20 + 20)
+        .and_then(|bytes| bytes.checked_mul(2))
+        .context("legacy lexical identity size overflow; checkpoint retained")
+}
+
+fn remove_legacy_local_copy_batch(
+    index: &mut TantivyIndex,
+    docs: &[CassDocument],
+) -> Result<usize> {
+    let identity_bytes = docs.iter().try_fold(0usize, |bytes, document| {
+        bytes
+            .checked_add(legacy_local_identity_max_bytes(document)?)
+            .context("legacy lexical cleanup size overflow; checkpoint retained")
+    })?;
+    anyhow::ensure!(
+        docs.len() <= LEGACY_CLEANUP_MAX_IDENTITIES
+            && identity_bytes <= LEGACY_CLEANUP_MAX_ID_BYTES,
+        "legacy lexical cleanup exceeds its identity budget; checkpoint retained"
+    );
+    if docs.is_empty() {
+        return Ok(0);
+    }
+    let published = canary::exact::PublishedSnapshot::from_keeper(index.committed_snapshot()?)?;
+    let count_before = published.doc_count();
+    let mut identities = BTreeSet::new();
+    let mut retained_capacity = 0usize;
+    for document in docs {
+        // An authoritative local identity must never be its own candidate,
+        // even if its origin metadata is remote.
+        if document.source_id == LOCAL_SOURCE_ID {
+            continue;
+        }
+        let legacy = CassDocumentRef {
+            source_id: LOCAL_SOURCE_ID,
+            origin_kind: "local",
+            origin_host: None,
+            ..document.as_ref()
+        };
+        if published.classify_content_ref(legacy)? != canary::exact::ContentMatch::Matching {
+            continue;
+        }
+        anyhow::ensure!(
+            published.verify_content(document)?,
+            "authoritative lexical counterpart is missing or stale for conversation {:?} \
+             message {}; checkpoint retained",
+            document.conversation_id,
+            document.msg_idx
+        );
+        let identity = cass_document_identity(
+            legacy.source_id,
+            CassConversationKey::for_document(legacy),
+            legacy.msg_idx,
+        );
+        retained_capacity = retained_capacity
+            .checked_add(identity.capacity())
+            .context("legacy lexical identity capacity overflow; checkpoint retained")?;
+        anyhow::ensure!(
+            retained_capacity <= LEGACY_CLEANUP_MAX_ID_BYTES,
+            "legacy lexical cleanup exceeds its retained identity budget; checkpoint retained"
+        );
+        anyhow::ensure!(
+            identities.insert(identity),
+            "legacy lexical cleanup contains a repeated identity; checkpoint retained"
+        );
+    }
+    // No previous generation remains pinned across a deletion. The writer
+    // admission and run lock preserve the authority used above; Quill resolves
+    // the same representative again and tombstones that one physical row.
+    // Native ambiguity errors propagate. This is not a corpus-wide duplicate
+    // audit or a repair of corrupted non-representative rows/tombstones.
+    drop(published);
+    if identities.is_empty() {
+        return Ok(0);
+    }
+    let identities = identities.into_iter().collect::<Vec<_>>();
+    let expected_count = count_before
+        .checked_sub(u64::try_from(identities.len())?)
+        .context("legacy lexical cleanup count underflow; checkpoint retained")?;
+    let deleted = index.delete_witnessed_document_ids(&identities)?;
+    anyhow::ensure!(
+        deleted == identities.len() && index.doc_count()? == expected_count,
+        "legacy lexical cleanup removed an unexpected document count; checkpoint retained"
+    );
+    Ok(identities.len())
+}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ProjectionSummary {
@@ -199,6 +297,62 @@ impl CanonicalProjection<'_> {
         Ok(verified_docs)
     }
 
+    /// Remove only the exact local copies produced by the former canonical
+    /// replay provenance bug. A different payload, metadata, or v9 identity
+    /// collision is ambiguous evidence and must remain untouched. Deletion
+    /// targets only the witnessed native representative; resolver ambiguity
+    /// errors refuse the batch rather than authorize deleting other rows.
+    fn remove_legacy_local_copies(
+        &self,
+        index: &mut TantivyIndex,
+        checkpoint: &LexicalReconcileCheckpoint,
+    ) -> Result<usize> {
+        anyhow::ensure!(
+            checkpoint.version == checkpoint::VERSION
+                && checkpoint.expected_docs > 0
+                && self.conversation_id == checkpoint.conversation_id
+                && self.row.source_id == checkpoint.source_id
+                && self.row.source_path.to_string_lossy().as_ref() == checkpoint.source_path,
+            "invalid lexical cleanup binding; checkpoint retained"
+        );
+        if self.provenance.source_id == LOCAL_SOURCE_ID {
+            return Ok(0);
+        }
+        let mut fingerprint = checkpoint::ProjectionFingerprint::new(checkpoint.expected_docs);
+        let mut removed = 0usize;
+        let summary = self.visit(|docs| {
+            fingerprint.update(docs)?;
+            let mut start = 0;
+            while start < docs.len() {
+                let mut end = start;
+                let mut bytes = 0usize;
+                while end < docs.len() && end - start < LEGACY_CLEANUP_MAX_IDENTITIES {
+                    let next_bytes = legacy_local_identity_max_bytes(&docs[end])?;
+                    anyhow::ensure!(
+                        next_bytes <= LEGACY_CLEANUP_MAX_ID_BYTES,
+                        "legacy lexical identity exceeds its cleanup budget; checkpoint retained"
+                    );
+                    if next_bytes > LEGACY_CLEANUP_MAX_ID_BYTES - bytes {
+                        break;
+                    }
+                    bytes += next_bytes;
+                    end += 1;
+                }
+                removed = removed
+                    .checked_add(remove_legacy_local_copy_batch(index, &docs[start..end])?)
+                    .context("legacy lexical cleanup count overflow; checkpoint retained")?;
+                start = end;
+            }
+            Ok(())
+        })?;
+        anyhow::ensure!(
+            summary.matches_checkpoint(checkpoint)
+                && checkpoint.projection_blake3.as_deref() == Some(fingerprint.finish()?.as_str()),
+            "canonical lexical projection changed during cleanup; checkpoint retained"
+        );
+        Ok(removed)
+    }
+
     // Keep the original complete replay as an independent test comparator.
     // Production uses publication-bound durable progress below.
     #[cfg(test)]
@@ -265,6 +419,9 @@ pub(crate) struct LexicalReconcileReport {
     /// First-pass documents submitted in this invocation, excluding a resumed
     /// prefix. Zero is valid when resuming the verification replay pass.
     pub upserted_docs: usize,
+    /// Exact copies left under the old local provenance identity, removed
+    /// only after their authoritative counterparts were fully witnessed.
+    pub removed_legacy_local_copies: usize,
     /// Every expected identity checked against native full-document witnesses
     /// and stored columns on one immutable publication, without ranking.
     pub verified_docs: usize,
@@ -479,12 +636,23 @@ pub(crate) fn run_lexical_conversation_reconcile(
     )?;
     let upserted_docs = published.upserted_docs;
     let doc_count_after_first = published.first_pass_live_docs;
+    let doc_count_after_replay = index.doc_count()?;
+    let converged = doc_count_after_replay == doc_count_after_first;
+    // Publication cursors are retained through cleanup. Each deletion changes
+    // the manifest, so an interrupted cleanup invalidates its earlier cursor
+    // and safely replays on retry. Never migrate incompatible old checkpoints.
+    let removed_legacy_local_copies =
+        projection.remove_legacy_local_copies(&mut index, &checkpoint)?;
     // One native admission supplies identity lookup, stored columns and live
     // accounting. Never rank endpoint discovery: an exact message can fall
     // below every page of a bounded common-term query on a large archive.
     let published = canary::exact::PublishedSnapshot::open(&index_path)?;
     let doc_count_after = published.doc_count();
-    let converged = doc_count_after.cmp(&doc_count_after_first).is_eq();
+    anyhow::ensure!(
+        doc_count_after.checked_add(u64::try_from(removed_legacy_local_copies)?)
+            == Some(doc_count_after_replay),
+        "lexical cleanup changed unrelated live-document accounting; checkpoint retained"
+    );
 
     // 5. Early/late endpoints against the published snapshot. Tokenless
     // messages must be verified too; unknown evidence cannot clear recovery.
@@ -517,6 +685,7 @@ pub(crate) fn run_lexical_conversation_reconcile(
         message_count: summary.message_count,
         expected_docs: summary.expected_docs,
         upserted_docs,
+        removed_legacy_local_copies,
         verified_docs,
         verification_kind: "quill-idmap-schema-v1-xxh3-64-and-stored-columns",
         doc_count_before,
@@ -803,6 +972,7 @@ mod tests {
         assert!(!checkpoint_path.with_extension("progress.json").exists());
         let json = serde_json::to_value(report)?;
         assert_eq!(json["verified_docs"], 3);
+        assert_eq!(json["removed_legacy_local_copies"], 0);
         assert_eq!(
             json["verification_kind"],
             "quill-idmap-schema-v1-xxh3-64-and-stored-columns"
@@ -849,6 +1019,16 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn public_reconcile_preserves_canonical_source_identity() -> Result<()> {
+        assert_public_reconcile_source_identity(false)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn public_reconcile_removes_witnessed_legacy_local_copies() -> Result<()> {
+        assert_public_reconcile_source_identity(true)
+    }
+
+    fn assert_public_reconcile_source_identity(seed_legacy_local_copies: bool) -> Result<()> {
         use crate::search::query::{FieldMask, SearchClient, SearchFilters};
         use crate::sources::provenance::{Source, SourceFilter};
 
@@ -868,7 +1048,11 @@ mod tests {
         })?;
         let mut named_local = Source::local();
         named_local.id = "full-history-plan".into();
-        let sources = [Source::remote("laptop", "laptop.example"), named_local];
+        let sources = [
+            Source::remote("laptop", "laptop.example"),
+            named_local,
+            Source::local(),
+        ];
         let mut conversations = Vec::new();
         let mut retained = Vec::new();
         for source in &sources {
@@ -879,7 +1063,17 @@ mod tests {
             ]);
             canonical.id = None;
             canonical.external_id = Some(format!("source-proof-{}", source.id));
-            canonical.source_path = PathBuf::from(format!("/archive/{}.jsonl", source.id));
+            // An independent local history shares the remote transcript path
+            // and message text; its different canonical conversation ID must
+            // keep it out of the narrowly witnessed cleanup.
+            canonical.source_path = PathBuf::from(format!(
+                "/archive/{}.jsonl",
+                if source.id == LOCAL_SOURCE_ID {
+                    "laptop"
+                } else {
+                    &source.id
+                }
+            ));
             canonical.source_id = source.id.clone();
             canonical.origin_host = source.host_label.clone();
             canonical.metadata_json = serde_json::json!({"cass":{"origin":{
@@ -912,6 +1106,20 @@ mod tests {
                 origin_host: source.host_label.clone(),
                 conversation_id: Some(id),
             });
+            if seed_legacy_local_copies && source.id != LOCAL_SOURCE_ID {
+                let template = retained.last().context("retained tail")?.clone();
+                for message in &canonical.messages {
+                    retained.push(CassDocument {
+                        source_id: LOCAL_SOURCE_ID.into(),
+                        origin_kind: "local".into(),
+                        origin_host: None,
+                        msg_idx: message.idx as u64,
+                        created_at: message.created_at,
+                        content: message.content.clone(),
+                        ..template.clone()
+                    });
+                }
+            }
         }
         storage.close()?;
         super::super::rebuild_tantivy_from_db(&db_path, &rebuilt_data, 2, None)?;
@@ -919,7 +1127,10 @@ mod tests {
         let mut index = TantivyIndex::open_or_create(&repaired_path)?;
         index.add_prebuilt_documents_slice(&retained)?;
         index.commit()?;
-        assert_eq!(index.doc_count()?, 2);
+        assert_eq!(
+            index.doc_count()?,
+            if seed_legacy_local_copies { 7 } else { 3 }
+        );
         drop(index);
 
         let search = |index_path: &Path, source_filter: SourceFilter| -> Result<Vec<String>> {
@@ -954,18 +1165,26 @@ mod tests {
             hits.sort();
             Ok(hits)
         };
-        for _ in 0..2 {
-            for &id in &conversations {
+        for attempt in 0..2 {
+            for (source, &id) in sources.iter().zip(&conversations) {
                 let report = run_lexical_conversation_reconcile(&repaired_data, &db_path, id)?;
                 assert!(report.checkpoint_cleared);
                 assert_eq!(report.verified_docs, 2);
+                let expected_removals =
+                    if seed_legacy_local_copies && attempt == 0 && source.id != LOCAL_SOURCE_ID {
+                        2
+                    } else {
+                        0
+                    };
+                assert_eq!(report.removed_legacy_local_copies, expected_removals);
             }
             for (filter, count) in [
-                (SourceFilter::All, 4),
+                (SourceFilter::All, 6),
                 (SourceFilter::Remote, 2),
-                (SourceFilter::Local, 2),
+                (SourceFilter::Local, 4),
                 (SourceFilter::SourceId("laptop".into()), 2),
                 (SourceFilter::SourceId("full-history-plan".into()), 2),
+                (SourceFilter::SourceId(LOCAL_SOURCE_ID.into()), 2),
                 (SourceFilter::SourceId("obsolete-source".into()), 0),
             ] {
                 let expected = search(&expected_index_dir(&rebuilt_data), filter.clone())?;
@@ -980,9 +1199,261 @@ mod tests {
         let published = canary::exact::PublishedSnapshot::open(&repaired_path)?;
         assert_eq!(
             published.doc_count(),
-            4,
+            6,
             "repair must not duplicate source identities"
         );
+        Ok(())
+    }
+
+    fn cleanup_document(message_index: u64) -> CassDocument {
+        CassDocument {
+            agent: "codex".into(),
+            workspace: None,
+            workspace_original: None,
+            source_path: "/archive/cleanup.jsonl".into(),
+            msg_idx: message_index,
+            created_at: Some(1_700_000_000_000),
+            title: Some("legacy cleanup".into()),
+            content: format!("legacyguard canonical message {message_index}"),
+            source_id: "laptop".into(),
+            origin_kind: "remote".into(),
+            origin_host: Some("laptop.example".into()),
+            conversation_id: Some(42),
+        }
+    }
+
+    fn legacy_local_copy(document: &CassDocument) -> CassDocument {
+        CassDocument {
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+            ..document.clone()
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn legacy_local_cleanup_preserves_different_content_and_identity_collisions() -> Result<()> {
+        use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+        use crate::sources::provenance::SourceFilter;
+
+        let temp = TempDir::new()?;
+        let index_path = expected_index_dir(temp.path());
+        let canonical = (0..3).map(cleanup_document).collect::<Vec<_>>();
+        let matching = legacy_local_copy(&canonical[0]);
+        let mut different_content = legacy_local_copy(&canonical[1]);
+        different_content.content = "legacyguard unrelated local history".into();
+        let mut collision = legacy_local_copy(&canonical[2]);
+        let expected_collision = cass_document_identity(
+            &collision.source_id,
+            CassConversationKey::for_document(collision.as_ref()),
+            collision.msg_idx,
+        );
+        // Retained v9 identities concatenate separators. This independent
+        // path without a conversation ID has the same opaque key as the
+        // proposed legacy copy, but different native stored metadata.
+        collision.source_path.push_str("#42");
+        collision.conversation_id = None;
+        assert_eq!(
+            cass_document_identity(
+                &collision.source_id,
+                CassConversationKey::for_document(collision.as_ref()),
+                collision.msg_idx,
+            ),
+            expected_collision
+        );
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        index.add_prebuilt_documents_slice(&canonical)?;
+        index.add_prebuilt_documents_slice(&[
+            matching.clone(),
+            different_content.clone(),
+            collision.clone(),
+        ])?;
+        index.commit()?;
+        assert_eq!(remove_legacy_local_copy_batch(&mut index, &canonical)?, 1);
+        assert_eq!(remove_legacy_local_copy_batch(&mut index, &canonical)?, 0);
+        assert_eq!(index.doc_count()?, 5);
+        drop(index);
+
+        let published = canary::exact::PublishedSnapshot::open(&index_path)?;
+        assert!(!published.verify_content(&matching)?);
+        assert!(published.verify_content(&different_content)?);
+        assert!(published.verify_content(&collision)?);
+        for document in &canonical {
+            assert!(published.verify_content(document)?);
+        }
+        let client = SearchClient::open(&index_path, None)?.context("cleanup test index")?;
+        let hits = client.search(
+            "legacyguard",
+            SearchFilters {
+                source_filter: SourceFilter::Local,
+                ..SearchFilters::default()
+            },
+            20,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|hit| {
+            hit.source_path == different_content.source_path
+                && hit.content == different_content.content
+        }));
+        assert!(hits.iter().any(|hit| {
+            hit.source_path == collision.source_path
+                && hit.conversation_id == collision.conversation_id
+                && hit.content == collision.content
+        }));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn legacy_local_cleanup_requires_full_authoritative_counterpart() -> Result<()> {
+        let temp = TempDir::new()?;
+        let index_path = expected_index_dir(temp.path());
+        let canonical = cleanup_document(0);
+        let legacy = legacy_local_copy(&canonical);
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        index.add_prebuilt_documents_slice(std::slice::from_ref(&legacy))?;
+        index.commit()?;
+        for stale_counterpart in [false, true] {
+            if stale_counterpart {
+                let mut stale = canonical.clone();
+                stale.content = "legacyguard stale authoritative payload".into();
+                index.add_prebuilt_documents_slice(&[stale])?;
+                index.commit()?;
+            }
+            let count = index.doc_count()?;
+            let manifest = std::fs::read(index_path.join("MANIFEST"))?;
+            let error =
+                remove_legacy_local_copy_batch(&mut index, std::slice::from_ref(&canonical))
+                    .expect_err("missing or stale authority cannot authorize deletion");
+            assert!(
+                error
+                    .to_string()
+                    .contains("counterpart is missing or stale")
+            );
+            assert_eq!(index.doc_count()?, count);
+            assert_eq!(std::fs::read(index_path.join("MANIFEST"))?, manifest);
+            let published =
+                canary::exact::PublishedSnapshot::from_keeper(index.committed_snapshot()?)?;
+            assert!(published.verify_content(&legacy)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn legacy_local_cleanup_refuses_pending_index_mutations() -> Result<()> {
+        let temp = TempDir::new()?;
+        let index_path = expected_index_dir(temp.path());
+        let canonical = cleanup_document(0);
+        let legacy = legacy_local_copy(&canonical);
+        let unrelated = cleanup_document(7);
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        index.add_prebuilt_documents_slice(&[canonical.clone(), legacy])?;
+        index.commit()?;
+        let manifest = std::fs::read(index_path.join("MANIFEST"))?;
+        index.add_prebuilt_documents_slice(std::slice::from_ref(&unrelated))?;
+        let error = remove_legacy_local_copy_batch(&mut index, std::slice::from_ref(&canonical))
+            .expect_err("cleanup cannot commit pending changes after witnessing a generation");
+        assert!(error.to_string().contains("fully committed generation"));
+        assert_eq!(index.doc_count()?, 2);
+        assert_eq!(std::fs::read(index_path.join("MANIFEST"))?, manifest);
+
+        index.commit()?;
+        assert_eq!(index.doc_count()?, 3);
+        assert_eq!(
+            remove_legacy_local_copy_batch(&mut index, std::slice::from_ref(&canonical))?,
+            1
+        );
+        let published = canary::exact::PublishedSnapshot::from_keeper(index.committed_snapshot()?)?;
+        assert!(published.verify_content(&canonical)?);
+        assert!(published.verify_content(&unrelated)?);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn legacy_local_cleanup_refuses_multiple_live_identity_rows() -> Result<()> {
+        use frankensearch::quill::KeeperError;
+
+        let temp = TempDir::new()?;
+        let index_path = expected_index_dir(temp.path());
+        let canonical = cleanup_document(0);
+        let legacy = legacy_local_copy(&canonical);
+        let identity = cass_document_identity(
+            &legacy.source_id,
+            CassConversationKey::for_document(legacy.as_ref()),
+            legacy.msg_idx,
+        );
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        index.add_prebuilt_documents_slice(&[canonical.clone(), legacy.clone()])?;
+        index.commit()?;
+        let old_id = index
+            .committed_snapshot()?
+            .resolve_document_id(&identity)?
+            .context("original legacy identity")?
+            .global_docid;
+        let mut different = legacy;
+        different.content = "legacyguard independent same-ID payload".into();
+        index.upsert_prebuilt_documents_slice(&[different])?;
+        index.commit()?;
+        let mut manifest = index
+            .committed_snapshot()?
+            .loaded_manifest()
+            .manifest
+            .clone();
+        drop(index);
+
+        // Reproduce a corrupt historical publication with two live physical
+        // rows behind one opaque ID: one matches the candidate and the other
+        // does not. Native resolution must reject the ambiguity instead of
+        // selecting a matching row and authorizing deletion of its sibling.
+        let segment = manifest
+            .segments
+            .iter_mut()
+            .find(|segment| segment.tombstones.contains(old_id))
+            .context("upsert tombstoned the original physical row")?;
+        assert!(segment.tombstones.remove(old_id)?);
+        let bytes = manifest.to_bytes()?;
+        std::fs::write(index_path.join("MANIFEST"), &bytes)?;
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        assert_eq!(index.doc_count()?, 3);
+        let error = remove_legacy_local_copy_batch(&mut index, std::slice::from_ref(&canonical))
+            .expect_err("ambiguous native identities must refuse cleanup");
+        assert!(matches!(
+            error.downcast_ref::<KeeperError>(),
+            Some(KeeperError::MultipleLiveDocumentIds { .. })
+        ));
+        assert_eq!(index.doc_count()?, 3);
+        assert_eq!(std::fs::read(index_path.join("MANIFEST"))?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn legacy_local_cleanup_bounds_identity_storage_before_mutation() -> Result<()> {
+        let temp = TempDir::new()?;
+        let index_path = expected_index_dir(temp.path());
+        let canonical = cleanup_document(0);
+        let legacy = legacy_local_copy(&canonical);
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        index.add_prebuilt_documents_slice(&[canonical.clone(), legacy])?;
+        index.commit()?;
+        let manifest = std::fs::read(index_path.join("MANIFEST"))?;
+        let mut oversized = canonical.clone();
+        oversized.source_path = "x".repeat(LEGACY_CLEANUP_MAX_ID_BYTES);
+        for batch in [
+            vec![oversized],
+            vec![canonical; LEGACY_CLEANUP_MAX_IDENTITIES + 1],
+        ] {
+            let error = remove_legacy_local_copy_batch(&mut index, &batch)
+                .expect_err("oversized cleanup admission must precede any mutation");
+            assert!(error.to_string().contains("identity budget"));
+            assert_eq!(index.doc_count()?, 2);
+            assert_eq!(std::fs::read(index_path.join("MANIFEST"))?, manifest);
+        }
         Ok(())
     }
 

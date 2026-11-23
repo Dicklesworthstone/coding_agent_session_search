@@ -2157,6 +2157,14 @@ impl TantivyIndex {
         Ok(())
     }
 
+    /// Remove a bounded batch of exact identities whose native representatives
+    /// the caller has verified against this writer's committed snapshot.
+    /// Quill re-resolves each identity and tombstones that one physical row;
+    /// native ambiguity errors propagate instead of authorizing broad deletion.
+    pub(crate) fn delete_witnessed_document_ids(&mut self, identities: &[String]) -> Result<usize> {
+        self.inner.delete_committed_cass_document_ids(identities)
+    }
+
     /// Total live documents in the published snapshot.
     pub fn doc_count(&self) -> Result<u64> {
         self.inner.doc_count()
