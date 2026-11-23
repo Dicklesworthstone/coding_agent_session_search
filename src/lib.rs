@@ -5489,6 +5489,9 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
     let mut rest: Vec<String> = Vec::new();
     let mut sub_seen = false;
     let mut corrections: Vec<String> = Vec::new();
+    // `--verbose`/`-v` written after a subcommand that declares its own detail
+    // flag. Re-attached after the positional rewrites below (GH #546).
+    let mut command_local_verbose: Option<String> = None;
 
     // Known long flags (without --) for single-dash and case normalization
     const KNOWN_LONG_FLAGS: &[&str] = &[
@@ -5866,6 +5869,20 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
             }
         }
 
+        // `--verbose`/`-v` after a subcommand with its own `verbose` field
+        // (diag, doctor, pages, sources list|sync|setup) asks for that
+        // command's detail output. Hoisting it bound it to the global
+        // log-level flag instead, so those fields could never be set (GH #546).
+        // Before the subcommand it stays the global flag.
+        if sub_seen
+            && matches!(normalized_arg.as_str(), "--verbose" | "-v")
+            && post_subcommand_verbose_is_command_local(&rest, &args[i + 1..])
+        {
+            command_local_verbose.get_or_insert(normalized_arg);
+            i += 1;
+            continue;
+        }
+
         // Handle global flags
         if is_global(&normalized_arg) {
             globals.push(normalized_arg.clone());
@@ -6213,6 +6230,15 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         corrections
             .push("Top-level --json/--robot → 'triage --json' (read-only agent preflight)".into());
     }
+    // Re-attach a command-local detail flag after the verb rewrites above
+    // (`doctor -v check` → `doctor --check -v`), ahead of any `--` separator.
+    if let Some(flag) = command_local_verbose {
+        let at = rest
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(rest.len());
+        rest.insert(at, flag);
+    }
     normalized.push(prog.clone());
     normalized.extend(globals);
     normalized.extend(rest);
@@ -6231,6 +6257,31 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         ))
     };
     (normalized, note)
+}
+
+/// Whether a `--verbose`/`-v` seen after the subcommand belongs to a command
+/// that declares its own `verbose` field rather than to the global log flag.
+///
+/// `seen` holds the tokens already routed after the subcommand name (aliases
+/// already canonicalized); `remaining` is the raw argv after the flag. Only the
+/// innermost command decides: `pages key …` has no detail flag, and the
+/// `sources` group declares one only on `list`, `sync` and `setup`.
+fn post_subcommand_verbose_is_command_local(seen: &[String], remaining: &[&String]) -> bool {
+    let Some(command_at) = seen.iter().position(|arg| !arg.starts_with('-')) else {
+        return false;
+    };
+    let after_command = &seen[command_at + 1..];
+    match seen[command_at].to_ascii_lowercase().as_str() {
+        "diag" | "doctor" => true,
+        "pages" => !after_command
+            .iter()
+            .chain(remaining.iter().copied())
+            .any(|arg| arg.eq_ignore_ascii_case("key")),
+        "sources" => after_command.first().is_some_and(|sub| {
+            matches!(sub.to_ascii_lowercase().as_str(), "list" | "sync" | "setup")
+        }),
+        _ => false,
+    }
 }
 
 /// Build a helpful error message when a command group (e.g. `analytics`, `sources`,
@@ -7231,6 +7282,138 @@ mod canonical_top_level_command_tests {
             !normalized.iter().any(|arg| arg == "search"),
             "forget must not be folded into an implicit search query (GH #367): {normalized:?}"
         );
+    }
+
+    /// GH #546: `--verbose`/`-v` after a subcommand that declares its own
+    /// detail flag must set that flag. It used to be hoisted to the global
+    /// log-level flag, so `cass doctor check --json --verbose` (the command
+    /// doctor itself prints for full details) stayed capped at 64 records.
+    /// Before the subcommand, or after one without a local flag, it stays
+    /// global.
+    #[test]
+    fn post_subcommand_verbose_reaches_command_local_detail_flags() {
+        let parse = |args: &[&str]| {
+            let (normalized, _) = normalize_args(args.iter().map(ToString::to_string).collect());
+            Cli::try_parse_from(normalized.clone())
+                .unwrap_or_else(|err| panic!("parse {normalized:?}: {err}"))
+        };
+        for flag in ["--verbose", "-v"] {
+            for args in [
+                vec!["cass", "doctor", "check", "--json", flag],
+                vec!["cass", "doctor", flag, "check", "--json"],
+                vec![
+                    "cass",
+                    "doctor",
+                    "--check",
+                    "--json",
+                    flag,
+                    "--data-dir",
+                    "/x",
+                ],
+            ] {
+                let cli = parse(&args);
+                assert!(!cli.verbose, "{args:?} must not set the global flag");
+                assert!(
+                    matches!(
+                        cli.command,
+                        Some(Commands::Doctor {
+                            check: true,
+                            verbose: true,
+                            ..
+                        })
+                    ),
+                    "{args:?} must set doctor's own verbose flag: {:?}",
+                    cli.command
+                );
+            }
+            let cli = parse(&["cass", "doctor", "repair", "--dry-run", "--json", flag]);
+            assert!(!cli.verbose);
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Doctor {
+                    repair: true,
+                    dry_run: true,
+                    verbose: true,
+                    ..
+                })
+            ));
+            for args in [
+                vec!["cass", "diag", "--json", flag],
+                vec!["cass", "check", flag],
+            ] {
+                let cli = parse(&args);
+                assert!(!cli.verbose, "{args:?}");
+                assert!(
+                    matches!(cli.command, Some(Commands::Diag { verbose: true, .. })),
+                    "{args:?}: {:?}",
+                    cli.command
+                );
+            }
+            let cli = parse(&["cass", "pages", "--verify", "/x", "--json", flag]);
+            assert!(!cli.verbose);
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Pages {
+                    subcommand: None,
+                    verbose: true,
+                    ..
+                })
+            ));
+            let cli = parse(&["cass", "sources", "list", flag]);
+            assert!(!cli.verbose);
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Sources(SourcesCommand::List {
+                    verbose: true,
+                    ..
+                }))
+            ));
+            let cli = parse(&["cass", "sources", "sync", "--source", "laptop", flag]);
+            assert!(!cli.verbose);
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Sources(SourcesCommand::Sync {
+                    verbose: true,
+                    ..
+                }))
+            ));
+            let cli = parse(&["cass", "sources", "setup", "--hosts", "a,b", flag]);
+            assert!(!cli.verbose);
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Sources(SourcesCommand::Setup {
+                    verbose: true,
+                    ..
+                }))
+            ));
+
+            // Global placements and commands without a local flag keep the
+            // global log-level meaning.
+            let cli = parse(&["cass", flag, "doctor", "check", "--json"]);
+            assert!(cli.verbose);
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Doctor {
+                    check: true,
+                    verbose: false,
+                    ..
+                })
+            ));
+            let cli = parse(&["cass", "search", "needle", "--robot", flag]);
+            assert!(cli.verbose);
+            assert!(matches!(cli.command, Some(Commands::Search { .. })));
+            let cli = parse(&["cass", "pages", "key", "list", "--archive", "/x", flag]);
+            assert!(cli.verbose, "pages key has no local detail flag");
+            let cli = parse(&["cass", "sources", "doctor", flag]);
+            assert!(cli.verbose, "sources doctor has no local detail flag");
+        }
+
+        // A repeated flag is one request, not a clap duplicate-argument error.
+        let cli = parse(&["cass", "doctor", "check", "--json", "-v", "--verbose"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Doctor { verbose: true, .. })
+        ));
     }
 }
 
@@ -8629,14 +8812,19 @@ async fn execute_cli(
                     }
                     // Handle --verify first
                     if let Some(verify_path) = verify {
-                        let result = crate::pages::verify::verify_bundle(&verify_path, verbose)
-                            .map_err(|e| CliError {
-                                code: 9,
-                                kind: CliErrorKind::Pages.kind_str(),
-                                message: format!("Verification failed: {e}"),
-                                hint: None,
-                                retryable: false,
-                            })?;
+                        // Progress lines go to stdout; structured output carries
+                        // every check result already and must stay one document.
+                        let result = crate::pages::verify::verify_bundle(
+                            &verify_path,
+                            verbose && structured_format.is_none(),
+                        )
+                        .map_err(|e| CliError {
+                            code: 9,
+                            kind: CliErrorKind::Pages.kind_str(),
+                            message: format!("Verification failed: {e}"),
+                            hint: None,
+                            retryable: false,
+                        })?;
 
                         if let Some(fmt) = structured_format {
                             output_structured_value(
