@@ -32187,15 +32187,13 @@ mod search_lexical_self_heal_tests {
         assert_eq!(search().expect("positive control").0.hits.len(), 1);
 
         crate::search::privacy::begin_forget(&db_path).expect("start privacy fence");
-        let pending = search().err().expect("pending repair must refuse queries");
+        let pending = search().expect_err("pending repair must refuse queries");
         assert_eq!((pending.code, pending.kind), (9, "forget-repair-pending"));
         assert!(!pending.retryable);
         assert!(pending.hint.is_none());
 
         crate::search::privacy::complete_forget(&db_path).expect("complete fence transition");
-        let invalidated = search()
-            .err()
-            .expect("completing repair must not renew a pinned reader");
+        let invalidated = search().expect_err("completing repair must not renew a pinned reader");
         assert_eq!(
             (invalidated.code, invalidated.kind),
             (9, "privacy-snapshot-invalidated")
