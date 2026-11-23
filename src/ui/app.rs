@@ -23270,7 +23270,8 @@ fn load_local_export_raw_messages(
     }
 
     if crate::detect_opencode_session(session_path) {
-        return crate::load_opencode_session_for_export(session_path)
+        // The TUI export is the full transcript, never the messages-only view.
+        return crate::load_opencode_session_for_export(session_path, false)
             .map(|(title, start, _end, msgs)| (msgs, title, start))
             .map_err(|err| format!("Failed to parse OpenCode session: {err}"));
     }
