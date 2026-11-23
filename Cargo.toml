@@ -274,7 +274,7 @@ rand_chacha = "0.10"
 tokenizers = { version = "*", default-features = false, features = ["fancy-regex"] }
 # rusqlite is retained only for C-SQLite interop fixtures in tests; production
 # storage and historical salvage paths use frankensqlite.
-rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
+rusqlite = { version = "0.43.0", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
 fsqlite-types = { version = "=0.4.12", package = "fsqlite-types" }
