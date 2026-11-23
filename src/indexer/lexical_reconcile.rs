@@ -1382,13 +1382,25 @@ mod tests {
         let index_path = expected_index_dir(temp.path());
         let canonical = cleanup_document(0);
         let legacy = legacy_local_copy(&canonical);
+        let controls = (101..=104)
+            .map(|conversation_id| CassDocument {
+                conversation_id: Some(conversation_id),
+                source_path: format!("/archive/unrelated-{conversation_id}.jsonl"),
+                ..cleanup_document(0)
+            })
+            .collect::<Vec<_>>();
         let identity = cass_document_identity(
             &legacy.source_id,
             CassConversationKey::for_document(legacy.as_ref()),
             legacy.msg_idx,
         );
         let mut index = TantivyIndex::open_or_create(&index_path)?;
-        index.add_prebuilt_documents_slice(&[canonical.clone(), legacy.clone()])?;
+        // Keep the replacement's tombstone density at 1/6, below CASS's
+        // default 0.20 automatic-compaction threshold. The old physical row
+        // must survive publication so this fixture can revive it explicitly.
+        let mut original = vec![canonical.clone(), legacy.clone()];
+        original.extend(controls.iter().cloned());
+        index.add_prebuilt_documents_slice(&original)?;
         index.commit()?;
         let old_id = index
             .committed_snapshot()?
@@ -1399,6 +1411,7 @@ mod tests {
         different.content = "legacyguard independent same-ID payload".into();
         index.upsert_prebuilt_documents_slice(&[different])?;
         index.commit()?;
+        assert_eq!(index.doc_count()?, 6);
         let mut manifest = index
             .committed_snapshot()?
             .loaded_manifest()
@@ -1414,20 +1427,27 @@ mod tests {
             .segments
             .iter_mut()
             .find(|segment| segment.tombstones.contains(old_id))
-            .context("upsert tombstoned the original physical row")?;
+            .context("original tombstone must survive automatic compaction")?;
+        assert_eq!(segment.doc_count, 6);
+        assert_eq!(segment.tombstones.cardinality(), 1);
         assert!(segment.tombstones.remove(old_id)?);
         let bytes = manifest.to_bytes()?;
         std::fs::write(index_path.join("MANIFEST"), &bytes)?;
         let mut index = TantivyIndex::open_or_create(&index_path)?;
-        assert_eq!(index.doc_count()?, 3);
+        assert_eq!(index.doc_count()?, 7);
         let error = remove_legacy_local_copy_batch(&mut index, std::slice::from_ref(&canonical))
             .expect_err("ambiguous native identities must refuse cleanup");
         assert!(matches!(
             error.downcast_ref::<KeeperError>(),
             Some(KeeperError::MultipleLiveDocumentIds { .. })
         ));
-        assert_eq!(index.doc_count()?, 3);
+        assert_eq!(index.doc_count()?, 7);
         assert_eq!(std::fs::read(index_path.join("MANIFEST"))?, bytes);
+        let published = canary::exact::PublishedSnapshot::from_keeper(index.committed_snapshot()?)?;
+        assert!(published.verify_content(&canonical)?);
+        for control in &controls {
+            assert!(published.verify_content(control)?);
+        }
         Ok(())
     }
 
