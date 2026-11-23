@@ -879,17 +879,35 @@ fn browser_lock_terminates_in_flight_crypto_before_reinitializing() {
     let clear_session_offset = lock_body
         .find("window.cassSession = null;")
         .expect("locking must clear the in-memory session key");
-    let first_await_offset = lock_body
-        .find("await closeQrScanner();")
-        .expect("locking should still close the QR scanner");
+    let first_cleanup_offset = lock_body
+        .find("void closeQrScanner();")
+        .expect("locking should still close the QR scanner independently");
     assert!(
-        reset_offset < first_await_offset,
+        lock_body
+            .find("closeLiveDatabase(lockToken);")
+            .is_some_and(|offset| offset < first_cleanup_offset),
+        "the database must be fenced synchronously before camera cleanup"
+    );
+    assert!(
+        reset_offset < first_cleanup_offset,
         "worker termination must happen synchronously before lockArchive yields"
     );
     assert!(
-        clear_session_offset < first_await_offset,
+        clear_session_offset < first_cleanup_offset,
         "the in-memory session key must be cleared before lockArchive yields"
     );
+    for boundary in [
+        "elements.appScreen.classList.add(\"hidden\");",
+        "broadcastAuthLock(action);",
+    ] {
+        let offset = lock_body
+            .find(boundary)
+            .expect("locking must hide plaintext and invalidate retained readers");
+        assert!(
+            offset < first_cleanup_offset,
+            "the visible lock and reader fence must precede asynchronous cleanup"
+        );
+    }
     assert!(
         !auth_js.contains("postMessage({ type: 'CLEAR_KEYS' })"),
         "a queued CLEAR_KEYS message is not a cancellation boundary"
@@ -906,7 +924,7 @@ fn browser_lock_terminates_in_flight_crypto_before_reinitializing() {
         .find("elements.passwordInput.value = \"\";")
         .expect("a successful unlock must erase the password input");
     let persist_session_offset = unlock_success_body
-        .find("persistSession(data.dek);")
+        .find("persistSession(data.dek)")
         .expect("successful unlock should still establish the configured session");
     assert!(
         clear_password_offset < persist_session_offset,

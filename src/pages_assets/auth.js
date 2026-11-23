@@ -11,6 +11,7 @@ import {
   initCOIDetection,
   onServiceWorkerActivated,
 } from "./coi-detector.js";
+import { closeDatabase } from "./database.js";
 import { createStrengthMeter } from "./password-strength.js";
 import { SESSION_CONFIG } from "./session.js";
 import { getArchiveScopeId, getStorageMode, getStoredMode, StorageMode } from "./storage.js";
@@ -25,6 +26,7 @@ let isUnencryptedArchive = false;
 let tofuStatus = { valid: true, isFirstVisit: true };
 let unlockInFlight = false;
 let decryptInFlight = false;
+let lockInFlight = false;
 let activeQrScannerSession = 0;
 let activeUnlockRequestId = null;
 let activeDecryptRequestId = null;
@@ -34,6 +36,7 @@ let qrLibraryLoadPromise = null;
 let qrScannerTeardownPromise = null;
 let activeSessionExpiryTs = 0;
 let activeSessionExpiryTimerId = null;
+const MAX_SESSION_TIMER_DELAY_MS = 2_147_483_647;
 const MAX_BROWSER_DATABASE_SIZE = 512 * 1024 * 1024;
 const ARCHIVE_SCOPE_URL = new URL("./", import.meta.url);
 const CRYPTO_WORKER_URL = new URL("crypto_worker.js", ARCHIVE_SCOPE_URL).href;
@@ -290,30 +293,36 @@ async function expireActiveSession() {
     return;
   }
 
-  await lockArchive({ broadcast: true, action: "expired" });
-  showError("Your session expired. Please unlock the archive again.");
+  await lockArchive({
+    broadcast: true,
+    action: "expired",
+    errorMessage: "Your session expired. Please unlock the archive again.",
+  });
 }
 
 function scheduleActiveSessionExpiry(expiryTs) {
   clearActiveSessionExpiryTimer();
 
-  const numericExpiry = Number(expiryTs);
-  if (!Number.isFinite(numericExpiry) || numericExpiry <= 0) {
+  const remainingMs = expiryTs - Date.now();
+  if (
+    !Number.isSafeInteger(expiryTs) ||
+    remainingMs <= 0 ||
+    remainingMs > MAX_SESSION_TIMER_DELAY_MS
+  ) {
     activeSessionExpiryTs = 0;
-    return;
+    throw new RangeError("Session expiry is outside the safe browser timer range");
   }
 
-  activeSessionExpiryTs = Math.trunc(numericExpiry);
-  const remainingMs = activeSessionExpiryTs - Date.now();
-  if (remainingMs <= 0) {
-    void expireActiveSession();
-    return;
+  activeSessionExpiryTs = expiryTs;
+  try {
+    activeSessionExpiryTimerId = window.setTimeout(() => {
+      activeSessionExpiryTimerId = null;
+      void expireActiveSession();
+    }, remainingMs);
+  } catch (error) {
+    activeSessionExpiryTs = 0;
+    throw error;
   }
-
-  activeSessionExpiryTimerId = window.setTimeout(() => {
-    activeSessionExpiryTimerId = null;
-    void expireActiveSession();
-  }, remainingMs);
 }
 
 function handleSessionVisibilityChange() {
@@ -641,7 +650,7 @@ async function handleUnlockClick(event) {
     event.preventDefault();
   }
 
-  if (unlockInFlight || decryptInFlight) {
+  if (lockInFlight || unlockInFlight || decryptInFlight) {
     return;
   }
 
@@ -705,7 +714,14 @@ function toggleFingerprintTooltip() {
  * Open QR code scanner
  */
 async function openQrScanner() {
+  if (lockInFlight) {
+    return;
+  }
+  const initToken = activeAppInitToken;
   await waitForQrScannerTeardown();
+  if (lockInFlight || !isCurrentAppInitToken(initToken)) {
+    return;
+  }
   if (qrScanner && !elements.qrScanner?.classList.contains("hidden")) {
     return;
   }
@@ -733,7 +749,11 @@ async function openQrScanner() {
     await scanner.start(
       { facingMode: "environment" },
       { fps: 10, qrbox: { width: 250, height: 250 } },
-      handleQrSuccess,
+      (decodedText) => {
+        if (isCurrentQrScannerSession(sessionToken) && qrScanner === scanner) {
+          handleQrSuccess(decodedText);
+        }
+      },
       handleQrError,
     );
     if (
@@ -776,7 +796,7 @@ async function closeQrScanner() {
  * Handle successful QR code scan
  */
 function handleQrSuccess(decodedText) {
-  if (unlockInFlight || decryptInFlight) {
+  if (lockInFlight || unlockInFlight || decryptInFlight) {
     return;
   }
 
@@ -790,6 +810,9 @@ function handleQrSuccess(decodedText) {
  * prints. Both reach the worker's UNLOCK_RECOVERY path unchanged.
  */
 function unlockWithRecoveryText(text, progressText) {
+  if (lockInFlight) {
+    return;
+  }
   hideError();
   showProgress(progressText);
   disableForm();
@@ -835,7 +858,7 @@ function toggleRecoveryKeyForm() {
  */
 function handleRecoveryKeySubmit(event) {
   event.preventDefault();
-  if (unlockInFlight || decryptInFlight) {
+  if (lockInFlight || unlockInFlight || decryptInFlight) {
     return;
   }
   const input = elements.recoveryKeyInput;
@@ -921,6 +944,8 @@ async function handleWorkerError(error) {
   console.error("Worker error:", error);
   const hadActiveSession = decryptInFlight || unlockInFlight || !!window.cassSession?.dek;
   invalidateAppInitAttempt();
+  const failureToken = activeAppInitToken;
+  lockInFlight = true;
   // Do not automatically recreate a worker which has crashed: a missing or
   // invalid script would otherwise create an unbounded crash/restart loop.
   terminateCryptoWorker();
@@ -934,17 +959,19 @@ async function handleWorkerError(error) {
   if (elements.passwordInput) {
     elements.passwordInput.value = "";
   }
-  await closeQrScanner();
-  await closeLiveDatabase();
+  if (elements.recoveryKeyInput) {
+    elements.recoveryKeyInput.value = "";
+  }
   hideProgress();
   disableForm();
+  elements.appScreen.classList.add("hidden");
+  elements.authScreen.classList.remove("hidden");
+  closeLiveDatabase(failureToken);
   if (hadActiveSession) {
     broadcastAuthLock("lock");
-    elements.appScreen.classList.add("hidden");
-    elements.authScreen.classList.remove("hidden");
-    elements.passwordInput.value = "";
   }
   showError("The decryption worker stopped unexpectedly. Reload this page to try again.");
+  void closeQrScanner();
 }
 
 /**
@@ -965,7 +992,9 @@ function handleUnlockSuccess(data) {
   };
 
   // Persist session based on selected storage mode
-  persistSession(data.dek);
+  if (!persistSession(data.dek)) {
+    return;
+  }
 
   // Transition to app
   transitionToApp();
@@ -1018,14 +1047,15 @@ async function handleDecryptSuccess(data) {
       throw new Error("Invalid database payload");
     }
     const dbModule = await import("./database.js");
+    if (!isCurrentAppInitToken(initToken)) {
+      return;
+    }
     await dbModule.initDatabase(dbBytes);
     if (!isCurrentAppInitToken(initToken)) {
-      await closeLiveDatabase();
       return;
     }
     const stats = dbModule.getStatistics();
     if (!isCurrentAppInitToken(initToken)) {
-      await closeLiveDatabase();
       return;
     }
     window.dispatchEvent(
@@ -1037,14 +1067,12 @@ async function handleDecryptSuccess(data) {
       }),
     );
     if (!isCurrentAppInitToken(initToken)) {
-      await closeLiveDatabase();
       return;
     }
     decryptInFlight = false;
     activeDecryptRequestId = null;
   } catch (error) {
     if (!isCurrentAppInitToken(initToken)) {
-      await closeLiveDatabase();
       return;
     }
     await recoverFromAppInitFailure("Failed to initialize database", error, initToken);
@@ -1059,30 +1087,7 @@ async function handleDecryptSuccess(data) {
  * Handle failed decryption
  */
 function handleDecryptFailed(data) {
-  invalidateAppInitAttempt();
-  const workerReady = resetCryptoWorker();
-  decryptInFlight = false;
-  activeDecryptRequestId = null;
-  void closeQrScanner();
-  hideProgress();
-  showError(
-    workerReady
-      ? `Decryption failed: ${data.error}`
-      : "The decryption worker could not be restarted. Reload this page to try again.",
-  );
-  if (workerReady) {
-    enableForm();
-  } else {
-    disableForm();
-  }
-  elements.appScreen.classList.add("hidden");
-  elements.authScreen.classList.remove("hidden");
-  clearActiveSessionExpiry();
-  clearStoredSession();
-  window.cassSession = null;
-  void closeLiveDatabase();
-  broadcastAuthLock("lock");
-  elements.passwordInput.value = "";
+  void lockArchive({ broadcast: true, errorMessage: `Decryption failed: ${data.error}` });
 }
 
 /**
@@ -1100,42 +1105,15 @@ async function recoverFromAppInitFailure(message, error, initToken = activeAppIn
   if (!isCurrentAppInitToken(initToken)) {
     return;
   }
-  invalidateAppInitAttempt();
-  const workerReady = resetCryptoWorker();
   console.error(message, error);
-  unlockInFlight = false;
-  decryptInFlight = false;
-  activeUnlockRequestId = null;
-  activeDecryptRequestId = null;
-  clearActiveSessionExpiry();
-  clearStoredSession();
-  window.cassSession = null;
-  if (elements.passwordInput) {
-    elements.passwordInput.value = "";
-  }
-  await closeQrScanner();
-  await closeLiveDatabase();
-  broadcastAuthLock("lock");
-  hideProgress();
-  if (workerReady) {
-    enableForm();
-  } else {
-    disableForm();
-  }
-  elements.appScreen.classList.add("hidden");
-  elements.authScreen.classList.remove("hidden");
-  showError(
-    workerReady
-      ? message
-      : "The decryption worker could not be restarted. Reload this page to try again.",
-  );
+  await lockArchive({ broadcast: true, errorMessage: message });
 }
 
 /**
  * Transition from auth screen to app screen
  */
 function transitionToApp() {
-  if (decryptInFlight) {
+  if (lockInFlight || decryptInFlight) {
     return;
   }
 
@@ -1165,7 +1143,7 @@ function transitionToApp() {
 }
 
 async function transitionToAppUnencrypted() {
-  if (decryptInFlight) {
+  if (lockInFlight || decryptInFlight) {
     return;
   }
 
@@ -1211,6 +1189,9 @@ async function loadUnencryptedDatabase(initToken = activeAppInitToken) {
   let dbModule;
   try {
     dbModule = await import("./database.js");
+    if (!isCurrentAppInitToken(initToken)) {
+      return false;
+    }
     await dbModule.initDatabase(dbBytes);
   } finally {
     // database.js consumes and wipes this view. Wipe again if import failed
@@ -1218,7 +1199,6 @@ async function loadUnencryptedDatabase(initToken = activeAppInitToken) {
     dbBytes.fill(0);
   }
   if (!isCurrentAppInitToken(initToken)) {
-    await closeLiveDatabase();
     return false;
   }
 
@@ -1415,10 +1395,12 @@ function handleExternalLockEvent(event) {
 /**
  * Best-effort close of the decrypted browser database before re-locking.
  */
-async function closeLiveDatabase() {
+function closeLiveDatabase(initToken = activeAppInitToken) {
   try {
-    const dbModule = await import("./database.js");
-    dbModule.closeDatabase();
+    // An obsolete cleanup must not close a database opened by a later unlock.
+    if (isCurrentAppInitToken(initToken)) {
+      closeDatabase();
+    }
   } catch (error) {
     console.warn("Failed to close live database during lock:", error);
   }
@@ -1428,8 +1410,10 @@ async function closeLiveDatabase() {
  * Lock the archive (return to auth screen)
  */
 async function lockArchive(options = {}) {
-  const { broadcast = false, action = "lock" } = options;
+  const { broadcast = false, action = "lock", errorMessage = null } = options;
   invalidateAppInitAttempt();
+  const lockToken = activeAppInitToken;
+  lockInFlight = true;
   const workerReady = resetCryptoWorker();
   unlockInFlight = false;
   decryptInFlight = false;
@@ -1441,27 +1425,43 @@ async function lockArchive(options = {}) {
   window.cassSession = null;
   clearStoredSession();
   elements.passwordInput.value = "";
-  await closeQrScanner();
+  if (elements.recoveryKeyInput) {
+    elements.recoveryKeyInput.value = "";
+  }
 
+  // Hide plaintext and cancel retained viewers/clipboard/attachment work before
+  // yielding. Camera teardown can stall indefinitely and is not a lock fence.
+  elements.appScreen.classList.add("hidden");
+  elements.authScreen.classList.remove("hidden");
+  disableForm();
+  hideProgress();
+  if (errorMessage) {
+    showError(errorMessage);
+  } else {
+    hideError();
+  }
+
+  // database.js loads WASM lazily, so its close operation is available even
+  // before viewer startup. This invalidates an in-flight initialization too.
+  closeLiveDatabase(lockToken);
   if (broadcast) {
     broadcastAuthLock(action);
   }
 
-  await closeLiveDatabase();
-
-  // Return to auth screen
-  elements.appScreen.classList.add("hidden");
-  elements.authScreen.classList.remove("hidden");
+  // A stuck camera cannot prevent the database fence or the visible lock state.
+  void closeQrScanner();
+  if (!isCurrentAppInitToken(lockToken)) {
+    return;
+  }
+  lockInFlight = false;
 
   // Reset form
   if (workerReady) {
     enableForm();
-    hideError();
   } else {
     disableForm();
     showError("The decryption worker could not be restarted. Reload this page to try again.");
   }
-  hideProgress();
 }
 
 async function loadQrScannerLibrary() {
@@ -1567,11 +1567,15 @@ function getSessionStorage(mode) {
 }
 
 function persistSession(dekBase64, expiryTs = activeSessionExpiryTs) {
-  const expiry =
-    Number.isFinite(Number(expiryTs)) && Number(expiryTs) > Date.now()
-      ? Math.trunc(Number(expiryTs))
-      : Date.now() + SESSION_CONFIG.DEFAULT_DURATION_MS;
-  scheduleActiveSessionExpiry(expiry);
+  // Zero is the first-unlock sentinel. An expired/invalid existing deadline
+  // must not silently turn a storage-mode change into a fresh four-hour grant.
+  const expiry = expiryTs === 0 ? Date.now() + SESSION_CONFIG.DEFAULT_DURATION_MS : expiryTs;
+  try {
+    scheduleActiveSessionExpiry(expiry);
+  } catch (error) {
+    void recoverFromAppInitFailure("Failed to establish a valid archive session", error);
+    return false;
+  }
 
   const mode = getPreferredSessionMode();
   // Remove stale copies from previously selected backends before persisting.
@@ -1579,7 +1583,7 @@ function persistSession(dekBase64, expiryTs = activeSessionExpiryTs) {
 
   const storage = getSessionStorage(mode);
   if (!storage) {
-    return;
+    return true;
   }
 
   const sessionKeys = getSessionKeys();
@@ -1590,6 +1594,7 @@ function persistSession(dekBase64, expiryTs = activeSessionExpiryTs) {
   } catch (e) {
     // Ignore write failures
   }
+  return true;
 }
 
 function restoreSession() {
@@ -1604,25 +1609,26 @@ function restoreSession() {
     const sessionKeys = getSessionKeys();
     const unlocked = storage.getItem(sessionKeys.UNLOCKED);
     const dekStored = storage.getItem(sessionKeys.DEK);
-    const expiry = parseInt(storage.getItem(sessionKeys.EXPIRY) || "0", 10);
+    const storedExpiry = storage.getItem(sessionKeys.EXPIRY);
+    const expiry =
+      typeof storedExpiry === "string" && /^[1-9][0-9]*$/.test(storedExpiry)
+        ? Number(storedExpiry)
+        : NaN;
 
-    if (unlocked !== "true" || !dekStored) {
-      clearStoredSession();
-      return false;
+    if (unlocked !== "true" || !dekStored || !Number.isSafeInteger(expiry)) {
+      throw new Error("Persisted session is missing a valid expiry");
     }
 
-    if (Date.now() > expiry) {
-      clearStoredSession();
-      return false;
-    }
-
+    // Admit the deadline (including timer creation) before publishing its key.
+    scheduleActiveSessionExpiry(expiry);
     window.cassSession = {
       dek: dekStored,
       config: config,
     };
-    scheduleActiveSessionExpiry(expiry);
     return true;
   } catch (e) {
+    clearActiveSessionExpiry();
+    window.cassSession = null;
     clearStoredSession();
     return false;
   }
