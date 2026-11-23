@@ -894,7 +894,7 @@ dependencies = [
  "itertools 0.15.0",
  "itoa",
  "libc",
- "lru 0.18.5",
+ "lru 0.19.1",
  "memmap2",
  "mime_guess",
  "notify",
@@ -4760,6 +4760,15 @@ name = "lru"
 version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
+dependencies = [
+ "hashbrown 0.17.2",
+]
+
+[[package]]
+name = "lru"
+version = "0.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83be4da409554841af087163ad187608824ad8ca8713d8e124c8e0f704a2f92f"
 dependencies = [
  "hashbrown 0.17.2",
 ]
