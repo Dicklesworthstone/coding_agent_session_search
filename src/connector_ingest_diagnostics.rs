@@ -682,6 +682,16 @@ fn read_inspection_line(
         let newline = available.iter().position(|&byte| byte == b'\n');
         let consumed = newline.map_or(available.len(), |position| position + 1);
         let retained = consumed.min(max_bytes.saturating_sub(line.len()));
+        let required_len = line.len() + retained;
+        if required_len > line.capacity() {
+            // Vec's automatic doubling can overshoot the record budget when
+            // reader chunks do not align with a power of two. Grow gradually,
+            // but clamp the final reservation before extending the buffer.
+            let capacity = required_len
+                .max(line.capacity().saturating_mul(2))
+                .min(max_bytes);
+            line.reserve_exact(capacity - line.len());
+        }
         line.extend_from_slice(&available[..retained]);
         result.oversized |= retained < consumed;
         result.bytes_read = result.bytes_read.saturating_add(consumed as u64);
@@ -2111,6 +2121,31 @@ mod tests {
             verify!(line.capacity() <= 8, "record allocation exceeded the bound");
         }
         verify_eq!(std::fs::read(&path)?, body);
+
+        // An awkward reader chunk size used to grow capacity to 1856 bytes
+        // despite retaining only 1024. Exercise the allocation bound with a
+        // large real record, then prove its complete successor still parses.
+        let large_path = temp.path().join("unaligned-reader.jsonl");
+        let mut large_body = vec![b'x'; 2 * 1024 * 1024];
+        large_body.extend_from_slice(b"\n{}\n");
+        std::fs::write(&large_path, &large_body)?;
+        let file = std::fs::File::open(&large_path)?;
+        let mut reader = std::io::BufReader::with_capacity(29, file);
+        let mut line = Vec::new();
+        let oversized = read_inspection_line(&mut reader, &mut line, 1024)?;
+        verify_eq!(oversized.bytes_read, 2 * 1024 * 1024 + 1);
+        verify!(oversized.oversized);
+        verify!(oversized.had_newline);
+        verify_eq!(line.len(), 1024);
+        verify!(
+            line.capacity() <= 1024,
+            "unaligned chunks exceeded the allocation budget"
+        );
+        let successor = read_inspection_line(&mut reader, &mut line, 1024)?;
+        verify_eq!(successor.bytes_read, 3);
+        verify!(!successor.oversized);
+        verify_eq!(line, b"{}\n");
+        verify!(line.capacity() <= 1024);
         Ok(())
     }
 
