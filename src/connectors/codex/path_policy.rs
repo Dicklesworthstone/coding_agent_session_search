@@ -58,6 +58,24 @@ impl ScanExclusions {
         Ok(())
     }
 
+    /// Bind scan reuse to the namespaces admission actually compares. Raw
+    /// relative names alone do not identify an exclusion after a cwd change,
+    /// and a symlink can be retargeted without changing its configured name.
+    /// Unresolvable aliases must disable reuse instead of certifying a scan.
+    pub(crate) fn reuse_identity(&self) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+        self.validate()?;
+        self.paths
+            .iter()
+            .map(|path| {
+                let absolute = self.absolute(path).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "unresolvable exclusion path")
+                })?;
+                let resolved = resolve_existing_ancestor(&absolute)?;
+                Ok((absolute, resolved))
+            })
+            .collect()
+    }
+
     fn parse(value: &str) -> Self {
         Self::parse_in(value, std::env::current_dir().ok())
     }
@@ -407,6 +425,18 @@ mod tests {
         let private = root.path().join("sessions/private");
         let relative = policy(root.path(), "sessions/private");
         let absolute = policy(root.path(), private.to_str().unwrap());
+        assert_eq!(relative.reuse_identity()?, absolute.reuse_identity()?);
+        let other_cwd = tempfile::tempdir()?;
+        assert_ne!(
+            relative.reuse_identity()?,
+            policy(other_cwd.path(), "sessions/private").reuse_identity()?,
+            "relative exclusions in different namespaces cannot share a completion",
+        );
+        assert!(
+            ScanExclusions::parse_in("sessions/private", None)
+                .reuse_identity()
+                .is_err()
+        );
         for exclusions in [relative, absolute] {
             assert!(exclusions.excludes(&private.join("rollout.jsonl")));
             assert!(exclusions.excludes(Path::new("sessions/private/rollout.jsonl")));
@@ -743,12 +773,15 @@ mod tests {
         fs::create_dir(&public)?;
         symlink(&public, &alias)?;
         let exclusions = policy(root.path(), "private");
+        let alias_exclusion = policy(root.path(), "alias");
+        let prior_identity = alias_exclusion.reuse_identity()?;
         assert!(!exclusions.excludes(&alias.join("source.jsonl")));
         // Replace a test-owned link atomically; no production path is removed.
         let replacement = root.path().join("replacement");
         symlink(&private, &replacement)?;
         fs::rename(replacement, &alias)?;
         assert!(exclusions.excludes(&alias.join("source.jsonl")));
+        assert_ne!(alias_exclusion.reuse_identity()?, prior_identity);
         Ok(())
     }
 

@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use franken_agent_detection::connectors::{SourceCompletion, SourceScanHooks};
 
 use super::{
     Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, ScanContext, ScanRoot,
@@ -180,6 +181,64 @@ impl PiFamilyOwnership {
         PiFamilyOwner::Unknown
     }
 
+    /// Preserve FAD's pre-parse admission and durable completion across the
+    /// primary discovery pass and CASS's additional roots. Dedupe before the
+    /// host predicate: a source reused from its ledger must not be reopened by
+    /// the fallback pass, and the other Pi-family provider must never certify it.
+    pub(crate) fn scan_with_source_boundaries(
+        &self,
+        connector: &dyn Connector,
+        ctx: &ScanContext,
+        agent_slug: &'static str,
+        additional_roots: &[(ScanRoot, Option<String>)],
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let mut seen = HashSet::new();
+        let should_scan_source = &mut hooks.should_scan_source;
+        let on_source_complete = &mut hooks.on_source_complete;
+        let mut should_scan = |source: &DiscoveredSourceFile| {
+            let owned = match agent_slug {
+                "omp" => self.owner(&source.source_path) == PiFamilyOwner::Omp,
+                "pi_agent" => self.owner(&source.source_path) != PiFamilyOwner::Omp,
+                _ => false,
+            };
+            if !owned {
+                return false;
+            }
+            let canonical = fs::canonicalize(&source.source_path)
+                .unwrap_or_else(|_| source.source_path.clone());
+            seen.insert(canonical)
+                && should_scan_source
+                    .as_mut()
+                    .is_none_or(|predicate| predicate(source))
+        };
+        let mut complete = |completion: &SourceCompletion| {
+            on_source_complete
+                .as_mut()
+                .map_or_else(|| Ok(()), |sink| sink(completion))
+        };
+        let mut filtered_hooks = SourceScanHooks {
+            should_scan_source: Some(&mut should_scan),
+            on_source_complete: Some(&mut complete),
+        };
+        let mut prepare = |mut conversation: NormalizedConversation| {
+            if agent_slug == "omp" {
+                fill_missing_profiles(std::slice::from_mut(&mut conversation), self);
+            }
+            promote_transcript_session_ids(std::slice::from_mut(&mut conversation));
+            on_conversation(conversation)
+        };
+        connector.scan_with_source_boundaries(ctx, &mut filtered_hooks, &mut prepare)?;
+        franken_agent_detection::connectors::pi_wire::scan_roots_with_boundaries(
+            additional_roots,
+            ctx,
+            agent_slug,
+            &mut filtered_hooks,
+            &mut prepare,
+        )
+    }
+
     #[must_use]
     fn omp_scan_roots(&self) -> &[(PathBuf, Option<String>)] {
         &self.omp_store_roots
@@ -265,6 +324,36 @@ impl PiFamilyOwnership {
             add_path(&mut hasher, "omp_store_root", Some(root));
         }
         hasher.finalize().to_hex().to_string()
+    }
+
+    /// Bind scan reuse to the ownership and profile inputs that affect parsing.
+    /// Keep both path spellings: ownership compares canonical paths when they
+    /// exist and raw paths otherwise. A retargeted alias must invalidate reuse
+    /// even when its configured spelling and all transcript bytes are unchanged.
+    #[must_use]
+    pub(crate) fn scan_reuse_context(&self) -> Option<String> {
+        fn path_evidence(path: &Path) -> (&Path, Option<PathBuf>) {
+            (path, fs::canonicalize(path).ok())
+        }
+
+        let store_roots = self
+            .omp_store_roots
+            .iter()
+            .map(|(path, profile)| (path_evidence(path), profile))
+            .collect::<Vec<_>>();
+        // Path serialization rejects non-Unicode inputs. Missing identity
+        // evidence must disable reuse rather than merge distinct native paths.
+        let encoded = serde_json::to_vec(&(
+            "cass-pi-family-scan-v1",
+            self.pi_sessions_dir.as_deref().map(path_evidence),
+            self.omp_session_dir.as_deref().map(path_evidence),
+            self.shared_agent_dir.as_deref().map(path_evidence),
+            self.omp_config_root.as_deref().map(path_evidence),
+            store_roots,
+            &self.active_profile,
+        ))
+        .ok()?;
+        Some(blake3::hash(&encoded).to_hex().to_string())
     }
 }
 
@@ -847,24 +936,6 @@ fn unrecognized_direct_session_roots(
         .collect()
 }
 
-pub(crate) fn append_missing_conversations(
-    conversations: &mut Vec<NormalizedConversation>,
-    additional: impl IntoIterator<Item = NormalizedConversation>,
-) {
-    let mut seen = conversations
-        .iter()
-        .map(|conversation| {
-            std::fs::canonicalize(&conversation.source_path)
-                .unwrap_or_else(|_| conversation.source_path.clone())
-        })
-        .collect::<std::collections::HashSet<_>>();
-    conversations.extend(additional.into_iter().filter(|conversation| {
-        let key = std::fs::canonicalize(&conversation.source_path)
-            .unwrap_or_else(|_| conversation.source_path.clone());
-        seen.insert(key)
-    }));
-}
-
 pub(crate) fn append_missing_sources(
     sources: &mut Vec<DiscoveredSourceFile>,
     additional: impl IntoIterator<Item = DiscoveredSourceFile>,
@@ -911,37 +982,62 @@ impl Connector for OmpConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let ownership = PiFamilyOwnership::live();
-        let mut conversations = self.inner.scan(ctx)?;
-
-        if ctx.use_default_detection() {
-            let fallback = franken_agent_detection::connectors::pi_wire::scan_homes_tagged(
-                ownership.omp_scan_roots(),
-                ctx,
-                "omp",
-            )?;
-            append_missing_conversations(&mut conversations, fallback);
-        }
-
-        let direct_roots = unrecognized_direct_session_roots(ctx, &ownership);
-        if !direct_roots.is_empty() {
-            let tagged_roots = direct_roots
-                .iter()
-                .map(|root| (root.path.clone(), direct_root_profile(root, &ownership)))
-                .collect::<Vec<_>>();
-            let fallback = franken_agent_detection::connectors::pi_wire::scan_homes_tagged(
-                &tagged_roots,
-                ctx,
-                "omp",
-            )?;
-            append_missing_conversations(&mut conversations, fallback);
-        }
-        conversations.retain(|conversation| {
-            ownership.owner(&conversation.source_path) == PiFamilyOwner::Omp
-        });
-        fill_missing_profiles(&mut conversations, &ownership);
-        promote_transcript_session_ids(&mut conversations);
+        let mut conversations = Vec::new();
+        self.scan_with_callback(ctx, &mut |conversation| {
+            conversations.push(conversation);
+            Ok(())
+        })?;
         Ok(conversations)
+    }
+
+    fn supports_streaming_scan(&self) -> bool {
+        self.inner.supports_streaming_scan()
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        self.inner.supports_source_boundaries()
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let ownership = PiFamilyOwnership::live();
+        let mut additional_roots = Vec::new();
+        if ctx.use_default_detection() {
+            additional_roots.extend(
+                ownership
+                    .omp_scan_roots()
+                    .iter()
+                    .map(|(path, profile)| (ScanRoot::local(path.clone()), profile.clone())),
+            );
+        }
+        additional_roots.extend(
+            unrecognized_direct_session_roots(ctx, &ownership)
+                .into_iter()
+                .map(|root| {
+                    let profile = direct_root_profile(&root, &ownership);
+                    (root, profile)
+                }),
+        );
+        ownership.scan_with_source_boundaries(
+            &self.inner,
+            ctx,
+            "omp",
+            &additional_roots,
+            hooks,
+            on_conversation,
+        )
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
@@ -993,6 +1089,169 @@ mod tests {
         .join("\n");
         fs::write(&path, format!("{transcript}\n")).expect("write test session");
         path
+    }
+
+    #[test]
+    fn pi_family_source_boundaries_preserve_ownership_identity_and_profiles() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let copied_home = temp.path().join("copied-home");
+        let pi_path = write_session(&copied_home.join(".pi/agent"), "pi-session");
+        let omp_path = write_session(&copied_home.join(".omp/profiles/work/agent"), "omp-session");
+        let root = ScanRoot::remote(
+            copied_home,
+            Origin::remote_with_host("laptop", "laptop.example"),
+            Some(Platform::Macos),
+        );
+        let ctx = ScanContext::with_roots(temp.path().join("cass-state"), vec![root], None);
+        let cases: Vec<(&str, Box<dyn Connector>, PathBuf, Option<&str>)> = vec![
+            (
+                "pi-session",
+                Box::new(super::super::pi_agent::PiAgentConnector::new()),
+                pi_path,
+                None,
+            ),
+            (
+                "omp-session",
+                Box::new(OmpConnector::new()),
+                omp_path,
+                Some("work"),
+            ),
+        ];
+        for (id, connector, expected_path, profile) in cases {
+            assert!(connector.supports_streaming_scan());
+            assert!(connector.supports_source_boundaries());
+            let discovered = connector.discover_source_files(&ctx)?;
+            assert_eq!(discovered.len(), 1, "only this provider's source is owned");
+            let mut admitted = Vec::new();
+            let mut completed = Vec::new();
+            let mut conversations = Vec::new();
+            connector.scan_with_source_boundaries(
+                &ctx,
+                &mut SourceScanHooks {
+                    should_scan_source: Some(&mut |source| {
+                        admitted.push(source.clone());
+                        true
+                    }),
+                    on_source_complete: Some(&mut |completion| {
+                        assert_eq!(completion.conversations_emitted, 1);
+                        completed.push(completion.source.clone());
+                        Ok(())
+                    }),
+                },
+                &mut |conversation| {
+                    conversations.push(conversation);
+                    Ok(())
+                },
+            )?;
+            assert_eq!(admitted, discovered, "admission retains discovery identity");
+            assert_eq!(
+                completed, discovered,
+                "completion retains discovery identity"
+            );
+            assert_eq!(conversations.len(), 1);
+            let conversation = &conversations[0];
+            assert_eq!(conversation.source_path, expected_path);
+            assert_eq!(conversation.external_id.as_deref(), Some(id));
+            assert_eq!(
+                conversation
+                    .metadata
+                    .get("profile")
+                    .and_then(|value| value.as_str()),
+                profile,
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pi_family_source_admission_skip_survives_overlapping_fallback_roots() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cases: Vec<(&str, &str, Box<dyn Connector>)> = vec![
+            (
+                ".pi/agent",
+                "pi_agent",
+                Box::new(franken_agent_detection::PiAgentConnector::new()),
+            ),
+            (
+                ".omp/agent",
+                "omp",
+                Box::new(franken_agent_detection::OmpConnector::new()),
+            ),
+        ];
+        for (layout, slug, inner) in cases {
+            let path = temp.path().join(layout);
+            write_session(&path, slug);
+            let root = ScanRoot::local(path.clone());
+            let ctx =
+                ScanContext::with_roots(temp.path().join("cass-state"), vec![root.clone()], None);
+            let mut admissions = 0;
+            let policy = ownership(None, None, None, Vec::new(), None);
+            policy.scan_with_source_boundaries(
+                inner.as_ref(),
+                &ctx,
+                slug,
+                &[
+                    (root.clone(), None),
+                    (root.with_path(path.join("sessions")), None),
+                ],
+                &mut SourceScanHooks {
+                    should_scan_source: Some(&mut |_| {
+                        admissions += 1;
+                        false
+                    }),
+                    on_source_complete: Some(&mut |_| {
+                        anyhow::bail!("a reused source must not emit completion")
+                    }),
+                },
+                &mut |_| anyhow::bail!("a reused source must not be parsed by the fallback"),
+            )?;
+            assert_eq!(admissions, 1, "each source is offered to the ledger once");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pi_family_callback_failure_withholds_source_completion() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cases: Vec<(&str, Box<dyn Connector>)> = vec![
+            (
+                ".pi/agent",
+                Box::new(super::super::pi_agent::PiAgentConnector::new()),
+            ),
+            (".omp/agent", Box::new(OmpConnector::new())),
+        ];
+        for (layout, connector) in cases {
+            let path = temp.path().join(layout);
+            write_session(&path, "callback-error");
+            let ctx = ScanContext::with_roots(
+                temp.path().join("cass-state"),
+                vec![ScanRoot::local(path)],
+                None,
+            );
+            let mut completions = 0;
+            let result = connector.scan_with_source_boundaries(
+                &ctx,
+                &mut SourceScanHooks {
+                    should_scan_source: None,
+                    on_source_complete: Some(&mut |_| {
+                        completions += 1;
+                        Ok(())
+                    }),
+                },
+                &mut |_| anyhow::bail!("fixture persistence failure"),
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("fixture persistence failure")
+            );
+            assert_eq!(
+                completions, 0,
+                "failed persistence cannot certify this source"
+            );
+        }
+        Ok(())
     }
 
     fn ownership(
@@ -1190,6 +1449,80 @@ mod tests {
             moved.archive_reclassification_context(),
             "a provider-qualified ownership root change must invalidate migration completion"
         );
+    }
+
+    #[test]
+    fn scan_reuse_context_tracks_ownership_and_profile_metadata() {
+        let root = PathBuf::from("/fixture/omp-sessions");
+        let mut work = ownership(
+            None,
+            Some(root.clone()),
+            None,
+            vec![root.clone()],
+            Some("work"),
+        );
+        work.omp_store_roots[0].1 = Some("work".to_string());
+        let original = work.scan_reuse_context().unwrap();
+        assert_eq!(
+            work.scan_reuse_context().as_deref(),
+            Some(original.as_str())
+        );
+
+        let mut profile = work.clone();
+        profile.active_profile = Some("review".to_string());
+        assert_ne!(profile.scan_reuse_context().unwrap(), original);
+        let mut tagged_root = work.clone();
+        tagged_root.omp_store_roots[0].1 = Some("review".to_string());
+        assert_ne!(tagged_root.scan_reuse_context().unwrap(), original);
+
+        let mut pi_override = work.clone();
+        pi_override.pi_sessions_dir = Some(root.clone());
+        assert_eq!(work.owner(&root), PiFamilyOwner::Omp);
+        assert_eq!(pi_override.owner(&root), PiFamilyOwner::PiAgent);
+        assert_ne!(pi_override.scan_reuse_context().unwrap(), original);
+
+        let mut shared = work.clone();
+        shared.shared_agent_dir = Some(PathBuf::from("/fixture/shared-agent"));
+        assert_ne!(shared.scan_reuse_context().unwrap(), original);
+        let mut config = work;
+        config.omp_config_root = Some(PathBuf::from("/fixture/custom-config"));
+        assert_ne!(config.scan_reuse_context().unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_reuse_context_detects_retargeted_ownership_aliases() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first)?;
+        fs::create_dir(&second)?;
+        let alias = temp.path().join("session-override");
+        symlink(&first, &alias)?;
+        let policy = ownership(None, Some(alias.clone()), None, vec![alias.clone()], None);
+        let original = policy.scan_reuse_context().unwrap();
+        assert_eq!(policy.owner(&first), PiFamilyOwner::Omp);
+        assert_eq!(policy.owner(&second), PiFamilyOwner::Unknown);
+
+        // Retain the prior alias so the fixture never needs to remove a file.
+        fs::rename(&alias, temp.path().join("previous-session-override"))?;
+        symlink(&second, &alias)?;
+        assert_eq!(policy.owner(&first), PiFamilyOwner::Unknown);
+        assert_eq!(policy.owner(&second), PiFamilyOwner::Omp);
+        assert_ne!(policy.scan_reuse_context().unwrap(), original);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_reuse_context_refuses_non_unicode_ownership_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"/fixture/\xff".to_vec()));
+        let policy = ownership(Some(path), None, None, Vec::new(), None);
+        assert!(policy.scan_reuse_context().is_none());
     }
 
     #[test]

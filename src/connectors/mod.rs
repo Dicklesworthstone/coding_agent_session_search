@@ -384,8 +384,10 @@ pub(crate) fn get_connector_registrations() -> Vec<source_dependencies::Connecto
                 "codebuff" => ConnectorRegistration::new(name, codebuff_connector_factory)
                     .with_source_capability::<codebuff::CodebuffConnector>("codebuff"),
                 "continue" => ConnectorRegistration::new(name, continue_connector_factory),
-                "omp" => ConnectorRegistration::new(name, omp_connector_factory),
-                "pi_agent" => ConnectorRegistration::new(name, pi_agent_connector_factory),
+                "omp" => ConnectorRegistration::new(name, omp_connector_factory)
+                    .with_source_capability::<omp::OmpConnector>("omp"),
+                "pi_agent" => ConnectorRegistration::new(name, pi_agent_connector_factory)
+                    .with_source_capability::<pi_agent::PiAgentConnector>("pi_agent"),
                 "grok_bot" => ConnectorRegistration::new(name, grok_bot_connector_factory),
                 "copilot" => ConnectorRegistration::new(name, copilot_connector_factory),
                 _ => ConnectorRegistration::new(name, factory),

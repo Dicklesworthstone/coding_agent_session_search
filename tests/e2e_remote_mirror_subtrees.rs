@@ -409,3 +409,227 @@ fn rsync_contents_only_subtrees_index_search_and_update() {
         false,
     );
 }
+
+fn gh574_session(id: &str) -> Vec<u8> {
+    [
+        json!({"type": "session", "version": 3, "id": id,
+               "timestamp": "2023-11-14T22:13:20Z", "cwd": "/remote/project"}),
+        json!({"type": "message", "timestamp": "2023-11-14T22:13:21Z",
+               "message": {"role": "user", "content": format!("{id} question")}}),
+        json!({"type": "message", "timestamp": "2023-11-14T22:13:22Z",
+               "message": {"role": "assistant", "content": format!("{id} answer")}}),
+    ]
+    .into_iter()
+    .map(|entry| entry.to_string() + "\n")
+    .collect::<String>()
+    .into_bytes()
+}
+
+fn gh574_preserve_old_mtime(path: &Path) {
+    let old_time = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    fs::File::open(path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(old_time))
+        .unwrap();
+    assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), old_time);
+}
+
+fn gh574_assert_scanned(report: &Value, expected: &[(&str, u64, u64)]) {
+    assert_eq!(
+        report["indexing_stats"]["scan_had_errors"], false,
+        "{report}"
+    );
+    let mut actual = BTreeMap::new();
+    for connector in report["indexing_stats"]["connectors"]
+        .as_array()
+        .expect("index report must contain per-connector scan counts")
+    {
+        assert!(connector["error"].is_null(), "{connector}");
+        let conversations = connector["conversations"].as_u64().unwrap();
+        let messages = connector["messages"].as_u64().unwrap();
+        if conversations != 0 || messages != 0 {
+            let counts = actual
+                .entry(connector["name"].as_str().unwrap())
+                .or_insert((0_u64, 0_u64));
+            counts.0 += conversations;
+            counts.1 += messages;
+        }
+    }
+    let expected: BTreeMap<_, _> = expected
+        .iter()
+        .map(|(name, conversations, messages)| (*name, (*conversations, *messages)))
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "scanned conversations must reflect parsing work, not just deduplicated archive rows: {report}"
+    );
+}
+
+/// GH574: one SSH source can have several mirror roots. Their successful-scan
+/// receipts must coexist, and changing one transcript must not reparse its
+/// unchanged siblings. rsync preserves remote mtimes, so both newly delivered
+/// files and appends deliberately retain timestamps older than every scan.
+#[test]
+fn gh574_ssh_mirrors_index_only_changed_sessions_in_both_modes() {
+    for streaming in ["0", "1"] {
+        let tracker = PhaseTracker::new(
+            "e2e_remote_mirror_subtrees",
+            &format!("gh574_incremental_streaming_{streaming}"),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let config = tmp.path().join("config");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(config.join("cass")).unwrap();
+        fs::write(home.join(".env"), "").unwrap();
+        let mirror = data.join("remotes").join(SOURCE_ID).join("mirror");
+        let paths = ["~/.pi/agent/sessions", "~/.omp/agent/sessions"];
+        let mut originals = BTreeMap::new();
+        for (provider, source) in ["pi", "omp"].into_iter().zip(paths) {
+            let directory = mirror
+                .join(path_to_safe_dirname(source))
+                .join("sessions/--remote-project--");
+            fs::create_dir_all(&directory).unwrap();
+            for index in 0..2 {
+                let id = format!("gh574{provider}session{index}");
+                let file = directory.join(format!("2023-11-14T22-13-20_{id}.jsonl"));
+                fs::write(&file, gh574_session(&id)).unwrap();
+                gh574_preserve_old_mtime(&file);
+                originals.insert((provider, index), file);
+            }
+        }
+        fs::write(
+            config.join("cass/sources.toml"),
+            format!(
+                "[[sources]]\nname = {SOURCE_ID:?}\ntype = \"ssh\"\nhost = {HOST:?}\npaths = {}\n",
+                serde_json::to_string(&paths).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let run = |args: &[&str]| -> Value {
+            let mut command = tracker.cass_std_command();
+            command
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &config)
+                .env("XDG_DATA_HOME", tmp.path().join("xdg"))
+                .env("CASS_DATA_DIR", &data)
+                .env("CASS_STREAMING_INDEX", streaming)
+                .env("CASS_AUTO_REFRESH", "0")
+                .env("RUST_MIN_STACK", "134217728")
+                .current_dir(&home);
+            tracker.command_environment().apply_to_std(&mut command);
+            let output = assert_cmd::Command::from_std(command)
+                .args(args)
+                .timeout(Duration::from_secs(120))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "streaming={streaming}, args={args:?}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice(&output.stdout).unwrap()
+        };
+        let incremental = ["index", "--json", "--no-progress-events"];
+        let full = ["index", "--full", "--json", "--no-progress-events"];
+
+        gh574_assert_scanned(&run(&full), &[("pi_agent", 2, 4), ("omp", 2, 4)]);
+        let initial = snapshot(&data);
+        assert_eq!((initial.0.len(), initial.1.len()), (4, 8));
+        assert!(
+            initial
+                .0
+                .iter()
+                .all(|row| { row.source == SOURCE_ID && row.host.as_deref() == Some(HOST) })
+        );
+        for _ in 0..2 {
+            gh574_assert_scanned(&run(&incremental), &[]);
+            assert_eq!(snapshot(&data), initial);
+        }
+
+        for (provider, slug, expected_messages) in [("pi", "pi_agent", 9), ("omp", "omp", 10)] {
+            let file = &originals[&(provider, 0)];
+            let marker = format!("gh574{provider}appendprobe");
+            let mut bytes = fs::read(file).unwrap();
+            bytes.extend_from_slice(
+                format!(
+                    "{}\n",
+                    json!({"type": "message", "timestamp": "2023-11-14T22:13:23Z",
+                           "message": {"role": "user", "content": marker}})
+                )
+                .as_bytes(),
+            );
+            fs::write(file, &bytes).unwrap();
+            gh574_preserve_old_mtime(file);
+            gh574_assert_scanned(&run(&incremental), &[(slug, 1, 3)]);
+            let updated = snapshot(&data);
+            assert_eq!(updated.0, initial.0, "an append must retain canonical IDs");
+            assert_eq!(updated.1.len(), expected_messages);
+            let selected_id = initial.0.iter().find(|row| row.path == *file).unwrap().id;
+            assert!(
+                updated
+                    .1
+                    .contains(&(selected_id, 2, "user".to_owned(), marker.clone()))
+            );
+            let search = run(&[
+                "search",
+                "--robot",
+                "--mode",
+                "lexical",
+                "--no-daemon",
+                &marker,
+            ]);
+            assert_eq!(search["hits"].as_array().unwrap().len(), 1, "{search}");
+            gh574_assert_scanned(&run(&incremental), &[]);
+            assert_eq!(fs::read(file).unwrap(), bytes);
+        }
+
+        let new_file = originals[&("pi", 0)]
+            .parent()
+            .unwrap()
+            .join("2023-11-14T22-13-20_gh574newarrival.jsonl");
+        fs::write(&new_file, gh574_session("gh574newarrival")).unwrap();
+        gh574_preserve_old_mtime(&new_file);
+        gh574_assert_scanned(&run(&incremental), &[("pi_agent", 1, 2)]);
+        let with_new = snapshot(&data);
+        assert_eq!((with_new.0.len(), with_new.1.len()), (5, 12));
+        assert!(with_new.0.iter().any(|row| row.path == new_file));
+        for original in &initial.0 {
+            assert!(
+                with_new.0.contains(original),
+                "new arrivals must not rekey old sessions"
+            );
+        }
+        let search = run(&[
+            "search",
+            "gh574newarrival",
+            "--robot",
+            "--mode",
+            "lexical",
+            "--no-daemon",
+        ]);
+        let found: BTreeSet<_> = search["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["conversation_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(found.len(), 1, "{search}");
+        gh574_assert_scanned(&run(&incremental), &[]);
+        assert_eq!(snapshot(&data), with_new);
+
+        gh574_assert_scanned(&run(&full), &[("pi_agent", 3, 7), ("omp", 2, 5)]);
+        assert_eq!(
+            snapshot(&data),
+            with_new,
+            "--full must retain archive identity"
+        );
+        gh574_assert_scanned(&run(&incremental), &[]);
+        tracker.complete();
+    }
+}

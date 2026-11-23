@@ -1109,6 +1109,9 @@ struct NonWatchIngestOutcome {
     lexical_update_deferred: bool,
     scanned_connectors: BTreeSet<String>,
     scan_had_errors: bool,
+    /// An admitted mirror source did not certify completion. This includes
+    /// legitimate empty sessions, so it prevents root caching without an error.
+    incomplete_remote_sources: bool,
     deferred_sources: BTreeSet<PathBuf>,
 }
 
@@ -1128,6 +1131,8 @@ impl NonWatchIngestOutcome {
             lexical_update_deferred: self.lexical_update_deferred || other.lexical_update_deferred,
             scanned_connectors,
             scan_had_errors: self.scan_had_errors || other.scan_had_errors,
+            incomplete_remote_sources: self.incomplete_remote_sources
+                || other.incomplete_remote_sources,
             deferred_sources,
         }
     }
@@ -15480,13 +15485,21 @@ fn source_ledger_key(source: &DiscoveredSourceFile, ctx: &ScanContext) -> Option
     let mappings = ctx
         .scan_roots
         .iter()
-        .map(|root| (&root.path, &root.workspace_rewrites))
+        .map(|root| {
+            (
+                &root.path,
+                root.platform,
+                &root.mirrored_source_path,
+                &root.workspace_rewrites,
+            )
+        })
         .collect::<Vec<_>>();
     // Path's JSON serializer rejects non-Unicode names. Missing identity
     // evidence must disable reuse, not panic before a source can be parsed or
     // collapse distinct native paths through lossy replacement characters.
-    // Keep the Value intermediate so existing workspace-mapping object order
-    // (and therefore every already-persisted key) stays byte-for-byte stable.
+    // Keep deterministic workspace-mapping object order. Adding platform and
+    // mirror interpretation invalidates older keys once, so a changed source
+    // context cannot reuse a parse completed under different identity rules.
     let identity = serde_json::to_value((
         &source.provider_slug,
         &source.scan_root,
@@ -15529,7 +15542,7 @@ fn source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bo
 /// A connector capability, not an inference from this scan's sidecar list.
 fn source_folder_is_dependency(source: &DiscoveredSourceFile) -> bool {
     crate::connectors::source_dependencies::source_dependency_policy(&source.provider_slug)
-        .observes_parent_directory()
+        .observes_parent_directory_for_path(&source.source_path)
 }
 
 fn source_parent_observation(source: &DiscoveredSourceFile) -> Option<serde_json::Value> {
@@ -15592,6 +15605,18 @@ fn scan_with_durable_source_boundaries(
 ) -> Result<()> {
     let producer_contract =
         WorkspaceExclusions::from_env()?.bind_contract(env!("CASS_SOURCE_INGEST_CONTRACT"));
+    // A live Pi-family override can change ownership or profile metadata
+    // without changing the transcript. Keep that context in the observation,
+    // not the key: returning to a prior profile must replace the latest parse.
+    let (producer_contract, source_reuse_enabled) =
+        if matches!(sender.connector_name, "pi_agent" | "omp") {
+            match crate::connectors::omp::PiFamilyOwnership::live().scan_reuse_context() {
+                Some(context) => (format!("{producer_contract}:pi-family:{context}"), true),
+                None => (producer_contract, false),
+            }
+        } else {
+            (producer_contract, true)
+        };
     if !connector.supports_source_boundaries() {
         return connector.scan_with_callback(ctx, &mut |conversation| {
             if let Some(conversation) = prepare(conversation)? {
@@ -15607,6 +15632,14 @@ fn scan_with_durable_source_boundaries(
     let filtered = std::cell::Cell::new(false);
     let before = std::cell::RefCell::new(None);
     let primary_before = std::cell::RefCell::new(None);
+    let uncompleted_remote_sources = std::cell::RefCell::new(HashSet::new());
+    let completion_key = |source: &DiscoveredSourceFile| {
+        (
+            source.origin.source_id.clone(),
+            source.scan_root.clone(),
+            source.source_path.clone(),
+        )
+    };
     // A self-contained parser cannot consult sidecars. Avoid a second full
     // inventory and stat/JSON map solely to prove the absence of dependencies.
     // Unexpected completion sidecars remain unobserved and withhold the marker.
@@ -15654,7 +15687,8 @@ fn scan_with_durable_source_boundaries(
         // an untracked sidecar appearing between discovery and admission.
         *before.borrow_mut() = dependencies_before.parent_for(&source.source_path).cloned();
         *primary_before.borrow_mut() = source_file_observation(&source.source_path);
-        let skip = env!("CASS_SOURCE_INGEST_REUSE") == "true"
+        let skip = source_reuse_enabled
+            && env!("CASS_SOURCE_INGEST_REUSE") == "true"
             && !filtered.get()
             && source_ledger_key(source, &ctx)
                 .and_then(|key| config.source_ledger.get(&key))
@@ -15667,11 +15701,21 @@ fn scan_with_durable_source_boundaries(
                 .borrow_mut()
                 .reused_sources
                 .push(source.source_path.clone());
+        } else if source.origin.is_remote() {
+            uncompleted_remote_sources
+                .borrow_mut()
+                .insert(completion_key(source));
         }
         !skip
     };
     let mut complete = |completion: &franken_agent_detection::connectors::SourceCompletion| {
-        if filtered.get()
+        if completion.source.origin.is_remote() {
+            uncompleted_remote_sources
+                .borrow_mut()
+                .remove(&completion_key(&completion.source));
+        }
+        if !source_reuse_enabled
+            || filtered.get()
             || completion.conversations_emitted == 0
             || completion.source.fs_metadata_changed()
             || completion
@@ -15723,6 +15767,14 @@ fn scan_with_durable_source_boundaries(
     })?;
     if let Some(error) = flush_error.into_inner() {
         return Err(error);
+    }
+    // FAD can omit completion for empty/header-only sessions and for a
+    // transient read failure. Neither may certify the whole mirror as done;
+    // completed siblings still retain their individual durable receipts.
+    if !uncompleted_remote_sources.into_inner().is_empty() {
+        config
+            .incomplete_remote_sources
+            .store(true, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -15964,6 +16016,7 @@ fn is_streaming_consumer_disconnected(error: &anyhow::Error) -> bool {
 #[derive(Clone)]
 struct StreamingProducerConfig {
     source_ledger: Arc<HashMap<String, String>>,
+    incomplete_remote_sources: Arc<AtomicBool>,
     raw_source_exclusions: Arc<RawSourceExclusions>,
     flow_limiter: Arc<StreamingByteLimiter>,
     data_dir: PathBuf,
@@ -17184,12 +17237,16 @@ where
     // Create bounded channel for backpressure
     let (tx, rx) = bounded::<IndexMessage>(STREAMING_CHANNEL_SIZE);
     let producer_config = StreamingProducerConfig {
+        incomplete_remote_sources: Arc::new(AtomicBool::new(false)),
         raw_source_exclusions: Arc::new(RawSourceExclusions::load(storage)?),
         source_ledger: Arc::new(
-            if matches!(
-                lexical_strategy,
-                LexicalPopulationStrategy::InlineRebuildFromScan
-            ) {
+            if opts.full
+                || opts.force_rebuild
+                || matches!(
+                    lexical_strategy,
+                    LexicalPopulationStrategy::InlineRebuildFromScan
+                )
+            {
                 HashMap::new()
             } else {
                 storage.source_ingest_ledger_entries()?
@@ -17279,6 +17336,9 @@ where
         Err(_) => unreachable!("handled above"),
     };
     let active_deferred = producer_config.active_source_filter.take_deferred_sources();
+    ingest_outcome.incomplete_remote_sources |= producer_config
+        .incomplete_remote_sources
+        .load(Ordering::Relaxed);
     record_deferred_active_sources(opts.progress.as_ref(), &active_deferred);
     ingest_outcome.deferred_sources.extend(active_deferred);
 
@@ -19175,6 +19235,7 @@ fn run_index_with_storage_ownership(
     let mut scan_lexical_update_deferred = false;
     let mut scanned_connectors = BTreeSet::new();
     let mut scan_had_errors = false;
+    let mut incomplete_remote_sources = false;
     let mut stale_index_ingest_quarantine_retry_attempted = false;
     let mut deferred_watch_sources = BTreeSet::new();
 
@@ -19970,6 +20031,7 @@ fn run_index_with_storage_ownership(
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                     scanned_connectors.extend(scan_outcome.scanned_connectors);
                     scan_had_errors |= scan_outcome.scan_had_errors;
+                    incomplete_remote_sources |= scan_outcome.incomplete_remote_sources;
                     deferred_watch_sources.extend(scan_outcome.deferred_sources);
                 } else {
                     tracing::info!(
@@ -19992,17 +20054,21 @@ fn run_index_with_storage_ownership(
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                     scanned_connectors.extend(scan_outcome.scanned_connectors);
                     scan_had_errors |= scan_outcome.scan_had_errors;
+                    incomplete_remote_sources |= scan_outcome.incomplete_remote_sources;
                     deferred_watch_sources.extend(scan_outcome.deferred_sources);
                 }
-                // #372: persist remote mirror fingerprints only after an
-                // error-free scan (the same signal that gates last_scan_ts), so
-                // a scan with errors never memoizes a fingerprint that would
-                // skip re-scanning incompletely-ingested mirror data.
-                if !scan_had_errors {
+                // Persist a root receipt only after an error-free scan with
+                // no admitted remote source missing its completion callback.
+                // Empty sessions remain successful but cannot hide a transient
+                // read failure behind the same zero-conversation outcome.
+                if !scan_had_errors && !incomplete_remote_sources {
                     for (source_id, fingerprint) in &mirror_fingerprints_to_store {
-                        if let Err(error) =
-                            storage.record_mirror_scan_fingerprint(source_id, fingerprint)
-                        {
+                        if let Err(error) = persist::with_ephemeral_writer(
+                            &storage,
+                            !opts.watch,
+                            "recording remote mirror scan fingerprints",
+                            |writer| writer.record_mirror_scan_fingerprint(source_id, fingerprint),
+                        ) {
                             tracing::warn!(
                                 source_id = %source_id,
                                 error = %error,
@@ -30817,6 +30883,7 @@ fn ingest_batch_detailed_with_source_completion(
         lexical_update_deferred: batch_outcome.lexical_update_deferred,
         scanned_connectors: BTreeSet::new(),
         scan_had_errors: false,
+        incomplete_remote_sources: false,
         deferred_sources: BTreeSet::new(),
     })
 }
@@ -31051,6 +31118,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
             lexical_update_deferred: true,
             scanned_connectors: BTreeSet::new(),
             scan_had_errors: true,
+            incomplete_remote_sources: false,
             deferred_sources: BTreeSet::from([conv.source_path.clone()]),
         });
     }
@@ -31083,6 +31151,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         lexical_update_deferred: true,
         scanned_connectors: BTreeSet::new(),
         scan_had_errors: true,
+        incomplete_remote_sources: false,
         deferred_sources: BTreeSet::from([conv.source_path.clone()]),
     })
 }
@@ -38173,63 +38242,105 @@ fn clear_watch_lexical_replay_debt(
     )
 }
 
-/// #372: fingerprint the current on-disk state of a remote mirror directory as
-/// `(relative_path, size, mtime)` over every regular file / symlink under
-/// `root_path`, hashed in a stable order.
+/// Fingerprint a remote mirror's files using the source ledger's filesystem
+/// observations (size, precise mtime and, where available, local change time
+/// and file identity). No transcript contents are read.
 ///
 /// This is compared against the fingerprint recorded at the last error-free
 /// scan to decide whether an unchanged mirror can skip its (deliberately
 /// full — see [`explicit_scan_root_since_ts`]) re-scan. It is intentionally
-/// self-referential: it compares the mirror to a prior snapshot of *itself*,
-/// never to a wall clock, so rsync's preservation of the *remote* mtime cannot
-/// cause a clock-skew false match. It also mirrors rsync's own size+mtime
-/// change-detection, so "rsync did not transfer" ⇒ "fingerprint unchanged".
+/// relative to its last completed scan, never a wall clock, so rsync's
+/// preservation of the *remote* mtime cannot hide newly arrived old sessions.
+/// Local change time also detects same-size replacements with preserved mtime.
 ///
-/// Returns `None` on any doubt (missing path, walk/stat error, unreadable
-/// mtime) so the caller falls through to a full scan — never a false skip.
+/// Returns `None` on any doubt (missing path, walk/stat error, unrepresentable
+/// path or symlink). A symlink can depend on files outside this inventory, so
+/// leave that scan to the connector instead of certifying an incomplete tree.
 fn remote_mirror_scan_fingerprint(root_path: &Path) -> Option<String> {
     if !root_path.exists() {
         return None;
     }
-    let mut entries: Vec<(String, u64, i64)> = Vec::new();
+    let mut entries = Vec::new();
+    // Include depth zero: a configured root may be a file, not a directory.
     for entry in walkdir::WalkDir::new(root_path)
-        .min_depth(1)
         .follow_links(false)
+        .follow_root_links(false)
     {
         let entry = entry.ok()?;
         let file_type = entry.file_type();
-        if !(file_type.is_file() || file_type.is_symlink()) {
+        if file_type.is_symlink() {
+            return None;
+        }
+        if !file_type.is_file() {
             continue;
         }
-        let metadata = entry.metadata().ok()?;
-        let modified_ms = metadata
-            .modified()
-            .ok()
-            .and_then(system_time_to_epoch_millis)?;
-        let relative = entry.path().strip_prefix(root_path).ok()?;
-        entries.push((
-            relative.to_string_lossy().into_owned(),
-            metadata.len(),
-            modified_ms,
-        ));
+        let observation = source_file_observation(entry.path())?;
+        if observation["absent"].as_bool() == Some(true) {
+            return None;
+        }
+        let relative = entry.path().strip_prefix(root_path).ok()?.to_str()?;
+        entries.push((relative.to_owned(), serde_json::to_vec(&observation).ok()?));
     }
     // Directory-walk order is not guaranteed stable across runs/platforms.
     entries.sort();
     let mut hasher = blake3::Hasher::new();
-    for (relative, size, modified_ms) in &entries {
+    for (relative, observation) in &entries {
         hasher.update(relative.as_bytes());
         hasher.update(&[0]);
-        hasher.update(&size.to_le_bytes());
-        hasher.update(&modified_ms.to_le_bytes());
+        hasher.update(observation);
         hasher.update(b"\n");
     }
     // Include the file count so a missing dir, an empty dir, and a populated
     // dir never collide on the empty-hash.
     Some(format!(
-        "mirrorfp-v1:{}:{}",
+        "mirrorfp-v2:{}:{}",
         entries.len(),
         hasher.finalize().to_hex()
     ))
+}
+
+/// Keep root receipts together under the existing per-source metadata key.
+/// Forget/release already invalidates that key atomically; changing its shape
+/// would leave stale completions behind. Legacy scalar fingerprints are not
+/// reusable: several configured paths used to overwrite one another (#574).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteMirrorScanCache {
+    version: u8,
+    contract: String,
+    roots: BTreeMap<String, String>,
+}
+
+fn remote_mirror_root_identity(root: &ScanRoot) -> Option<String> {
+    let identity = serde_json::to_vec(&(
+        crate::normalize_path_identity(&root.path),
+        &root.origin,
+        root.platform,
+        &root.mirrored_source_path,
+        &root.workspace_rewrites,
+    ))
+    .ok()?;
+    Some(blake3::hash(&identity).to_hex().to_string())
+}
+
+fn remote_mirror_scan_contract(policy: &WorkspaceExclusions) -> Option<String> {
+    let connectors: Vec<_> = configured_connector_factories()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let excluded_paths = crate::connectors::codex::path_policy::ScanExclusions::from_env()
+        .reuse_identity()
+        .ok()?;
+    let contract = serde_json::to_vec(&(
+        policy.bind_contract(env!("CASS_SOURCE_INGEST_CONTRACT")),
+        connectors,
+        dotenvy::var("CASS_EXCLUDE_PATHS").ok(),
+        excluded_paths,
+        skip_subagents_active(),
+        crate::connectors::omp::PiFamilyOwnership::live().scan_reuse_context()?,
+    ))
+    .ok()?;
+    Some(blake3::hash(&contract).to_hex().to_string())
 }
 
 /// #372: has this mirror source already produced at least one canonical
@@ -38252,70 +38363,104 @@ fn remote_mirror_source_already_indexed(storage: &FrankenStorage, source_id: &st
 ///
 /// A remote (ssh) mirror root gets `since_ts = None` (a full re-scan every run)
 /// so freshly-synced old-content sessions still promote to canonical. When the
-/// mirror is byte-identical to the last clean scan, that full re-scan is pure
+/// mirror metadata matches the last clean scan, that full re-scan is pure
 /// waste (issue #372: 2.9 h for a 2.67 GB `opencode.db`). Such a root is
 /// dropped from the returned scan set; the returned fingerprint list is stored
-/// by the caller *only after an error-free scan*.
+/// by the caller only after an error-free scan with complete source boundaries.
 ///
 /// Fail-safe: local roots are never touched (they already honor the incremental
 /// cutoff); `--full` / `--force-rebuild` never skip; and any fingerprint doubt
-/// falls through to a full scan.
+/// falls through to a full scan. Explicit file roots use the per-source ledger
+/// because their reconstruction dependencies can sit outside the file root.
 fn plan_remote_mirror_scan_skips(
     storage: &FrankenStorage,
     opts: &IndexOptions,
     roots: Vec<ScanRoot>,
 ) -> (Vec<ScanRoot>, Vec<(String, String)>) {
-    let skip_enabled = !opts.full && !opts.force_rebuild;
     let workspace_policy = WorkspaceExclusions::from_env().ok();
+    let contract = workspace_policy
+        .as_ref()
+        .and_then(remote_mirror_scan_contract);
+    let reuse_enabled = env!("CASS_SOURCE_INGEST_REUSE") == "true";
+    let skip_enabled = !opts.full && !opts.force_rebuild && reuse_enabled;
     let mut scanned = Vec::with_capacity(roots.len());
-    let mut fingerprints_to_store: Vec<(String, String)> = Vec::new();
+    let mut saved_by_source: HashMap<String, Option<RemoteMirrorScanCache>> = HashMap::new();
+    let mut indexed_sources = HashMap::new();
+    let mut current_by_source: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut changed_sources = BTreeSet::new();
     let mut skipped = 0usize;
     for root in roots {
-        if root.origin.kind != SourceKind::Ssh {
+        // An explicit file root can depend on SQLite WAL/SHM siblings outside
+        // the fingerprinted path. Its connector's source ledger observes those
+        // dependencies; the whole-root shortcut cannot certify them.
+        if root.origin.kind != SourceKind::Ssh || !root.path.is_dir() {
             scanned.push(root);
             continue;
         }
-        let fingerprint_now = remote_mirror_scan_fingerprint(&root.path).and_then(|fingerprint| {
-            workspace_policy
-                .as_ref()
-                .map(|policy| policy.bind_contract(&fingerprint))
+        let source_id = &root.origin.source_id;
+        let saved = saved_by_source.entry(source_id.clone()).or_insert_with(|| {
+            storage
+                .read_mirror_scan_fingerprint(source_id)
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_str::<RemoteMirrorScanCache>(&value).ok())
+                .filter(|cache| {
+                    cache.version == 2 && Some(cache.contract.as_str()) == contract.as_deref()
+                })
         });
-        let stored = storage
-            .read_mirror_scan_fingerprint(&root.origin.source_id)
-            .ok()
-            .flatten();
+        let observation =
+            remote_mirror_root_identity(&root).zip(remote_mirror_scan_fingerprint(&root.path));
+        let matching_root = observation.as_ref().is_some_and(|(identity, fingerprint)| {
+            saved.as_ref().and_then(|cache| cache.roots.get(identity)) == Some(fingerprint)
+        });
+        if let Some((identity, fingerprint)) = observation {
+            current_by_source
+                .entry(source_id.clone())
+                .or_default()
+                .insert(identity, fingerprint);
+        }
         // A clean scan can deliberately exclude every session. Its saved
         // fingerprint still proves completion under this exact policy even
         // though no canonical conversation exists to prove prior admission.
         let unchanged = skip_enabled
-            && fingerprint_now.is_some()
-            && stored.is_some()
-            && stored.as_deref() == fingerprint_now.as_deref()
-            && (remote_mirror_source_already_indexed(storage, &root.origin.source_id)
-                .unwrap_or(false)
-                || workspace_policy
-                    .as_ref()
-                    .is_some_and(|policy| !policy.patterns.is_empty()));
+            && matching_root
+            && (*indexed_sources.entry(source_id.clone()).or_insert_with(|| {
+                remote_mirror_source_already_indexed(storage, source_id).unwrap_or(false)
+            }) || workspace_policy
+                .as_ref()
+                .is_some_and(|policy| !policy.patterns.is_empty()));
         if unchanged {
             skipped += 1;
             tracing::info!(
                 source_id = %root.origin.source_id,
                 root = %root.path.display(),
-                "skipping unchanged remote mirror scan; fingerprint matches last clean scan (#372)"
+                "skipping unchanged remote mirror root; fingerprint matches last clean scan (#574)"
             );
             continue;
         }
-        if let Some(fingerprint) = fingerprint_now {
-            fingerprints_to_store.push((root.origin.source_id.clone(), fingerprint));
-        }
+        changed_sources.insert(source_id.clone());
         scanned.push(root);
     }
     if skipped > 0 {
         tracing::info!(
             skipped_mirror_roots = skipped,
-            "#372: skipped unchanged remote mirror roots to avoid a redundant full re-scan"
+            "#574: skipped unchanged remote mirror roots to avoid a redundant full re-scan"
         );
     }
+    let fingerprints_to_store = current_by_source
+        .into_iter()
+        .filter(|(source_id, _)| changed_sources.contains(source_id))
+        .filter_map(|(source_id, roots)| {
+            let cache = RemoteMirrorScanCache {
+                version: 2,
+                contract: contract.as_ref()?.clone(),
+                roots,
+            };
+            serde_json::to_string(&cache)
+                .ok()
+                .map(|value| (source_id, value))
+        })
+        .collect();
     (scanned, fingerprints_to_store)
 }
 
@@ -38505,6 +38650,324 @@ mod mirror_scan_skip_tests {
         assert_eq!(scanned4.len(), 1, "a changed mirror must re-scan");
         assert_eq!(fps4.len(), 1, "changed mirror captures a new fingerprint");
         assert_ne!(fps4[0].1, fps[0].1, "fingerprint changed with content");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn gh574_explicit_file_roots_never_reuse_whole_root_receipts() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("archive.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let file = tmp.path().join("session.db");
+        fs::write(&file, b"database").unwrap();
+        let root = ssh_root(&file, "css");
+        insert_conv_with_source(&storage, "css", &file);
+        let fingerprint = remote_mirror_scan_fingerprint(&file).unwrap();
+        let cache = RemoteMirrorScanCache {
+            version: 2,
+            contract: remote_mirror_scan_contract(&WorkspaceExclusions::default()).unwrap(),
+            roots: BTreeMap::from([(
+                remote_mirror_root_identity(&root).unwrap(),
+                fingerprint.clone(),
+            )]),
+        };
+        storage
+            .record_mirror_scan_fingerprint("css", &serde_json::to_string(&cache).unwrap())
+            .unwrap();
+        // The file-only fingerprint cannot see a new reconstruction sidecar.
+        fs::write(tmp.path().join("session.db-wal"), b"pending transaction").unwrap();
+        assert_eq!(remote_mirror_scan_fingerprint(&file).unwrap(), fingerprint);
+        let (scanned, receipts) =
+            plan_remote_mirror_scan_skips(&storage, &base_opts(&db_path, tmp.path()), vec![root]);
+        assert_eq!(scanned.len(), 1);
+        assert!(
+            receipts.is_empty(),
+            "file roots must use source dependency observations"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn gh574_uncompleted_remote_sessions_withhold_only_root_cache() -> Result<()> {
+        fn scan(
+            root: ScanRoot,
+            data_dir: &Path,
+            saved: HashMap<String, String>,
+        ) -> Result<(bool, Vec<PathBuf>, HashMap<String, String>)> {
+            let config = StreamingProducerConfig {
+                source_ledger: Arc::new(saved.clone()),
+                incomplete_remote_sources: Arc::new(AtomicBool::new(false)),
+                raw_source_exclusions: Arc::new(RawSourceExclusions::default()),
+                flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+                data_dir: data_dir.to_path_buf(),
+                additional_scan_roots: vec![root.clone()],
+                local_connector_roots: None,
+                since_ts: None,
+                local_since_ts_by_connector: Arc::new(HashMap::new()),
+                progress: None,
+                active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
+            };
+            let ctx = crate::connectors::ScanContext::with_roots(
+                data_dir.to_path_buf(),
+                vec![root],
+                None,
+            );
+            let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+            let mut sender =
+                StreamingBatchSender::new(&tx, config.flow_limiter.clone(), "pi_agent", true);
+            let mut emitted = Vec::new();
+            scan_with_durable_source_boundaries(
+                &crate::connectors::pi_agent::PiAgentConnector::new(),
+                &ctx,
+                &config,
+                &mut sender,
+                |conversation| {
+                    emitted.push(conversation.source_path.clone());
+                    Ok(Some(conversation))
+                },
+            )?;
+            sender.flush()?;
+            drop(sender);
+            drop(tx);
+            let mut receipts = saved;
+            for message in rx {
+                match message {
+                    IndexMessage::SourceComplete {
+                        completion,
+                        byte_reservation,
+                        ..
+                    } => {
+                        receipts.insert(completion.key, completion.observation);
+                        config.flow_limiter.release(byte_reservation);
+                    }
+                    IndexMessage::Batch {
+                        byte_reservation, ..
+                    } => {
+                        config.flow_limiter.release(byte_reservation);
+                    }
+                    _ => panic!("source scan emitted an unexpected control message"),
+                }
+            }
+            Ok((
+                config.incomplete_remote_sources.load(Ordering::Relaxed),
+                emitted,
+                receipts,
+            ))
+        }
+
+        const HEADER: &str = "{\"type\":\"session\",\"id\":\"test-session\",\"cwd\":\"/work\",\"timestamp\":\"2024-01-01T00:00:00Z\"}\n";
+        const MESSAGE: &str = "{\"type\":\"message\",\"id\":\"user\",\"timestamp\":\"2024-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n";
+        for remote in [false, true] {
+            let tmp = TempDir::new()?;
+            let sessions = tmp.path().join(".pi/agent/sessions");
+            fs::create_dir_all(&sessions)?;
+            let healthy = sessions.join("healthy.jsonl");
+            let empty = sessions.join("header-only.jsonl");
+            fs::write(&healthy, format!("{HEADER}{MESSAGE}"))?;
+            fs::write(&empty, HEADER)?;
+            let root = if remote {
+                ssh_root(&sessions, "css")
+            } else {
+                ScanRoot::local(sessions)
+            };
+
+            let (incomplete, emitted, receipts) = scan(root.clone(), tmp.path(), HashMap::new())?;
+            assert_eq!(
+                incomplete, remote,
+                "local empty sessions cannot block mirror reuse"
+            );
+            assert_eq!(emitted, vec![healthy.clone()]);
+            assert_eq!(
+                receipts.len(),
+                1,
+                "the healthy sibling keeps its source receipt"
+            );
+
+            let (incomplete, emitted, receipts) = scan(root.clone(), tmp.path(), receipts)?;
+            assert_eq!(incomplete, remote);
+            assert!(emitted.is_empty(), "retry must reuse the completed sibling");
+
+            fs::write(&empty, format!("{HEADER}{MESSAGE}"))?;
+            let (incomplete, emitted, _) = scan(root, tmp.path(), receipts)?;
+            assert!(!incomplete, "all admitted sources now completed");
+            assert_eq!(emitted, vec![empty]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gh574_mirror_roots_share_source_without_overwriting_completions() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let opts = base_opts(&db_path, tmp.path());
+        let pi = tmp.path().join("mirror/pi");
+        let omp = tmp.path().join("mirror/omp");
+        for path in [&pi, &omp] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("session.jsonl"), b"session").unwrap();
+        }
+        let roots = vec![ssh_root(&pi, "css"), ssh_root(&omp, "css")];
+        insert_conv_with_source(&storage, "css", &pi.join("session.jsonl"));
+
+        let (scanned, receipts) = plan_remote_mirror_scan_skips(&storage, &opts, roots.clone());
+        assert_eq!(scanned.len(), 2);
+        assert_eq!(receipts.len(), 1, "one atomic receipt per source");
+        let cache: RemoteMirrorScanCache = serde_json::from_str(&receipts[0].1).unwrap();
+        assert_eq!(
+            cache.roots.len(),
+            2,
+            "each configured root has its own completion"
+        );
+        storage
+            .record_mirror_scan_fingerprint("css", &receipts[0].1)
+            .unwrap();
+
+        // Reordering configured paths must not change the receipt or scan work.
+        let mut reordered = roots.clone();
+        reordered.reverse();
+        let (scanned, receipts) = plan_remote_mirror_scan_skips(&storage, &opts, reordered);
+        assert!(scanned.is_empty());
+        assert!(
+            receipts.is_empty(),
+            "idle indexing writes no new completion"
+        );
+
+        let file = pi.join("session.jsonl");
+        let old_mtime = fs::metadata(&file).unwrap().modified().unwrap();
+        fs::write(&file, b"session plus an old-timestamp message").unwrap();
+        File::open(&file).unwrap().set_modified(old_mtime).unwrap();
+        let (scanned, receipts) = plan_remote_mirror_scan_skips(&storage, &opts, roots.clone());
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].path, pi);
+        let cache: RemoteMirrorScanCache = serde_json::from_str(&receipts[0].1).unwrap();
+        assert_eq!(
+            cache.roots.len(),
+            2,
+            "retain the unchanged root's completion"
+        );
+
+        // An incomplete scan does not persist the proposed receipt. The next
+        // plan must retry precisely that changed root, not bless its new state.
+        let (retry, _) = plan_remote_mirror_scan_skips(&storage, &opts, roots.clone());
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].path, pi);
+        storage
+            .record_mirror_scan_fingerprint("css", &receipts[0].1)
+            .unwrap();
+        assert!(
+            plan_remote_mirror_scan_skips(&storage, &opts, roots.clone())
+                .0
+                .is_empty()
+        );
+
+        let mut forced = opts;
+        forced.force_rebuild = true;
+        assert_eq!(
+            plan_remote_mirror_scan_skips(&storage, &forced, roots)
+                .0
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn gh574_legacy_or_incompatible_mirror_receipts_do_not_skip() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let opts = base_opts(&db_path, tmp.path());
+        let mirror = tmp.path().join("mirror");
+        fs::create_dir_all(&mirror).unwrap();
+        let file = mirror.join("session.jsonl");
+        fs::write(&file, b"session").unwrap();
+        insert_conv_with_source(&storage, "css", &file);
+        let root = ssh_root(&mirror, "css");
+        let (_, receipts) = plan_remote_mirror_scan_skips(&storage, &opts, vec![root.clone()]);
+        let mut wrong_version: RemoteMirrorScanCache =
+            serde_json::from_str(&receipts[0].1).unwrap();
+        wrong_version.version = 1;
+        let mut wrong_contract: RemoteMirrorScanCache =
+            serde_json::from_str(&receipts[0].1).unwrap();
+        wrong_contract.contract = "previous-parser-or-filter-policy".into();
+        for saved in [
+            remote_mirror_scan_fingerprint(&mirror).unwrap(),
+            "{incomplete-json".into(),
+            serde_json::to_string(&wrong_version).unwrap(),
+            serde_json::to_string(&wrong_contract).unwrap(),
+        ] {
+            storage
+                .record_mirror_scan_fingerprint("css", &saved)
+                .unwrap();
+            assert_eq!(
+                plan_remote_mirror_scan_skips(&storage, &opts, vec![root.clone()])
+                    .0
+                    .len(),
+                1,
+                "unproven receipt must replay: {saved}",
+            );
+        }
+    }
+
+    #[test]
+    fn gh574_mirror_identity_binds_source_interpretation() {
+        let root = ssh_root(Path::new("mirror/pi"), "css");
+        let original = remote_mirror_root_identity(&root).unwrap();
+        let mut variants = vec![root.clone(); 5];
+        variants[0].path = PathBuf::from("mirror/other");
+        variants[1].origin.host = Some("another-host".into());
+        variants[2].platform = Some(Platform::Macos);
+        variants[3].mirrored_source_path = Some("~/.pi/agent".into());
+        variants[4] = root.clone().with_rewrite("/remote", "/local");
+        for variant in variants {
+            assert_ne!(remote_mirror_root_identity(&variant).unwrap(), original);
+        }
+        assert_ne!(
+            remote_mirror_scan_contract(&WorkspaceExclusions::default()),
+            remote_mirror_scan_contract(&WorkspaceExclusions::parse("/private/*").unwrap()),
+        );
+    }
+
+    #[test]
+    fn gh574_explicit_file_mirror_fingerprints_observe_the_file() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("session.jsonl");
+        fs::write(&file, b"session").unwrap();
+        let before = remote_mirror_scan_fingerprint(&file).unwrap();
+        fs::write(&file, b"session with an append").unwrap();
+        assert_ne!(remote_mirror_scan_fingerprint(&file).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh574_mirror_replacements_with_preserved_size_and_mtime_are_observed() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("session.jsonl");
+        let replacement = tmp.path().join("replacement");
+        fs::write(&file, b"original").unwrap();
+        let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+        let before = remote_mirror_scan_fingerprint(&file).unwrap();
+        fs::write(&replacement, b"replaced").unwrap();
+        File::open(&replacement)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        fs::rename(&replacement, &file).unwrap();
+        assert_ne!(remote_mirror_scan_fingerprint(&file).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh574_mirror_symlinks_cannot_certify_unobserved_targets() {
+        let tmp = TempDir::new().unwrap();
+        let mirror = tmp.path().join("mirror");
+        fs::create_dir_all(&mirror).unwrap();
+        let external = tmp.path().join("external.jsonl");
+        fs::write(&external, b"session").unwrap();
+        let link = mirror.join("session.jsonl");
+        std::os::unix::fs::symlink(external, &link).unwrap();
+        assert_eq!(remote_mirror_scan_fingerprint(&mirror), None);
+        assert_eq!(remote_mirror_scan_fingerprint(&link), None);
     }
 }
 
@@ -62597,6 +63060,7 @@ mod tests {
             tx,
             StreamingProducerConfig {
                 source_ledger: Arc::new(HashMap::new()),
+                incomplete_remote_sources: Arc::new(AtomicBool::new(false)),
                 raw_source_exclusions: Arc::new(RawSourceExclusions::default()),
                 flow_limiter: flow_limiter.clone(),
                 data_dir: data_dir.clone(),
@@ -63518,6 +63982,7 @@ mod tests {
             tx,
             StreamingProducerConfig {
                 source_ledger: Arc::new(HashMap::new()),
+                incomplete_remote_sources: Arc::new(AtomicBool::new(false)),
                 raw_source_exclusions: Arc::new(RawSourceExclusions::default()),
                 flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
                 data_dir,

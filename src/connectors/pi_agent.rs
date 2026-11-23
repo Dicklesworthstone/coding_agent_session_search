@@ -5,6 +5,7 @@
 //! Pi's permissive explicit-root detection walk into an OMP store.
 
 use anyhow::Result;
+use franken_agent_detection::connectors::SourceScanHooks;
 
 use super::{
     Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, ScanContext,
@@ -67,31 +68,54 @@ impl Connector for PiAgentConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let ownership = super::omp::PiFamilyOwnership::live();
-        let mut conversations = self.inner.scan(ctx)?;
+        let mut conversations = Vec::new();
+        self.scan_with_callback(ctx, &mut |conversation| {
+            conversations.push(conversation);
+            Ok(())
+        })?;
+        Ok(conversations)
+    }
 
-        if !ctx.use_default_detection() {
-            let direct_roots = ctx
-                .scan_roots
+    fn supports_streaming_scan(&self) -> bool {
+        self.inner.supports_streaming_scan()
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.scan_with_source_boundaries(ctx, &mut SourceScanHooks::default(), on_conversation)
+    }
+
+    fn supports_source_boundaries(&self) -> bool {
+        self.inner.supports_source_boundaries()
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let ownership = super::omp::PiFamilyOwnership::live();
+        let additional_roots = if ctx.use_default_detection() {
+            Vec::new()
+        } else {
+            ctx.scan_roots
                 .iter()
                 .filter(|root| ownership.owner(&root.path) == super::omp::PiFamilyOwner::PiAgent)
-                .map(|root| root.path.clone())
-                .collect::<Vec<_>>();
-            if !direct_roots.is_empty() {
-                let fallback = franken_agent_detection::connectors::pi_wire::scan_homes(
-                    &direct_roots,
-                    ctx,
-                    "pi_agent",
-                )?;
-                super::omp::append_missing_conversations(&mut conversations, fallback);
-            }
-        }
-
-        conversations.retain(|conversation| {
-            ownership.owner(&conversation.source_path) != super::omp::PiFamilyOwner::Omp
-        });
-        super::omp::promote_transcript_session_ids(&mut conversations);
-        Ok(conversations)
+                .map(|root| (root.clone(), None))
+                .collect()
+        };
+        ownership.scan_with_source_boundaries(
+            &self.inner,
+            ctx,
+            "pi_agent",
+            &additional_roots,
+            hooks,
+            on_conversation,
+        )
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {

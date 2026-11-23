@@ -136,6 +136,7 @@ fn gh538_unencodable_ledger_identity_keeps_real_source_parsing_without_ack() -> 
     let mut ctx = ScanContext::with_roots(data_dir.clone(), vec![ScanRoot::local(path)], None);
     let mut config = StreamingProducerConfig {
         source_ledger: Arc::new(HashMap::new()),
+        incomplete_remote_sources: Arc::new(AtomicBool::new(false)),
         raw_source_exclusions: Arc::new(RawSourceExclusions::default()),
         flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
         data_dir,
@@ -616,6 +617,7 @@ fn gh512_real_connectors_complete_during_growth_without_redundant_discovery() ->
         let limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
         let mut config = StreamingProducerConfig {
             source_ledger: Arc::new(HashMap::new()),
+            incomplete_remote_sources: Arc::new(AtomicBool::new(false)),
             raw_source_exclusions: Arc::new(RawSourceExclusions::default()),
             flow_limiter: Arc::clone(&limiter),
             data_dir,
@@ -949,6 +951,7 @@ fn gh512_real_sidecar_appearance_before_admission_cannot_certify_an_untracked_fi
     );
     let mut config = StreamingProducerConfig {
         source_ledger: Arc::new(HashMap::new()),
+        incomplete_remote_sources: Arc::new(AtomicBool::new(false)),
         raw_source_exclusions: Arc::new(RawSourceExclusions::default()),
         flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
         data_dir,
@@ -1038,6 +1041,7 @@ struct DiagnosticLedgerScan {
 fn diagnostic_ledger_config(data_dir: PathBuf) -> StreamingProducerConfig {
     StreamingProducerConfig {
         source_ledger: Arc::new(HashMap::new()),
+        incomplete_remote_sources: Arc::new(AtomicBool::new(false)),
         raw_source_exclusions: Arc::new(RawSourceExclusions::default()),
         flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
         data_dir,

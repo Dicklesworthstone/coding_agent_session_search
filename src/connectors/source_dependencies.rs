@@ -4,6 +4,7 @@
 //! registration, rather than teaching the indexer a list of provider names.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::OnceLock;
 
 pub(crate) mod observation;
@@ -22,11 +23,24 @@ pub(crate) enum SourceDependencyPolicy {
     /// omitted. This is an opt-in parser contract, not an inference from an
     /// empty `required_sidecars` list on one particular scan.
     SelfContained,
+    /// Pi-family JSONL transcripts read only the selected file, while their
+    /// SQLite stores can acquire a previously absent WAL. Keep the directory
+    /// guard for every format other than the explicitly self-contained one.
+    SelfContainedJsonl,
 }
 
 impl SourceDependencyPolicy {
     pub(crate) fn observes_parent_directory(self) -> bool {
-        self == Self::ObserveParentDirectory
+        self != Self::SelfContained
+    }
+
+    pub(crate) fn observes_parent_directory_for_path(self, path: &Path) -> bool {
+        self.observes_parent_directory()
+            && !(self == Self::SelfContainedJsonl
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl")))
     }
 }
 
@@ -53,6 +67,17 @@ impl SourceDependencyCapability for super::codex::CodexConnector {
     const SOURCE_DEPENDENCIES: SourceDependencyPolicy = SourceDependencyPolicy::SelfContained;
     // The CASS budget/exclusion adapter rejects the rollout before either
     // parser pass or the host hook. Archived rollouts use the same admission.
+    const WHOLE_SOURCE_EXCLUSIONS: bool = true;
+}
+
+impl SourceDependencyCapability for super::pi_agent::PiAgentConnector {
+    const SOURCE_DEPENDENCIES: SourceDependencyPolicy = SourceDependencyPolicy::SelfContainedJsonl;
+    // pi_wire rejects the primary source path before its admission hook.
+    const WHOLE_SOURCE_EXCLUSIONS: bool = true;
+}
+
+impl SourceDependencyCapability for super::omp::OmpConnector {
+    const SOURCE_DEPENDENCIES: SourceDependencyPolicy = SourceDependencyPolicy::SelfContainedJsonl;
     const WHOLE_SOURCE_EXCLUSIONS: bool = true;
 }
 
@@ -163,7 +188,10 @@ mod tests {
             );
         }
         for registration in super::super::get_connector_registrations() {
-            if !matches!(registration.source_slug, "claude_code" | "codex") {
+            if !matches!(
+                registration.source_slug,
+                "claude_code" | "codex" | "pi_agent" | "omp"
+            ) {
                 assert_eq!(
                     registration.source_dependencies,
                     SourceDependencyPolicy::ObserveParentDirectory
@@ -181,11 +209,32 @@ mod tests {
     }
 
     #[test]
+    fn gh574_pi_family_jsonl_reuses_siblings_but_sqlite_keeps_directory_guard() {
+        for slug in ["pi_agent", "omp"] {
+            let policy = source_dependency_policy(slug);
+            assert_eq!(policy, SourceDependencyPolicy::SelfContainedJsonl);
+            assert!(policy.observes_parent_directory());
+            for file in ["session.jsonl", "session.JSONL"] {
+                assert!(!policy.observes_parent_directory_for_path(Path::new(file)));
+            }
+            for file in ["sessions.db", "sessions.sqlite", "unknown"] {
+                assert!(policy.observes_parent_directory_for_path(Path::new(file)));
+            }
+        }
+        assert!(
+            source_dependency_policy("unknown")
+                .observes_parent_directory_for_path(Path::new("session.jsonl"))
+        );
+    }
+
+    #[test]
     fn gh512_whole_source_exclusions_require_explicit_runtime_capabilities() {
         for (registration, source) in [
             ("claude", "claude_code"),
             ("codex", "codex"),
             ("codebuff", "codebuff"),
+            ("pi_agent", "pi_agent"),
+            ("omp", "omp"),
         ] {
             assert!(can_reuse_with_path_exclusions(registration, source));
             assert!(!can_reuse_with_path_exclusions("unknown", source));
@@ -198,7 +247,7 @@ mod tests {
             );
             if !matches!(
                 registration.source_slug,
-                "claude_code" | "codex" | "codebuff"
+                "claude_code" | "codex" | "codebuff" | "pi_agent" | "omp"
             ) {
                 assert!(!registration.whole_source_exclusions);
             }

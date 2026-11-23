@@ -3121,6 +3121,8 @@ The global `last_scan_ts` and `last_indexed_at` watermarks live in the SQLite `m
 - **1-second mtime slack**: Accounts for filesystem timestamp granularity
 - **No per-message filtering**: Prevents data loss when new messages are appended
 - **Completed-source reuse is a build-time property**: a source that was fully ingested and has not changed is skipped, but only in builds whose `Cargo.lock` resolves every dependency from a registry or git source. A build with a local path dependency or `[patch]` reparses every source on every incremental run. `cass capabilities --json` reports which applies as `source_ingest_reuse.{enabled,disabled_by}` (GH #426). Release binaries have it on.
+- **SSH mirrors have independent root receipts**: each configured path keeps its own successful-scan fingerprint, including when several paths belong to the same SSH source. Unchanged roots require a filesystem metadata walk instead of transcript parsing. The receipt also tracks parser, connector-selection, path-mapping and exclusion-policy changes. Legacy receipts are refreshed on the first successful scan after upgrading (GH #574).
+- **Pi/OMP reuse completed transcripts individually**: when a mirror changes, only new or changed JSONL files are parsed. Adding a sibling does not invalidate completed transcripts; SQLite stores retain directory and WAL checks. Newly synced files remain discoverable even when rsync preserves an old mtime. Failed scans do not certify a new root receipt, and `cass index --full` bypasses both root and file reuse.
 
 ### Codex Token Backfill
 

@@ -11712,6 +11712,15 @@ impl FrankenStorage {
                     LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY
                 ],
             )?;
+            // Receipts certify canonical provider/source identities. A migration
+            // invalidates that evidence even if ownership policy later returns
+            // to an earlier context. Source keys are hashed, so clear both
+            // receipt families atomically with the identity rewrite.
+            tx.execute(
+                "DELETE FROM meta
+                 WHERE (key >= 'source_ingest_v1:' AND key < 'source_ingest_v1;')
+                    OR (key >= 'mirror_scan_fp:' AND key < 'mirror_scan_fp;')",
+            )?;
             // Semantic doc ids embed both the numeric agent id and a hash of
             // source_id. Reclassification changes those filter identities in
             // place without changing message rowids, so neither the semantic
@@ -44428,7 +44437,19 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             source_id: LOCAL_SOURCE_ID.into(),
             origin_host: None,
         };
-        storage.insert_conversations_batched(&[(pi_agent_id, None, &conversation)])?;
+        let source_completion = SourceIngestLedgerEntry {
+            key: "source_ingest_v1:legacy-omp".into(),
+            observation: serde_json::json!({
+                "primary": {"path": conversation.source_path}, "dependencies": []
+            })
+            .to_string(),
+        };
+        storage.insert_conversations_batched_with_source_completion(
+            &[(pi_agent_id, None, &conversation)],
+            &source_completion,
+        )?;
+        storage.record_mirror_scan_fingerprint("remote-fixture", "before-migration")?;
+        assert_eq!(storage.source_ingest_ledger_entries()?.len(), 1);
 
         let legacy_token_agent_id: i64 = storage.conn.query_row_map(
             "SELECT agent_id FROM token_usage LIMIT 1",
@@ -44458,6 +44479,8 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 analytics_rebuild_required: true,
             }
         );
+        assert!(storage.source_ingest_ledger_entries()?.is_empty());
+        assert_eq!(storage.read_mirror_scan_fingerprint("remote-fixture")?, None);
         assert_eq!(
             storage.get_last_embedded_message_id("minilm-384")?,
             None,
@@ -44469,6 +44492,8 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 "each semantic tier must fail closed until its Pi-era doc ids are republished"
             );
         }
+        storage.record_filtered_source_completion(&source_completion)?;
+        storage.record_mirror_scan_fingerprint("remote-fixture", "after-migration")?;
         assert_eq!(
             storage.reclassify_legacy_omp_conversations()?,
             LegacyOmpReclassificationResult {
@@ -44476,6 +44501,19 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                 lexical_rebuild_required: true,
                 analytics_rebuild_required: true,
             }
+        );
+        assert_eq!(
+            storage
+                .source_ingest_ledger_entries()?
+                .get(&source_completion.key),
+            Some(&source_completion.observation),
+            "a zero-row migration retry must retain newly recorded source receipts"
+        );
+        assert_eq!(
+            storage
+                .read_mirror_scan_fingerprint("remote-fixture")?
+                .as_deref(),
+            Some("after-migration")
         );
 
         let conversations = storage.list_conversations(10, 0)?;
