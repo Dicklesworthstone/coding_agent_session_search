@@ -37761,7 +37761,8 @@ mod pack_field_mask_tests {
             title: String::new(),
             snippet: String::new(),
             source_path: "/sessions/pack-budget.jsonl".to_string(),
-            content: "Useful quoted \"matrix\" evidence with Unicode 界😀 and a newline\n".to_string(),
+            content: "Useful quoted \"matrix\" evidence with Unicode 界😀 and a newline\n"
+                .to_string(),
             content_hash: 7,
             conversation_id: Some(42),
             line_number: Some(3),
@@ -37803,7 +37804,10 @@ mod pack_field_mask_tests {
         let token_limit = compact.chars().count().div_ceil(4);
         assert!(pretty.chars().count().div_ceil(4) > token_limit);
         let mut bounded_plan = plan;
-        bounded_plan.diagnostics.budget.max_output_tokens_with_overflow = token_limit;
+        bounded_plan
+            .diagnostics
+            .budget
+            .max_output_tokens_with_overflow = token_limit;
         for require_evidence in [false, true] {
             let actual = render_cli_pack_with_output_budget(
                 bounded_plan.clone(),
