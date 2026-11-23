@@ -32506,11 +32506,17 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         storage
             .insert_conversations_batched_with_analytics(&[(agent, None, &conversation)], false)?;
         storage.raw().execute("UPDATE token_usage SET input_tokens = 11, output_tokens = 3, cache_read_tokens = 0, cache_creation_tokens = 0, thinking_tokens = 0, estimated_cost_usd = 0.5, model_family = 'fixture'")?;
+        // The bounded reset reports `(0, 0)` keepalives to the indexer watchdog
+        // between its pages. Pin only the message-keyset progress.
         let progress = std::cell::RefCell::new(Vec::new());
         storage.rebuild_analytics_since_with_chunk_size_and_progress(
             None,
             10_000,
-            Some(&|count, _| progress.borrow_mut().push(count)),
+            Some(&|count, total| {
+                if total != 0 {
+                    progress.borrow_mut().push(count);
+                }
+            }),
             None,
             None,
             None,
