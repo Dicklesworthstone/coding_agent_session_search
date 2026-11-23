@@ -147,10 +147,11 @@ impl WatchSourceLedger {
                 }
                 return false;
             }
-            if should_skip_active_session_source(
+            if should_skip_active_session_source_before_parse(
                 active_filter,
                 source.origin.kind,
                 &source.source_path,
+                connector_name,
             ) {
                 ledger.borrow_mut().active_sources_skipped += 1;
                 return false;

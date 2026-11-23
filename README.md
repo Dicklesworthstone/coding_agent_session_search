@@ -3035,14 +3035,23 @@ Re-index affected files
 - **Debounce**: 2 seconds (wait for burst of changes to settle)
 - **Max wait**: 5 seconds (don't wait forever during continuous activity)
 
-The debounce only batches events. A session file that was modified within the
-last `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` seconds (default 120), is
-open for writing, or holds an advisory lock is treated as still being written
-and is deferred, then retried after the window. So a message appended to the
-session an agent is actively working in becomes searchable after roughly two to
-three minutes, not seconds: 123 s, 139 s and 189 s were measured on a synthetic
-Claude Code session. Lowering the window shortens that wait, at the cost of
-parsing files that are still being written.
+The debounce only batches events. Complete, newline-terminated plain Codex
+`rollout-*.jsonl` files can be indexed even when recently modified or held open
+by an idle writer. The Codex parser checks the bounded file's identity, size and
+modification time across parsing and enrichment, then checks again before
+publishing its source receipt. A racing append, truncation or replacement causes
+a retry instead of certifying the source as complete. An advisory lock still
+defers the source.
+
+This admission reads a complete stable file; it does not read past an
+unfinished trailing record or ingest a prefix of a changing file. Those files,
+compressed Codex rollouts, and other providers retain conservative deferral:
+recent writes wait for `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` (default
+120 seconds), and open-writer or advisory-lock evidence can defer them longer.
+For Claude Code, 123 s, 139 s and 189 s were measured on a synthetic appended
+session. Lowering the window shortens that wait, at the cost of parsing files
+that may still be changing. No sub-ten-second end-to-end latency is guaranteed
+by the debounce settings.
 
 ### Path Classification
 

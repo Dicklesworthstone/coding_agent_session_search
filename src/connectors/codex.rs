@@ -29,7 +29,8 @@ pub(crate) use implementation::modern_codex_message;
 pub(crate) use implementation::over_budget_scan_error;
 #[allow(unused_imports)]
 pub(crate) use implementation::{
-    SourceFailureReason, for_each_source_failure, over_budget_sources, source_read_budget,
+    SourceFailureReason, can_attempt_active_jsonl_source, for_each_source_failure,
+    guarded_active_jsonl_source, over_budget_sources, source_read_budget,
 };
 
 /// Archive-aware public surface; parsing and enrichment live in implementation.

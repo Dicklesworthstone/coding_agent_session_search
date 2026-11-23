@@ -33,6 +33,7 @@ mod deferred_watch_sources {
             .env("XDG_DATA_HOME", home.join(".local/share"))
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("CODEX_HOME", home.join(".codex"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
             .env("CASS_IGNORE_SOURCES_CONFIG", "1")
             .env("CASS_AUTO_REFRESH", "0")
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
@@ -623,15 +624,18 @@ mod deferred_watch_sources {
     fn assert_deferred_source_retried(skipped_at_startup: bool, streaming: bool) {
         let home = indexed_watch_home();
         let data = home.path().join("cass-data");
-        let deferred = home.path().join(".codex/sessions/rollout-deferred.jsonl");
+        // Claude retains whole-source deferral. Complete guarded Codex reads
+        // have their own positive/partial-tail regression below (GH #563).
+        let deferred = home.path().join(".claude/projects/-test/deferred.jsonl");
+        fs::create_dir_all(deferred.parent().unwrap()).unwrap();
         if skipped_at_startup {
-            write_codex_session(&deferred, "deferredwatchneedle", "deferred-watch");
+            write_claude_session_with_id(&deferred, "deferredwatchneedle", "deferred-watch");
         }
         let (mut child, log_path) = start_watch(home.path(), &data, streaming);
         if !skipped_at_startup {
             // Exactly one source write after the actual watcher is installed.
             // Neither this source nor its directory is touched again.
-            write_codex_session(&deferred, "deferredwatchneedle", "deferred-watch");
+            write_claude_session_with_id(&deferred, "deferredwatchneedle", "deferred-watch");
         }
         let before = fs::read(&deferred).expect("deferred source bytes");
         let modified = fs::metadata(&deferred)
@@ -645,7 +649,7 @@ mod deferred_watch_sources {
             let skips = logs
                 .lines()
                 .filter(|line| {
-                    line.contains("rollout-deferred.jsonl")
+                    line.contains("deferred.jsonl")
                         && line
                             .contains("skipping session source that appears to be actively written")
                 })
@@ -707,11 +711,12 @@ mod deferred_watch_sources {
     fn watch_retains_writer_held_source_after_another_deferred_source_is_indexed() {
         let home = indexed_watch_home();
         let data = home.path().join("cass-data");
-        let sessions = home.path().join(".codex/sessions");
-        let completed = sessions.join("rollout-completed.jsonl");
-        let held = sessions.join("rollout-held.jsonl");
-        write_codex_session(&completed, "completedwatchneedle", "completed-watch");
-        write_codex_session(&held, "heldwatchneedle", "held-watch");
+        let sessions = home.path().join(".claude/projects/-test");
+        fs::create_dir_all(&sessions).unwrap();
+        let completed = sessions.join("completed.jsonl");
+        let held = sessions.join("held.jsonl");
+        write_claude_session_with_id(&completed, "completedwatchneedle", "completed-watch");
+        write_claude_session_with_id(&held, "heldwatchneedle", "held-watch");
         let writer = fs::OpenOptions::new()
             .append(true)
             .open(&held)
@@ -745,7 +750,7 @@ mod deferred_watch_sources {
             let writer_skips = logs
                 .lines()
                 .filter(|line| {
-                    line.contains("rollout-held.jsonl")
+                    line.contains("held.jsonl")
                         && line.contains("WritableFileDescriptor")
                         && line
                             .contains("skipping session source that appears to be actively written")
@@ -764,7 +769,7 @@ mod deferred_watch_sources {
             std::thread::sleep(Duration::from_millis(500));
         }
         let logs = fs::read_to_string(&log_path).expect("read watch deferral evidence");
-        for source in ["rollout-completed.jsonl", "rollout-held.jsonl"] {
+        for source in ["completed.jsonl", "held.jsonl"] {
             assert!(
                 logs.lines().any(|line| {
                     line.contains(source)
@@ -812,6 +817,142 @@ mod deferred_watch_sources {
             fs::metadata(&held).unwrap().modified().unwrap(),
             held_modified
         );
+    }
+
+    // The real cass child sees this test process's append descriptor in /proc.
+    // No writer-close event is allowed to make either positive assertion pass.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn complete_codex_with_held_writer_indexes_and_retries_unterminated_watch_tail() {
+        use std::io::Write;
+
+        fn canonical_messages(data: &Path, source: &Path) -> Vec<(i64, i64, i64, String)> {
+            let storage = SqliteStorage::open_readonly(&data.join("agent_search.db"))
+                .expect("read held-writer canonical history");
+            storage
+                .raw()
+                .query_map_collect(
+                    "SELECT c.id, m.id, m.idx, m.content \
+                     FROM conversations c JOIN messages m ON m.conversation_id = c.id \
+                     WHERE c.source_path = ?1 ORDER BY c.id, m.idx",
+                    &[source.to_string_lossy().as_ref().into()],
+                    |row| {
+                        Ok((
+                            row.get_typed(0)?,
+                            row.get_typed(1)?,
+                            row.get_typed(2)?,
+                            row.get_typed(3)?,
+                        ))
+                    },
+                )
+                .expect("read canonical source identities")
+        }
+
+        let home = indexed_watch_home();
+        let data = home.path().join("cass-data");
+        let source = home
+            .path()
+            .join(".codex/sessions/rollout-idle-writer.jsonl");
+        write_codex_session(&source, "heldcodexinitialneedle", "held-codex");
+        let mut writer = fs::OpenOptions::new().append(true).open(&source).unwrap();
+        writer
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
+            .unwrap();
+        let bytes = fs::read(&source).unwrap();
+        let modified = fs::metadata(&source).unwrap().modified().unwrap();
+        assert_cmd::Command::from_std(cass(home.path(), &data))
+            .args(["index", "--json", "--no-progress-events"])
+            .timeout(Duration::from_secs(120))
+            .assert()
+            .success();
+        assert_eq!(
+            content_hit_count(
+                &search(home.path(), &data, "heldcodexinitialneedle"),
+                "heldcodexinitialneedle"
+            ),
+            1
+        );
+        let initial_rows = canonical_messages(&data, &source);
+        assert_eq!(initial_rows.len(), 2);
+
+        // An unchanged rerun must retain the same conversation/message IDs,
+        // even though the provider still holds its source open for appending.
+        assert_cmd::Command::from_std(cass(home.path(), &data))
+            .args(["index", "--json", "--no-progress-events"])
+            .timeout(Duration::from_secs(120))
+            .assert()
+            .success();
+        assert_eq!(canonical_messages(&data, &source), initial_rows);
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), modified);
+
+        let (mut watcher, log_path) = start_watch_with_env(
+            home.path(),
+            &data,
+            true,
+            &[("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "3600")],
+        );
+        let append = serde_json::json!({
+            "timestamp":"2025-09-30T15:45:00.000Z",
+            "type":"response_item",
+            "payload":{"type":"message","role":"user","content":[
+                {"type":"input_text","text":"heldcodexappendneedle"}
+            ]}
+        })
+        .to_string();
+        let split = append.len() - 1;
+        writer.write_all(&append.as_bytes()[..split]).unwrap();
+        writer.flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let logs = fs::read_to_string(&log_path).unwrap();
+            assert!(watcher.0.try_wait().unwrap().is_none(), "{logs}");
+            if logs.lines().any(|line| {
+                line.contains("rollout-idle-writer.jsonl")
+                    && line.contains("skipping session source that appears to be actively written")
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "unfinished source was not deferred: {logs}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            content_hit_count(
+                &search(home.path(), &data, "heldcodexappendneedle"),
+                "heldcodexappendneedle"
+            ),
+            0
+        );
+        assert_eq!(canonical_messages(&data, &source), initial_rows);
+
+        writer.write_all(&append.as_bytes()[split..]).unwrap();
+        writer.write_all(b"\n").unwrap();
+        writer.flush().unwrap();
+        wait_for_hit(
+            &mut watcher,
+            home.path(),
+            &data,
+            &log_path,
+            "heldcodexappendneedle",
+        );
+        let final_rows = canonical_messages(&data, &source);
+        assert_eq!(final_rows.len(), 3);
+        assert_eq!(&final_rows[..2], initial_rows.as_slice());
+        assert_eq!(
+            final_rows
+                .iter()
+                .filter(|row| row.3 == "heldcodexappendneedle")
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read(&source).unwrap(),
+            [bytes, append.into_bytes(), vec![b'\n']].concat()
+        );
+        drop(writer);
     }
 
     /// GH #538: exercise a resident watcher, including repeated source discovery

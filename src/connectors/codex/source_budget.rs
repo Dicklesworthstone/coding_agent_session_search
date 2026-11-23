@@ -16,6 +16,7 @@ mod recovery;
 mod snapshot;
 
 pub(crate) use recovery::{SourceFailureReason, for_each_source_failure};
+pub(crate) use snapshot::{can_attempt_active_jsonl_source, guarded_active_jsonl_source};
 
 use std::cell::RefCell;
 use std::fmt;
@@ -482,6 +483,12 @@ fn scan_with_admission(
         // Deliberately outside the enrichment error match: sink/storage errors
         // must abort even when a caller returns the same concrete error type.
         let source_path = conversation.source_path.clone();
+        let _complete_source_delivery = state
+            .borrow()
+            .snapshot
+            .as_ref()
+            .context("Codex delivery has no admitted source snapshot")?
+            .guard_complete_delivery(&source_path)?;
         on_conversation(conversation)?;
         let mut state = state.borrow_mut();
         state.delivered_conversation = true;

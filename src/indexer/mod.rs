@@ -189,12 +189,51 @@ fn should_skip_active_session_source(
     source_kind: SourceKind,
     source_path: &Path,
 ) -> bool {
+    should_skip_active_session_source_unless(active_source_filter, source_kind, source_path, || {
+        crate::connectors::codex::guarded_active_jsonl_source(source_path)
+    })
+}
+
+/// A quiet writer may keep a complete Codex rollout open indefinitely. Permit
+/// an attempt for that one guarded parser; a successful filename preflight is
+/// not enough for the post-parse filter, which requires its delivery evidence.
+fn should_skip_active_session_source_before_parse(
+    active_source_filter: &ActiveSessionSourceFilter,
+    source_kind: SourceKind,
+    source_path: &Path,
+    provider: &str,
+) -> bool {
+    should_skip_active_session_source_unless(active_source_filter, source_kind, source_path, || {
+        provider == "codex"
+            && crate::connectors::codex::can_attempt_active_jsonl_source(source_path)
+    })
+}
+
+fn should_skip_active_session_source_unless(
+    active_source_filter: &ActiveSessionSourceFilter,
+    source_kind: SourceKind,
+    source_path: &Path,
+    complete_codex_source: impl FnOnce() -> bool,
+) -> bool {
     if source_kind != SourceKind::Local {
         return false;
     }
     let Some(reason) = active_source_filter.active_writer_reason(source_path) else {
         return false;
     };
+    if matches!(
+        reason,
+        ActiveSessionSourceReason::WritableFileDescriptor
+            | ActiveSessionSourceReason::RecentlyModified
+    ) && complete_codex_source()
+    {
+        tracing::debug!(
+            source_path = %source_path.display(),
+            ?reason,
+            "admitting complete Codex source through guarded whole-file read"
+        );
+        return false;
+    }
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
     active_source_filter
         .deferred_sources
@@ -36603,7 +36642,12 @@ fn reindex_paths_with_semantic_delta(
         let since_ts = watch_scan_lower_bound(kind, since_ts);
 
         if root.path.is_file()
-            && should_skip_active_session_source(active_source_filter, root.origin.kind, &root.path)
+            && should_skip_active_session_source_before_parse(
+                active_source_filter,
+                root.origin.kind,
+                &root.path,
+                kind.slug(),
+            )
         {
             tracing::debug!(
                 ?kind,
@@ -39595,10 +39639,11 @@ fn capture_connector_sources_before_parse(
             }
             let mut observed_sources = Vec::with_capacity(sources.len());
             for source in sources {
-                if should_skip_active_session_source(
+                if should_skip_active_session_source_before_parse(
                     active_source_filter,
                     source.origin.kind,
                     &source.source_path,
+                    provider,
                 ) {
                     active_source_skipped = true;
                     continue;
@@ -39890,7 +39935,12 @@ fn capture_scan_root_file_before_parse(
     if !root.path.is_file() {
         return false;
     }
-    if should_skip_active_session_source(active_source_filter, root.origin.kind, &root.path) {
+    if should_skip_active_session_source_before_parse(
+        active_source_filter,
+        root.origin.kind,
+        &root.path,
+        provider,
+    ) {
         return true;
     }
     if !crate::raw_mirror::capture_enabled() || raw_source_exclusions.excludes(&root.path) {
@@ -50464,6 +50514,84 @@ mod tests {
             !should_skip_active_session_source(&active_filter, SourceKind::Ssh, &source_path),
             "remote mirrors are immutable local copies, not live provider writers"
         );
+    }
+
+    #[test]
+    fn active_codex_admission_requires_guarded_complete_delivery() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("rollout-active.jsonl");
+        let bytes = b"{\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":\"quiet writer history\"}}\n";
+        fs::write(&path, bytes)?;
+        let writer = fs::OpenOptions::new().append(true).open(&path)?;
+        let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(Some(
+            Duration::from_secs(3_600),
+        ));
+        assert!(!should_skip_active_session_source_before_parse(
+            &filter,
+            SourceKind::Local,
+            &path,
+            "codex",
+        ));
+        for provider in ["claude", "pi_agent", "omp", "opencode", "unknown"] {
+            assert!(should_skip_active_session_source_before_parse(
+                &filter,
+                SourceKind::Local,
+                &path,
+                provider,
+            ));
+        }
+        assert!(should_skip_active_session_source(
+            &filter,
+            SourceKind::Local,
+            &path
+        ));
+
+        let connector = crate::connectors::codex::CodexConnector::new();
+        let ctx = ScanContext::with_roots(
+            tmp.path().join("data"),
+            vec![ScanRoot::local(path.clone())],
+            None,
+        );
+        let mut delivered = 0;
+        connector.scan_with_callback(&ctx, &mut |conversation| {
+            assert_eq!(conversation.source_path, path);
+            assert!(!should_skip_active_session_source(
+                &filter,
+                SourceKind::Local,
+                &conversation.source_path,
+            ));
+            assert_eq!(conversation.messages.len(), 1);
+            assert_eq!(conversation.messages[0].content, "quiet writer history");
+            delivered += 1;
+            Ok(())
+        })?;
+        assert_eq!(delivered, 1);
+        assert!(should_skip_active_session_source(
+            &filter,
+            SourceKind::Local,
+            &path
+        ));
+        assert_eq!(fs::read(&path)?, bytes);
+
+        // Neither eligibility nor a valid complete-EOF JSON record may turn
+        // an unterminated active append into a complete-source receipt.
+        fs::write(&path, &bytes[..bytes.len() - 1])?;
+        assert!(should_skip_active_session_source_before_parse(
+            &filter,
+            SourceKind::Local,
+            &path,
+            "codex",
+        ));
+        connector.scan_with_callback(&ctx, &mut |_| {
+            assert!(should_skip_active_session_source(
+                &filter,
+                SourceKind::Local,
+                &path
+            ));
+            Ok(())
+        })?;
+        drop(writer);
+        Ok(())
     }
 
     #[test]

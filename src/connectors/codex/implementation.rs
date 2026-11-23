@@ -4,7 +4,8 @@ mod source_budget;
 #[cfg(test)]
 pub(crate) use source_budget::over_budget_scan_error;
 pub(crate) use source_budget::{
-    SourceFailureReason, for_each_source_failure, over_budget_sources, source_read_budget,
+    SourceFailureReason, can_attempt_active_jsonl_source, for_each_source_failure,
+    guarded_active_jsonl_source, over_budget_sources, source_read_budget,
 };
 
 use std::collections::HashMap;
