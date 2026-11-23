@@ -63456,6 +63456,9 @@ mod tests {
             1
         );
         transaction.rollback().unwrap();
+        // `rollback` takes `&mut self`; the transaction still borrows the
+        // connection until it is dropped, so release it before closing.
+        drop(transaction);
         storage.close_without_checkpoint().unwrap();
         epoch.verify(&db_path).unwrap();
     }
