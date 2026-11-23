@@ -401,7 +401,8 @@ fn project_messages_only_record(
         })
         .and_then(|line| serde_json::from_str::<Value>(&line).ok());
     let preserved_source = preserved.as_ref().filter(|event| {
-        crate::extract_role(event) == role && messages_only_content(event).is_some()
+        crate::extract_role(event) == role
+            && (messages_only_nonprose_envelope(event) || messages_only_content(event).is_some())
     });
     let is_cline_sdk =
         |extra: &Value| extra.pointer("/cass/cline_sdk").and_then(Value::as_bool) == Some(true);
@@ -418,6 +419,14 @@ fn project_messages_only_record(
         return None;
     }
     let source = preserved_source.unwrap_or(raw);
+    if messages_only_nonprose_envelope(source)
+        || messages_only_nonprose_envelope(messages_only_body(source)?)
+    {
+        // Reasoning and tool-directed messages can carry ordinary text blocks.
+        // A preserved nonprose envelope is authoritative even when the archive
+        // also has flattened text; never fall back to that text.
+        return None;
+    }
     let source_content = messages_only_content(source)?;
     let mut content = messages_only_text(source_content);
     let legacy_prefix = (flattened_source || (archived.is_some() && preserved_source.is_none()))
@@ -500,7 +509,7 @@ fn messages_only_legacy_prefix(content: &str) -> &str {
 
 fn messages_only_content(record: &Value) -> Option<&Value> {
     let body = messages_only_body(record)?;
-    if messages_only_nonprose_envelope(body) {
+    if messages_only_nonprose_envelope(record) || messages_only_nonprose_envelope(body) {
         // A role-less tool envelope can sit inside a user event. Keep it as a
         // typed, non-text block so the preserved source is recognized and its
         // empty projection cannot fall back to flattened canonical tool text.
@@ -511,6 +520,19 @@ fn messages_only_content(record: &Value) -> Option<&Value> {
 }
 
 fn messages_only_nonprose_envelope(body: &Value) -> bool {
+    // Some providers use ordinary message/text types for reasoning and tool
+    // dispatch, distinguished only by channel or destination metadata. Keep
+    // public commentary/final replies and ordinary conversational recipients.
+    if matches!(
+        body.get("channel").and_then(Value::as_str),
+        Some("analysis" | "reasoning" | "thinking")
+    ) || body
+        .get("recipient")
+        .and_then(Value::as_str)
+        .is_some_and(|recipient| !matches!(recipient, "all" | "user" | "assistant"))
+    {
+        return true;
+    }
     matches!(
         body.get("type").and_then(Value::as_str),
         Some(
@@ -596,14 +618,22 @@ fn messages_only_text(content: &Value) -> String {
     if let Some(blocks) = content.as_array() {
         blocks
             .iter()
-            .filter_map(crate::export_text_block)
+            .filter_map(messages_only_text_block)
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join("\n")
     } else {
-        crate::export_text_block(content)
+        messages_only_text_block(content)
             .unwrap_or_default()
             .to_string()
+    }
+}
+
+fn messages_only_text_block(block: &Value) -> Option<&str> {
+    if messages_only_nonprose_envelope(block) {
+        None
+    } else {
+        crate::export_text_block(block)
     }
 }
 
@@ -1134,6 +1164,130 @@ mod tests {
         ] {
             assert!(messages_only_record(2, &raw, None).is_none(), "{raw}");
         }
+    }
+
+    #[test]
+    fn messages_only_omits_reasoning_and_tool_directed_text_envelopes() {
+        for body in [
+            serde_json::json!({"role": "assistant", "type": "message", "channel": "analysis",
+                "content": [{"type": "output_text", "text": "PRIVATE_REASONING"}]}),
+            serde_json::json!({"role": "assistant", "channel": "reasoning",
+                "content": "PRIVATE_REASONING", "text": "PRIVATE_UNTYPED_FALLBACK"}),
+            serde_json::json!({"role": "assistant", "channel": "thinking",
+                "content": "PRIVATE_THINKING"}),
+            serde_json::json!({"role": "assistant", "type": "message", "channel": "commentary",
+                "recipient": "functions.exec", "content": [{"type": "output_text", "text": "PRIVATE_TOOL_INPUT"}]}),
+            serde_json::json!({"role": "assistant", "recipient": "python",
+                "content": "PRIVATE_TOOL_INPUT", "text": "PRIVATE_UNTYPED_FALLBACK"}),
+            serde_json::json!({"role": "assistant", "type": "assistant", "channel": "analysis"}),
+        ] {
+            for raw in [
+                body.clone(),
+                serde_json::json!({"type": "response_item", "payload": body.clone()}),
+                serde_json::json!({"type": "assistant", "message": body.clone()}),
+            ] {
+                let before = raw.clone();
+                assert!(messages_only_record(5, &raw, None).is_none(), "{raw}");
+                assert!(messages_only_flattened_record(5, &raw).is_none(), "{raw}");
+
+                let flattened = serde_json::json!({
+                    "role": "assistant", "content": "PRIVATE_FLATTENED_CONTENT"
+                });
+                for extra_json in [
+                    raw.clone(),
+                    serde_json::json!({"__cass_historical_raw_json__": raw.to_string()}),
+                ] {
+                    let archived = Message {
+                        id: Some(900),
+                        idx: 5,
+                        role: crate::model::types::MessageRole::Agent,
+                        author: None,
+                        created_at: None,
+                        content: "PRIVATE_FLATTENED_CONTENT".to_string(),
+                        extra_json,
+                        snippets: Vec::new(),
+                    };
+                    assert!(messages_only_record(5, &flattened, Some(&archived)).is_none());
+                    assert_eq!(archived.content, "PRIVATE_FLATTENED_CONTENT");
+                }
+                assert_eq!(raw, before, "projection must leave the source intact");
+            }
+        }
+    }
+
+    #[test]
+    fn messages_only_preserved_reasoning_metadata_prevents_flattened_fallback() {
+        let raw =
+            serde_json::json!({"role": "assistant", "content": "PRIVATE_FLATTENED_REASONING"});
+        for extra_json in [
+            serde_json::json!({"type": "assistant", "channel": "analysis"}),
+            serde_json::json!({"type": "assistant", "recipient": "python"}),
+        ] {
+            let archived = Message {
+                id: None,
+                idx: 2,
+                role: crate::model::types::MessageRole::Agent,
+                author: None,
+                created_at: None,
+                content: "PRIVATE_FLATTENED_REASONING".to_string(),
+                extra_json,
+                snippets: Vec::new(),
+            };
+            assert!(messages_only_record(2, &raw, Some(&archived)).is_none());
+        }
+    }
+
+    #[test]
+    fn messages_only_applies_channel_policy_to_wrappers_and_text_blocks() {
+        for raw in [
+            serde_json::json!({"role": "assistant", "channel": "analysis",
+                "message": {"content": "PRIVATE_WRAPPED_REASONING"}}),
+            serde_json::json!({"type": "assistant", "recipient": "functions.exec",
+                "message": {"role": "assistant", "content": "PRIVATE_WRAPPED_TOOL_INPUT"}}),
+            serde_json::json!({"type": "response_item", "channel": "analysis",
+                "payload": {"role": "assistant", "content": "PRIVATE_WRAPPED_REASONING"}}),
+            serde_json::json!({"role": "assistant", "content": {
+                "type": "text", "channel": "thinking", "text": "PRIVATE_TYPED_REASONING"}}),
+        ] {
+            assert!(messages_only_record(4, &raw, None).is_none(), "{raw}");
+        }
+        let raw = serde_json::json!({"role": "assistant", "content": [
+            {"type": "text", "text": "Before"},
+            {"type": "output_text", "channel": "analysis", "text": "PRIVATE_REASONING"},
+            {"type": "text", "recipient": "python", "text": "PRIVATE_TOOL_INPUT"},
+            {"channel": "thinking", "text": "PRIVATE_UNTYPED_REASONING"},
+            {"type": "output_text", "channel": "final", "recipient": "all", "text": "After"}
+        ]});
+        let projected = messages_only_record(6, &raw, None).expect("public text blocks");
+        assert_eq!(projected["content"], "Before\nAfter");
+        assert!(!projected.to_string().contains("PRIVATE_"));
+    }
+
+    #[test]
+    fn messages_only_preserves_public_channels_and_selected_envelope() {
+        for channel in [Value::Null, Value::from("commentary"), Value::from("final")] {
+            for recipient in [Value::Null, Value::from("all"), Value::from("user")] {
+                let raw = serde_json::json!({"type": "response_item", "payload": {
+                    "type": "message", "role": "assistant", "channel": channel,
+                    "recipient": recipient, "phase": "final_answer", "id": "public-reply",
+                    "content": [{"type": "output_text", "text": "Ordinary reply"}]
+                }});
+                let projected =
+                    messages_only_record(9, &raw, None).expect("public assistant reply");
+                assert_eq!(projected["content"], "Ordinary reply");
+                assert_eq!(projected["id"], "public-reply");
+                assert_eq!(projected["source_index"], 9);
+            }
+        }
+
+        // Metadata on a conflicting envelope cannot suppress the actual turn.
+        let raw = serde_json::json!({
+            "role": "user", "recipient": "assistant", "content": "Please explain the analysis channel",
+            "message": {"role": "assistant", "channel": "analysis",
+                "recipient": "python", "content": "PRIVATE_OTHER_ENVELOPE"}
+        });
+        let projected = messages_only_record(10, &raw, None).expect("ordinary user prompt");
+        assert_eq!(projected["content"], "Please explain the analysis channel");
     }
 
     #[test]

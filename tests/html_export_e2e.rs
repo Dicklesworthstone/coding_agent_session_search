@@ -1043,6 +1043,18 @@ fn messages_only_export_keeps_prose_and_source_identity_without_mutating_history
             {"type":"toolCall", "name":"Read", "arguments":{"text":"PRIVATE_TOOL_ONLY"}}
         ]}),
         serde_json::json!({"role":"assistant", "content":"Ordinary final reply"}),
+        serde_json::json!({"type":"response_item", "payload":{
+            "type":"message", "role":"assistant", "channel":"analysis",
+            "content":[{"type":"output_text", "text":"PRIVATE_ANALYSIS_MESSAGE"}]
+        }}),
+        serde_json::json!({"role":"assistant", "recipient":"functions.exec",
+            "message":{"content":"PRIVATE_DIRECTED_TOOL_INPUT"}}),
+        serde_json::json!({"role":"assistant", "content":[
+            {"type":"text", "channel":"analysis", "text":"PRIVATE_ANALYSIS_BLOCK"},
+            {"type":"text", "recipient":"python", "text":"PRIVATE_DIRECTED_TOOL_BLOCK"}
+        ]}),
+        serde_json::json!({"role":"assistant", "channel":"commentary", "recipient":"all",
+            "content":"Ordinary visible commentary"}),
     ];
     let mut source_bytes = Vec::new();
     for record in &records {
@@ -1056,6 +1068,10 @@ fn messages_only_export_keeps_prose_and_source_identity_without_mutating_history
         MessageRole::Agent,
         MessageRole::User,
         MessageRole::Tool,
+        MessageRole::Agent,
+        MessageRole::Agent,
+        MessageRole::Agent,
+        MessageRole::Agent,
         MessageRole::Agent,
         MessageRole::Agent,
     ];
@@ -1105,7 +1121,7 @@ fn messages_only_export_keeps_prose_and_source_identity_without_mutating_history
     let wal_before = fs::read(&wal_path).ok();
     let expected_projection = serde_json::json!({
         "mode":"messages-only", "canonical_history_preserved":true,
-        "input_records":7, "retained_messages":3, "omitted_records":4
+        "input_records":11, "retained_messages":4, "omitted_records":7
     });
     for (path, archive_only) in [(&raw, false), (&archived_path, true)] {
         for format in ["json", "markdown", "text", "html", "export-html"] {
@@ -1136,8 +1152,8 @@ fn messages_only_export_keeps_prose_and_source_identity_without_mutating_history
                     let messages = payload["messages"]
                         .as_array()
                         .ok_or("normalized messages")?;
-                    assert_eq!(messages.len(), 3);
-                    for (message, original_index) in messages.iter().zip([1, 2, 6]) {
+                    assert_eq!(messages.len(), 4);
+                    for (message, original_index) in messages.iter().zip([1, 2, 6, 10]) {
                         assert_eq!(message["source_index"], original_index);
                         if archive_only {
                             assert_eq!(message["message_index"], original_index + 1);
@@ -1179,6 +1195,7 @@ fn messages_only_export_keeps_prose_and_source_identity_without_mutating_history
                 "Ordinary reply before",
                 "Ordinary reply after",
                 "Ordinary final reply",
+                "Ordinary visible commentary",
             ] {
                 assert!(rendered.contains(text), "{format}: missing {text}");
             }
@@ -1200,8 +1217,9 @@ fn messages_only_export_keeps_prose_and_source_identity_without_mutating_history
             String::from_utf8_lossy(&output.stderr)
         );
         let full: Value = serde_json::from_slice(&output.stdout)?;
-        assert_eq!(full.as_array().ok_or("default raw array")?.len(), 7);
+        assert_eq!(full.as_array().ok_or("default raw array")?.len(), 11);
         assert!(full.to_string().contains("PRIVATE_TOOL_ARGUMENT"));
+        assert!(full.to_string().contains("PRIVATE_ANALYSIS_MESSAGE"));
     }
     assert_eq!(fs::read(raw)?, source_bytes);
     assert!(!archived_path.exists());
