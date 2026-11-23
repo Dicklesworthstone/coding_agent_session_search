@@ -9,7 +9,8 @@ use crate::evidence_bundle::{
     EvidenceBundleKind, EvidenceBundleManifest,
 };
 use crate::model::conversation_packet::{
-    ConversationPacket, ConversationPacketMessage, ConversationPacketProvenance,
+    ConversationPacket, ConversationPacketBuilder, ConversationPacketMessage,
+    ConversationPacketProvenance,
 };
 use crate::search::canonicalize::is_hard_message_noise;
 use crate::sources::provenance::LOCAL_SOURCE_ID;
@@ -309,29 +310,27 @@ fn push_cass_document_into_pending(
 
 /// Build the per-document context the lexical sink needs from a
 /// [`ConversationPacket`]. Packet builders (raw scan + canonical replay)
-/// already normalized identity, provenance, metadata, and timestamps, so
-/// the lexical builder no longer has to re-walk the raw connector
-/// payload (`coding_agent_session_search-ibuuh.32`). We still re-derive
-/// `source_id`/`origin_kind`/`origin_host` from `metadata.cass.origin`
-/// (rather than trusting `packet.payload.provenance` blindly) so the
-/// packet pipeline produces byte-identical CassDocuments to the legacy
-/// `cass_doc_context` path — that's the equivalence gate covered by
-/// `packet_driven_lexical_pipeline_matches_legacy_for_normalized_conv`.
+/// already normalized identity and timestamps. Canonical replay also carries
+/// authoritative provenance from the archive and source registry: its optional
+/// metadata can be absent or stale, so it cannot override that identity. Raw
+/// connector packets retain the legacy metadata-based normalization contract.
 fn cass_doc_context_from_packet(packet: &ConversationPacket) -> CassDocContext {
     let payload = &packet.payload;
     let metadata = &payload.metadata_json;
     let cass_origin = metadata.get("cass").and_then(|c| c.get("origin"));
-    let raw_source_id = cass_origin
-        .and_then(|o| o.get("source_id"))
-        .and_then(|v| v.as_str());
-    let raw_origin_kind = cass_origin
-        .and_then(|o| o.get("kind"))
-        .and_then(|v| v.as_str());
-    let origin_host = normalized_index_origin_host(
-        cass_origin
-            .and_then(|o| o.get("host"))
-            .and_then(|v| v.as_str()),
-    );
+    let (raw_source_id, raw_origin_kind, raw_origin_host) = match packet.diagnostics.builder {
+        ConversationPacketBuilder::CanonicalReplay => (
+            Some(payload.provenance.source_id.as_str()),
+            Some(payload.provenance.origin_kind.as_str()),
+            payload.provenance.origin_host.as_deref(),
+        ),
+        ConversationPacketBuilder::RawConnectorScan => (
+            cass_origin.and_then(|origin| origin.get("source_id")?.as_str()),
+            cass_origin.and_then(|origin| origin.get("kind")?.as_str()),
+            cass_origin.and_then(|origin| origin.get("host")?.as_str()),
+        ),
+    };
+    let origin_host = normalized_index_origin_host(raw_origin_host);
     let source_id =
         normalized_index_source_id(raw_source_id, raw_origin_kind, origin_host.as_deref());
     let origin_kind = normalized_index_origin_kind(&source_id, raw_origin_kind);

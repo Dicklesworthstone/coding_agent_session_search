@@ -811,6 +811,182 @@ mod tests {
     }
 
     #[test]
+    fn canonical_packet_provenance_overrides_stale_metadata() {
+        for (source_id, origin_kind, origin_host) in [
+            ("laptop", "remote", Some("laptop.example")),
+            ("full-history-plan", "local", None),
+            ("local", "local", None),
+        ] {
+            let mut canonical = conversation(vec![message(0, "canonical provenance proof")]);
+            canonical.source_id = source_id.into();
+            canonical.origin_host = origin_host.map(str::to_owned);
+            // Historical connector metadata is neither required nor allowed
+            // to override the canonical columns and registered source kind.
+            for metadata in [
+                serde_json::Value::Null,
+                serde_json::json!({"cass":{"origin":{
+                    "source_id":"stale-source", "kind":"ssh", "host":"stale-host"
+                }}}),
+            ] {
+                canonical.metadata_json = metadata;
+                let packet = ConversationPacket::from_canonical_replay(
+                    &canonical,
+                    ConversationPacketProvenance {
+                        source_id: source_id.into(),
+                        origin_kind: origin_kind.into(),
+                        origin_host: origin_host.map(str::to_owned),
+                    },
+                );
+                let docs = TantivyIndex::build_packet_documents(&packet, canonical.id);
+                assert_eq!(docs.len(), 1);
+                assert_eq!(docs[0].source_id, source_id);
+                assert_eq!(docs[0].origin_kind, origin_kind);
+                assert_eq!(docs[0].origin_host.as_deref(), origin_host);
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn public_reconcile_preserves_canonical_source_identity() -> Result<()> {
+        use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+        use crate::sources::provenance::{Source, SourceFilter};
+
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("archive.db");
+        let repaired_data = temp.path().join("repaired");
+        let rebuilt_data = temp.path().join("rebuilt");
+        std::fs::create_dir_all(&repaired_data)?;
+        std::fs::create_dir_all(&rebuilt_data)?;
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let mut named_local = Source::local();
+        named_local.id = "full-history-plan".into();
+        let sources = [Source::remote("laptop", "laptop.example"), named_local];
+        let mut conversations = Vec::new();
+        let mut retained = Vec::new();
+        for source in &sources {
+            storage.upsert_source(source)?;
+            let mut canonical = conversation(vec![
+                message(0, "provenanceproof missing prefix"),
+                message(7, "provenanceproof retained tail"),
+            ]);
+            canonical.id = None;
+            canonical.external_id = Some(format!("source-proof-{}", source.id));
+            canonical.source_path = PathBuf::from(format!("/archive/{}.jsonl", source.id));
+            canonical.source_id = source.id.clone();
+            canonical.origin_host = source.host_label.clone();
+            canonical.metadata_json = serde_json::json!({"cass":{"origin":{
+                "source_id":"obsolete-source", "kind":"ssh", "host":"obsolete-host"
+            }}});
+            let id = storage
+                .insert_conversation_tree(agent, None, &canonical)?
+                .conversation_id;
+            conversations.push(id);
+            // Seed an independently constructed, correctly attributed tail.
+            // Repair must add the missing prefix under this same identity,
+            // without manufacturing a second local copy of the healthy tail.
+            let tail = &canonical.messages[1];
+            retained.push(CassDocument {
+                agent: canonical.agent_slug.clone(),
+                workspace: None,
+                workspace_original: None,
+                source_path: canonical.source_path.to_string_lossy().into_owned(),
+                msg_idx: tail.idx as u64,
+                created_at: tail.created_at,
+                title: canonical.title.clone(),
+                content: tail.content.clone(),
+                source_id: source.id.clone(),
+                origin_kind: if source.is_remote() {
+                    "remote"
+                } else {
+                    "local"
+                }
+                .into(),
+                origin_host: source.host_label.clone(),
+                conversation_id: Some(id),
+            });
+        }
+        storage.close()?;
+        super::super::rebuild_tantivy_from_db(&db_path, &rebuilt_data, 2, None)?;
+        let repaired_path = expected_index_dir(&repaired_data);
+        let mut index = TantivyIndex::open_or_create(&repaired_path)?;
+        index.add_prebuilt_documents_slice(&retained)?;
+        index.commit()?;
+        assert_eq!(index.doc_count()?, 2);
+        drop(index);
+
+        let search = |index_path: &Path, source_filter: SourceFilter| -> Result<Vec<String>> {
+            // No canonical fallback: these results must come from the actual
+            // published lexical identities and stored source metadata.
+            let client = SearchClient::open(index_path, None)?.context("published test index")?;
+            let mut hits = client
+                .search(
+                    "provenanceproof",
+                    SearchFilters {
+                        source_filter,
+                        ..SearchFilters::default()
+                    },
+                    20,
+                    0,
+                    FieldMask::FULL,
+                )?
+                .into_iter()
+                .map(|hit| {
+                    serde_json::json!({
+                        "conversation_id": hit.conversation_id,
+                        "message_index": hit.line_number,
+                        "source_id": hit.source_id,
+                        "origin_kind": hit.origin_kind,
+                        "origin_host": hit.origin_host,
+                        "source_path": hit.source_path,
+                        "content": hit.content,
+                    })
+                    .to_string()
+                })
+                .collect::<Vec<_>>();
+            hits.sort();
+            Ok(hits)
+        };
+        for _ in 0..2 {
+            for &id in &conversations {
+                let report = run_lexical_conversation_reconcile(&repaired_data, &db_path, id)?;
+                assert!(report.checkpoint_cleared);
+                assert_eq!(report.verified_docs, 2);
+            }
+            for (filter, count) in [
+                (SourceFilter::All, 4),
+                (SourceFilter::Remote, 2),
+                (SourceFilter::Local, 2),
+                (SourceFilter::SourceId("laptop".into()), 2),
+                (SourceFilter::SourceId("full-history-plan".into()), 2),
+                (SourceFilter::SourceId("obsolete-source".into()), 0),
+            ] {
+                let expected = search(&expected_index_dir(&rebuilt_data), filter.clone())?;
+                assert_eq!(expected.len(), count, "full rebuild control: {filter:?}");
+                assert_eq!(
+                    search(&repaired_path, filter.clone())?,
+                    expected,
+                    "{filter:?}"
+                );
+            }
+        }
+        let published = canary::exact::PublishedSnapshot::open(&repaired_path)?;
+        assert_eq!(
+            published.doc_count(),
+            4,
+            "repair must not duplicate source identities"
+        );
+        Ok(())
+    }
+
+    #[test]
     #[serial_test::serial]
     fn bounded_projection_preserves_sparse_indices_noise_and_oversized_messages() -> Result<()> {
         let tmp = TempDir::new()?;
