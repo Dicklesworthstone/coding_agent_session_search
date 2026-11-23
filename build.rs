@@ -369,15 +369,14 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "toon",
         crate_package_name: "tru",
         manifest_package_field: Some("tru"),
-        // GH#416: registry pin. crates.io 0.2.4 differs from the previously
-        // pinned git rev d7185c78 by exactly one TEST assertion line
-        // (src/decode/event_builder.rs); production sources are
-        // byte-identical (verified by tree diff, not the version field).
+        // GH#416: registry pin. 0.3.0 splits the crate into `lib`, `serde`
+        // and `cli` features; CASS needs only the serde_json conversions, so
+        // the CLI (clap) and the former vergen-gix build graph stay out.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.2.4",
-        expected_features: &[],
-        expected_default_features: None,
+        expected_version: "0.3.0",
+        expected_features: &["serde"],
+        expected_default_features: Some(false),
         repo_rel: "../toon_rust",
         manifest_rel: "Cargo.toml",
         patch_url: None,
