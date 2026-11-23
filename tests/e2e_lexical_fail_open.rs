@@ -2693,6 +2693,351 @@ fn gh452_semantic_only_search_ignores_corrupt_lexical_assets() {
     assert_eq!(before, data_tree_snapshot(&data_dir));
 }
 
+fn seed_semantic_pack_archive(home: &Path, data_dir: &Path) {
+    for idx in 1..=2 {
+        seed_codex_session(
+            &home.join(".codex"),
+            &format!("rollout-pack-semantics-{idx:02}.jsonl"),
+            &format!("packsemanticneedle bounded semantic evidence session {idx}"),
+        );
+    }
+    run_fresh_index(home, data_dir);
+}
+
+fn semantic_pack_command(home: &Path, data_dir: &Path, mode: &str) -> Command {
+    let mut command = cass_cmd(home);
+    command
+        .env("CASS_SEMANTIC_EMBEDDER", "hash")
+        .env("CASS_PACK_BUDGET_MS", "30000")
+        .args([
+            "pack",
+            "packsemanticneedle",
+            "--json",
+            "--mode",
+            mode,
+            "--freshness-policy",
+            "allow-stale",
+            "--data-dir",
+        ])
+        .arg(data_dir)
+        .timeout(Duration::from_secs(60));
+    command
+}
+
+#[test]
+fn pack_semantic_and_hybrid_preserve_filters_and_canonical_citations() {
+    // Hash assets prove real vector dispatch, hydration, and scope admission;
+    // they do not stand in for a neural relevance or performance benchmark.
+    for sharded in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let data_dir = home.join("pack_semantic_data");
+        let codex_home = home.join(".codex");
+        seed_semantic_pack_archive(home, &data_dir);
+        build_hash_semantic_assets(&data_dir, sharded);
+        let selected_path =
+            native_codex_session_path(&codex_home, "rollout-pack-semantics-02.jsonl");
+        let scope = home.join("selected-session.txt");
+        fs::write(&scope, format!("{}\n", selected_path.display())).unwrap();
+        let empty_scope = home.join("empty-sessions.txt");
+        fs::write(&empty_scope, "").unwrap();
+        // The fixture's user message is at +1000 ms and its assistant message
+        // is at +2000 ms. This interval must admit only the user message.
+        let since = chrono::DateTime::from_timestamp_millis(1_714_000_000_500)
+            .unwrap()
+            .to_rfc3339();
+        let until = chrono::DateTime::from_timestamp_millis(1_714_000_001_500)
+            .unwrap()
+            .to_rfc3339();
+        let archive_before = data_tree_snapshot(&data_dir);
+        let sources_before = data_tree_snapshot(&codex_home);
+
+        for mode in ["semantic", "hybrid"] {
+            let output = semantic_pack_command(home, &data_dir, mode)
+                .args([
+                    "--require-evidence",
+                    "--explain-selection",
+                    "--agent",
+                    "codex",
+                    "--source",
+                    "local",
+                    "--workspace",
+                ])
+                .arg(&codex_home)
+                .arg("--sessions-from")
+                .arg(&scope)
+                .args(["--since", &since, "--until", &until])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "sharded={sharded}, mode={mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let pack: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(pack["realized"]["search_mode"], mode, "{pack}");
+            assert_eq!(pack["realized"]["semantic_joined"], true, "{pack}");
+            assert!(pack["realized"]["fallback_mode"].is_null(), "{pack}");
+            assert!(pack["realized"]["fallback_reason"].is_null(), "{pack}");
+            assert_eq!(pack["health"]["semantic_state"], "joined", "{pack}");
+            assert_eq!(pack["budget"]["timed_out"], false, "{pack}");
+            let evidence = pack["evidence"].as_array().unwrap();
+            assert_eq!(evidence.len(), 1, "{pack}");
+            assert_eq!(
+                evidence[0]["excerpt"],
+                "packsemanticneedle bounded semantic evidence session 2"
+            );
+            let citation = &evidence[0]["citation"];
+            assert_eq!(
+                cited_source(home, citation["source_path"].as_str().unwrap()),
+                selected_path
+            );
+            assert_eq!(citation["message_index"], 1);
+            assert_eq!(citation["message_index_base"], 1);
+            assert_eq!(citation["line_start"], 2);
+            assert_eq!(citation["line_end"], 2);
+            assert_eq!(citation["verified"], true);
+            assert_eq!(citation["source_id"], "local");
+            assert_eq!(citation["agent"], "codex");
+            assert!(citation["conversation_id"].as_i64().unwrap() > 0);
+            assert!(
+                evidence[0]["selection"]["relevance_score"]
+                    .as_f64()
+                    .is_some_and(|score| score > 0.0 && score <= 1.0)
+            );
+
+            let empty = semantic_pack_command(home, &data_dir, mode)
+                .arg("--sessions-from")
+                .arg(&empty_scope)
+                .output()
+                .unwrap();
+            assert!(
+                empty.status.success(),
+                "{}",
+                String::from_utf8_lossy(&empty.stderr)
+            );
+            let empty: Value = serde_json::from_slice(&empty.stdout).unwrap();
+            assert!(empty["evidence"].as_array().unwrap().is_empty());
+            assert_eq!(empty["realized"]["semantic_joined"], false);
+            assert_eq!(empty["health"]["semantic_state"], "not_reported");
+        }
+        assert_eq!(archive_before, data_tree_snapshot(&data_dir));
+        assert_eq!(sources_before, data_tree_snapshot(&codex_home));
+    }
+}
+
+#[test]
+fn pack_semantic_only_ignores_corrupt_lexical_assets() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("pack_semantic_isolation");
+    seed_semantic_pack_archive(home, &data_dir);
+    build_hash_semantic_assets(&data_dir, true);
+    let index_path = coding_agent_search::search::tantivy::expected_index_dir(&data_dir);
+    fs::write(index_path.join("MANIFEST"), b"invalid lexical contract").unwrap();
+    fs::write(
+        index_path.join("MANIFEST.prev"),
+        b"invalid prior lexical contract",
+    )
+    .unwrap();
+    let before = data_tree_snapshot(&data_dir);
+
+    let output = semantic_pack_command(home, &data_dir, "semantic")
+        .arg("--require-evidence")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pack: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!pack["evidence"].as_array().unwrap().is_empty(), "{pack}");
+    assert_eq!(pack["realized"]["search_mode"], "semantic");
+    assert_eq!(pack["realized"]["semantic_joined"], true);
+    assert_eq!(pack["health"]["lexical_readiness"], "unknown");
+    assert_eq!(pack["health"]["semantic_state"], "joined");
+    assert_eq!(before, data_tree_snapshot(&data_dir));
+}
+
+#[test]
+fn pack_missing_semantic_assets_fall_back_only_for_hybrid() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("pack_semantic_missing");
+    seed_semantic_pack_archive(home, &data_dir);
+    let before = data_tree_snapshot(&data_dir);
+    let lexical = semantic_pack_command(home, &data_dir, "lexical")
+        .arg("--require-evidence")
+        .output()
+        .unwrap();
+    assert!(lexical.status.success(), "{lexical:?}");
+    let lexical: Value = serde_json::from_slice(&lexical.stdout).unwrap();
+    let hybrid = semantic_pack_command(home, &data_dir, "hybrid")
+        .arg("--require-evidence")
+        .output()
+        .unwrap();
+    assert!(hybrid.status.success(), "{hybrid:?}");
+    let hybrid: Value = serde_json::from_slice(&hybrid.stdout).unwrap();
+    assert_eq!(hybrid["realized"]["search_mode"], "lexical");
+    assert_eq!(hybrid["realized"]["fallback_mode"], "lexical");
+    assert_eq!(
+        hybrid["realized"]["fallback_reason"],
+        "semantic_context_unavailable"
+    );
+    assert_eq!(hybrid["realized"]["semantic_joined"], false);
+    assert_eq!(hybrid["health"]["semantic_state"], "fallback_lexical");
+    let evidence_identity = |pack: &Value| {
+        pack["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                (
+                    item["excerpt"].clone(),
+                    item["citation"]["conversation_id"].clone(),
+                    item["citation"]["message_index"].clone(),
+                    item["citation"]["verified"].clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(evidence_identity(&lexical), evidence_identity(&hybrid));
+
+    let semantic = semantic_pack_command(home, &data_dir, "semantic")
+        .output()
+        .unwrap();
+    assert_eq!(semantic.status.code(), Some(15), "{semantic:?}");
+    assert!(semantic.stdout.is_empty());
+    let failure: Value = serde_json::from_slice(&semantic.stderr).unwrap();
+    assert_eq!(failure["error"]["kind"], "semantic-unavailable");
+    assert_eq!(before, data_tree_snapshot(&data_dir));
+}
+
+#[test]
+fn pack_semantic_timeouts_never_emit_lexical_or_partial_evidence() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("pack_semantic_timeout");
+    seed_semantic_pack_archive(home, &data_dir);
+    build_hash_semantic_assets(&data_dir, true);
+    let started = std::time::Instant::now();
+    let baseline = semantic_pack_command(home, &data_dir, "semantic")
+        .arg("--require-evidence")
+        .output()
+        .unwrap();
+    assert!(baseline.status.success(), "{baseline:?}");
+    // Adapt to the worker's real archive-open cost so the injected phase,
+    // rather than an unrelated cold-open delay, consumes the deadline.
+    let budget_ms = (started.elapsed().as_millis() as u64)
+        .saturating_mul(3)
+        .max(2_000);
+    let stall_ms = budget_ms.saturating_mul(3);
+    let before = data_tree_snapshot(&data_dir);
+    for (hook, phase) in [
+        ("CASS_TEST_SEARCH_SETUP_SLOW_MS", "pack setup"),
+        (
+            "CASS_TEST_SEARCH_SEMANTIC_SETUP_SLOW_MS",
+            "pack semantic setup",
+        ),
+        ("CASS_TEST_PACK_SLOW_MS", "pack search"),
+        ("CASS_TEST_PACK_PLAN_SLOW_MS", "pack planning"),
+        ("CASS_TEST_PACK_RENDER_SLOW_MS", "pack rendering"),
+    ] {
+        let started = std::time::Instant::now();
+        let output = semantic_pack_command(home, &data_dir, "semantic")
+            .env(hook, stall_ms.to_string())
+            .arg("--timeout")
+            .arg(budget_ms.to_string())
+            .timeout(Duration::from_millis(stall_ms + budget_ms))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(10), "{hook}: {output:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "{hook}: semantic pack was downgraded"
+        );
+        let failure: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(failure["error"]["kind"], "timeout", "{hook}: {failure}");
+        assert_eq!(failure["error"]["retryable"], true);
+        assert!(
+            failure["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(phase),
+            "the injected phase must exhaust the budget: {hook}: {failure}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(stall_ms));
+    }
+
+    let hybrid = semantic_pack_command(home, &data_dir, "hybrid")
+        .env("CASS_TEST_SEARCH_SEMANTIC_SETUP_SLOW_MS", stall_ms.to_string())
+        .arg("--timeout")
+        .arg(budget_ms.to_string())
+        .timeout(Duration::from_millis(stall_ms + budget_ms))
+        .output()
+        .unwrap();
+    assert!(hybrid.status.success(), "{hybrid:?}");
+    let hybrid: Value = serde_json::from_slice(&hybrid.stdout).unwrap();
+    assert!(hybrid["evidence"].as_array().unwrap().is_empty());
+    assert_eq!(hybrid["budget"]["timed_out"], true);
+    assert_eq!(hybrid["realized"]["semantic_joined"], false);
+    assert_eq!(hybrid["realized"]["fallback_reason"], "semantic_budget_limited");
+    assert!(
+        hybrid["budget"]["skipped_sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|section| section == "semantic_setup")
+    );
+    assert_eq!(before, data_tree_snapshot(&data_dir));
+}
+
+#[test]
+fn pack_output_refuses_privacy_epoch_changes_during_rendering() {
+    use coding_agent_search::search::privacy::{begin_forget, complete_forget};
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("pack_privacy_epoch");
+    seed_semantic_pack_archive(home, &data_dir);
+    build_hash_semantic_assets(&data_dir, true);
+    for mode in ["lexical", "semantic"] {
+        let ready = home.join(format!("render-ready-{mode}"));
+        let output = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                semantic_pack_command(home, &data_dir, mode)
+                    .env("CASS_TEST_PACK_RENDER_READY_FILE", &ready)
+                    .env("CASS_TEST_PACK_RENDER_SLOW_MS", "3000")
+                    .arg("--require-evidence")
+                    .output()
+                    .unwrap()
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !ready.exists() {
+                assert!(!worker.is_finished(), "{mode}: pack never reached rendering");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{mode}: renderer never started"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Advance and finish the real privacy fence after search has
+            // returned. There is no pending repair left to catch at output:
+            // only the pack's original admission can detect the stale epoch.
+            let db_path = data_dir.join("agent_search.db");
+            begin_forget(&db_path).unwrap();
+            complete_forget(&db_path).unwrap();
+            worker.join().unwrap()
+        });
+        assert_eq!(output.status.code(), Some(9), "{mode}: {output:?}");
+        assert!(output.stdout.is_empty(), "{mode}: stale evidence escaped");
+        let failure: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(failure["error"]["kind"], "privacy-snapshot-invalidated");
+        assert_eq!(failure["error"]["retryable"], true);
+    }
+}
+
 #[test]
 fn explicit_hybrid_mode_fails_open_to_lexical_when_semantic_assets_missing() {
     let tmp = TempDir::new().unwrap();

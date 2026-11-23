@@ -1372,6 +1372,7 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
         .assert()
         .success();
     let mut cmd = isolated_cass_cmd(home);
+    cmd.env("CASS_SEMANTIC_EMBEDDER", "hash");
     cmd.args([command, "auth", "--json", "--data-dir"]);
     cmd.arg(&data_dir);
     cmd.args([
@@ -1406,9 +1407,9 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
     );
     assert_eq!(citation["verified"], true);
 
-    // GH #507: pack selects evidence lexically. A default (hybrid-preferred)
-    // request reports that fallback with its cause; an explicit lexical
-    // request is not a fallback at all.
+    // GH #507: this fixture has no semantic assets. A default hybrid request
+    // reports the actual missing-context fallback; explicit lexical mode is
+    // not a fallback at all.
     let warnings: Vec<&str> = json["_meta"]["warnings"]
         .as_array()
         .expect("pack warnings")
@@ -1432,7 +1433,7 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
     } else {
         assert_eq!(realized["fallback_mode"], "lexical", "{json}");
         assert_eq!(
-            realized["fallback_reason"], "pack_enrichment_unavailable",
+            realized["fallback_reason"], "semantic_context_unavailable",
             "{json}"
         );
         assert!(warnings.contains(&"semantic_fallback_lexical"), "{json}");

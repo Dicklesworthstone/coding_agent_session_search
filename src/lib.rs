@@ -29670,7 +29670,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  Pack vs search: use search to explore/paginate/aggregate candidates; use pack once you need a bounded handoff artifact.".to_string(),
             "  Pack vs export-html: export-html creates a complete browsable session archive; pack creates a token-budgeted evidence bundle.".to_string(),
             "  Pack vs doctor/status: status/health report readiness before a handoff; doctor diagnoses or repairs derived assets and is not a summarizer.".to_string(),
-            "  Pack warnings: inspect health, freshness, privacy, and warnings for semantic_fallback_lexical (realized.fallback_reason names the cause; pack_enrichment_unavailable means pack itself selects evidence lexically), privacy_redactions_applied, and no_evidence_found before copying output; stale evidence is structural via freshness.stale_evidence_count.".to_string(),
+            "  Pack warnings: inspect health, freshness, privacy, and warnings for semantic_fallback_lexical (realized.fallback_reason names the cause), privacy_redactions_applied, and no_evidence_found before copying output; stale evidence is structural via freshness.stale_evidence_count.".to_string(),
             "  Pack budgets: tune --max-tokens, --max-evidence, --max-sessions, --max-excerpt-chars, and --fields summary/minimal to fit the recipient context.".to_string(),
             "  Default search: hybrid-preferred. With --robot-meta, inspect requested_search_mode, search_mode, semantic_refinement, fallback_tier, and fallback_reason.".to_string(),
             "  Quick history: use --workspace PATH --days 7 --mode lexical --no-maintenance --robot --robot-meta --fields source_path,line_number,agent,source_id,conversation_id --limit 5 --max-tokens 2000 --timeout 2000.".to_string(),
@@ -36455,6 +36455,11 @@ fn maybe_test_pack_plan_delay() {
 }
 
 fn maybe_test_pack_render_delay() {
+    // Let a subprocess test invalidate privacy after search and planning,
+    // without relying on a guessed archive-open duration.
+    if let Ok(path) = dotenvy::var("CASS_TEST_PACK_RENDER_READY_FILE") {
+        let _ = std::fs::write(path, b"ready\n");
+    }
     maybe_test_pack_worker_delay("CASS_TEST_PACK_RENDER_SLOW_MS");
 }
 
@@ -36630,7 +36635,7 @@ fn run_cli_pack(
         PackRenderFormat, PackRenderRequest, PackSemanticReadiness, budget_fallback_answer_pack,
         pack_candidate_fetch_limit, plan_answer_pack,
     };
-    use crate::search::query::{FieldMask, SearchFilters};
+    use crate::search::query::{FieldMask, SearchFilters, SearchMode, SemanticTierMode};
     use crate::sources::provenance::SourceFilter;
 
     let start_time = Instant::now();
@@ -36720,19 +36725,10 @@ fn run_cli_pack(
 
     let requested_mode = mode.unwrap_or_default();
     let mut mode_meta = SearchModeMeta::new(requested_mode, mode.is_none());
-    if matches!(requested_mode, crate::search::query::SearchMode::Semantic) {
-        return Err(CliError {
-            code: 15,
-            kind: CliErrorKind::SemanticUnavailable.kind_str(),
-            message: "cass pack cannot currently run semantic-only evidence selection".to_string(),
-            hint: Some("Use --mode lexical or the default hybrid-preferred mode, which fails open to lexical evidence.".to_string()),
-            retryable: true,
-        });
-    }
-    if matches!(requested_mode, crate::search::query::SearchMode::Hybrid) {
-        mode_meta
-            .fall_back_to_lexical("pack semantic enrichment unavailable; using lexical evidence");
-    }
+    // Asset admission alone is not semantic evidence. Empty scopes and workers
+    // that exceed the budget must never claim a completed semantic join.
+    mode_meta.semantic_work_completed = false;
+    let strict_semantic = matches!(requested_mode, SearchMode::Semantic);
 
     if cass_not_initialized(
         db_path.exists(),
@@ -36750,6 +36746,36 @@ fn run_cli_pack(
             retryable: true,
         });
     }
+
+    // Keep the privacy admission alive through planning, source verification,
+    // and rendering. Search's own fence cannot cover those later stages. An
+    // explicit semantic request deliberately does not open lexical assets.
+    let privacy_error = |error: anyhow::Error| {
+        privacy_search_cli_error(&error).unwrap_or_else(|| CliError {
+            code: 9,
+            kind: CliErrorKind::Search.kind_str(),
+            message: format!("failed to validate pack privacy: {error}"),
+            hint: None,
+            retryable: false,
+        })
+    };
+    let database_privacy =
+        crate::search::privacy::PrivacySnapshot::for_database(&db_path).map_err(privacy_error)?;
+    let lexical_privacy = if strict_semantic {
+        None
+    } else {
+        Some(
+            crate::search::privacy::PrivacySnapshot::for_index(&index_path)
+                .map_err(privacy_error)?,
+        )
+    };
+    let validate_pack_privacy = || -> CliResult<()> {
+        database_privacy.validate().map_err(privacy_error)?;
+        if let Some(snapshot) = &lexical_privacy {
+            snapshot.validate().map_err(privacy_error)?;
+        }
+        Ok(())
+    };
 
     if let Some(ref sessions_from_arg) = sessions_from {
         match read_session_paths_bounded(
@@ -36794,7 +36820,7 @@ fn run_cli_pack(
                 &worker_data_dir,
                 &worker_db_path,
                 &worker_index_path,
-                Some(crate::search::query::SearchMode::Lexical),
+                Some(requested_mode),
                 timeout_ms,
                 start_time,
                 true,
@@ -36818,7 +36844,7 @@ fn run_cli_pack(
             &data_dir,
             &db_path,
             &index_path,
-            Some(crate::search::query::SearchMode::Lexical),
+            Some(requested_mode),
             timeout_ms,
             start_time,
             true,
@@ -36851,11 +36877,96 @@ fn run_cli_pack(
         );
     }
 
-    if !structured_pack && bounded_pack && (hard_deadline_reached || pack_budget.is_exhausted()) {
+    if (!structured_pack || strict_semantic)
+        && bounded_pack
+        && (hard_deadline_reached || pack_budget.is_exhausted())
+    {
         return Err(search_timeout_error(
             pack_budget.total_ms(),
             "during pack setup",
         ));
+    }
+
+    let lexical_admitted = client.is_some() && !strict_semantic;
+    if !session_scope_empty
+        && matches!(mode_meta.realized, SearchMode::Semantic | SearchMode::Hybrid)
+    {
+        let setup_snapshot = bounded_pack.then(|| BudgetSnapshot::capture(&pack_budget));
+        match semantic_budget_action(&mode_meta, setup_snapshot) {
+            SemanticBudgetAction::StrictSemanticTimeout => {
+                return Err(strict_semantic_budget_error(
+                    &mode_meta,
+                    setup_snapshot,
+                    SemanticBudgetCheckpoint::BeforeSetup,
+                ));
+            }
+            SemanticBudgetAction::HybridLexicalFallback => {
+                skipped_sections.push("semantic_refinement".to_string());
+                mode_meta.fall_back_to_lexical(semantic_budget_fallback_reason(
+                    SemanticBudgetCheckpoint::BeforeSetup,
+                ));
+            }
+            SemanticBudgetAction::Execute => {
+                if let Some(client) = &client {
+                    let worker_client = std::sync::Arc::clone(client);
+                    let worker_data_dir = data_dir.clone();
+                    let worker_db_path = db_path.clone();
+                    let worker_mode = mode_meta.clone();
+                    let configure = move || {
+                        configure_bounded_search_semantics(
+                            worker_client,
+                            worker_data_dir,
+                            worker_db_path,
+                            worker_mode,
+                            SemanticSearchOptions::default(),
+                            true,
+                        )
+                    };
+                    let configured = if bounded_pack {
+                        run_read_only_search_worker(pack_budget.remaining_ms(), configure)
+                    } else {
+                        configure().map(Some)
+                    };
+                    // Semantic loaders may describe an invalidated privacy
+                    // fence as unavailable context. Preserve the authoritative
+                    // typed refusal before considering that fallback or error.
+                    validate_pack_privacy()?;
+                    if let Some((configured_mode, _)) = configured? {
+                        mode_meta = configured_mode;
+                    } else {
+                        if strict_semantic {
+                            return Err(search_timeout_error(
+                                pack_budget.total_ms(),
+                                "during pack semantic setup",
+                            ));
+                        }
+                        hard_deadline_reached = true;
+                        skipped_sections.push("semantic_setup".to_string());
+                        mode_meta.fall_back_to_lexical(
+                            "semantic refinement skipped because semantic setup exceeded the robot search budget",
+                        );
+                    }
+                }
+            }
+        }
+
+        let search_snapshot = bounded_pack.then(|| BudgetSnapshot::capture(&pack_budget));
+        match semantic_budget_action(&mode_meta, search_snapshot) {
+            SemanticBudgetAction::StrictSemanticTimeout => {
+                return Err(strict_semantic_budget_error(
+                    &mode_meta,
+                    search_snapshot,
+                    SemanticBudgetCheckpoint::BeforeSearch,
+                ));
+            }
+            SemanticBudgetAction::HybridLexicalFallback => {
+                skipped_sections.push("semantic_refinement".to_string());
+                mode_meta.fall_back_to_lexical(semantic_budget_fallback_reason(
+                    SemanticBudgetCheckpoint::BeforeSearch,
+                ));
+            }
+            SemanticBudgetAction::Execute => {}
+        }
     }
 
     let candidate_limit = if limit == 0 {
@@ -36867,7 +36978,7 @@ fn run_cli_pack(
     let result = if session_scope_empty {
         empty_search_result()
     } else if bounded_pack && (hard_deadline_reached || pack_budget.is_exhausted()) {
-        if !structured_pack {
+        if !structured_pack || strict_semantic {
             return Err(search_timeout_error(
                 pack_budget.total_ms(),
                 "before pack search",
@@ -36881,44 +36992,44 @@ fn run_cli_pack(
     } else {
         let client = client.expect("completed pack setup provides a search client");
         let query = query.to_string();
+        let worker_mode = mode_meta.clone();
         let search_task = move || {
             maybe_test_pack_delay();
-            client
-                .search_with_fallback(
-                    &query,
-                    filters,
-                    candidate_limit,
-                    0,
-                    search_sparse_threshold,
-                    FieldMask::FULL,
-                )
-                .map_err(|error| {
-                    let mut failure =
-                        lexical_search_cli_error(&error, format!("pack search failed: {error}"));
-                    failure.hint.get_or_insert_with(|| {
-                        "Try `cass search <query> --robot --robot-meta` to inspect the search path."
-                            .to_string()
-                    });
-                    failure
-                })
+            execute_search_operation(
+                client,
+                query,
+                filters,
+                candidate_limit,
+                0,
+                search_sparse_threshold,
+                FieldMask::FULL,
+                false,
+                SemanticTierMode::Single,
+                worker_mode,
+            )
         };
-        if bounded_pack {
-            match run_read_only_search_worker(pack_budget.remaining_ms(), search_task)? {
-                Some(result) => result,
-                None => {
-                    if !structured_pack {
-                        return Err(search_timeout_error(
-                            pack_budget.total_ms(),
-                            "during pack search",
-                        ));
-                    }
-                    hard_deadline_reached = true;
-                    skipped_sections.push("search".to_string());
-                    empty_search_result()
-                }
-            }
+        let completed = if bounded_pack {
+            run_read_only_search_worker(pack_budget.remaining_ms(), search_task)?
         } else {
-            search_task()?
+            Some(search_task()?)
+        };
+        if let Some((result, mut completed_mode)) = completed {
+            completed_mode.semantic_work_completed = matches!(
+                completed_mode.realized,
+                SearchMode::Semantic | SearchMode::Hybrid
+            );
+            mode_meta = completed_mode;
+            result
+        } else {
+            if !structured_pack || strict_semantic {
+                return Err(search_timeout_error(
+                    pack_budget.total_ms(),
+                    "during pack search",
+                ));
+            }
+            hard_deadline_reached = true;
+            skipped_sections.push("search".to_string());
+            empty_search_result()
         }
     };
 
@@ -36935,7 +37046,22 @@ fn run_cli_pack(
                 query_term_count,
                 query_phrase_count,
             );
-            candidate.hybrid_rank = Some(index + 1);
+            match mode_meta.realized {
+                SearchMode::Lexical => {
+                    // Retain the existing lexical pack's reciprocal-rank
+                    // signal as well as its raw lexical score.
+                    candidate.hybrid_rank = Some(index + 1);
+                }
+                SearchMode::Semantic => {
+                    candidate.semantic_score = candidate.lexical_score.take();
+                }
+                SearchMode::Hybrid => {
+                    // A hybrid hit carries a fused score, not either leg's
+                    // raw score. Preserve its combined rank as the signal.
+                    candidate.lexical_score = None;
+                    candidate.hybrid_rank = Some(index + 1);
+                }
+            }
             candidate.source_explicitly_requested = source_explicitly_requested;
             candidate
         })
@@ -37013,7 +37139,10 @@ fn run_cli_pack(
         );
         plan
     };
-    if !structured_pack && bounded_pack && (hard_deadline_reached || pack_budget.is_exhausted()) {
+    if (!structured_pack || strict_semantic)
+        && bounded_pack
+        && (hard_deadline_reached || pack_budget.is_exhausted())
+    {
         return Err(search_timeout_error(
             pack_budget.total_ms(),
             "during pack planning",
@@ -37109,15 +37238,23 @@ fn run_cli_pack(
             index_generation: search_self_heal
                 .indexed_docs
                 .map(|count| format!("indexed_docs:{count}")),
-            lexical_readiness: if rebuild_active {
+            lexical_readiness: if !lexical_admitted {
+                PackLexicalReadiness::Unknown
+            } else if rebuild_active {
                 PackLexicalReadiness::Rebuilding
             } else {
                 PackLexicalReadiness::Ready
             },
-            semantic_readiness: if mode_meta.fell_back_to_lexical() {
+            semantic_readiness: if mode_meta.semantic_refinement() {
+                PackSemanticReadiness::Joined
+            } else if mode_meta.fell_back_to_lexical() {
                 PackSemanticReadiness::FallbackLexical
-            } else {
+            } else if matches!(requested_mode, SearchMode::Lexical) {
                 PackSemanticReadiness::Disabled
+            } else {
+                // No completed semantic work and no lexical fallback: an
+                // empty scope or expired worker is not unavailable evidence.
+                PackSemanticReadiness::NotReported
             },
             active_rebuild: rebuild_active,
             lock_state: rebuild_active.then(|| "index-run-lock-active".to_string()),
@@ -37137,6 +37274,7 @@ fn run_cli_pack(
             start_time,
             &correlation,
         )?;
+        validate_pack_privacy()?;
         return write_cli_pack_output(&rendered);
     }
 
@@ -37174,7 +37312,7 @@ fn run_cli_pack(
         budget_fallback_answer_pack(&limits, candidate_count).map_err(pack_invalid_limit_error)?;
 
     let render_result = if pack_budget.is_exhausted() {
-        if !structured_pack {
+        if !structured_pack || strict_semantic {
             return Err(search_timeout_error(
                 pack_budget.total_ms(),
                 "before pack rendering",
@@ -37216,7 +37354,7 @@ fn run_cli_pack(
         match receiver.recv_timeout(Duration::from_millis(pack_budget.remaining_ms().max(1))) {
             Ok(result) => result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if !structured_pack {
+                if !structured_pack || strict_semantic {
                     return Err(search_timeout_error(
                         pack_budget.total_ms(),
                         "during pack rendering",
@@ -37252,7 +37390,7 @@ fn run_cli_pack(
         }
     };
     let rendered = render_result?;
-    if !structured_pack && pack_budget.is_exhausted() {
+    if (!structured_pack || strict_semantic) && pack_budget.is_exhausted() {
         return Err(search_timeout_error(
             pack_budget.total_ms(),
             "before pack output",
@@ -37261,6 +37399,7 @@ fn run_cli_pack(
     if fields.is_some() && matches!(render_format, PackRenderFormat::Jsonl) {
         eprintln!("Warning: --fields is ignored for pack JSONL output.");
     }
+    validate_pack_privacy()?;
     write_cli_pack_output(&rendered)
 }
 
@@ -107156,7 +107295,7 @@ fn response_schema_pack() -> serde_json::Value {
                     "fallback_mode": { "type": ["string", "null"] },
                     "fallback_reason": {
                         "type": ["string", "null"],
-                        "description": "Why the pack's search fell back to fallback_mode, as the executor recorded it (the typed codes of search's _meta.semantic_fallback_reason; pack_enrichment_unavailable means pack itself selects evidence lexically). Null when there was no fallback, or when none was supplied, which also adds the warning semantic_fallback_reason_unreported."
+                        "description": "Why the pack's search fell back to fallback_mode, as the executor recorded it (the typed codes of search's _meta.semantic_fallback_reason). Null when there was no fallback, or when none was supplied, which also adds the warning semantic_fallback_reason_unreported."
                     },
                     "semantic_joined": { "type": "boolean" },
                     "candidate_count": { "type": "integer" },
