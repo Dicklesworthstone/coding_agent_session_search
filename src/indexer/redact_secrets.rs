@@ -478,9 +478,13 @@ impl<'de> serde::de::Visitor<'de> for EmbeddedJsonKeyCheck {
 /// - String values are redacted without changing their JSON type.
 /// - Objects/arrays and quoted JSON strings encoded as strings use the same
 ///   field policy. Unchanged valid strings retain their exact bytes.
-///   Truncated containers, duplicate keys, container parser refusals, and JSON
-///   payloads beyond eight encoded layers are replaced in full. Malformed
-///   quoted prose retains the plain-text policy.
+///   JSON objects, arrays and encoded strings inside prose or code fences
+///   receive the same policy. Truncated containers, duplicate keys, parser
+///   refusals and payloads beyond eight encoded layers are hidden. Ordinary
+///   malformed quoted prose and bracketed log labels retain their bytes.
+/// - The original whole-text policy runs before structural interpretation.
+///   If its changes cannot be reconciled exactly with structured redaction,
+///   the containing text is hidden in full rather than risking a secret tail.
 /// - Values under credential-bearing object keys are replaced in full.
 /// - Arrays and objects are walked recursively.
 /// - Numbers, booleans, and null are left untouched.
@@ -500,32 +504,7 @@ pub(crate) fn redact_content_with_text_redactor(
     input: &str,
     redact_plain_text: &mut impl FnMut(&str) -> String,
 ) -> String {
-    let trimmed = input.trim();
-    if !matches!(trimmed.as_bytes().first(), Some(b'{' | b'[' | b'"'))
-        || serde_json::from_str::<EmbeddedJsonKeyCheck>(trimmed).is_err()
-    {
-        // Plain transcript content can begin with a log label or timestamp.
-        // Only a complete JSON value opts in to structured interpretation.
-        return redact_plain_text(input);
-    }
-    // Decoding can shorten a raw credential below a pattern's minimum length,
-    // and walking fields can erase a header whose original match crossed them.
-    // Retain the original whole-string policy as a separate safety obligation.
-    let original_plain = redact_plain_text(input);
-    let structured = redact_json_string(input, redact_plain_text, 0);
-    if original_plain == input {
-        return structured;
-    }
-    if structured == input {
-        return original_plain;
-    }
-    let combined = redact_plain_text(&structured);
-    if combined == original_plain {
-        return combined;
-    }
-    // The two policies changed different representations. Without original
-    // span proof, a complete sensitive payload is safer hidden in full.
-    REDACTED.to_owned()
+    redact_json_string(input, redact_plain_text, 0)
 }
 
 /// Inspect original JSON keys and encoded values before applying a text policy.
@@ -580,57 +559,48 @@ fn redact_json_string(
     redact_plain_text: &mut impl FnMut(&str) -> String,
     embedded_layers: usize,
 ) -> String {
+    // Capture the original whole-string obligation before decoding or
+    // replacing a fragment can hide a credential prefix or custom policy.
+    // This is also the only callback on the ordinary no-JSON fast path.
+    let original_plain = redact_plain_text(input);
+    if !input.contains(['{', '[', '"']) {
+        return original_plain;
+    }
+
     let trimmed = input.trim();
-    // Truncated tool output can retain credentials before its missing suffix.
-    // Let the parser below establish completeness and reject it safely.
-    let quoted_string = trimmed.starts_with('"');
-    let has_json_prefix = trimmed.starts_with('{') || trimmed.starts_with('[') || quoted_string;
-    if !has_json_prefix {
-        return redact_plain_text(input);
-    }
-
-    // Inspect only the first token, peeling leading arrays in linear time.
-    // An object still needs a quoted first key (or to be empty), so ordinary
-    // code such as [{ id: 1 }] keeps the existing text rules.
-    let mut prefix = trimmed;
-    while let Some(rest) = prefix.strip_prefix('[') {
-        prefix = rest.trim_start();
-    }
-    let plausible_first_token = if quoted_string {
-        true
-    } else if let Some(rest) = prefix.strip_prefix('{') {
-        matches!(
-            rest.trim_start().as_bytes().first().copied(),
-            Some(b'"' | b'}')
-        )
+    let structured = if matches!(trimmed.as_bytes().first(), Some(b'{' | b'[' | b'"'))
+        && let Ok(keys) = serde_json::from_str::<EmbeddedJsonKeyCheck>(trimmed)
+    {
+        redact_complete_json(input, redact_plain_text, embedded_layers, keys)
     } else {
-        matches!(
-            prefix.as_bytes().first().copied(),
-            Some(b'"' | b']' | b'-' | b'0'..=b'9')
-        ) || prefix.starts_with("true")
-            || prefix.starts_with("false")
-            || prefix.starts_with("null")
+        redact_mixed_json_fragments(input, redact_plain_text, embedded_layers)
     };
-    if !plausible_first_token {
-        return redact_plain_text(input);
+    if original_plain == input {
+        return structured;
     }
+    if structured == input {
+        return original_plain;
+    }
+    let combined = redact_plain_text(&structured);
+    if combined == original_plain {
+        return combined;
+    }
+    // The two policies changed different representations. Without original
+    // span proof, hide the containing text instead of retaining an uncertain
+    // suffix. This also protects custom policies across JSON/prose boundaries.
+    REDACTED.to_owned()
+}
 
-    // serde_json classifies depth and number/Unicode representation failures
-    // as syntax errors too. An advertised container that fails inspection must
-    // be hidden rather than expose unexamined credential fields.
-    let Ok(keys) = serde_json::from_str::<EmbeddedJsonKeyCheck>(trimmed) else {
-        // Ordinary quoted prose need not be a complete JSON string literal.
-        // Keep its existing text policy; a valid literal is decoded below and
-        // any structured payload inside it still receives strict inspection.
-        if quoted_string {
-            return redact_plain_text(input);
-        }
-        return REDACTED.to_owned();
-    };
+fn redact_complete_json(
+    input: &str,
+    redact_plain_text: &mut impl FnMut(&str) -> String,
+    embedded_layers: usize,
+    keys: EmbeddedJsonKeyCheck,
+) -> String {
     if keys.0 || embedded_layers >= MAX_EMBEDDED_JSON_LAYERS {
         return REDACTED.to_owned();
     }
-    let Ok(embedded) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+    let Ok(embedded) = serde_json::from_str::<serde_json::Value>(input.trim()) else {
         return REDACTED.to_owned();
     };
     let redacted = redact_json_with(&embedded, redact_plain_text, embedded_layers + 1);
@@ -639,6 +609,237 @@ fn redact_json_string(
     }
     // Do not reformat clean tool output or falsely report that it changed.
     input.to_owned()
+}
+
+/// Admit JSON-looking containers without treating log labels or source-code
+/// braces as JSON. On refusal the returned cursor skips all inspected leading
+/// arrays and whitespace, so a long run of '[' cannot cause quadratic retries.
+fn json_fragment_prefix(input: &str, start: usize, escaped_keys: bool) -> (bool, usize) {
+    let bytes = input.as_bytes();
+    let mut cursor = start;
+    if bytes[cursor] == b'"' {
+        return (true, cursor + 1);
+    }
+    while bytes.get(cursor) == Some(&b'[') {
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+    }
+    if bytes.get(cursor) == Some(&b'{') {
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if escaped_keys {
+            while bytes.get(cursor) == Some(&b'\\') {
+                cursor += 1;
+            }
+        }
+        return (
+            matches!(bytes.get(cursor), Some(b'"' | b'}')),
+            cursor.max(start + 1),
+        );
+    }
+    if escaped_keys {
+        while bytes.get(cursor) == Some(&b'\\') {
+            cursor += 1;
+        }
+    }
+    (
+        matches!(bytes.get(cursor), Some(b'"' | b']' | b'-' | b'0'..=b'9'))
+            || input[cursor..].starts_with("true")
+            || input[cursor..].starts_with("false")
+            || input[cursor..].starts_with("null"),
+        cursor.max(start + 1),
+    )
+}
+
+/// Look inside a quoted span for an actual container prefix. Ordinary source
+/// braces such as "{value}" are not enough; encoded keys need an escaped quote.
+/// The prefix helper advances past every inspected array/whitespace run.
+fn quoted_container_start(
+    input: &str,
+    mut cursor: usize,
+    end: usize,
+    escaped_keys: bool,
+) -> Option<usize> {
+    while cursor < end {
+        let offset = input[cursor..end].find(['{', '['])?;
+        let start = cursor + offset;
+        let (admitted, resume) = json_fragment_prefix(input, start, escaped_keys);
+        if admitted {
+            return Some(start);
+        }
+        cursor = resume;
+    }
+    None
+}
+
+/// Find a candidate span with bounded retained state. A mismatched closer or
+/// excessive nesting makes the remainder ambiguous and belongs to this unsafe
+/// candidate; stopping at that closer could expose later credential fields.
+/// Quotes and escapes shield delimiters. serde still checks the full grammar.
+fn json_fragment_end(input: &str, start: usize) -> (usize, bool) {
+    let bytes = input.as_bytes();
+    let opening = bytes[start];
+    let quoted = opening == b'"';
+    let mut closers = [0_u8; 128];
+    closers[0] = if opening == b'{' { b'}' } else { b']' };
+    let mut depth = 1_usize;
+    let mut in_string = quoted;
+    let mut escaped = false;
+    for (offset, &byte) in bytes[start + 1..].iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                if quoted {
+                    return (start + offset + 2, true);
+                }
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        } else if matches!(byte, b'{' | b'[') {
+            if depth == closers.len() {
+                return (input.len(), false);
+            }
+            closers[depth] = if byte == b'{' { b'}' } else { b']' };
+            depth += 1;
+        } else if matches!(byte, b'}' | b']') {
+            if byte != closers[depth - 1] {
+                return (input.len(), false);
+            }
+            depth -= 1;
+            if depth == 0 {
+                return (start + offset + 2, true);
+            }
+        }
+    }
+    (input.len(), false)
+}
+
+/// Inspect candidates with a forward-only cursor. An unchanged quote may
+/// also open the next literal (a Rust raw string around encoded JSON), so its
+/// closing quote is reconsidered once. Escaped quotes are never retry points;
+/// each intervening byte range is scanned a bounded number of times. No span
+/// list grows with input size. Decoding retains serde's nesting limit and the
+/// same eight-layer encoded-string limit as whole JSON.
+fn redact_mixed_json_fragments(
+    input: &str,
+    redact_plain_text: &mut impl FnMut(&str) -> String,
+    embedded_layers: usize,
+) -> String {
+    let mut cursor = 0;
+    let mut copied_until = 0;
+    let mut output: Option<String> = None;
+    while let Some(offset) = input[cursor..].find(['{', '[', '"']) {
+        let start = cursor + offset;
+        if input.as_bytes()[start] == b'"'
+            && input.as_bytes()[..start]
+                .iter()
+                .rev()
+                .take_while(|&&byte| byte == b'\\')
+                .count()
+                % 2
+                != 0
+        {
+            // An inner-container reroute can expose source-level escaped
+            // quotes. Starting a new literal there would repeatedly scan the
+            // remaining suffix. Each preceding backslash run is disjoint.
+            cursor = start + 1;
+            continue;
+        }
+        let (admitted, resume) = json_fragment_prefix(input, start, false);
+        if !admitted {
+            cursor = resume;
+            continue;
+        }
+        let (end, complete) = json_fragment_end(input, start);
+        cursor = end;
+        let fragment = &input[start..end];
+        let quoted = input.as_bytes()[start] == b'"';
+        // A prose quote can end on a JSON object's first key quote: "{" is a
+        // complete string, but consuming it would hide the object's opener.
+        // Resume at that inner container, never at every intervening quote.
+        if quoted
+            && let Some(inner) = quoted_container_start(input, start + 1, end, false)
+        {
+            if let Ok(keys) = serde_json::from_str::<EmbeddedJsonKeyCheck>(fragment) {
+                if redact_complete_json(fragment, redact_plain_text, embedded_layers, keys)
+                    != fragment
+                {
+                    // Decoding this overlapping prose quote also revealed a
+                    // secret. Its two interpretations cannot be spliced safely.
+                    return REDACTED.to_owned();
+                }
+            } else if input[start + 1..end]
+                .match_indices('{')
+                .any(|(offset, _)| json_fragment_prefix(input, start + 1 + offset, true).0)
+            {
+                // A malformed literal can contain a harmless raw array before
+                // an encoded object. Rerouting to the array would abandon the
+                // object's escaped keys, so hide this ambiguous containing text.
+                return REDACTED.to_owned();
+            }
+            cursor = inner;
+            continue;
+        }
+        let protected = match serde_json::from_str::<EmbeddedJsonKeyCheck>(fragment) {
+            Ok(keys) => redact_complete_json(
+                fragment,
+                redact_plain_text,
+                embedded_layers,
+                keys,
+            ),
+            Err(_)
+                if quoted
+                    && quoted_container_start(input, start + 1, end, true).is_none() =>
+            {
+                // Windows paths and ordinary quoted prose need not be JSON
+                // strings. Without an actual (possibly encoded) container
+                // prefix, keep the original whole-text policy.
+                if !complete {
+                    break;
+                }
+                cursor = end - 1;
+                continue;
+            }
+            Err(_) if fragment.starts_with('[') && !fragment.contains(['{', '"']) => {
+                // A bracketed timestamp or numeric log label has no object
+                // fields or encoded strings. Keep its exact original bytes.
+                continue;
+            }
+            Err(_) => REDACTED.to_owned(),
+        };
+        if protected != fragment {
+            if quoted
+                && (input.as_bytes().get(end) == Some(&b'\\')
+                    || (matches!(input.as_bytes().get(end), Some(b'{' | b'['))
+                        && json_fragment_prefix(input, end, true).0))
+            {
+                // A changed decoded literal overlaps another possible encoded
+                // container. Neither interpretation may expose the other.
+                return REDACTED.to_owned();
+            }
+            let buffer = output.get_or_insert_with(|| String::with_capacity(input.len()));
+            buffer.push_str(&input[copied_until..start]);
+            buffer.push_str(&protected);
+            copied_until = end;
+        } else if quoted && complete {
+            cursor = end - 1;
+        }
+    }
+    match output {
+        Some(mut output) => {
+            output.push_str(&input[copied_until..]);
+            output
+        }
+        None => input.to_owned(),
+    }
 }
 
 #[doc(hidden)]
@@ -705,10 +906,10 @@ fn redaction_enabled_from_values(modern: Option<&str>, legacy: Option<&str>) -> 
 /// regex tightened) automatically invalidates every prior cache entry
 /// — silent stale cross-version reuse is impossible by construction.
 ///
-/// The fingerprint is `redact-v3:<blake3-hex>` where the hash covers
+/// The fingerprint is `redact-v4:<blake3-hex>` where the hash covers
 /// every pattern source string concatenated with NUL separators and the
-/// replacement marker. The `v3` epoch adds structured transcript content
-/// to the original-span replacement policy introduced by `v2`.
+/// replacement marker. The `v4` epoch covers mixed-text JSON fragments and
+/// original whole-text policy reconciliation at every decoded layer.
 /// Bump the epoch for algorithm changes even when the pattern set is unchanged.
 pub fn redaction_algorithm_fingerprint() -> String {
     static FINGERPRINT: Lazy<String> = Lazy::new(|| {
@@ -718,7 +919,7 @@ pub fn redaction_algorithm_fingerprint() -> String {
             hasher.update(&[0]);
         }
         hasher.update(REDACTED.as_bytes());
-        format!("redact-v3:{}", hasher.finalize().to_hex())
+        format!("redact-v4:{}", hasher.finalize().to_hex())
     });
     FINGERPRINT.clone()
 }
@@ -1710,34 +1911,27 @@ mod tests {
     }
 
     #[test]
-    fn gh551_nested_embedded_json_redacts_and_preserves_memo_hits()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn gh551_nested_embedded_json_reconciles_original_matches_and_reuses_memo() {
         let details = json!([
             {"registration_token": "opaque-short-value", "detail": "DB_PASSWORD=synthetic-assignment"},
             {"detail": "DB_PASSWORD=synthetic-assignment"}
         ]);
         let input = json!({"content": json!({"output": details.to_string()}).to_string()});
-        let output = redact_json(&input);
-        let outer: serde_json::Value =
-            serde_json::from_str(output["content"].as_str().ok_or("outer string missing")?)?;
-        let decoded: serde_json::Value =
-            serde_json::from_str(outer["output"].as_str().ok_or("inner string missing")?)?;
-        assert_eq!(
-            decoded,
-            json!([
-                {"registration_token": REDACTED, "detail": REDACTED},
-                {"detail": REDACTED}
-            ])
-        );
+        // The original unquoted assignment match consumes an encoded closing
+        // quote. A field-by-field rewrite cannot prove that original span was
+        // preserved, so this containing encoded payload is hidden in full.
+        let expected = json!({"content": REDACTED});
+        assert_eq!(redact_json(&input), expected);
         let mut memo = MemoizingRedactor::with_capacity(16);
-        assert_eq!(memo.redact_json(&input), output);
-        assert_eq!(memo.stats().misses, 1);
-        assert_eq!(memo.stats().hits, 1);
-        assert_eq!(memo.redact_json(&input), output);
-        assert_eq!(memo.stats().misses, 1);
-        assert_eq!(memo.stats().hits, 3);
-        assert_eq!(redact_json(&output), output);
-        Ok(())
+        assert_eq!(memo.redact_json(&input), expected);
+        let misses = memo.stats().misses;
+        let hits = memo.stats().hits;
+        assert!(misses > 0, "the original candidate-bearing text must be checked");
+        assert!(hits > 0, "the repeated plain leaf must reuse its cached result");
+        assert_eq!(memo.redact_json(&input), expected);
+        assert_eq!(memo.stats().misses, misses);
+        assert!(memo.stats().hits > hits);
+        assert_eq!(redact_json(&expected), expected);
     }
 
     #[test]
@@ -1810,6 +2004,239 @@ mod tests {
         }
         assert_eq!(memo.stats().misses, 0);
         assert_eq!(memo.stats().hits, 0);
+    }
+
+    #[test]
+    fn gh551_mixed_text_json_fragments_redact_without_changing_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let structured = json!({
+            "registration_token": "synthetic-wrapped-credential",
+            "safe": "kept café 界",
+            "token_count": 42,
+            "nested": [{"passphrase": "tiny"}]
+        });
+        let protected = json!({
+            "registration_token": REDACTED,
+            "safe": "kept café 界",
+            "token_count": 42,
+            "nested": [{"passphrase": REDACTED}]
+        });
+        let mut memo = MemoizingRedactor::with_capacity(8);
+        for (prefix, suffix) in [
+            ("Tool response: ", "\ncomplete"),
+            ("```json\n", "\n```"),
+            ("before café 界\n", "\nafter café 界"),
+            ("Result: \"prefix ", " suffix\""),
+            ("r#\"", "\"#"),
+        ] {
+            let mut payload = structured.to_string();
+            let mut expected_payload = protected.to_string();
+            for _ in 0..3 {
+                let input = format!("{prefix}{payload}{suffix}");
+                let expected = format!("{prefix}{expected_payload}{suffix}");
+                assert_eq!(redact_content(&input), expected, "{input}");
+                assert_eq!(redact_json(&json!(input)), json!(expected));
+                assert_eq!(memo.redact_content(&input), expected);
+                assert_eq!(memo.redact_content(&input), expected);
+                assert_eq!(redact_content(&expected), expected);
+                payload = serde_json::to_string(&payload)?;
+                expected_payload = serde_json::to_string(&expected_payload)?;
+            }
+        }
+        let input = format!("first: {structured}\nsecond: [{structured}]\nfinished");
+        let expected = format!("first: {protected}\nsecond: [{protected}]\nfinished");
+        assert_eq!(redact_content(&input), expected);
+        assert_eq!(memo.redact_content(&input), expected);
+        assert_eq!(redact_content(&expected), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn gh551_mixed_text_malformed_and_deep_json_fails_closed() {
+        let deep = format!(
+            "{}{}{}",
+            "[".repeat(130),
+            r#"{"registration_token":"synthetic-hidden"}"#,
+            "]".repeat(130)
+        );
+        let mut memo = MemoizingRedactor::with_capacity(8);
+        for fragment in [
+            r#"{"registration_token":"synthetic-hidden","registration_token":null}"#,
+            r#"{"pin":"synthetic-hidden","\u0070in":null}"#,
+            r#"{"registration_token":"synthetic-hidden","number":1e400}"#,
+            r#"{"registration_token":"synthetic-hidden","text":"\uD800"}"#,
+        ] {
+            let input = format!("result: {fragment}\nfinished");
+            let expected = "result: [REDACTED]\nfinished";
+            assert_eq!(redact_content(&input), expected, "{input}");
+            assert_eq!(memo.redact_content(&input), expected);
+            assert_eq!(redact_content(expected), expected);
+        }
+        for fragment in [
+            deep.as_str(),
+            r#"[{"unclosed":], "registration_token":"synthetic-hidden"} trailing"#,
+            r#"[{"unclosed":]} , "registration_token":"synthetic-hidden"} trailing"#,
+            r#"{"registration_token":"synthetic-hidden""#,
+            r#"[{"registration_token":"synthetic-hidden"}"#,
+            r#"{"registration_token":"synthetic-hidden"#,
+            r#"{"registration_token":"synthetic-hidden","broken":[}"#,
+            r#""{\"registration_token\":\"synthetic-hidden\""#,
+        ] {
+            let input = format!("result: {fragment}");
+            let expected = "result: [REDACTED]";
+            assert_eq!(redact_content(&input), expected, "{input}");
+            assert_eq!(memo.redact_content(&input), expected);
+        }
+    }
+
+    #[test]
+    fn gh551_mixed_text_clean_bytes_and_plain_policy_preserved() {
+        let mut memo = MemoizingRedactor::with_capacity(8);
+        for input in [
+            "[2026-11-22 22:35:42] Build succeeded",
+            "[INFO] response: { \"token_count\": 42, \"safe\": \"café 界\" }\ndone",
+            "```json\n[ { \"null_token\": null, \"safe\": true } ]\n```",
+            "code: [{ id: 1 }] and {not valid JSON}; [unfinished",
+            "\"ordinary quoted café 界\" with a suffix",
+            "{ not-json } then { \"safe\": 42 }",
+            r#"let message = "use {value}"#,
+            r#"prefix "ordinary invalid \q prose" suffix"#,
+            r#"response: "{\"safe\":\"kept café 界\"}" done"#,
+        ] {
+            assert_eq!(redact_content(input), input);
+            assert_eq!(redact_json(&json!(input)), json!(input));
+            assert_eq!(memo.redact_content(input), input);
+            assert_eq!(memo.redact_content(input), input);
+        }
+        for input in [
+            "DB_PASSWORD=\"before {} after\"",
+            r#"PASSWORD="before {\"ok\":true} after""#,
+            "-----BEGIN PRIVATE KEY-----\n{\"safe\":true}\n-----END PRIVATE KEY-----",
+        ] {
+            assert_eq!(redact_text(input), REDACTED);
+            assert_eq!(redact_content(input), REDACTED);
+            assert_eq!(memo.redact_content(input), REDACTED);
+        }
+    }
+
+    #[test]
+    fn gh551_mixed_text_preserves_original_and_custom_cross_boundary_protection() {
+        let mut memo = MemoizingRedactor::with_capacity(8);
+        for input in [
+            concat!(
+                "-----BEGIN PRIVATE KEY-----\n",
+                "{\"registration_token\":\"tiny\",\"note\":\"PUBLICISH\"}\n",
+                "synthetic-private-tail\n-----END PRIVATE KEY-----",
+            ),
+            concat!(
+                "log: {\"note\":\"-----BEGIN PRIVATE KEY-----\"}\n",
+                "synthetic-private-tail\n-----END PRIVATE KEY-----",
+            ),
+            r#"log: "\u0073k-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij {"pin":12}"#,
+        ] {
+            let output = redact_content(input);
+            assert_eq!(output, REDACTED, "{input}");
+            assert_eq!(memo.redact_content(input), output);
+            assert_eq!(redact_json(&json!(input)), json!(output));
+        }
+        let custom = Regex::new(r"(?s)PRIVATE_BEGIN.*?PRIVATE_END").unwrap();
+        let input = concat!(
+            "before PRIVATE_BEGIN {\"registration_token\":\"tiny\"} ",
+            "synthetic-custom-tail PRIVATE_END after",
+        );
+        let mut scalar = |text: &str| custom.replace_all(text, "[CUSTOM]").into_owned();
+        assert_eq!(
+            redact_content_with_text_redactor(input, &mut scalar),
+            "before [CUSTOM] after"
+        );
+        assert_eq!(
+            redact_json_with_text_redactor(&json!({"content": input}), &mut scalar),
+            json!({"content": "before [CUSTOM] after"})
+        );
+        let input = r#"before {"registration_token":"PRIVATE_BEGIN"} synthetic-tail PRIVATE_END after"#;
+        assert_eq!(
+            redact_content_with_text_redactor(input, &mut scalar),
+            REDACTED
+        );
+    }
+
+    #[test]
+    fn gh551_mixed_text_escaped_layers_keep_original_custom_refusals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = json!({
+            "registration_token": "tiny",
+            "command": "rch exec -- sh -c $(synthetic-command)"
+        })
+        .to_string();
+        let mut scalar = |text: &str| {
+            if text.contains("$(") {
+                "[UNSAFE COMMAND]".to_owned()
+            } else {
+                text.to_owned()
+            }
+        };
+        let mut encoded = payload;
+        for _ in 0..4 {
+            let input = format!("Tool response: {encoded}");
+            assert_eq!(
+                redact_content_with_text_redactor(&input, &mut scalar),
+                REDACTED
+            );
+            encoded = serde_json::to_string(&encoded)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gh551_mixed_text_escaped_quotes_do_not_restart_suffix_scans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for repetitions in [256, 512] {
+            let decoded = "[1] \" café 界 ".repeat(repetitions);
+            let input = format!("prefix {}", serde_json::to_string(&decoded)?);
+            let mut inspected_bytes = 0;
+            let mut scalar = |text: &str| {
+                inspected_bytes += text.len();
+                text.to_owned()
+            };
+            assert_eq!(
+                redact_content_with_text_redactor(&input, &mut scalar),
+                input
+            );
+            // Repeatedly decoding the suffix at every escaped quote makes
+            // the total inspected text quadratic. The bound allows ordinary
+            // whole-string, decoded-string, and short inner-literal passes.
+            assert!(inspected_bytes <= 32 * input.len(), "{inspected_bytes}");
+            assert_eq!(redact_content(&input), input);
+        }
+        for input in [
+            r#"prefix "bad \q [1] {\"registration_token\":\"tiny\"}" suffix"#,
+            r#"prefix "bad \q [1] {\"registration_token\":\"tiny\"}"#,
+        ] {
+            assert_eq!(redact_content(input), REDACTED);
+            assert_eq!(redact_json(&json!(input)), json!(REDACTED));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gh551_mixed_text_long_refused_prefixes_keep_later_credentials_visible() {
+        let input = format!(
+            "before {}source-code {} after",
+            "[".repeat(16_384),
+            r#"{"pin":"synthetic-hidden"}"#,
+        );
+        let output = redact_content(&input);
+        assert!(output.starts_with("before "));
+        assert!(output.ends_with(" after"));
+        assert!(!output.contains("synthetic-hidden"));
+        assert!(output.contains(REDACTED));
+
+        let input = format!(
+            "before {}{}",
+            "[".repeat(16_384),
+            r#"{"pin":"synthetic-hidden"}"#,
+        );
+        assert_eq!(redact_content(&input), "before [REDACTED]");
     }
 
     #[test]
@@ -2078,17 +2505,17 @@ mod tests {
     /// `MemoizingRedactor` instances whose algorithm fingerprints
     /// differ — entries from one cannot serve hits to the other,
     /// guaranteeing safe cross-version semantics. Pinning the
-    /// fingerprint structure (`redact-v3:<hex>`) guards against an
+    /// fingerprint structure (`redact-v4:<hex>`) guards against an
     /// accidental hash-format change that would silently break
     /// invalidation.
     #[test]
     fn memoizing_redactor_keys_isolate_by_algorithm_fingerprint() {
         let fingerprint = redaction_algorithm_fingerprint();
         assert!(
-            fingerprint.starts_with("redact-v3:"),
+            fingerprint.starts_with("redact-v4:"),
             "fingerprint must carry an explicit version epoch, got: {fingerprint}"
         );
-        let hex_part = fingerprint.strip_prefix("redact-v3:").unwrap();
+        let hex_part = fingerprint.strip_prefix("redact-v4:").unwrap();
         assert_eq!(
             hex_part.len(),
             64,
@@ -2260,7 +2687,7 @@ mod tests {
         // ContentAddressedMemoCaches share the same logger target.
         for record in first_audit.iter().chain(second_audit.iter()) {
             assert_eq!(record.key.algorithm, "redact_text");
-            assert!(record.key.algorithm_version.starts_with("redact-v3:"));
+            assert!(record.key.algorithm_version.starts_with("redact-v4:"));
         }
     }
 

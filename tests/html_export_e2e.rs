@@ -531,11 +531,22 @@ fn gh551_export_redaction_covers_json_titles() -> Result<(), Box<dyn std::error:
         "token_count":42
     })
     .to_string();
-    for wrappers in 0..=2 {
+    for (wrappers, prefix, suffix) in (0..=2).flat_map(|wrappers| {
+        [
+            (wrappers, "", ""),
+            (wrappers, "title-prefix-kept ", " title-suffix-kept"),
+            (
+                wrappers,
+                "title-prefix-kept\n~~~json\n",
+                "\n~~~\ntitle-suffix-kept",
+            ),
+        ]
+    }) {
         let mut title = structured_title.clone();
         for _ in 0..wrappers {
             title = serde_json::to_string(&title)?;
         }
+        let title = format!("{prefix}{title}{suffix}");
         fs::write(
             &session,
             serde_json::to_vec(&serde_json::json!({
@@ -576,6 +587,10 @@ fn gh551_export_redaction_covers_json_titles() -> Result<(), Box<dyn std::error:
                 assert!(exported.contains("export-title-clean-body"));
                 if renders_title {
                     assert!(exported.contains("title-kept"));
+                    if !prefix.is_empty() {
+                        assert!(exported.contains("title-prefix-kept"));
+                        assert!(exported.contains("title-suffix-kept"));
+                    }
                 }
                 let stderr = String::from_utf8(output.stderr)?;
                 let announcement = stderr
@@ -590,6 +605,10 @@ fn gh551_export_redaction_covers_json_titles() -> Result<(), Box<dyn std::error:
                 export_privacy_html(root.path(), &session, None, include_secrets, false)?;
             assert_eq!(html.contains(EXPORT_PRIVACY_SECRET), include_secrets);
             assert!(html.contains("title-kept"));
+            if !prefix.is_empty() {
+                assert!(html.contains("title-prefix-kept"));
+                assert!(html.contains("title-suffix-kept"));
+            }
             assert!(html.contains("export-title-clean-body"));
             assert_eq!(receipt["privacy"]["redaction_applied"], !include_secrets);
         }
@@ -623,11 +642,25 @@ fn gh551_export_redaction_covers_embedded_json_tool_results()
         "records": [{"passphrase": "tiny", "enabled": true}]
     })
     .to_string();
-    for wrappers in 0..=2 {
+    for (wrappers, prefix, suffix) in (0..=2)
+        .flat_map(|wrappers| {
+            [
+                (wrappers, "", ""),
+                (wrappers, "tool-prefix-kept ", " tool-suffix-kept"),
+                (
+                    wrappers,
+                    "tool-prefix-kept\n~~~json\n",
+                    "\n~~~\ntool-suffix-kept",
+                ),
+            ]
+        })
+        .chain(std::iter::once((0, "r#\"", "\"#")))
+    {
         let mut payload = tool_result.clone();
         for _ in 0..wrappers {
             payload = serde_json::to_string(&payload)?;
         }
+        let payload = format!("{prefix}{payload}{suffix}");
         let events = [
             serde_json::json!({"type":"user","message":{"role":"user","content":"Register this agent"}}),
             serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[
@@ -666,6 +699,10 @@ fn gh551_export_redaction_covers_embedded_json_tool_results()
                     "{format}, include_secrets={include_secrets}"
                 );
                 assert!(exported.contains("tool-json-kept"));
+                if prefix.starts_with("tool-prefix-kept") {
+                    assert!(exported.contains("tool-prefix-kept"));
+                    assert!(exported.contains("tool-suffix-kept"));
+                }
                 let stderr = String::from_utf8(output.stderr)?;
                 let announcement = stderr
                     .lines()
@@ -681,7 +718,12 @@ fn gh551_export_redaction_covers_embedded_json_tool_results()
                     let embedded = messages[2]["message"]["content"][0]["content"]
                         .as_str()
                         .ok_or("tool result changed JSON type")?;
-                    let mut decoded = embedded.to_owned();
+                    let mut decoded = embedded
+                        .strip_prefix(prefix)
+                        .ok_or("tool result lost its public prefix")?
+                        .strip_suffix(suffix)
+                        .ok_or("tool result lost its public suffix")?
+                        .to_owned();
                     for _ in 0..wrappers {
                         decoded = serde_json::from_str::<String>(&decoded)?;
                     }
@@ -712,6 +754,10 @@ fn gh551_export_redaction_covers_embedded_json_tool_results()
                 export_privacy_html(root.path(), &session, None, include_secrets, false)?;
             assert_eq!(html.contains(EXPORT_PRIVACY_SECRET), include_secrets);
             assert!(html.contains("tool-json-kept"));
+            if prefix.starts_with("tool-prefix-kept") {
+                assert!(html.contains("tool-prefix-kept"));
+                assert!(html.contains("tool-suffix-kept"));
+            }
             assert_eq!(receipt["privacy"]["redaction_applied"], !include_secrets);
         }
         assert_eq!(

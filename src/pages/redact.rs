@@ -488,7 +488,7 @@ pub fn redact_swarm_json_value(value: &Value) -> Value {
     // a field's credential semantics or consume a JSON quote's escape. The
     // scalar policy still preserves precise swarm markers and RCH admission.
     crate::indexer::redact_secrets::redact_json_with_text_redactor(value, &mut |text| {
-        redact_swarm_scalar_with_engine(&engine, text).output
+        redact_swarm_plain_scalar_with_engine(&engine, text).output
     })
 }
 
@@ -553,15 +553,7 @@ fn redact_swarm_original_scalar(engine: &RedactionEngine, input: &str) -> Redact
     redacted
 }
 
-/// Admit original credential/path spans, then apply the remaining identity and
-/// PII transforms and a final canonical secret floor. Swarm evidence includes
-/// live operational data that did not necessarily pass through ingestion.
-fn redact_swarm_scalar_with_engine(engine: &RedactionEngine, input: &str) -> RedactedString {
-    // Parse the original RCH command before redaction can hide unsafe shell
-    // syntax. Both decoded words and ordinary scalars then merge canonical and
-    // swarm matches from their original bytes, retaining the precise markers.
-    let mut redacted = redact_rch_command(engine, input)
-        .unwrap_or_else(|| redact_swarm_original_scalar(engine, input));
+fn apply_swarm_secret_floor(mut redacted: RedactedString) -> RedactedString {
     let floored = crate::indexer::redact_secrets::redact_text(&redacted.output).into_owned();
     if floored != redacted.output {
         redacted.output = floored;
@@ -573,6 +565,55 @@ fn redact_swarm_scalar_with_engine(engine: &RedactionEngine, input: &str) -> Red
         });
     }
     redacted
+}
+
+/// Plain-text callback for the shared JSON walker. Do not restart JSON parsing
+/// here: malformed quoted prose reaches this callback unchanged, and restarting
+/// the walker would recurse without consuming input or its encoded-depth budget.
+fn redact_swarm_plain_scalar_with_engine(engine: &RedactionEngine, input: &str) -> RedactedString {
+    apply_swarm_secret_floor(
+        redact_rch_command(engine, input)
+            .unwrap_or_else(|| redact_swarm_original_scalar(engine, input)),
+    )
+}
+
+fn redact_swarm_structured_scalar(engine: &RedactionEngine, input: &str) -> RedactedString {
+    let mut original = None;
+    let output = crate::indexer::redact_secrets::redact_content_with_text_redactor(
+        input,
+        &mut |text| {
+            let redacted = redact_swarm_plain_scalar_with_engine(engine, text);
+            if original.is_none() {
+                original = Some((redacted.output.clone(), redacted.changes));
+            }
+            redacted.output
+        },
+    );
+    // Reconciliation may inspect the same credential more than once. Preserve
+    // the original policy's counts only when that exact output is selected;
+    // otherwise record one structural transformation of the containing field.
+    let mut changes = match original {
+        Some((original_output, changes)) if output == original_output => changes,
+        _ => Vec::new(),
+    };
+    if output != input && changes.is_empty() {
+        changes.push(RedactionChange {
+            kind: RedactionKind::CustomPattern,
+        });
+    }
+    apply_swarm_secret_floor(RedactedString { output, changes })
+}
+
+/// Swarm evidence can contain live tool output that never passed ingestion.
+/// Apply the shared structured credential policy to text as well as JSON nodes.
+fn redact_swarm_scalar_with_engine(engine: &RedactionEngine, input: &str) -> RedactedString {
+    // Admit the original command before a JSON rewrite can conceal unsafe shell
+    // syntax. Each decoded word receives structural inspection below, without
+    // treating a partial command split around a JSON span as a new command.
+    match redact_rch_command(engine, input) {
+        Some(redacted) => apply_swarm_secret_floor(redacted),
+        None => redact_swarm_structured_scalar(engine, input),
+    }
 }
 
 // Only recognized RCH cargo invocations supply enough context to distinguish
@@ -665,7 +706,7 @@ fn redact_rch_command(engine: &RedactionEngine, input: &str) -> Option<RedactedS
     let mut output = String::from("rch exec -- env");
     let mut changes = Vec::new();
     for (idx, word) in words.into_iter().enumerate() {
-        let mut redacted = redact_swarm_original_scalar(engine, &word);
+        let mut redacted = redact_swarm_structured_scalar(engine, &word);
         if redacted.output != word
             && redacted
                 .output
@@ -1222,6 +1263,181 @@ mod tests {
     }
 
     #[test]
+    fn swarm_text_and_evidence_fields_redact_json_credentials() {
+        let input = concat!(
+            "Registration response:\n~~~json\n",
+            "{\"registration_token\":\"fixture-opaque-value\",",
+            "\"pin\":1234,\"token_count\":7,\"note\":\"kept café\"}",
+            "\n~~~\nPublic follow-up."
+        );
+        let expected = concat!(
+            "Registration response:\n~~~json\n",
+            "{\"note\":\"kept café\",\"pin\":\"[REDACTED]\",",
+            "\"registration_token\":\"[REDACTED]\",",
+            "\"token_count\":7}",
+            "\n~~~\nPublic follow-up."
+        );
+        assert_eq!(redact_swarm_text(input), expected);
+        assert_eq!(redact_swarm_text(expected), expected);
+
+        let mut redactor = SwarmEvidenceRedactor::new(SwarmEvidenceRedactionConfig {
+            include_mail_body_snippets: true,
+            include_raw_session_content: false,
+        });
+        assert_eq!(redactor.redact_command_argument(input), expected);
+        assert_eq!(redactor.redact_sensitive_path(input), expected);
+        assert_eq!(redactor.redact_evidence_reference(input), expected);
+        assert_eq!(redactor.redact_mail_body_snippet(input), expected);
+        let report = redactor.report();
+        assert!(report.redaction_applied);
+        assert!(report.command_arguments_scrubbed > 0);
+        assert!(report.sensitive_paths_scrubbed > 0);
+        assert!(report.evidence_references_scrubbed > 0);
+        assert!(report.mail_body_snippets_included);
+        assert_eq!(report.mailbox_snippets_omitted, 0);
+
+        let mut hidden = SwarmEvidenceRedactor::strict_default();
+        assert_eq!(hidden.redact_mail_body_snippet(input), SWARM_MAIL_BODY_OMITTED);
+    }
+
+    #[test]
+    fn swarm_structural_only_redaction_reports_changes_and_keeps_clean_text() {
+        let mut redactor = SwarmEvidenceRedactor::strict_default();
+        let clean = "Result: { \"token_count\" : 7, \"ok\": true }\nunchanged";
+        assert_eq!(redactor.redact_evidence_reference(clean), clean);
+        assert!(!redactor.report().redaction_applied);
+
+        let output = redactor.redact_evidence_reference(
+            "Result: {\"registration_token\":\"fixture-small-value\"}",
+        );
+        assert_eq!(output, "Result: {\"registration_token\":\"[REDACTED]\"}");
+        assert!(redactor.report().redaction_applied);
+        assert_eq!(redactor.report().evidence_references_scrubbed, 1);
+
+        for input in [
+            "Response: {\"registration_token\":\"fixture-small-value\",",
+            "Response: {\"registration_token\":\"fixture-small-value\",\"registration_token\":null}",
+        ] {
+            let output = redact_swarm_text(input);
+            assert!(!output.contains("fixture-small-value"));
+            assert!(output.contains("[REDACTED]"));
+        }
+        assert_eq!(
+            redact_swarm_text("\"ordinary quoted prose"),
+            "\"ordinary quoted prose"
+        );
+    }
+
+    #[test]
+    fn swarm_rch_json_arguments_preserve_original_command_admission() {
+        let command = concat!(
+            "rch exec -- env PAYLOAD='{\"registration_token\":\"fixture-short-value\",",
+            "\"token_count\":7}' CARGO_TARGET_DIR=/home/alice/build cargo test"
+        );
+        let output = redact_swarm_text(command);
+        assert_eq!(
+            output,
+            concat!(
+                "rch exec -- env PAYLOAD={\"registration_token\":\"[REDACTED]\",",
+                "\"token_count\":7} CARGO_TARGET_DIR=[REDACTED_PATH] cargo test"
+            )
+        );
+        assert!(!output.contains("fixture-short-value"));
+
+        for unsafe_command in [
+            "rch exec -- env PAYLOAD='{\"registration_token\":\"$(hidden-command)\"}' cargo test",
+            "rch exec -- env PAYLOAD='{\"registration_token\":\"\u{0060}hidden-command\u{0060}\"}' cargo test",
+            "rch exec -- env PAYLOAD='{\"registration_token\":\"fixture-short-value\"}' cargo test; hidden-command",
+        ] {
+            assert_eq!(redact_swarm_text(unsafe_command), "[REDACTED_COMMAND]");
+        }
+    }
+
+    #[test]
+    fn swarm_mixed_json_preserves_original_custom_secret_spans() {
+        let input = concat!(
+            "Result: KEY='private-prefix {\"registration_token\":",
+            "\"fixture-opaque-value\"} private-suffix' public"
+        );
+        let output = redact_swarm_text(input);
+        assert!(
+            output == "[REDACTED]" || output == "Result: [SECRET_ENV_REDACTED] public",
+            "original custom assignment must remain completely hidden"
+        );
+        assert!(!output.contains("fixture-opaque-value"));
+        assert!(!output.contains("private-prefix"));
+        assert!(!output.contains("private-suffix"));
+        assert_eq!(redact_swarm_text(&output), output);
+
+        let ambiguous = concat!(
+            "Result: {\"registration_token\":\"fixture-opaque-value\",",
+            "\"path\":\"/home/alice/private-client\",\"token_count\":7} done"
+        );
+        assert_eq!(redact_swarm_text(ambiguous), "[REDACTED]");
+        assert_eq!(
+            redact_swarm_json_value(&serde_json::json!({"content": ambiguous})),
+            serde_json::json!({"content": "[REDACTED]"})
+        );
+    }
+
+    #[test]
+    fn swarm_structured_redaction_counts_outputs_instead_of_policy_passes() {
+        let input = concat!(
+            "{\"registration_token\":\"fixture-opaque-value\",",
+            "\"path\":\"/home/alice/private-client\"}"
+        );
+        let mut redactor = SwarmEvidenceRedactor::strict_default();
+        let output = redactor.redact_evidence_reference(input);
+        assert_eq!(output, "[REDACTED]");
+        assert_eq!(redactor.report().evidence_references_scrubbed, 1);
+        assert_eq!(redactor.redact_evidence_reference(&output), output);
+        assert_eq!(redactor.report().evidence_references_scrubbed, 1);
+
+        let path_only = "{\"path\":\"/home/alice/private-client\",\"token_count\":7}";
+        let mut redactor = SwarmEvidenceRedactor::strict_default();
+        let output = redactor.redact_sensitive_path(path_only);
+        assert_eq!(
+            output,
+            "{\"path\":\"[REDACTED_PATH]\",\"token_count\":7}"
+        );
+        assert_eq!(redactor.report().sensitive_paths_scrubbed, 1);
+    }
+
+    #[test]
+    fn swarm_encoded_rch_commands_keep_original_refusals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let command = concat!(
+            "rch exec -- env PAYLOAD='{\"registration_token\":",
+            "\"$(hidden-command)\"}' cargo test"
+        );
+        for wrappers in [0, 1, 3] {
+            let mut encoded = command.to_owned();
+            for _ in 0..wrappers {
+                encoded = serde_json::to_string(&encoded)?;
+            }
+            let text_output = redact_swarm_text(&encoded);
+            assert!(!text_output.contains("cargo"));
+            assert!(!text_output.contains("hidden-command"));
+            assert!(text_output.contains("[REDACTED"));
+            assert_eq!(redact_swarm_text(&text_output), text_output);
+
+            let output = redact_swarm_json_value(&serde_json::json!({
+                "command": encoded,
+                "message_index": 7,
+            }));
+            let command_output = output["command"]
+                .as_str()
+                .ok_or("command changed JSON type")?;
+            assert!(!command_output.contains("cargo"));
+            assert!(!command_output.contains("hidden-command"));
+            assert!(command_output.contains("[REDACTED"));
+            assert_eq!(output["message_index"], 7);
+            assert_eq!(redact_swarm_json_value(&output), output);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn swarm_json_preserves_original_field_privacy_and_collisions()
     -> Result<(), Box<dyn std::error::Error>> {
         let input = serde_json::json!({
@@ -1254,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn swarm_json_decodes_original_strings_before_path_redaction()
+    fn swarm_json_preserves_native_fields_and_hides_ambiguous_encoded_content()
     -> Result<(), Box<dyn std::error::Error>> {
         let original = serde_json::json!({
             "password": "tiny",
@@ -1270,20 +1486,22 @@ mod tests {
             "token_count": 7,
             "nullable_password": null,
         });
+        assert_eq!(redact_swarm_json_value(&original), scrubbed);
+
         for wrappers in [0, 1, 3] {
             let mut encoded = original.to_string();
-            let mut expected = scrubbed.to_string();
             for _ in 0..wrappers {
                 encoded = serde_json::to_string(&encoded)?;
-                expected = serde_json::to_string(&expected)?;
             }
             let input = serde_json::json!({
                 "content": encoded,
                 "command_shape": "TOKEN=synthetic-marker-value",
                 "message_index": 7,
             });
+            // The original path policy and decoded credential-field policy
+            // change different bytes. Withhold the ambiguous encoded payload.
             let expected = serde_json::json!({
-                "content": expected,
+                "content": "[REDACTED]",
                 "command_shape": SWARM_SECRET_ENV_ASSIGNMENT_REDACTED,
                 "message_index": 7,
             });
@@ -1291,14 +1509,26 @@ mod tests {
             assert_eq!(output, expected, "encoded wrappers: {wrappers}");
             assert_eq!(redact_swarm_json_value(&output), output);
         }
+
+        let path_only = serde_json::json!({
+            "path": "/home/alice/private-client",
+            "public_note": "kept",
+        });
+        let expected = serde_json::json!({
+            "path": "[REDACTED_PATH]",
+            "public_note": "kept",
+        });
+        assert_eq!(
+            redact_swarm_text(&path_only.to_string()),
+            expected.to_string()
+        );
         Ok(())
     }
 
     #[test]
     fn swarm_json_keeps_duplicate_key_and_encoded_depth_refusals()
     -> Result<(), Box<dyn std::error::Error>> {
-        let duplicate =
-            r#"{"password":"tiny","path":"/home/alice/private-client","path":"public"}"#;
+        let duplicate = r#"{"password":"tiny","note":"first","note":"second"}"#;
         let input = serde_json::json!({
             "content": serde_json::to_string(duplicate)?,
             "public_note": "kept",
@@ -1319,7 +1549,7 @@ mod tests {
         for wrappers in [8, 9] {
             let mut encoded = serde_json::json!({
                 "password": "tiny",
-                "path": "/home/alice/private-client",
+                "public_note": "kept",
             })
             .to_string();
             for _ in 0..wrappers {
