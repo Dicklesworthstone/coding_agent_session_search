@@ -146,7 +146,7 @@ fn selected_hnsw_index_path(data_dir: &Path) -> PathBuf {
 }
 
 fn write_same_doc_ids_different_vectors(source_path: &Path, replacement_path: &Path) {
-    let source = VectorIndex::open(source_path).expect("open selected exact FSVI");
+    let source = VectorIndex::open_read_only(source_path).expect("open selected exact FSVI");
     let mut writer = VectorIndex::create_with_revision(
         replacement_path,
         source.embedder_id(),
@@ -174,7 +174,8 @@ fn write_same_doc_ids_different_vectors(source_path: &Path, replacement_path: &P
     }
     writer.finish().expect("finish replacement exact FSVI");
 
-    let replacement = VectorIndex::open(replacement_path).expect("open replacement exact FSVI");
+    let replacement =
+        VectorIndex::open_read_only(replacement_path).expect("open replacement exact FSVI");
     assert_eq!(replacement.record_count(), source.record_count());
     for index in 0..source.record_count() {
         assert_eq!(
@@ -1227,7 +1228,7 @@ fn certified_fsvi_payload_mutation_is_rejected_without_builder_fallback() {
     tracker.end("build_exact_source", None, phase);
 
     let selected = selected_vector_index_path(&data_dir);
-    let exact = VectorIndex::open(&selected).expect("open certified exact vectors");
+    let exact = VectorIndex::open_read_only(&selected).expect("open certified exact vectors");
     let builder = coding_agent_search::search::vector_index::vector_index_path(
         &data_dir,
         exact.embedder_id(),
@@ -1809,7 +1810,8 @@ fn approximate_stale_same_doc_ids_falls_back_exact_without_mutation() {
     let exact_before = fs::read(&selected_exact).expect("read certified exact FSVI");
     let replacement_exact = home.join("same-doc-ids-different-vectors.fsvi");
     write_same_doc_ids_different_vectors(&selected_exact, &replacement_exact);
-    let replacement = VectorIndex::open(&replacement_exact).expect("open alternate ANN source");
+    let replacement =
+        VectorIndex::open_read_only(&replacement_exact).expect("open alternate ANN source");
     HnswIndex::build_from_vector_index(&replacement, HnswConfig::default())
         .expect("build same-ID different-vector ANN")
         .save(&selected_ann)
@@ -1820,7 +1822,9 @@ fn approximate_stale_same_doc_ids_falls_back_exact_without_mutation() {
             .is_some(),
         "fixture must be a valid native graph for its alternate vectors"
     );
-    let exact = VectorIndex::open(&selected_exact).expect("open certified exact FSVI");
+    // Retain a second query reader throughout the child search. Read-only
+    // fallback must coexist with it, without acquiring a mutation lease.
+    let exact = VectorIndex::open_read_only(&selected_exact).expect("open certified exact FSVI");
     assert!(
         HnswIndex::try_load_native(&selected_ann, &exact)
             .expect("compare ANN to the selected exact source")
@@ -1963,7 +1967,8 @@ fn exercise_invalid_ann_fresh_process_fallback(case: InvalidAnnInstallation) {
 
     let exact_path = selected_vector_index_path(&data_dir);
     let ann_path = selected_hnsw_index_path(&data_dir);
-    let exact = VectorIndex::open(&exact_path).expect("open selected exact FSVI");
+    // The observer intentionally remains live during the fresh-process query.
+    let exact = VectorIndex::open_read_only(&exact_path).expect("open selected exact FSVI");
     assert!(
         HnswIndex::try_load_native(&ann_path, &exact)
             .expect("inspect selected fixture ANN")

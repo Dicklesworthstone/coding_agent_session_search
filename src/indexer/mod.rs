@@ -22625,7 +22625,7 @@ fn validate_semantic_watch_once_artifact(
         );
         index_path = canonical_index_path;
     }
-    let index = FsVectorIndex::open(&index_path).map_err(|err| {
+    let index = FsVectorIndex::open_read_only(&index_path).map_err(|err| {
         anyhow::anyhow!(
             "semantic watch-once cannot open existing vector artifact {}: {err}",
             index_path.display()
@@ -22643,7 +22643,7 @@ fn validate_semantic_watch_once_artifact(
 }
 
 fn inspect_semantic_artifact(index_path: &Path) -> Result<SemanticArtifactInventory> {
-    let index = FsVectorIndex::open(index_path).map_err(|err| {
+    let index = FsVectorIndex::open_read_only(index_path).map_err(|err| {
         anyhow::anyhow!(
             "semantic watch-once cannot inventory vector artifact {}: {err}",
             index_path.display()
@@ -22929,7 +22929,7 @@ fn run_targeted_semantic_watch_once_publish(
 
     let doc_count = match selection.mode {
         TargetedSemanticWatchOnceMode::AlreadyCovered => {
-            let index = FsVectorIndex::open(&selection.index_path).map_err(|err| {
+            let index = FsVectorIndex::open_read_only(&selection.index_path).map_err(|err| {
                 anyhow::anyhow!(
                     "open already-covered semantic watch-once index {}: {err}",
                     selection.index_path.display()
@@ -50709,6 +50709,65 @@ mod tests {
             }
         }
         assert_eq!(fs::read(&index_path)?, b"not a vector index");
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_watch_once_inspection_allows_concurrent_readers() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let indexer = SemanticIndexer::new("hash", Some(temp.path()))?;
+        let index_path = vector_index_path(temp.path(), indexer.embedder_id());
+        fs::create_dir_all(index_path.parent().context("vector parent")?)?;
+        let mut writer = FsVectorIndex::create_with_revision(
+            &index_path,
+            indexer.embedder_id(),
+            crate::indexer::semantic::HASH_VECTOR_SPACE_REVISION,
+            indexer.embedder_dimension(),
+            frankensearch::index::Quantization::F16,
+        )?;
+        let mut vector = vec![0.0_f32; indexer.embedder_dimension()];
+        vector[0] = 1.0;
+        writer.write_record("retained-reader", &vector)?;
+        writer.finish()?;
+        let artifact = ArtifactRecord {
+            tier: SemanticTierKind::Fast,
+            embedder_id: indexer.embedder_id().to_owned(),
+            model_revision: semantic_model_revision_for_embedder_id(indexer.embedder_id()),
+            schema_version: SEMANTIC_SCHEMA_VERSION,
+            chunking_version: CHUNKING_STRATEGY_VERSION,
+            dimension: indexer.embedder_dimension(),
+            doc_count: 1,
+            conversation_count: 1,
+            db_fingerprint: "content-v1:1:1:1".to_owned(),
+            index_path: index_path
+                .strip_prefix(temp.path())?
+                .to_string_lossy()
+                .into_owned(),
+            size_bytes: fs::metadata(&index_path)?.len(),
+            started_at_ms: 1,
+            completed_at_ms: 2,
+            ready: true,
+        };
+        let reader = FsVectorIndex::open_read_only(&index_path)?;
+        let bytes_before = fs::read(&index_path)?;
+        let modified_before = fs::metadata(&index_path)?.modified()?;
+
+        assert!(FsVectorIndex::open_writer(&index_path).is_err());
+        assert_eq!(
+            validate_semantic_watch_once_artifact(
+                temp.path(),
+                &artifact,
+                &indexer,
+                SemanticTierKind::Fast,
+            )?,
+            index_path
+        );
+        let inventory = inspect_semantic_artifact(&index_path)?;
+        assert_eq!(inventory.live_record_count(), 1);
+        assert!(inventory.reusable_main_doc_ids.contains("retained-reader"));
+        assert_eq!(fs::read(&index_path)?, bytes_before);
+        assert_eq!(fs::metadata(&index_path)?.modified()?, modified_before);
+        assert_eq!(reader.doc_id_at(0)?, "retained-reader");
         Ok(())
     }
 

@@ -1652,8 +1652,9 @@ pub fn needs_index_rebuild(data_dir: &Path) -> bool {
         return false;
     }
 
-    // Try to load the index and check its embedder ID
-    match VectorIndex::open(&index_path) {
+    // This is a header probe, so it must coexist with active semantic readers.
+    // A writer lock here would mistake a healthy, in-use index for corruption.
+    match VectorIndex::open_read_only(&index_path) {
         Ok(index) => {
             validate_vector_index_contract(&index, FastEmbedder::embedder_id_static(), 384).is_err()
         }
@@ -1919,6 +1920,32 @@ mod tests {
     fn test_needs_index_rebuild_no_index() {
         let tmp = tempdir().unwrap();
         assert!(!needs_index_rebuild(tmp.path()));
+    }
+
+    #[test]
+    fn needs_index_rebuild_allows_concurrent_readers_without_mutation() -> anyhow::Result<()> {
+        let tmp = tempdir()?;
+        let index_path = vector_index_path(tmp.path(), FastEmbedder::embedder_id_static());
+        std::fs::create_dir_all(index_path.parent().expect("vector index parent"))?;
+        VectorIndex::create_with_revision(
+            &index_path,
+            FastEmbedder::embedder_id_static(),
+            expected_vector_space_revision(FastEmbedder::embedder_id_static())
+                .ok_or_else(|| anyhow::anyhow!("MiniLM vector-space revision is not registered"))?,
+            384,
+            frankensearch::index::Quantization::F16,
+        )?
+        .finish()?;
+        let reader = VectorIndex::open_read_only(&index_path)?;
+        let bytes_before = std::fs::read(&index_path)?;
+        let modified_before = std::fs::metadata(&index_path)?.modified()?;
+
+        assert!(VectorIndex::open_writer(&index_path).is_err());
+        assert!(!needs_index_rebuild(tmp.path()));
+        assert_eq!(std::fs::read(&index_path)?, bytes_before);
+        assert_eq!(std::fs::metadata(&index_path)?.modified()?, modified_before);
+        assert_eq!(reader.embedder_id(), FastEmbedder::embedder_id_static());
+        Ok(())
     }
 
     #[test]
