@@ -15515,6 +15515,24 @@ fn source_file_observation(path: &Path) -> Option<serde_json::Value> {
     crate::connectors::source_dependencies::observation::file_observation(path)
 }
 
+/// Bind every source-ledger producer to the same live parsing policy. A Pi-family
+/// override can change ownership or profile metadata without changing the file.
+/// Keep that context in the observation, not the key: returning to a prior
+/// profile must replace the latest parse. Unencodable context disables both
+/// receipt reuse and publication while leaving source parsing available.
+fn source_ledger_producer_contract(connector_name: &str) -> Result<(String, bool)> {
+    let producer_contract =
+        WorkspaceExclusions::from_env()?.bind_contract(env!("CASS_SOURCE_INGEST_CONTRACT"));
+    Ok(if matches!(connector_name, "pi_agent" | "omp") {
+        match crate::connectors::omp::PiFamilyOwnership::live().scan_reuse_context() {
+            Some(context) => (format!("{producer_contract}:pi-family:{context}"), true),
+            None => (producer_contract, false),
+        }
+    } else {
+        (producer_contract, true)
+    })
+}
+
 fn source_ledger_matches_with_contract(
     observation: &str,
     source: &DiscoveredSourceFile,
@@ -15597,20 +15615,8 @@ fn scan_with_durable_source_boundaries(
     sender: &mut StreamingBatchSender<'_>,
     mut prepare: impl FnMut(NormalizedConversation) -> Result<Option<NormalizedConversation>>,
 ) -> Result<()> {
-    let producer_contract =
-        WorkspaceExclusions::from_env()?.bind_contract(env!("CASS_SOURCE_INGEST_CONTRACT"));
-    // A live Pi-family override can change ownership or profile metadata
-    // without changing the transcript. Keep that context in the observation,
-    // not the key: returning to a prior profile must replace the latest parse.
     let (producer_contract, source_reuse_enabled) =
-        if matches!(sender.connector_name, "pi_agent" | "omp") {
-            match crate::connectors::omp::PiFamilyOwnership::live().scan_reuse_context() {
-                Some(context) => (format!("{producer_contract}:pi-family:{context}"), true),
-                None => (producer_contract, false),
-            }
-        } else {
-            (producer_contract, true)
-        };
+        source_ledger_producer_contract(sender.connector_name)?;
     if !connector.supports_source_boundaries() {
         return connector.scan_with_callback(ctx, &mut |conversation| {
             if let Some(conversation) = prepare(conversation)? {
@@ -38699,7 +38705,9 @@ mod mirror_scan_skip_tests {
                 since_ts: None,
                 local_since_ts_by_connector: Arc::new(HashMap::new()),
                 progress: None,
-                active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
+                active_source_filter: Arc::new(
+                    ActiveSessionSourceFilter::with_recent_write_window_for_test(None),
+                ),
             };
             let ctx = crate::connectors::ScanContext::with_roots(
                 data_dir.to_path_buf(),
@@ -38755,8 +38763,8 @@ mod mirror_scan_skip_tests {
             let tmp = TempDir::new()?;
             let sessions = tmp.path().join(".pi/agent/sessions");
             fs::create_dir_all(&sessions)?;
-            let healthy = sessions.join("healthy.jsonl");
-            let empty = sessions.join("header-only.jsonl");
+            let healthy = sessions.join("2024-01-01T00-00-00_healthy.jsonl");
+            let empty = sessions.join("2024-01-01T00-00-00_header-only.jsonl");
             fs::write(&healthy, format!("{HEADER}{MESSAGE}"))?;
             fs::write(&empty, HEADER)?;
             let root = if remote {

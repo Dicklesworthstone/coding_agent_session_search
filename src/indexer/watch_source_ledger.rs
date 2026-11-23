@@ -66,8 +66,8 @@ impl WatchSourceLedger {
         }
         let mut ctx = ctx.clone();
         ctx.since_ts = None;
-        let producer_contract =
-            WorkspaceExclusions::from_env()?.bind_contract(env!("CASS_SOURCE_INGEST_CONTRACT"));
+        let (producer_contract, source_reuse_enabled) =
+            source_ledger_producer_contract(connector_name)?;
         // As in startup, a self-contained provider needs no second inventory
         // merely to prove that it has no sidecars. Unknown policies fail closed.
         let dependencies = if !crate::connectors::source_dependencies::source_dependency_policy(
@@ -125,7 +125,8 @@ impl WatchSourceLedger {
             );
             let key = source_ledger_key(source, &ctx);
             let saved_observation = key.as_ref().and_then(|key| saved.get(key));
-            let reusable = allow_reuse
+            let reusable = source_reuse_enabled
+                && allow_reuse
                 && env!("CASS_SOURCE_INGEST_REUSE") == "true"
                 && !filtered.get()
                 && saved_observation.is_some_and(|observation| {
@@ -180,7 +181,7 @@ impl WatchSourceLedger {
             if let Some(progress) = progress {
                 progress.check_stop()?;
             }
-            if filtered.get() || completion.conversations_emitted == 0 {
+            if !source_reuse_enabled || filtered.get() || completion.conversations_emitted == 0 {
                 return Ok(());
             }
             let Some(key) = source_ledger_key(&completion.source, &ctx) else {
