@@ -46,6 +46,97 @@ fn codex_prefix_fixture(temp: &TempDir) -> Result<(PathBuf, ScanContext, Streami
 #[cfg(unix)]
 #[test]
 #[serial_test::serial]
+fn claude_prefix_startup_retains_partial_identity_and_replays_only_proven_history() -> Result<()> {
+    let temp = TempDir::new()?;
+    let path = temp.path().join("claude-ledger-prefix.jsonl");
+    let first = b"{\"type\":\"user\",\"uuid\":\"first\",\"message\":{\"role\":\"user\",\"content\":\"first stable turn\"}}\n";
+    fs::write(&path, first)?;
+    let mut writer = OpenOptions::new().append(true).open(&path)?;
+    let data = temp.path().join("data");
+    fs::create_dir(&data)?;
+    let ctx = ScanContext::with_roots(data.clone(), vec![ScanRoot::local(path.clone())], None);
+    let mut config = diagnostic_ledger_config(data);
+    let connector = crate::connectors::claude_code::ClaudeCodeConnector::new();
+    let (initial, mut entries) = collect_ledger_scan(&connector, &ctx, &config, "claude")?;
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].messages.len(), 1);
+    let entry = entries.pop().context("Claude startup receipt missing")?;
+    let saved: serde_json::Value = serde_json::from_str(&entry.observation)?;
+    assert!(saved.get("codex_prefix").is_none());
+    assert_eq!(saved["claude_prefix"]["provider"], "claude_code");
+    assert_eq!(saved["claude_prefix"]["partial"], true);
+    assert!(!source_ledger_matches(
+        &entry.observation,
+        &discovered(&path, "claude_code")
+    ));
+    assert!(
+        config
+            .active_source_filter
+            .take_deferred_sources()
+            .contains(&path)
+    );
+    config.source_ledger = Arc::new(HashMap::from([(entry.key, entry.observation)]));
+    writer.write_all(b"{\"type\":\"assistant\",\"uuid\":\"second\",\"message\":{\"role\":\"assistant\",\"content\":\"second stable turn\"}}\n")?;
+    let (next, entries) = collect_ledger_scan(&connector, &ctx, &config, "claude")?;
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].messages.len(), 2);
+    assert_eq!(next[0].external_id, initial[0].external_id);
+    assert_eq!(next[0].source_path, path);
+    assert_eq!(next[0].messages[0].content, initial[0].messages[0].content);
+    assert_eq!(entries.len(), 1);
+    let (replayed, _) = collect_ledger_scan(&connector, &ctx, &config, "claude")?;
+    assert_eq!(replayed[0].external_id, next[0].external_id);
+    fs::write(
+        &path,
+        fs::read_to_string(&path)?.replace("first stable", "other stable"),
+    )?;
+    assert!(collect_ledger_scan(&connector, &ctx, &config, "claude").is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn claude_prefix_startup_discards_source_changed_in_delivery_callback() -> Result<()> {
+    let temp = TempDir::new()?;
+    let path = temp.path().join("claude-queued-prefix.jsonl");
+    fs::write(
+        &path,
+        b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"first turn\"}}\n",
+    )?;
+    let data = temp.path().join("data");
+    fs::create_dir(&data)?;
+    let ctx = ScanContext::with_roots(data.clone(), vec![ScanRoot::local(path.clone())], None);
+    let config = diagnostic_ledger_config(data);
+    let (tx, rx) = bounded(8);
+    let mut sender =
+        StreamingBatchSender::new(&tx, Arc::clone(&config.flow_limiter), "claude", true);
+    let result = scan_with_durable_source_boundaries(
+        &crate::connectors::claude_code::ClaudeCodeConnector::new(),
+        &ctx,
+        &config,
+        &mut sender,
+        |conversation| {
+            fs::write(&path, fs::read_to_string(&path)?.replace("first", "other"))?;
+            Ok(Some(conversation))
+        },
+    );
+    assert!(result.is_err());
+    sender.flush()?;
+    assert!(rx.try_iter().next().is_none());
+    assert!(sender.partial_sources_observed);
+    assert!(
+        config
+            .active_source_filter
+            .take_deferred_sources()
+            .contains(&path)
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
 fn codex_prefix_startup_keeps_partial_receipts_and_rediscovers_appends() -> Result<()> {
     let temp = TempDir::new()?;
     let (path, ctx, mut config) = codex_prefix_fixture(&temp)?;
@@ -1924,18 +2015,50 @@ fn canonical_refusal_packet(
     NormalizedConversation,
     crate::storage::sqlite::SourceIngestLedgerEntry,
 )> {
+    canonical_refusal_packet_for_provider(
+        root,
+        config,
+        name,
+        messages,
+        remote,
+        crate::connectors::codex::StablePrefixProvider::Codex,
+    )
+}
+
+#[cfg(unix)]
+fn canonical_refusal_packet_for_provider(
+    root: &Path,
+    config: &StreamingProducerConfig,
+    name: &str,
+    messages: usize,
+    remote: bool,
+    provider: crate::connectors::codex::StablePrefixProvider,
+) -> Result<(
+    NormalizedConversation,
+    crate::storage::sqlite::SourceIngestLedgerEntry,
+)> {
+    use crate::connectors::codex::StablePrefixProvider;
+
     let source = root.join(format!("rollout-{name}.jsonl"));
     let mut bytes = String::new();
     for idx in 0..messages {
-        bytes.push_str(&serde_json::json!({
-            "type": "response_item",
-            "timestamp": format!("2026-11-23T12:00:{idx:02}Z"),
-            "payload": {
-                "type": "message",
-                "role": "user",
-                "content": format!("canonical isolation fixture {name} message {idx}")
-            }
-        }).to_string());
+        let timestamp = format!("2026-11-23T12:00:{idx:02}Z");
+        let content = format!("canonical isolation fixture {name} message {idx}");
+        let record = match provider {
+            StablePrefixProvider::Codex => serde_json::json!({
+                "type": "response_item",
+                "timestamp": timestamp,
+                "payload": {"type": "message", "role": "user", "content": content}
+            }),
+            StablePrefixProvider::ClaudeCode => serde_json::json!({
+                "type": "user",
+                "timestamp": timestamp,
+                "sessionId": name,
+                "uuid": format!("{name}-{idx}"),
+                "message": {"role": "user", "content": content}
+            }),
+        };
+        bytes.push_str(&record.to_string());
         bytes.push('\n');
     }
     fs::write(&source, bytes)?;
@@ -1946,18 +2069,25 @@ fn canonical_refusal_packet(
         ScanRoot::local(source)
     };
     let ctx = ScanContext::with_roots(config.data_dir.clone(), vec![scan_root], None);
-    let (mut packets, mut entries) = collect_ledger_scan(
-        &crate::connectors::codex::CodexConnector::new(),
-        &ctx,
-        config,
-        "codex",
-    )?;
+    let (connector, connector_name): (Box<dyn Connector>, &'static str) = match provider {
+        StablePrefixProvider::Codex => (
+            Box::new(crate::connectors::codex::CodexConnector::new()),
+            "codex",
+        ),
+        StablePrefixProvider::ClaudeCode => (
+            Box::new(crate::connectors::claude_code::ClaudeCodeConnector::new()),
+            "claude",
+        ),
+    };
+    let (mut packets, mut entries) =
+        collect_ledger_scan(connector.as_ref(), &ctx, config, connector_name)?;
     assert_eq!(packets.len(), 1);
     assert_eq!(entries.len(), 1);
     let packet = packets.remove(0);
     let entry = entries.remove(0);
     let observation: serde_json::Value = serde_json::from_str(&entry.observation)?;
-    assert_eq!(observation["codex_prefix"]["partial"], false);
+    assert_eq!(packet.agent_slug, provider.slug());
+    assert_eq!(observation[provider.observation_key()]["partial"], false);
     Ok((packet, entry))
 }
 
@@ -1968,9 +2098,14 @@ fn send_canonical_refusal_packet(
     packet: NormalizedConversation,
     completion: crate::storage::sqlite::SourceIngestLedgerEntry,
 ) -> Result<()> {
+    let connector_name = match packet.agent_slug.as_str() {
+        "codex" => "codex",
+        "claude_code" => "claude",
+        _ => anyhow::bail!("canonical refusal fixture has an unsupported parser"),
+    };
     let byte_reservation = limiter.acquire(1024)?;
     tx.send(IndexMessage::SourceComplete {
-        connector_name: "codex",
+        connector_name,
         conversations: vec![packet],
         completion,
         byte_reservation,
@@ -2006,6 +2141,28 @@ fn assert_canonical_refusal_repair_pending(data_dir: &Path) -> Result<()> {
 #[test]
 #[serial_test::serial]
 fn codex_canonical_refusal_startup_preserves_healthy_sibling_receipts() -> Result<()> {
+    canonical_refusal_startup_preserves_healthy_sibling_receipts(
+        crate::connectors::codex::StablePrefixProvider::Codex,
+    )
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn claude_canonical_refusal_startup_preserves_healthy_sibling_receipts() -> Result<()> {
+    canonical_refusal_startup_preserves_healthy_sibling_receipts(
+        crate::connectors::codex::StablePrefixProvider::ClaudeCode,
+    )
+}
+
+#[cfg(unix)]
+fn canonical_refusal_startup_preserves_healthy_sibling_receipts(
+    provider: crate::connectors::codex::StablePrefixProvider,
+) -> Result<()> {
+    let connector_name = match provider {
+        crate::connectors::codex::StablePrefixProvider::Codex => "codex",
+        crate::connectors::codex::StablePrefixProvider::ClaudeCode => "claude",
+    };
     let _env = CanonicalRefusalTestEnv::new(false);
     for remote in [false, true] {
         for refused_first in [false, true] {
@@ -2016,11 +2173,35 @@ fn codex_canonical_refusal_startup_preserves_healthy_sibling_receipts() -> Resul
             let db_path = data_dir.join("archive.db");
             let storage = FrankenStorage::open(&db_path)?;
             let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir)?)?;
-            let before = canonical_refusal_packet(temp.path(), &config, "a-healthy", 1, remote)?;
-            let refused = canonical_refusal_packet(temp.path(), &config, "b-refused", 1, remote)?;
-            let after = canonical_refusal_packet(temp.path(), &config, "c-healthy", 1, remote)?;
+            let before = canonical_refusal_packet_for_provider(
+                temp.path(),
+                &config,
+                "a-healthy",
+                1,
+                remote,
+                provider,
+            )?;
+            let refused = canonical_refusal_packet_for_provider(
+                temp.path(),
+                &config,
+                "b-refused",
+                1,
+                remote,
+                provider,
+            )?;
+            let after = canonical_refusal_packet_for_provider(
+                temp.path(),
+                &config,
+                "c-healthy",
+                1,
+                remote,
+                provider,
+            )?;
             let mut legacy = refused.0.clone();
-            legacy.metadata["cass"].as_object_mut().unwrap().remove("codex_stable_prefix");
+            legacy.metadata["cass"]
+                .as_object_mut()
+                .unwrap()
+                .remove(provider.metadata_key());
             legacy.messages[0].content = "retained divergent canonical history".to_owned();
             persist::persist_conversation(&storage, &mut index, &legacy)?;
             index.commit()?;
@@ -2041,7 +2222,13 @@ fn codex_canonical_refusal_startup_preserves_healthy_sibling_receipts() -> Resul
             for (packet, receipt) in packets {
                 send_canonical_refusal_packet(&tx, &config.flow_limiter, packet, receipt)?;
             }
-            send_canonical_refusal_done(&tx)?;
+            tx.send(IndexMessage::Done {
+                connector_name,
+                scan_ms: 1,
+                is_discovered: true,
+                scan_succeeded: true,
+                active_source_skipped: false,
+            })?;
             drop(tx);
             let progress = Arc::new(IndexingProgress::default());
             let (_, outcome) = run_streaming_consumer(
@@ -2064,19 +2251,30 @@ fn codex_canonical_refusal_startup_preserves_healthy_sibling_receipts() -> Resul
             assert!(outcome.incomplete_remote_sources);
             assert_eq!(outcome.deferred_sources, BTreeSet::from([refused_path]));
             assert!(outcome.scanned_connectors.is_empty());
-            assert_eq!(storage.get_connector_last_scan_ts("codex")?, None);
+            assert_eq!(storage.get_connector_last_scan_ts(connector_name)?, None);
             let saved = storage.source_ingest_ledger_entries()?;
             assert_eq!(saved.get(&refused_key), Some(&refused_proof));
             for (key, observation) in healthy_receipts {
                 assert_eq!(saved.get(&key), Some(&observation));
             }
             let stats = progress.stats.lock().unwrap();
-            assert_eq!(stats.deferred_active_sources, 0, "canonical refusal is not an active writer");
-            assert!(stats.connectors.iter().any(|connector| connector.error.as_deref()
-                .is_some_and(|error| error.contains("canonical source deferred"))));
+            assert_eq!(
+                stats.deferred_active_sources, 0,
+                "canonical refusal is not an active writer"
+            );
+            assert!(stats.connectors.iter().any(|connector| {
+                connector
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("canonical source deferred"))
+            }));
             drop(stats);
             assert_canonical_refusal_repair_pending(&data_dir)?;
-            assert_eq!(index.doc_count()?, 1, "no abandoned staged documents may publish");
+            assert_eq!(
+                index.doc_count()?,
+                1,
+                "no abandoned staged documents may publish"
+            );
 
             // Mirror run_index's existing finalization boundary: drop the owner,
             // then rebuild from actual canonical rows rather than lost counts.
@@ -2231,6 +2429,7 @@ fn codex_canonical_refusal_classification_is_typed_and_source_exclusive() -> Res
     )?;
     let packet = &packets[0];
     let refusal = || anyhow::Error::new(CodexCanonicalRefusal {
+        provider: crate::connectors::codex::StablePrefixProvider::Codex,
         source_path: packet.source_path.clone(),
         external_id: packet.external_id.clone(),
         conversation_id: 42,

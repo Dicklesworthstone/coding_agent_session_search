@@ -9210,7 +9210,7 @@ fn collect_new_messages_for_existing_conversation<'a>(
         }
 
         let incoming_replay = replay_fingerprint_from_merge(&incoming_fingerprint);
-        if !codex_prefix_packet(conv) && existing_replay_fingerprints.contains(&incoming_replay) {
+        if !source_prefix_packet(conv) && existing_replay_fingerprints.contains(&incoming_replay) {
             tracing::debug!(
                 conversation_id,
                 idx = msg.idx,
@@ -15796,7 +15796,7 @@ impl FrankenStorage {
                     idx_collision_count,
                     first_collision_idx,
                 } = if let Some(plan) =
-                    franken_validate_codex_prefix_overlap(&tx, existing_id, conv)?
+                    franken_validate_source_prefix_overlap(&tx, existing_id, conv)?
                 {
                     plan
                 } else {
@@ -15937,7 +15937,7 @@ impl FrankenStorage {
             }
             let incoming_replay = message_replay_fingerprint(msg);
             if conv.agent_slug != "grok_bot"
-                && !codex_prefix_packet(conv)
+                && !source_prefix_packet(conv)
                 && pending_replay_fingerprints.contains(&incoming_replay)
             {
                 tracing::debug!(
@@ -16093,7 +16093,7 @@ impl FrankenStorage {
 
             let incoming_replay = message_replay_fingerprint(msg);
             if conv.agent_slug != "grok_bot"
-                && !codex_prefix_packet(conv)
+                && !source_prefix_packet(conv)
                 && pending_replay_fingerprints.contains(&incoming_replay)
             {
                 tracing::debug!(
@@ -16242,7 +16242,7 @@ impl FrankenStorage {
         })?;
         let existing_id = existing.id;
 
-        let prefix_plan = franken_validate_codex_prefix_overlap(&tx, existing_id, conv)?;
+        let prefix_plan = franken_validate_source_prefix_overlap(&tx, existing_id, conv)?;
 
         let existing_idx_lookup_start = Instant::now();
         let append_tail_state = existing.tail_state;
@@ -16440,7 +16440,7 @@ impl FrankenStorage {
         defer_lexical_updates: bool,
         defer_analytics_updates: bool,
     ) -> Result<InsertOutcome> {
-        let prefix_plan = franken_validate_codex_prefix_overlap(tx, conversation_id, conv)?;
+        let prefix_plan = franken_validate_source_prefix_overlap(tx, conversation_id, conv)?;
         let append_tail_ended_at = append_tail_state.and_then(|state| state.ended_at);
         let append_plan = append_tail_state.as_ref().and_then(|state| {
             collect_append_only_tail_messages(
@@ -19309,7 +19309,7 @@ impl FrankenStorage {
                             let incoming_replay = message_replay_fingerprint(msg);
                             if pending_messages.contains_key(&msg.idx)
                                 || (!native_messages_are_reconciled(conv)
-                                    && !codex_prefix_packet(conv)
+                                    && !source_prefix_packet(conv)
                                     && pending_replay_fingerprints.contains(&incoming_replay))
                             {
                                 continue;
@@ -20891,14 +20891,17 @@ fn franken_insert_conversation(
     workspace_id: Option<i64>,
     conv: &Conversation,
 ) -> Result<Option<i64>> {
-    let prefix_packet = codex_prefix_packet(conv);
+    let prefix = source_prefix_receipt(conv)?;
     let mut metadata = Cow::Borrowed(&conv.metadata_json);
-    if prefix_packet {
-        set_codex_prefix_requirement(metadata.to_mut())?;
+    if let Some(prefix) = &prefix {
+        set_source_prefix_requirement(metadata.to_mut(), prefix.provider)?;
     }
     let (metadata_json_str, metadata_bin) = franken_metadata_insert_payload(metadata.as_ref())?;
-    if prefix_packet {
-        ensure_codex_prefix_metadata_budget(metadata_json_str.as_deref(), metadata_bin.as_deref())?;
+    if prefix.is_some() {
+        ensure_source_prefix_metadata_budget(
+            metadata_json_str.as_deref(),
+            metadata_bin.as_deref(),
+        )?;
     }
     let (last_message_idx, last_message_created_at) = conversation_tail_state(conv);
     let metadata_bin_bytes = metadata_bin.as_deref();
@@ -21129,7 +21132,7 @@ fn franken_append_insert_new_messages<'a>(
 ) -> Result<Vec<(i64, &'a Message)>> {
     let mut inserted = Vec::with_capacity(messages.len());
     for msg in messages {
-        if native_messages_are_reconciled(conv) || codex_prefix_packet(conv) {
+        if native_messages_are_reconciled(conv) || source_prefix_packet(conv) {
             // Native-ID reconciliation proved this index new in this
             // transaction. A conflicting writer must abort/retry the packet,
             // never silently discard its new native entry via OR IGNORE.
@@ -21581,13 +21584,14 @@ fn franken_existing_message_lookup_with_pending(
     Ok(lookup)
 }
 
-/// An expected disagreement between one Codex source and retained canonical
+/// An expected disagreement between one source and retained canonical
 /// history. Only this typed domain refusal may be isolated by a source-scoped
 /// caller; malformed metadata, database failures and cleanup failures remain
 /// terminal. The identity never contains transcript payloads.
 #[derive(Debug, Error)]
 #[error("{reason}")]
 pub(crate) struct CodexCanonicalRefusal {
+    pub(crate) provider: crate::connectors::codex::StablePrefixProvider,
     pub(crate) source_path: PathBuf,
     pub(crate) external_id: Option<String>,
     pub(crate) conversation_id: i64,
@@ -21596,21 +21600,23 @@ pub(crate) struct CodexCanonicalRefusal {
 
 #[derive(Debug, Error)]
 pub(crate) enum CodexCanonicalRefusalReason {
-    #[error("Codex canonical history requires prefix admission; parser-mode reconciliation is required")]
+    #[error("source canonical history requires prefix admission; parser-mode reconciliation is required")]
     PrefixRequired,
-    #[error("Codex prefix is shorter than canonical history; reconciliation is required")]
+    #[error("source prefix is shorter than canonical history; reconciliation is required")]
     HistoryBeyondPrefix,
-    #[error("Codex prefix differs from canonical message idx {0}; reconciliation is required")]
+    #[error("source prefix differs from canonical message idx {0}; reconciliation is required")]
     ProjectionMismatch(i64),
 }
 
 impl CodexCanonicalRefusal {
     fn new(
+        provider: crate::connectors::codex::StablePrefixProvider,
         conv: &Conversation,
         conversation_id: i64,
         reason: CodexCanonicalRefusalReason,
     ) -> Self {
         Self {
+            provider,
             source_path: conv.source_path.clone(),
             external_id: conv.external_id.clone(),
             conversation_id,
@@ -21619,22 +21625,59 @@ impl CodexCanonicalRefusal {
     }
 }
 
-fn codex_prefix_packet(conv: &Conversation) -> bool {
-    conv.agent_slug == "codex"
-        && conv
-            .metadata_json
-            .pointer("/cass/codex_stable_prefix")
-            .is_some()
+fn source_prefix_packet(conv: &Conversation) -> bool {
+    conv.metadata_json.pointer("/cass").is_some_and(|cass| {
+        cass.get("codex_stable_prefix").is_some() || cass.get("claude_stable_prefix").is_some()
+    })
 }
 
-const MAX_CODEX_PREFIX_METADATA_BYTES: usize = 256 * 1024;
+fn source_prefix_receipt(
+    conv: &Conversation,
+) -> Result<Option<crate::connectors::codex::StablePrefixReceipt>> {
+    if !source_prefix_packet(conv) {
+        return Ok(None);
+    }
+    let metadata_context = match conv.agent_slug.as_str() {
+        "codex" => "invalid Codex prefix metadata at canonical admission",
+        "claude_code" => "invalid Claude prefix metadata at canonical admission",
+        _ => "invalid source prefix metadata at canonical admission",
+    };
+    let receipt = crate::connectors::codex::metadata_receipt(&conv.metadata_json)
+        .context(metadata_context)?
+        .context("missing source prefix metadata at canonical admission")?;
+    let projection_len = i64::try_from(receipt.message_count)
+        .context("source prefix message count exceeds canonical index range")?;
+    anyhow::ensure!(
+        conv.agent_slug == receipt.provider.slug()
+            && conv.source_path == receipt.source_path
+            && receipt.schema_version == 1
+            && receipt.committed_bytes > 0
+            && receipt.committed_bytes <= receipt.admitted_bytes
+            && projection_len > 0
+            && conv.messages.len() <= receipt.message_count,
+        "invalid source prefix provider, path or projection at canonical admission"
+    );
+    let mut previous_idx = None;
+    for message in &conv.messages {
+        anyhow::ensure!(
+            message.idx >= 0
+                && message.idx < projection_len
+                && previous_idx.is_none_or(|previous| message.idx > previous),
+            "source prefix slice has invalid or repeated message indices"
+        );
+        previous_idx = Some(message.idx);
+    }
+    Ok(Some(receipt))
+}
 
-fn ensure_codex_prefix_metadata_budget(json: Option<&str>, binary: Option<&[u8]>) -> Result<()> {
+const MAX_SOURCE_PREFIX_METADATA_BYTES: usize = 256 * 1024;
+
+fn ensure_source_prefix_metadata_budget(json: Option<&str>, binary: Option<&[u8]>) -> Result<()> {
     anyhow::ensure!(
         json.map_or(0, str::len)
             .saturating_add(binary.map_or(0, <[u8]>::len))
-            <= MAX_CODEX_PREFIX_METADATA_BYTES,
-        "Codex canonical integrity metadata exceeds its byte budget; reconciliation is required"
+            <= MAX_SOURCE_PREFIX_METADATA_BYTES,
+        "source canonical integrity metadata exceeds its byte budget; reconciliation is required"
     );
     Ok(())
 }
@@ -21642,31 +21685,37 @@ fn ensure_codex_prefix_metadata_budget(json: Option<&str>, binary: Option<&[u8]>
 /// A canonical protocol requirement, not a source or publication receipt. It
 /// survives a later parser mode or source-ledger-key change, including a
 /// regular source becoming an explicitly selected symlink or compressed file.
-fn set_codex_prefix_requirement(metadata: &mut serde_json::Value) -> Result<bool> {
+fn set_source_prefix_requirement(
+    metadata: &mut serde_json::Value,
+    provider: crate::connectors::codex::StablePrefixProvider,
+) -> Result<bool> {
     if metadata.is_null() {
         *metadata = serde_json::json!({});
     }
     let object = metadata.as_object_mut().context(
-        "cannot preserve non-object Codex metadata while requiring prefix admission",
+        "cannot preserve non-object source metadata while requiring prefix admission",
     )?;
     let cass = object.entry("cass").or_insert_with(|| serde_json::json!({}));
     if cass.is_null() {
         *cass = serde_json::json!({});
     }
     let cass = cass.as_object_mut().context(
-        "cannot preserve non-object CASS metadata while requiring Codex prefix admission",
+        "cannot preserve non-object CASS metadata while requiring source prefix admission",
     )?;
-    if cass.get("codex_prefix_required") == Some(&serde_json::Value::Bool(true)) {
+    if cass.get(provider.requirement_key()) == Some(&serde_json::Value::Bool(true)) {
         return Ok(false);
     }
-    cass.insert("codex_prefix_required".to_owned(), serde_json::Value::Bool(true));
+    cass.insert(
+        provider.requirement_key().to_owned(),
+        serde_json::Value::Bool(true),
+    );
     Ok(true)
 }
 
 /// Bound both stored representations before returning either from SQLite.
 /// Unlike display-oriented compatibility readers, corruption must not become
 /// empty metadata and thereby erase an existing integrity requirement.
-fn franken_codex_integrity_metadata(
+fn franken_source_integrity_metadata(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
 ) -> Result<serde_json::Value> {
@@ -21680,17 +21729,17 @@ fn franken_codex_integrity_metadata(
                                COALESCE(length(CAST(metadata_bin AS BLOB)), 0) <= ?2 \
                      THEN metadata_bin ELSE NULL END \
          FROM conversations WHERE id = ?1",
-        fparams![conversation_id, MAX_CODEX_PREFIX_METADATA_BYTES as i64],
+        fparams![conversation_id, MAX_SOURCE_PREFIX_METADATA_BYTES as i64],
         |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
     )?;
     anyhow::ensure!(
-        (0..=MAX_CODEX_PREFIX_METADATA_BYTES as i64).contains(&encoded_bytes),
-        "Codex canonical integrity metadata exceeds its byte budget; reconciliation is required"
+        (0..=MAX_SOURCE_PREFIX_METADATA_BYTES as i64).contains(&encoded_bytes),
+        "source canonical integrity metadata exceeds its byte budget; reconciliation is required"
     );
     if let Some(bytes) = binary.as_deref().filter(|bytes| !bytes.is_empty()) {
-        rmp_serde::from_slice(bytes).context("invalid canonical Codex MessagePack metadata")
+        rmp_serde::from_slice(bytes).context("invalid canonical source MessagePack metadata")
     } else if let Some(json) = json.as_deref() {
-        serde_json::from_str(json).context("invalid canonical Codex JSON metadata")
+        serde_json::from_str(json).context("invalid canonical source JSON metadata")
     } else {
         Ok(serde_json::json!({}))
     }
@@ -21705,20 +21754,37 @@ fn franken_codex_integrity_metadata(
 /// text or compare against the unredacted parser digest here. Each indexed
 /// equality query returns at most one integer; stored transcript bodies are
 /// never materialized into a second, unbounded in-memory collection.
-fn franken_validate_codex_prefix_overlap<'a>(
+fn franken_validate_source_prefix_overlap<'a>(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
     conv: &'a Conversation,
 ) -> Result<Option<ExistingConversationNewMessages<'a>>> {
-    if conv.agent_slug != "codex" {
+    use crate::connectors::codex::StablePrefixProvider;
+    let receipt = source_prefix_receipt(conv)?;
+    let Some(provider) = StablePrefixProvider::from_slug(&conv.agent_slug) else {
         return Ok(None);
-    }
-    let mut canonical_metadata = franken_codex_integrity_metadata(tx, conversation_id)?;
-    if !codex_prefix_packet(conv) {
-        if canonical_metadata.pointer("/cass/codex_prefix_required").is_some()
-            || canonical_metadata.pointer("/cass/codex_stable_prefix").is_some()
-        {
+    };
+    let mut canonical_metadata = franken_source_integrity_metadata(tx, conversation_id)?;
+    let requires_prefix = |candidate: StablePrefixProvider| {
+        canonical_metadata.get("cass").is_some_and(|cass| {
+            cass.get(candidate.requirement_key()).is_some()
+                || cass.get(candidate.metadata_key()).is_some()
+        })
+    };
+    let providers = [
+        StablePrefixProvider::Codex,
+        StablePrefixProvider::ClaudeCode,
+    ];
+    anyhow::ensure!(
+        !providers
+            .iter()
+            .any(|candidate| *candidate != provider && requires_prefix(*candidate)),
+        "canonical source prefix provider differs; reconciliation is required"
+    );
+    let Some(receipt) = receipt else {
+        if requires_prefix(provider) {
             return Err(CodexCanonicalRefusal::new(
+                provider,
                 conv,
                 conversation_id,
                 CodexCanonicalRefusalReason::PrefixRequired,
@@ -21726,24 +21792,9 @@ fn franken_validate_codex_prefix_overlap<'a>(
             .into());
         }
         return Ok(None);
-    }
-    let receipt: crate::connectors::codex::StablePrefixReceipt = serde_json::from_value(
-        conv.metadata_json
-            .pointer("/cass/codex_stable_prefix")
-            .expect("prefix packet has a receipt")
-            .clone(),
-    )
-    .context("invalid Codex prefix metadata at canonical admission")?;
+    };
     let projection_len = i64::try_from(receipt.message_count)
-        .context("Codex prefix message count exceeds canonical index range")?;
-    anyhow::ensure!(
-        receipt.schema_version == 1
-            && receipt.committed_bytes > 0
-            && receipt.committed_bytes <= receipt.admitted_bytes
-            && projection_len > 0
-            && conv.messages.len() <= receipt.message_count,
-        "invalid Codex prefix projection at canonical admission"
-    );
+        .context("source prefix message count exceeds canonical index range")?;
     // A packet may be one bounded slice of a larger admitted projection. Its
     // final idx is not the source boundary; the unchanged receipt carries it.
     for direction in ["ASC", "DESC"] {
@@ -21758,6 +21809,7 @@ fn franken_validate_codex_prefix_overlap<'a>(
             .optional()?;
         if canonical_idx.is_some_and(|idx| idx < 0 || idx >= projection_len) {
             return Err(CodexCanonicalRefusal::new(
+                provider,
                 conv,
                 conversation_id,
                 CodexCanonicalRefusalReason::HistoryBeyondPrefix,
@@ -21765,17 +21817,9 @@ fn franken_validate_codex_prefix_overlap<'a>(
             .into());
         }
     }
-    let mut previous_idx = None;
     let mut messages = Vec::new();
     let mut new_chars = 0_i64;
     for message in &conv.messages {
-        anyhow::ensure!(
-            message.idx >= 0
-                && message.idx < projection_len
-                && previous_idx.is_none_or(|previous| message.idx > previous),
-            "Codex prefix slice has invalid or repeated message indices"
-        );
-        previous_idx = Some(message.idx);
         let matches = tx
             .query_row_map(
                 "SELECT CASE WHEN \
@@ -21797,6 +21841,7 @@ fn franken_validate_codex_prefix_overlap<'a>(
             .optional()?;
         if matches == Some(0) {
             return Err(CodexCanonicalRefusal::new(
+                provider,
                 conv,
                 conversation_id,
                 CodexCanonicalRefusalReason::ProjectionMismatch(message.idx),
@@ -21808,14 +21853,17 @@ fn franken_validate_codex_prefix_overlap<'a>(
             new_chars = new_chars.saturating_add(i64::try_from(message.content.len())?);
         }
     }
-    if set_codex_prefix_requirement(&mut canonical_metadata)? {
+    if set_source_prefix_requirement(&mut canonical_metadata, provider)? {
         let (json, binary) = franken_metadata_insert_payload(&canonical_metadata)?;
-        ensure_codex_prefix_metadata_budget(json.as_deref(), binary.as_deref())?;
+        ensure_source_prefix_metadata_budget(json.as_deref(), binary.as_deref())?;
         let updated = tx.execute_compat(
             "UPDATE conversations SET metadata_json = ?1, metadata_bin = ?2 WHERE id = ?3",
             fparams![json.as_deref(), binary.as_deref(), conversation_id],
         )?;
-        anyhow::ensure!(updated == 1, "canonical Codex metadata disappeared during prefix admission");
+        anyhow::ensure!(
+            updated == 1,
+            "canonical source metadata disappeared during prefix admission"
+        );
     }
     Ok(Some(ExistingConversationNewMessages {
         messages,
@@ -21837,7 +21885,7 @@ fn franken_collect_batched_existing_new_messages<'a>(
     HashMap<i64, MessageMergeFingerprint>,
     HashSet<MessageReplayFingerprint>,
 )> {
-    if let Some(plan) = franken_validate_codex_prefix_overlap(tx, conversation_id, conv)? {
+    if let Some(plan) = franken_validate_source_prefix_overlap(tx, conversation_id, conv)? {
         return Ok((plan, HashMap::new(), HashSet::new()));
     }
     if native_messages_are_reconciled(conv) {

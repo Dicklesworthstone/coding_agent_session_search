@@ -171,8 +171,15 @@ fn reports_bound_samples_and_preserve_budget_only_schema() -> Result<()> {
         let summary = error.to_string();
         assert!(!summary.contains('\n'));
         assert!(!summary.contains("raw-private-body"));
-        let json: serde_json::Value =
-            serde_json::from_str(summary.strip_prefix("Codex scan incomplete: ").unwrap())?;
+        let json: serde_json::Value = serde_json::from_str(
+            summary
+                .strip_prefix(if mixed {
+                    "Session scan incomplete: "
+                } else {
+                    "Codex scan incomplete: "
+                })
+                .unwrap(),
+        )?;
         if mixed {
             assert_eq!(json["failed_source_count"], count);
             assert_eq!(
@@ -231,7 +238,7 @@ fn host_admission_failures_bound_samples_and_preserve_typed_causes() -> Result<(
     assert!(!summary.contains('\n'));
     assert!(!summary.contains("raw-private-body"));
     let json: serde_json::Value = serde_json::from_str(
-        summary.strip_prefix("Codex scan incomplete: ").unwrap(),
+        summary.strip_prefix("Session scan incomplete: ").unwrap(),
     )?;
     assert_eq!(json["reason"], "source_admission_failures");
     assert_eq!(json["failed_source_count"], MAX_REJECTION_SAMPLES + 8);

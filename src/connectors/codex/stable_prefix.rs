@@ -1,4 +1,4 @@
-//! A bounded immutable parser view of an append-oriented Codex rollout.
+//! A bounded immutable parser view of an append-oriented session transcript.
 //!
 //! This is content-verified evidence, not a filesystem transaction. We retain
 //! the original descriptor, check the named object's identity, and rehash the
@@ -21,10 +21,93 @@ mod tail;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const RECEIPT_VERSION: u32 = 1;
 
+/// The parser is part of the admission proof. A newline in an arbitrary file
+/// never authorizes another connector to bypass its active-writer policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StablePrefixProvider {
+    #[default]
+    Codex,
+    ClaudeCode,
+}
+
+impl StablePrefixProvider {
+    pub(crate) fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "codex" => Some(Self::Codex),
+            "claude_code" => Some(Self::ClaudeCode),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn slug(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::ClaudeCode => "claude_code",
+        }
+    }
+
+    pub(crate) const fn observation_key(self) -> &'static str {
+        match self {
+            Self::Codex => "codex_prefix",
+            Self::ClaudeCode => "claude_prefix",
+        }
+    }
+
+    pub(crate) const fn metadata_key(self) -> &'static str {
+        match self {
+            Self::Codex => "codex_stable_prefix",
+            Self::ClaudeCode => "claude_stable_prefix",
+        }
+    }
+
+    pub(crate) const fn requirement_key(self) -> &'static str {
+        match self {
+            Self::Codex => "codex_prefix_required",
+            Self::ClaudeCode => "claude_prefix_required",
+        }
+    }
+
+    fn is_codex(&self) -> bool {
+        *self == Self::Codex
+    }
+
+    fn plain_jsonl(self, path: &Path) -> bool {
+        cfg!(unix)
+            && path.to_str().is_some()
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            && match self {
+                Self::Codex => path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("rollout-")),
+                Self::ClaudeCode => !path.components().any(|component| {
+                    matches!(
+                        component.as_os_str().to_str(),
+                        Some("claude-code-sessions" | "local-agent-mode-sessions")
+                    )
+                }),
+            }
+    }
+
+    fn read_budget(self, path: &Path) -> Result<u64> {
+        match self {
+            Self::Codex => super::source_read_budget(path),
+            Self::ClaudeCode => crate::connectors::claude_code::source_read_budget(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StablePrefixReceipt {
     pub(crate) schema_version: u32,
+    // Legacy Codex receipts remain byte-compatible. Every other parser must
+    // identify itself explicitly; moving its receipt under another key fails.
+    #[serde(default, skip_serializing_if = "StablePrefixProvider::is_codex")]
+    pub(crate) provider: StablePrefixProvider,
     pub(crate) source_path: PathBuf,
     pub(crate) device: u64,
     pub(crate) inode: u64,
@@ -40,6 +123,61 @@ pub(crate) struct StablePrefixReceipt {
     pub(crate) inactive_eof: bool,
 }
 
+fn named_receipt(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: impl Fn(StablePrefixProvider) -> &'static str,
+) -> Result<Option<StablePrefixReceipt>> {
+    let mut found = None;
+    for provider in [
+        StablePrefixProvider::Codex,
+        StablePrefixProvider::ClaudeCode,
+    ] {
+        let Some(value) = object.get(key(provider)) else {
+            continue;
+        };
+        anyhow::ensure!(found.is_none(), "conflicting parser prefix evidence");
+        let receipt: StablePrefixReceipt =
+            serde_json::from_value(value.clone()).context("invalid session prefix evidence")?;
+        anyhow::ensure!(
+            receipt.provider == provider,
+            "prefix evidence is stored under another parser's key"
+        );
+        found = Some(receipt);
+    }
+    Ok(found)
+}
+
+/// Decode durable evidence without granting source or publication authority.
+/// A caller still compares the actual provider/path and revalidates the bytes.
+pub(crate) fn observation_receipt(
+    observation: &serde_json::Value,
+) -> Result<Option<StablePrefixReceipt>> {
+    let object = observation
+        .as_object()
+        .context("previous source observation must be a JSON object")?;
+    named_receipt(object, StablePrefixProvider::observation_key)
+}
+
+/// Conversation metadata uses a separate namespace from the source ledger.
+/// Neither malformed evidence nor a different provider marker means "absent".
+pub(crate) fn metadata_receipt(
+    metadata: &serde_json::Value,
+) -> Result<Option<StablePrefixReceipt>> {
+    if metadata.is_null() {
+        return Ok(None);
+    }
+    let object = metadata
+        .as_object()
+        .context("session metadata must be a JSON object")?;
+    let Some(cass) = object.get("cass").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let cass = cass
+        .as_object()
+        .context("CASS session metadata must be a JSON object")?;
+    named_receipt(cass, StablePrefixProvider::metadata_key)
+}
+
 fn changed(message: &'static str) -> anyhow::Error {
     io::Error::new(io::ErrorKind::Interrupted, message).into()
 }
@@ -50,25 +188,18 @@ fn digest_is_valid(value: &str) -> bool {
 
 /// Eligibility is deliberately narrower than the general Codex parser.
 pub(crate) fn eligible(path: &Path) -> bool {
-    plain_rollout(path) && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+    eligible_for(StablePrefixProvider::Codex, path)
 }
 
-fn plain_rollout(path: &Path) -> bool {
-    cfg!(unix)
-        && path.to_str().is_some()
-        && path
-            .extension()
-            .is_some_and(|extension| extension == "jsonl")
-        && path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("rollout-"))
+pub(crate) fn eligible_for(provider: StablePrefixProvider, path: &Path) -> bool {
+    provider.plain_jsonl(path)
+        && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
-fn open_source(path: &Path) -> Result<File> {
+fn open_source(provider: StablePrefixProvider, path: &Path) -> Result<File> {
     anyhow::ensure!(
-        plain_rollout(path),
-        "stable-prefix admission requires a plain Codex rollout"
+        provider.plain_jsonl(path),
+        "stable-prefix admission requires a supported plain session transcript"
     );
     if !fs::symlink_metadata(path)?.is_file() {
         return Err(changed(
@@ -139,7 +270,7 @@ impl StablePrefixReceipt {
             self.schema_version == RECEIPT_VERSION
                 && self.committed_bytes > 0
                 && self.committed_bytes <= self.admitted_bytes
-                && self.admitted_bytes <= super::source_read_budget(&self.source_path)?
+                && self.admitted_bytes <= self.provider.read_budget(&self.source_path)?
                 && (!self.inactive_eof
                     || (!self.partial && self.committed_bytes == self.admitted_bytes))
                 && digest_is_valid(&self.blake3)
@@ -193,7 +324,7 @@ impl StablePrefixReceipt {
     /// Revalidate persisted evidence before delayed raw capture or reuse.
     pub(crate) fn validate_source(&self) -> Result<()> {
         self.validate_shape()?;
-        let file = open_source(&self.source_path)?;
+        let file = open_source(self.provider, &self.source_path)?;
         self.validate_opened(&file, None)
     }
 
@@ -201,7 +332,7 @@ impl StablePrefixReceipt {
     #[cfg(test)]
     pub(crate) fn capture_view(&self) -> Result<StablePrefixSnapshot> {
         self.validate_shape()?;
-        let file = open_source(&self.source_path)?;
+        let file = open_source(self.provider, &self.source_path)?;
         self.validate_opened(&file, None)?;
         let before = file.metadata()?;
         let copied = copy_view(
@@ -366,14 +497,24 @@ impl StablePrefixSnapshot {
         previous: Option<&StablePrefixReceipt>,
         tick: Option<&(dyn Fn() + Send + Sync)>,
     ) -> Result<Option<Self>> {
-        if !eligible(source) {
+        Self::capture_for(StablePrefixProvider::Codex, source, limit, previous, tick)
+    }
+
+    pub(crate) fn capture_for(
+        provider: StablePrefixProvider,
+        source: &Path,
+        limit: u64,
+        previous: Option<&StablePrefixReceipt>,
+        tick: Option<&(dyn Fn() + Send + Sync)>,
+    ) -> Result<Option<Self>> {
+        if !eligible_for(provider, source) {
             anyhow::ensure!(
                 previous.is_none(),
                 "Codex prefix source no longer has a supported identity"
             );
             return Ok(None);
         }
-        let file = open_source(source)?;
+        let file = open_source(provider, source)?;
         let before = file.metadata()?;
         if before.len() > limit {
             return Err(io::Error::new(
@@ -384,8 +525,14 @@ impl StablePrefixSnapshot {
         }
         require_unlocked(&file)?;
         if let Some(previous) = previous {
+            anyhow::ensure!(
+                previous.provider == provider,
+                "prior prefix belongs to another parser"
+            );
             if before.len() < previous.admitted_bytes {
-                return Err(changed("Codex admission length moved behind its previous receipt"));
+                return Err(changed(
+                    "Codex admission length moved behind its previous receipt",
+                ));
             }
             anyhow::ensure!(
                 previous.source_path == source,
@@ -402,7 +549,14 @@ impl StablePrefixSnapshot {
         input.read_exact(&mut last)?;
         let inactive = crate::indexer::source_can_recover_incomplete_tail(source);
         let inactive_eof = last != *b"\n" && inactive;
-        let copied = copy_view(source, &file, before.len(), tick, inactive_eof, !inactive)?;
+        let copied = copy_view(
+            source,
+            &file,
+            before.len(),
+            tick,
+            inactive_eof,
+            provider == StablePrefixProvider::Codex && !inactive,
+        )?;
         let boundary = copied.bytes;
         if previous.is_some_and(|receipt| boundary < receipt.committed_bytes) {
             return Err(changed("Codex admitted prefix boundary moved backwards"));
@@ -421,6 +575,7 @@ impl StablePrefixSnapshot {
         let (device, inode) = identity(&before)?;
         let receipt = StablePrefixReceipt {
             schema_version: RECEIPT_VERSION,
+            provider,
             source_path: source.to_path_buf(),
             device,
             inode,
@@ -470,7 +625,18 @@ impl StablePrefixSnapshot {
     ) -> Result<StablePrefixReceipt> {
         self.validate(None)?;
         let mut receipt = self.receipt.clone();
+        anyhow::ensure!(
+            previous.is_none_or(|previous| {
+                previous.provider == receipt.provider && previous.source_path == receipt.source_path
+            }),
+            "prior projection belongs to another parser or source"
+        );
         if let Some(conversation) = conversation {
+            anyhow::ensure!(
+                conversation.agent_slug == receipt.provider.slug()
+                    && conversation.source_path == receipt.source_path,
+                "prefix projection belongs to another parser or source"
+            );
             if let Some(previous) = previous
                 && (conversation.messages.len() < previous.message_count
                     || messages_digest(&conversation.messages[..previous.message_count])?
@@ -609,36 +775,46 @@ pub(crate) fn current_prefix_receipt(path: &Path) -> Option<StablePrefixReceipt>
 }
 
 pub(crate) fn guarded_prefix_delivery(path: &Path) -> bool {
+    guarded_prefix_delivery_for(StablePrefixProvider::Codex, path)
+}
+
+pub(crate) fn guarded_prefix_delivery_for(provider: StablePrefixProvider, path: &Path) -> bool {
     CURRENT.with(|current| {
         current
             .borrow()
             .as_ref()
             .is_some_and(|(receipt, delivery)| {
-                *delivery && receipt.source_path == path && receipt.validate_source().is_ok()
+                *delivery
+                    && receipt.provider == provider
+                    && receipt.source_path == path
+                    && receipt.validate_source().is_ok()
             })
     })
 }
 
 /// The host supplies the last durable observation before admission. Invalidated
 /// publication receipts retain overlap evidence; they grant no reuse authority.
+#[cfg(test)]
 pub(crate) fn set_previous_prefix_receipt(path: &Path, observation: Option<&str>) -> Result<()> {
+    set_previous_prefix_receipt_for(StablePrefixProvider::Codex, path, observation)
+}
+
+pub(crate) fn set_previous_prefix_receipt_for(
+    provider: StablePrefixProvider,
+    path: &Path,
+    observation: Option<&str>,
+) -> Result<()> {
     PREVIOUS.with(|previous| *previous.borrow_mut() = None);
     let Some(observation) = observation else {
         return Ok(());
     };
     let value: serde_json::Value = serde_json::from_str(observation)?;
-    anyhow::ensure!(
-        value.is_object(),
-        "previous Codex source observation must be a JSON object"
-    );
-    let Some(value) = value.get("codex_prefix") else {
+    let Some(receipt) = observation_receipt(&value)? else {
         return Ok(());
     };
-    let receipt: StablePrefixReceipt =
-        serde_json::from_value(value.clone()).context("invalid previous Codex prefix evidence")?;
     anyhow::ensure!(
-        receipt.source_path == path,
-        "previous Codex receipt belongs to another source"
+        receipt.provider == provider && receipt.source_path == path,
+        "previous prefix receipt belongs to another parser or source"
     );
     // Admission may take the legacy strict path (for example after a pathname
     // becomes a symlink). Such a transition must not bypass a prior prefix's
@@ -653,23 +829,34 @@ pub(crate) fn clear_previous_prefix_receipt() {
 }
 
 pub(crate) fn take_previous_prefix_receipt(path: &Path) -> Result<Option<StablePrefixReceipt>> {
+    take_previous_prefix_receipt_for(StablePrefixProvider::Codex, path)
+}
+
+pub(crate) fn take_previous_prefix_receipt_for(
+    provider: StablePrefixProvider,
+    path: &Path,
+) -> Result<Option<StablePrefixReceipt>> {
     let previous = PREVIOUS.with(|previous| previous.borrow_mut().take());
     anyhow::ensure!(
         previous
             .as_ref()
-            .is_none_or(|receipt| receipt.source_path == path),
-        "previous Codex prefix admission belongs to another source"
+            .is_none_or(|receipt| receipt.provider == provider && receipt.source_path == path),
+        "previous prefix admission belongs to another parser or source"
     );
     Ok(previous)
 }
 
 /// Preflight is bounded and grants no delivery or publication authority.
 pub(crate) fn can_attempt(path: &Path, limit: u64) -> bool {
+    can_attempt_for(StablePrefixProvider::Codex, path, limit)
+}
+
+pub(crate) fn can_attempt_for(provider: StablePrefixProvider, path: &Path, limit: u64) -> bool {
     let attempt = || -> Result<bool> {
-        if !eligible(path) {
+        if !eligible_for(provider, path) {
             return Ok(false);
         }
-        let file = open_source(path)?;
+        let file = open_source(provider, path)?;
         let metadata = file.metadata()?;
         if metadata.len() == 0 || metadata.len() > limit {
             return Ok(false);
@@ -701,3 +888,6 @@ mod zero_boundary_tests;
 
 #[cfg(test)]
 mod receipt_shape_tests;
+
+#[cfg(all(test, unix))]
+mod provider_tests;

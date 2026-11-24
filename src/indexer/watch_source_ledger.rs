@@ -67,20 +67,33 @@ impl WatchSourceLedger {
         &self,
         conversation: &mut NormalizedConversation,
     ) -> Result<()> {
-        if conversation.agent_slug != "codex" {
+        let packet_has_prefix = conversation
+            .metadata
+            .pointer("/cass/codex_stable_prefix")
+            .is_some()
+            || conversation
+                .metadata
+                .pointer("/cass/claude_stable_prefix")
+                .is_some();
+        let completion = self
+            .completions
+            .get(&conversation.source_path)
+            .filter(|completion| completion.certified);
+        let Some(completion) = completion else {
+            anyhow::ensure!(
+                !packet_has_prefix,
+                "watch prefix packet has no certified source completion"
+            );
             return Ok(());
-        }
-        if let Some(completion) = self.completions.get(&conversation.source_path)
-            && completion.certified
-        {
-            let saved: serde_json::Value = serde_json::from_str(&completion.entry.observation)?;
-            if let Some(prefix) = saved.get("codex_prefix")
-                && let Some(value) = conversation
-                    .metadata
-                    .pointer_mut("/cass/codex_stable_prefix")
-            {
-                *value = prefix.clone();
-            }
+        };
+        let saved: serde_json::Value = serde_json::from_str(&completion.entry.observation)?;
+        if let Some(prefix) = crate::connectors::codex::observation_receipt(&saved)? {
+            align_source_prefix_metadata(conversation, &prefix)?;
+        } else {
+            anyhow::ensure!(
+                !packet_has_prefix,
+                "watch prefix packet lost its source completion evidence"
+            );
         }
         Ok(())
     }
@@ -229,7 +242,9 @@ impl WatchSourceLedger {
             let key = source_ledger_key(source, &ctx);
             let mut saved_observation = key.as_ref().and_then(|key| saved.get(key))
                 .map(|observation| Cow::Borrowed(observation.as_str()));
-            if source.provider_slug == "codex"
+            let prefix_provider =
+                crate::connectors::codex::StablePrefixProvider::from_slug(&source.provider_slug);
+            if prefix_provider.is_some()
                 && saved_observation.is_none()
                 && saved.contains_key(super::watch_source_cache::INCOMPLETE_SOURCE_LEDGER_KEY)
             {
@@ -285,8 +300,9 @@ impl WatchSourceLedger {
                 }
                 return false;
             }
-            if source.provider_slug == "codex"
-                && let Err(error) = crate::connectors::codex::set_previous_prefix_receipt(
+            if let Some(provider) = prefix_provider
+                && let Err(error) = crate::connectors::codex::set_previous_prefix_receipt_for(
+                    provider,
                     &source.source_path,
                     saved_observation,
                 )
@@ -306,7 +322,7 @@ impl WatchSourceLedger {
                 return false;
             }
             if let Some(key) = key {
-                let invalidation = if source.provider_slug == "codex" {
+                let invalidation = if prefix_provider.is_some() {
                     match saved_observation
                         .map(|value| invalidated_prefix_observation(value))
                         .transpose()
@@ -361,12 +377,13 @@ impl WatchSourceLedger {
                 progress.check_stop()?;
             }
             let prefix_observation =
-                codex_prefix_ledger_observation(&completion.source, &producer_contract, true)?;
+                source_prefix_ledger_observation(&completion.source, &producer_contract, true)?;
             let partial =
                 crate::connectors::codex::current_prefix_receipt(&completion.source.source_path)
                     .is_some_and(|receipt| receipt.partial)
                     || prefix_observation.as_ref().is_some_and(|value| {
-                        value["codex_prefix"]["partial"].as_bool() == Some(true)
+                        crate::connectors::codex::observation_receipt(value)
+                            .is_ok_and(|prefix| prefix.is_some_and(|prefix| prefix.partial))
                     });
             if partial {
                 ledger.borrow_mut().unstable_sources = true;
@@ -381,7 +398,7 @@ impl WatchSourceLedger {
             let value = if let Some(observation) = prefix_observation {
                 anyhow::ensure!(
                     completion.required_sidecars.is_empty(),
-                    "Codex prefix receipt cannot certify unobserved sidecars"
+                    "prefix receipt cannot certify unobserved sidecars"
                 );
                 observation
             } else {
@@ -467,7 +484,7 @@ impl WatchSourceLedger {
                     let source = current_source
                         .borrow()
                         .clone()
-                        .context("Codex prefix delivery lacks an admitted source")?;
+                        .context("prefix delivery lacks an admitted source")?;
                     let key = source_ledger_key(&source, &ctx);
                     let mut ledger = ledger.borrow_mut();
                     let bytes = MAX_RECEIPT_ENTRY_BYTES
@@ -483,12 +500,12 @@ impl WatchSourceLedger {
                         return Ok(());
                     }
                     let value =
-                        codex_prefix_ledger_observation(&source, &producer_contract, false)?
-                            .context("Codex prefix delivery lacks its typed proof")?;
+                        source_prefix_ledger_observation(&source, &producer_contract, false)?
+                            .context("prefix delivery lacks its typed proof")?;
                     let mut observation = ReceiptBuffer::default();
                     serde_json::to_writer(&mut observation, &value)?;
                     let entry = SourceIngestLedgerEntry {
-                        key: key.context("Codex prefix delivery lacks its ledger key")?,
+                        key: key.context("prefix delivery lacks its ledger key")?,
                         observation: String::from_utf8(observation.0)
                             .expect("JSON serialization produces UTF-8"),
                     };

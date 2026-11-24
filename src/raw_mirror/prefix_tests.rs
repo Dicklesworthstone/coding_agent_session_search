@@ -41,6 +41,47 @@ fn receipt(source: &Path, boundary: usize) -> Result<StablePrefixReceipt> {
 }
 
 #[test]
+fn claude_capture_preserves_the_parsed_prefix_and_original_provider_after_append() -> Result<()> {
+    use crate::connectors::{Connector, ScanContext, ScanRoot};
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let source = temp.path().join("claude-live.jsonl");
+    let first = b"{\"type\":\"user\",\"uuid\":\"first\",\"message\":{\"role\":\"user\",\"content\":\"first stable Claude turn\"}}\n";
+    let mut admitted = first.to_vec();
+    admitted.extend_from_slice(b"{\"type\":\"assistant\",\"message\":");
+    fs::write(&source, &admitted)?;
+    let mut writer = OpenOptions::new().append(true).open(&source)?;
+    let ctx = ScanContext::with_roots(data.clone(), vec![ScanRoot::local(source.clone())], None);
+    let parsed = crate::connectors::claude_code::ClaudeCodeConnector::new().scan(&ctx)?;
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].messages.len(), 1);
+    let proof = crate::connectors::codex::metadata_receipt(&parsed[0].metadata)?
+        .ok_or_else(|| anyhow::anyhow!("Claude prefix proof missing"))?;
+    assert!(proof.partial);
+    writer.write_all(b"{\"role\":\"assistant\",\"content\":\"later turn\"}}\n")?;
+    let full = fs::read(&source)?;
+    let capture_input = RawMirrorCaptureInput {
+        provider: "claude_code",
+        ..input(&data, &source)
+    };
+    let captured = capture_codex_prefix(capture_input.clone(), &proof)?;
+    assert_eq!(super::append_tests::read_capture(&data, &captured), first);
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(
+        data.join("raw-mirror/v1")
+            .join(&captured.manifest_relative_path),
+    )?)?;
+    assert_eq!(manifest["provider"], "claude_code");
+    assert_eq!(manifest["original_path"], source.to_string_lossy().as_ref());
+    assert_eq!(manifest["source_size_bytes"], first.len() as u64);
+    assert!(capture_codex_prefix(input(&data, &source), &proof).is_err());
+    let complete = capture_source_file(capture_input)?;
+    assert_ne!(complete.manifest_id, captured.manifest_id);
+    assert_eq!(super::append_tests::read_capture(&data, &complete), full);
+    assert_eq!(super::append_tests::read_capture(&data, &captured), first);
+    Ok(())
+}
+
+#[test]
 fn exact_prefix_mirror_preserves_original_identity_and_cannot_poison_full_capture_cache()
 -> Result<()> {
     let temp = tempfile::tempdir()?;

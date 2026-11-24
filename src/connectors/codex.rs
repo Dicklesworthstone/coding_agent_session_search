@@ -18,8 +18,11 @@ use anyhow::{Context, Result};
 // Indexer/raw-mirror consumers are absent from the standalone Codex harness.
 #[allow(unused_imports)]
 pub(crate) use stable_prefix::{
-    StablePrefixReceipt, current_prefix_receipt, set_previous_prefix_receipt,
+    StablePrefixProvider, StablePrefixReceipt, current_prefix_receipt, metadata_receipt,
+    observation_receipt, set_previous_prefix_receipt_for,
 };
+#[cfg(test)]
+pub(crate) use stable_prefix::set_previous_prefix_receipt;
 
 use super::{
     Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, NormalizedMessage,
@@ -36,8 +39,8 @@ pub(crate) use implementation::modern_codex_message;
 pub(crate) use implementation::over_budget_scan_error;
 #[allow(unused_imports)]
 pub(crate) use implementation::{
-    SourceAdmissionFailures, SourceFailureReason, can_attempt_active_jsonl_source, for_each_source_failure,
-    guarded_active_jsonl_source, over_budget_sources, source_read_budget,
+    SourceAdmissionFailures, SourceFailureReason, can_attempt_active_jsonl_source,
+    for_each_source_failure, guarded_active_jsonl_source, over_budget_sources, source_read_budget,
 };
 
 /// Archive-aware public surface; parsing and enrichment live in implementation.

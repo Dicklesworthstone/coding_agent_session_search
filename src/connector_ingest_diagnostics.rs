@@ -938,13 +938,13 @@ impl ConnectorIngestRun {
     }
 
     /// Record a failed connector scan using typed per-source evidence when
-    /// available. A moving, missing, unfinished, or oversized Codex rollout
+    /// available. A moving, missing, unfinished, or oversized source transcript
     /// must not turn into a permissions error naming the whole scan root.
     pub fn observe_connector_scan_error(&mut self, fallback_path: &Path, error: &anyhow::Error) {
         // GH #559: the first cause cannot classify an aggregate containing
         // moving, missing, malformed and oversized rollouts. Each sample has
         // its own typed cause and original path; never parse its Display text.
-        if self.provider == "codex"
+        if matches!(self.provider.as_str(), "codex" | "claude" | "claude_code")
             && crate::connectors::codex::for_each_source_failure(error, |path, reason| {
                 use crate::connectors::codex::SourceFailureReason;
                 let kind = match reason {

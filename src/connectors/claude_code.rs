@@ -1,7 +1,13 @@
 //! Claude Code connector.
 //!
-//! The parser lives in `franken_agent_detection`; this wrapper only makes
-//! *detection* agree with the parser's own root resolver (GH #448).
+//! The parser lives in `franken_agent_detection`. This wrapper aligns root
+//! detection and supplies verified immutable views of active JSONL prefixes.
+
+mod prefix;
+
+pub(crate) use prefix::{
+    can_attempt_active_jsonl_source, guarded_active_jsonl_source, source_read_budget,
+};
 
 use std::path::{Path, PathBuf};
 
@@ -107,8 +113,7 @@ impl Connector for ClaudeCodeConnector {
         hooks: &mut franken_agent_detection::connectors::SourceScanHooks<'_>,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
-        self.inner
-            .scan_with_source_boundaries(ctx, hooks, on_conversation)
+        prefix::scan(&self.inner, ctx, hooks, on_conversation)
     }
 
     fn detect(&self) -> DetectionResult {
@@ -120,7 +125,12 @@ impl Connector for ClaudeCodeConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        self.inner.scan(ctx)
+        let mut conversations = Vec::new();
+        self.scan_with_callback(ctx, &mut |conversation| {
+            conversations.push(conversation);
+            Ok(())
+        })?;
+        Ok(conversations)
     }
 
     fn supports_streaming_scan(&self) -> bool {
@@ -136,7 +146,11 @@ impl Connector for ClaudeCodeConnector {
         ctx: &ScanContext,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
-        self.inner.scan_with_callback(ctx, on_conversation)
+        self.scan_with_source_boundaries(
+            ctx,
+            &mut franken_agent_detection::connectors::SourceScanHooks::default(),
+            on_conversation,
+        )
     }
 }
 

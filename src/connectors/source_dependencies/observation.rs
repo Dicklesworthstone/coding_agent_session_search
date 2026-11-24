@@ -114,6 +114,7 @@ pub(crate) fn ledger_matches(
     // or an admitted prefix. The host must validate a full prefix's content
     // certificate before asking this metadata-only matcher to reuse it.
     if saved.get("codex_prefix").is_some()
+        || saved.get("claude_prefix").is_some()
         || saved
             .get("publication_invalidated")
             .is_some_and(|value| value.as_bool() != Some(false))
@@ -258,13 +259,15 @@ mod tests {
             row["publication_invalidated"] = marker;
             assert!(!ledger_matches(&row.to_string(), &path, false, CONTRACT));
         }
-        for partial in [true, false] {
-            let mut row: Value = serde_json::from_str(&original).unwrap();
-            row["codex_prefix"] = serde_json::json!({"partial": partial});
-            assert!(
-                !ledger_matches(&row.to_string(), &path, false, CONTRACT),
-                "a caller-provided flag cannot replace byte validation"
-            );
+        for key in ["codex_prefix", "claude_prefix"] {
+            for partial in [true, false] {
+                let mut row: Value = serde_json::from_str(&original).unwrap();
+                row[key] = serde_json::json!({"partial": partial});
+                assert!(
+                    !ledger_matches(&row.to_string(), &path, false, CONTRACT),
+                    "a caller-provided flag cannot replace byte validation"
+                );
+            }
         }
     }
 

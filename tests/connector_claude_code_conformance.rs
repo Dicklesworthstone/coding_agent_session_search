@@ -79,7 +79,9 @@ const CLAUDE_CODE_NORMALIZATION_SPEC: &[ConnectorRequirement] = &[
 
 fn write_session(root: &Path, name: &str, lines: &[&str]) -> std::path::PathBuf {
     let path = root.join(name);
-    fs::write(&path, lines.join("\n")).unwrap();
+    // These fixtures represent committed records. A recent valid JSON value
+    // without its final LF intentionally remains outside the live prefix.
+    fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
     path
 }
 

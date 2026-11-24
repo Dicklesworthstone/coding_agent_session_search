@@ -146,7 +146,7 @@ pub fn capture_source_file(
     result
 }
 
-/// Preserve exactly the Codex bytes admitted by a stable-prefix delivery.
+/// Preserve exactly the provider bytes admitted by a stable-prefix delivery.
 ///
 /// Source policy and manifest identity use the original source name. Capture
 /// reads exactly the admitted range through a verified descriptor and the
@@ -161,11 +161,12 @@ pub(crate) fn capture_codex_prefix(
     }
     exclusions::ensure_allowed(input.source_path)?;
     anyhow::ensure!(
-        input.provider == "codex" && input.source_path == receipt.source_path.as_path(),
-        "Codex prefix capture does not match its admitted source"
+        input.provider == receipt.provider.slug()
+            && input.source_path == receipt.source_path.as_path(),
+        "prefix capture does not match its admitted provider and source"
     );
     // Physical ownership remains authoritative even when a caller labels a
-    // sensitive store as Codex. Check before making another copy of its bytes.
+    // sensitive store as a transcript. Check before making another copy of its bytes.
     if zcode_source_is_sensitive(input.source_path)? {
         anyhow::bail!(
             "disabled_sensitive_container: ZCode database and store files cannot be raw-mirrored"

@@ -70,6 +70,28 @@ budget can therefore increase memory and CPU use. This setting does not
 establish the older performance estimates elsewhere in this document, and does
 not add a `--partial-ok` policy or suppress exit 9 for other incomplete scans.
 
+## Claude Code Live JSONL Prefixes
+
+On Unix, complete newline-terminated records in an active Claude Code JSONL
+transcript can be indexed while its writer stays open. CASS parses a private,
+content-verified prefix; an unfinished final record remains deferred. Original
+source files are never changed, and partial prefixes cannot certify full EOF.
+Inactive valid records without a final newline retain the existing EOF behavior.
+
+Prefix admission defaults to **104857600 bytes (100 MiB)**. Set
+`CASS_CLAUDE_MAX_SOURCE_BYTES` to a decimal byte count from **1 through 1073741824
+(1 GiB)** to raise the bound, for example:
+
+```bash
+CASS_CLAUDE_MAX_SOURCE_BYTES=536870912 cass index --json
+```
+
+If a previously admitted transcript grows past the bound, raise it and retry;
+the prior source identity, byte prefix and normalized message overlap are still
+verified. Invalid values are errors. This controls input bytes, not process RSS.
+Larger inactive JSONL files without prior prefix receipts retain the existing
+parser path. JSON/desktop-sidecar formats keep their existing admission rules.
+
 ## Memory Usage
 
 | Operation | Expected Memory | Notes |
@@ -150,6 +172,7 @@ not add a `--partial-ok` policy or suppress exit 9 for other incomplete scans.
 | `CASS_SEMANTIC_EMBEDDER` | auto | Force hash/ml embedder |
 | `CASS_STREAMING_INDEX` | true | Enable streaming indexer |
 | `CASS_CODEX_MAX_SOURCE_BYTES` | 104857600 | Modern Codex JSONL source-byte admission; 1..1073741824, legacy JSON at most 100 MiB |
+| `CASS_CLAUDE_MAX_SOURCE_BYTES` | 104857600 | Claude Code live JSONL prefix admission; 1..1073741824, preserves prior prefix proof when raised |
 
 ## Tested Configurations
 

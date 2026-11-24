@@ -2,6 +2,7 @@
 #![cfg(unix)]
 
 use super::*;
+use crate::connectors::codex::StablePrefixProvider;
 use crate::connectors::{Connector, ScanContext, ScanRoot};
 
 struct Fixture {
@@ -13,8 +14,26 @@ struct Fixture {
 
 impl Fixture {
     fn new(count: usize, repeated: bool, timestamps: bool) -> Result<Self> {
+        Self::for_provider(
+            count,
+            repeated,
+            timestamps,
+            crate::connectors::codex::StablePrefixProvider::Codex,
+        )
+    }
+
+    fn for_provider(
+        count: usize,
+        repeated: bool,
+        timestamps: bool,
+        provider: crate::connectors::codex::StablePrefixProvider,
+    ) -> Result<Self> {
+        use crate::connectors::codex::StablePrefixProvider;
         let directory = tempfile::tempdir()?;
-        let source = directory.path().join("rollout-legacy-admission.jsonl");
+        let source = directory.path().join(match provider {
+            StablePrefixProvider::Codex => "rollout-legacy-admission.jsonl",
+            StablePrefixProvider::ClaudeCode => "claude-legacy-admission.jsonl",
+        });
         let mut bytes = String::new();
         for idx in 0..count {
             let content = if repeated {
@@ -22,10 +41,16 @@ impl Fixture {
             } else {
                 format!("canonical prefix message {idx}")
             };
-            let mut record = serde_json::json!({
-                "type": "response_item",
-                "payload": {"role": "user", "content": content}
-            });
+            let mut record = match provider {
+                StablePrefixProvider::Codex => serde_json::json!({
+                    "type": "response_item",
+                    "payload": {"role": "user", "content": content}
+                }),
+                StablePrefixProvider::ClaudeCode => serde_json::json!({
+                    "type": "user", "uuid": format!("claude-prefix-{idx}"),
+                    "message": {"role": "user", "content": content}
+                }),
+            };
             if timestamps {
                 let second = if repeated { 0 } else { idx };
                 record["timestamp"] = serde_json::json!(format!("2026-11-23T12:00:{second:02}Z"));
@@ -39,16 +64,23 @@ impl Fixture {
             vec![ScanRoot::local(source)],
             None,
         );
-        let mut normalized = crate::connectors::codex::CodexConnector::new().scan(&ctx)?;
+        let mut normalized = match provider {
+            StablePrefixProvider::Codex => {
+                crate::connectors::codex::CodexConnector::new().scan(&ctx)?
+            }
+            StablePrefixProvider::ClaudeCode => {
+                crate::connectors::claude_code::ClaudeCodeConnector::new().scan(&ctx)?
+            }
+        };
         assert_eq!(normalized.len(), 1);
         let conversation = crate::indexer::persist::map_to_internal(&normalized.remove(0));
         assert_eq!(conversation.messages.len(), count);
-        assert!(codex_prefix_packet(&conversation));
+        assert!(source_prefix_packet(&conversation));
         let storage = FrankenStorage::open(&directory.path().join("archive.db"))?;
         let agent = storage.ensure_agent(&Agent {
             id: None,
-            slug: "codex".to_owned(),
-            name: "Codex".to_owned(),
+            slug: provider.slug().to_owned(),
+            name: provider.slug().to_owned(),
             version: None,
             kind: AgentKind::Cli,
         })?;
@@ -84,12 +116,16 @@ impl Fixture {
     }
 
     fn completion(&self) -> SourceIngestLedgerEntry {
+        let provider = crate::connectors::codex::StablePrefixProvider::from_slug(
+            &self.conversation.agent_slug,
+        )
+        .expect("fixture provider");
+        let mut observation = serde_json::json!({});
+        observation[provider.observation_key()] =
+            self.conversation.metadata_json["cass"][provider.metadata_key()].clone();
         SourceIngestLedgerEntry {
-            key: "source_ingest_v1:codex-prefix-regression".to_owned(),
-            observation: serde_json::json!({
-                "codex_prefix": self.conversation.metadata_json.pointer("/cass/codex_stable_prefix")
-            })
-            .to_string(),
+            key: format!("source_ingest_v1:{}-prefix-regression", provider.slug()),
+            observation: observation.to_string(),
         }
     }
 
@@ -120,6 +156,129 @@ impl Fixture {
 }
 
 #[test]
+fn claude_prefix_preserves_repeated_turns_and_requires_future_proven_admission() -> Result<()> {
+    for batched in [false, true] {
+        let fixture = Fixture::for_provider(
+            3,
+            true,
+            true,
+            crate::connectors::codex::StablePrefixProvider::ClaudeCode,
+        )?;
+        let id = fixture.seed(&fixture.legacy(1))?;
+        let appended = fixture.ingest(&fixture.conversation, batched)?;
+        assert_eq!(appended.conversation_id, id);
+        assert_eq!(appended.inserted_indices, [1, 2]);
+        let rows = fixture.rows(id)?;
+        assert_eq!(rows.as_array().context("canonical rows")?.len(), 3);
+        assert!(
+            fixture
+                .ingest(&fixture.conversation, batched)?
+                .inserted_indices
+                .is_empty()
+        );
+        assert_eq!(fixture.rows(id)?, rows);
+        let error = fixture
+            .ingest(&fixture.legacy(3), batched)
+            .err()
+            .context("ordinary replay bypassed the durable Claude prefix requirement")?;
+        assert!(error.to_string().contains("requires prefix admission"));
+        let refusal = error
+            .downcast_ref::<CodexCanonicalRefusal>()
+            .context("Claude requirement lost its typed refusal")?;
+        assert_eq!(refusal.provider, StablePrefixProvider::ClaudeCode);
+        assert_eq!(refusal.source_path, fixture.conversation.source_path);
+        assert_eq!(refusal.external_id, fixture.conversation.external_id);
+        assert_eq!(refusal.conversation_id, id);
+        assert!(matches!(
+            refusal.reason,
+            CodexCanonicalRefusalReason::PrefixRequired
+        ));
+        assert_eq!(fixture.rows(id)?, rows);
+    }
+    Ok(())
+}
+
+#[test]
+fn claude_prefix_rejects_divergent_canonical_history_and_provider_substitution() -> Result<()> {
+    for batched in [false, true] {
+        let fixture = Fixture::for_provider(
+            3,
+            false,
+            true,
+            crate::connectors::codex::StablePrefixProvider::ClaudeCode,
+        )?;
+        let mut legacy = fixture.legacy(2);
+        legacy.messages[0].content = "a different canonical Claude turn".to_owned();
+        let id = fixture.seed(&legacy)?;
+        let rows = fixture.rows(id)?;
+        let error = fixture
+            .ingest(&fixture.conversation, batched)
+            .err()
+            .context("divergent Claude overlap was accepted")?;
+        assert!(error.to_string().contains("canonical message idx 0"));
+        let refusal = error
+            .downcast_ref::<CodexCanonicalRefusal>()
+            .context("Claude overlap lost its typed refusal")?;
+        assert_eq!(refusal.provider, StablePrefixProvider::ClaudeCode);
+        assert_eq!(refusal.source_path, fixture.conversation.source_path);
+        assert_eq!(refusal.external_id, fixture.conversation.external_id);
+        assert_eq!(refusal.conversation_id, id);
+        assert!(matches!(
+            refusal.reason,
+            CodexCanonicalRefusalReason::ProjectionMismatch(0)
+        ));
+        assert_eq!(fixture.rows(id)?, rows);
+        assert!(fixture.storage.source_ingest_ledger_entries()?.is_empty());
+        let mut substituted = fixture.conversation.clone();
+        substituted.metadata_json["cass"]["claude_stable_prefix"]["provider"] =
+            serde_json::json!("codex");
+        let error = fixture
+            .ingest(&substituted, batched)
+            .err()
+            .context("foreign provider proof was accepted")?;
+        assert!(error.to_string().contains("invalid Claude prefix metadata"));
+        assert!(
+            error.downcast_ref::<CodexCanonicalRefusal>().is_none(),
+            "provider substitution is not an isolatable canonical disagreement"
+        );
+        let mut malformed = fixture.conversation.clone();
+        malformed.metadata_json["cass"]["claude_stable_prefix"] = serde_json::json!({});
+        let error = fixture
+            .ingest(&malformed, batched)
+            .err()
+            .context("malformed Claude proof was accepted")?;
+        assert!(error.to_string().contains("invalid Claude prefix metadata"));
+        assert!(
+            error.downcast_ref::<CodexCanonicalRefusal>().is_none(),
+            "malformed metadata is not an isolatable canonical disagreement"
+        );
+        assert_eq!(fixture.rows(id)?, rows);
+        assert!(fixture.storage.source_ingest_ledger_entries()?.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn new_prefix_conversation_refuses_a_foreign_provider_before_any_insert() -> Result<()> {
+    let fixture = Fixture::for_provider(
+        1,
+        false,
+        true,
+        crate::connectors::codex::StablePrefixProvider::ClaudeCode,
+    )?;
+    let mut incoming = fixture.conversation.clone();
+    incoming.metadata_json["cass"]["claude_stable_prefix"]["provider"] = serde_json::json!("codex");
+    assert!(fixture.ingest(&incoming, true).is_err());
+    assert!(fixture.storage.source_ingest_ledger_entries()?.is_empty());
+    assert!(
+        fixture
+            .ingest(&fixture.conversation, true)?
+            .conversation_inserted
+    );
+    Ok(())
+}
+
+#[test]
 fn codex_prefix_rejects_divergent_legacy_overlap_before_canonical_or_receipt_commit() -> Result<()>
 {
     for batched in [false, true] {
@@ -144,12 +303,17 @@ fn codex_prefix_rejects_divergent_legacy_overlap_before_canonical_or_receipt_com
                 "{field}: {error:#}"
             );
             assert!(!error.to_string().contains("unrelated legacy variant"));
-            let refusal = error.downcast_ref::<CodexCanonicalRefusal>()
+            let refusal = error
+                .downcast_ref::<CodexCanonicalRefusal>()
                 .context("canonical overlap lost its typed refusal")?;
+            assert_eq!(refusal.provider, StablePrefixProvider::Codex);
             assert_eq!(refusal.source_path, fixture.conversation.source_path);
             assert_eq!(refusal.external_id, fixture.conversation.external_id);
             assert_eq!(refusal.conversation_id, id);
-            assert!(matches!(refusal.reason, CodexCanonicalRefusalReason::ProjectionMismatch(0)));
+            assert!(matches!(
+                refusal.reason,
+                CodexCanonicalRefusalReason::ProjectionMismatch(0)
+            ));
             assert_eq!(fixture.rows(id)?, before, "{field}, batched={batched}");
             assert!(fixture.storage.source_ingest_ledger_entries()?.is_empty());
         }
@@ -271,9 +435,13 @@ fn codex_prefix_slices_use_whole_receipt_boundary_and_reject_shorter_history() -
         .err()
         .context("short source accepted")?;
     assert!(error.to_string().contains("shorter than canonical history"));
+    let refusal = error
+        .downcast_ref::<CodexCanonicalRefusal>()
+        .context("short source lost its typed refusal")?;
+    assert_eq!(refusal.provider, StablePrefixProvider::Codex);
     assert!(matches!(
-        error.downcast_ref::<CodexCanonicalRefusal>().map(|refusal| &refusal.reason),
-        Some(CodexCanonicalRefusalReason::HistoryBeyondPrefix)
+        refusal.reason,
+        CodexCanonicalRefusalReason::HistoryBeyondPrefix
     ));
     assert_eq!(shorter.rows(id)?, before);
     assert!(shorter.storage.source_ingest_ledger_entries()?.is_empty());
@@ -330,8 +498,10 @@ fn codex_prefix_absent_metadata_preserves_legacy_behavior_but_malformed_proof_fa
         .err()
         .context("malformed proof accepted")?;
     assert!(error.to_string().contains("invalid Codex prefix metadata"));
-    assert!(error.downcast_ref::<CodexCanonicalRefusal>().is_none(),
-        "malformed metadata is not an isolatable canonical disagreement");
+    assert!(
+        error.downcast_ref::<CodexCanonicalRefusal>().is_none(),
+        "malformed metadata is not an isolatable canonical disagreement"
+    );
     assert_eq!(fixture.rows(id)?, before);
     assert!(fixture.storage.source_ingest_ledger_entries()?.is_empty());
     Ok(())
@@ -403,9 +573,13 @@ fn codex_prefix_requirement_blocks_downgrade_for_new_and_existing_receipt_metada
             strict.messages[0].content = "rewritten prefix under another parser mode".to_owned();
             let error = fixture.ingest(&strict, batched).err().context("parser downgrade merged")?;
             assert!(error.to_string().contains("requires prefix admission"));
+            let refusal = error
+                .downcast_ref::<CodexCanonicalRefusal>()
+                .context("required prefix lost its typed refusal")?;
+            assert_eq!(refusal.provider, StablePrefixProvider::Codex);
             assert!(matches!(
-                error.downcast_ref::<CodexCanonicalRefusal>().map(|refusal| &refusal.reason),
-                Some(CodexCanonicalRefusalReason::PrefixRequired)
+                refusal.reason,
+                CodexCanonicalRefusalReason::PrefixRequired
             ));
             assert_eq!(fixture.rows(id)?, rows);
             assert_eq!(fixture.metadata_columns(id)?, metadata);
@@ -486,14 +660,15 @@ fn codex_prefix_integrity_metadata_is_bounded_and_strictly_decoded() -> Result<(
     let ordinary = "{\"legacy_archive\":true}".to_owned();
     let mut at_limit = serde_json::json!({"padding": ""});
     let empty_len = at_limit.to_string().len();
-    at_limit["padding"] = serde_json::json!("x".repeat(MAX_CODEX_PREFIX_METADATA_BYTES - empty_len));
+    at_limit["padding"] =
+        serde_json::json!("x".repeat(MAX_SOURCE_PREFIX_METADATA_BYTES - empty_len));
     let at_limit = at_limit.to_string();
-    assert_eq!(at_limit.len(), MAX_CODEX_PREFIX_METADATA_BYTES);
+    assert_eq!(at_limit.len(), MAX_SOURCE_PREFIX_METADATA_BYTES);
     let cases = [
         ("json-invalid", Some("SECRET_INVALID_METADATA".to_owned()), None),
         ("bin-invalid", Some(ordinary), Some(vec![0xc1])),
-        ("json-large", Some("{".repeat(MAX_CODEX_PREFIX_METADATA_BYTES + 1)), None),
-        ("bin-large", None, Some(vec![0; MAX_CODEX_PREFIX_METADATA_BYTES + 1])),
+        ("json-large", Some("{".repeat(MAX_SOURCE_PREFIX_METADATA_BYTES + 1)), None),
+        ("bin-large", None, Some(vec![0; MAX_SOURCE_PREFIX_METADATA_BYTES + 1])),
         ("output-large", Some(at_limit), None),
         ("root-array", Some("[]".to_owned()), None),
     ];
@@ -586,7 +761,7 @@ fn codex_prefix_regular_to_explicit_symlink_cannot_downgrade_canonical_admission
             assert_eq!(completions, 1);
             assert_eq!(delivered.len(), 1);
             let strict = crate::indexer::persist::map_to_internal(&delivered.remove(0));
-            assert!(!codex_prefix_packet(&strict));
+            assert!(!source_prefix_packet(&strict));
             assert_eq!(strict.external_id, fixture.conversation.external_id);
             assert_eq!(strict.source_path, *source);
             assert_eq!(strict.messages.len(), 3);

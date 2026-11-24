@@ -579,7 +579,7 @@ fn stage_source_chunk(
     Ok(reference)
 }
 
-/// The ordinary snapshot keeps its strict metadata checks. A Codex prefix
+/// The ordinary snapshot keeps its strict metadata checks. A proven prefix
 /// instead carries the original byte/object receipt for a fixed historical
 /// range; later bytes are outside this raw capture.
 struct CaptureSource<'a> {
@@ -668,7 +668,7 @@ fn prepare_bounded(
     if let Some(receipt) = prefix {
         anyhow::ensure!(
             content_hash == receipt.blake3,
-            "Codex prefix capture bytes do not match the parsed source receipt"
+            "prefix capture bytes do not match the parsed source receipt"
         );
         // Verify the held object as well as its current name. A replacement,
         // in-place rewrite, truncation or new advisory lock cannot authorize
@@ -848,8 +848,9 @@ pub(crate) fn capture_codex_prefix(
     policy: RawMirrorRetentionPolicy,
 ) -> Result<RawMirrorCaptureRecord> {
     anyhow::ensure!(
-        input.provider == "codex" && input.source_path == receipt.source_path.as_path(),
-        "Codex prefix capture does not match its admitted source"
+        input.provider == receipt.provider.slug()
+            && input.source_path == receipt.source_path.as_path(),
+        "prefix capture does not match its admitted provider and source"
     );
     receipt.validate_source()?;
     capture_with_prefix(input, threshold, chunk_size, policy, Some(receipt))
@@ -959,7 +960,7 @@ fn capture_with_prefix(
         anyhow::ensure!(
             record.source_size_bytes == receipt.committed_bytes
                 && record.source_content_blake3 == receipt.blake3,
-            "Codex prefix capture bytes do not match the parsed source receipt"
+            "prefix capture bytes do not match the parsed source receipt"
         );
         // No content-addressed blob or manifest is visible yet. Reject a
         // replacement or in-place edit before the publication reservation.

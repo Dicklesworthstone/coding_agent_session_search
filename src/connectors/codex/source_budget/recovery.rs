@@ -70,7 +70,7 @@ impl fmt::Display for FailureReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Codex scan incomplete: {}",
+            "Session scan incomplete: {}",
             serde_json::to_string(self).map_err(|_| fmt::Error)?
         )
     }
@@ -138,7 +138,7 @@ impl SourceAdmissionFailures {
         let error = if error.downcast_ref::<io::Error>().is_none() {
             error.context(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid previous Codex source evidence",
+                "invalid source admission evidence",
             ))
         } else {
             error

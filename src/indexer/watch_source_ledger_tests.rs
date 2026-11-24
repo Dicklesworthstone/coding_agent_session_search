@@ -22,6 +22,362 @@ fn codex_watch_prefix_fixture(temp: &TempDir) -> Result<(PathBuf, ScanContext)> 
 }
 
 #[cfg(unix)]
+fn claude_watch_prefix_line(role: &str, content: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "type": role,
+            "timestamp": "2026-11-24T12:00:00Z",
+            "sessionId": "watch-prefix-session",
+            "cwd": "/workspace/project",
+            "message": {"role": role, "content": content}
+        })
+    )
+}
+
+#[cfg(unix)]
+fn claude_watch_prefix_fixture(temp: &TempDir) -> Result<(PathBuf, ScanContext)> {
+    let root = temp.path().join("projects");
+    let project = root.join("watch-project");
+    fs::create_dir_all(&project)?;
+    let path = project.join("session.jsonl");
+    fs::write(&path, claude_watch_prefix_line("user", "first"))?;
+    let ctx = ScanContext::with_roots(
+        temp.path().join("archive"),
+        vec![ScanRoot::local(root)],
+        None,
+    );
+    Ok((path, ctx))
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn claude_prefix_watch_receipt_survives_publication_while_writer_and_debt_remain() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (path, ctx) = claude_watch_prefix_fixture(&temp)?;
+    let mut writer = OpenOptions::new().append(true).open(&path)?;
+    let tail = claude_watch_prefix_line("assistant", "unfinished second turn");
+    writer.write_all(tail.trim_end_matches('\n').as_bytes())?;
+    writer.flush()?;
+    let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+    let mut ledger = WatchSourceLedger::default();
+    let mut conversations = Vec::new();
+    ledger.scan(
+        &crate::connectors::claude_code::ClaudeCodeConnector::new(),
+        "claude",
+        &ctx,
+        &HashMap::new(),
+        true,
+        false,
+        &filter,
+        None,
+        &mut |conversation| {
+            conversations.push(conversation);
+            Ok(true)
+        },
+    )?;
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].agent_slug, "claude_code");
+    assert_eq!(conversations[0].source_path, path);
+    assert_eq!(conversations[0].messages.len(), 1);
+    assert_eq!(conversations[0].messages[0].content, "first");
+    ledger.align_prefix_metadata(&mut conversations[0])?;
+    let receipt = conversations[0].metadata["cass"]["claude_stable_prefix"].clone();
+    assert_eq!(receipt["provider"], "claude_code");
+    assert_eq!(receipt["partial"], true);
+    assert_eq!(receipt["message_count"], 1);
+    assert_eq!(
+        receipt["committed_bytes"],
+        claude_watch_prefix_line("user", "first").len() as u64
+    );
+    assert!(ledger.unstable_sources);
+    assert!(ledger.completed_source_paths().next().is_none());
+    assert!(ledger.may_publish_source(&path));
+    let key = ledger.completions[&path].entry.key.clone();
+    let storage = FrankenStorage::open(&temp.path().join("archive.db"))?;
+    let debt = WatchLexicalReplayDebt::for_root(ConnectorKind::Claude, &ctx.scan_roots[0]);
+    ledger.begin_publication(&storage, &debt, None)?;
+    let admitted = storage.source_ingest_ledger_entries()?;
+    let value: serde_json::Value = serde_json::from_str(&admitted[&key])?;
+    assert_eq!(value["publication_invalidated"], true);
+    assert_eq!(value["watch_published"], false);
+    assert_eq!(value["claude_prefix"], receipt);
+    assert!(value.get("codex_prefix").is_none());
+    assert!(!load_watch_lexical_replay_debt(&storage)?.is_empty());
+
+    // Invoke the real ledger acknowledgement used after canonical+lexical
+    // commit. The active tail retains replay debt without losing its proof.
+    ledger.publish_batch(&storage, &conversations, &[], true)?;
+    let published = storage.source_ingest_ledger_entries()?;
+    let value: serde_json::Value = serde_json::from_str(&published[&key])?;
+    assert_eq!(value["watch_published"], true);
+    assert!(value.get("publication_invalidated").is_none());
+    assert_eq!(value["claude_prefix"], receipt);
+    assert!(!load_watch_lexical_replay_debt(&storage)?.is_empty());
+    assert!(!source_ledger_matches_with_contract(
+        &published[&key],
+        &DiscoveredSourceFile::new(
+            "claude_code",
+            &ctx.scan_roots[0],
+            path.clone(),
+            DiscoveredSourceRole::PrimarySessionLog,
+            true,
+        )
+        .with_fs_metadata(),
+        &source_ledger_producer_contract("claude")?.0,
+    ));
+    assert!(fs::read_to_string(&path)?.ends_with(tail.trim_end_matches('\n')));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn claude_prefix_watch_exact_lookup_preserves_omitted_overlap_and_discovers_appends() -> Result<()>
+{
+    let temp = TempDir::new()?;
+    let (path, ctx) = claude_watch_prefix_fixture(&temp)?;
+    let mut writer = OpenOptions::new().append(true).open(&path)?;
+    let connector = crate::connectors::claude_code::ClaudeCodeConnector::new();
+    let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+    let mut initial = WatchSourceLedger::default();
+    let mut first = Vec::new();
+    initial.scan_with_ledger_lookup(
+        &connector,
+        "claude",
+        &ctx,
+        &HashMap::new(),
+        true,
+        false,
+        &filter,
+        None,
+        &mut |_| panic!("a complete empty cache needs no database fallback"),
+        &mut |conversation| {
+            first.push(conversation);
+            Ok(true)
+        },
+    )?;
+    assert_eq!(first.len(), 1);
+    let key = initial.completions[&path].entry.key.clone();
+    let storage = FrankenStorage::open(&temp.path().join("archive.db"))?;
+    let debt = WatchLexicalReplayDebt::for_root(ConnectorKind::Claude, &ctx.scan_roots[0]);
+    initial.begin_publication(&storage, &debt, None)?;
+    initial.publish_batch(&storage, &first, &[], true)?;
+    let original = storage.source_ingest_ledger_entries()?;
+    let cache = HashMap::from([(
+        super::super::watch_source_cache::INCOMPLETE_SOURCE_LEDGER_KEY.to_string(),
+        String::new(),
+    )]);
+    writer.write_all(claude_watch_prefix_line("assistant", "second").as_bytes())?;
+    writer.flush()?;
+    let mut next = WatchSourceLedger::default();
+    let mut lookups = 0;
+    let mut delivered = Vec::new();
+    next.scan_with_ledger_lookup(
+        &connector,
+        "claude",
+        &ctx,
+        &cache,
+        true,
+        false,
+        &filter,
+        None,
+        &mut |observed_key| {
+            lookups += 1;
+            assert_eq!(observed_key, key);
+            super::super::watch_source_cache::lookup_watch_source_observation(
+                &storage,
+                observed_key,
+                None,
+            )
+        },
+        &mut |conversation| {
+            delivered.push(conversation);
+            Ok(true)
+        },
+    )?;
+    assert_eq!(lookups, 1);
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].agent_slug, "claude_code");
+    assert_eq!(delivered[0].external_id, first[0].external_id);
+    assert_eq!(delivered[0].messages.len(), 2);
+    assert_eq!(delivered[0].messages[0].content, "first");
+    assert_eq!(delivered[0].messages[1].content, "second");
+    assert_eq!(
+        next.prefix_invalidations[&key],
+        invalidated_prefix_observation(&original[&key])?.unwrap()
+    );
+    assert_eq!(
+        cache.len(),
+        1,
+        "exact lookups must not grow the bounded cache"
+    );
+    assert_eq!(storage.source_ingest_ledger_entries()?, original);
+
+    fs::write(&path, fs::read_to_string(&path)?.replace("first", "other"))?;
+    let mut refused = WatchSourceLedger::default();
+    let mut called = false;
+    assert!(
+        refused
+            .scan_with_ledger_lookup(
+                &connector,
+                "claude",
+                &ctx,
+                &cache,
+                true,
+                false,
+                &filter,
+                None,
+                &mut |observed_key| {
+                    super::super::watch_source_cache::lookup_watch_source_observation(
+                        &storage,
+                        observed_key,
+                        None,
+                    )
+                },
+                &mut |_| {
+                    called = true;
+                    Ok(true)
+                },
+            )
+            .is_err()
+    );
+    assert!(
+        !called,
+        "an omitted Claude proof must still reject rewritten admitted bytes"
+    );
+    assert!(refused.admitted_keys.is_empty());
+    assert_eq!(storage.source_ingest_ledger_entries()?, original);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn claude_prefix_watch_alignment_requires_original_evidence_and_allows_only_downgrade() -> Result<()>
+{
+    let temp = TempDir::new()?;
+    let (path, ctx) = claude_watch_prefix_fixture(&temp)?;
+    File::open(&path)?.set_modified(SystemTime::now() - Duration::from_secs(7200))?;
+    let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+    let mut ledger = WatchSourceLedger::default();
+    let mut conversations = Vec::new();
+    ledger.scan(
+        &crate::connectors::claude_code::ClaudeCodeConnector::new(),
+        "claude",
+        &ctx,
+        &HashMap::new(),
+        true,
+        false,
+        &filter,
+        None,
+        &mut |conversation| {
+            conversations.push(conversation);
+            Ok(true)
+        },
+    )?;
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(ledger.completed_source_paths().count(), 1);
+    let conversation = &mut conversations[0];
+    let original = conversation.metadata.clone();
+    assert_eq!(original["cass"]["claude_stable_prefix"]["partial"], false);
+    ledger.align_prefix_metadata(conversation)?;
+    assert_eq!(conversation.metadata, original);
+    for mismatch in [
+        "missing_cass",
+        "missing_marker",
+        "provider",
+        "path",
+        "count",
+        "bytes",
+        "digest",
+        "promote",
+    ] {
+        conversation.metadata = original.clone();
+        match mismatch {
+            "missing_cass" => conversation.metadata["cass"] = serde_json::Value::Null,
+            "missing_marker" => {
+                conversation.metadata["cass"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("claude_stable_prefix");
+            }
+            "provider" => {
+                conversation.metadata["cass"]["claude_stable_prefix"]["provider"] = "codex".into()
+            }
+            "path" => {
+                conversation.metadata["cass"]["claude_stable_prefix"]["source_path"] =
+                    serde_json::json!(temp.path().join("other.jsonl"))
+            }
+            "count" => {
+                conversation.metadata["cass"]["claude_stable_prefix"]["message_count"] = 2.into()
+            }
+            "bytes" => {
+                conversation.metadata["cass"]["claude_stable_prefix"]["committed_bytes"] = 0.into()
+            }
+            "digest" => {
+                conversation.metadata["cass"]["claude_stable_prefix"]["messages_blake3"] =
+                    "0".repeat(64).into()
+            }
+            "promote" => {
+                conversation.metadata["cass"]["claude_stable_prefix"]["partial"] = true.into()
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            ledger.align_prefix_metadata(conversation).is_err(),
+            "accepted {mismatch}"
+        );
+    }
+
+    conversation.metadata = original.clone();
+    conversation.source_path = temp.path().join("different-source.jsonl");
+    assert!(ledger.align_prefix_metadata(conversation).is_err());
+    conversation.source_path = path.clone();
+    let mut completion = ledger.completions.remove(&path).unwrap();
+    assert!(
+        ledger.align_prefix_metadata(conversation).is_err(),
+        "a typed packet cannot publish without its source completion"
+    );
+    completion.certified = false;
+    ledger.completions.insert(path.clone(), completion);
+    assert!(
+        ledger.align_prefix_metadata(conversation).is_err(),
+        "provisional delivery is not certified publication evidence"
+    );
+    let completion = ledger.completions.get_mut(&path).unwrap();
+    completion.certified = true;
+    let original_observation = completion.entry.observation.clone();
+    let mut without_receipt: serde_json::Value = serde_json::from_str(&original_observation)?;
+    without_receipt
+        .as_object_mut()
+        .unwrap()
+        .remove("claude_prefix");
+    completion.entry.observation = serde_json::to_string(&without_receipt)?;
+    assert!(
+        ledger.align_prefix_metadata(conversation).is_err(),
+        "a completion without its typed proof cannot replace parser evidence"
+    );
+    ledger.completions.get_mut(&path).unwrap().entry.observation = original_observation;
+
+    conversation.metadata = original.clone();
+    let mut writer = OpenOptions::new().append(true).open(&path)?;
+    writer.write_all(claude_watch_prefix_line("assistant", "second").as_bytes())?;
+    writer.flush()?;
+    ledger.revalidate_prefixes(&filter, None)?;
+    assert!(ledger.may_publish_source(&path));
+    assert!(ledger.completed_source_paths().next().is_none());
+    ledger.align_prefix_metadata(conversation)?;
+    let mut downgraded = original;
+    downgraded["cass"]["claude_stable_prefix"]["partial"] = true.into();
+    assert_eq!(conversation.metadata, downgraded);
+    assert_eq!(conversation.messages.len(), 1);
+    assert_eq!(conversation.messages[0].content, "first");
+    Ok(())
+}
+
+#[cfg(unix)]
 #[test]
 #[serial]
 fn codex_prefix_watch_receipt_is_durable_without_whole_source_coverage() -> Result<()> {
