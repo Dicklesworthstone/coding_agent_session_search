@@ -678,6 +678,25 @@ impl ExportEngine {
                     progress(processed, total_convs);
                 }
 
+                // Build once after bulk insertion. INTEGER PRIMARY KEY aliases rowid,
+                // the final key in each ordinary SQLite index: equal idx values
+                // sort by id, and a reverse time scan breaks ties by id DESC.
+                for ddl in [
+                    "CREATE INDEX messages_conversation_order ON messages(conversation_id, idx)",
+                    "CREATE INDEX conversations_recent ON conversations(started_at)",
+                    "CREATE INDEX conversations_agent_recent ON conversations(agent, started_at)",
+                    "CREATE INDEX conversations_workspace_recent ON conversations(workspace, started_at)",
+                ] {
+                    if running
+                        .as_ref()
+                        .is_some_and(|flag| !flag.load(Ordering::Relaxed))
+                    {
+                        bail!("Export cancelled");
+                    }
+                    tx.execute(ddl)
+                        .with_context(|| format!("Failed to build Pages viewer index: {ddl}"))?;
+                }
+
                 // Metadata
                 tx.execute("INSERT INTO export_meta (key, value) VALUES ('schema_version', '1')")?;
                 // 019i2: record the realized path policy so verify/summary

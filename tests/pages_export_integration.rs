@@ -1222,6 +1222,81 @@ fn export_engine_populates_fts_indexes() {
     );
 }
 
+/// Open the finished export with the SQLite implementation used as our native
+/// viewer oracle. Fixture-created browser indexes cannot qualify a real bundle.
+#[test]
+fn exported_database_serves_ordered_viewer_queries_without_temporary_sorts() -> TestResult<()> {
+    let tmp = TempDir::new()?;
+    let source = tmp.path().join("source.db");
+    let output = tmp.path().join("export.db");
+    let conn = open_db(&source)?;
+    create_source_db(&conn)?;
+    insert_test_data(&conn)?;
+    conn.execute("UPDATE messages SET idx = 0 WHERE id = 2")?;
+    conn.execute("UPDATE conversations SET started_at = 2000000000000 WHERE id IN (2, 3)")?;
+    drop(conn);
+    let filter = ExportFilter {
+        agents: None,
+        workspaces: None,
+        since: None,
+        until: None,
+        path_mode: PathMode::Full,
+    };
+    ExportEngine::new(&source, &output, filter).execute(|_, _| {}, None)?;
+
+    let viewer = rusqlite::Connection::open_with_flags(
+        &output,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let window = "SELECT id FROM messages WHERE conversation_id = 1
+                  ORDER BY idx, id LIMIT 50 OFFSET 0";
+    let recent = "SELECT id FROM conversations ORDER BY started_at DESC, id DESC LIMIT 2";
+    for (query, index) in [
+        (window, "messages_conversation_order"),
+        (
+            "SELECT id, idx, instr(content, 'token') > 0 FROM messages
+             WHERE conversation_id = 1 AND (idx, id) < (2, 3)
+             ORDER BY idx DESC, id DESC LIMIT 128",
+            "messages_conversation_order",
+        ),
+        (
+            "SELECT id, idx, length(CAST(content AS BLOB)) FROM messages
+             WHERE conversation_id = 1 AND (idx, id) > (0, 1) ORDER BY idx, id LIMIT 128",
+            "messages_conversation_order",
+        ),
+        (recent, "conversations_recent"),
+        (
+            "SELECT id, title FROM conversations WHERE agent = 'claude' AND started_at >= 0
+             ORDER BY started_at DESC, id DESC LIMIT 50",
+            "conversations_agent_recent",
+        ),
+        (
+            "SELECT id, title FROM conversations WHERE workspace = '/home/user/project-a' COLLATE BINARY
+             ORDER BY started_at DESC, id DESC LIMIT 50",
+            "conversations_workspace_recent",
+        ),
+    ] {
+        let mut explain = viewer.prepare(&format!("EXPLAIN QUERY PLAN {query}"))?;
+        let plan = explain
+            .query_map([], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .join("\n");
+        assert!(plan.contains(index), "{query}\n{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{query}\n{plan}");
+        if index != "conversations_recent" {
+            assert!(plan.contains("SEARCH "), "{query}\n{plan}");
+        }
+    }
+    for (query, expected) in [(window, vec![1_i64, 2, 3]), (recent, vec![3, 2])] {
+        let mut stmt = viewer.prepare(query)?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(ids, expected, "{query}");
+    }
+    Ok(())
+}
+
 #[test]
 fn export_engine_preserves_message_order() {
     let tmp = TempDir::new().unwrap();
