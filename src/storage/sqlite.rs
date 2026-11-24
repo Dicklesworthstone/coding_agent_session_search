@@ -20891,7 +20891,15 @@ fn franken_insert_conversation(
     workspace_id: Option<i64>,
     conv: &Conversation,
 ) -> Result<Option<i64>> {
-    let (metadata_json_str, metadata_bin) = franken_metadata_insert_payload(&conv.metadata_json)?;
+    let prefix_packet = codex_prefix_packet(conv);
+    let mut metadata = Cow::Borrowed(&conv.metadata_json);
+    if prefix_packet {
+        set_codex_prefix_requirement(metadata.to_mut())?;
+    }
+    let (metadata_json_str, metadata_bin) = franken_metadata_insert_payload(metadata.as_ref())?;
+    if prefix_packet {
+        ensure_codex_prefix_metadata_budget(metadata_json_str.as_deref(), metadata_bin.as_deref())?;
+    }
     let (last_message_idx, last_message_created_at) = conversation_tail_state(conv);
     let metadata_bin_bytes = metadata_bin.as_deref();
 
@@ -21581,6 +21589,75 @@ fn codex_prefix_packet(conv: &Conversation) -> bool {
             .is_some()
 }
 
+const MAX_CODEX_PREFIX_METADATA_BYTES: usize = 256 * 1024;
+
+fn ensure_codex_prefix_metadata_budget(json: Option<&str>, binary: Option<&[u8]>) -> Result<()> {
+    anyhow::ensure!(
+        json.map_or(0, str::len)
+            .saturating_add(binary.map_or(0, <[u8]>::len))
+            <= MAX_CODEX_PREFIX_METADATA_BYTES,
+        "Codex canonical integrity metadata exceeds its byte budget; reconciliation is required"
+    );
+    Ok(())
+}
+
+/// A canonical protocol requirement, not a source or publication receipt. It
+/// survives a later parser mode or source-ledger-key change, including a
+/// regular source becoming an explicitly selected symlink or compressed file.
+fn set_codex_prefix_requirement(metadata: &mut serde_json::Value) -> Result<bool> {
+    if metadata.is_null() {
+        *metadata = serde_json::json!({});
+    }
+    let object = metadata.as_object_mut().context(
+        "cannot preserve non-object Codex metadata while requiring prefix admission",
+    )?;
+    let cass = object.entry("cass").or_insert_with(|| serde_json::json!({}));
+    if cass.is_null() {
+        *cass = serde_json::json!({});
+    }
+    let cass = cass.as_object_mut().context(
+        "cannot preserve non-object CASS metadata while requiring Codex prefix admission",
+    )?;
+    if cass.get("codex_prefix_required") == Some(&serde_json::Value::Bool(true)) {
+        return Ok(false);
+    }
+    cass.insert("codex_prefix_required".to_owned(), serde_json::Value::Bool(true));
+    Ok(true)
+}
+
+/// Bound both stored representations before returning either from SQLite.
+/// Unlike display-oriented compatibility readers, corruption must not become
+/// empty metadata and thereby erase an existing integrity requirement.
+fn franken_codex_integrity_metadata(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+) -> Result<serde_json::Value> {
+    let (encoded_bytes, json, binary): (i64, Option<String>, Option<Vec<u8>>) = tx.query_row_map(
+        "SELECT COALESCE(length(CAST(metadata_json AS BLOB)), 0) + \
+                       COALESCE(length(CAST(metadata_bin AS BLOB)), 0), \
+                CASE WHEN COALESCE(length(CAST(metadata_json AS BLOB)), 0) + \
+                               COALESCE(length(CAST(metadata_bin AS BLOB)), 0) <= ?2 \
+                     THEN metadata_json ELSE NULL END, \
+                CASE WHEN COALESCE(length(CAST(metadata_json AS BLOB)), 0) + \
+                               COALESCE(length(CAST(metadata_bin AS BLOB)), 0) <= ?2 \
+                     THEN metadata_bin ELSE NULL END \
+         FROM conversations WHERE id = ?1",
+        fparams![conversation_id, MAX_CODEX_PREFIX_METADATA_BYTES as i64],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+    )?;
+    anyhow::ensure!(
+        (0..=MAX_CODEX_PREFIX_METADATA_BYTES as i64).contains(&encoded_bytes),
+        "Codex canonical integrity metadata exceeds its byte budget; reconciliation is required"
+    );
+    if let Some(bytes) = binary.as_deref().filter(|bytes| !bytes.is_empty()) {
+        rmp_serde::from_slice(bytes).context("invalid canonical Codex MessagePack metadata")
+    } else if let Some(json) = json.as_deref() {
+        serde_json::from_str(json).context("invalid canonical Codex JSON metadata")
+    } else {
+        Ok(serde_json::json!({}))
+    }
+}
+
 /// A source receipt proves the parser's bytes, not that an older archive used
 /// the same message projection. Check actual canonical rows before any append
 /// or replay shortcut, including archives created before prefix receipts.
@@ -21595,7 +21672,19 @@ fn franken_validate_codex_prefix_overlap<'a>(
     conversation_id: i64,
     conv: &'a Conversation,
 ) -> Result<Option<ExistingConversationNewMessages<'a>>> {
+    if conv.agent_slug != "codex" {
+        return Ok(None);
+    }
+    let mut canonical_metadata = franken_codex_integrity_metadata(tx, conversation_id)?;
     if !codex_prefix_packet(conv) {
+        if canonical_metadata.pointer("/cass/codex_prefix_required").is_some()
+            || canonical_metadata.pointer("/cass/codex_stable_prefix").is_some()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Codex canonical history requires prefix admission; parser-mode reconciliation is required",
+            ).into());
+        }
         return Ok(None);
     }
     let receipt: crate::connectors::codex::StablePrefixReceipt = serde_json::from_value(
@@ -21673,6 +21762,15 @@ fn franken_validate_codex_prefix_overlap<'a>(
             messages.push(message);
             new_chars = new_chars.saturating_add(i64::try_from(message.content.len())?);
         }
+    }
+    if set_codex_prefix_requirement(&mut canonical_metadata)? {
+        let (json, binary) = franken_metadata_insert_payload(&canonical_metadata)?;
+        ensure_codex_prefix_metadata_budget(json.as_deref(), binary.as_deref())?;
+        let updated = tx.execute_compat(
+            "UPDATE conversations SET metadata_json = ?1, metadata_bin = ?2 WHERE id = ?3",
+            fparams![json.as_deref(), binary.as_deref(), conversation_id],
+        )?;
+        anyhow::ensure!(updated == 1, "canonical Codex metadata disappeared during prefix admission");
     }
     Ok(Some(ExistingConversationNewMessages {
         messages,

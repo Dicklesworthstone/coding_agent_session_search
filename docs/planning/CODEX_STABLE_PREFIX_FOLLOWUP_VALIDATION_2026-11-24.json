@@ -2,7 +2,7 @@
   "schema": "cass.stable_prefix.followup_validation.v1",
   "date_utc": "2026-11-24",
   "base_commit": "f9d7a0a8014e877482190f92498ff5eb28020c9a",
-  "scope": "Advisory-probe FIFO admission, nonempty active zero-boundary deferral, observation root validation, and per-source rebuild integrity preparation",
+  "scope": "Advisory-probe FIFO admission, nonempty active zero-boundary deferral, observation root validation, and per-source rebuild integrity preparation, and a transactional canonical prefix-protocol requirement across parser/ledger-key changes",
   "qualification": "Final sources have exact-context reconstruction and independent source review only. No test binary executed in this restored attempt. No final compiler, formatter, Clippy, UBS, host/storage or CLI pass is claimed.",
   "captured_execution_attempt": {
     "schema": "cass.stable_prefix.restored_environment_validation.v1",
@@ -256,6 +256,16 @@
       "path": "src/indexer/source_ledger_tests.rs",
       "git_blob_sha1": "c4fdefb0b76f80cf52a54e2186e44e61d23d43f7",
       "sha256": "1160ef6a43728b1baa7b87bb3ec60bc75061294bdf2de7fb763cb6426a15e8be"
+    },
+    {
+      "path": "src/storage/sqlite.rs",
+      "git_blob_sha1": "b610d40b21e029da4777ffee3053d97943f6d1f6",
+      "sha256": "5dcd3090e98415d1102ba4599203170b7146ccd170fb72e769b40170bdd2e5d5"
+    },
+    {
+      "path": "src/storage/sqlite/codex_prefix_tests.rs",
+      "git_blob_sha1": "f1b8f0736b454898ace4bdfb307b61637b400015",
+      "sha256": "254341f5cf546dfaa2c5205812a4d641cb7b517aff51c60eb27413073d0fb372"
     }
   ],
   "recovery": {
@@ -286,6 +296,38 @@
     "branch": "main",
     "pull_request": false,
     "dependencies_or_toolchain_changed": false,
-    "github_actions_used": false
+    "github_actions_used": false,
+    "admission_and_rebuild_commit": "c6dfcc5aad95a96180260debe80edfb5f93d0977",
+    "concurrent_upstream_preserved": "46f433f6bb9dd296dcd50b1691de26af11aa5a89"
+  },
+  "canonical_storage": {
+    "requirement": "/cass/codex_prefix_required",
+    "authority": "Canonical protocol requirement only; grants no source-completion, reuse or publication authority.",
+    "metadata_budget_combined_bytes": 262144,
+    "strict_binary_precedence": true,
+    "marker_and_canonical_receipt_transaction_shared": true,
+    "new_regression_entrypoints": [
+      "codex_prefix_requirement_blocks_downgrade_for_new_and_existing_receipt_metadata",
+      "codex_prefix_requirement_preserves_legacy_metadata_for_append_and_noop_upgrades",
+      "codex_prefix_requirement_rolls_back_with_later_batch_refusal",
+      "codex_prefix_integrity_metadata_is_bounded_and_strictly_decoded",
+      "codex_prefix_regular_to_explicit_symlink_cannot_downgrade_canonical_admission"
+    ],
+    "original_six_canonical_test_source_preserved": true,
+    "independent_review": "Source-only: SQL bounds, strict binary precedence, actual conversation resolution and normal single/batched/profile/conflict routes, metadata preservation, no-op transaction commit, rollback, and pinned-FAD explicit-symlink identity.",
+    "final_native_results": "Not executed: no compile/typecheck, Rust test, SQL runtime, formatter or Clippy result for these final sources.",
+    "rebase": {
+      "upstream_commit": "46f433f6bb9dd296dcd50b1691de26af11aa5a89",
+      "base_storage_blob": "d9d1bcbf514e79a81e8901827b973346e8afd5b1",
+      "manifest_blob": "6b62392914892e6f9edf8dff9ea25e50cd0ccab6",
+      "exact_reviewed_patch_reapplication_verified": true,
+      "concurrent_forget_wal_edits_preserved": true
+    },
+    "historical_limit": "Legacy conversations upgraded before this correction whose only prefix evidence remains under an obsolete ledger key require explicit reconciliation/backfill. No automatic migration or unindexed ledger scan was added."
+  },
+  "final_environment_probe": {
+    "outcome": "Unavailable; a minimal pwd probe failed to create an exec process after transport recovery timed out.",
+    "runtime_checks_started": 0,
+    "qualification": "No additional native validation was attempted through an alternate environment."
   }
 }

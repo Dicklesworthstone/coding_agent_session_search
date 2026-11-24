@@ -324,3 +324,267 @@ fn codex_prefix_absent_metadata_preserves_legacy_behavior_but_malformed_proof_fa
     assert!(fixture.storage.source_ingest_ledger_entries()?.is_empty());
     Ok(())
 }
+
+
+impl Fixture {
+    fn metadata_columns(&self, conversation_id: i64) -> Result<(Option<String>, Option<Vec<u8>>)> {
+        Ok(self.storage.raw().query_row_map(
+            "SELECT metadata_json, metadata_bin FROM conversations WHERE id = ?1",
+            fparams![conversation_id],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )?)
+    }
+
+    fn metadata(&self, conversation_id: i64) -> Result<serde_json::Value> {
+        Ok(self.storage.raw().query_row_map(
+            "SELECT metadata_json, metadata_bin FROM conversations WHERE id = ?1",
+            fparams![conversation_id],
+            |row| Ok(franken_read_metadata_compat(row, 0, 1)),
+        )?)
+    }
+
+    fn replace_metadata(
+        &self,
+        conversation_id: i64,
+        json: Option<&str>,
+        binary: Option<&[u8]>,
+    ) -> Result<()> {
+        self.storage.raw().execute_compat(
+            "UPDATE conversations SET metadata_json = ?1, metadata_bin = ?2 WHERE id = ?3",
+            fparams![json, binary, conversation_id],
+        )?;
+        Ok(())
+    }
+
+    fn ordinary_append(&self) -> Conversation {
+        let mut conversation = self.legacy(self.conversation.messages.len());
+        let mut next = conversation.messages.last().unwrap().clone();
+        next.idx += 1;
+        next.created_at = next.created_at.map(|timestamp| timestamp + 1_000);
+        next.content = "new suffix from the strict parser".to_owned();
+        conversation.ended_at = next.created_at;
+        conversation.messages.push(next);
+        conversation
+    }
+}
+
+#[test]
+fn codex_prefix_requirement_blocks_downgrade_for_new_and_existing_receipt_metadata() -> Result<()> {
+    for batched in [false, true] {
+        for old_receipt_without_requirement in [false, true] {
+            let fixture = Fixture::new(3, false, true)?;
+            let id = fixture.seed(&fixture.conversation)?;
+            assert_eq!(
+                fixture.metadata(id)?.pointer("/cass/codex_prefix_required"),
+                Some(&serde_json::Value::Bool(true))
+            );
+            if old_receipt_without_requirement {
+                // Older native prefix rows already retained a full receipt,
+                // but predate the explicit canonical protocol requirement.
+                let bytes = rmp_serde::to_vec(&fixture.conversation.metadata_json)?;
+                fixture.replace_metadata(id, None, Some(&bytes))?;
+                assert!(fixture.metadata(id)?.pointer("/cass/codex_prefix_required").is_none());
+            }
+            let rows = fixture.rows(id)?;
+            let metadata = fixture.metadata_columns(id)?;
+            let mut strict = fixture.ordinary_append();
+            strict.messages[0].content = "rewritten prefix under another parser mode".to_owned();
+            let error = fixture.ingest(&strict, batched).err().context("parser downgrade merged")?;
+            assert!(error.to_string().contains("requires prefix admission"));
+            assert_eq!(fixture.rows(id)?, rows);
+            assert_eq!(fixture.metadata_columns(id)?, metadata);
+            assert!(fixture.storage.source_ingest_ledger_entries()?.is_empty());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn codex_prefix_requirement_preserves_legacy_metadata_for_append_and_noop_upgrades() -> Result<()> {
+    for batched in [false, true] {
+        for binary in [false, true] {
+            for append in [false, true] {
+                let fixture = Fixture::new(3, false, true)?;
+                let seed_count = if append { 2 } else { 3 };
+                let legacy = fixture.legacy(seed_count);
+                let id = fixture.seed(&legacy)?;
+                let preserved = serde_json::json!({
+                    "legacy_archive": true,
+                    "provider": {"retained": ["one", 2, false]},
+                    "cass": {"workspace_original": "/remote/project", "unrelated": {"keep": true}}
+                });
+                let json = serde_json::to_string(&preserved)?;
+                let packed = rmp_serde::to_vec(&preserved)?;
+                fixture.replace_metadata(
+                    id,
+                    (!binary).then_some(json.as_str()),
+                    binary.then_some(packed.as_slice()),
+                )?;
+                let outcome = fixture.ingest(&fixture.conversation, batched)?;
+                assert_eq!(outcome.inserted_indices.len(), usize::from(append));
+                let mut expected = preserved;
+                expected["cass"]["codex_prefix_required"] = serde_json::Value::Bool(true);
+                assert_eq!(fixture.metadata(id)?, expected);
+                assert!(fixture.metadata(id)?.pointer("/cass/codex_stable_prefix").is_none(),
+                    "a protocol marker must not fabricate a source publication receipt");
+                let rows = fixture.rows(id)?;
+                let metadata = fixture.metadata_columns(id)?;
+                let receipts = fixture.storage.source_ingest_ledger_entries()?;
+                let error = fixture.ingest(&fixture.ordinary_append(), batched)
+                    .err().context("legacy upgrade lost its protocol requirement")?;
+                assert!(error.to_string().contains("requires prefix admission"));
+                assert_eq!(fixture.rows(id)?, rows);
+                assert_eq!(fixture.metadata_columns(id)?, metadata);
+                assert_eq!(fixture.storage.source_ingest_ledger_entries()?, receipts);
+                assert!(fixture.ingest(&fixture.conversation, batched)?.inserted_indices.is_empty());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn codex_prefix_requirement_rolls_back_with_later_batch_refusal() -> Result<()> {
+    let fixture = Fixture::new(3, false, true)?;
+    let id = fixture.seed(&fixture.legacy(1))?;
+    let rows = fixture.rows(id)?;
+    let metadata = fixture.metadata_columns(id)?;
+    let strict = fixture.ordinary_append();
+    let error = fixture.storage.insert_conversations_batched_with_completion(
+        &[
+            (fixture.agent, None, &fixture.conversation),
+            (fixture.agent, None, &strict),
+        ],
+        false,
+        Some(&fixture.completion()),
+    ).err().context("a later strict packet ignored the preceding prefix admission")?;
+    assert!(error.to_string().contains("requires prefix admission"));
+    assert_eq!(fixture.rows(id)?, rows);
+    assert_eq!(fixture.metadata_columns(id)?, metadata);
+    assert!(fixture.storage.source_ingest_ledger_entries()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn codex_prefix_integrity_metadata_is_bounded_and_strictly_decoded() -> Result<()> {
+    let ordinary = "{\"legacy_archive\":true}".to_owned();
+    let mut at_limit = serde_json::json!({"padding": ""});
+    let empty_len = at_limit.to_string().len();
+    at_limit["padding"] = serde_json::json!("x".repeat(MAX_CODEX_PREFIX_METADATA_BYTES - empty_len));
+    let at_limit = at_limit.to_string();
+    assert_eq!(at_limit.len(), MAX_CODEX_PREFIX_METADATA_BYTES);
+    let cases = [
+        ("json-invalid", Some("SECRET_INVALID_METADATA".to_owned()), None),
+        ("bin-invalid", Some(ordinary), Some(vec![0xc1])),
+        ("json-large", Some("{".repeat(MAX_CODEX_PREFIX_METADATA_BYTES + 1)), None),
+        ("bin-large", None, Some(vec![0; MAX_CODEX_PREFIX_METADATA_BYTES + 1])),
+        ("output-large", Some(at_limit), None),
+        ("root-array", Some("[]".to_owned()), None),
+    ];
+    for (name, json, binary) in cases {
+        let fixture = Fixture::new(3, false, true)?;
+        let id = fixture.seed(&fixture.legacy(2))?;
+        fixture.replace_metadata(id, json.as_deref(), binary.as_deref())?;
+        let rows = fixture.rows(id)?;
+        let metadata = fixture.metadata_columns(id)?;
+        let error = fixture.ingest(&fixture.conversation, true)
+            .err().with_context(|| format!("{name}: unsafe metadata was replaced"))?;
+        let message = error.to_string();
+        match name {
+            "json-invalid" => assert!(message.contains("JSON metadata")),
+            "bin-invalid" => assert!(message.contains("MessagePack metadata")),
+            "root-array" => assert!(message.contains("non-object")),
+            _ => assert!(message.contains("byte budget"), "{name}: {error:#}"),
+        }
+        assert!(!format!("{error:#}").contains("SECRET_INVALID_METADATA"));
+        assert_eq!(fixture.rows(id)?, rows, "{name}");
+        assert_eq!(fixture.metadata_columns(id)?, metadata, "{name}");
+        assert!(fixture.storage.source_ingest_ledger_entries()?.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn codex_prefix_regular_to_explicit_symlink_cannot_downgrade_canonical_admission() -> Result<()> {
+    use std::os::unix::fs::symlink;
+    use franken_agent_detection::connectors::{SourceCompletion, SourceScanHooks};
+
+    for legacy_upgrade in [false, true] {
+        for batched in [false, true] {
+            let fixture = Fixture::new(2, false, true)?;
+            let id = if legacy_upgrade {
+                let id = fixture.seed(&fixture.legacy(1))?;
+                fixture.ingest(&fixture.conversation, batched)?;
+                id
+            } else {
+                fixture.seed(&fixture.conversation)?
+            };
+            let source = &fixture.conversation.source_path;
+            let original_key_path = fs::canonicalize(source)?;
+            let original = fs::read_to_string(source)?;
+            let retained = source.with_extension("retained");
+            let replacement = source.with_file_name("symlink-target.jsonl");
+            fs::rename(source, &retained)?;
+            let appended = serde_json::json!({
+                "type": "response_item", "timestamp": "2026-11-23T12:00:02Z",
+                "payload": {"role": "user", "content": "new strict suffix"}
+            });
+            fs::write(&replacement, format!("{}{appended}\n",
+                original.replace("canonical prefix message 0", "changed first source message")))?;
+            fs::File::open(&replacement)?.set_modified(
+                SystemTime::now() - Duration::from_secs(7200)
+            )?;
+            symlink(&replacement, source)?;
+            assert_ne!(fs::canonicalize(source)?, original_key_path,
+                "the canonical-path ledger key must change in this regression");
+            let ctx = ScanContext::with_roots(
+                fixture._directory.path().join("cass"),
+                vec![ScanRoot::local(source.clone())],
+                None,
+            );
+            let mut should_scan = |observed: &crate::connectors::DiscoveredSourceFile| {
+                // Simulate the actual changed-key cache miss. Core strict
+                // parsing deliberately retains support for explicit symlinks.
+                crate::connectors::codex::set_previous_prefix_receipt(&observed.source_path, None)
+                    .unwrap();
+                true
+            };
+            let mut completions = 0;
+            let mut complete = |done: &SourceCompletion| {
+                assert!(crate::connectors::codex::current_prefix_receipt(&done.source.source_path).is_none());
+                completions += 1;
+                Ok(())
+            };
+            let mut delivered = Vec::new();
+            crate::connectors::codex::CodexConnector::new().scan_with_source_boundaries(
+                &ctx,
+                &mut SourceScanHooks {
+                    should_scan_source: Some(&mut should_scan),
+                    on_source_complete: Some(&mut complete),
+                },
+                &mut |conversation| {
+                    delivered.push(conversation);
+                    Ok(())
+                },
+            )?;
+            assert_eq!(completions, 1);
+            assert_eq!(delivered.len(), 1);
+            let strict = crate::indexer::persist::map_to_internal(&delivered.remove(0));
+            assert!(!codex_prefix_packet(&strict));
+            assert_eq!(strict.external_id, fixture.conversation.external_id);
+            assert_eq!(strict.source_path, *source);
+            assert_eq!(strict.messages.len(), 3);
+            assert_eq!(strict.messages[0].content, "changed first source message");
+            let rows = fixture.rows(id)?;
+            let metadata = fixture.metadata_columns(id)?;
+            let receipts = fixture.storage.source_ingest_ledger_entries()?;
+            let error = fixture.ingest(&strict, batched).err().context("symlink downgrade merged")?;
+            assert!(error.to_string().contains("requires prefix admission"));
+            assert_eq!(fixture.rows(id)?, rows);
+            assert_eq!(fixture.metadata_columns(id)?, metadata);
+            assert_eq!(fixture.storage.source_ingest_ledger_entries()?, receipts);
+            assert_eq!(fs::read_to_string(&retained)?, original);
+        }
+    }
+    Ok(())
+}
