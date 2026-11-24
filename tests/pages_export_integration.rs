@@ -1026,6 +1026,79 @@ fn export_engine_preserves_existing_output_when_staged_verifier_rejects() {
 }
 
 #[test]
+fn staged_secret_scan_blocks_historical_json_credentials_before_publication() -> TestResult<()> {
+    use coding_agent_search::pages::profiles::ShareProfile;
+    use coding_agent_search::pages::secret_scan::{SecretScanConfig, scan_staged_export_database};
+
+    let tmp = TempDir::new()?;
+    let source_path = tmp.path().join("source.db");
+    let output_path = tmp.path().join("export.db");
+    let src_conn = open_db(&source_path)?;
+    create_source_db(&src_conn)?;
+    insert_test_data(&src_conn)?;
+    src_conn.close()?;
+    let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+    let engine = || {
+        ExportEngine::new(
+            &source_path,
+            &output_path,
+            ExportFilter {
+                agents: None,
+                workspaces: None,
+                since: None,
+                until: None,
+                path_mode: PathMode::Full,
+            },
+        )
+        .with_share_profile(ShareProfile::Public)
+    };
+
+    // A genuinely clean generation passes the real staged scan and publishes.
+    let (_, clean) = engine().execute_verified(
+        |_, _| {},
+        None,
+        |path| scan_staged_export_database(path, &config),
+    )?;
+    assert_eq!(clean.report.summary.total, 0);
+    let approved = std::fs::read(&output_path)?;
+
+    // Simulate historical rows written before ingestion's structured policy.
+    // Public profiles deliberately leave credentials for this approval scan.
+    let src_conn = open_db(&source_path)?;
+    src_conn.execute_compat(
+        "UPDATE messages SET content = ?1 WHERE id = 1",
+        fparams!["tool output: {\"password\":\"rose\"} public tail"],
+    )?;
+    src_conn.execute_compat(
+        "UPDATE conversations SET metadata_json = ?1 WHERE id = 1",
+        fparams![serde_json::json!({"tool_result": r#"{"pin":"7319"}"#}).to_string()],
+    )?;
+    src_conn.close()?;
+    let mut finding_count = 0;
+    let error = engine()
+        .execute_verified(
+            |_, _| {},
+            None,
+            |path| {
+                let scan = scan_staged_export_database(path, &config)?;
+                finding_count = scan.report.summary.total;
+                let report = serde_json::to_string(&scan.report)?;
+                assert!(!report.contains("rose"));
+                assert!(!report.contains("7319"));
+                if finding_count > 0 {
+                    anyhow::bail!("staged generation contains structured credentials");
+                }
+                Ok(())
+            },
+        )
+        .expect_err("a false-clean scan must never replace the approved generation");
+    assert!(error.to_string().contains("verification failed"));
+    assert_eq!(finding_count, 2);
+    assert_eq!(std::fs::read(&output_path)?, approved);
+    Ok(())
+}
+
+#[test]
 fn export_engine_rejects_sidecar_created_by_staged_verifier() {
     let tmp = TempDir::new().unwrap();
     let source_path = tmp.path().join("source.db");

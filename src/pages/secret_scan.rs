@@ -6,8 +6,8 @@ use crate::indexer::redact_secrets::{
     ANTHROPIC_API_KEY_PATTERN, AWS_ACCESS_KEY_PATTERN, AWS_SECRET_KEY_PATTERN,
     AWS_SESSION_TOKEN_PATTERN, BEARER_TOKEN_PATTERN, DATABASE_URL_PATTERN,
     GENERIC_SECRET_ASSIGNMENT_PATTERN, GITHUB_TOKEN_PATTERN, HTTP_AUTHORIZATION_PATTERN,
-    HTTP_COOKIE_PATTERN, JWT_PATTERN, OPENAI_API_KEY_PATTERN, PRIVATE_KEY_BLOCK_PATTERN,
-    SLACK_TOKEN_PATTERN, STRIPE_KEY_PATTERN,
+    HTTP_COOKIE_PATTERN, JWT_PATTERN, JsonPrivacyEvent, JsonSourceSpan, OPENAI_API_KEY_PATTERN,
+    PRIVATE_KEY_BLOCK_PATTERN, SLACK_TOKEN_PATTERN, STRIPE_KEY_PATTERN, inspect_json_content,
 };
 use anyhow::{Context, Result, bail};
 use console::{Term, style};
@@ -16,7 +16,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -291,7 +291,6 @@ struct ScanContext {
 
 struct StructuredMetadataScan {
     text: String,
-    value: Option<serde_json::Value>,
 }
 
 struct FindingCandidate<'a> {
@@ -332,6 +331,80 @@ impl FindingOccurrence {
             && self.location == candidate.location
             && self.start < candidate.end
             && candidate.start < self.end
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MatchFingerprint {
+    digest: [u8; 32],
+    bytes: usize,
+}
+
+impl MatchFingerprint {
+    fn of(text: &str) -> Self {
+        Self {
+            digest: Sha256::digest(text.as_bytes()).into(),
+            bytes: text.len(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TextScanCoverage {
+    // Only bounded fingerprints and finding indices are retained, never an
+    // extra copy of a credential or a potentially large private-key block.
+    matches: Vec<(MatchFingerprint, usize, usize, usize)>,
+    claimed: HashSet<usize>,
+}
+
+impl TextScanCoverage {
+    fn claim(&mut self, fingerprint: MatchFingerprint, source: JsonSourceSpan) -> Option<usize> {
+        let index = self.matches.iter().find_map(|(known, index, start, end)| {
+            (*known == fingerprint
+                && source.start <= *start
+                && *end <= source.end
+                && !self.claimed.contains(index))
+            .then_some(*index)
+        })?;
+        self.claimed.insert(index);
+        Some(index)
+    }
+}
+
+struct JsonScanCoverage {
+    original: TextScanCoverage,
+    decoded: BTreeMap<usize, TextScanCoverage>,
+}
+
+struct PendingSensitiveField {
+    needs_floor: bool,
+    reported_high: bool,
+}
+
+impl JsonScanCoverage {
+    fn new(original: TextScanCoverage) -> Self {
+        Self {
+            original,
+            decoded: BTreeMap::new(),
+        }
+    }
+
+    fn enter_layer(&mut self, layer: usize) {
+        self.decoded.retain(|depth, _| *depth < layer);
+    }
+
+    fn parent(
+        &mut self,
+        layer: usize,
+        source_span: Option<JsonSourceSpan>,
+    ) -> Option<(&mut TextScanCoverage, JsonSourceSpan)> {
+        let source = source_span?;
+        let coverage = if layer == 1 {
+            &mut self.original
+        } else {
+            self.decoded.get_mut(&layer.checked_sub(1)?)?
+        };
+        Some((coverage, source))
     }
 }
 
@@ -1069,12 +1142,7 @@ fn structured_metadata_scan_text(
             .with_context(|| {
                 format!("Failed to serialize decoded {binary_column} value for row {row_id}")
             })
-            .map(|text| {
-                Some(StructuredMetadataScan {
-                    text,
-                    value: Some(value),
-                })
-            });
+            .map(|text| Some(StructuredMetadataScan { text }));
     }
 
     let Some(text) = legacy_json.filter(|text| !text.trim().is_empty()) else {
@@ -1092,10 +1160,8 @@ fn parse_json_metadata(text: &str, column: &str, row_id: i64) -> Result<Structur
     if crate::indexer::redact_secrets::json_has_duplicate_keys(text).with_context(decode_error)? {
         bail!("Duplicate JSON keys in {column} for row {row_id}; cannot certify every value");
     }
-    let value = serde_json::from_str(text).with_context(decode_error)?;
     Ok(StructuredMetadataScan {
         text: text.to_owned(),
-        value: Some(value),
     })
 }
 
@@ -1108,18 +1174,25 @@ fn scan_structured_metadata(
     truncated: &mut bool,
 ) {
     let first = findings.len();
-    scan_field(
+    let coverage = scan_text_recorded(
         &metadata.text,
         location.clone(),
         ctx,
         config,
         findings,
         truncated,
+        None,
+    );
+    scan_json_privacy(
+        &metadata.text,
+        coverage,
+        location,
+        ctx,
+        config,
+        findings,
+        truncated,
     );
     redact_structured_metadata_contexts(&mut findings[first..]);
-    if let Some(value) = &metadata.value {
-        scan_sensitive_json_fields(value, location, ctx, config, findings, truncated);
-    }
 }
 
 fn redact_structured_metadata_contexts(findings: &mut [SecretFinding]) {
@@ -1128,17 +1201,13 @@ fn redact_structured_metadata_contexts(findings: &mut [SecretFinding]) {
     }
 }
 
-/// Report credential-bearing structured fields that text patterns cannot see.
-///
-/// The ingestion redactor treats field names such as `pin`, `cookie`, and
-/// `private_key` as authoritative even when their values are too short to
-/// satisfy a token regex. The post-hoc scanner must apply the same structural
-/// floor or it can return a false-clean report for historical rows. A field
-/// already covered by an equal-or-higher-severity text detector is skipped so
-/// the structural floor does not inflate an equivalent existing finding. A
-/// lower-severity heuristic must not suppress this high-severity floor.
-fn scan_sensitive_json_fields(
-    value: &serde_json::Value,
+/// Apply the canonical bounded walk to historical transcript text and decoded
+/// metadata. A decoded detector must actually report an occurrence before it
+/// can suppress the structural floor; recognizing a token in a reserialized
+/// value is not proof that the original escaped bytes were scanned.
+fn scan_json_privacy(
+    text: &str,
+    original: TextScanCoverage,
     location: SecretLocation,
     ctx: &ScanContext,
     config: &SecretScanConfig,
@@ -1148,72 +1217,159 @@ fn scan_sensitive_json_fields(
     if *truncated {
         return;
     }
-
-    match value {
-        serde_json::Value::Array(values) => {
-            for value in values {
-                scan_sensitive_json_fields(
-                    value,
+    let mut coverage = JsonScanCoverage::new(original);
+    let mut ambiguous_reported = false;
+    let mut pending_fields: Vec<PendingSensitiveField> = Vec::new();
+    let mut observe = |event: JsonPrivacyEvent<'_>| {
+        if *truncated {
+            return;
+        }
+        match event {
+            JsonPrivacyEvent::DecodedText {
+                text,
+                layer,
+                source_span,
+            } => {
+                coverage.enter_layer(layer);
+                let decoded = scan_text_recorded(
+                    text,
                     location.clone(),
                     ctx,
                     config,
                     findings,
                     truncated,
+                    coverage.parent(layer, source_span),
                 );
-                if *truncated {
-                    return;
+                if decoded.matches.iter().any(|(_, index, _, _)| {
+                    findings[*index].severity.rank() <= SecretSeverity::High.rank()
+                }) {
+                    for field in &mut pending_fields {
+                        field.reported_high = true;
+                    }
                 }
+                coverage.decoded.insert(layer, decoded);
             }
-        }
-        serde_json::Value::Object(fields) => {
-            for (field, field_value) in fields {
-                if crate::indexer::redact_secrets::is_sensitive_json_field(field) {
-                    if !structured_value_contains_material(field_value)
-                        || structured_value_is_fully_allowlisted(field_value, config)
-                        || structured_field_has_equal_or_higher_text_detector(
-                            field,
-                            field_value,
-                            config,
-                            SecretSeverity::High,
-                        )
-                    {
-                        continue;
-                    }
-                    if findings.len() >= config.max_findings {
-                        *truncated = true;
-                        return;
-                    }
-                    findings.push(SecretFinding {
-                        severity: SecretSeverity::High,
-                        kind: "sensitive_metadata_field".to_string(),
-                        pattern: "sensitive_json_field".to_string(),
-                        match_redacted: REDACTED_CONTEXT.to_string(),
-                        context: REDACTED_METADATA_CONTEXT.to_string(),
-                        location: location.clone(),
-                        agent: redact_report_provenance(&ctx.agent, config),
-                        workspace: redact_report_provenance(&ctx.workspace, config),
-                        source_path: redact_report_provenance(&ctx.source_path, config),
-                        conversation_id: ctx.conversation_id,
-                        message_id: ctx.message_id,
-                        message_idx: ctx.message_idx,
-                    });
+            JsonPrivacyEvent::SensitiveField {
+                value,
+                layer,
+                source_span,
+                ..
+            } => {
+                coverage.enter_layer(layer);
+                // Containers are visited as real child nodes by the shared
+                // walker, with no synthetic serialization layer. A scalar's
+                // decoded text is scanned once here before embedded descent.
+                let decoded = if value.is_object() || value.is_array() {
+                    TextScanCoverage::default()
                 } else {
-                    scan_sensitive_json_fields(
-                        field_value,
+                    let decoded_text = match value {
+                        serde_json::Value::String(text) => {
+                            std::borrow::Cow::Borrowed(text.as_str())
+                        }
+                        _ => std::borrow::Cow::Owned(value.to_string()),
+                    };
+                    scan_text_recorded(
+                        &decoded_text,
                         location.clone(),
                         ctx,
                         config,
                         findings,
                         truncated,
+                        coverage.parent(layer, source_span),
+                    )
+                };
+                let reported_high = decoded.matches.iter().any(|(_, index, _, _)| {
+                    findings[*index].severity.rank() <= SecretSeverity::High.rank()
+                });
+                coverage.decoded.insert(layer, decoded);
+                if reported_high {
+                    for field in &mut pending_fields {
+                        field.reported_high = true;
+                    }
+                }
+                pending_fields.push(PendingSensitiveField {
+                    needs_floor: structured_value_contains_material(value)
+                        && !structured_value_is_fully_allowlisted(value, config),
+                    reported_high,
+                });
+            }
+            JsonPrivacyEvent::SensitiveFieldEnd => {
+                if let Some(field) = pending_fields.pop()
+                    && field.needs_floor
+                    && !field.reported_high
+                {
+                    let kind = match location {
+                        SecretLocation::ConversationMetadata | SecretLocation::MessageMetadata => {
+                            "sensitive_metadata_field"
+                        }
+                        _ => "sensitive_json_field",
+                    };
+                    push_json_finding(
+                        kind,
+                        "sensitive_json_field",
+                        &location,
+                        ctx,
+                        config,
+                        findings,
+                        truncated,
                     );
-                    if *truncated {
-                        return;
+                    if !*truncated {
+                        for field in &mut pending_fields {
+                            field.reported_high = true;
+                        }
                     }
                 }
             }
+            JsonPrivacyEvent::Ambiguous if !ambiguous_reported => {
+                ambiguous_reported = true;
+                push_json_finding(
+                    "uninspectable_json",
+                    "bounded_json_policy",
+                    &location,
+                    ctx,
+                    config,
+                    findings,
+                    truncated,
+                );
+                if !*truncated {
+                    for field in &mut pending_fields {
+                        field.reported_high = true;
+                    }
+                }
+            }
+            JsonPrivacyEvent::Ambiguous => {}
         }
-        _ => {}
+    };
+    inspect_json_content(text, &mut observe);
+}
+
+fn push_json_finding(
+    kind: &str,
+    pattern: &str,
+    location: &SecretLocation,
+    ctx: &ScanContext,
+    config: &SecretScanConfig,
+    findings: &mut Vec<SecretFinding>,
+    truncated: &mut bool,
+) {
+    if findings.len() >= config.max_findings {
+        *truncated = true;
+        return;
     }
+    findings.push(SecretFinding {
+        severity: SecretSeverity::High,
+        kind: kind.to_owned(),
+        pattern: pattern.to_owned(),
+        match_redacted: REDACTED_CONTEXT.to_owned(),
+        context: REDACTED_METADATA_CONTEXT.to_owned(),
+        location: location.clone(),
+        agent: redact_report_provenance(&ctx.agent, config),
+        workspace: redact_report_provenance(&ctx.workspace, config),
+        source_path: redact_report_provenance(&ctx.source_path, config),
+        conversation_id: ctx.conversation_id,
+        message_id: ctx.message_id,
+        message_idx: ctx.message_idx,
+    });
 }
 
 fn structured_value_contains_material(value: &serde_json::Value) -> bool {
@@ -1253,47 +1409,6 @@ fn structured_value_is_fully_allowlisted(
         serde_json::Value::Bool(value) => is_fully_allowlisted(&value.to_string(), config),
         serde_json::Value::Number(value) => is_fully_allowlisted(&value.to_string(), config),
     }
-}
-
-fn structured_field_has_equal_or_higher_text_detector(
-    field: &str,
-    value: &serde_json::Value,
-    config: &SecretScanConfig,
-    structural_severity: SecretSeverity,
-) -> bool {
-    let Ok(field_text) = serde_json::to_string(field) else {
-        return false;
-    };
-    let Ok(value_text) = serde_json::to_string(value) else {
-        return false;
-    };
-    let mut text = String::with_capacity(
-        field_text
-            .len()
-            .saturating_add(value_text.len())
-            .saturating_add(3),
-    );
-    text.push('{');
-    text.push_str(&field_text);
-    text.push(':');
-    text.push_str(&value_text);
-    text.push('}');
-
-    if SecretSeverity::Critical.rank() <= structural_severity.rank()
-        && config
-            .denylist
-            .iter()
-            .any(|pattern| pattern.is_match(&text))
-    {
-        return true;
-    }
-    BUILTIN_PATTERNS.iter().any(|pattern| {
-        pattern.severity.rank() <= structural_severity.rank()
-            && pattern
-                .regex
-                .find_iter(&text)
-                .any(|matched| !is_allowlisted(matched.as_str(), config))
-    })
 }
 
 pub fn print_human_report(
@@ -1451,17 +1566,77 @@ fn scan_field(
     findings: &mut Vec<SecretFinding>,
     truncated: &mut bool,
 ) {
-    scan_text(
+    let coverage = scan_text_recorded(
         text,
-        location,
+        location.clone(),
         ctx,
         config,
         findings,
-        &mut Vec::new(),
         truncated,
+        None,
     );
+    scan_json_privacy(text, coverage, location, ctx, config, findings, truncated);
 }
 
+/// Scan one representation, remembering which real occurrences it reported.
+/// A child decoded representation can reuse each occurrence once. Different
+/// fields and repeated equal credentials therefore remain distinct, while
+/// repeated JSON decoding does not multiply findings or consume the cap.
+fn scan_text_recorded(
+    text: &str,
+    location: SecretLocation,
+    ctx: &ScanContext,
+    config: &SecretScanConfig,
+    findings: &mut Vec<SecretFinding>,
+    truncated: &mut bool,
+    mut inherited: Option<(&mut TextScanCoverage, JsonSourceSpan)>,
+) -> TextScanCoverage {
+    let mut coverage = TextScanCoverage::default();
+    if *truncated {
+        return coverage;
+    }
+    let mut seen: Vec<FindingOccurrence> = Vec::new();
+    visit_text_candidates(text, location, ctx, config, |candidate| {
+        let fingerprint = MatchFingerprint::of(&candidate.text[candidate.start..candidate.end]);
+        if !seen
+            .iter()
+            .any(|occurrence| occurrence.overlaps(&candidate))
+            && let Some(index) = inherited
+                .as_mut()
+                .and_then(|(parent, source)| parent.claim(fingerprint, *source))
+        {
+            seen.push(FindingOccurrence {
+                source_path: ctx.source_path.clone(),
+                conversation_id: ctx.conversation_id,
+                message_id: ctx.message_id,
+                message_idx: ctx.message_idx,
+                location: candidate.location.clone(),
+                start: candidate.start,
+                end: candidate.end,
+                finding_index: index,
+            });
+        }
+        let index = seen
+            .iter()
+            .find(|occurrence| occurrence.overlaps(&candidate))
+            .map_or(findings.len(), |occurrence| occurrence.finding_index);
+        let start = candidate.start;
+        let end = candidate.end;
+        push_finding(findings, &mut seen, candidate, config, truncated);
+        if index < findings.len() {
+            if inherited.is_some() {
+                findings[index].context = REDACTED_METADATA_CONTEXT.to_owned();
+            }
+            if !coverage.matches.contains(&(fingerprint, index, start, end)) {
+                coverage.matches.push((fingerprint, index, start, end));
+            }
+        }
+        !*truncated
+    });
+    coverage
+}
+
+#[cfg(test)]
 fn scan_text(
     text: &str,
     location: SecretLocation,
@@ -1475,26 +1650,39 @@ fn scan_text(
         return;
     }
 
+    visit_text_candidates(text, location, ctx, config, |candidate| {
+        push_finding(findings, seen, candidate, config, truncated);
+        !*truncated
+    });
+}
+
+/// Keep decoded strings on exactly the same detectors and allowlist policy as
+/// their original representation. The visitor can reconcile an occurrence
+/// before applying the global finding cap.
+fn visit_text_candidates<'a>(
+    text: &'a str,
+    location: SecretLocation,
+    ctx: &'a ScanContext,
+    config: &SecretScanConfig,
+    mut visit: impl FnMut(FindingCandidate<'a>) -> bool,
+) {
+    if text.is_empty() {
+        return;
+    }
+
     // Denylist first (always critical)
     for deny in &config.denylist {
         for mat in deny.find_iter(text) {
-            push_finding(
-                findings,
-                seen,
-                FindingCandidate {
-                    severity: SecretSeverity::Critical,
-                    kind: "denylist",
-                    pattern: CUSTOM_DENYLIST_PATTERN_ID,
-                    text,
-                    start: mat.start(),
-                    end: mat.end(),
-                    location: location.clone(),
-                    ctx,
-                },
-                config,
-                truncated,
-            );
-            if *truncated {
+            if !visit(FindingCandidate {
+                severity: SecretSeverity::Critical,
+                kind: "denylist",
+                pattern: CUSTOM_DENYLIST_PATTERN_ID,
+                text,
+                start: mat.start(),
+                end: mat.end(),
+                location: location.clone(),
+                ctx,
+            }) {
                 return;
             }
         }
@@ -1507,23 +1695,16 @@ fn scan_text(
             if is_allowlisted(matched, config) {
                 continue;
             }
-            push_finding(
-                findings,
-                seen,
-                FindingCandidate {
-                    severity: pattern.severity,
-                    kind: pattern.id,
-                    pattern: pattern.regex.as_str(),
-                    text,
-                    start: mat.start(),
-                    end: mat.end(),
-                    location: location.clone(),
-                    ctx,
-                },
-                config,
-                truncated,
-            );
-            if *truncated {
+            if !visit(FindingCandidate {
+                severity: pattern.severity,
+                kind: pattern.id,
+                pattern: pattern.regex.as_str(),
+                text,
+                start: mat.start(),
+                end: mat.end(),
+                location: location.clone(),
+                ctx,
+            }) {
                 return;
             }
         }
@@ -1538,51 +1719,37 @@ fn scan_text(
         if candidate.len() >= 32 && candidate.chars().all(|ch| ch.is_ascii_hexdigit()) {
             continue;
         }
-        if is_base64_entropy_secret(candidate, config, true) {
-            push_finding(
-                findings,
-                seen,
-                FindingCandidate {
-                    severity: SecretSeverity::Medium,
-                    kind: "high_entropy_base64",
-                    pattern: "entropy",
-                    text,
-                    start: mat.start(),
-                    end: mat.end(),
-                    location: location.clone(),
-                    ctx,
-                },
-                config,
-                truncated,
-            );
-            if *truncated {
-                return;
-            }
+        if is_base64_entropy_secret(candidate, config, true)
+            && !visit(FindingCandidate {
+                severity: SecretSeverity::Medium,
+                kind: "high_entropy_base64",
+                pattern: "entropy",
+                text,
+                start: mat.start(),
+                end: mat.end(),
+                location: location.clone(),
+                ctx,
+            })
+        {
+            return;
         }
     }
 
     for mat in ENTROPY_HEX_RE.find_iter(text) {
         let candidate = &text[mat.start()..mat.end()];
-        if is_hex_entropy_secret(candidate, config, true) {
-            push_finding(
-                findings,
-                seen,
-                FindingCandidate {
-                    severity: SecretSeverity::Low,
-                    kind: "high_entropy_hex",
-                    pattern: "entropy",
-                    text,
-                    start: mat.start(),
-                    end: mat.end(),
-                    location: location.clone(),
-                    ctx,
-                },
-                config,
-                truncated,
-            );
-            if *truncated {
-                return;
-            }
+        if is_hex_entropy_secret(candidate, config, true)
+            && !visit(FindingCandidate {
+                severity: SecretSeverity::Low,
+                kind: "high_entropy_hex",
+                pattern: "entropy",
+                text,
+                start: mat.start(),
+                end: mat.end(),
+                location: location.clone(),
+                ctx,
+            })
+        {
+            return;
         }
     }
 }
@@ -1717,6 +1884,12 @@ fn redact_report_slice(
     config: &SecretScanConfig,
     mut redactions: Vec<RedactionRange>,
 ) -> String {
+    // Inspect the complete field before slicing. A context window can begin
+    // inside an opaque credential, beyond its JSON key and opening quote;
+    // parsing that shortened window would no longer prove it safe to show.
+    if structured_report_needs_mask(text, config) {
+        return REDACTED_METADATA_CONTEXT.to_owned();
+    }
     redactions.extend(collect_context_redactions(
         text,
         config,
@@ -1749,6 +1922,40 @@ fn redact_report_slice(
     // credential floor. The interval pass additionally covers custom
     // denylist and entropy matches, including secrets crossing slice edges.
     crate::indexer::redact_secrets::redact_text(&redacted).into_owned()
+}
+
+fn structured_report_needs_mask(text: &str, config: &SecretScanConfig) -> bool {
+    if !text.contains(['{', '[', '"']) {
+        return false;
+    }
+    let mut sensitive = false;
+    inspect_json_content(text, &mut |event| {
+        if sensitive {
+            return;
+        }
+        sensitive = match event {
+            JsonPrivacyEvent::SensitiveField { value, .. } => {
+                structured_value_contains_material(value)
+            }
+            JsonPrivacyEvent::SensitiveFieldEnd => false,
+            JsonPrivacyEvent::Ambiguous => true,
+            JsonPrivacyEvent::DecodedText { text, .. } => {
+                // Reports mask allowlisted values as well as admitted
+                // findings; allowlisting never grants display permission.
+                config.denylist.iter().any(|pattern| pattern.is_match(text))
+                    || BUILTIN_PATTERNS
+                        .iter()
+                        .any(|pattern| pattern.regex.is_match(text))
+                    || ENTROPY_BASE64_RE
+                        .find_iter(text)
+                        .any(|matched| is_base64_entropy_secret(matched.as_str(), config, false))
+                    || ENTROPY_HEX_RE
+                        .find_iter(text)
+                        .any(|matched| is_hex_entropy_secret(matched.as_str(), config, false))
+            }
+        };
+    });
+    sensitive
 }
 
 fn collect_context_redactions(
@@ -3374,6 +3581,334 @@ mod tests {
             findings.len()
         );
         assert!(truncated, "should set truncated flag");
+    }
+
+    fn json_scan_context() -> ScanContext {
+        ScanContext {
+            agent: Some("codex".to_owned()),
+            workspace: None,
+            source_path: Some("public-session.jsonl".to_owned()),
+            conversation_id: Some(1),
+            message_id: Some(7),
+            message_idx: Some(0),
+        }
+    }
+
+    fn scan_json_test_field(text: &str, config: &SecretScanConfig) -> (Vec<SecretFinding>, bool) {
+        let mut findings = Vec::new();
+        let mut truncated = false;
+        scan_field(
+            text,
+            SecretLocation::MessageContent,
+            &json_scan_context(),
+            config,
+            &mut findings,
+            &mut truncated,
+        );
+        (findings, truncated)
+    }
+
+    #[test]
+    fn scan_field_inspects_structured_and_encoded_json_credentials() -> Result<()> {
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+        let inner = r#"{"p\u0069n":"7319"}"#;
+        let encoded = serde_json::to_string(&serde_json::to_string(inner)?)?;
+        for text in [
+            r#"{"password":"rose"}"#.to_owned(),
+            format!("tool output:\n```json\n{inner}\n```\npublic tail"),
+            encoded,
+        ] {
+            let (findings, truncated) = scan_json_test_field(&text, &config);
+            assert!(!truncated);
+            assert_eq!(findings.len(), 1, "one actual credential field: {text}");
+            assert_eq!(findings[0].kind, "sensitive_json_field");
+            assert_eq!(findings[0].severity, SecretSeverity::High);
+            let report = serde_json::to_string(&findings)?;
+            assert!(!report.contains("7319"));
+            assert!(!report.contains("rose"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_scan_decodes_escaped_tokens_before_suppressing_structural_findings() -> Result<()> {
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+        let token = "AKIAIOSFODNN7EXAMPLE";
+        let escaped: String = token
+            .chars()
+            .map(|ch| format!("\\u{:04x}", u32::from(ch)))
+            .collect();
+        let text = format!(r#"{{"credential":"{escaped}"}}"#);
+        let metadata = parse_json_metadata(&text, "messages.extra_json", 7)?;
+        let mut findings = Vec::new();
+        let mut truncated = false;
+        scan_structured_metadata(
+            &metadata,
+            SecretLocation::MessageMetadata,
+            &json_scan_context(),
+            &config,
+            &mut findings,
+            &mut truncated,
+        );
+        assert!(!truncated);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, "aws_access_key_id");
+        assert_eq!(findings[0].severity, SecretSeverity::High);
+        assert!(!serde_json::to_string(&findings)?.contains(token));
+
+        let metadata = parse_json_metadata(
+            &serde_json::json!({"tool_result": r#"{"pin":"7319"}"#}).to_string(),
+            "messages.extra_json",
+            7,
+        )?;
+        findings.clear();
+        scan_structured_metadata(
+            &metadata,
+            SecretLocation::MessageMetadata,
+            &json_scan_context(),
+            &config,
+            &mut findings,
+            &mut truncated,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, "sensitive_metadata_field");
+        assert!(!serde_json::to_string(&findings)?.contains("7319"));
+        Ok(())
+    }
+
+    #[test]
+    fn decoded_json_occurrences_preserve_counts_caps_and_denylist_severity() -> Result<()> {
+        let token = "AKIAIOSFODNN7EXAMPLE";
+        let mut config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+        config.max_findings = 2;
+        let inner = serde_json::json!({"note": format!("{token} {token}")}).to_string();
+        let text = serde_json::json!({"result": serde_json::to_string(&inner)?}).to_string();
+        let (findings, truncated) = scan_json_test_field(&text, &config);
+        assert_eq!(
+            findings.len(),
+            2,
+            "decoding must not duplicate actual occurrences"
+        );
+        assert!(
+            !truncated,
+            "repeated decoding must not spend the finding cap"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.kind == "aws_access_key_id")
+        );
+
+        let (findings, truncated) = scan_json_test_field(
+            r#"{"pin":"7319","password":"rose","cookie":"sid"}"#,
+            &config,
+        );
+        assert_eq!(findings.len(), 2);
+        assert!(
+            truncated,
+            "a third structured credential must refuse complete approval"
+        );
+
+        let mut denied = SecretScanConfig::from_inputs_with_env(
+            &[token.to_owned()],
+            &[token.to_owned()],
+            false,
+        )?;
+        denied.max_findings = 1;
+        let escaped: String = token
+            .chars()
+            .map(|ch| format!("\\u{:04x}", u32::from(ch)))
+            .collect();
+        let (findings, truncated) =
+            scan_json_test_field(&format!(r#"{{"credential":"{escaped}"}}"#), &denied);
+        assert_eq!(findings.len(), 1);
+        assert!(!truncated);
+        assert_eq!(findings[0].severity, SecretSeverity::Critical);
+        assert_eq!(findings[0].pattern, CUSTOM_DENYLIST_PATTERN_ID);
+        Ok(())
+    }
+
+    #[test]
+    fn decoded_json_never_claims_an_equal_token_outside_its_containing_span() -> Result<()> {
+        let token = "AKIAIOSFODNN7EXAMPLE";
+        let escaped: String = token
+            .chars()
+            .map(|ch| format!("\\u{:04x}", u32::from(ch)))
+            .collect();
+        let hidden = format!(r#"{{"result":"{escaped}"}}"#);
+        let mut config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+        config.max_findings = 2;
+        for text in [
+            format!("{token} tool: {hidden}"),
+            format!("tool: {hidden} later {token}"),
+            serde_json::to_string(&format!("{token} tool: {hidden}"))?,
+            format!("first {hidden} second {hidden}"),
+        ] {
+            let (findings, truncated) = scan_json_test_field(&text, &config);
+            assert_eq!(
+                findings.len(),
+                2,
+                "distinct source occurrences must survive decoding: {text}"
+            );
+            assert!(!truncated);
+        }
+        let text = format!(r#"{token} tool: {{"result":["{escaped}","{escaped}"]}}"#);
+        let (findings, truncated) = scan_json_test_field(&text, &config);
+        assert_eq!(findings.len(), 2);
+        assert!(truncated, "a hidden third occurrence must spend the cap");
+        config.max_findings = 3;
+        let (findings, truncated) = scan_json_test_field(&text, &config);
+        assert_eq!(findings.len(), 3);
+        assert!(!truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn sensitive_wrappers_preserve_decoded_denylist_precedence_and_provenance() -> Result<()> {
+        let inner = r#"{"note":"\u0037\u0033\u0031\u0039"}"#;
+        let text = serde_json::json!({"credentials": inner}).to_string();
+        for allow in [Vec::new(), vec![".*".to_owned()]] {
+            let mut config =
+                SecretScanConfig::from_inputs_with_env(&allow, &["7319".to_owned()], false)?;
+            config.max_findings = 1;
+            let (findings, truncated) = scan_json_test_field(&text, &config);
+            assert_eq!(findings.len(), 1);
+            assert!(
+                !truncated,
+                "the parent floor must not duplicate its decoded finding"
+            );
+            assert_eq!(findings[0].severity, SecretSeverity::Critical);
+            assert_eq!(findings[0].pattern, CUSTOM_DENYLIST_PATTERN_ID);
+            assert!(!serde_json::to_string(&findings)?.contains("7319"));
+        }
+
+        let token = "AKIAIOSFODNN7EXAMPLE";
+        let mut config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+        config.max_findings = 1;
+        let (findings, truncated) = scan_json_test_field(
+            &serde_json::json!({"credential": token}).to_string(),
+            &config,
+        );
+        assert_eq!(
+            findings.len(),
+            1,
+            "an ordinary sensitive scalar is scanned once"
+        );
+        assert!(!truncated);
+        assert_eq!(findings[0].kind, "aws_access_key_id");
+
+        let escaped: String = token
+            .chars()
+            .map(|ch| format!("\\u{:04x}", u32::from(ch)))
+            .collect();
+        let mut ctx = json_scan_context();
+        ctx.source_path = Some(format!(r#"{{"credentials":{{"{escaped}":null}}}}"#));
+        let mut findings = Vec::new();
+        let mut truncated = false;
+        scan_field(
+            token,
+            SecretLocation::MessageContent,
+            &ctx,
+            &config,
+            &mut findings,
+            &mut truncated,
+        );
+        assert_eq!(
+            findings[0].source_path.as_deref(),
+            Some(REDACTED_METADATA_CONTEXT)
+        );
+        let report = serde_json::to_string(&findings)?;
+        assert!(!report.contains(&escaped));
+        assert!(!report.contains("IOSFODNN"));
+
+        let mut deep = inner.to_owned();
+        for _ in 0..9 {
+            deep = serde_json::json!({"credentials": deep}).to_string();
+        }
+        let (findings, truncated) = scan_json_test_field(&deep, &config);
+        assert_eq!(findings.len(), 1);
+        assert!(
+            !truncated,
+            "nested parent floors must not multiply an ambiguity finding"
+        );
+        assert_eq!(findings[0].kind, "uninspectable_json");
+        Ok(())
+    }
+
+    #[test]
+    fn structured_json_allowlists_and_clean_controls_keep_their_meaning() -> Result<()> {
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+        for text in [
+            r#"{"pin":"","cookie":null,"password":"[REDACTED]","credentials":{"empty":""}}"#,
+            r#"{"safe":"public","token_count":4}"#,
+            r#"ordinary "quoted prose", Windows "C:\Users\demo", and {value}"#,
+            "[2026-11-24] discussion of password fields",
+        ] {
+            let (findings, truncated) = scan_json_test_field(text, &config);
+            assert!(
+                findings.is_empty(),
+                "clean control must remain clean: {text}"
+            );
+            assert!(!truncated);
+        }
+        let inner = r#"{"pin":"SAFE-7319"}"#;
+        let text = serde_json::json!({"result": inner}).to_string();
+        let prefix = SecretScanConfig::from_inputs_with_env(&["SAFE".to_owned()], &[], false)?;
+        assert_eq!(scan_json_test_field(&text, &prefix).0.len(), 1);
+        let exact =
+            SecretScanConfig::from_inputs_with_env(&["^SAFE-7319$".to_owned()], &[], false)?;
+        assert!(scan_json_test_field(&text, &exact).0.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn structured_json_refusals_and_clipped_report_contexts_fail_closed() -> Result<()> {
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+        let mut deep = r#"{"pin":"7319"}"#.to_owned();
+        for _ in 0..9 {
+            deep = serde_json::to_string(&deep)?;
+        }
+        for text in [
+            r#"tool output: {"pin":"7319""#.to_owned(),
+            r#"{"pin":"7319","p\u0069n":null}"#.to_owned(),
+            deep,
+        ] {
+            let (findings, truncated) = scan_json_test_field(&text, &config);
+            assert!(!truncated);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.kind == "uninspectable_json")
+            );
+            assert!(!serde_json::to_string(&findings)?.contains("7319"));
+        }
+
+        let token = "AKIAIOSFODNN7EXAMPLE";
+        let opaque = "private-neighbor-".repeat(40);
+        let text = format!(r#"{{"pin":"{opaque}","note":"{token}"}}"#);
+        let start = text.find(token).expect("focal token");
+        assert!(
+            start > 500,
+            "the JSON key is well outside the context window"
+        );
+        assert_eq!(
+            redact_context(&text, start, start + token.len(), 32, &config),
+            REDACTED_METADATA_CONTEXT,
+        );
+        let mut ctx = json_scan_context();
+        ctx.source_path = Some(r#"{"pin":"7319"}"#.to_owned());
+        let mut findings = Vec::new();
+        let mut truncated = false;
+        scan_field(
+            token,
+            SecretLocation::MessageContent,
+            &ctx,
+            &config,
+            &mut findings,
+            &mut truncated,
+        );
+        assert!(!serde_json::to_string(&findings)?.contains("7319"));
+        Ok(())
     }
 
     #[test]

@@ -517,6 +517,39 @@ pub(crate) fn json_has_duplicate_keys(text: &str) -> serde_json::Result<bool> {
     serde_json::from_str::<EmbeddedJsonKeyCheck>(text).map(|check| check.0)
 }
 
+/// Observations from the same bounded JSON walk used by credential redaction.
+/// `layer` identifies decoded string nesting, so a scanner can reconcile a
+/// token seen in an outer representation with the same decoded occurrence.
+#[derive(Clone, Copy)]
+pub(crate) struct JsonSourceSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+pub(crate) enum JsonPrivacyEvent<'a> {
+    DecodedText {
+        text: &'a str,
+        layer: usize,
+        source_span: Option<JsonSourceSpan>,
+    },
+    SensitiveField {
+        value: &'a serde_json::Value,
+        layer: usize,
+        source_span: Option<JsonSourceSpan>,
+    },
+    SensitiveFieldEnd,
+    Ambiguous,
+}
+
+fn ignore_json_privacy_event(_: JsonPrivacyEvent<'_>) {}
+
+/// Inspect transcript JSON without inferring findings from rewritten output.
+/// Field, duplicate-key, malformed-fragment and encoded-depth decisions come
+/// from the production redactor; callers retain their own reporting policy.
+pub(crate) fn inspect_json_content(input: &str, observe: &mut impl FnMut(JsonPrivacyEvent<'_>)) {
+    let _ = redact_json_string(input, &mut str::to_owned, observe, 0, true);
+}
+
 /// Redact secrets from a JSON value, recursively walking strings.
 ///
 /// - String values are redacted without changing their JSON type.
@@ -548,7 +581,13 @@ pub(crate) fn redact_content_with_text_redactor(
     input: &str,
     redact_plain_text: &mut impl FnMut(&str) -> String,
 ) -> String {
-    redact_json_string(input, redact_plain_text, 0)
+    redact_json_string(
+        input,
+        redact_plain_text,
+        &mut ignore_json_privacy_event,
+        0,
+        false,
+    )
 }
 
 /// Inspect original JSON keys and encoded values before applying a text policy.
@@ -558,32 +597,105 @@ pub(crate) fn redact_json_with_text_redactor(
     value: &serde_json::Value,
     redact_plain_text: &mut impl FnMut(&str) -> String,
 ) -> serde_json::Value {
-    redact_json_with(value, redact_plain_text, 0)
+    redact_json_with(
+        value,
+        redact_plain_text,
+        &mut ignore_json_privacy_event,
+        0,
+        None,
+        false,
+    )
 }
 
 fn redact_json_with(
     value: &serde_json::Value,
     redact_plain_text: &mut impl FnMut(&str) -> String,
+    observe: &mut impl FnMut(JsonPrivacyEvent<'_>),
     embedded_layers: usize,
+    source_span: Option<JsonSourceSpan>,
+    inspect_sensitive_values: bool,
 ) -> serde_json::Value {
     match value {
-        serde_json::Value::String(input) => serde_json::Value::String(redact_json_string(
-            input,
-            redact_plain_text,
-            embedded_layers,
-        )),
+        serde_json::Value::String(input) => {
+            observe(JsonPrivacyEvent::DecodedText {
+                text: input,
+                layer: embedded_layers,
+                source_span,
+            });
+            serde_json::Value::String(redact_json_string(
+                input,
+                redact_plain_text,
+                observe,
+                embedded_layers,
+                inspect_sensitive_values,
+            ))
+        }
         serde_json::Value::Array(arr) => serde_json::Value::Array(
             arr.iter()
-                .map(|value| redact_json_with(value, redact_plain_text, embedded_layers))
+                .map(|value| {
+                    redact_json_with(
+                        value,
+                        redact_plain_text,
+                        observe,
+                        embedded_layers,
+                        source_span,
+                        inspect_sensitive_values,
+                    )
+                })
                 .collect(),
         ),
         serde_json::Value::Object(obj) => {
             let mut new_obj = serde_json::Map::with_capacity(obj.len());
             let mut next_suffixes = HashMap::new();
             for (key, value) in obj {
+                observe(JsonPrivacyEvent::DecodedText {
+                    text: key,
+                    layer: embedded_layers,
+                    source_span,
+                });
                 let redacted_key = redact_plain_text(key);
+                if is_sensitive_json_field(key) && !value.is_null() {
+                    observe(JsonPrivacyEvent::SensitiveField {
+                        value,
+                        layer: embedded_layers,
+                        source_span,
+                    });
+                    if inspect_sensitive_values {
+                        // Redaction can replace the whole value immediately.
+                        // Inspection must still find decoded denylist matches
+                        // and credential-bearing keys inside it. A string's
+                        // initial text event has already been represented by
+                        // SensitiveField; inspect only its embedded layers.
+                        if let serde_json::Value::String(text) = value {
+                            let _ = redact_json_string(
+                                text,
+                                redact_plain_text,
+                                observe,
+                                embedded_layers,
+                                true,
+                            );
+                        } else {
+                            let _ = redact_json_with(
+                                value,
+                                redact_plain_text,
+                                observe,
+                                embedded_layers,
+                                source_span,
+                                true,
+                            );
+                        }
+                    }
+                    observe(JsonPrivacyEvent::SensitiveFieldEnd);
+                }
                 let redacted_value = redact_sensitive_json_value(key, value, || {
-                    redact_json_with(value, redact_plain_text, embedded_layers)
+                    redact_json_with(
+                        value,
+                        redact_plain_text,
+                        observe,
+                        embedded_layers,
+                        source_span,
+                        inspect_sensitive_values,
+                    )
                 });
                 insert_redacted_json_entry(
                     &mut new_obj,
@@ -601,7 +713,9 @@ fn redact_json_with(
 fn redact_json_string(
     input: &str,
     redact_plain_text: &mut impl FnMut(&str) -> String,
+    observe: &mut impl FnMut(JsonPrivacyEvent<'_>),
     embedded_layers: usize,
+    inspect_sensitive_values: bool,
 ) -> String {
     // Capture the original whole-string obligation before decoding or
     // replacing a fragment can hide a credential prefix or custom policy.
@@ -615,9 +729,26 @@ fn redact_json_string(
     let structured = if matches!(trimmed.as_bytes().first(), Some(b'{' | b'[' | b'"'))
         && let Ok(keys) = serde_json::from_str::<EmbeddedJsonKeyCheck>(trimmed)
     {
-        redact_complete_json(input, redact_plain_text, embedded_layers, keys)
+        redact_complete_json(
+            input,
+            redact_plain_text,
+            observe,
+            embedded_layers,
+            keys,
+            JsonSourceSpan {
+                start: 0,
+                end: input.len(),
+            },
+            inspect_sensitive_values,
+        )
     } else {
-        redact_mixed_json_fragments(input, redact_plain_text, embedded_layers)
+        redact_mixed_json_fragments(
+            input,
+            redact_plain_text,
+            observe,
+            embedded_layers,
+            inspect_sensitive_values,
+        )
     };
     if original_plain == input {
         return structured;
@@ -632,22 +763,35 @@ fn redact_json_string(
     // The two policies changed different representations. Without original
     // span proof, hide the containing text instead of retaining an uncertain
     // suffix. This also protects custom policies across JSON/prose boundaries.
+    observe(JsonPrivacyEvent::Ambiguous);
     REDACTED.to_owned()
 }
 
 fn redact_complete_json(
     input: &str,
     redact_plain_text: &mut impl FnMut(&str) -> String,
+    observe: &mut impl FnMut(JsonPrivacyEvent<'_>),
     embedded_layers: usize,
     keys: EmbeddedJsonKeyCheck,
+    source_span: JsonSourceSpan,
+    inspect_sensitive_values: bool,
 ) -> String {
     if keys.0 || embedded_layers >= MAX_EMBEDDED_JSON_LAYERS {
+        observe(JsonPrivacyEvent::Ambiguous);
         return REDACTED.to_owned();
     }
     let Ok(embedded) = serde_json::from_str::<serde_json::Value>(input.trim()) else {
+        observe(JsonPrivacyEvent::Ambiguous);
         return REDACTED.to_owned();
     };
-    let redacted = redact_json_with(&embedded, redact_plain_text, embedded_layers + 1);
+    let redacted = redact_json_with(
+        &embedded,
+        redact_plain_text,
+        observe,
+        embedded_layers + 1,
+        Some(source_span),
+        inspect_sensitive_values,
+    );
     if redacted != embedded {
         return redacted.to_string();
     }
@@ -775,7 +919,9 @@ fn json_fragment_end(input: &str, start: usize) -> (usize, bool) {
 fn redact_mixed_json_fragments(
     input: &str,
     redact_plain_text: &mut impl FnMut(&str) -> String,
+    observe: &mut impl FnMut(JsonPrivacyEvent<'_>),
     embedded_layers: usize,
+    inspect_sensitive_values: bool,
 ) -> String {
     let mut cursor = 0;
     let mut copied_until = 0;
@@ -813,11 +959,21 @@ fn redact_mixed_json_fragments(
             && let Some(inner) = quoted_container_start(input, start + 1, end, false)
         {
             if let Ok(keys) = serde_json::from_str::<EmbeddedJsonKeyCheck>(fragment) {
-                if redact_complete_json(fragment, redact_plain_text, embedded_layers, keys)
-                    != fragment
+                // This interpretation is speculative: only the final
+                // ambiguous result, not its decoded fields, is observable.
+                if redact_complete_json(
+                    fragment,
+                    redact_plain_text,
+                    &mut ignore_json_privacy_event,
+                    embedded_layers,
+                    keys,
+                    JsonSourceSpan { start, end },
+                    false,
+                ) != fragment
                 {
                     // Decoding this overlapping prose quote also revealed a
                     // secret. Its two interpretations cannot be spliced safely.
+                    observe(JsonPrivacyEvent::Ambiguous);
                     return REDACTED.to_owned();
                 }
             } else if input[start + 1..end]
@@ -827,6 +983,7 @@ fn redact_mixed_json_fragments(
                 // A malformed literal can contain a harmless raw array before
                 // an encoded object. Rerouting to the array would abandon the
                 // object's escaped keys, so hide this ambiguous containing text.
+                observe(JsonPrivacyEvent::Ambiguous);
                 return REDACTED.to_owned();
             }
             cursor = inner;
@@ -836,8 +993,11 @@ fn redact_mixed_json_fragments(
             Ok(keys) => redact_complete_json(
                 fragment,
                 redact_plain_text,
+                observe,
                 embedded_layers,
                 keys,
+                JsonSourceSpan { start, end },
+                inspect_sensitive_values,
             ),
             Err(_)
                 if quoted
@@ -857,7 +1017,10 @@ fn redact_mixed_json_fragments(
                 // fields or encoded strings. Keep its exact original bytes.
                 continue;
             }
-            Err(_) => REDACTED.to_owned(),
+            Err(_) => {
+                observe(JsonPrivacyEvent::Ambiguous);
+                REDACTED.to_owned()
+            }
         };
         if protected != fragment {
             if quoted
@@ -867,6 +1030,7 @@ fn redact_mixed_json_fragments(
             {
                 // A changed decoded literal overlaps another possible encoded
                 // container. Neither interpretation may expose the other.
+                observe(JsonPrivacyEvent::Ambiguous);
                 return REDACTED.to_owned();
             }
             let buffer = output.get_or_insert_with(|| String::with_capacity(input.len()));
@@ -3414,5 +3578,74 @@ mod tests {
         assert_eq!(audit.len(), 1);
         assert!(matches!(audit[0].event, MemoCacheEvent::Quarantine { .. }));
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn json_privacy_inspection_decodes_content_metadata_and_keys() {
+        let inner = r#"{"p\u0069n":"7319","ordinary":"public"}"#;
+        let envelope = json!({"tool_result": inner, "\u{03bb}": true});
+        let mut fields = Vec::new();
+        let mut layers = Vec::new();
+        inspect_json_content(&envelope.to_string(), &mut |event| match event {
+            JsonPrivacyEvent::SensitiveField { value, layer, .. } => {
+                fields.push(value.clone());
+                layers.push(layer);
+            }
+            JsonPrivacyEvent::DecodedText { .. }
+            | JsonPrivacyEvent::SensitiveFieldEnd
+            | JsonPrivacyEvent::Ambiguous => {}
+        });
+        assert_eq!(fields, [json!("7319")]);
+        assert_eq!(layers, [2]);
+        assert!(!redact_json(&envelope).to_string().contains("7319"));
+
+        let input = format!("tool output:\n```json\n{inner}\n```\npublic tail");
+        let mut content_fields = Vec::new();
+        inspect_json_content(&input, &mut |event| {
+            if let JsonPrivacyEvent::SensitiveField { value, .. } = event {
+                content_fields.push(value.clone());
+            }
+        });
+        assert_eq!(content_fields, fields);
+        let protected = redact_content(&input);
+        assert!(!protected.contains("7319"));
+        assert!(protected.contains("public tail"));
+    }
+
+    #[test]
+    fn json_privacy_inspection_reports_canonical_refusals() {
+        let mut deeply_encoded = r#"{"pin":"7319"}"#.to_owned();
+        for _ in 0..MAX_EMBEDDED_JSON_LAYERS {
+            deeply_encoded = serde_json::to_string(&deeply_encoded).unwrap();
+        }
+        for input in [
+            r#"tool output: {"pin":"7319""#.to_owned(),
+            r#"{"pin":"7319","p\u0069n":null}"#.to_owned(),
+            deeply_encoded,
+        ] {
+            let mut refused = false;
+            inspect_json_content(&input, &mut |event| {
+                refused |= matches!(event, JsonPrivacyEvent::Ambiguous);
+            });
+            assert!(refused, "canonical refusal must be observable");
+            assert!(!redact_content(&input).contains("7319"));
+        }
+        for input in [
+            "plain discussion of pin and password fields",
+            r#"Windows path "C:\Users\demo" and {value}"#,
+            "[2026-11-24] public log message",
+            r#"{"safe":"public","token_count":4}"#,
+        ] {
+            let mut refused = false;
+            let mut fields = 0;
+            inspect_json_content(input, &mut |event| match event {
+                JsonPrivacyEvent::Ambiguous => refused = true,
+                JsonPrivacyEvent::SensitiveField { .. } => fields += 1,
+                JsonPrivacyEvent::DecodedText { .. } | JsonPrivacyEvent::SensitiveFieldEnd => {}
+            });
+            assert!(!refused, "ordinary prose must remain inspectable: {input}");
+            assert_eq!(fields, 0);
+            assert_eq!(redact_content(input), input);
+        }
     }
 }

@@ -1104,6 +1104,79 @@ mod tests {
     }
 
     #[test]
+    fn historical_structured_credentials_are_detected_on_every_database_surface() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("historical-json.db");
+        let metadata_bin = rmp_serde::to_vec(&serde_json::json!({
+            "tool_result": r#"{"p\u0069n":"conversation-pin"}"#,
+        }))?;
+        let extra_bin = rmp_serde::to_vec(&serde_json::json!({
+            "tool_result": r#"{"cookie":"message-cookie"}"#,
+        }))?;
+        setup_db_with_binary_metadata(&db_path, "{}", &metadata_bin, "{}", &extra_bin)?;
+        let conn = open_db(&db_path)?;
+        conn.execute_compat(
+            "UPDATE conversations SET title = ?1 WHERE id = 1",
+            fparams![r#"{"password":"title-pass"}"#],
+        )?;
+        conn.execute_compat(
+            "UPDATE messages SET content = ?1 WHERE id = 1",
+            fparams!["tool output:\n```json\n{\"token\":\"content-token\"}\n```"],
+        )?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE snippets (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                file_path TEXT,
+                language TEXT,
+                snippet_text TEXT
+            );
+            INSERT INTO snippets (id, message_id, file_path, language, snippet_text)
+            VALUES (1, 1, 'public.json', 'json', '{"pin":"snippet-pin"}');
+            "#,
+        )?;
+        conn.close()?;
+
+        let report = scan(&db_path)?;
+        assert!(!report.summary.truncated);
+        assert_eq!(report.summary.total, 5);
+        for location in [
+            SecretLocation::ConversationTitle,
+            SecretLocation::ConversationMetadata,
+            SecretLocation::MessageContent,
+            SecretLocation::MessageMetadata,
+            SecretLocation::MessageSnippet,
+        ] {
+            let findings = report
+                .findings
+                .iter()
+                .filter(|finding| finding.location == location)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                findings.len(),
+                1,
+                "missing or duplicated {location:?} obligation"
+            );
+            assert_eq!(findings[0].severity, SecretSeverity::High);
+        }
+        let serialized = serde_json::to_string(&report)?;
+        for secret in [
+            "conversation-pin",
+            "message-cookie",
+            "title-pass",
+            "content-token",
+            "snippet-pin",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "a diagnostic exposed a structured credential"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn empty_null_and_already_redacted_sensitive_fields_remain_clean() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
