@@ -158,6 +158,26 @@ impl SemanticIndexer {
         })
     }
 
+    /// Keep caller-owned cancellation live through candidate validation and
+    /// the final installation fence, including for local embedding models.
+    pub(crate) fn build_and_save_index_with_producer_and_cancel<F, P, C>(
+        &self,
+        data_dir: &Path,
+        produce: F,
+        on_progress: P,
+        mut check_cancelled: C,
+    ) -> Result<VectorIndex>
+    where
+        F: FnOnce(&mut dyn FnMut(EmbeddedMessage) -> Result<()>) -> Result<()>,
+        P: FnMut(usize),
+        C: FnMut() -> Result<()>,
+    {
+        rebuild::run_with_producer(self, data_dir, produce, on_progress, || {
+            self.inner.check_external_cancelled()?;
+            check_cancelled()
+        })
+    }
+
     /// Replay and embed bounded text batches directly into an unpublished
     /// candidate. Only the native writer retains corpus-sized vectors: CASS
     /// keeps no second complete text or embedding collection. Native writer,

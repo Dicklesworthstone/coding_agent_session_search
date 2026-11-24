@@ -6,7 +6,11 @@
 mod embedding_source;
 mod existing_index;
 mod model_selection;
+mod publication;
 mod work_queue;
+
+#[cfg(test)]
+mod streaming_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -223,6 +227,7 @@ fn canonical_message_inputs(
     let Some(message_id) = message_id_from_db(message.message_id) else {
         return Ok(Vec::new());
     };
+    let role = crate::model::conversation_packet::normalize_role(&message.role);
     let mut inputs = Vec::new();
     for (ordinal, passage) in embedding_passages(&message.content).into_iter().enumerate() {
         let input = EmbeddingInput {
@@ -231,7 +236,7 @@ fn canonical_message_inputs(
             agent_id: saturating_u32_from_i64(message.agent_id),
             workspace_id: saturating_u32_from_i64(message.workspace_id.unwrap_or(0)),
             source_id: message.source_id_hash,
-            role: role_code_from_str(&message.role).unwrap_or(0),
+            role: role_code_from_str(&role).unwrap_or(0),
             chunk_idx: u8::try_from(ordinal)?,
             content: passage.to_owned(),
         };
@@ -572,10 +577,15 @@ impl EmbeddingWorker {
             maintenance.mark_progress();
             let pass_result = {
                 let _scope = cancellation.enter();
-                (|| {
+                (|| -> anyhow::Result<EmbeddingPassOutcome> {
+                    let publication = publication::PublicationAdmission::capture(
+                        index_path,
+                        &resolve_embedder_kind(model_name, pass.use_semantic)?,
+                        pass.tier,
+                    )?;
                     #[cfg(debug_assertions)]
                     self.pause_open_snapshot_for_test(db_path, job_id)?;
-                    self.generate_embeddings_from_source(
+                    let outcome = self.generate_embeddings_from_source(
                         &storage,
                         &messages,
                         model_name,
@@ -585,7 +595,15 @@ impl EmbeddingWorker {
                         db_path,
                         pass.tier,
                         &mut |_| maintenance.mark_progress(),
-                    )
+                    )?;
+                    if outcome == EmbeddingPassOutcome::Completed {
+                        // Progress writes have finished. Publication now proves
+                        // the actual vector generation against a fresh, stable
+                        // canonical replay, including the unchanged/retry path.
+                        publication.publish(&storage, index_path, &|| self.is_cancelled())?;
+                        maintenance.mark_progress();
+                    }
+                    Ok(outcome)
                 })()
             };
             // The engine operation has fully drained and its cancellation
@@ -598,11 +616,11 @@ impl EmbeddingWorker {
                 result => result,
             };
             match pass_result {
-                Ok(EmbeddingPassOutcome::Completed) => {
+                Ok(EmbeddingPassOutcome::Completed) if !self.is_cancelled() => {
                     storage.complete_embedding_job(job_id)?;
                     info!(model = model_name, "Embedding pass completed");
                 }
-                Ok(EmbeddingPassOutcome::Cancelled) => {
+                Ok(EmbeddingPassOutcome::Completed | EmbeddingPassOutcome::Cancelled) => {
                     cancel_persisted_jobs(storage.raw(), &config.db_path, Some(model_name))?;
                     info!(model = model_name, "Embedding pass cancelled");
                     // A different tier remains eligible unless the whole job
@@ -708,8 +726,9 @@ impl EmbeddingWorker {
     }
 
     /// Plan identities without retaining bodies, then replay the same source
-    /// into bounded passage batches. Generated vectors and reconciliation
-    /// identities remain corpus-sized; this is not a total-memory bound.
+    /// into bounded passage batches. First builds emit vectors directly into
+    /// the private writer; reconciliation still collects replacement vectors.
+    /// Native writer storage and identity sets remain corpus-sized.
     ///
     /// `on_progress` receives the completed-message count after every stored
     /// progress update, so tests observe progress without depending on
@@ -807,14 +826,26 @@ impl EmbeddingWorker {
                 SemanticIndexer::new(model_name, Some(index_path))?
             }
         };
-        let mut embedded = Vec::new();
-        {
+        let check_cancelled = || -> anyhow::Result<()> {
+            anyhow::ensure!(!cancelled(), "daemon embedding pass cancelled");
+            Ok(())
+        };
+        let mut produce = |emit: &mut dyn FnMut(
+            crate::indexer::semantic::EmbeddedMessage,
+        ) -> anyhow::Result<()>|
+         -> anyhow::Result<()> {
+            let mut embedded_count = 0usize;
             let mut embed_chunk = |chunk: &[EmbeddingInput]| -> anyhow::Result<()> {
+                check_cancelled()?;
                 let batch = indexer.embed_messages(chunk)?;
                 if batch.len() != chunk.len() {
                     anyhow::bail!("daemon embedding batch returned an incomplete vector set");
                 }
-                embedded.extend(batch);
+                for embedded in batch {
+                    check_cancelled()?;
+                    emit(embedded)?;
+                    embedded_count += 1;
+                }
                 for input in chunk {
                     let pending = pending_passages.get_mut(&input.message_id).ok_or_else(|| {
                         anyhow::anyhow!("embedded passage has no canonical message progress entry")
@@ -848,43 +879,62 @@ impl EmbeddingWorker {
                 Ok(())
             })?;
             if !scanned || cancelled() {
-                return Ok(EmbeddingPassOutcome::Cancelled);
+                anyhow::bail!("daemon embedding pass cancelled");
             }
             if !inputs.is_empty() {
                 embed_chunk(&inputs)?;
             }
-        }
-        if cancelled() {
-            return Ok(EmbeddingPassOutcome::Cancelled);
-        }
-        if embedded.len() != input_count || pending_passages.values().any(|count| *count != 0) {
-            anyhow::bail!("daemon embedding source did not yield every planned passage");
-        }
+            check_cancelled()?;
+            if embedded_count != input_count || pending_passages.values().any(|count| *count != 0) {
+                anyhow::bail!("daemon embedding source did not yield every planned passage");
+            }
 
-        // Planning owns the original read-only index throughout both replays.
-        // A different publication must not inherit its vector-reuse decisions.
-        existing_state.ensure_current()?;
-        // Preserve the existing private-candidate/atomic-publication path:
-        // stale identities disappear and unchanged vectors retain exact bits.
+            // Validate before the producer returns: for a first build the
+            // writer may install its candidate as soon as this replay ends.
+            // A different publication cannot inherit our reuse decisions.
+            existing_state.ensure_current()?;
+            Ok(())
+        };
         let save_path = vector_index_path(index_path, indexer.embedder_id());
-        if existing_state.path_exists {
-            let db_fingerprint = crate::indexer::lexical_storage_fingerprint_for_db(db_path)?;
+        let published = (|| -> anyhow::Result<()> {
+            if existing_state.path_exists {
+                // Existing generations retain the canonical reconciliation
+                // path: unchanged vectors keep their exact stored bits.
+                let mut embedded = Vec::new();
+                produce(&mut |message| {
+                    embedded.push(message);
+                    Ok(())
+                })?;
+                let db_fingerprint = crate::indexer::lexical_storage_fingerprint_for_db(db_path)?;
+                check_cancelled()?;
+                let reconciled = indexer.reconcile_index_with_canonical_documents(
+                    embedded,
+                    index_path,
+                    tier,
+                    &db_fingerprint,
+                    &current_doc_ids,
+                )?;
+                info!(
+                    published = reconciled.record_count(),
+                    "Reconciled semantic index with canonical documents"
+                );
+            } else {
+                // Consume each batch while replaying. Errors, incomplete
+                // replays and cancellation keep every emitted vector private.
+                let _index = indexer.build_and_save_index_with_producer_and_cancel(
+                    index_path,
+                    produce,
+                    |_| {},
+                    check_cancelled,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = published {
             if cancelled() {
                 return Ok(EmbeddingPassOutcome::Cancelled);
             }
-            let reconciled = indexer.reconcile_index_with_canonical_documents(
-                embedded,
-                index_path,
-                tier,
-                &db_fingerprint,
-                &current_doc_ids,
-            )?;
-            info!(
-                published = reconciled.record_count(),
-                "Reconciled semantic index with canonical documents"
-            );
-        } else {
-            let _index = indexer.build_and_save_index(embedded, index_path)?;
+            return Err(error);
         }
         storage.update_job_progress(job_id, saturating_i64_from_usize(messages.total_docs()))?;
         info!(

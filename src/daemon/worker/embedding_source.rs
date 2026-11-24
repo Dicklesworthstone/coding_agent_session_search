@@ -13,6 +13,7 @@ use crate::franken_sync::{
     Connection, SqliteValue,
     compat::{OpenFlags, RowExt, open_with_flags},
 };
+use crate::search::tantivy::normalized_index_source_id;
 use crate::storage::sqlite::MessageForEmbedding;
 
 const MAX_PAGE_ROWS: usize = 128;
@@ -118,14 +119,14 @@ impl SqliteEmbeddingSource {
         let (sql, params) = match after {
             Some(id) => (
                 "SELECT m.id, m.created_at, COALESCE(c.agent_id, 0), \
-                 c.workspace_id, c.source_id, m.role, m.content \
+                 c.workspace_id, c.source_id, m.role, m.content, c.origin_host \
                  FROM messages m JOIN conversations c ON m.conversation_id = c.id \
                  WHERE m.id > ?1 AND m.id <= ?2 ORDER BY m.id",
                 vec![SqliteValue::Integer(id), SqliteValue::Integer(last_id)],
             ),
             None => (
                 "SELECT m.id, m.created_at, COALESCE(c.agent_id, 0), \
-                 c.workspace_id, c.source_id, m.role, m.content \
+                 c.workspace_id, c.source_id, m.role, m.content, c.origin_host \
                  FROM messages m JOIN conversations c ON m.conversation_id = c.id \
                  WHERE m.id <= ?1 ORDER BY m.id",
                 vec![SqliteValue::Integer(last_id)],
@@ -134,9 +135,10 @@ impl SqliteEmbeddingSource {
         let mut messages = Vec::with_capacity(selected_rows);
         self.connection
             .query_with_params_for_each(sql, &params, |row| {
-                let source_id = row
-                    .get_typed::<Option<String>>(4)?
-                    .unwrap_or_else(|| "local".to_string());
+                let source_id: Option<String> = row.get_typed(4)?;
+                let origin_host: Option<String> = row.get_typed(7)?;
+                let source_id =
+                    normalized_index_source_id(source_id.as_deref(), None, origin_host.as_deref());
                 messages.push(MessageForEmbedding {
                     message_id: row.get_typed(0)?,
                     created_at: row.get_typed(1)?,
@@ -235,10 +237,11 @@ mod tests {
         connection.execute("PRAGMA journal_mode=WAL")?;
         connection.execute_batch(
             "CREATE TABLE conversations (id INTEGER PRIMARY KEY, agent_id INTEGER, \
-             workspace_id INTEGER, source_id TEXT); \
+             workspace_id INTEGER, source_id TEXT, origin_host TEXT); \
              CREATE TABLE messages (id INTEGER PRIMARY KEY, conversation_id INTEGER, \
              created_at INTEGER, role TEXT, content TEXT); \
-             INSERT INTO conversations VALUES (1, NULL, NULL, NULL), (2, 7, 9, 'remote');",
+             INSERT INTO conversations (id, agent_id, workspace_id, source_id) \
+             VALUES (1, NULL, NULL, NULL), (2, 7, 9, 'remote');",
         )?;
         Ok((temp, connection))
     }
@@ -252,6 +255,30 @@ mod tests {
                 SqliteValue::Text(text.to_string().into()),
             ],
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn source_identity_matches_canonical_replay_for_legacy_local_and_remote_rows() -> Result<()> {
+        let (temp, writer) = fixture()?;
+        writer.execute_batch(
+            "UPDATE conversations SET source_id = '  LoCaL  ', origin_host = 'ignored-host' WHERE id = 1; \
+             UPDATE conversations SET source_id = '   ', origin_host = ' host.example ' WHERE id = 2; \
+             INSERT INTO conversations (id, source_id, origin_host) VALUES (3, ' remote-id ', 'other-host');",
+        )?;
+        for id in 1..=3 {
+            insert(&writer, id, id, "canonical source provenance")?;
+        }
+        let source = SqliteEmbeddingSource::open(&temp.path().join("archive.db"))?;
+        let mut observed = Vec::new();
+        assert!(source.visit(&|| false, &mut |message| {
+            observed.push(message.source_id_hash);
+            Ok(())
+        })?);
+        assert_eq!(
+            observed,
+            ["local", "host.example", "remote-id"].map(|source| crc32fast::hash(source.as_bytes()))
+        );
         Ok(())
     }
 
