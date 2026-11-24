@@ -2,7 +2,7 @@
   "schema": "cass.stable_prefix.followup_validation.v1",
   "date_utc": "2026-11-24",
   "base_commit": "f9d7a0a8014e877482190f92498ff5eb28020c9a",
-  "scope": "Advisory-probe FIFO admission, nonempty active zero-boundary deferral, observation root validation, and per-source rebuild integrity preparation, and a transactional canonical prefix-protocol requirement across parser/ledger-key changes",
+  "scope": "Advisory-probe FIFO admission, nonempty active zero-boundary deferral, observation root validation, and per-source rebuild integrity preparation, and a transactional canonical prefix-protocol requirement across parser/ledger-key changes; budgeted direct-descriptor Codex prefix raw capture without an unbudgeted second full-prefix copy",
   "qualification": "Final sources have exact-context reconstruction and independent source review only. No test binary executed in this restored attempt. No final compiler, formatter, Clippy, UBS, host/storage or CLI pass is claimed.",
   "captured_execution_attempt": {
     "schema": "cass.stable_prefix.restored_environment_validation.v1",
@@ -298,7 +298,8 @@
     "dependencies_or_toolchain_changed": false,
     "github_actions_used": false,
     "admission_and_rebuild_commit": "c6dfcc5aad95a96180260debe80edfb5f93d0977",
-    "concurrent_upstream_preserved": "46f433f6bb9dd296dcd50b1691de26af11aa5a89"
+    "concurrent_upstream_preserved": "46f433f6bb9dd296dcd50b1691de26af11aa5a89",
+    "canonical_requirement_commit": "366a6e5903ae74524c483f05cc9bd9c887b2059f"
   },
   "canonical_storage": {
     "requirement": "/cass/codex_prefix_required",
@@ -329,5 +330,173 @@
     "outcome": "Unavailable; a minimal pwd probe failed to create an exec process after transport recovery timed out.",
     "runtime_checks_started": 0,
     "qualification": "No additional native validation was attempted through an alternate environment."
+  },
+  "raw_capture_budget": {
+    "base_commit": "366a6e5903ae74524c483f05cc9bd9c887b2059f",
+    "manifest_blob": "f8a7eae6de1a103d87e107d6bce5e8a4856dbf49",
+    "unified_diff_blob": "ca9742747e7185c549861d6375fe6dfb78e69d36",
+    "source_identity": [
+      {
+        "path": "src/connectors/codex/stable_prefix.rs",
+        "base_blob": "53b4b31b500162d0500507f2fe75b695e4613232",
+        "blob_sha": "80e2adb78d2882fcdf5d47751e9795a923a151ea",
+        "sha256": "ac15c04aae78a61f4216f8c86c91a9cef5a2a9b98e013960c2ea607e5b84ad40",
+        "bytes": 24662,
+        "lines": 703
+      },
+      {
+        "path": "src/connectors/codex/stable_prefix/tests.rs",
+        "base_blob": "484282dd7651d9cd0fa4f3177d74fadf2b41f0df",
+        "blob_sha": "3960d2bda0ba7746f6feeb7760f9c385cbfd8306",
+        "sha256": "dabd2b4779b2411c0b35521d932d8e1815c9499d4ae6064af65763e4e0a0ff5a",
+        "bytes": 16264,
+        "lines": 431
+      },
+      {
+        "path": "src/raw_mirror.rs",
+        "base_blob": "f0a7ca27a4d384892d3701fb43222c8c6fdf740a",
+        "blob_sha": "8240e3280dcbc2e0012a2024146f2344bfdca803",
+        "sha256": "49d0930c7bed3e79a440c44cf5392c41fbf5caa8269844088f47b2e31249ef34",
+        "bytes": 14266,
+        "lines": 351
+      },
+      {
+        "path": "src/raw_mirror/policy.rs",
+        "base_blob": "b76add9a127b330bdeb0662fb9699094c09f7a0d",
+        "blob_sha": "b4caa2803e2ff0ba589038c8d3f064850ac15fe6",
+        "sha256": "772cc3820db9659f73c29bb3d62b657ec0d5224cb51d5a72beb868dab12b5d61",
+        "bytes": 43392,
+        "lines": 1139
+      },
+      {
+        "path": "src/raw_mirror/prefix_tests.rs",
+        "base_blob": "089412180100912e7ffe37bb91216a60cc63840d",
+        "blob_sha": "c63da26e03499efc32d3758bc41a954561cc93c8",
+        "sha256": "047a0876bf68e8c0d06bb03fecd719ea608cebb47bcb7f1efe71410c5404d89f",
+        "bytes": 20788,
+        "lines": 508
+      },
+      {
+        "path": "src/raw_mirror/prefix_tests/budgeted_tests.rs",
+        "base_blob": null,
+        "blob_sha": "63ae99b2514ff61e42ba9484ba4065a9d6149b14",
+        "sha256": "c2fef36005fdd44a882e71843544abc9da56d0c33254aabec03425ff51e3de40",
+        "bytes": 6375,
+        "lines": 153
+      },
+      {
+        "path": "src/raw_mirror/policy_tests.rs",
+        "base_blob": "57f0dc47d5c9bbbb26a7c4e4301800e1a07857c8",
+        "blob_sha": "347c6b6e50ee293d782bfc96db42d9eb34b73ef4",
+        "sha256": "56474054dc0a6f18d2b8b4ed0c23764e0a30ace86bbd1c59490a14ad408ae316",
+        "bytes": 39290,
+        "lines": 786
+      }
+    ],
+    "substantive_changes": [
+      "Public prefix raw capture no longer calls StablePrefixReceipt::capture_view before raw policy; it carries the original typed receipt into the budgeted chunk preparation path.",
+      "The retained descriptor is opened through the unchanged regular-object O_NOFOLLOW/O_NONBLOCK helper using post-lock metadata for prefixes. Existing ordinary pre-lock and post-read snapshot metadata guards are unchanged.",
+      "A thin crate-private validate_opened_source helper reuses the existing shape, object/name identity, minimum admitted length, BLAKE3, last-LF/inactive-EOF and advisory-lock proof. It grants no new parser/publication/EOF authority.",
+      "Validation leaves the descriptor cursor at B. Prefix preparation explicitly rewinds, consumes exactly take(B), verifies the hash of bytes actually streamed, then revalidates the held descriptor. This detects mixed reads even if the source is restored before final validation.",
+      "Every created content/descriptor staging file remains under existing per-write retention/free-space Budget accounting. Prefixes cannot read or populate the whole-source cache, while verified content-addressed chunk/manifest reuse can succeed with no new byte reservation.",
+      "capture_view remains available only under cfg(test) for the existing reconstruction contract test; no dead-code allowance or dependency changes.",
+      "The existing test-only prepare_for_test wrapper and direct ordinary snapshot test pass CaptureSource{metadata,prefix:None}; their strict whole-snapshot behavior and assertions are preserved."
+    ],
+    "regressions": [
+      {
+        "path": "src/raw_mirror/prefix_tests/budgeted_tests.rs",
+        "test": "prefix_capture_pauses_or_reuses_chunks_without_a_second_full_temp_copy",
+        "cases": [
+          "max_bytes=0 returns typed pause without global-temp copy",
+          "min_free_bytes=u64::MAX returns typed pause without global-temp copy",
+          "allowed exact-B capture succeeds with TMPDIR naming a regular file",
+          "after later appends all chunks/manifest reuse succeeds under max_bytes=0 and min_free_bytes=u64::MAX"
+        ],
+        "safeguards": "Parent creates genuine byte/object proof before invalid TMPDIR; exact one-test subprocess assertion plus fresh child completion receipt prevents a zero-test pass."
+      },
+      {
+        "path": "src/raw_mirror/prefix_tests.rs",
+        "test": "streamed_prefix_hash_rejects_restored_in_place_changes_before_publication",
+        "cases": [
+          "real staging-I/O observation mutates unread second chunk after first chunk is staged",
+          "actual tampered compressed chunk observed in staging",
+          "original bytes and mtime restored before final validation",
+          "stream digest rejects mixed bytes; no manifest/content blobs published and staging cleaned"
+        ]
+      },
+      {
+        "path": "src/connectors/codex/stable_prefix/tests.rs",
+        "test": "retained_descriptor_receipt_allows_appends_and_rejects_object_substitution",
+        "cases": [
+          "real proof permits suffix append",
+          "validation cursor at B requires rewind",
+          "foreign same-content descriptor rejected",
+          "name replacement while original descriptor retained rejected",
+          "mtime-restored in-place rewrite rejected"
+        ]
+      },
+      {
+        "path": "src/raw_mirror/prefix_tests.rs",
+        "test": "source_mutation_during_prefix_admission_is_rejected_before_raw_publication",
+        "cases": [
+          "existing coordinated writer regression now explicitly triggers after original privacy/metadata admission in the mirror-init/lock window"
+        ]
+      },
+      {
+        "path": "src/raw_mirror/prefix_tests.rs",
+        "test": "existing positive/negative controls retained",
+        "cases": [
+          "exact B and original manifest provenance",
+          "no whole-file cache poisoning",
+          "source mutation/truncation/replacement",
+          "capture off and exclusions",
+          "foreign relabel and sensitive physical store",
+          "append during admission"
+        ]
+      }
+    ],
+    "source_review": "Independent review of bounded descriptor reading, rewind, streamed-byte digest, source/name revalidation, publication ordering, policy guards, no whole-source cache reuse, staging budget and affected call sites.",
+    "native_validation": "These final edits and new tests were not compiled or executed in the exact-366 native attempt.",
+    "limitations": [
+      "Source reading and bounded compression can still occur before a write budget refusal; the guarantee is no unbudgeted full-B copy or staging write.",
+      "Receipt checks establish captured historical bytes, not immutability against a future write.",
+      "Existing full-source size cap, inactivity and abandoned-tail recovery rules remain unchanged."
+    ]
+  },
+  "exact_366_native_attempt": {
+    "base_commit": "366a6e5903ae74524c483f05cc9bd9c887b2059f",
+    "evidence_path": "docs/planning/CODEX_STABLE_PREFIX_NATIVE_ATTEMPT_2026-11-24.json",
+    "evidence_blob": "5ff8f9ad493221f05bf9b5ecc09a9b382ebc4b3a",
+    "evidence_sha256": "bb0d55e05bab76f18aba62f0efb70c9346a480d24fcf666a3b7bff0dfce89e4b",
+    "classification": "dependency compilation stopped by host memory reserve; zero tests executed",
+    "source_file_count": 44,
+    "source_manifest_sha256": "d5918eafb705dd04f750542f17bb2225834deb1db044e718ef92d46fdaa6d4d7",
+    "source_changes": [],
+    "resource_result": {
+      "duration_seconds": 63.52,
+      "initial_mem_available_kib": 5879764,
+      "lowest_mem_available_kib": 2044232,
+      "peak_aggregate_rss_kib": 423120,
+      "peak_aggregate_vas_kib": 1781600,
+      "stop_reason": "Memory guard: MemAvailable below 2 GiB",
+      "child_returncode": -15,
+      "supervisor_returncode": 125
+    },
+    "terminal_dsr": {
+      "outer_exit_code": 1,
+      "status": "failed",
+      "observed": 1,
+      "executed": 1,
+      "passed": 0,
+      "check_exit_code": 125
+    },
+    "native_test_binaries_executed": 0,
+    "limitations": [
+      "No native test binary executed.",
+      "CASS host/storage/raw integration was not compiled or tested.",
+      "No Clippy, rustfmt check, or UBS scan ran in this attempt.",
+      "DSR source_before/after labels this minimal archive not-a-git-repo; the complete independent 44-file manifest is the authoritative source proof.",
+      "Compilation resources include tmpfs effects through global MemAvailable monitoring; external pressure attribution is not proven."
+    ]
   }
 }

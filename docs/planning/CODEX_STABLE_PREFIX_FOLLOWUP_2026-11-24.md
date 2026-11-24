@@ -187,6 +187,67 @@ contains the captured decoded check log, tool provenance, watchdog results,
 input manifests and final source hashes. The prior evidence ZIP does not
 contain this newly captured attempt.
 
+
+## Budget raw-mirror capture without another full-prefix copy
+
+The earlier raw-mirror adapter reconstructed a second full admitted prefix in
+the global temporary directory before the raw retention/free-space policy
+could refuse it. A paused capture could therefore consume B extra bytes even
+when its configured raw budget was zero.
+
+The raw adapter now carries the typed source receipt into the existing
+budgeted chunk writer. It opens the original source through the existing
+regular-file, no-follow, nonblocking opener, validates that retained descriptor,
+rewinds after validation, and reads exactly B bytes. It hashes the bytes
+actually streamed before any content-addressed blob or manifest is published,
+then validates the held descriptor and named source again. The streamed hash
+rejects a mixed capture even if a writer restores the original bytes before
+the final source check.
+
+New staging writes retain the existing per-write retention/free-space
+accounting. Verified content-addressed chunks and an unchanged manifest can
+still be reused without a new write reservation. Prefix captures neither read
+nor populate the whole-source cache. The parser's immutable admission view,
+ordinary raw snapshot metadata guards, source exclusions, physical sensitive
+store checks, inactive EOF policy and abandoned-tail recovery remain unchanged.
+
+Regressions include real append and descriptor-substitution cases, a
+deterministically coordinated in-place mutation and restoration during chunk
+capture, and isolated child processes whose global temporary path is an
+existing regular file. Those children cover zero retention budget, impossible
+free-space reserve, successful exact-B capture, and read-only reuse after later
+appends. A fresh child completion receipt and exact one-test result prevent
+an accidentally empty child test selection from satisfying the regression.
+These new native tests have source review only at this publication boundary.
+
+## Exact-366 native execution attempt
+
+A later authorized DSR attempt used the exact
+[366a6e5](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/366a6e5903ae74524c483f05cc9bd9c887b2059f)
+source, unchanged nightly-2026-08-31, genuine DSR 0.2.3 at
+ed04eee4a02e510c66762cdbd720aa20ef359b86, and pinned Franken Agent Detection
+a0dd013a8c1e374d6a80949637e5e51cbb45550b. Its independent manifest froze 44
+source/input files; their hashes were unchanged after execution.
+
+Cargo metadata verified the parser pin. Dependency compilation reached FAD,
+then the two GiB available-memory reserve stopped the owned process group
+after 63.52 seconds. Available memory fell from 5,879,764 KiB to a sampled
+minimum of 2,044,232 KiB. Peak owned aggregate RSS was 423,120 KiB and VAS was
+1,781,600 KiB. The child received SIGTERM; the configured check returned 125.
+
+Unlike the earlier interrupted receipt collection above, this attempt's
+terminal DSR receipt was captured: outer exit 1, status failed, one observed
+and executed check, zero passed. **Zero test binaries executed.** This is
+dependency-build evidence, not CASS typechecking or a test result for either
+the baseline or the subsequent edits. No dependency, gate, memory reserve or
+toolchain pin was weakened.
+
+[The complete native-attempt record](CODEX_STABLE_PREFIX_NATIVE_ATTEMPT_2026-11-24.json)
+preserves the decoded log, terminal receipt, resource samples, guard scripts,
+tool provenance and exact input manifest. Its Git blob is
+5ff8f9ad493221f05bf9b5ecc09a9b382ebc4b3a and its SHA256 is
+bb0d55e05bab76f18aba62f0efb70c9346a480d24fcf666a3b7bff0dfce89e4b.
+
 ## Qualification boundaries
 
 These changes have source review and exact source-identity checks, not final

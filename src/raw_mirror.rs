@@ -148,9 +148,10 @@ pub fn capture_source_file(
 
 /// Preserve exactly the Codex bytes admitted by a stable-prefix delivery.
 ///
-/// Source policy always uses the original source name. The private view is a
-/// parser/capture input only: it must never become a manifest identity or a
-/// full-source cache entry, and a later append must not change this capture.
+/// Source policy and manifest identity use the original source name. Capture
+/// reads exactly the admitted range through a verified descriptor and the
+/// existing budgeted chunk writer; no second full-size temporary copy is made.
+/// A later append must not change this capture or create a full-source cache entry.
 pub(crate) fn capture_codex_prefix(
     input: RawMirrorCaptureInput<'_>,
     receipt: &crate::connectors::codex::StablePrefixReceipt,
@@ -171,11 +172,9 @@ pub(crate) fn capture_codex_prefix(
         );
     }
     let policy = RawMirrorRetentionPolicy::from_env()?;
-    let snapshot = receipt.capture_view()?;
     let result = store::policy::capture_codex_prefix(
         input.clone(),
         receipt,
-        snapshot.path(),
         TRANSCRIPT_CHUNK_BYTES as u64,
         TRANSCRIPT_CHUNK_BYTES,
         policy,

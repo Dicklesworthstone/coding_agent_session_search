@@ -379,3 +379,53 @@ fn header_only_and_blank_prefixes_do_not_fabricate_completions() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn retained_descriptor_receipt_allows_appends_and_rejects_object_substitution() -> Result<()> {
+    let original = b"{\"original\":true}\n";
+    let (directory, path) = fixture(original)?;
+    let captured = snapshot(&path)?;
+    let receipt = captured.receipt_for(None, None)?;
+    let mut opened = File::open(&path)?;
+    receipt.validate_opened_source(&opened)?;
+    assert_eq!(opened.stream_position()?, receipt.committed_bytes);
+
+    OpenOptions::new()
+        .append(true)
+        .open(&path)?
+        .write_all(b"{\"later\":true}\n")?;
+    receipt.validate_opened_source(&opened)?;
+    opened.rewind()?;
+    let mut admitted = Vec::new();
+    (&mut opened)
+        .take(receipt.committed_bytes)
+        .read_to_end(&mut admitted)?;
+    assert_eq!(admitted, original);
+
+    let foreign = directory.path().join("rollout-foreign.jsonl");
+    fs::write(&foreign, fs::read(&path)?)?;
+    assert!(
+        receipt.validate_opened_source(&File::open(&foreign)?).is_err(),
+        "identical bytes in another opened object are not the admitted descriptor"
+    );
+    let retained = path.with_extension("retained");
+    fs::rename(&path, &retained)?;
+    fs::rename(&foreign, &path)?;
+    assert!(
+        receipt.validate_opened_source(&opened).is_err(),
+        "the retained object cannot certify a replacement at its original name"
+    );
+
+    fs::rename(&path, directory.path().join("replacement-retained"))?;
+    fs::rename(&retained, &path)?;
+    receipt.validate_opened_source(&opened)?;
+    let modified = fs::metadata(&path)?.modified()?;
+    let mut writer = OpenOptions::new().write(true).open(&path)?;
+    writer.write_all(b"{\"modified\":true}\n")?;
+    writer.set_modified(modified)?;
+    assert!(
+        receipt.validate_opened_source(&opened).is_err(),
+        "restoring mtime cannot hide a rewrite of the admitted bytes"
+    );
+    Ok(())
+}

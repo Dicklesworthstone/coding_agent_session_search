@@ -182,6 +182,14 @@ impl StablePrefixReceipt {
         self.validate_identity(file)
     }
 
+    /// Validate the retained source descriptor used by a bounded raw capture.
+    /// This reuses the byte/object proof and grants no parser-delivery or EOF
+    /// authority. Validation moves the descriptor cursor; readers must rewind
+    /// before consuming their independently bounded range.
+    pub(crate) fn validate_opened_source(&self, file: &File) -> Result<()> {
+        self.validate_opened(file, None)
+    }
+
     /// Revalidate persisted evidence before delayed raw capture or reuse.
     pub(crate) fn validate_source(&self) -> Result<()> {
         self.validate_shape()?;
@@ -190,6 +198,7 @@ impl StablePrefixReceipt {
     }
 
     /// Recreate only the previously admitted bytes. Never consume a later EOF.
+    #[cfg(test)]
     pub(crate) fn capture_view(&self) -> Result<StablePrefixSnapshot> {
         self.validate_shape()?;
         let file = open_source(&self.source_path)?;

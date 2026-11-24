@@ -394,7 +394,18 @@ fn growing_source_reads_only_the_admitted_length_and_publishes_nothing() {
     let root = ensure_raw_mirror_root(&data).unwrap();
     let mut staging = Staging::new(&root);
     let mut budget = Budget { root: &root, policy: policy(2 * 1024 * 1024), used: 0, inventoried: true };
-    let result = prepare_bounded(&root, &input(&data, &source), &metadata, 1, CHUNK, &mut staging, &mut budget);
+    let result = prepare_bounded(
+        &root,
+        &input(&data, &source),
+        CaptureSource {
+            metadata: &metadata,
+            prefix: None,
+        },
+        1,
+        CHUNK,
+        &mut staging,
+        &mut budget,
+    );
     assert!(result.is_err());
     let staged: u64 = staging.files.iter().map(|path| fs::metadata(path).unwrap().len()).sum();
     assert_eq!(staged, metadata.len(), "do not chase the new megabyte to EOF");

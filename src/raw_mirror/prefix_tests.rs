@@ -135,41 +135,132 @@ fn prefix_capture_rejects_rewrites_truncation_and_same_bytes_replacement_before_
 }
 
 #[test]
-fn immutable_view_bytes_must_match_receipt_before_any_blob_is_published() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let data = temp.path().join("data");
-    let source = temp.path().join("rollout-source.jsonl");
-    let view = temp.path().join("rollout-unrelated.jsonl");
-    let original = b"{\"text\":\"original\"}\n";
-    fs::write(&source, original)?;
-    fs::write(&view, b"{\"text\":\"tampered\"}\n")?;
+fn streamed_prefix_hash_rejects_restored_in_place_changes_before_publication() -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    fn block(fill: u8) -> Vec<u8> {
+        let mut bytes = b"{\"text\":\"".to_vec();
+        bytes.extend(std::iter::repeat_n(
+            fill,
+            TRANSCRIPT_CHUNK_BYTES - bytes.len() - 3,
+        ));
+        bytes.extend_from_slice(b"\"}\n");
+        assert_eq!(bytes.len(), TRANSCRIPT_CHUNK_BYTES);
+        bytes
+    }
+
+    fn staged_blobs(data: &Path) -> Vec<PathBuf> {
+        let mut blobs = Vec::new();
+        if let Ok(directories) = fs::read_dir(data.join("raw-mirror/v1/tmp")) {
+            for directory in directories.flatten() {
+                let Ok(files) = fs::read_dir(directory.path()) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    if file
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(".blob."))
+                        && file
+                            .metadata()
+                            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+                    {
+                        blobs.push(file.path());
+                    }
+                }
+            }
+        }
+        blobs
+    }
+
+    let directory = tempfile::tempdir()?;
+    let data = directory.path().join("data");
+    let source = directory.path().join("rollout-streamed-race.jsonl");
+    let first = block(b'a');
+    let second = block(b'b');
+    let tampered = block(b'c');
+    let original = [first.as_slice(), second.as_slice()].concat();
+    fs::write(&source, &original)?;
     let proof = receipt(&source, original.len())?;
-    let error = store::policy::capture_codex_prefix(
+    let modified = fs::metadata(&source)?.modified()?;
+    let encoded_tampered = super::codec::compress_chunk(&tampered)?;
+    let phase = Arc::new(AtomicUsize::new(0));
+    let saw_tampered_chunk = Arc::new(AtomicBool::new(false));
+    let observer = observe_raw_mirror_io(
+        Arc::new({
+            let data = data.clone();
+            let source = source.clone();
+            let phase = Arc::clone(&phase);
+            let saw_tampered_chunk = Arc::clone(&saw_tampered_chunk);
+            move || {
+                let blobs = staged_blobs(&data);
+                let state = phase.load(Ordering::SeqCst);
+                if state == 0 && !blobs.is_empty() {
+                    // The first chunk has already been read. Change only the
+                    // next chunk before the bounded reader reaches it.
+                    let mut writer = OpenOptions::new().write(true).open(&source).unwrap();
+                    writer
+                        .seek(SeekFrom::Start(TRANSCRIPT_CHUNK_BYTES as u64))
+                        .unwrap();
+                    writer.write_all(&tampered).unwrap();
+                    writer.set_modified(modified).unwrap();
+                    phase.store(1, Ordering::SeqCst);
+                } else if state == 1 && blobs.len() >= 2 {
+                    saw_tampered_chunk.store(
+                        blobs
+                            .iter()
+                            .any(|path| fs::read(path).unwrap() == encoded_tampered),
+                        Ordering::SeqCst,
+                    );
+                    // Restore the current source before final descriptor
+                    // validation. Only the hash of the bytes actually read
+                    // can reject a mixed historical capture in this case.
+                    let mut writer = OpenOptions::new().write(true).open(&source).unwrap();
+                    writer
+                        .seek(SeekFrom::Start(TRANSCRIPT_CHUNK_BYTES as u64))
+                        .unwrap();
+                    writer.write_all(&second).unwrap();
+                    writer.set_modified(modified).unwrap();
+                    phase.store(2, Ordering::SeqCst);
+                }
+            }
+        }),
+        Arc::new(|| false),
+    );
+    let result = store::policy::capture_codex_prefix(
         input(&data, &source),
         &proof,
-        &view,
         TRANSCRIPT_CHUNK_BYTES as u64,
         TRANSCRIPT_CHUNK_BYTES,
         RawMirrorRetentionPolicy {
             max_bytes: u64::MAX,
             min_free_bytes: 0,
         },
-    )
-    .unwrap_err();
+    );
+    drop(observer);
+    assert_eq!(phase.load(Ordering::SeqCst), 2, "{result:?}");
+    assert!(saw_tampered_chunk.load(Ordering::SeqCst));
+    assert_eq!(fs::read(&source)?, original);
+    proof.validate_source()?;
+    let error = result.expect_err("restored source bytes cannot certify the mixed stream");
     assert!(
         error
             .to_string()
-            .contains("do not match the parsed source receipt")
+            .contains("do not match the parsed source receipt"),
+        "{error:#}"
     );
     let summary = storage_summary(&data);
     assert_eq!(summary.manifest_count, 0);
     assert_eq!(summary.unique_blob_count, 0);
     assert_eq!(summary.orphan_blob_count, 0);
+    assert_eq!(fs::read_dir(data.join("raw-mirror/v1/tmp"))?.count(), 0);
     Ok(())
 }
 
 #[test]
-fn source_mutation_after_prefix_copy_is_rejected_before_raw_publication() -> Result<()> {
+fn source_mutation_during_prefix_admission_is_rejected_before_raw_publication() -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
 
@@ -199,12 +290,13 @@ fn source_mutation_after_prefix_copy_is_rejected_before_raw_publication() -> Res
     let completed = Mutex::new(completed);
     let triggered = Arc::new(AtomicBool::new(false));
     let trigger = Arc::clone(&triggered);
-    // Raw policy I/O starts only after capture_view has made and verified its
-    // immutable copy. Coordinate a real writer at that boundary, rather than
-    // relying on a scheduler race or changing the private parser input.
+    // Mirror initialization follows original-source metadata/privacy checks.
+    // Coordinate a real writer in the lock/admission window; the typed source
+    // proof must be checked again before reading or publishing bytes.
+    let observed_data = data.clone();
     let scope = observe_raw_mirror_io(
         Arc::new(move || {
-            if !trigger.swap(true, Ordering::SeqCst) {
+            if observed_data.is_dir() && !trigger.swap(true, Ordering::SeqCst) {
                 request.send(()).unwrap();
                 completed
                     .lock()
@@ -219,7 +311,7 @@ fn source_mutation_after_prefix_copy_is_rejected_before_raw_publication() -> Res
     drop(scope);
     writer.join().expect("writer joined");
     assert!(triggered.load(Ordering::SeqCst));
-    let error = result.expect_err("a valid private copy cannot authorize a rewritten source");
+    let error = result.expect_err("a source receipt cannot authorize rewritten bytes");
     assert_eq!(
         error.downcast_ref::<std::io::Error>().unwrap().kind(),
         std::io::ErrorKind::Interrupted
@@ -296,8 +388,8 @@ fn prefix_capture_policy_child() -> Result<()> {
     let bytes = fs::read(&source)?;
     let proof = receipt(&source, bytes.len())?;
     if case != "budget" {
-        // Missing source proves these policy refusals happen before capture_view
-        // opens or validates the original file, not merely before publication.
+        // A missing source proves these policy refusals precede descriptor
+        // opening/validation, not merely raw publication.
         fs::rename(&source, source.with_extension("retained"))?;
     }
     let error = capture_codex_prefix(input(&data, &source), &proof).unwrap_err();
@@ -346,8 +438,8 @@ fn prefix_capture_cannot_copy_a_sensitive_store_under_a_codex_label() -> Result<
     let bytes = b"{\"private_store_setting\":true}\n";
     fs::write(&source, bytes)?;
     let proof = receipt(&source, bytes.len())?;
-    // The physical store's ownership must reject before a prefix view tries
-    // to reopen the source, even when all of its receipt fields are plausible.
+    // Physical ownership must reject before prefix descriptor validation
+    // reopens the source, even when all receipt fields are plausible.
     fs::rename(&source, source.with_extension("retained"))?;
     let error = capture_codex_prefix(input(&data, &source), &proof).unwrap_err();
     assert!(error.to_string().contains("disabled_sensitive_container"));
@@ -412,3 +504,5 @@ fn append_after_raw_admission_keeps_the_admitted_prefix() -> Result<()> {
     }
     Ok(())
 }
+
+mod budgeted_tests;

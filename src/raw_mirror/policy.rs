@@ -579,10 +579,18 @@ fn stage_source_chunk(
     Ok(reference)
 }
 
+/// The ordinary snapshot keeps its strict metadata checks. A Codex prefix
+/// instead carries the original byte/object receipt for a fixed historical
+/// range; later bytes are outside this raw capture.
+struct CaptureSource<'a> {
+    metadata: &'a fs::Metadata,
+    prefix: Option<&'a crate::connectors::codex::StablePrefixReceipt>,
+}
+
 fn prepare_bounded(
     root: &Path,
     input: &RawMirrorCaptureInput<'_>,
-    metadata: &fs::Metadata,
+    source: CaptureSource<'_>,
     threshold: u64,
     chunk_size: usize,
     staging: &mut Staging,
@@ -592,28 +600,35 @@ fn prepare_bounded(
         chunk_size > 0 && chunk_size <= crate::raw_mirror::codec::MAX_DECODED_CHUNK_BYTES,
         "raw-mirror chunk size exceeds the bounded codec policy"
     );
-    let chunked = metadata.len() >= threshold;
-    let count = metadata.len().div_ceil(chunk_size as u64);
+    let CaptureSource { metadata, prefix } = source;
+    let source_bytes = prefix.map_or(metadata.len(), |receipt| receipt.committed_bytes);
+    let chunked = source_bytes >= threshold;
+    let count = source_bytes.div_ceil(chunk_size as u64);
     if chunked && count > RAW_MIRROR_MANIFEST_MAX_BYTES / 512 {
         anyhow::bail!("raw-mirror source needs too many chunks for a bounded manifest");
     }
-    let reusable = if chunked {
+    let reusable = if chunked && prefix.is_none() {
         let key = raw_mirror_blob_cache_key(input, metadata, threshold, chunk_size);
         reusable_source_chunks(root, &key).unwrap_or_default()
     } else {
         HashMap::new()
     };
     let mut source = open_stable_source_file(input.source_path, metadata)?;
-    // Never chase a concurrently appending writer to EOF. Truncation, append,
-    // in-place rewrites and replacement still fail the existing stability test.
-    let mut snapshot = (&mut source).take(metadata.len());
+    if let Some(receipt) = prefix {
+        receipt.validate_opened_source(&source)?;
+        source.rewind()?;
+    }
+    // Never chase a writer to a later EOF. Ordinary captures retain the
+    // unchanged whole-snapshot checks below. Prefixes are fixed at the
+    // admitted byte boundary and must match its independently recorded hash.
+    let mut snapshot = (&mut source).take(source_bytes);
     let buffer_size = if chunked {
         chunk_size
     } else {
-        usize::try_from(metadata.len()).context("raw-mirror source does not fit memory")?
+        usize::try_from(source_bytes).context("raw-mirror source does not fit memory")?
     };
     let mut buffer = vec![0_u8; buffer_size];
-    let mut remaining = metadata.len();
+    let mut remaining = source_bytes;
     let mut hasher = blake3::Hasher::new();
     let mut seen = HashSet::new();
     let mut files = Vec::new();
@@ -649,20 +664,29 @@ fn prepare_bounded(
             break;
         }
     }
-    if source_file_changed_during_capture(
+    let content_hash = hasher.finalize().to_hex().to_string();
+    if let Some(receipt) = prefix {
+        anyhow::ensure!(
+            content_hash == receipt.blake3,
+            "Codex prefix capture bytes do not match the parsed source receipt"
+        );
+        // Verify the held object as well as its current name. A replacement,
+        // in-place rewrite, truncation or new advisory lock cannot authorize
+        // publication merely because a bounded read already finished.
+        receipt.validate_opened_source(&source)?;
+    } else if source_file_changed_during_capture(
         metadata,
         &raw_mirror_io("fstat_source", input.source_path, || source.metadata())?,
     ) || source_path_changed_identity_during_capture(input.source_path, metadata)
     {
         anyhow::bail!("raw-mirror source changed during bounded capture; retry a stable snapshot");
     }
-    let content_hash = hasher.finalize().to_hex().to_string();
     let (reference, content_storage) = if chunked {
         let storage = RawMirrorContentStorage {
             kind: RAW_MIRROR_FIXED_CHUNKS_V2_KIND.to_string(),
             content_hash_algorithm: RAW_MIRROR_HASH_ALGORITHM.to_string(),
             content_blake3: content_hash.clone(),
-            content_size_bytes: metadata.len(),
+            content_size_bytes: source_bytes,
             chunk_size_bytes: chunk_size as u64,
             chunks,
         };
@@ -682,7 +706,7 @@ fn prepare_bounded(
             blob_blake3: reference.blob_blake3,
             blob_size_bytes: reference.blob_size_bytes,
             source_content_blake3: content_hash,
-            source_size_bytes: metadata.len(),
+            source_size_bytes: source_bytes,
             content_storage,
         },
         files,
@@ -745,7 +769,10 @@ pub(super) fn prepare_for_test(
     prepare_bounded(
         root,
         &input,
-        metadata,
+        CaptureSource {
+            metadata,
+            prefix: None,
+        },
         threshold,
         chunk_size,
         &mut staging,
@@ -810,13 +837,12 @@ pub(crate) fn capture(
     chunk_size: usize,
     policy: RawMirrorRetentionPolicy,
 ) -> Result<RawMirrorCaptureRecord> {
-    capture_with_view(input, threshold, chunk_size, policy, None)
+    capture_with_prefix(input, threshold, chunk_size, policy, None)
 }
 
 pub(crate) fn capture_codex_prefix(
     input: RawMirrorCaptureInput<'_>,
     receipt: &crate::connectors::codex::StablePrefixReceipt,
-    view: &Path,
     threshold: u64,
     chunk_size: usize,
     policy: RawMirrorRetentionPolicy,
@@ -826,15 +852,15 @@ pub(crate) fn capture_codex_prefix(
         "Codex prefix capture does not match its admitted source"
     );
     receipt.validate_source()?;
-    capture_with_view(input, threshold, chunk_size, policy, Some((view, receipt)))
+    capture_with_prefix(input, threshold, chunk_size, policy, Some(receipt))
 }
 
-fn capture_with_view(
+fn capture_with_prefix(
     input: RawMirrorCaptureInput<'_>,
     threshold: u64,
     chunk_size: usize,
     policy: RawMirrorRetentionPolicy,
-    prefix: Option<(&Path, &crate::connectors::codex::StablePrefixReceipt)>,
+    prefix: Option<&crate::connectors::codex::StablePrefixReceipt>,
 ) -> Result<RawMirrorCaptureRecord> {
     if crate::raw_mirror::is_sensitive_container_provider(input.provider) {
         anyhow::bail!(
@@ -882,26 +908,14 @@ fn capture_with_view(
     {
         anyhow::bail!("raw mirror source changed identity while waiting for capture");
     }
-    // The original name owns privacy, provenance and manifest identity. A
-    // prefix view supplies only bytes and is independently held to the same
-    // immutable-file guards as an ordinary capture.
-    let view_input = RawMirrorCaptureInput {
-        source_path: prefix.map_or(input.source_path, |(view, _)| view),
-        ..input.clone()
-    };
-    let view_metadata = if let Some((view, receipt)) = prefix {
+    // The original name owns privacy, provenance and manifest identity.
+    // Recheck prefix evidence after waiting for the mutation lock. Its reader
+    // binds to this current object while the ordinary path keeps the original
+    // pre-lock snapshot. No unbudgeted full-size temporary view is created.
+    if let Some(receipt) = prefix {
         receipt.validate_source()?;
-        let observed = raw_mirror_symlink_metadata(view)?;
-        anyhow::ensure!(
-            observed.is_file()
-                && !observed.file_type().is_symlink()
-                && observed.len() == receipt.committed_bytes,
-            "Codex prefix capture view does not match its admitted boundary"
-        );
-        observed
-    } else {
-        metadata.clone()
-    };
+    }
+    let reader_metadata = if prefix.is_some() { &current } else { &metadata };
     // Validate coordination even on a cache hit, but do not rewrite it until
     // this capture actually needs to publish something. Repeated watch scans
     // of unchanged sources must not create staging trees or mutation events.
@@ -929,8 +943,11 @@ fn capture_with_view(
         },
         None => prepare_bounded(
             &root,
-            &view_input,
-            &view_metadata,
+            &input,
+            CaptureSource {
+                metadata: reader_metadata,
+                prefix,
+            },
             threshold,
             chunk_size,
             &mut staging,
@@ -938,7 +955,7 @@ fn capture_with_view(
         )?,
     };
     let record = prepared.record;
-    if let Some((_, receipt)) = prefix {
+    if let Some(receipt) = prefix {
         anyhow::ensure!(
             record.source_size_bytes == receipt.committed_bytes
                 && record.source_content_blake3 == receipt.blake3,
