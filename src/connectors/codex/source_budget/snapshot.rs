@@ -126,6 +126,31 @@ fn source_is_unlocked(file: &File) -> bool {
     file.unlock().is_ok()
 }
 
+/// Open a regular source without waiting for a peer on a substituted FIFO.
+///
+/// Path metadata cannot protect a later open from replacement. On Unix, apply
+/// nonblocking mode to the actual open, then validate the opened object before
+/// any reads. Ordinary snapshot reads deliberately keep following symlinks to
+/// regular files; the stricter active-source exemption has its own opener.
+pub(super) fn open_regular_source(path: &Path) -> io::Result<(File, Metadata)> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Codex source snapshot is not a regular file",
+        ));
+    }
+    Ok((file, metadata))
+}
+
 impl SourceSnapshot {
     #[cfg(test)]
     pub(super) fn capture(path: &Path) -> Result<Self> {
@@ -133,16 +158,8 @@ impl SourceSnapshot {
     }
 
     pub(super) fn capture_with_limit(path: &Path, limit: u64) -> Result<Self> {
-        let file =
-            File::open(path).with_context(|| format!("open Codex source snapshot {path:?}"))?;
-        let before = file.metadata().context("inspect Codex source snapshot")?;
-        if !before.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Codex source snapshot is not a regular file",
-            )
-            .into());
-        }
+        let (file, before) = open_regular_source(path)
+            .with_context(|| format!("open Codex source snapshot {path:?}"))?;
         let observed = super::text_len(path, &file, before.len());
         if observed > limit {
             return Err(super::EnrichmentBudgetExceeded {
@@ -453,6 +470,188 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("consumer stopped"));
         assert!(!guarded_active_jsonl_source(&path));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_snapshot_refuses_fifo_replacements_with_a_bounded_child() -> Result<()> {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir()?;
+        let (_, module) = module_path!()
+            .split_once("::")
+            .context("snapshot test module has a crate prefix")?;
+        let child_test = format!("{module}::source_snapshot_fifo_child");
+        let mut child = Command::new(std::env::current_exe()?)
+            .args(["--exact", &child_test, "--nocapture", "--test-threads=1"])
+            .env("CASS_TEST_CODEX_SNAPSHOT_FIFO_ROOT", root.path())
+            .stdin(Stdio::null())
+            .spawn()?;
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() < Duration::from_secs(10) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                outcome => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    match outcome {
+                        Err(error) => return Err(error.into()),
+                        _ => anyhow::bail!("Codex source admission waited for a FIFO writer"),
+                    }
+                }
+            }
+        };
+        assert!(status.success(), "snapshot FIFO child failed");
+        // A receipt proves that the exact child filter executed every case;
+        // a successful empty test selection cannot satisfy this regression.
+        assert_eq!(
+            fs::read(root.path().join("snapshot-fifo-receipt"))?,
+            b"plain,compressed,symlink,replace-after-discovery,retry"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_snapshot_fifo_child() -> Result<()> {
+        let Ok(root) = dotenvy::var("CASS_TEST_CODEX_SNAPSHOT_FIFO_ROOT") else {
+            return Ok(());
+        };
+        let root = PathBuf::from(root);
+        let make_fifo = |path: &Path| -> Result<()> {
+            anyhow::ensure!(
+                std::process::Command::new("mkfifo")
+                    .arg(path)
+                    .status()?
+                    .success(),
+                "create source FIFO"
+            );
+            Ok(())
+        };
+
+        // No writer is ever opened. A blocking read-open would therefore wait
+        // forever; the parent kills this test process if that regresses.
+        for extension in ["jsonl", "jsonl.zst"] {
+            let fifo = root.join(format!("rollout-no-writer.{extension}"));
+            make_fifo(&fifo)?;
+            let error = SourceSnapshot::capture(&fifo)
+                .err()
+                .context("a FIFO cannot be admitted as a source snapshot")?;
+            assert_kind(&error, io::ErrorKind::InvalidInput);
+        }
+        let alias = root.join("rollout-fifo-alias.jsonl");
+        std::os::unix::fs::symlink(root.join("rollout-no-writer.jsonl"), &alias)?;
+        let error = SourceSnapshot::capture(&alias)
+            .err()
+            .context("a symlink to a FIFO cannot be admitted")?;
+        assert_kind(&error, io::ErrorKind::InvalidInput);
+
+        // Exercise the real connector boundary, where an earlier discovery
+        // already saw a regular file. Keep the original bytes for the retry.
+        let (_fixture, path, ctx) = fixture("jsonl")?;
+        let retained = path.with_extension("retained");
+        let original = fs::read(&path)?;
+        let mut swapped = false;
+        let mut predicate = |source: &DiscoveredSourceFile| {
+            assert_eq!(source.source_path, path);
+            if !swapped {
+                fs::rename(&path, &retained).expect("retain discovered source");
+                make_fifo(&path).expect("substitute source after discovery");
+                swapped = true;
+            }
+            true
+        };
+        let mut complete = |_: &SourceCompletion| panic!("FIFO source cannot complete");
+        let mut hooks = SourceScanHooks {
+            should_scan_source: Some(&mut predicate),
+            on_source_complete: Some(&mut complete),
+        };
+        let error = scan(
+            &CodexConnector::new(),
+            &ctx,
+            &mut hooks,
+            &mut |_| panic!("FIFO source cannot emit a conversation"),
+            |_| panic!("FIFO source cannot be enriched"),
+        )
+        .unwrap_err();
+        assert_kind(&error, io::ErrorKind::InvalidInput);
+        assert!(swapped);
+        assert_eq!(fs::read(&retained)?, original);
+
+        fs::rename(&path, path.with_extension("retained-fifo"))?;
+        fs::rename(&retained, &path)?;
+        let mut delivered = 0;
+        let mut completed = 0;
+        let mut complete = |_: &SourceCompletion| {
+            completed += 1;
+            Ok(())
+        };
+        let mut hooks = SourceScanHooks {
+            should_scan_source: None,
+            on_source_complete: Some(&mut complete),
+        };
+        scan(
+            &CodexConnector::new(),
+            &ctx,
+            &mut hooks,
+            &mut |conversation| {
+                assert_eq!(conversation.messages.len(), 1);
+                assert_eq!(conversation.messages[0].content, "original");
+                delivered += 1;
+                Ok(())
+            },
+            |conversation| augment_modern_codex_messages(conversation, None),
+        )?;
+        assert_eq!((delivered, completed), (1, 1));
+        assert_eq!(fs::read(&path)?, original);
+        fs::write(
+            root.join("snapshot-fifo-receipt"),
+            b"plain,compressed,symlink,replace-after-discovery,retry",
+        )?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_snapshot_preserves_regular_symlink_reads_and_identity_checks() -> Result<()> {
+        let (root, path, _) = fixture("jsonl")?;
+        let alias = root.path().join("rollout-regular-alias.jsonl");
+        std::os::unix::fs::symlink(&path, &alias)?;
+        let snapshot = SourceSnapshot::capture(&alias)?;
+        snapshot.validate(&alias)?;
+        assert_eq!(snapshot.len(), fs::metadata(&path)?.len());
+        // Normal historical reads permit the alias; active-source admission
+        // remains deliberately stricter.
+        assert!(!can_attempt_active_jsonl_source(&alias));
+        let _guard = snapshot.guard_complete_delivery(&alias)?;
+        assert!(!guarded_active_jsonl_source(&alias));
+
+        let error = SourceSnapshot::capture_with_limit(&alias, snapshot.len() - 1)
+            .err()
+            .context("symlink reads must still obey the source budget")?;
+        assert_eq!(
+            error
+                .downcast_ref::<EnrichmentBudgetExceeded>()
+                .context("typed source budget refusal")?
+                .observed_bytes,
+            snapshot.len()
+        );
+
+        let replacement = root.path().join("rollout-replacement.jsonl");
+        fs::write(&replacement, content("jsonl", "replaced"))?;
+        File::open(&replacement)?.set_modified(snapshot.before.modified()?)?;
+        assert_eq!(fs::metadata(&replacement)?.len(), snapshot.len());
+        fs::rename(&alias, alias.with_extension("retained-link"))?;
+        std::os::unix::fs::symlink(&replacement, &alias)?;
+        assert_kind(
+            &snapshot.validate(&alias).unwrap_err(),
+            io::ErrorKind::Interrupted,
+        );
         Ok(())
     }
 

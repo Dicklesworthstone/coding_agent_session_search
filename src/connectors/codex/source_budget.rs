@@ -298,9 +298,10 @@ fn observed_over_limit_with_limit(source: &DiscoveredSourceFile, limit: u64) -> 
         return None;
     }
     let observed = if compressed {
-        std::fs::File::open(&source.source_path).map_or(metadata.len(), |file| {
-            text_len(&source.source_path, &file, metadata.len())
-        })
+        snapshot::open_regular_source(&source.source_path)
+            .map_or(metadata.len(), |(file, opened)| {
+                text_len(&source.source_path, &file, opened.len())
+            })
     } else {
         metadata.len()
     };
