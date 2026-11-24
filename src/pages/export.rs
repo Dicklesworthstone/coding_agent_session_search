@@ -67,14 +67,6 @@ pub struct ExportStats {
     pub messages_processed: usize,
 }
 
-type SnippetExportRow = (
-    Option<String>,
-    Option<i64>,
-    Option<i64>,
-    Option<String>,
-    String,
-);
-
 impl ExportEngine {
     pub fn new(source_db_path: &Path, output_path: &Path, filter: ExportFilter) -> Self {
         Self {
@@ -436,81 +428,83 @@ impl ExportEngine {
                     params.push(ParamValue::from(until.timestamp_millis()));
                 }
 
-                let query = format!(
-                    "SELECT c.id, COALESCE(a.slug, 'unknown') as agent, w.path as workspace, c.title, c.source_path, c.started_at, c.ended_at,
-             (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count,
-             {conversation_metadata}
-             {from_where}
-             ORDER BY c.id"
-                );
-
-                // Execute Main Query - collect all conversation rows
-                type ConversationExportRow = (
-                    i64,
-                    String,
-                    Option<String>,
-                    Option<String>,
-                    String,
-                    Option<i64>,
-                    Option<i64>,
-                    i64,
-                    Option<String>,
-                    Option<Vec<u8>>,
-                );
-                let mut conv_rows: Vec<ConversationExportRow> =
-                    src_tx.query_map_collect(&query, &params, |row: &FrankenRow| {
-                        Ok((
-                            row.get_typed::<i64>(0)?,
-                            row.get_typed::<String>(1)?,
-                            row.get_typed::<Option<String>>(2)?,
-                            row.get_typed::<Option<String>>(3)?,
-                            row.get_typed::<String>(4)?,
-                            row.get_typed::<Option<i64>>(5)?,
-                            row.get_typed::<Option<i64>>(6)?,
-                            row.get_typed::<i64>(7)?,
-                            row.get_typed::<Option<String>>(8)?,
-                            row.get_typed::<Option<Vec<u8>>>(9)?,
-                        ))
+                let running = running.as_deref();
+                ensure_export_running(running)?;
+                let total_convs = if self.exclusions.has_exclusions() {
+                    // Regex title exclusions are evaluated by Rust. Count using
+                    // just the review fields, in the same source transaction.
+                    let count_query = ExportPageQuery::new(
+                        &format!("SELECT c.id, w.path, c.title {from_where}"),
+                        &[("c.id", 0)],
+                    );
+                    let mut count = 0;
+                    count_query.visit(&src_tx, &params, running, |row| {
+                        let id = row.get_typed::<i64>(0)?;
+                        let workspace = row.get_typed::<Option<String>>(1)?;
+                        let title = row.get_typed::<Option<String>>(2)?;
+                        if !self.exclusions.should_exclude(
+                            workspace.as_deref(),
+                            id,
+                            title.as_deref().unwrap_or(""),
+                        ) {
+                            count += 1;
+                        }
+                        Ok(())
                     })?;
-                conv_rows.retain(|(id, _, workspace, title, _, _, _, _, _, _)| {
-                    !self.exclusions.should_exclude(
-                        workspace.as_deref(),
-                        *id,
-                        title.as_deref().unwrap_or(""),
-                    )
-                });
-                let total_convs = conv_rows.len();
+                    count
+                } else {
+                    let count: i64 = src_tx.query_row_map(
+                        &format!("SELECT COUNT(*) {from_where}"),
+                        &params,
+                        |row| row.get_typed(0),
+                    )?;
+                    usize::try_from(count).context("invalid Pages conversation count")?
+                };
 
+                let conversations = ExportPageQuery::new(
+                    &format!(
+                        "SELECT c.id, COALESCE(a.slug, 'unknown'), w.path, c.title, c.source_path,
+                                c.started_at, c.ended_at,
+                                (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id),
+                                {conversation_metadata} {from_where}"
+                    ),
+                    &[("c.id", 0)],
+                );
+                let snippets = ExportPageQuery::new(
+                    "SELECT rowid, file_path, start_line, end_line, language, snippet_text
+                     FROM snippets WHERE message_id = ?1",
+                    &[("rowid", 0)],
+                );
                 let mut processed = 0;
                 let mut msg_processed = 0;
                 let mut redactions = RedactionCounts::new();
 
-                for (
-                    id,
-                    agent,
-                    workspace,
-                    title,
-                    source_path,
-                    started_at,
-                    ended_at,
-                    message_count,
-                    metadata_json,
-                    metadata_bin,
-                ) in &conv_rows
-                {
-                    if let Some(r) = &running
-                        && !r.load(Ordering::Relaxed)
-                    {
-                        return Err(anyhow::anyhow!("Export cancelled"));
+                conversations.visit(&src_tx, &params, running, |row| {
+                    let id = row.get_typed::<i64>(0)?;
+                    let workspace = row.get_typed::<Option<String>>(2)?;
+                    let title = row.get_typed::<Option<String>>(3)?;
+                    if self.exclusions.should_exclude(
+                        workspace.as_deref(),
+                        id,
+                        title.as_deref().unwrap_or(""),
+                    ) {
+                        return Ok(());
                     }
+                    let agent = row.get_typed::<String>(1)?;
+                    let source_path = row.get_typed::<String>(4)?;
+                    let started_at = row.get_typed::<Option<i64>>(5)?;
+                    let ended_at = row.get_typed::<Option<i64>>(6)?;
+                    let message_count = row.get_typed::<i64>(7)?;
+                    let metadata_json = row.get_typed::<Option<String>>(8)?;
+                    let metadata_bin = row.get_typed::<Option<Vec<u8>>>(9)?;
 
                     // Transform Path
-                    let transformed_path = self.transform_path(source_path, workspace);
+                    let transformed_path = self.transform_path(&source_path, &workspace);
                     // 019i2: the workspace is a path too. Under the
                     // obfuscating modes (hash/basename) it must not survive
                     // verbatim — a "hidden metadata" bundle previously kept
                     // every exact local workspace path here.
-                    let transformed_workspace = self.transform_workspace(workspace);
+                    let transformed_workspace = self.transform_workspace(&workspace);
                     // 2l1b0.60: the share profile applies after the path
                     // policy, to every text the bundle carries.
                     let shared_workspace = transformed_workspace
@@ -526,7 +520,7 @@ impl ExportEngine {
                     let canonical_metadata = super::decode_metadata_blob(
                         metadata_bin.as_deref(),
                         "conversations.metadata_bin",
-                        *id,
+                        id,
                     )?
                     .map(|value| serde_json::to_string(&value))
                     .transpose()?;
@@ -540,83 +534,61 @@ impl ExportEngine {
                     "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, ended_at, message_count, metadata_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
-                        *id,
-                        self.share_redact(agent, false, &mut redactions).as_ref(),
+                        id,
+                        self.share_redact(&agent, false, &mut redactions).as_ref(),
                         shared_workspace.as_deref(),
                         shared_title.as_deref(),
                         shared_path.as_str(),
-                        *started_at,
-                        *ended_at,
-                        *message_count,
+                        started_at,
+                        ended_at,
+                        message_count,
                         shared_metadata.as_deref()
                     ],
                 )?;
 
-                    // Fetch messages for this conversation
-                    let msg_rows: Vec<MessageExportRow> = src_tx.query_map_collect(
-                        &msg_query,
-                        crate::franken_sync::params![*id],
-                        |row: &FrankenRow| {
-                            Ok((
-                                row.get_typed::<i64>(0)?,
-                                row.get_typed::<String>(1)?,
-                                row.get_typed::<String>(2)?,
-                                row.get_typed::<Option<i64>>(3)?,
-                                row.get_typed::<i64>(4)?,
-                                row.get_typed::<Option<i64>>(5)?,
-                                row.get_typed::<Option<String>>(6)?,
-                                row.get_typed::<Option<String>>(7)?,
-                                row.get_typed::<Option<String>>(8)?,
-                                row.get_typed::<Option<Vec<u8>>>(9)?,
-                            ))
-                        },
-                    )?;
-
-                    for (
-                        source_message_id,
-                        role,
-                        content,
-                        created_at,
-                        idx,
-                        updated_at,
-                        model,
-                        attachment_refs,
-                        extra_json,
-                        extra_bin,
-                    ) in &msg_rows
-                    {
+                    msg_query.visit(&src_tx, params![id], running, |row| {
+                        let source_message_id = row.get_typed::<i64>(0)?;
+                        let role = row.get_typed::<String>(1)?;
+                        let content = row.get_typed::<String>(2)?;
+                        let created_at = row.get_typed::<Option<i64>>(3)?;
+                        let idx = row.get_typed::<i64>(4)?;
+                        let updated_at = row.get_typed::<Option<i64>>(5)?;
+                        let model = row.get_typed::<Option<String>>(6)?;
+                        let attachment_refs = row.get_typed::<Option<String>>(7)?;
+                        let extra_json = row.get_typed::<Option<String>>(8)?;
+                        let extra_bin = row.get_typed::<Option<Vec<u8>>>(9)?;
                         let extra = super::decode_metadata_blob(
                             extra_bin.as_deref(),
                             "messages.extra_bin",
-                            *source_message_id,
+                            source_message_id,
                         )?
                         .or_else(|| serde_json::from_str(extra_json.as_deref()?).ok());
-                        let resolved_model = normalize_optional_text(model.clone())
+                        let resolved_model = normalize_optional_text(model)
                             .or_else(|| derive_message_model(extra.as_ref()?))
                             .map(|value| {
                                 self.share_redact(&value, false, &mut redactions).into_owned()
                             });
                         let resolved_attachment_refs =
-                            normalize_optional_text(attachment_refs.clone())
+                            normalize_optional_text(attachment_refs)
                                 .or_else(|| derive_attachment_refs(extra.as_ref()?))
                                 .map(|refs| self.share_redact_json(&refs, &mut redactions))
                                 .transpose()?;
                         // The search indexes are built from the same redacted
                         // text, so the bundle's FTS cannot find what the
                         // message body no longer shows.
-                        let content = self.share_redact(content, false, &mut redactions);
+                        let content = self.share_redact(&content, false, &mut redactions);
 
                         tx.execute_compat(
                             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at, updated_at, model, attachment_refs)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                             params![
-                                *source_message_id,
-                                *id,
-                                *idx,
-                                self.share_redact(role, false, &mut redactions).as_ref(),
+                                source_message_id,
+                                id,
+                                idx,
+                                self.share_redact(&role, false, &mut redactions).as_ref(),
                                 &*content,
-                                *created_at,
-                                *updated_at,
+                                created_at,
+                                updated_at,
                                 resolved_model.as_deref(),
                                 resolved_attachment_refs.as_deref()
                             ],
@@ -625,58 +597,49 @@ impl ExportEngine {
                         // Populate FTS
                         tx.execute_compat(
                             "INSERT INTO messages_fts (rowid, content) VALUES (?1, ?2)",
-                            params![*source_message_id, &*content],
+                            params![source_message_id, &*content],
                         )?;
                         tx.execute_compat(
                             "INSERT INTO messages_code_fts (rowid, content) VALUES (?1, ?2)",
-                            params![*source_message_id, &*content],
+                            params![source_message_id, &*content],
                         )?;
 
-                        // 5. Migrate Snippets for this message (bd-4x92)
-                        let snip_rows: Vec<SnippetExportRow> = if has_snippets_table {
-                            src_tx.query_map_collect(
-                                "SELECT file_path, start_line, end_line, language, snippet_text FROM snippets WHERE message_id = ?1",
-                                params![*source_message_id],
-                                |row: &FrankenRow| {
-                                    Ok((
-                                        row.get_typed::<Option<String>>(0)?,
-                                        row.get_typed::<Option<i64>>(1)?,
-                                        row.get_typed::<Option<i64>>(2)?,
-                                        row.get_typed::<Option<String>>(3)?,
-                                        row.get_typed::<String>(4)?,
-                                    ))
-                                },
-                            )?
-                        } else {
-                            Vec::new()
-                        };
-
-                        for (fpath, start, end, lang, stext) in snip_rows {
-                            // 019i2: snippet file paths follow the same path
-                            // policy as source paths (relative strips the
-                            // workspace; hash/basename obfuscate).
-                            let fpath = fpath.as_deref().map(|path| {
-                                let path = self.transform_path(path, workspace);
-                                self.share_redact(&path, false, &mut redactions)
-                                    .into_owned()
-                            });
-                            let lang = lang.as_deref().map(|value| {
-                                self.share_redact(value, false, &mut redactions).into_owned()
-                            });
-                            let stext = self.share_redact(&stext, false, &mut redactions);
-                            tx.execute_compat(
-                                "INSERT INTO snippets (message_id, file_path, start_line, end_line, language, snippet_text)
-                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                                params![*source_message_id, fpath, start, end, lang, &*stext],
-                            )?;
+                        if has_snippets_table {
+                            snippets.visit(&src_tx, params![source_message_id], running, |row| {
+                                let fpath = row.get_typed::<Option<String>>(1)?;
+                                let start = row.get_typed::<Option<i64>>(2)?;
+                                let end = row.get_typed::<Option<i64>>(3)?;
+                                let lang = row.get_typed::<Option<String>>(4)?;
+                                let stext = row.get_typed::<String>(5)?;
+                                // 019i2: snippet file paths follow the same path
+                                // policy as source paths (relative strips the
+                                // workspace; hash/basename obfuscate).
+                                let fpath = fpath.as_deref().map(|path| {
+                                    let path = self.transform_path(path, &workspace);
+                                    self.share_redact(&path, false, &mut redactions)
+                                        .into_owned()
+                                });
+                                let lang = lang.as_deref().map(|value| {
+                                    self.share_redact(value, false, &mut redactions).into_owned()
+                                });
+                                let stext = self.share_redact(&stext, false, &mut redactions);
+                                tx.execute_compat(
+                                    "INSERT INTO snippets (message_id, file_path, start_line, end_line, language, snippet_text)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                    params![source_message_id, fpath, start, end, lang, &*stext],
+                                )?;
+                                Ok(())
+                            })?;
                         }
 
                         msg_processed += 1;
-                    }
+                        Ok(())
+                    })?;
 
                     processed += 1;
                     progress(processed, total_convs);
-                }
+                    Ok(())
+                })?;
 
                 // Build once after bulk insertion. INTEGER PRIMARY KEY aliases rowid,
                 // the final key in each ordinary SQLite index: equal idx values
@@ -769,6 +732,7 @@ impl ExportEngine {
                 }
             };
 
+            ensure_export_running(running.as_deref())?;
             let candidate_path = temp_output_path.to_string_lossy();
             dest.execute_compat("VACUUM INTO ?1;", params![candidate_path.as_ref()])
                 .context("Failed to materialize self-contained Pages export candidate")?;
@@ -790,6 +754,7 @@ impl ExportEngine {
             reject_existing_sqlite_sidecars(&temp_output_path, "verified staged database")
                 .context("Staged Pages export verifier left an unbound SQLite sidecar")?;
 
+            ensure_export_running(running.as_deref())?;
             replace_file_from_temp(
                 &temp_output_path,
                 &output_path,
@@ -1032,18 +997,73 @@ fn existing_regular_files_share_identity(first: &Path, second: &Path) -> Result<
     Ok(first_identity.is_some() && first_identity == second_identity)
 }
 
-type MessageExportRow = (
-    i64,
-    String,
-    String,
-    Option<i64>,
-    i64,
-    Option<i64>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<Vec<u8>>,
-);
+// The source is held at one read snapshot. Page by stable integer order
+// keys so large metadata, message bodies and snippets do not accumulate for
+// the whole archive or transcript. One large row may still dominate memory.
+const EXPORT_PAGE_ROWS: usize = 32;
+
+fn ensure_export_running(running: Option<&AtomicBool>) -> Result<()> {
+    if running.is_some_and(|flag| !flag.load(Ordering::Relaxed)) {
+        bail!("Export cancelled");
+    }
+    Ok(())
+}
+
+struct ExportPageQuery {
+    first: String,
+    next: String,
+    cursor_columns: Vec<usize>,
+}
+
+impl ExportPageQuery {
+    fn new(select: &str, keys: &[(&str, usize)]) -> Self {
+        let order = keys
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let seek = if keys.len() == 1 {
+            format!("{order} > ?")
+        } else {
+            let placeholders = vec!["?"; keys.len()].join(", ");
+            format!("({order}) > ({placeholders})")
+        };
+        let suffix = format!("ORDER BY {order} LIMIT {EXPORT_PAGE_ROWS}");
+        Self {
+            first: format!("{select} {suffix}"),
+            next: format!("{select} AND {seek} {suffix}"),
+            cursor_columns: keys.iter().map(|(_, position)| *position).collect(),
+        }
+    }
+
+    fn visit(
+        &self,
+        source: &Transaction<'_>,
+        params: &[ParamValue],
+        running: Option<&AtomicBool>,
+        mut visit: impl FnMut(&FrankenRow) -> Result<()>,
+    ) -> Result<()> {
+        let mut sql = &self.first;
+        let mut page_params = params.to_vec();
+        loop {
+            ensure_export_running(running)?;
+            let rows = source.query_params(sql, &page_params)?;
+            for row in &rows {
+                ensure_export_running(running)?;
+                visit(row)?;
+            }
+            if rows.len() < EXPORT_PAGE_ROWS {
+                return Ok(());
+            }
+            let last = &rows[rows.len() - 1];
+            page_params.truncate(params.len());
+            for &column in &self.cursor_columns {
+                page_params.push(ParamValue::from(last.get_typed::<i64>(column)?));
+            }
+            sql = &self.next;
+        }
+    }
+}
 
 fn table_columns_in_transaction(conn: &Transaction<'_>, table_name: &str) -> Result<Vec<String>> {
     let pragma = format!("PRAGMA table_info({table_name})");
@@ -1083,23 +1103,26 @@ fn metadata_projection(columns: &[String], table: &str, json: &str, binary: &str
         String::from("NULL")
     };
     if columns.iter().any(|column| column == binary) {
-        format!("CASE WHEN length({table}.{binary}) > 0 THEN NULL ELSE {legacy} END, {table}.{binary}")
+        format!(
+            "CASE WHEN length({table}.{binary}) > 0 THEN NULL ELSE {legacy} END, {table}.{binary}"
+        )
     } else {
         format!("{legacy}, NULL")
     }
 }
 
-fn build_message_export_query(columns: &[String]) -> String {
+fn build_message_export_query(columns: &[String]) -> ExportPageQuery {
     let updated_at = optional_column(columns, "updated_at");
     let model = optional_column(columns, "model");
     let attachment_refs = optional_column(columns, "attachment_refs");
     let extra = metadata_projection(columns, "messages", "extra_json", "extra_bin");
-    format!(
-        "SELECT id, role, content, created_at, idx, {updated_at}, {model},
-                {attachment_refs}, {extra}
-         FROM messages
-         WHERE conversation_id = ?1
-         ORDER BY idx ASC"
+    ExportPageQuery::new(
+        &format!(
+            "SELECT id, role, content, created_at, idx, {updated_at}, {model},
+                    {attachment_refs}, {extra}
+             FROM messages WHERE conversation_id = ?1"
+        ),
+        &[("idx", 4), ("id", 0)],
     )
 }
 

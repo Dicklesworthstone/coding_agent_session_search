@@ -926,6 +926,117 @@ mod tests {
     }
 
     #[test]
+    fn paged_export_preserves_tied_message_order_snippets_and_review_totals() -> Result<()> {
+        use coding_agent_search::pages::summary::ExclusionSet;
+        use std::cell::RefCell;
+
+        let temp = TempDir::new()?;
+        let source = temp.path().join("source.db");
+        let output = temp.path().join("export.db");
+        setup_source_db(&source)?;
+        let conn = open_franken_db(&source)?;
+        for n in 0..70_i64 {
+            conn.execute_compat(
+                "INSERT INTO conversations (id, agent_id, title, source_path)
+                 VALUES (?1, 1, ?2, 'session.jsonl')",
+                fparams![100 + n, if n % 2 == 0 { "omit me" } else { "keep me" }],
+            )?;
+            conn.execute_compat(
+                "INSERT INTO messages (id, conversation_id, idx, role, content)
+                 VALUES (?1, 1, ?2, 'tool', ?3)",
+                fparams![200 + n * 3, if n < 48 { -1_i64 } else { 7 }, format!("row-{n}")],
+            )?;
+            conn.execute_compat(
+                "INSERT INTO snippets (id, message_id, snippet_text) VALUES (?1, 1, ?2)",
+                fparams![400 + n * 5, format!("snippet-{n}")],
+            )?;
+        }
+        conn.close()?;
+
+        let mut exclusions = ExclusionSet::new();
+        exclusions.add_pattern("^omit me$")?;
+        let filter = ExportFilter {
+            agents: Some(vec!["claude".to_string()]),
+            workspaces: None,
+            since: None,
+            until: None,
+            path_mode: PathMode::Full,
+        };
+        let progress = RefCell::new(Vec::new());
+        let stats = ExportEngine::new(&source, &output, filter)
+            .with_exclusions(exclusions)
+            .execute(|done, total| progress.borrow_mut().push((done, total)), None)?;
+        assert_eq!(stats.conversations_processed, 36);
+        assert_eq!(stats.messages_processed, 72);
+        assert_eq!(
+            progress.into_inner(),
+            (1..=36).map(|n| (n, 36)).collect::<Vec<_>>()
+        );
+
+        let exported = open_franken_db(&output)?;
+        let ids = exported.query_map_collect(
+            "SELECT id FROM messages WHERE conversation_id = 1 ORDER BY idx, id",
+            &[],
+            |row| row.get_typed::<i64>(0),
+        )?;
+        let expected: Vec<_> = (0..48)
+            .map(|n| 200 + 3 * n)
+            .chain([1, 2])
+            .chain((48..70).map(|n| 200 + 3 * n))
+            .collect();
+        assert_eq!(ids, expected);
+        let snippet_texts = exported.query_map_collect(
+            "SELECT snippet_text FROM snippets WHERE message_id = 1 ORDER BY id",
+            &[],
+            |row| row.get_typed::<String>(0),
+        )?;
+        assert_eq!(snippet_texts.len(), 71);
+        assert_eq!(
+            snippet_texts[1..],
+            (0..70).map(|n| format!("snippet-{n}")).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_export_after_the_last_progress_update_preserves_the_old_bundle() -> Result<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temp = TempDir::new()?;
+        let source = temp.path().join("source.db");
+        let output = temp.path().join("export.db");
+        setup_source_db(&source)?;
+        let filter = ExportFilter {
+            agents: None,
+            workspaces: None,
+            since: None,
+            until: None,
+            path_mode: PathMode::Full,
+        };
+        let engine = ExportEngine::new(&source, &output, filter);
+        engine.execute(|_, _| {}, None)?;
+        let before = std::fs::read(&output)?;
+        let running = Arc::new(AtomicBool::new(true));
+        let error = engine
+            .execute(
+                |done, total| {
+                    if done == total {
+                        running.store(false, Ordering::Relaxed);
+                    }
+                },
+                Some(Arc::clone(&running)),
+            )
+            .expect_err("cancelled export must not be published");
+        assert!(
+            format!("{error:#}").contains("Export cancelled"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&output)?, before);
+        Ok(())
+    }
+
+    #[test]
     fn test_export_progress_callback() -> Result<()> {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
