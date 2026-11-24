@@ -10,7 +10,7 @@ pub(crate) use source_budget::{
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 
 use anyhow::{Context, Result};
 use franken_agent_detection::connectors::codex as codex_rollouts;
@@ -220,6 +220,7 @@ fn augment_modern_codex_reader(
     // The primary parser keeps exact output text but compacts raw extras on
     // large rollouts. Match source occurrences against this initial inventory;
     // newly enriched rows must never replenish it.
+    let mut signature_writer = BufWriter::new(blake3::Hasher::new());
     let mut message_indices_by_signature = HashMap::new();
     let mut message_indices_by_call_id = HashMap::new();
     let mut message_indices_by_raw_entry = HashMap::new();
@@ -229,7 +230,7 @@ fn augment_modern_codex_reader(
         HashMap::new();
     for (index, message) in conversation.messages.iter().enumerate() {
         let signature = modern_codex_message_signature(message);
-        let raw_signature = modern_codex_raw_signature(&message.extra);
+        let raw_signature = modern_codex_raw_signature(&mut signature_writer, &message.extra)?;
         if native_web_search(message)
             && message.invocations.first().is_some_and(|call| call.call_id.is_none())
         {
@@ -344,7 +345,11 @@ fn augment_modern_codex_reader(
         };
         for raw in parsed.into_iter().chain(recovered) {
             let output = primary_codex_tool_output(&raw);
-            let primary_signature = output.map(|_| modern_codex_raw_signature(&raw));
+            let primary_signature = if output.is_some() {
+                Some(modern_codex_raw_signature(&mut signature_writer, &raw)?)
+            } else {
+                None
+            };
             let unmatched_primary_output = if let Some((output, raw_signature)) =
                 output.zip(primary_signature)
             {
@@ -376,8 +381,10 @@ fn augment_modern_codex_reader(
             // Ignored entries need no digest. Web activity retains only its
             // projected action; opaque results and encrypted fields never need
             // to be serialized into a signature buffer.
-            let raw_signature =
-                primary_signature.unwrap_or_else(|| modern_codex_raw_signature(&message.extra));
+            let raw_signature = match primary_signature {
+                Some(signature) => signature,
+                None => modern_codex_raw_signature(&mut signature_writer, &message.extra)?,
+            };
             let web = native_web_search(&message);
             let idless_web =
                 web && message.invocations.first().is_some_and(|call| call.call_id.is_none());
@@ -896,12 +903,18 @@ fn consume_initial_occurrence(remaining: Option<&mut usize>) -> bool {
     }
 }
 
-fn modern_codex_raw_signature(raw: &Value) -> [u8; 32] {
-    let mut bytes = Vec::new();
-    if serde_json::to_writer(&mut bytes, raw).is_err() {
-        bytes.extend_from_slice(raw.to_string().as_bytes());
-    }
-    *blake3::hash(&bytes).as_bytes()
+/// Feed the same compact JSON bytes to BLAKE3 without retaining a second
+/// record-sized allocation. One writer is reused for the entire rollout.
+fn modern_codex_raw_signature(
+    writer: &mut BufWriter<blake3::Hasher>,
+    raw: &Value,
+) -> Result<[u8; 32]> {
+    serde_json::to_writer(&mut *writer, raw).context("serialize Codex source identity")?;
+    writer.flush().context("finish Codex source identity")?;
+    let hasher = writer.get_mut();
+    let digest = *hasher.finalize().as_bytes();
+    hasher.reset();
+    Ok(digest)
 }
 
 fn modern_codex_message_call_ids(message: &NormalizedMessage) -> impl Iterator<Item = String> + '_ {
@@ -1073,6 +1086,29 @@ mod tests {
                 .unwrap_or_default(),
             snippets: Vec::new(),
         }
+    }
+
+    #[test]
+    fn streaming_raw_signatures_match_the_complete_json_encoding() -> Result<()> {
+        let large = serde_json::json!({
+            "payload": {"output": "café\\n\n🦀\"".repeat(32_768)},
+            "metadata": [1, null, {"nested": true}]
+        });
+        let small = serde_json::json!({"text": "next record"});
+        // An unusually small buffer exercises splits within the encoding and
+        // the direct-write path for individual values larger than the buffer.
+        let mut writer = BufWriter::with_capacity(31, blake3::Hasher::new());
+        let initial_capacity = writer.capacity();
+        for raw in [&large, &small, &Value::Null, &small, &large] {
+            let expected = blake3::hash(&serde_json::to_vec(raw)?);
+            assert_eq!(
+                modern_codex_raw_signature(&mut writer, raw)?,
+                *expected.as_bytes()
+            );
+            assert!(writer.buffer().is_empty());
+            assert_eq!(writer.capacity(), initial_capacity);
+        }
+        Ok(())
     }
 
     #[test]
