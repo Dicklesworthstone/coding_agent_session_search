@@ -473,6 +473,11 @@ impl<'de> serde::de::Visitor<'de> for EmbeddedJsonKeyCheck {
     }
 }
 
+/// A Value map loses earlier members with identical decoded keys.
+pub(crate) fn json_has_duplicate_keys(text: &str) -> serde_json::Result<bool> {
+    serde_json::from_str::<EmbeddedJsonKeyCheck>(text).map(|check| check.0)
+}
+
 /// Redact secrets from a JSON value, recursively walking strings.
 ///
 /// - String values are redacted without changing their JSON type.

@@ -1568,6 +1568,7 @@ fn calculate_dir_size(dir: &Path) -> Result<u64> {
 /// Both FTS tables are rescanned too: a value left in the search index is as
 /// public as one left in the message it indexes.
 const SHARE_PROFILE_SURFACES: &[(&str, &str, &str, bool)] = &[
+    ("conversations.agent", "conversations", "agent", false),
     ("conversations.title", "conversations", "title", false),
     (
         "conversations.workspace",
@@ -1587,6 +1588,8 @@ const SHARE_PROFILE_SURFACES: &[(&str, &str, &str, bool)] = &[
         "metadata_json",
         true,
     ),
+    ("messages.role", "messages", "role", false),
+    ("messages.model", "messages", "model", false),
     ("messages.content", "messages", "content", false),
     (
         "messages.attachment_refs",
@@ -1594,6 +1597,7 @@ const SHARE_PROFILE_SURFACES: &[(&str, &str, &str, bool)] = &[
         "attachment_refs",
         true,
     ),
+    ("snippets.language", "snippets", "language", false),
     ("snippets.file_path", "snippets", "file_path", false),
     ("snippets.snippet_text", "snippets", "snippet_text", false),
     ("messages_fts.content", "messages_fts", "content", false),
@@ -1714,18 +1718,31 @@ fn check_share_profile(
 }
 
 /// How many values in `text` the engine would still rewrite. JSON is rescanned
-/// by string value, as the export redacted it; text that does not parse is
+/// by key and string value, as the export redacted it; text that does not parse is
 /// rescanned whole.
 fn residual_values(engine: &RedactionEngine, text: &str, json: bool) -> u64 {
     fn walk(engine: &RedactionEngine, node: &Value) -> u64 {
         match node {
             Value::String(text) => u64::from(!engine.redact_text(text).changes.is_empty()),
             Value::Array(items) => items.iter().map(|item| walk(engine, item)).sum(),
-            Value::Object(fields) => fields.values().map(|item| walk(engine, item)).sum(),
+            Value::Object(fields) => fields
+                .iter()
+                .map(|(key, value)| {
+                    u64::from(!engine.redact_text(key).changes.is_empty()) + walk(engine, value)
+                })
+                .sum(),
             _ => 0,
         }
     }
     if json && let Ok(value) = serde_json::from_str::<Value>(text) {
+        // A duplicate can hide values from the parsed map. Verification
+        // cannot certify that surface even when the last member looks clean.
+        if !matches!(
+            crate::indexer::redact_secrets::json_has_duplicate_keys(text),
+            Ok(false)
+        ) {
+            return 1;
+        }
         return walk(engine, &value);
     }
     u64::from(!engine.redact_text(text).changes.is_empty())

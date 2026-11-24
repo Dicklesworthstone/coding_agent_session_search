@@ -1225,6 +1225,99 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn profile_covers_json_keys_and_provider_labels_and_detects_tampering() -> Result<()> {
+        let temp = TempDir::new()?;
+        let source = temp.path().join("source.db");
+        setup_share_profile_source(&source, "/synthetic-home")?;
+        let conn = open_franken_db(&source)?;
+        conn.execute_batch(
+            r#"
+            ALTER TABLE messages ADD COLUMN attachment_refs TEXT;
+            UPDATE conversations SET metadata_json =
+                '{"nested":[{"first@example.com":"first","second@example.com":"second","[EMAIL_REDACTED]":"original"}]}';
+            UPDATE agents SET slug = 'agent@example.com';
+            UPDATE messages SET role = 'role@example.com', model = 'model@example.com',
+                attachment_refs = '{"owner@example.com":"blob-ref"}';
+            UPDATE snippets SET language = 'lang@example.com';
+            "#,
+        )?;
+        conn.close()?;
+
+        let site = plaintext_site(&source, temp.path(), ShareProfile::Public)?;
+        let payload = site.join("payload/data.db");
+        let exported = open_franken_db(&payload)?;
+        let text = exported_text(&exported)?;
+        assert!(!text.contains("@example.com"));
+        let metadata: serde_json::Value = serde_json::from_str(&query_string(
+            &exported,
+            "SELECT metadata_json FROM conversations",
+        )?)?;
+        let object = metadata["nested"][0]
+            .as_object()
+            .ok_or_else(|| anyhow!("missing nested metadata object"))?;
+        assert_eq!(object.len(), 3);
+        assert_eq!(object["[EMAIL_REDACTED]"], "original");
+        assert!(object.values().any(|value| value == "first"));
+        assert!(object.values().any(|value| value == "second"));
+        exported.close()?;
+        assert!(verify_bundle(&site, false)?.checks.share_profile.passed);
+
+        tamper(&site, "UPDATE conversations SET agent = 'agent@example.com'")?;
+        tamper(
+            &site,
+            r#"UPDATE conversations SET metadata_json = '{"nested":{"first\u0040example.com":true}}'"#,
+        )?;
+        tamper(
+            &site,
+            r#"UPDATE messages SET model = 'model@example.com', role = 'role@example.com',
+               attachment_refs = '{"ref":"hidden@example.com","ref":"innocent"}'"#,
+        )?;
+        tamper(&site, "UPDATE snippets SET language = 'lang@example.com'")?;
+        let checked = verify_bundle(&site, false)?;
+        assert!(!checked.checks.share_profile.passed);
+        let labels: Vec<_> = checked
+            .share_profile
+            .residual
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "conversations.agent",
+                "conversations.metadata_json",
+                "messages.attachment_refs",
+                "messages.model",
+                "messages.role",
+                "snippets.language",
+            ]
+        );
+
+        // A duplicate in the source must refuse publication, including when
+        // only the earlier occurrence would have been redacted.
+        let before = std::fs::read(&payload)?;
+        let source_conn = open_franken_db(&source)?;
+        source_conn.execute(
+            r#"UPDATE conversations SET metadata_json = '{"k":"hidden@example.com","k":"public"}'"#,
+        )?;
+        source_conn.close()?;
+        let filter = ExportFilter {
+            agents: None,
+            workspaces: None,
+            since: None,
+            until: None,
+            path_mode: PathMode::Full,
+        };
+        let error = ExportEngine::new(&source, &payload, filter)
+            .with_share_profile(ShareProfile::Public)
+            .execute(|_, _| {}, None)
+            .expect_err("ambiguous metadata cannot be approved for sharing");
+        assert!(format!("{error:#}").contains("duplicate keys"), "{error:#}");
+        assert_eq!(std::fs::read(&payload)?, before);
+        Ok(())
+    }
+
     /// Export `source` under `profile` into a plaintext site directory that
     /// carries just the config and payload the share-profile check reads.
     fn plaintext_site(source: &Path, root: &Path, profile: ShareProfile) -> Result<PathBuf> {

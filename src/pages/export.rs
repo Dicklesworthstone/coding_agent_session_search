@@ -130,20 +130,18 @@ impl ExportEngine {
         std::borrow::Cow::Owned(redacted.output)
     }
 
-    /// Redact the string values of a JSON document, keeping it valid JSON;
-    /// text that does not parse is redacted as plain text.
-    fn share_redact_json(&self, value: &str, counts: &mut RedactionCounts) -> String {
+    /// Apply the profile to JSON keys and string values. Keep clean JSON
+    /// byte-for-byte and retain all members when private keys redact alike.
+    fn share_redact_json(&self, value: &str, counts: &mut RedactionCounts) -> Result<String> {
         if self.share.is_none() {
-            return value.to_string();
+            return Ok(value.to_string());
         }
         fn walk(engine: &ExportEngine, node: &mut Value, counts: &mut RedactionCounts) {
             match node {
                 Value::String(text) => {
-                    let redacted = match engine.share_redact(text, false, counts) {
-                        std::borrow::Cow::Owned(redacted) => Some(redacted),
-                        std::borrow::Cow::Borrowed(_) => None,
-                    };
-                    if let Some(redacted) = redacted {
+                    if let std::borrow::Cow::Owned(redacted) =
+                        engine.share_redact(text, false, counts)
+                    {
                         *text = redacted;
                     }
                 }
@@ -153,8 +151,23 @@ impl ExportEngine {
                     }
                 }
                 Value::Object(map) => {
-                    for item in map.values_mut() {
+                    let mut renames = Vec::new();
+                    for (key, item) in map.iter_mut() {
                         walk(engine, item, counts);
+                        if let std::borrow::Cow::Owned(new_key) =
+                            engine.share_redact(key, false, counts)
+                            && new_key != *key
+                        {
+                            renames.push((key.clone(), new_key));
+                        }
+                    }
+                    let mut suffixes = std::collections::HashMap::new();
+                    for (key, new_key) in renames {
+                        if let Some(item) = map.remove(&key) {
+                            crate::indexer::redact_secrets::insert_redacted_json_entry(
+                                map, &mut suffixes, new_key, item,
+                            );
+                        }
                     }
                 }
                 _ => {}
@@ -162,15 +175,20 @@ impl ExportEngine {
         }
         match serde_json::from_str::<Value>(value) {
             Ok(mut document) => {
+                // Value keeps only the last duplicate. Returning the original
+                // bytes after inspecting that value can disclose an earlier one.
+                if crate::indexer::redact_secrets::json_has_duplicate_keys(value)? {
+                    bail!("ambiguous JSON with duplicate keys in Pages share metadata");
+                }
                 let before: u64 = counts.values().sum();
                 walk(self, &mut document, counts);
                 if counts.values().sum::<u64>() == before {
-                    value.to_string()
+                    Ok(value.to_string())
                 } else {
-                    document.to_string()
+                    Ok(document.to_string())
                 }
             }
-            Err(_) => self.share_redact(value, false, counts).into_owned(),
+            Err(_) => Ok(self.share_redact(value, false, counts).into_owned()),
         }
     }
 
@@ -515,14 +533,15 @@ impl ExportEngine {
                     let shared_metadata = canonical_metadata
                         .as_deref()
                         .or(metadata_json.as_deref())
-                        .map(|value| self.share_redact_json(value, &mut redactions));
+                        .map(|value| self.share_redact_json(value, &mut redactions))
+                        .transpose()?;
 
                     tx.execute_compat(
                     "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, ended_at, message_count, metadata_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         *id,
-                        agent.as_str(),
+                        self.share_redact(agent, false, &mut redactions).as_ref(),
                         shared_workspace.as_deref(),
                         shared_title.as_deref(),
                         shared_path.as_str(),
@@ -573,11 +592,15 @@ impl ExportEngine {
                         )?
                         .or_else(|| serde_json::from_str(extra_json.as_deref()?).ok());
                         let resolved_model = normalize_optional_text(model.clone())
-                            .or_else(|| derive_message_model(extra.as_ref()?));
+                            .or_else(|| derive_message_model(extra.as_ref()?))
+                            .map(|value| {
+                                self.share_redact(&value, false, &mut redactions).into_owned()
+                            });
                         let resolved_attachment_refs =
                             normalize_optional_text(attachment_refs.clone())
                                 .or_else(|| derive_attachment_refs(extra.as_ref()?))
-                                .map(|refs| self.share_redact_json(&refs, &mut redactions));
+                                .map(|refs| self.share_redact_json(&refs, &mut redactions))
+                                .transpose()?;
                         // The search indexes are built from the same redacted
                         // text, so the bundle's FTS cannot find what the
                         // message body no longer shows.
@@ -590,7 +613,7 @@ impl ExportEngine {
                                 *source_message_id,
                                 *id,
                                 *idx,
-                                role.as_str(),
+                                self.share_redact(role, false, &mut redactions).as_ref(),
                                 &*content,
                                 *created_at,
                                 *updated_at,
@@ -636,6 +659,9 @@ impl ExportEngine {
                                 let path = self.transform_path(path, workspace);
                                 self.share_redact(&path, false, &mut redactions)
                                     .into_owned()
+                            });
+                            let lang = lang.as_deref().map(|value| {
+                                self.share_redact(value, false, &mut redactions).into_owned()
                             });
                             let stext = self.share_redact(&stext, false, &mut redactions);
                             tx.execute_compat(
