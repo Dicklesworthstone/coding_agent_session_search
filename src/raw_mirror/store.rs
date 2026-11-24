@@ -2135,8 +2135,25 @@ fn content_addressed_blob_is_verified(root: &Path, reference: &RawMirrorChunkRef
     }
 }
 
-fn open_stable_source_file(source_path: &Path, expected_metadata: &fs::Metadata) -> Result<File> {
-    let source = raw_mirror_io("open_source", source_path, || File::open(source_path))
+pub(super) fn open_stable_source_file(
+    source_path: &Path,
+    expected_metadata: &fs::Metadata,
+) -> Result<File> {
+    // The producer can rotate a file after lstat. Do not follow a replacement
+    // symlink or wait for a FIFO writer while the archive mutation lock is held.
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let source = raw_mirror_io("open_source", source_path, || options.open(source_path))
         .with_context(|| format!("open raw mirror source {}", source_path.display()))?;
     let opened_metadata = raw_mirror_tracked_io("fstat_source", source_path, || source.metadata())
         .with_context(|| format!("stat opened raw mirror source {}", source_path.display()))?;
@@ -4335,6 +4352,78 @@ mod tests {
             !control.already_present,
             "ordinary providers remain capturable"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_refuses_a_sidecar_with_a_nonregular_owner() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let owner = temp.path().join("store");
+        let _listener = std::os::unix::net::UnixListener::bind(&owner)?;
+        let sidecar = temp.path().join("store-wal");
+        fs::write(&sidecar, b"fixture sidecar")?;
+        let data = temp.path().join("archive");
+        let result = crate::raw_mirror::capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data,
+            provider: "opencode",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &sidecar,
+            db_links: &[],
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file")
+        );
+        assert!(!data.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn capture_retries_a_source_rotated_after_admission() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let data = temp.path().join("archive");
+        let source = temp.path().join("session.jsonl");
+        fs::write(&source, b"old log\n")?;
+        let rotated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observer = observe_raw_mirror_io(
+            Arc::new({
+                let source = source.clone();
+                let data = data.clone();
+                let rotated = Arc::clone(&rotated);
+                move || {
+                    // The mirror is initialized after source classification.
+                    if data.is_dir() && !rotated.swap(true, Ordering::Relaxed) {
+                        fs::rename(&source, source.with_extension("old")).unwrap();
+                        fs::write(&source, b"replacement log\n").unwrap();
+                    }
+                }
+            }),
+            Arc::new(|| false),
+        );
+        let input = RawMirrorCaptureInput {
+            data_dir: &data,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source,
+            db_links: &[],
+        };
+        let error = crate::raw_mirror::capture_source_file(input.clone()).unwrap_err();
+        drop(observer);
+        assert!(rotated.load(Ordering::Relaxed));
+        assert!(error.to_string().contains("changed identity"));
+        assert_eq!(storage_summary(&data).manifest_count, 0);
+        let fresh = crate::raw_mirror::capture_source_file(input)?;
+        assert_eq!(
+            read_source_bytes(&data, &fresh.manifest_id)?,
+            b"replacement log\n"
+        );
+        Ok(())
     }
 
     #[test]

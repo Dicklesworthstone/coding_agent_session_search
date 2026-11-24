@@ -846,8 +846,10 @@ pub(crate) fn capture(
     }
     let root = ensure_raw_mirror_root(input.data_dir)?;
     let _mutation = acquire_raw_mirror_mutation_lock(&root)?;
-    let metadata = raw_mirror_symlink_metadata(input.source_path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    // Admission inspected the pre-lock source. A regular replacement or an
+    // in-place rewrite must be classified afresh on the next capture.
+    let current = raw_mirror_symlink_metadata(input.source_path)?;
+    if current.file_type().is_symlink() || source_file_changed_during_capture(&metadata, &current) {
         anyhow::bail!("raw mirror source changed identity while waiting for capture");
     }
     // Validate coordination even on a cache hit, but do not rewrite it until

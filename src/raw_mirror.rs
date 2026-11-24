@@ -85,6 +85,23 @@ pub(crate) fn zcode_source_is_sensitive(path: &std::path::Path) -> anyhow::Resul
     } else {
         path.to_path_buf()
     };
+    // A sidecar's owner is a separate path and may already have rotated. Check
+    // its file type before opening it, and use the store's nonblocking opener
+    // for the header so ordinary transcript probes never wait on a writer.
+    let metadata = std::fs::symlink_metadata(&database)?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "raw-mirror source owner is not a regular file"
+    );
+    if metadata.len() < 16 {
+        return Ok(false);
+    }
+    let mut file = store::open_stable_source_file(&database, &metadata)?;
+    let mut header = [0; 16];
+    std::io::Read::read_exact(&mut file, &mut header)?;
+    if &header != b"SQLite format 3\0" {
+        return Ok(false);
+    }
     franken_agent_detection::connectors::zcode::is_zcode_container(&database)
 }
 
