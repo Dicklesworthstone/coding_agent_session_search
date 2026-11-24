@@ -9647,7 +9647,6 @@ impl SearchClient {
 
     #[cfg(test)]
     fn sqlite_message_scan_query_sql(
-        field_mask: FieldMask,
         filters: &SearchFilters,
         scan_page_rows: usize,
     ) -> (String, Vec<ParamValue>) {
@@ -9658,7 +9657,6 @@ impl SearchClient {
             .collect::<Vec<_>>();
         session_paths.sort_unstable();
         Self::sqlite_message_scan_query_sql_for_session_paths(
-            field_mask,
             filters,
             session_paths.as_slice(),
             None,
@@ -9667,25 +9665,18 @@ impl SearchClient {
     }
 
     fn sqlite_message_scan_query_sql_for_session_paths(
-        field_mask: FieldMask,
         filters: &SearchFilters,
         session_paths: &[&str],
         after_message_id: Option<i64>,
         scan_page_rows: usize,
     ) -> (String, Vec<ParamValue>) {
-        let title_expr = if field_mask.wants_title() {
-            "COALESCE(c.title, '')"
-        } else {
-            "''"
-        };
-        let content_expr = "COALESCE(m.content, '')";
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
 
         let mut sql = format!(
             "SELECT m.id,
-                    {title_expr},
-                    {content_expr},
+                    COALESCE(c.title, ''),
+                    COALESCE(m.content, ''),
                     COALESCE(a.slug, ''),
                     COALESCE(w.path, ''),
                     COALESCE(c.source_path, ''),
@@ -9694,9 +9685,7 @@ impl SearchClient {
                     c.id,
                     {normalized_source_sql},
                     c.origin_host,
-                    s.kind,
-                    COALESCE(m.content, ''),
-                    COALESCE(c.title, '')
+                    s.kind
              FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
              LEFT JOIN sources s ON c.source_id = s.id
@@ -9773,34 +9762,30 @@ impl SearchClient {
     }
 
     fn sqlite_message_scan_row_to_hit(
-        row: (SqliteFtsMessageRow, String, String),
+        row: SqliteFtsMessageRow,
         scan_query: &SqliteMessageScanQuery,
         request: SqliteMessageScanRequest<'_>,
     ) -> Option<(i64, SearchHit)> {
         let (
-            (
-                message_id,
-                title,
-                raw_content,
-                agent,
-                workspace,
-                source_path,
-                created_at,
-                idx,
-                conversation_id,
-                raw_source_id,
-                origin_host,
-                raw_origin_kind,
-            ),
-            scan_content,
-            scan_title,
+            message_id,
+            title,
+            content,
+            agent,
+            workspace,
+            source_path,
+            created_at,
+            idx,
+            conversation_id,
+            raw_source_id,
+            origin_host,
+            raw_origin_kind,
         ) = row;
 
         // The primary CASS lexical query targets title/content; agent,
         // workspace, and source are filters rather than searchable text.
         // Keep the two text fields separate so a quoted phrase cannot
         // accidentally bridge the content/title boundary.
-        let scan_haystacks = [scan_content.to_lowercase(), scan_title.to_lowercase()];
+        let scan_haystacks = [content.to_lowercase(), title.to_lowercase()];
         let score = Self::sqlite_message_scan_score(&scan_haystacks, scan_query);
         if score <= 0.0 {
             return None;
@@ -9818,11 +9803,10 @@ impl SearchClient {
             .and_then(|i| usize::try_from(i).ok())
             .map(|i| i.saturating_add(1));
         let snippet = if request.field_mask.wants_snippet() {
-            snippet_from_content(&scan_content)
+            snippet_from_content(&content)
         } else {
             String::new()
         };
-        let content = raw_content;
         let content_hash = if content.is_empty() {
             stable_hit_hash(&snippet, &source_path, line_number, created_at)
         } else {
@@ -9830,7 +9814,11 @@ impl SearchClient {
         };
 
         let hit = SearchHit {
-            title,
+            title: if request.field_mask.wants_title() {
+                title
+            } else {
+                String::new()
+            },
             snippet,
             content,
             content_hash,
@@ -9935,42 +9923,37 @@ impl SearchClient {
             let mut after_message_id = None;
             loop {
                 let (sql, params) = Self::sqlite_message_scan_query_sql_for_session_paths(
-                    request.field_mask,
                     request.filters,
                     session_path_chunk,
                     after_message_id,
                     request.scan_page_rows,
                 );
+                // Drop decoded nonmatches while mapping the engine's page.
+                // Keep their IDs for keyset progress through empty pages.
                 let page_rows = franken_query_map_collect_retry(conn, &sql, &params, |row| {
+                    let message_id = row.get_typed(0)?;
+                    let message = (
+                        message_id,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                        row.get_typed(5)?,
+                        row.get_typed(6)?,
+                        row.get_typed(7)?,
+                        row.get_typed(8)?,
+                        row.get_typed(9)?,
+                        row.get_typed(10)?,
+                        row.get_typed(11)?,
+                    );
                     Ok((
-                        (
-                            row.get_typed(0)?,
-                            row.get_typed(1)?,
-                            row.get_typed(2)?,
-                            row.get_typed(3)?,
-                            row.get_typed(4)?,
-                            row.get_typed(5)?,
-                            row.get_typed(6)?,
-                            row.get_typed(7)?,
-                            row.get_typed(8)?,
-                            row.get_typed::<Option<String>>(9)?,
-                            row.get_typed(10)?,
-                            row.get_typed(11)?,
-                        ),
-                        row.get_typed(12)?,
-                        row.get_typed(13)?,
+                        message_id,
+                        Self::sqlite_message_scan_row_to_hit(message, &scan_query, request),
                     ))
                 })?;
                 let page_len = page_rows.len();
-                let next_after_message_id = page_rows.last().map(|row| row.0.0);
-
-                for row in page_rows {
-                    if let Some(hit) =
-                        Self::sqlite_message_scan_row_to_hit(row, &scan_query, request)
-                    {
-                        scored_hits.push(hit);
-                    }
-                }
+                let next_after_message_id = page_rows.last().map(|(id, _)| *id);
+                scored_hits.extend(page_rows.into_iter().filter_map(|(_, hit)| hit));
                 if scored_hits.len() > retained_hit_count {
                     Self::trim_sqlite_message_scan_hits(&mut scored_hits, retained_hit_count);
                 }
@@ -16992,8 +16975,9 @@ mod tests {
             source_filter: SourceFilter::SourceId("remote-a".to_string()),
             session_paths: HashSet::from(["/tmp/session.jsonl".to_string()]),
         };
-        let (sql, params) =
-            SearchClient::sqlite_message_scan_query_sql(FieldMask::FULL, &filters, 7);
+        let (sql, params) = SearchClient::sqlite_message_scan_query_sql(&filters, 7);
+        assert_eq!(sql.matches("COALESCE(m.content, '')").count(), 1);
+        assert_eq!(sql.matches("COALESCE(c.title, '')").count(), 1);
         let limit_pos = sql
             .find(" ORDER BY m.id LIMIT ?")
             .expect("bounded scan limit");
@@ -17015,7 +16999,6 @@ mod tests {
         assert_eq!(params.len(), 7, "six filter values plus scan limit");
 
         let (local_sql, _) = SearchClient::sqlite_message_scan_query_sql(
-            FieldMask::FULL,
             &SearchFilters {
                 source_filter: SourceFilter::Local,
                 ..SearchFilters::default()
@@ -17023,7 +17006,6 @@ mod tests {
             7,
         );
         let (remote_sql, _) = SearchClient::sqlite_message_scan_query_sql(
-            FieldMask::FULL,
             &SearchFilters {
                 source_filter: SourceFilter::Remote,
                 ..SearchFilters::default()
@@ -17193,6 +17175,28 @@ mod tests {
         )?;
         assert_eq!(offset_hit.len(), 1);
         assert_eq!(offset_hit[0].content, "needle");
+
+        // Titles still participate in matching when projected out. Content
+        // remains available to downstream noise classification and hashing.
+        let masked = client.search_sqlite_message_scan(
+            conn.connection(),
+            SqliteMessageScanRequest {
+                raw_query: "fallback",
+                filters: &filters,
+                limit: 3,
+                offset: 0,
+                scan_page_rows: 1,
+                field_mask: FieldMask::new(true, false, false, false),
+                query_match_type: MatchType::Exact,
+            },
+        )?;
+        assert_eq!(masked.len(), 3);
+        assert!(
+            masked
+                .iter()
+                .all(|hit| hit.title.is_empty() && hit.snippet.is_empty())
+        );
+        assert_eq!(masked[0].content, "prefix noise");
         Ok(())
     }
 
