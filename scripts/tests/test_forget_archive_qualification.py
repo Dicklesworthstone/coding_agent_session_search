@@ -187,13 +187,89 @@ class VerificationTests(unittest.TestCase):
             qualification.validate_seed(incomplete, manifest)
 
 
+def ready_lexical_status(documents: int = 7) -> dict:
+    return {"index": {
+        "status": "ready", "exists": True, "fresh": True, "stale": False,
+        "partial": False, "rebuilding": False, "stalled": False,
+        "engine_incompatible": False, "hollow": False, "empty_with_messages": False,
+        "manifest_source": "current", "documents": documents, "live_documents": documents,
+        "checkpoint": {"present": True, "completed": True, "db_matches": True,
+                       "schema_matches": True, "page_size_matches": True,
+                       "page_size_compatible": True},
+        "fingerprint": {"matches_current_db_fingerprint": True}},
+        "budget": {"timed_out": False}}
+
+
+class LexicalPublicationTests(unittest.TestCase):
+    def test_complete_current_publication_and_compatible_bounded_page_size(self) -> None:
+        status = ready_lexical_status()
+        qualification.validate_lexical_publication(status, 7)
+        status["index"]["checkpoint"]["page_size_matches"] = False
+        qualification.validate_lexical_publication(status, 7)
+
+    def test_ready_word_and_matching_checkpoint_cannot_hide_incomplete_publication(self) -> None:
+        fields = {"exists": False, "fresh": False, "stale": True, "partial": True,
+                  "rebuilding": True, "stalled": True, "engine_incompatible": True,
+                  "hollow": True, "empty_with_messages": True, "status": "partial"}
+        for field, value in fields.items():
+            for wrong in (value, None):
+                status = ready_lexical_status()
+                status["index"][field] = wrong
+                with self.subTest(field=field, value=wrong), self.assertRaises(RuntimeError):
+                    qualification.validate_lexical_publication(status, 7)
+
+    def test_old_recorded_count_does_not_substitute_for_exact_live_manifest_count(self) -> None:
+        for count in (None, True, False, "7", 7.0, 0, 6, 8):
+            status = ready_lexical_status()
+            status["index"]["live_documents"] = count
+            # The fallback documents count and completed checkpoint still look
+            # correct: this is the hollow/unknown live-generation counterexample.
+            with self.subTest(count=count), self.assertRaisesRegex(RuntimeError, "live MANIFEST"):
+                qualification.validate_lexical_publication(status, 7)
+
+    def test_previous_manifest_or_missing_checkpoint_authority_is_refused(self) -> None:
+        for source in (None, "previous_after_missing_current", "previous_after_corrupt_current"):
+            status = ready_lexical_status()
+            status["index"]["manifest_source"] = source
+            with self.subTest(source=source), self.assertRaisesRegex(RuntimeError, "current MANIFEST"):
+                qualification.validate_lexical_publication(status, 7)
+        for field in ("present", "completed", "db_matches", "schema_matches", "page_size_compatible"):
+            for value in (False, None, 1):
+                status = ready_lexical_status()
+                status["index"]["checkpoint"][field] = value
+                with self.subTest(field=field, value=value), self.assertRaises(RuntimeError):
+                    qualification.validate_lexical_publication(status, 7)
+        for value in (False, None, 1):
+            status = ready_lexical_status()
+            status["index"]["fingerprint"]["matches_current_db_fingerprint"] = value
+            with self.subTest(fingerprint=value), self.assertRaisesRegex(RuntimeError, "fingerprint"):
+                qualification.validate_lexical_publication(status, 7)
+
+    def test_optional_status_budget_shedding_never_excuses_missing_core_evidence(self) -> None:
+        status = ready_lexical_status()
+        status["budget"] = {"timed_out": True, "skipped_sections": ["remote_sync", "doctor_summary"]}
+        qualification.validate_lexical_publication(status, 7)
+        for field in ("checkpoint", "fingerprint", "live_documents"):
+            incomplete = copy.deepcopy(status)
+            del incomplete["index"][field]
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                qualification.validate_lexical_publication(incomplete, 7)
+        for incomplete in ({}, {"index": None}, {"index": []}):
+            with self.subTest(status=incomplete), self.assertRaises(RuntimeError):
+                qualification.validate_lexical_publication(incomplete, 7)
+
+
 class ReceiptAdapter:
     """Feed a stored JSON receipt into a predicate; does not start a process."""
     def __init__(self, receipt: dict):
         self.receipt = receipt
+        self.calls: list[tuple[list[str], str]] = []
 
     def cass(self, argv: list[str], label: str) -> dict:
+        self.calls.append((argv, label))
         return self.receipt
+
+    json = qualification.Commands.json
 
 
 class SearchReceiptTests(unittest.TestCase):
@@ -218,6 +294,40 @@ class SearchReceiptTests(unittest.TestCase):
     def query(self, receipt: dict, mode: str = "lexical", pending: bool = False):
         return qualification.search(ReceiptAdapter(receipt), "syntheticmarker", mode,
                                     "predicate-only", pending=pending)
+
+    def test_every_search_surface_including_pending_refusal_disallows_maintenance(self) -> None:
+        for mode in qualification.legacy.SURFACES:
+            for pending in (False, True):
+                receipt = (self.receipt(code=9, kind="forget-repair-pending")
+                           if pending else self.receipt())
+                adapter = ReceiptAdapter(receipt)
+                qualification.search(adapter, "syntheticmarker", mode, "read-only-check", pending=pending)
+                with self.subTest(mode=mode, pending=pending):
+                    self.assertEqual(len(adapter.calls), 1)
+                    argv, label = adapter.calls[0]
+                    self.assertEqual(argv[:2], ["search", "syntheticmarker"])
+                    self.assertIn("--no-maintenance", argv)
+                    self.assertNotIn("--refresh", argv)
+                    self.assertNotIn("--daemon", argv)
+                    self.assertEqual(label, "read-only-check")
+
+    def test_publication_evidence_uses_status_and_retains_its_receipt(self) -> None:
+        payload = ready_lexical_status()
+        receipt = self.receipt(payload=payload)
+        adapter = ReceiptAdapter(receipt)
+        evidence = qualification.lexical_publication_checks(adapter, 7, "after-repair")
+        self.assertEqual(adapter.calls, [(["status", "--json"], "after-repair")])
+        self.assertEqual(evidence["measurement"], receipt)
+        self.assertEqual(evidence["application_report"], payload)
+        self.assertEqual(evidence["expected_live_documents"], 7)
+        self.assertIs(evidence["included_in_forget_timing"], False)
+
+    def test_status_process_failure_cannot_be_accepted_as_budget_shedding(self) -> None:
+        for flags in ({"timed_out": True}, {"exit_code": 1}, {"output_limit_exceeded": True},
+                      {"memory": {"events_delta": {"oom_kill": 1}}}):
+            adapter = ReceiptAdapter(self.receipt(payload=ready_lexical_status(), **flags))
+            with self.subTest(flags=flags), self.assertRaises(RuntimeError):
+                qualification.lexical_publication_checks(adapter, 7, "status-process-failed")
 
     def test_successful_empty_search_is_distinct_from_failed_or_timed_out_search(self) -> None:
         self.assertEqual(self.query(self.receipt()), [])

@@ -54,6 +54,20 @@ def inventory(rows: list[dict], removed: list[dict] = (), *, pending: bool = Fal
                            "forgotten_conversations": {"rows": [], "sha256": digest([])}}}
 
 
+def lexical_publication(messages: int) -> dict:
+    """Recorded-shape status input for driver ordering/count predicates only."""
+    return {"index": {
+        "status": "ready", "exists": True, "fresh": True, "stale": False,
+        "partial": False, "rebuilding": False, "stalled": False,
+        "engine_incompatible": False, "hollow": False, "empty_with_messages": False,
+        "manifest_source": "current", "documents": messages, "live_documents": messages,
+        "checkpoint": {"present": True, "completed": True, "db_matches": True,
+                       "schema_matches": True, "page_size_matches": False,
+                       "page_size_compatible": True},
+        "fingerprint": {"matches_current_db_fingerprint": True}},
+        "budget": {"timed_out": False}}
+
+
 class ReceiptCommands(qualification.Commands):
     """Feed receipts to the real driver predicates without launching a binary."""
     def __init__(self, *args, scenario: dict, **kwargs):
@@ -73,12 +87,21 @@ class ReceiptCommands(qualification.Commands):
         if label == "admit-restored-seed":
             self.admitted = True
             payload = {"harness_only": True, "operation": "copied-seed-index-admission"}
+        elif label in ("restored-seed-lexical-publication", "after-repair-lexical-publication",
+                       "after-rescan-lexical-publication"):
+            baseline = "seed" if label == "restored-seed-lexical-publication" else "after"
+            payload = self.scenario.get("lexical_publications", {}).get(
+                label, lexical_publication(self.scenario[baseline]["canonical"]["messages"]))
         elif label == "restored-seed":
             if not self.admitted:
                 raise AssertionError("strict probe ran before copied-seed writer admission")
             payload = self.scenario.get("restored", self.scenario["seed"])
         elif label == "preview":
             payload = {"conversations_matched": 2, "messages_matched": 4}
+        elif label == "forget":
+            payload = {"applied": True, "conversations_deleted": 2, "messages_matched": 4,
+                       "derived_rebuilt": True, "rebuild_profile": {"name": "bounded"}}
+            extra["phases"] = [{"phase": phase} for phase in qualification.PHASES]
         elif label == "interrupted-forget":
             self.interrupted = True
             for relative in self.scenario["bundle_files"]:
@@ -169,7 +192,7 @@ class RecoveryFlowTests(unittest.TestCase):
                                "bundle_files": bundle}
 
     def run_scenario(self, profile: Path, home: Path, scenario: dict,
-                     phase: str = "analytics") -> tuple[dict, ReceiptCommands]:
+                     phase: str | None = "analytics") -> tuple[dict, ReceiptCommands]:
         args = argparse.Namespace(verification_memory_max=None, memory_max=[],
                                   fts_shadow_max_messages=None, quick_check=False,
                                   canonical_interrupt_delay=0.01,
@@ -202,6 +225,12 @@ class RecoveryFlowTests(unittest.TestCase):
                 self.assertIn("rescan_canonical_checks", result)
                 self.assertIn("search_checks", result)
                 self.assertIn("rescan_search_checks", result)
+                for key, count in (("restored_seed_lexical_publication", 8),
+                                   ("lexical_publication", 4), ("rescan_lexical_publication", 4)):
+                    publication = result[key]
+                    self.assertEqual(publication["expected_live_documents"], count)
+                    self.assertEqual(publication["application_report"]["index"]["live_documents"], count)
+                    self.assertIs(publication["included_in_forget_timing"], False)
                 failed_probe = result["pre_recovery_probe"]["measurement"]
                 self.assertEqual(failed_probe["exit_code"], 1)
                 self.assertEqual(qualification.read_json(Path(failed_probe["receipt_path"])), failed_probe)
@@ -221,8 +250,10 @@ class RecoveryFlowTests(unittest.TestCase):
     def test_copied_seed_admission_precedes_strict_probe_and_is_outside_measurement(self) -> None:
         profile, home, scenario = self.scenario()
         result, adapter = self.run_scenario(profile, home, scenario)
-        admission, probe = adapter.calls[:2]
+        admission, publication, probe = adapter.calls[:3]
         self.assertEqual(admission["label"], "admit-restored-seed")
+        self.assertEqual(publication["label"], "restored-seed-lexical-publication")
+        self.assertEqual(publication["argv"], ["status", "--json"])
         self.assertEqual(probe["label"], "restored-seed")
         self.assertEqual(admission["argv"],
                          ["index", "--rebuild-profile", "bounded", "--json", "--no-progress-events"])
@@ -253,9 +284,63 @@ class RecoveryFlowTests(unittest.TestCase):
                 self.assertEqual(result["status"], "failed")
                 self.assertIn("copied seed", result["error"])
                 self.assertEqual([call["label"] for call in adapter.calls],
-                                 ["admit-restored-seed", "restored-seed"])
+                                 ["admit-restored-seed", "restored-seed-lexical-publication", "restored-seed"])
                 self.assertNotIn("measurement", result)
                 self.assertIn("restored_seed_admission", result)
+
+    def test_incomplete_seed_publication_aborts_before_any_probe_or_search(self) -> None:
+        profile, home, scenario = self.scenario()
+        incomplete = lexical_publication(8)
+        incomplete["index"]["partial"] = True
+        scenario["lexical_publications"] = {"restored-seed-lexical-publication": incomplete}
+        result, adapter = self.run_scenario(profile, home, scenario)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("partial", result["error"])
+        self.assertEqual([call["label"] for call in adapter.calls],
+                         ["admit-restored-seed", "restored-seed-lexical-publication"])
+        self.assertNotIn("measurement", result)
+
+    def test_incomplete_repair_publication_stops_before_followup_scan_or_search(self) -> None:
+        for phase in (None, "analytics", "lexical-index"):
+            with self.subTest(phase=phase):
+                profile, home, scenario = self.scenario(str(phase))
+                scenario.update(probe_unavailable=False, interrupted_snapshot=inventory(
+                    scenario["rows"][2:], scenario["rows"][:2], pending=True))
+                incomplete = lexical_publication(4)
+                incomplete["index"]["live_documents"] = 3
+                scenario["lexical_publications"] = {"after-repair-lexical-publication": incomplete}
+                result, adapter = self.run_scenario(profile, home, scenario, phase)
+                self.assertEqual(result["status"], "failed")
+                self.assertIn("live MANIFEST", result["error"])
+                labels = [call["label"] for call in adapter.calls]
+                mutation = "forget" if phase is None else "recovery"
+                command = adapter.calls[labels.index(mutation)]
+                self.assertTrue(command["measured"])
+                self.assertEqual(labels[labels.index(mutation) + 1:],
+                                 ["after-repair-lexical-publication"])
+                self.assertNotIn("canonical_checks", result)
+                self.assertNotIn("search_checks", result)
+                if phase is not None:
+                    self.assertTrue(adapter.recovered)
+                    expected_route = "index-full" if phase == "lexical-index" else "same-selector-forget"
+                    self.assertEqual(result["recovery"]["route"], expected_route)
+                    self.assertEqual(result["recovery"]["measurement"]["exit_code"], 0)
+
+    def test_incomplete_rescan_publication_stops_before_rescan_scan_or_search(self) -> None:
+        profile, home, scenario = self.scenario()
+        incomplete = lexical_publication(4)
+        incomplete["index"]["checkpoint"]["completed"] = False
+        scenario["lexical_publications"] = {"after-rescan-lexical-publication": incomplete}
+        result, adapter = self.run_scenario(profile, home, scenario, None)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("checkpoint completed", result["error"])
+        labels = [call["label"] for call in adapter.calls]
+        self.assertEqual(labels[labels.index("full-rescan") + 1:],
+                         ["after-rescan-lexical-publication"])
+        self.assertIn("canonical_checks", result)
+        self.assertIn("search_checks", result)
+        self.assertNotIn("rescan_canonical_checks", result)
+        self.assertNotIn("rescan_search_checks", result)
 
     def test_recovery_failure_stays_failed_and_keeps_both_receipts(self) -> None:
         profile, home, scenario = self.scenario()

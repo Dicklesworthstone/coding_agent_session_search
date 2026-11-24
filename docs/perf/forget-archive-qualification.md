@@ -42,6 +42,21 @@ plus the derived totals. The measured forget environment has no inline-analytics
 override. The benchmark never clears a marker,
 relaxes a reader fence, injects SQL, disables an assertion, or defers repair.
 
+Token-rollup repair uses the existing conversation index to obtain each
+conversation's minimum and maximum ledger ID and exact row count. Its ordered
+rowid pages start at that minimum and request at most 128 remaining matching
+rows. The final page stops at the known row count instead of scanning the
+unrelated archive tail to discover that no matches remain. Page commits, model
+ordering, cancellation, and the pending privacy fence retain their existing
+contracts; no new index or migration is required.
+
+This removes repeated unrelated prefix/tail traversal without claiming a
+general linear-time bound: interleaved ledger IDs can still require scanning
+unrelated rows inside a conversation's ID span. The native query-plan and
+correctness regressions must run through the normal gate, and the qualification
+matrix must still measure wall time and RSS. No native speedup is established
+by the source change alone.
+
 ## Synthetic profiles
 
 | Profile | Conversations | Messages | Message text bytes | Batch deletion |
@@ -229,6 +244,30 @@ canonical totals, every retained-row digest, analytics summaries and tombstones
 to match the seed, with no pending repair. Any drift aborts before forgetting.
 This preparation uses the verification cap and is excluded from forget timing.
 
+Immediately after copied-seed admission, the measured forget or recovery, and
+the full rescan, a recorded `status --json` check must establish a current,
+complete lexical publication. This check runs before canonical scans or search
+witnesses. It requires a ready, fresh index; the current MANIFEST; no stale,
+partial, hollow or rebuilding state; and a completed checkpoint matching the
+canonical database fingerprint, schema and compatible page-size profile. A
+bounded profile can be compatible without matching the default page size.
+
+The MANIFEST's `live_documents` must equal the exact remaining message count.
+That equality is specific to this fixture's distinct, nonempty ordinary
+user/assistant messages, each of which should produce one lexical document.
+It is publication metadata, not a complete audit of indexed bodies, so full
+canonical digests and retained search witnesses remain independent checks.
+Missing authority, a previous-MANIFEST fallback or a stale publication fails
+validation. Optional status sections may be omitted under the command's own
+budget only when all required publication evidence remains present and valid;
+process timeouts, OOMs and failed command receipts still fail.
+
+Every verification search uses `--no-maintenance`, including pending-repair
+privacy checks. Search cannot repair a failed publication after the timed
+operation and turn that failure into a successful qualification. Status and
+search receipts remain outside the forget measurement and are retained in the
+trial report.
+
 Every ordinary trial requires all of the following:
 
 1. The indexed seed contains exactly the synthetic paths, message counts and
@@ -236,7 +275,8 @@ Every ordinary trial requires all of the following:
 2. A lexical positive control proves the selected marker was searchable. The
    dry-run selector must match the exact cohort and message count.
 3. Real `forget --apply --json` completes, reports the expected deletion and
-   bounded lexical profile, and emits every repair phase.
+   bounded lexical profile, emits every repair phase, and leaves a complete
+   current lexical publication before verification begins.
 4. A new read-only native process hashes every remaining canonical conversation,
    every field of every remaining message, and all retained token-ledger rows.
    Exact counts and digests must preserve all unselected history, including IDs.

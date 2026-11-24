@@ -22458,16 +22458,28 @@ const TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY: &str = "token_daily_stats_rebuild_cu
 /// Same-row ledger revisions must invalidate both resumed and active rebuilds.
 const TOKEN_USAGE_REVISION_GENERATION_META_KEY: &str = "token_usage_revision_generation";
 
+/// Seek the conversation index once for scalar bounds and cardinality. A
+/// fresh unbounded rowid scan otherwise visits the archive for every
+/// conversation, even when the returned page is tiny. Cardinality limits the
+/// final page to the remaining matches, so its LIMIT stops at the last row
+/// without depending on an upper-bound predicate becoming a range exit.
+const FORGET_TOKEN_USAGE_BOUNDS_SQL: &str =
+    "SELECT MIN(id), MAX(id), COUNT(*) FROM token_usage INDEXED BY idx_token_usage_conv
+     WHERE conversation_id = ?1";
+const FORGET_TOKEN_USAGE_PAGE_SIZE: usize = 128;
+
 /// The pinned engine cannot stream ORDER BY id from the conversation index's
-/// implicit rowid suffix. Force a rowid scan with an early LIMIT so a token
-/// page never enters the sorter or its spill path (GH #565).
+/// implicit rowid suffix. Keep the ordered rowid lane inside the indexed
+/// bounds, with an early LIMIT and no sorter (GH #565). Interleaved ledger
+/// IDs can still require reading unrelated rows within that span; these
+/// bounds remove unrelated prefixes and tails, not every intervening row.
 const FORGET_TOKEN_USAGE_PAGE_SQL: &str =
     "SELECT id, day_id, role, COALESCE(model_family, 'unknown'),
             input_tokens, output_tokens, cache_read_tokens,
             cache_creation_tokens, thinking_tokens,
             has_tool_calls, tool_call_count, content_chars, estimated_cost_usd
      FROM token_usage NOT INDEXED
-     WHERE conversation_id = ?1 AND id >= ?2 ORDER BY id LIMIT 128";
+     WHERE conversation_id = ?1 AND id >= ?2 AND id <= ?3 ORDER BY id LIMIT ?4";
 
 /// Same upsert as the live-table writer, addressed to `table` — which must be
 /// one of the two compile-time table-name constants above (never caller
@@ -23230,6 +23242,7 @@ impl FrankenStorage {
             control,
         )?;
 
+        let usage_bounds_statement = self.conn.prepare(FORGET_TOKEN_USAGE_BOUNDS_SQL)?;
         let mut next_conversation_id = Some(i64::MIN);
         let mut processed_conversations = 0_usize;
         let mut processed_usage_rows = 0_usize;
@@ -23257,15 +23270,32 @@ impl FrankenStorage {
             next_conversation_id = last.0.checked_add(1);
 
             for (conversation_id, started_at, source_id, agent_slug) in conversations {
-                let mut next_usage_id = Some(i64::MIN);
+                if let Some(control) = control {
+                    control()?;
+                }
+                let bounds = usage_bounds_statement
+                    .query_row_with_params(&[SqliteValue::Integer(conversation_id)])?;
+                let (mut next_usage_id, upper_usage_id, mut remaining_usage_rows) = match (
+                    bounds.get_typed::<Option<i64>>(0)?,
+                    bounds.get_typed::<Option<i64>>(1)?,
+                    bounds.get_typed::<i64>(2)?,
+                ) {
+                    (Some(lower), Some(upper), count) if lower <= upper && count > 0 => {
+                        (Some(lower), upper, count)
+                    }
+                    (None, None, 0) => (None, i64::MIN, 0),
+                    _ => bail!("inconsistent token_usage bounds for conversation {conversation_id}"),
+                };
                 let mut session_model_family = String::from("unknown");
                 while let Some(lower) = next_usage_id {
                     if let Some(control) = control {
                         control()?;
                     }
+                    let requested_rows =
+                        remaining_usage_rows.min(FORGET_TOKEN_USAGE_PAGE_SIZE as i64);
                     let usage_rows = self.conn.query_map_collect(
                         FORGET_TOKEN_USAGE_PAGE_SQL,
-                        fparams![conversation_id, lower],
+                        fparams![conversation_id, lower, upper_usage_id, requested_rows],
                         |row| {
                             Ok((
                                 row.get_typed::<i64>(0)?,
@@ -23284,10 +23314,31 @@ impl FrankenStorage {
                             ))
                         },
                     )?;
-                    let Some(last) = usage_rows.last() else {
-                        break;
+                    anyhow::ensure!(
+                        usage_rows.len() == usize::try_from(requested_rows)?,
+                        "token_usage changed during bounded forget repair for conversation {conversation_id}: expected {requested_rows} rows, got {}",
+                        usage_rows.len()
+                    );
+                    let last = usage_rows.last().context("missing bounded token_usage page")?;
+                    anyhow::ensure!(
+                        last.0 >= lower && last.0 <= upper_usage_id,
+                        "token_usage page left its indexed bounds for conversation {conversation_id}"
+                    );
+                    remaining_usage_rows -= requested_rows;
+                    next_usage_id = if remaining_usage_rows == 0 {
+                        anyhow::ensure!(
+                            last.0 == upper_usage_id,
+                            "token_usage ended before its indexed maximum for conversation {conversation_id}"
+                        );
+                        None
+                    } else {
+                        Some(
+                            last.0
+                                .checked_add(1)
+                                .filter(|next| *next <= upper_usage_id)
+                                .context("token_usage ended before its indexed row count")?,
+                        )
                     };
-                    next_usage_id = last.0.checked_add(1);
                     processed_usage_rows = processed_usage_rows.saturating_add(usage_rows.len());
                     // The aggregate is flushed per ledger page, never per
                     // conversation: one long session can span arbitrarily
@@ -32594,37 +32645,248 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
 
     #[test]
     fn forget_derived_token_pages_stream_without_a_sorter() -> Result<()> {
+        type Opcode = (i64, String, i64, i64, i64);
         let dir = TempDir::new()?;
         let storage = FrankenStorage::open(&dir.path().join("forget-token-page-plan.db"))?;
-        let opcodes: Vec<(String, i64, i64)> = storage.raw().query_map_collect(
-            &format!("EXPLAIN {FORGET_TOKEN_USAGE_PAGE_SQL}"),
-            fparams![42_i64, i64::MIN],
-            |row| Ok((row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
-        )?;
+        let explain = |sql: &str, parameters: &[ParamValue]| -> Result<Vec<Opcode>> {
+            Ok(storage.raw().query_map_collect(
+                &format!("EXPLAIN {sql}"),
+                parameters,
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                    ))
+                },
+            )?)
+        };
         let rootpage: i64 = storage.raw().query_row_map(
             "SELECT rootpage FROM sqlite_master WHERE name = 'token_usage'",
             fparams![],
             |row| row.get_typed(0),
         )?;
-        let cursor = opcodes
-            .iter()
-            .find_map(|(op, p1, p2)| (op == "OpenRead" && *p2 == rootpage).then_some(*p1))
-            .expect("the token page must open the rowid table");
+        let cursor_for = |program: &[Opcode], root: i64| {
+            program.iter().find_map(|(_, op, p1, p2, _)| {
+                (op == "OpenRead" && *p2 == root).then_some(*p1)
+            })
+        };
+        let starts_at_lower_bound = |program: &[Opcode]| {
+            let Some(cursor) = cursor_for(program, rootpage) else {
+                return false;
+            };
+            !program.iter().any(|(_, op, p1, _, _)| {
+                matches!(op.as_str(), "Rewind" | "Last") && *p1 == cursor
+            }) && program.iter().any(|(_, op, p1, _, p3)| {
+                op == "SeekGE"
+                    && *p1 == cursor
+                    && program.iter().any(|(_, op, parameter, register, _)| {
+                        op == "Variable" && *parameter == 2 && register == p3
+                    })
+            })
+        };
+        let stops_at_counted_limit = |program: &[Opcode]| {
+            let Some(cursor) = cursor_for(program, rootpage) else {
+                return false;
+            };
+            program.iter().any(|(address, op, register, exit, _)| {
+                op == "DecrJumpZero"
+                    && program.iter().any(|(_, op, parameter, target, _)| {
+                        op == "Variable" && *parameter == 4 && target == register
+                    })
+                    && program.iter().any(|(next_address, op, p1, _, _)| {
+                        op == "Next" && *p1 == cursor
+                            && next_address > address && next_address < exit
+                    })
+            })
+        };
+        let page = explain(
+            FORGET_TOKEN_USAGE_PAGE_SQL,
+            fparams![42_i64, -1_000_i64, 1_000_i64, 7_i64],
+        )?;
         assert!(
-            opcodes
-                .iter()
-                .any(|(op, p1, _)| op == "Next" && *p1 == cursor)
-                && opcodes.iter().any(|(op, _, _)| op == "ResultRow")
-                && opcodes.iter().any(|(op, _, _)| op == "DecrJumpZero"),
-            "token pages must stream rows and stop at their LIMIT: {opcodes:?}"
+            starts_at_lower_bound(&page),
+            "token pages must seek their scalar lower bound, not scan the archive prefix: {page:?}"
         );
         assert!(
-            !opcodes.iter().any(|(op, _, _)| matches!(
-                op.as_str(),
-                "SorterOpen" | "SorterInsert" | "SorterSort" | "OpenEphemeral" | "OpenAutoindex"
-            )),
-            "token pages must not materialize a sorter or temporary table: {opcodes:?}"
+            stops_at_counted_limit(&page),
+            "the remaining-row LIMIT must exit before advancing into an unrelated tail: {page:?}"
         );
+        assert!(page.iter().any(|(_, op, _, _, _)| op == "ResultRow"));
+
+        let unbounded_prefix = explain(
+            "SELECT id FROM token_usage NOT INDEXED
+             WHERE conversation_id = ?1 ORDER BY id LIMIT ?2",
+            fparams![42_i64, 7_i64],
+        )?;
+        assert!(
+            !starts_at_lower_bound(&unbounded_prefix),
+            "the unbounded-prefix control must fail the same seek check"
+        );
+        let old_page = explain(
+            "SELECT id FROM token_usage NOT INDEXED
+             WHERE conversation_id = ?1 AND id >= ?2 ORDER BY id LIMIT 128",
+            fparams![42_i64, i64::MIN],
+        )?;
+        assert!(
+            !stops_at_counted_limit(&old_page),
+            "the former fixed LIMIT cannot certify the short final page's stop"
+        );
+
+        let bounds = explain(FORGET_TOKEN_USAGE_BOUNDS_SQL, fparams![42_i64])?;
+        let index_root: i64 = storage.raw().query_row_map(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'idx_token_usage_conv'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        let cursor = cursor_for(&bounds, index_root)
+            .expect("scalar token bounds must use the conversation index");
+        assert!(
+            bounds.iter().any(|(_, op, p1, _, _)| op == "SeekGE" && *p1 == cursor)
+                && !bounds.iter().any(|(_, op, p1, _, _)| {
+                    matches!(op.as_str(), "Rewind" | "Last") && *p1 == cursor
+                }),
+            "scalar token bounds must seek the selected conversation: {bounds:?}"
+        );
+        for program in [&page, &bounds] {
+            assert!(
+                !program.iter().any(|(_, op, _, _, _)| matches!(
+                    op.as_str(),
+                    "SorterOpen" | "SorterInsert" | "SorterSort" | "OpenEphemeral" | "OpenAutoindex"
+                )),
+                "token bounds and pages must not materialize a sorter or temporary table: {program:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn forget_token_rollup_bounds_preserve_sparse_ids_models_and_empty_sessions() -> Result<()> {
+        fn canonical_snapshot(storage: &FrankenStorage) -> Result<Vec<Vec<String>>> {
+            ["conversations", "messages", "token_usage"]
+                .into_iter()
+                .map(|table| {
+                    let mut rows: Vec<_> = storage
+                        .raw()
+                        .query(&format!("SELECT * FROM {table}"))?
+                        .into_iter()
+                        .map(|row| format!("{:?}", row.values()))
+                        .collect();
+                    rows.sort();
+                    Ok(rows)
+                })
+                .collect()
+        }
+
+        let dir = TempDir::new()?;
+        let path = dir.path().join("forget-token-bounds.db");
+        let storage = FrankenStorage::open(&path)?;
+        let agent = gh423_agent(&storage);
+        let start = 1_700_000_000_000_i64;
+        for conversation_id in 1_i64..=5 {
+            storage.raw().execute_compat(
+                "INSERT INTO conversations(id, agent_id, source_path, started_at)
+                 VALUES(?1, ?2, ?3, ?4)",
+                fparams![
+                    conversation_id,
+                    agent,
+                    format!("/fixture/forget-token-{conversation_id}.json"),
+                    start + conversation_id * 86_400_000
+                ],
+            )?;
+        }
+        // Populated targets have unrelated prefixes or tails. The first two
+        // conversations interleave; the empty fifth conversation still owns
+        // one session. Unknown final rows must not erase a known model.
+        let ledger = [
+            (1_i64, i64::MIN, 0_i64, Some("first"), 11_i64),
+            (1, -1, 1, Some("final-known"), 17),
+            (1, 0, 2, None, 19),
+            (2, -10, 0, Some("sibling"), 23),
+            (2, 50, 1, Some("sibling"), 29),
+            (3, 100, 0, Some("earlier"), 31),
+            (3, 1_000, 1, Some("last-known"), 37),
+            (3, 2_000, 2, Some("unknown"), 41),
+            (4, i64::MAX - 1, 0, Some("before-max"), 43),
+            (4, i64::MAX, 1, Some("maximum"), 47),
+        ];
+        for (ordinal, (conversation_id, usage_id, idx, model, input)) in
+            ledger.into_iter().enumerate()
+        {
+            let message_id = i64::try_from(ordinal)? + 1;
+            let timestamp = start + conversation_id * 86_400_000;
+            storage.raw().execute_compat(
+                "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
+                 VALUES(?1, ?2, ?3, 'assistant', 'retained', ?4)",
+                fparams![message_id, conversation_id, idx, timestamp],
+            )?;
+            storage.raw().execute_compat(
+                "INSERT INTO token_usage(id, message_id, conversation_id, agent_id,
+                     timestamp_ms, day_id, role, content_chars, model_family,
+                     input_tokens, output_tokens, total_tokens)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'assistant', 8, ?7, ?8, 1, ?9)",
+                fparams![
+                    usage_id,
+                    message_id,
+                    conversation_id,
+                    agent,
+                    timestamp,
+                    FrankenStorage::day_id_from_millis(timestamp),
+                    model,
+                    input,
+                    input + 1
+                ],
+            )?;
+        }
+        for (conversation_id, expected) in [
+            (1_i64, (Some(i64::MIN), Some(0_i64), 3_i64)),
+            (2, (Some(-10), Some(50), 2)),
+            (3, (Some(100), Some(2_000), 3)),
+            (4, (Some(i64::MAX - 1), Some(i64::MAX), 2)),
+            (5, (None, None, 0)),
+        ] {
+            let bounds: (Option<i64>, Option<i64>, i64) = storage.raw().query_row_map(
+                FORGET_TOKEN_USAGE_BOUNDS_SQL,
+                fparams![conversation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )?;
+            assert_eq!(bounds, expected);
+        }
+        let canonical = canonical_snapshot(&storage)?;
+        crate::search::privacy::begin_forget(&path)?;
+        for _ in 0..2 {
+            storage.rebuild_token_daily_stats_after_forget()?;
+            let totals: (i64, i64, i64) = storage.raw().query_row_map(
+                "SELECT SUM(api_call_count), SUM(grand_total_tokens), SUM(session_count)
+                 FROM token_daily_stats
+                 WHERE agent_slug = 'all' AND source_id = 'all' AND model_family = 'all'",
+                fparams![],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )?;
+            assert_eq!(totals, (10, 308, 5));
+            for (conversation_id, model) in [
+                (1_i64, "final-known"),
+                (2, "sibling"),
+                (3, "last-known"),
+                (4, "maximum"),
+                (5, "unknown"),
+            ] {
+                let sessions: Vec<(String, i64)> = storage.raw().query_map_collect(
+                    "SELECT model_family, session_count FROM token_daily_stats
+                     WHERE day_id = ?1 AND agent_slug = 'codebuff' AND source_id = 'local'
+                       AND model_family <> 'all' AND session_count > 0",
+                    fparams![FrankenStorage::day_id_from_millis(
+                        start + conversation_id * 86_400_000
+                    )],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                )?;
+                assert_eq!(sessions, vec![(model.to_owned(), 1)]);
+            }
+            assert_eq!(canonical_snapshot(&storage)?, canonical);
+            assert!(crate::search::privacy::repair_pending(&path)?);
+        }
         Ok(())
     }
 

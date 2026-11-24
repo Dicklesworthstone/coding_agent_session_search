@@ -294,10 +294,54 @@ def error_kind(receipt: dict[str, Any]) -> str | None:
     return None
 
 
+def validate_lexical_publication(status: dict[str, Any], expected_messages: int) -> None:
+    """Require a current, complete publication before any validating search.
+
+    This fixture contains only nonempty ordinary user/assistant messages, each
+    with distinct content, so it expects one lexical document per canonical
+    message. live_documents is published MANIFEST metadata, not a scan proving
+    every indexed body; canonical hashes and search witnesses remain separate.
+    """
+    require(type(expected_messages) is int and expected_messages > 0,
+            "invalid synthetic lexical document expectation")
+    index = status.get("index")
+    require(isinstance(index, dict), "status omitted lexical publication state")
+    require(index.get("status") == "ready", "lexical publication is not ready")
+    for field in ("exists", "fresh"):
+        require(index.get(field) is True, f"lexical publication {field} is not true")
+    for field in ("stale", "partial", "rebuilding", "stalled", "engine_incompatible",
+                  "hollow", "empty_with_messages"):
+        require(index.get(field) is False, f"lexical publication {field} is not false")
+    require(index.get("manifest_source") == "current",
+            "lexical publication is not served from the current MANIFEST")
+    live_documents = index.get("live_documents")
+    require(type(live_documents) is int and live_documents == expected_messages,
+            "live MANIFEST document count differs from the synthetic canonical message count")
+    checkpoint = index.get("checkpoint")
+    require(isinstance(checkpoint, dict), "status omitted lexical checkpoint authority")
+    for field in ("present", "completed", "db_matches", "schema_matches", "page_size_compatible"):
+        require(checkpoint.get(field) is True, f"lexical checkpoint {field} is not true")
+    fingerprint = index.get("fingerprint")
+    require(isinstance(fingerprint, dict)
+            and fingerprint.get("matches_current_db_fingerprint") is True,
+            "lexical checkpoint does not match the current canonical database fingerprint")
+
+
+def lexical_publication_checks(commands: Commands, expected_messages: int,
+                               label: str) -> dict[str, Any]:
+    status, receipt = commands.json(["status", "--json"], label)
+    # Status may shed optional coverage/remote/doctor sections under its budget.
+    # Every core publication field above is mandatory; a clean partial receipt
+    # with those fields intact is sufficient for this metadata-only assertion.
+    validate_lexical_publication(status, expected_messages)
+    return {"included_in_forget_timing": False, "application_report": status,
+            "measurement": receipt, "expected_live_documents": expected_messages}
+
+
 def search(commands: Commands, marker: str, mode: str, label: str,
            *, pending: bool = False) -> list[dict[str, Any]] | None:
     receipt = commands.cass(["search", marker, "--robot", "--limit", "5",
-                             "--robot-meta", *legacy.SURFACES[mode]], label)
+                             "--robot-meta", "--no-maintenance", *legacy.SURFACES[mode]], label)
     require(clean_observation(receipt), f"{mode}: search observation was not cleanly completed")
     if pending:
         require(receipt.get("exit_code") == 9 and error_kind(receipt) == "forget-repair-pending",
@@ -465,6 +509,8 @@ def run_trial(profile_root: Path, home: Path, manifest: dict[str, Any],
             "included_in_forget_timing": False, "measurement": admission}
         require(successful(admission), "copied seed index admission did not complete")
         result["restored_seed_admission"]["application_report"] = read_json(Path(admission["stdout_path"]))
+        result["restored_seed_lexical_publication"] = lexical_publication_checks(
+            commands, seed["canonical"]["messages"], "restored-seed-lexical-publication")
         restored = commands.probe("restored-seed")
         seed_rows = rows_by_path(seed)
         require(restored["canonical"] == seed["canonical"], "copied seed canonical totals changed")
@@ -557,6 +603,12 @@ def run_trial(profile_root: Path, home: Path, manifest: dict[str, Any],
                     "repair did not complete with the bounded lexical profile")
             require(set(PHASES) <= set(phase_names(measurement)), "repair-phase telemetry missing")
             result["application_report"] = applied
+        # Observe publication immediately after the measured command, before a
+        # potentially long full canonical scan or any search could hide a stale
+        # generation. Search itself is also forbidden from doing maintenance.
+        remaining_messages = seed["canonical"]["messages"] - expected_messages
+        result["lexical_publication"] = lexical_publication_checks(
+            commands, remaining_messages, "after-repair-lexical-publication")
         after = commands.probe("after-repair")
         result["canonical_checks"] = verify_snapshot(seed, after, chosen)
         result["search_checks"] = search_checks(commands, marker, chosen, manifest)
@@ -572,6 +624,8 @@ def run_trial(profile_root: Path, home: Path, manifest: dict[str, Any],
         _, rescan = commands.json(["index", "--full", "--rebuild-profile", "bounded",
                                     "--json", "--no-progress-events"], "full-rescan")
         result["rescan_measurement"] = rescan
+        result["rescan_lexical_publication"] = lexical_publication_checks(
+            commands, remaining_messages, "after-rescan-lexical-publication")
         rescanned = commands.probe("after-full-rescan")
         # Routine indexing can defer analytics: canonical preservation and
         # erasure are asserted separately from the completed repair totals.
