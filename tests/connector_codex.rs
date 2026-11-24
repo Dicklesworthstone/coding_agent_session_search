@@ -10,6 +10,67 @@ fn codex_real_fixture_home() -> PathBuf {
 }
 
 #[test]
+fn codex_indexes_native_web_actions_and_pairs_completion_by_call_id() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("rollout-web-search.jsonl");
+    let body = r#"{"type":"session_meta","payload":{"id":"native-web","cwd":"/synthetic/work"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Find the API guide"}}
+{"type":"event_msg","payload":{"type":"web_search_end","call_id":"ws_one","query":"API guide","results":[{"content":"OPAQUE_FIXTURE_RESULT"}]}}
+{"type":"response_item","payload":{"type":"web_search_call","id":"ws_one","action":{"type":"search","query":"API guide","queries":["API guide","café API reference"]},"encrypted_content":"OPAQUE_FIXTURE_CIPHER"}}
+{"type":"response_item","payload":{"type":"web_search_call","id":"ws_two","action":{"type":"search","query":"API guide"}}}
+{"type":"event_msg","payload":{"type":"web_search_end","call_id":"ws_open","action":{"type":"open_page","url":"https://example.org/docs"}}}
+{"type":"response_item","payload":{"type":"web_search_call","action":{"type":"find_in_page","url":"https://example.org/docs","pattern":"request timeout","internal":"OPAQUE_FIXTURE_ACTION"}}}
+{"type":"response_item","payload":{"type":"web_search_call","action":{"type":"find_in_page","url":"https://example.org/docs","pattern":"request timeout"}}}
+{"type":"response_item","payload":{"type":"web_search_call","id":"ws_find","action":{"type":"find_in_page","url":"https://example.org/docs","pattern":"request timeout"}}}
+{"type":"response_item","payload":{"type":"web_search_call","id":"ws_pending","status":"in_progress"}}
+{"type":"response_item","payload":{"type":"web_search_call","action":{"type":"future","opaque":"OPAQUE_FIXTURE_ACTION"}}}
+"#;
+    fs::write(&path, body).unwrap();
+    let ctx = ScanContext::with_roots(
+        root.path().to_path_buf(),
+        vec![ScanRoot::local(path.clone())],
+        None,
+    );
+    let conversations = CodexConnector::new().scan(&ctx).unwrap();
+    assert_eq!(conversations.len(), 1);
+    let messages = &conversations[0].messages;
+    let calls: Vec<_> = messages
+        .iter()
+        .filter(|message| {
+            message
+                .invocations
+                .iter()
+                .any(|call| call.name == "web_search")
+        })
+        .collect();
+    assert_eq!(calls.len(), 6);
+    let find = |id| {
+        calls
+            .iter()
+            .copied()
+            .find(|message| message.invocations[0].call_id.as_deref() == Some(id))
+            .expect("native call ID")
+    };
+    assert!(find("ws_one").content.contains("café API reference"));
+    assert!(find("ws_two").content.contains("API guide"));
+    assert!(find("ws_open").content.contains("https://example.org/docs"));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|message| message.content.contains("request timeout"))
+            .count(),
+        3,
+        "both ID-less occurrences and the separate native call survive"
+    );
+    assert!(
+        !serde_json::to_string(messages)
+            .unwrap()
+            .contains("OPAQUE_FIXTURE")
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), body);
+}
+
+#[test]
 fn codex_tool_output_rows_survive_the_real_large_session_compaction_threshold() {
     use franken_agent_detection::connectors::{SourceCompletion, SourceScanHooks};
     use std::io::Write;

@@ -223,12 +223,20 @@ fn augment_modern_codex_reader(
     let mut message_indices_by_signature = HashMap::new();
     let mut message_indices_by_call_id = HashMap::new();
     let mut message_indices_by_raw_entry = HashMap::new();
+    let mut remaining_idless_web_searches = HashMap::new();
     let mut remaining_tool_outputs_by_raw_entry: HashMap<[u8; 32], usize> = HashMap::new();
     let mut remaining_compacted_tool_outputs: HashMap<ModernCodexMessageSignature, usize> =
         HashMap::new();
     for (index, message) in conversation.messages.iter().enumerate() {
         let signature = modern_codex_message_signature(message);
         let raw_signature = modern_codex_raw_signature(&message.extra);
+        if native_web_search(message)
+            && message.invocations.first().is_some_and(|call| call.call_id.is_none())
+        {
+            *remaining_idless_web_searches
+                .entry(raw_signature)
+                .or_default() += 1;
+        }
         if message.role == "tool" && message.author.is_none() && message.invocations.is_empty() {
             if primary_codex_tool_output(&message.extra).is_some() {
                 *remaining_tool_outputs_by_raw_entry
@@ -335,11 +343,14 @@ fn augment_modern_codex_reader(
             }
         };
         for raw in parsed.into_iter().chain(recovered) {
-            let raw_signature = modern_codex_raw_signature(&raw);
-            let unmatched_primary_output = if let Some(output) = primary_codex_tool_output(&raw) {
+            let output = primary_codex_tool_output(&raw);
+            let primary_signature = output.map(|_| modern_codex_raw_signature(&raw));
+            let unmatched_primary_output = if let Some((output, raw_signature)) =
+                output.zip(primary_signature)
+            {
                 // Each initial row covers only one source occurrence, even
                 // when several results have identical text, time, or raw JSON.
-                if consume_tool_output_occurrence(
+                if consume_initial_occurrence(
                     remaining_tool_outputs_by_raw_entry.get_mut(&raw_signature),
                 ) {
                     continue;
@@ -350,7 +361,7 @@ fn augment_modern_codex_reader(
                     created_at: raw.get("timestamp").and_then(parse_timestamp),
                     content_hash: *blake3::hash(output.as_bytes()).as_bytes(),
                 };
-                if consume_tool_output_occurrence(
+                if consume_initial_occurrence(
                     remaining_compacted_tool_outputs.get_mut(&signature),
                 ) {
                     continue;
@@ -362,11 +373,32 @@ fn augment_modern_codex_reader(
             let Some(message) = modern_codex_message(&raw) else {
                 continue;
             };
+            // Ignored entries need no digest. Web activity retains only its
+            // projected action; opaque results and encrypted fields never need
+            // to be serialized into a signature buffer.
+            let raw_signature =
+                primary_signature.unwrap_or_else(|| modern_codex_raw_signature(&message.extra));
+            let web = native_web_search(&message);
+            let idless_web =
+                web && message.invocations.first().is_some_and(|call| call.call_id.is_none());
+            if idless_web
+                && consume_initial_occurrence(
+                    remaining_idless_web_searches.get_mut(&raw_signature),
+                )
+            {
+                continue;
+            }
             let message_signature = modern_codex_message_signature(&message);
-            let existing_index = if unmatched_primary_output {
+            let existing_index = if unmatched_primary_output || idless_web {
                 // Exhausting the initial inventory means this is another
                 // occurrence. Learned raw/text aliases must not swallow it.
                 None
+            } else if web {
+                // Similar query text cannot establish that two actions were
+                // the same request, even at the same timestamp.
+                modern_codex_message_call_ids(&message)
+                    .find_map(|id| message_indices_by_call_id.get(&id).copied())
+                    .filter(|index| native_web_search(&conversation.messages[*index]))
             } else {
                 message_indices_by_raw_entry
                     .get(&raw_signature)
@@ -519,6 +551,7 @@ fn response_item_message(
                 }],
             ))
         }
+        Some("web_search_call") => web_search_message(payload, created_at, "web_search_call"),
         Some("function_call_output") => {
             let output = payload.get("output").and_then(Value::as_str)?;
             let call_id = payload.get("call_id").and_then(Value::as_str);
@@ -541,6 +574,7 @@ fn event_message(
     raw: &Value,
 ) -> Option<NormalizedMessage> {
     match payload.get("type").and_then(Value::as_str) {
+        Some("web_search_end") => web_search_message(payload, created_at, "web_search_end"),
         Some("agent_message") => {
             let content = payload
                 .get("message")
@@ -570,6 +604,93 @@ fn event_message(
         }
         _ => None,
     }
+}
+
+fn web_search_message(
+    payload: &Value,
+    created_at: Option<i64>,
+    record_type: &str,
+) -> Option<NormalizedMessage> {
+    let action = payload.get("action");
+    let event = record_type == "web_search_end";
+    let kind = match action {
+        Some(action) => action.get("type")?.as_str()?,
+        None if event => "search",
+        None => return None,
+    };
+    let keys: &[&str] = match kind {
+        "search" => &["query"],
+        "open_page" => &["url"],
+        "find_in_page" => &["url", "pattern"],
+        _ => return None,
+    };
+    let mut arguments = serde_json::Map::new();
+    for &key in keys {
+        let fallback = if event && key == "query" {
+            payload.get("query").and_then(Value::as_str)
+        } else {
+            None
+        };
+        let value = action
+            .and_then(|action| action.get(key))
+            .and_then(Value::as_str)
+            .or(fallback);
+        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+            arguments.insert(key.to_string(), Value::from(value));
+        }
+    }
+    if kind == "search"
+        && let Some(queries) = action
+            .and_then(|action| action.get("queries"))
+            .and_then(Value::as_array)
+    {
+        let queries: Vec<_> = queries
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|query| !query.trim().is_empty())
+            .map(Value::from)
+            .collect();
+        if !queries.is_empty() {
+            arguments.insert("queries".to_string(), Value::Array(queries));
+        }
+    }
+    if arguments.is_empty() {
+        return None;
+    }
+    arguments.insert("type".to_string(), Value::from(kind));
+    let arguments = Value::Object(arguments);
+    let id_key = if event { "call_id" } else { "id" };
+    let call_id = payload
+        .get(id_key)
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
+    // Copy only fields from the public action. Web-search response items may
+    // also carry encrypted_content and completion events may carry raw results.
+    let extra = serde_json::json!({
+        "type": record_type, "role": "assistant", "timestamp": created_at,
+        "call_id": call_id, "action": &arguments
+    });
+    Some(normalized_message(
+        "assistant".to_string(),
+        None,
+        created_at,
+        tool_call_content("web_search", Some(&arguments)),
+        extra,
+        vec![franken_agent_detection::NormalizedInvocation {
+            kind: "tool".to_string(),
+            name: "web_search".to_string(),
+            raw_name: None,
+            call_id: call_id.map(str::to_string),
+            arguments: Some(arguments),
+        }],
+    ))
+}
+
+fn native_web_search(message: &NormalizedMessage) -> bool {
+    matches!(
+        message.extra.get("type").and_then(Value::as_str),
+        Some("web_search_call" | "web_search_end")
+    )
 }
 
 fn normalized_message(
@@ -765,7 +886,7 @@ fn is_compacted_codex_message_extra(extra: &Value) -> bool {
     })
 }
 
-fn consume_tool_output_occurrence(remaining: Option<&mut usize>) -> bool {
+fn consume_initial_occurrence(remaining: Option<&mut usize>) -> bool {
     match remaining {
         Some(remaining) if *remaining > 0 => {
             *remaining -= 1;
@@ -821,6 +942,20 @@ fn merge_modern_codex_tool_call(
     existing: &mut NormalizedMessage,
     candidate: &NormalizedMessage,
 ) -> bool {
+    // A completion event may precede the canonical response item and carry
+    // only a display query. Prefer the structured response for the same ID.
+    if existing.extra["type"] == "web_search_end"
+        && candidate.extra["type"] == "web_search_call"
+        && let (Some(old), Some(new)) =
+            (existing.invocations.first(), candidate.invocations.first())
+        && old.call_id.is_some()
+        && old.call_id == new.call_id
+    {
+        existing.content.clone_from(&candidate.content);
+        existing.invocations.clone_from(&candidate.invocations);
+        existing.extra.clone_from(&candidate.extra);
+        return true;
+    }
     let mut changed = false;
     let mut matched_invocation = false;
     let mut upgraded_unknown_call_id = None;

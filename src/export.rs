@@ -546,6 +546,8 @@ fn messages_only_nonprose_envelope(body: &Value) -> bool {
                 | "function_call_output"
                 | "custom_tool_call"
                 | "custom_tool_call_output"
+                | "web_search_call"
+                | "web_search_end"
                 | "thinking"
                 | "reasoning"
                 | "patch"
@@ -1180,6 +1182,10 @@ mod tests {
             serde_json::json!({"role": "assistant", "recipient": "python",
                 "content": "PRIVATE_TOOL_INPUT", "text": "PRIVATE_UNTYPED_FALLBACK"}),
             serde_json::json!({"role": "assistant", "type": "assistant", "channel": "analysis"}),
+            serde_json::json!({"role": "assistant", "type": "web_search_call",
+                "content": "PRIVATE_TOOL_QUERY"}),
+            serde_json::json!({"role": "assistant", "type": "web_search_end",
+                "content": "PRIVATE_TOOL_RESULT"}),
         ] {
             for raw in [
                 body.clone(),
