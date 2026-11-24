@@ -26,8 +26,8 @@ use self::model_selection::{cancel_persisted_jobs, canonical_model};
 use self::work_queue::{JobControl, Receiver, Sender};
 use crate::franken_sync::CancellationHandle;
 use crate::indexer::semantic::{
-    EmbeddingInput, SemanticIndexer, expected_vector_space_revision, message_id_from_db,
-    saturating_u32_from_i64, semantic_doc_id_for_input,
+    CanonicalReconciliationPlan, EmbeddingInput, SemanticIndexer, expected_vector_space_revision,
+    message_id_from_db, saturating_u32_from_i64, semantic_doc_id_for_input,
 };
 use crate::search::canonicalize::embedding_passages;
 use crate::search::fastembed_embedder::FastEmbedder;
@@ -726,9 +726,10 @@ impl EmbeddingWorker {
     }
 
     /// Plan identities without retaining bodies, then replay the same source
-    /// into bounded passage batches. First builds emit vectors directly into
-    /// the private writer; reconciliation still collects replacement vectors.
-    /// Native writer storage and identity sets remain corpus-sized.
+    /// into bounded passage batches. First builds and canonical replacements
+    /// emit directly into a private native writer. Unchanged vectors retain
+    /// their stored values; native writer storage and identity sets still
+    /// remain corpus-sized.
     ///
     /// `on_progress` receives the completed-message count after every stored
     /// progress update, so tests observe progress without depending on
@@ -830,7 +831,8 @@ impl EmbeddingWorker {
             anyhow::ensure!(!cancelled(), "daemon embedding pass cancelled");
             Ok(())
         };
-        let mut produce = |emit: &mut dyn FnMut(
+        let has_existing_index = existing_state.path_exists;
+        let produce = |emit: &mut dyn FnMut(
             crate::indexer::semantic::EmbeddedMessage,
         ) -> anyhow::Result<()>|
          -> anyhow::Result<()> {
@@ -893,26 +895,30 @@ impl EmbeddingWorker {
             // writer may install its candidate as soon as this replay ends.
             // A different publication cannot inherit our reuse decisions.
             existing_state.ensure_current()?;
+            // The reconciler retains its own source under the artifact lease.
+            // Release this planning owner and its file observations before
+            // installation so a Windows rename can replace the destination.
+            drop(existing_state);
             Ok(())
         };
         let save_path = vector_index_path(index_path, indexer.embedder_id());
         let published = (|| -> anyhow::Result<()> {
-            if existing_state.path_exists {
-                // Existing generations retain the canonical reconciliation
-                // path: unchanged vectors keep their exact stored bits.
-                let mut embedded = Vec::new();
-                produce(&mut |message| {
-                    embedded.push(message);
-                    Ok(())
-                })?;
+            if has_existing_index {
+                // Replacements flow into the same private native writer that
+                // merges unchanged main/WAL rows, without a second complete
+                // replacement-vector collection in the daemon.
                 let db_fingerprint = crate::indexer::lexical_storage_fingerprint_for_db(db_path)?;
                 check_cancelled()?;
-                let reconciled = indexer.reconcile_index_with_canonical_documents(
-                    embedded,
+                let reconciled = indexer.reconcile_index_with_producer_and_cancel(
                     index_path,
-                    tier,
-                    &db_fingerprint,
-                    &current_doc_ids,
+                    CanonicalReconciliationPlan {
+                        tier,
+                        db_fingerprint: &db_fingerprint,
+                        current_doc_ids: &current_doc_ids,
+                        replacement_count: input_count,
+                    },
+                    produce,
+                    check_cancelled,
                 )?;
                 info!(
                     published = reconciled.record_count(),

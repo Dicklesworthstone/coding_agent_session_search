@@ -36,6 +36,15 @@ pub(crate) struct SemanticStorageBuildOutcome {
     pub canonical_boundary: Option<(crate::storage::sqlite::SemanticArchiveState, i64)>,
 }
 
+/// Canonical identities and the exact replacement count selected before a
+/// fallible replay begins. This describes input coverage, not serving readiness.
+pub(crate) struct CanonicalReconciliationPlan<'a> {
+    pub tier: TierKind,
+    pub db_fingerprint: &'a str,
+    pub current_doc_ids: &'a HashSet<String>,
+    pub replacement_count: usize,
+}
+
 const DIRECT_EMBED_MAX_INPUTS: usize = 512;
 const DIRECT_EMBED_MAX_INPUT_BYTES: usize = 1024 * 1024;
 
@@ -387,6 +396,29 @@ impl SemanticIndexer {
             current_doc_ids,
             || self.inner.check_external_cancelled(),
         )
+    }
+
+    /// Stream a planned replacement delta into private scratch while retaining
+    /// the existing native main/WAL owner. Replacement embeddings outside the
+    /// native writer are limited to the current inference batch. Retained
+    /// source/WAL storage, canonical identity sets and native writer storage
+    /// still scale with the corpus. Producer failure or caller cancellation
+    /// cannot install the emitted prefix or reclaim old scratch.
+    pub(crate) fn reconcile_index_with_producer_and_cancel<P, C>(
+        &self,
+        data_dir: &Path,
+        plan: CanonicalReconciliationPlan<'_>,
+        produce: P,
+        mut check_cancelled: C,
+    ) -> Result<VectorIndex>
+    where
+        P: FnOnce(&mut dyn FnMut(EmbeddedMessage) -> Result<()>) -> Result<()>,
+        C: FnMut() -> Result<()>,
+    {
+        reconcile::run_with_producer(self, data_dir, plan, produce, || {
+            self.inner.check_external_cancelled()?;
+            check_cancelled()
+        })
     }
 
     /// Return a shared, query-only owner when no vector or identity changes

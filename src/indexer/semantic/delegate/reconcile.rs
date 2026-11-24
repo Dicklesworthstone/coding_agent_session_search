@@ -1,12 +1,12 @@
 //! Canonical replacement assembly with cancellation and one-owner vector handoff.
 //!
-//! The canonical identity set remains caller-owned. Replacement vectors are
-//! released as soon as the native writer copies them, before retained rows are
-//! added. Native writer buffering and identity tables remain proportional to
-//! the result set; this does not establish a process memory ceiling.
+//! The canonical identity set remains caller-owned. Eager inputs retain their
+//! complete preflight; fallible producers validate and hand off one vector at a
+//! time without collecting the replacement set. Retained source/WAL storage,
+//! native writer buffering and identity tables still scale with the result set;
+//! this is not a process memory ceiling.
 
 use super::*;
-use frankensearch::index::VectorIndexWriter;
 
 pub(super) fn run(
     indexer: &SemanticIndexer,
@@ -25,7 +25,7 @@ pub(super) fn run(
         !db_fingerprint.trim().is_empty(),
         "canonical semantic reconciliation requires a DB fingerprint"
     );
-    let revision = expected_vector_space_revision(indexer.embedder_id())
+    expected_vector_space_revision(indexer.embedder_id())
         .context("canonical reconciliation has no registered vector-space revision")?;
     let mut replacements = prepare_replacements(
         indexer,
@@ -33,7 +33,104 @@ pub(super) fn run(
         current_doc_ids,
         &mut check_cancelled,
     )?;
-    let complete_replacement = replacements.len() == current_doc_ids.len();
+    let plan = CanonicalReconciliationPlan {
+        tier,
+        db_fingerprint,
+        current_doc_ids,
+        replacement_count: replacements.len(),
+    };
+    publish(
+        indexer,
+        data_dir,
+        plan,
+        Admission::Prepared,
+        |emit| {
+            write_replacements(&mut replacements, emit)?;
+            drop(replacements);
+            Ok(())
+        },
+        check_cancelled,
+    )
+}
+
+/// A fallible producer cannot preflight all vectors without retaining them.
+/// Use the existing-writer lease, which never sweeps other recovery scratch.
+/// The producer must yield exactly the planned delta, including for an empty
+/// delta: its final source and cancellation fences must still execute.
+pub(super) fn run_with_producer<P, C>(
+    indexer: &SemanticIndexer,
+    data_dir: &Path,
+    plan: CanonicalReconciliationPlan<'_>,
+    produce: P,
+    mut check_cancelled: C,
+) -> Result<VectorIndex>
+where
+    P: FnOnce(&mut dyn FnMut(EmbeddedMessage) -> Result<()>) -> Result<()>,
+    C: FnMut() -> Result<()>,
+{
+    check_cancelled()?;
+    ensure!(
+        !plan.db_fingerprint.trim().is_empty(),
+        "canonical semantic reconciliation requires a DB fingerprint"
+    );
+    ensure!(
+        plan.replacement_count <= plan.current_doc_ids.len(),
+        "planned replacement count exceeds the canonical document set"
+    );
+    let current_doc_ids = plan.current_doc_ids;
+    publish(
+        indexer,
+        data_dir,
+        plan,
+        Admission::Streaming,
+        |emit| {
+            let mut rejected = false;
+            produce(&mut |embedded| {
+                ensure!(
+                    !rejected,
+                    "canonical producer continued after a rejected replacement"
+                );
+                let result = (|| {
+                    let id = canonical_replacement_id(indexer, &embedded, current_doc_ids)?;
+                    emit(id, embedded.embedding)
+                })();
+                rejected = result.is_err();
+                result
+            })?;
+            ensure!(
+                !rejected,
+                "canonical producer ignored a rejected replacement"
+            );
+            Ok(())
+        },
+        check_cancelled,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum Admission {
+    Prepared,
+    Streaming,
+}
+
+fn publish<P, C>(
+    indexer: &SemanticIndexer,
+    data_dir: &Path,
+    plan: CanonicalReconciliationPlan<'_>,
+    admission: Admission,
+    produce: P,
+    mut check_cancelled: C,
+) -> Result<VectorIndex>
+where
+    P: FnOnce(&mut dyn FnMut(&str, Vec<f32>) -> Result<()>) -> Result<()>,
+    C: FnMut() -> Result<()>,
+{
+    let current_doc_ids = plan.current_doc_ids;
+    let tier = plan.tier;
+    let replacement_count = plan.replacement_count;
+    let complete_replacement = replacement_count == current_doc_ids.len();
+    let revision = expected_vector_space_revision(indexer.embedder_id())
+        .context("canonical reconciliation has no registered vector-space revision")?;
     let destination = vector_index_path(data_dir, indexer.embedder_id());
     if !complete_replacement {
         // This observation can only REFUSE early. It cannot admit a source or
@@ -43,7 +140,7 @@ pub(super) fn run(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 anyhow::bail!(
                     "initial canonical reconciliation lacks vectors for {} current documents",
-                    current_doc_ids.len().saturating_sub(replacements.len())
+                    current_doc_ids.len().saturating_sub(replacement_count)
                 );
             }
             Err(error) => {
@@ -53,9 +150,27 @@ pub(super) fn run(
         }
     }
     check_cancelled()?;
+    let mut produce = Some(produce);
+    if replacement_count == 0 {
+        let mut rejected = false;
+        produce.take().context("missing canonical producer")?(&mut |_, _| {
+            rejected = true;
+            anyhow::bail!("canonical producer exceeded its planned replacement count")
+        })?;
+        ensure!(
+            !rejected,
+            "canonical producer ignored an unplanned replacement"
+        );
+        check_cancelled()?;
+    }
     // Hold the lease through authoritative source observations and all writes.
     // Its scratch borrow also prevents releasing it before TempDir cleanup.
-    let artifacts = super::super::artifacts::BackfillArtifacts::for_rebuild(data_dir)?;
+    let artifacts = match admission {
+        Admission::Prepared => super::super::artifacts::BackfillArtifacts::for_rebuild(data_dir)?,
+        Admission::Streaming => {
+            super::super::artifacts::BackfillArtifacts::for_existing_writer(data_dir)?
+        }
+    };
     check_cancelled()?;
     let wal_path = wal_path_for(&destination);
     let wal_before = ObservedSemanticFile::capture(&wal_path)?;
@@ -64,7 +179,7 @@ pub(super) fn run(
     // the stored vectors under a retained native reader. In that case no
     // generation or recovery sidecar is being replaced or retired.
     if wal_before.is_none()
-        && replacements.is_empty()
+        && replacement_count == 0
         && let Some(source) = indexer.retain_unchanged_canonical_index(
             &destination,
             current_doc_ids,
@@ -85,6 +200,10 @@ pub(super) fn run(
     refuse_publication_sidecars(&destination, true)?;
     check_cancelled()?;
     let previous = RebuildDestination::capture(&destination)?;
+    ensure!(
+        matches!(admission, Admission::Prepared) || previous.file.is_some(),
+        "streaming canonical reconciliation requires its existing generation"
+    );
     // The same reader-owned merge serves both WAL and log-free sources.
     // Even a complete replacement must respect the existing artifact's
     // reader/writer lock and header admission, rather than overwriting an
@@ -99,7 +218,7 @@ pub(super) fn run(
         ensure!(
             complete_replacement,
             "initial canonical reconciliation lacks vectors for {} current documents",
-            current_doc_ids.len().saturating_sub(replacements.len())
+            current_doc_ids.len().saturating_sub(replacement_count)
         );
         None
     };
@@ -140,12 +259,46 @@ pub(super) fn run(
     let mut remaining = HashSet::new();
     remaining.try_reserve(current_doc_ids.len())?;
     fill_remaining(&mut remaining, current_doc_ids, &mut check_cancelled)?;
-    write_replacements(
-        &mut replacements,
-        &mut writer,
-        &mut remaining,
-        &mut check_cancelled,
-    )?;
+    let mut replacement_ids = HashSet::new();
+    replacement_ids.try_reserve(replacement_count)?;
+    if let Some(produce) = produce {
+        let mut rejected = false;
+        produce(&mut |id, vector| {
+            ensure!(
+                !rejected,
+                "canonical producer continued after a rejected replacement"
+            );
+            let result = (|| {
+                check_cancelled()?;
+                ensure!(
+                    replacement_ids.len() < replacement_count,
+                    "canonical producer exceeded its planned replacement count"
+                );
+                let id = current_doc_ids
+                    .get(id)
+                    .context("replacement document is not in the current canonical set")?
+                    .as_str();
+                ensure!(
+                    replacement_ids.insert(id),
+                    "duplicate canonical replacement document"
+                );
+                writer.write_record(id, &vector)?;
+                remaining.remove(id);
+                check_cancelled()
+            })();
+            rejected = result.is_err();
+            result
+        })?;
+        ensure!(
+            !rejected,
+            "canonical producer ignored a rejected replacement"
+        );
+    }
+    check_cancelled()?;
+    ensure!(
+        replacement_ids.len() == replacement_count,
+        "canonical producer did not yield every planned replacement"
+    );
 
     if !complete_replacement {
         let source = source
@@ -169,9 +322,7 @@ pub(super) fn run(
                 continue;
             }
             let id = source.doc_id_at(row)?;
-            if !current_doc_ids.contains(id)
-                || replacements.contains_key(id)
-                || wal_ids.contains(id)
+            if !current_doc_ids.contains(id) || replacement_ids.contains(id) || wal_ids.contains(id)
             {
                 continue;
             }
@@ -243,15 +394,15 @@ pub(super) fn run(
     tracing::info!(
         tier = tier.as_str(),
         published_docs = published.record_count(),
-        replaced_docs = replacements.len(),
+        replaced_docs = replacement_ids.len(),
         retained_wal_rows,
         "published canonical semantic reconciliation"
     );
     Ok(published)
 }
 
-// Keep borrowed canonical keys even after a vector is handed off, so main/WAL
-// precedence checks need no second replacement-ID inventory or string copies.
+// Eager callers preflight before acquiring any lease. Borrow canonical keys
+// without cloning their strings; release the table once its vectors are emitted.
 type ReplacementVectors<'a> = HashMap<&'a str, Option<Vec<f32>>>;
 
 fn prepare_replacements<'a>(
@@ -266,35 +417,10 @@ fn prepare_replacements<'a>(
     // Validate the complete replacement set before opening a source or writer.
     for embedded in messages {
         check_cancelled()?;
-        ensure!(
-            embedded.embedding.len() == indexer.embedder_dimension(),
-            "canonical replacement has the wrong vector dimension"
-        );
-        let norm = embedded
-            .embedding
-            .iter()
-            .fold(0.0f32, |sum, value| sum + value * value);
-        ensure!(
-            norm.is_finite() && norm > 0.0,
-            "canonical replacement has a non-finite or zero-norm vector"
-        );
-        let id = SemanticDocId {
-            message_id: embedded.message_id,
-            chunk_idx: embedded.chunk_idx,
-            agent_id: embedded.agent_id,
-            workspace_id: embedded.workspace_id,
-            source_id: embedded.source_id,
-            role: embedded.role,
-            created_at_ms: embedded.created_at_ms,
-            content_hash: Some(embedded.content_hash),
-        }
-        .to_doc_id_string();
-        let canonical_id = current_doc_ids
-            .get(id.as_str())
-            .context("replacement document is not in the current canonical set")?;
+        let canonical_id = canonical_replacement_id(indexer, &embedded, current_doc_ids)?;
         ensure!(
             replacements
-                .insert(canonical_id.as_str(), Some(embedded.embedding))
+                .insert(canonical_id, Some(embedded.embedding))
                 .is_none(),
             "duplicate canonical replacement document"
         );
@@ -303,23 +429,52 @@ fn prepare_replacements<'a>(
     Ok(replacements)
 }
 
-fn write_replacements<'a>(
-    replacements: &mut ReplacementVectors<'a>,
-    writer: &mut VectorIndexWriter,
-    remaining: &mut HashSet<&'a str>,
-    check_cancelled: &mut impl FnMut() -> Result<()>,
+fn canonical_replacement_id<'a>(
+    indexer: &SemanticIndexer,
+    embedded: &EmbeddedMessage,
+    current_doc_ids: &'a HashSet<String>,
+) -> Result<&'a str> {
+    ensure!(
+        embedded.embedding.len() == indexer.embedder_dimension(),
+        "canonical replacement has the wrong vector dimension"
+    );
+    let norm = embedded
+        .embedding
+        .iter()
+        .fold(0.0f32, |sum, value| sum + value * value);
+    ensure!(
+        norm.is_finite() && norm > 0.0,
+        "canonical replacement has a non-finite or zero-norm vector"
+    );
+    let id = SemanticDocId {
+        message_id: embedded.message_id,
+        chunk_idx: embedded.chunk_idx,
+        agent_id: embedded.agent_id,
+        workspace_id: embedded.workspace_id,
+        source_id: embedded.source_id,
+        role: embedded.role,
+        created_at_ms: embedded.created_at_ms,
+        content_hash: Some(embedded.content_hash),
+    }
+    .to_doc_id_string();
+    current_doc_ids
+        .get(id.as_str())
+        .map(String::as_str)
+        .context("replacement document is not in the current canonical set")
+}
+
+fn write_replacements(
+    replacements: &mut ReplacementVectors<'_>,
+    emit: &mut dyn FnMut(&str, Vec<f32>) -> Result<()>,
 ) -> Result<()> {
     for (&id, vector) in replacements {
-        check_cancelled()?;
         let vector = vector
             .take()
             .context("canonical replacement was already consumed")?;
-        writer.write_record(id, &vector)?;
-        remaining.remove(id);
+        emit(id, vector)?;
         // The native writer now owns its copy. Drop the original immediately,
         // rather than holding every replacement through finish and validation.
     }
-    check_cancelled()?;
     Ok(())
 }
 

@@ -18,7 +18,9 @@ pub use artifacts::{
     BackfillManifestChanged, apply_backfill_artifact_plan, plan_backfill_artifacts,
     reclaim_backfill_artifacts,
 };
-pub(crate) use delegate::{SemanticStorageBuildPhase, semantic_delta_selection_limits};
+pub(crate) use delegate::{
+    CanonicalReconciliationPlan, SemanticStorageBuildPhase, semantic_delta_selection_limits,
+};
 pub use engine::*;
 pub use titles::{
     TITLE_MAX_BATCH_CONVERSATIONS, TitleMaintenanceOutcome, maintain_title_index,

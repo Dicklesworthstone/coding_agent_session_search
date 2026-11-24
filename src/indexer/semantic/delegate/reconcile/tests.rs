@@ -155,6 +155,29 @@ impl Fixture {
             check,
         )
     }
+
+    fn run_streamed(
+        &self,
+        indexer: &SemanticIndexer,
+        check: impl FnMut() -> Result<()>,
+    ) -> Result<VectorIndex> {
+        indexer.reconcile_index_with_producer_and_cancel(
+            self.root.path(),
+            CanonicalReconciliationPlan {
+                tier: TierKind::Fast,
+                db_fingerprint: "canonical-streaming-fixture",
+                current_doc_ids: &self.current,
+                replacement_count: self.replacements.len(),
+            },
+            |emit| {
+                for replacement in &self.replacements {
+                    emit(replacement.clone())?;
+                }
+                Ok(())
+            },
+            check,
+        )
+    }
 }
 
 #[test]
@@ -415,8 +438,10 @@ fn replacement_handoff_borrows_canonical_keys_and_releases_original_vectors() ->
         indexer.embedder_dimension(),
         Quantization::F16,
     )?;
-    let mut remaining = fixture.current.iter().map(String::as_str).collect();
-    write_replacements(&mut replacements, &mut writer, &mut remaining, &mut || {
+    let mut remaining: HashSet<&str> = fixture.current.iter().map(String::as_str).collect();
+    write_replacements(&mut replacements, &mut |id, vector| {
+        writer.write_record(id, &vector)?;
+        remaining.remove(id);
         Ok(())
     })?;
     assert!(remaining.is_empty());
@@ -451,13 +476,15 @@ fn cancelled_handoff_never_finishes_a_partial_replacement() -> Result<()> {
         indexer.embedder_dimension(),
         Quantization::F16,
     )?;
-    let mut remaining = fixture.current.iter().map(String::as_str).collect();
+    let mut remaining: HashSet<&str> = fixture.current.iter().map(String::as_str).collect();
     let mut probes = 0;
-    let error = write_replacements(&mut replacements, &mut writer, &mut remaining, &mut || {
+    let error = write_replacements(&mut replacements, &mut |id, vector| {
         probes += 1;
         if probes == 2 {
             Err(interrupted())
         } else {
+            writer.write_record(id, &vector)?;
+            remaining.remove(id);
             Ok(())
         }
     })
@@ -468,11 +495,236 @@ fn cancelled_handoff_never_finishes_a_partial_replacement() -> Result<()> {
             .values()
             .filter(|value| value.is_none())
             .count(),
-        1
+        2
     );
     assert_eq!(remaining.len(), fixture.current.len() - 1);
     drop(writer);
     assert!(!output.exists());
     fixture.assert_preserved()?;
+    Ok(())
+}
+
+#[test]
+fn streamed_reconciliation_matches_eager_for_reuse_wal_deletion_and_noop() -> Result<()> {
+    let indexer = SemanticIndexer::new("hash", None)?;
+    for scenario in 1..6 {
+        let eager = Fixture::new(&indexer, scenario)?;
+        let expected = vectors(&eager.run(&indexer, || Ok(()))?)?;
+        let streamed = Fixture::new(&indexer, scenario)?;
+        let mut calls = 0usize;
+        let output = indexer.reconcile_index_with_producer_and_cancel(
+            streamed.root.path(),
+            CanonicalReconciliationPlan {
+                tier: TierKind::Fast,
+                db_fingerprint: "canonical-streaming-fixture",
+                current_doc_ids: &streamed.current,
+                replacement_count: streamed.replacements.len(),
+            },
+            |emit| {
+                calls += 1;
+                for replacement in &streamed.replacements {
+                    assert_eq!(bytes(&streamed.path)?, streamed.before);
+                    assert_eq!(bytes(&wal_path_for(&streamed.path))?, streamed.wal_before);
+                    emit(replacement.clone())?;
+                }
+                Ok(())
+            },
+            || Ok(()),
+        )?;
+        assert_eq!(
+            calls, 1,
+            "an empty producer still owns a final source fence"
+        );
+        assert_eq!(vectors(&output)?, expected, "scenario {scenario}");
+        drop(output);
+        assert_eq!(
+            vectors(&VectorIndex::open_read_only(&streamed.path)?)?,
+            expected
+        );
+        if scenario == 4 {
+            assert_eq!(bytes(&streamed.path)?, streamed.before);
+            assert_eq!(
+                fs::read(streamed.path.with_extension("fsvi.fec"))?,
+                b"untouched recovery fixture"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn streamed_rejections_preserve_live_wal_and_unrelated_recovery_scratch() -> Result<()> {
+    let indexer = SemanticIndexer::new("hash", None)?;
+    for scenario in [1, 3] {
+        for rejection in [
+            "dimension",
+            "nan",
+            "zero",
+            "foreign",
+            "duplicate",
+            "missing",
+            "excess",
+            "producer_error",
+            "ignored_invalid",
+            "ignored_duplicate",
+            "unplanned",
+        ] {
+            let fixture = Fixture::new(&indexer, scenario)?;
+            let evidence = fixture
+                .root
+                .path()
+                .join("vector_index/.backfill-reuse-Streamed123");
+            fs::create_dir_all(&evidence)?;
+            let retained = evidence.join("candidate.fsvi");
+            fs::write(&retained, b"interrupted recovery evidence")?;
+            let mut replacements = fixture.replacements.clone();
+            let replacement_count = if rejection == "unplanned" {
+                0
+            } else {
+                replacements.len()
+            };
+            match rejection {
+                "dimension" => {
+                    replacements[1].embedding.pop();
+                }
+                "nan" | "ignored_invalid" => replacements[1].embedding[0] = f32::NAN,
+                "zero" => replacements[1].embedding.fill(0.0),
+                "foreign" => replacements[1].message_id = u64::MAX,
+                "duplicate" | "ignored_duplicate" => replacements[1] = replacements[0].clone(),
+                "missing" => {
+                    replacements.pop();
+                }
+                "excess" => replacements.push(replacements[0].clone()),
+                "producer_error" | "unplanned" => {}
+                _ => unreachable!(),
+            }
+            let result = indexer.reconcile_index_with_producer_and_cancel(
+                fixture.root.path(),
+                CanonicalReconciliationPlan {
+                    tier: TierKind::Fast,
+                    db_fingerprint: "canonical-streaming-fixture",
+                    current_doc_ids: &fixture.current,
+                    replacement_count,
+                },
+                |emit| {
+                    for replacement in replacements {
+                        let result = emit(replacement);
+                        if !rejection.starts_with("ignored_") {
+                            result?;
+                        }
+                        if rejection == "producer_error" {
+                            anyhow::bail!("source replay failed after its first replacement");
+                        }
+                    }
+                    Ok(())
+                },
+                || Ok(()),
+            );
+            assert!(result.is_err(), "accepted {rejection}, scenario {scenario}");
+            assert_eq!(bytes(&fixture.path)?, fixture.before, "{rejection}");
+            assert_eq!(
+                bytes(&wal_path_for(&fixture.path))?,
+                fixture.wal_before,
+                "{rejection}"
+            );
+            assert_eq!(fs::read(&retained)?, b"interrupted recovery evidence");
+            let scratch_count = fs::read_dir(fixture.path.parent().unwrap())?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<std::io::Result<Vec<_>>>()?
+                .iter()
+                .filter(|name| name.to_string_lossy().starts_with(".backfill-reuse-"))
+                .count();
+            assert_eq!(scratch_count, 1, "a rejected stream left new scratch");
+            let retried = fixture.run_streamed(&indexer, || Ok(()))?;
+            assert_eq!(retried.record_count(), fixture.current.len());
+            assert_eq!(fs::read(&retained)?, b"interrupted recovery evidence");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn every_streamed_cancellation_boundary_preserves_main_wal_and_readers() -> Result<()> {
+    let indexer = SemanticIndexer::new("hash", None)?;
+    for scenario in 1..6 {
+        let control = Fixture::new(&indexer, scenario)?;
+        let mut probes = 0usize;
+        let output = control.run_streamed(&indexer, || {
+            probes += 1;
+            Ok(())
+        })?;
+        let expected = vectors(&output)?;
+        drop(output);
+        for fail_at in 1..=probes {
+            let fixture = Fixture::new(&indexer, scenario)?;
+            let retained = VectorIndex::open_read_only(&fixture.path)?;
+            let mut observed = 0usize;
+            let error = fixture
+                .run_streamed(&indexer, || {
+                    observed += 1;
+                    if observed == fail_at {
+                        Err(interrupted())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+            assert_interrupted(&error);
+            assert_eq!(observed, fail_at);
+            fixture.assert_preserved()?;
+            assert_eq!(
+                VectorIndex::open_read_only(&fixture.path)?.record_count(),
+                retained.record_count()
+            );
+            drop(retained);
+            let retried = fixture.run_streamed(&indexer, || Ok(()))?;
+            assert_eq!(vectors(&retried)?, expected);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn streaming_checks_cancellation_after_native_finish_and_never_after_install() -> Result<()> {
+    let indexer = SemanticIndexer::new("hash", None)?;
+    for scenario in [1, 2, 3, 5] {
+        let fixture = Fixture::new(&indexer, scenario)?;
+        let mut finished = false;
+        let error = fixture
+            .run_streamed(&indexer, || {
+                for entry in fs::read_dir(fixture.path.parent().unwrap())? {
+                    let entry = entry?;
+                    let candidate_path = entry.path().join("candidate.fsvi");
+                    if entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".backfill-reuse-")
+                        && candidate_path.exists()
+                    {
+                        let candidate = VectorIndex::open_read_only(&candidate_path)?;
+                        assert_eq!(candidate.record_count(), fixture.current.len());
+                        assert_eq!(candidate.wal_record_count(), 0);
+                        finished = true;
+                        return Err(interrupted());
+                    }
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert_interrupted(&error);
+        assert!(finished);
+        fixture.assert_preserved()?;
+        // Cancellation is checked immediately before installation. Once the
+        // native rename commits, the result must remain an acknowledged success.
+        let output = fixture.run_streamed(&indexer, || {
+            if bytes(&fixture.path)? != fixture.before {
+                Err(interrupted())
+            } else {
+                Ok(())
+            }
+        })?;
+        assert_eq!(output.record_count(), fixture.current.len());
+        assert_ne!(bytes(&fixture.path)?, fixture.before);
+    }
     Ok(())
 }
