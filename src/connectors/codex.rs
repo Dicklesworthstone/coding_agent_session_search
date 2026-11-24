@@ -6,6 +6,7 @@ mod discovery;
 mod implementation;
 #[doc(hidden)]
 pub mod layout_identity;
+pub(crate) mod stable_prefix;
 // Also consumed by raw-mirror admission, including the legacy fallback route.
 pub(crate) mod path_policy;
 
@@ -13,6 +14,12 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+
+// Indexer/raw-mirror consumers are absent from the standalone Codex harness.
+#[allow(unused_imports)]
+pub(crate) use stable_prefix::{
+    StablePrefixReceipt, current_prefix_receipt, set_previous_prefix_receipt,
+};
 
 use super::{
     Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, NormalizedMessage,
@@ -29,7 +36,7 @@ pub(crate) use implementation::modern_codex_message;
 pub(crate) use implementation::over_budget_scan_error;
 #[allow(unused_imports)]
 pub(crate) use implementation::{
-    SourceFailureReason, can_attempt_active_jsonl_source, for_each_source_failure,
+    SourceAdmissionFailures, SourceFailureReason, can_attempt_active_jsonl_source, for_each_source_failure,
     guarded_active_jsonl_source, over_budget_sources, source_read_budget,
 };
 

@@ -20,6 +20,10 @@ pub(super) fn corpus() -> Result<(tempfile::TempDir, Vec<PathBuf>, ScanContext)>
         .collect();
     for (index, path) in paths.iter().enumerate() {
         fs::write(path, message(&format!("healthy-{index}")))?;
+        // These controls represent settled history with reusable EOF receipts.
+        // Individual tests overwrite the live/failed source after this point.
+        fs::File::open(path)?
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))?;
     }
     let ctx = ScanContext::with_roots(
         root.path().join("cass"),
@@ -30,9 +34,11 @@ pub(super) fn corpus() -> Result<(tempfile::TempDir, Vec<PathBuf>, ScanContext)>
 }
 
 #[test]
-fn unfinished_middle_source_does_not_starve_later_sessions() -> Result<()> {
+fn unfinished_middle_source_without_a_record_does_not_starve_later_sessions() -> Result<()> {
     let (_root, paths, mut ctx) = corpus()?;
-    let broken = format!("{}{{\"type\":", message("unfinished-private-prefix"));
+    // There is no complete record to admit. Valid prefixes are covered by the
+    // growing-writer matrix; this remains the source-local failure control.
+    let broken = "{\"type\":\"unfinished-private-prefix\",\"payload\":".to_owned();
     fs::write(&paths[1], &broken)?;
     let connector = CodexConnector::new();
     for since in [None, Some(0)] {
@@ -136,7 +142,7 @@ fn invalid_data_and_budget_failures_are_both_reported() -> Result<()> {
 fn consumer_errors_abort_even_after_a_source_local_failure() -> Result<()> {
     for completion_error in [false, true] {
         let (_root, paths, ctx) = corpus()?;
-        fs::write(&paths[0], format!("{}{{", message("unfinished")))?;
+        fs::write(&paths[0], "{\"type\":\"unfinished\",\"payload\":")?;
         let mut delivered = Vec::new();
         let mut complete = |_: &SourceCompletion| -> Result<()> {
             if completion_error {

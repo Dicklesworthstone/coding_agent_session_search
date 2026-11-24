@@ -122,7 +122,10 @@ def main() -> None:
         "anyhow", "blake3", "chrono", "dirs", "dotenvy", "franken-agent-detection", "libc", "walkdir",
         "serde", "serde_json", "tempfile", "thiserror", "tracing", "zstd",
     )
-    tests = ("connector_codex", "connector_codex_exclusions", "codex_source_containment")
+    tests = (
+        "connector_codex", "connector_codex_exclusions", "codex_source_containment",
+        "codex_stable_prefix",
+    )
     refuse_full_crate_tests(root, tests)
     lines = [
         "[package]", 'name = "cass-codex-contract"', 'version = "0.0.0"',

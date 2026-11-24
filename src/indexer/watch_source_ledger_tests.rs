@@ -9,6 +9,527 @@ use serial_test::serial;
 use std::io::Write;
 use tempfile::TempDir;
 
+#[cfg(unix)]
+fn codex_watch_prefix_fixture(temp: &TempDir) -> Result<(PathBuf, ScanContext)> {
+    let path = temp.path().join("rollout-watch-prefix.jsonl");
+    fs::write(&path, b"{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"first\"}}\n")?;
+    let ctx = ScanContext::with_roots(
+        temp.path().to_path_buf(),
+        vec![ScanRoot::local(path.clone())],
+        None,
+    );
+    Ok((path, ctx))
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_prefix_watch_receipt_is_durable_without_whole_source_coverage() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (path, ctx) = codex_watch_prefix_fixture(&temp)?;
+    let _writer = OpenOptions::new().append(true).open(&path)?;
+    let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+    let mut ledger = WatchSourceLedger::default();
+    let mut conversations = Vec::new();
+    ledger.scan(
+        &crate::connectors::codex::CodexConnector::new(),
+        "codex",
+        &ctx,
+        &HashMap::new(),
+        true,
+        false,
+        &filter,
+        None,
+        &mut |conversation| {
+            conversations.push(conversation);
+            Ok(true)
+        },
+    )?;
+    assert_eq!(conversations.len(), 1);
+    assert!(ledger.unstable_sources);
+    assert!(ledger.completed_source_paths().next().is_none());
+    assert!(ledger.may_publish_source(&path));
+    let key = ledger.completions[&path].entry.key.clone();
+    let storage = FrankenStorage::open(&temp.path().join("archive.db"))?;
+    let debt = WatchLexicalReplayDebt::for_root(ConnectorKind::Codex, &ctx.scan_roots[0]);
+    ledger.begin_publication(&storage, &debt, None)?;
+    let admitted = storage.source_ingest_ledger_entries()?;
+    let value: serde_json::Value = serde_json::from_str(&admitted[&key])?;
+    assert_eq!(value["publication_invalidated"], true);
+    assert_eq!(value["watch_published"], false);
+    assert_eq!(value["codex_prefix"]["partial"], true);
+    assert!(!load_watch_lexical_replay_debt(&storage)?.is_empty());
+    // This is the ledger operation invoked after canonical+lexical commit.
+    // Keeping root-wide recovery debt must not discard the partial receipt.
+    ledger.publish_batch(&storage, &conversations, &[], true)?;
+    let published = storage.source_ingest_ledger_entries()?;
+    let value: serde_json::Value = serde_json::from_str(&published[&key])?;
+    assert_eq!(value["watch_published"], true);
+    assert!(value.get("publication_invalidated").is_none());
+    assert_eq!(value["codex_prefix"]["partial"], true);
+    assert!(!load_watch_lexical_replay_debt(&storage)?.is_empty());
+    assert!(!source_ledger_matches_with_contract(
+        &published[&key],
+        &DiscoveredSourceFile::new(
+            "codex",
+            &ctx.scan_roots[0],
+            path.clone(),
+            DiscoveredSourceRole::PrimarySessionLog,
+            true,
+        )
+        .with_fs_metadata(),
+        &source_ledger_producer_contract("codex")?.0,
+    ));
+    fs::write(&path, fs::read_to_string(&path)?.replace("first", "other"))?;
+    let mut retry = WatchSourceLedger::default();
+    let mut called = false;
+    assert!(
+        retry
+            .scan(
+                &crate::connectors::codex::CodexConnector::new(),
+                "codex",
+                &ctx,
+                &published,
+                true,
+                true,
+                &filter,
+                None,
+                &mut |_| {
+                    called = true;
+                    Ok(true)
+                },
+            )
+            .is_err()
+    );
+    assert!(
+        !called,
+        "persisted overlap must reject a rewritten first message"
+    );
+    assert_eq!(storage.source_ingest_ledger_entries()?, published);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_prefix_watch_drops_spooled_delivery_when_final_validation_fails() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (path, ctx) = codex_watch_prefix_fixture(&temp)?;
+    let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+    let mut ledger = WatchSourceLedger::default();
+    let mut spool = WatchConversationSpool::new(temp.path(), 1);
+    let result = ledger.scan(
+        &crate::connectors::codex::CodexConnector::new(),
+        "codex",
+        &ctx,
+        &HashMap::new(),
+        true,
+        false,
+        &filter,
+        None,
+        &mut |conversation| {
+            spool.push(conversation, None)?;
+            fs::write(&path, fs::read_to_string(&path)?.replace("first", "other"))?;
+            Ok(true)
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(spool.len(), 1, "delivery was provisional");
+    ledger.revalidate_prefixes(&filter, None)?;
+    spool
+        .entries
+        .retain(|entry| ledger.may_publish_source(&entry.key.source_path));
+    assert_eq!(spool.len(), 0);
+    assert!(ledger.unstable_sources);
+    assert!(ledger.completed_source_paths().next().is_none());
+    assert!(filter.take_deferred_sources().contains(&path));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_prefix_watch_cannot_deliver_when_receipt_capacity_is_exhausted() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (path, ctx) = codex_watch_prefix_fixture(&temp)?;
+    let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+    let mut ledger = WatchSourceLedger {
+        completion_bytes: MAX_RECEIPT_BYTES,
+        ..Default::default()
+    };
+    let mut called = false;
+    ledger.scan(
+        &crate::connectors::codex::CodexConnector::new(),
+        "codex",
+        &ctx,
+        &HashMap::new(),
+        true,
+        false,
+        &filter,
+        None,
+        &mut |_| {
+            called = true;
+            Ok(true)
+        },
+    )?;
+    assert!(!called);
+    assert!(ledger.completions.is_empty());
+    assert!(ledger.unstable_sources);
+    assert!(filter.take_deferred_sources().contains(&path));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_prefix_watch_missing_integrity_cache_entry_defers_without_invalidation() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (path, ctx) = codex_watch_prefix_fixture(&temp)?;
+    let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+    let mut ledger = WatchSourceLedger::default();
+    let saved = HashMap::from([(
+        super::super::watch_source_cache::INCOMPLETE_SOURCE_LEDGER_KEY.to_string(),
+        String::new(),
+    )]);
+    let mut called = false;
+    ledger.scan(
+        &crate::connectors::codex::CodexConnector::new(),
+        "codex",
+        &ctx,
+        &saved,
+        true,
+        false,
+        &filter,
+        None,
+        &mut |_| {
+            called = true;
+            Ok(true)
+        },
+    )?;
+    assert!(!called);
+    assert!(ledger.admitted_keys.is_empty());
+    assert!(ledger.unstable_sources);
+    assert!(filter.take_deferred_sources().contains(&path));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_prefix_watch_exact_lookup_admits_new_source_despite_unrelated_cache_omission() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (path, ctx) = codex_watch_prefix_fixture(&temp)?;
+    let storage = FrankenStorage::open(&temp.path().join("archive.db"))?;
+    let unrelated = "x".repeat(super::super::watch_source_cache::MAX_WATCH_SOURCE_LEDGER_VALUE_BYTES + 1);
+    storage.raw().execute_compat(
+        "INSERT INTO meta(key, value) VALUES('source_ingest_v1:unrelated', ?1)",
+        &[ParamValue::from(unrelated.as_str())],
+    )?;
+    let cache = super::super::watch_source_cache::load_bounded_watch_source_ledger(&storage, None)?;
+    assert!(cache.contains_key(super::super::watch_source_cache::INCOMPLETE_SOURCE_LEDGER_KEY));
+    let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+    let mut ledger = WatchSourceLedger::default();
+    let mut lookups = 0;
+    let mut delivered = Vec::new();
+    ledger.scan_with_ledger_lookup(
+        &crate::connectors::codex::CodexConnector::new(), "codex", &ctx, &cache,
+        true, false, &filter, None,
+        &mut |key| {
+            lookups += 1;
+            super::super::watch_source_cache::lookup_watch_source_observation(&storage, key, None)
+        },
+        &mut |conversation| { delivered.push(conversation); Ok(true) },
+    )?;
+    assert_eq!(lookups, 1);
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].source_path, path);
+    assert_eq!(delivered[0].messages[0].content, "first");
+    assert!(ledger.completions[&path].certified);
+    assert_eq!(cache.len(), 1, "point lookups must not grow the cache");
+    assert_eq!(storage.source_ingest_ledger_entries()?.len(), 1, "lookup is read-only");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_prefix_watch_exact_lookup_preserves_omitted_overlap_and_discovers_appends() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (path, ctx) = codex_watch_prefix_fixture(&temp)?;
+    let mut writer = OpenOptions::new().append(true).open(&path)?;
+    let connector = crate::connectors::codex::CodexConnector::new();
+    let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+    let mut initial = WatchSourceLedger::default();
+    initial.scan_with_ledger_lookup(
+        &connector, "codex", &ctx, &HashMap::new(), true, false, &filter, None,
+        &mut |_| panic!("a complete empty cache needs no database fallback"),
+        &mut |_| Ok(true),
+    )?;
+    let entry = &initial.completions[&path].entry;
+    let storage = FrankenStorage::open(&temp.path().join("archive.db"))?;
+    storage.raw().execute_compat(
+        "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+        &[ParamValue::from(entry.key.as_str()), ParamValue::from(entry.observation.as_str())],
+    )?;
+    let original = storage.source_ingest_ledger_entries()?;
+    let cache = HashMap::from([(
+        super::super::watch_source_cache::INCOMPLETE_SOURCE_LEDGER_KEY.to_string(), String::new(),
+    )]);
+    writer.write_all(b"{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"second\"}}\n")?;
+    let mut next = WatchSourceLedger::default();
+    let mut delivered = Vec::new();
+    next.scan_with_ledger_lookup(
+        &connector, "codex", &ctx, &cache, true, false, &filter, None,
+        &mut |key| super::super::watch_source_cache::lookup_watch_source_observation(&storage, key, None),
+        &mut |conversation| { delivered.push(conversation); Ok(true) },
+    )?;
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].messages.len(), 2);
+    assert_eq!(next.prefix_invalidations[&entry.key], invalidated_prefix_observation(&entry.observation)?.unwrap());
+    assert_eq!(storage.source_ingest_ledger_entries()?, original);
+    fs::write(&path, fs::read_to_string(&path)?.replace("first", "other"))?;
+    let mut refused = WatchSourceLedger::default();
+    let mut called = false;
+    assert!(refused.scan_with_ledger_lookup(
+        &connector, "codex", &ctx, &cache, true, false, &filter, None,
+        &mut |key| super::super::watch_source_cache::lookup_watch_source_observation(&storage, key, None),
+        &mut |_| { called = true; Ok(true) },
+    ).is_err());
+    assert!(!called, "an omitted proof must still reject changed admitted bytes");
+    assert!(refused.admitted_keys.is_empty());
+    assert_eq!(storage.source_ingest_ledger_entries()?, original);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_prefix_watch_exact_lookup_refuses_only_the_oversized_source_receipt() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (refused, _) = codex_watch_prefix_fixture(&temp)?;
+    let healthy = temp.path().join("rollout-z-healthy.jsonl");
+    fs::write(&healthy, fs::read(&refused)?)?;
+    let ctx = ScanContext::with_roots(
+        temp.path().to_path_buf(), vec![ScanRoot::local(temp.path().to_path_buf())], None,
+    );
+    let connector = crate::connectors::codex::CodexConnector::new();
+    let source = connector.discover_source_files(&ctx)?.into_iter()
+        .find(|source| source.source_path == refused).context("refused fixture source")?;
+    let key = source_ledger_key(&source, &ctx).context("refused fixture key")?;
+    let storage = FrankenStorage::open(&temp.path().join("archive.db"))?;
+    storage.raw().execute_compat(
+        "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+        &[ParamValue::from(key.as_str()), ParamValue::from("x".repeat(
+            super::super::watch_source_cache::MAX_WATCH_SOURCE_LEDGER_VALUE_BYTES + 1,
+        ))],
+    )?;
+    let cache = super::super::watch_source_cache::load_bounded_watch_source_ledger(&storage, None)?;
+    let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+    let mut ledger = WatchSourceLedger::default();
+    let mut delivered = Vec::new();
+    ledger.scan_with_ledger_lookup(
+        &connector, "codex", &ctx, &cache, true, false, &filter, None,
+        &mut |key| super::super::watch_source_cache::lookup_watch_source_observation(&storage, key, None),
+        &mut |conversation| { delivered.push(conversation.source_path); Ok(true) },
+    )?;
+    assert_eq!(delivered, vec![healthy]);
+    assert!(ledger.unstable_sources);
+    assert!(!ledger.admitted_keys.contains(&key));
+    assert!(filter.take_deferred_sources().contains(&refused));
+    assert_eq!(storage.source_ingest_ledger_entries()?.len(), 1);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_prefix_watch_exact_lookup_database_failure_preserves_unadmitted_source() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (path, ctx) = codex_watch_prefix_fixture(&temp)?;
+    let cache = HashMap::from([(
+        super::super::watch_source_cache::INCOMPLETE_SOURCE_LEDGER_KEY.to_string(), String::new(),
+    )]);
+    let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+    let mut ledger = WatchSourceLedger::default();
+    let mut called = false;
+    let error = ledger.scan_with_ledger_lookup(
+        &crate::connectors::codex::CodexConnector::new(), "codex", &ctx, &cache,
+        true, false, &filter, None,
+        &mut |_| anyhow::bail!("fixture database lookup failure"),
+        &mut |_| { called = true; Ok(true) },
+    ).err().context("database failure was treated as absent evidence")?;
+    assert!(format!("{error:#}").contains("fixture database lookup failure"));
+    assert!(!called);
+    assert!(ledger.admitted_keys.is_empty());
+    assert!(ledger.unstable_sources);
+    assert!(filter.take_deferred_sources().contains(&path));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_prefix_watch_refused_proof_does_not_starve_later_siblings() -> Result<()> {
+    for malformed in [false, true] {
+        for omitted in [false, true] {
+            let temp = TempDir::new()?;
+            let (refused, _) = codex_watch_prefix_fixture(&temp)?;
+            let ctx = ScanContext::with_roots(temp.path().to_path_buf(),
+                vec![ScanRoot::local(temp.path().to_path_buf())], None);
+            let connector = crate::connectors::codex::CodexConnector::new();
+            let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+            let mut initial = WatchSourceLedger::default();
+            initial.scan(&connector, "codex", &ctx, &HashMap::new(), true, false,
+                &filter, None, &mut |_| Ok(true))?;
+            let entry = &initial.completions[&refused].entry;
+            let key = entry.key.clone();
+            let observation = if malformed {
+                serde_json::json!({"codex_prefix": "malformed"}).to_string()
+            } else {
+                fs::write(&refused, fs::read_to_string(&refused)?.replace("first", "other"))?;
+                entry.observation.clone()
+            };
+            let healthy = temp.path().join("rollout-z-healthy.jsonl");
+            fs::write(&healthy, fs::read(&refused)?)?;
+            assert_eq!(connector.discover_source_files(&ctx)?[0].source_path, refused);
+            let storage = FrankenStorage::open(&temp.path().join("archive.db"))?;
+            storage.raw().execute_compat("INSERT INTO meta(key, value) VALUES(?1, ?2)", &[
+                ParamValue::from(key.as_str()), ParamValue::from(observation.as_str()),
+            ])?;
+            let saved = if omitted {
+                HashMap::from([(
+                    super::super::watch_source_cache::INCOMPLETE_SOURCE_LEDGER_KEY.to_string(),
+                    String::new(),
+                )])
+            } else {
+                super::super::watch_source_cache::load_bounded_watch_source_ledger(&storage, None)?
+            };
+            filter.take_deferred_sources();
+            let mut ledger = WatchSourceLedger::default();
+            let mut delivered = Vec::new();
+            let error = ledger.scan_with_ledger_lookup(&connector, "codex", &ctx, &saved,
+                true, false, &filter, None,
+                &mut |key| super::super::watch_source_cache::lookup_watch_source_observation(&storage, key, None),
+                &mut |conversation| { delivered.push(conversation); Ok(true) },
+            ).err().context("refused proof certified complete coverage")?;
+            assert_eq!(delivered.len(), 1, "malformed={malformed}, omitted={omitted}");
+            assert_eq!(delivered[0].source_path, healthy);
+            assert!(ledger.completions[&healthy].certified);
+            assert!(!ledger.admitted_keys.contains(&key));
+            assert!(ledger.unstable_sources);
+            assert!(filter.take_deferred_sources().contains(&refused));
+            let mut failures = Vec::new();
+            assert!(crate::connectors::codex::for_each_source_failure(&error, |path, reason| {
+                failures.push((path.to_path_buf(), reason));
+            }));
+            assert_eq!(failures, vec![(refused.clone(), if malformed {
+                crate::connectors::codex::SourceFailureReason::InvalidSourceData
+            } else {
+                crate::connectors::codex::SourceFailureReason::SourceChanged
+            })]);
+            // Real watch publication can proceed for the certified sibling,
+            // but must neither invalidate nor replace the rejected proof.
+            let debt = WatchLexicalReplayDebt::for_root(ConnectorKind::Codex, &ctx.scan_roots[0]);
+            ledger.begin_publication(&storage, &debt, None)?;
+            assert_eq!(storage.source_ingest_ledger_entries()?[&key], observation);
+            assert!(!load_watch_lexical_replay_debt(&storage)?.is_empty());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_prefix_watch_terminal_failures_still_stop_after_source_refusal() -> Result<()> {
+    for database_failure in [false, true] {
+        let temp = TempDir::new()?;
+        let (refused, _) = codex_watch_prefix_fixture(&temp)?;
+        let first = temp.path().join("rollout-y-terminal-failure.jsonl");
+        let later = temp.path().join("rollout-z-must-not-deliver.jsonl");
+        for path in [&first, &later] {
+            fs::write(path, fs::read(&refused)?)?;
+        }
+        let ctx = ScanContext::with_roots(temp.path().to_path_buf(),
+            vec![ScanRoot::local(temp.path().to_path_buf())], None);
+        let connector = crate::connectors::codex::CodexConnector::new();
+        let source = connector.discover_source_files(&ctx)?.into_iter()
+            .find(|source| source.source_path == refused).context("refused source")?;
+        let key = source_ledger_key(&source, &ctx).context("refused source key")?;
+        let saved = HashMap::from([
+            (key.clone(), serde_json::json!({"codex_prefix": "malformed"}).to_string()),
+            (super::super::watch_source_cache::INCOMPLETE_SOURCE_LEDGER_KEY.to_string(), String::new()),
+        ]);
+        let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+        let mut ledger = WatchSourceLedger::default();
+        let mut lookups = 0;
+        let mut delivered = Vec::new();
+        let error = ledger.scan_with_ledger_lookup(&connector, "codex", &ctx, &saved,
+            true, false, &filter, None,
+            &mut |_| {
+                lookups += 1;
+                anyhow::ensure!(!database_failure, "terminal metadata database failure");
+                Ok(SourceObservationLookup::Absent)
+            },
+            &mut |conversation| {
+                delivered.push(conversation.source_path);
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "terminal spool failure").into())
+            },
+        ).err().context("terminal failure was hidden")?;
+        assert_eq!(lookups, 1, "a terminal error must stop later source admission");
+        if database_failure {
+            assert!(delivered.is_empty());
+            assert!(ledger.admitted_keys.is_empty());
+            assert!(format!("{error:#}").contains("terminal metadata database failure"));
+        } else {
+            assert_eq!(delivered, vec![first]);
+            assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::BrokenPipe);
+        }
+        assert!(!ledger.admitted_keys.contains(&key));
+        assert!(ledger.unstable_sources);
+        assert!(filter.take_deferred_sources().contains(&refused));
+        let mut refused_paths = Vec::new();
+        assert!(crate::connectors::codex::for_each_source_failure(&error, |path, _| {
+            refused_paths.push(path.to_path_buf());
+        }));
+        assert_eq!(refused_paths, vec![refused]);
+    }
+    Ok(())
+}
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_prefix_watch_late_append_downgrades_coverage_before_publication() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (path, ctx) = codex_watch_prefix_fixture(&temp)?;
+    File::open(&path)?.set_modified(SystemTime::now() - Duration::from_secs(7200))?;
+    let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+    let mut ledger = WatchSourceLedger::default();
+    ledger.scan(
+        &crate::connectors::codex::CodexConnector::new(),
+        "codex",
+        &ctx,
+        &HashMap::new(),
+        true,
+        false,
+        &filter,
+        None,
+        &mut |_| Ok(true),
+    )?;
+    assert_eq!(ledger.completed_source_paths().count(), 1);
+    let mut writer = OpenOptions::new().append(true).open(&path)?;
+    writer.write_all(b"{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"second\"}}\n")?;
+    ledger.revalidate_prefixes(&filter, None)?;
+    assert!(ledger.may_publish_source(&path));
+    assert!(ledger.completed_source_paths().next().is_none());
+    assert!(ledger.unstable_sources);
+    let value: serde_json::Value =
+        serde_json::from_str(&ledger.completions[&path].entry.observation)?;
+    assert_eq!(value["codex_prefix"]["partial"], true);
+    assert_eq!(value["codex_prefix"]["message_count"], 1);
+    Ok(())
+}
+
 struct WithheldCompletionConnector {
     provider: &'static str,
     root: ScanRoot,

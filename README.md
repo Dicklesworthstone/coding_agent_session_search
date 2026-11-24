@@ -3078,23 +3078,38 @@ Re-index affected files
 - **Debounce**: 2 seconds (wait for burst of changes to settle)
 - **Max wait**: 5 seconds (don't wait forever during continuous activity)
 
-The debounce only batches events. Complete, newline-terminated plain Codex
-`rollout-*.jsonl` files can be indexed even when recently modified or held open
-by an idle writer. The Codex parser checks the bounded file's identity, size and
-modification time across parsing and enrichment, then checks again before
-publishing its source receipt. A racing append, truncation or replacement causes
-a retry instead of certifying the source as complete. An advisory lock still
-defers the source.
+The debounce only batches events. On Unix, plain Codex `rollout-*.jsonl` files
+can publish a bounded prefix while a writer continues appending, including a
+writer that keeps its writable descriptor open. Admission fixes a byte limit
+and captures only records ending in a newline within that limit. The parser
+and enrichment read the same private immutable view; file identity and a
+content hash bind it to the original rollout. Later appends wait for another
+pass. A trailing partial record, even valid JSON without its newline, is not
+admitted by this live-prefix path.
 
-This admission reads a complete stable file; it does not read past an
-unfinished trailing record or ingest a prefix of a changing file. Those files,
-compressed Codex rollouts, and other providers retain conservative deferral:
+Prefix publication does not certify EOF. Its durable receipt retains the byte
+boundary and normalized-message overlap, and the source stays queued for
+retry without advancing a complete-source watermark. Each retry reparses a
+bounded prefix through the pinned parser and validates the earlier projection
+before the archive's existing message deduplication. Truncation, replacement,
+in-place edits, or changes to already published message indices fail closed
+and require source reconciliation. Raw-mirror capture, when enabled, retains
+the same admitted bytes. An advisory lock still defers the source. Settled EOF
+and abandoned-tail recovery retain their existing inactivity checks.
+
+Compressed Codex rollouts, non-Unix systems, and other providers retain their
+existing conservative admission behavior. For sources that remain deferred,
 recent writes wait for `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` (default
 120 seconds), and open-writer or advisory-lock evidence can defer them longer.
 For Claude Code, 123 s, 139 s and 189 s were measured on a synthetic appended
 session. Lowering the window shortens that wait, at the cost of parsing files
 that may still be changing. No sub-ten-second end-to-end latency is guaranteed
 by the debounce settings.
+
+The Codex change does not qualify the broader multi-provider stable-prefix
+bead or establish a measured watch-to-search latency. See
+[the implementation and qualification notes](docs/planning/CODEX_STABLE_PREFIX_INGEST_2026-11-23.md)
+for the byte/receipt contract, regression matrix, and remaining boundaries.
 
 ### Path Classification
 
@@ -3937,7 +3952,7 @@ Forgetting is always an explicit operation. CASS does not automatically delete o
 
 **Recovering a failed forget.** Repeat the same selectors with `--apply`. Completed deletion batches survive a later failure; each individual conversation and its tombstones are atomic, and the retry selects the remaining conversations. A durable pending marker makes the retry finish rebuilding even when there are no matching canonical rows left. Reader admission remains blocked until the required derived repair and replacement lexical publication succeed. A preview remains read-only and does not perform this recovery. `cass index --full --rebuild-profile bounded` can rebuild derived assets for already-committed deletions; rerun the forget selectors to finish an interrupted deletion batch.
 
-- **Active session retries**: continuous watch mode retains paths skipped because they are still being written, including during startup, and retries them after the normal watch cooldown even without another filesystem event. `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` controls the recent-write window (default 120 seconds, maximum 3600); writer and advisory-lock checks still apply.
+- **Active session retries**: continuous watch mode retains skipped active paths and partially published Codex prefixes, including during startup, and retries them after the normal watch cooldown even without another filesystem event. `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` controls the recent-write window (default 120 seconds, maximum 3600); whole-file and advisory-lock guards remain in place outside the admitted Codex prefix path.
 
 - **Watch testing (dev only)**: `cass index --watch --watch-once path1,path2` triggers a single reindex without filesystem notify (also respects `CASS_TEST_WATCH_PATHS` for backward compatibility); useful for deterministic tests/smoke runs.
 

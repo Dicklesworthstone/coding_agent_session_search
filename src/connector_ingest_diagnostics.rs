@@ -941,12 +941,6 @@ impl ConnectorIngestRun {
     /// available. A moving, missing, unfinished, or oversized Codex rollout
     /// must not turn into a permissions error naming the whole scan root.
     pub fn observe_connector_scan_error(&mut self, fallback_path: &Path, error: &anyhow::Error) {
-        if let Some(over) = crate::connectors::codex::over_budget_sources(error) {
-            for path in &over.sampled_paths {
-                self.observe_source_failure(path, IngestFailureKind::SourceOverReadBudget);
-            }
-            return;
-        }
         // GH #559: the first cause cannot classify an aggregate containing
         // moving, missing, malformed and oversized rollouts. Each sample has
         // its own typed cause and original path; never parse its Display text.
@@ -967,6 +961,12 @@ impl ConnectorIngestRun {
                 self.observe_source_failure(path, kind);
             })
         {
+            return;
+        }
+        if let Some(over) = crate::connectors::codex::over_budget_sources(error) {
+            for path in &over.sampled_paths {
+                self.observe_source_failure(path, IngestFailureKind::SourceOverReadBudget);
+            }
             return;
         }
         // Codebuff retains bounded typed failures for independently scanned

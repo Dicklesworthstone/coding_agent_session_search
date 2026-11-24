@@ -19,6 +19,9 @@ use super::{
     ScanLimits, SourceCompletion, SourceScanHooks, scan_with_admission,
 };
 use crate::connectors::codex::archives;
+use crate::connectors::codex::stable_prefix::{
+    self, PrefixDeliveryGuard, StablePrefixReceipt, StablePrefixSnapshot,
+};
 
 /// Source-local causes, captured before aggregating a partial scan. Keep this
 /// typed so diagnostics never infer a path or cause from formatted error text.
@@ -80,13 +83,90 @@ pub(crate) fn for_each_source_failure(
     error: &anyhow::Error,
     mut observe: impl FnMut(&Path, SourceFailureReason),
 ) -> bool {
-    let Some(report) = error.downcast_ref::<FailureReport>() else {
+    let report = error.downcast_ref::<FailureReport>();
+    let admissions = error.downcast_ref::<AdmissionFailureReport>();
+    if report.is_none() && admissions.is_none() {
         return false;
-    };
-    for source in &report.failed_sources {
-        observe(&source.path, source.reason);
+    }
+    for report in report.into_iter().chain(admissions.map(|report| &report.0)) {
+        for source in &report.failed_sources {
+            observe(&source.path, source.reason);
+        }
+    }
+    // A budget-only parser error has no FailureReport. When host admission
+    // also refused a different source, retain both causes in the typed path.
+    // A direct admission-budget error carries both report types, so avoid
+    // repeating samples already represented by its native-path evidence.
+    if report.is_none()
+        && let Some(admission_report) = admissions
+        && let Some(budget) = error.downcast_ref::<IncompleteScan>()
+    {
+        for source in &budget.rejected_sources {
+            let path = Path::new(&source.source_path);
+            let already_reported = admission_report.0.failed_sources.iter().any(|failed| {
+                failed.path.as_path() == path
+                    && failed.reason == SourceFailureReason::ReadBudgetExceeded
+            });
+            if !already_reported {
+                observe(path, SourceFailureReason::ReadBudgetExceeded);
+            }
+        }
     }
     true
+}
+
+/// Host predicates cannot return errors through FAD's boolean admission hook.
+/// Retain bounded per-source evidence separately from terminal delivery/SQL
+/// errors so one rejected prior proof never vetoes unrelated later sources.
+#[derive(Default)]
+pub(crate) struct SourceAdmissionFailures(Failures);
+
+#[derive(Debug)]
+struct AdmissionFailureReport(FailureReport);
+
+impl fmt::Display for AdmissionFailureReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl SourceAdmissionFailures {
+    pub(crate) fn record(&mut self, source: &DiscoveredSourceFile, error: anyhow::Error) {
+        // Identity/content changes and genuine I/O failures already carry an
+        // I/O kind. A malformed receipt is invalid evidence, never an inferred
+        // permissions failure or a reason to forget previously occupied rows.
+        let error = if error.downcast_ref::<io::Error>().is_none() {
+            error.context(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid previous Codex source evidence",
+            ))
+        } else {
+            error
+        };
+        self.0.report.reason = "source_admission_failures";
+        self.0.record(source, error);
+    }
+
+    pub(crate) fn finish(self, scan_result: Result<()>) -> Result<()> {
+        let Failures {
+            report,
+            budgets,
+            first_error,
+        } = self.0;
+        if report.failed_source_count == 0 {
+            return scan_result;
+        }
+        // Preserve the existing error's typed causes, including terminal
+        // consumer failures, while adding a distinct report type so the
+        // visitor can still see the parser's own source-failure report.
+        // Budget-only refusals intentionally have no first_error; they still
+        // make this admission incomplete and must retain their typed evidence.
+        let error = scan_result
+            .err()
+            .or(first_error)
+            .unwrap_or_else(|| budgets.into());
+        Err(error.context(AdmissionFailureReport(report)))
+    }
 }
 
 #[derive(Default)]
@@ -216,6 +296,7 @@ fn directory_session_id(source: &DiscoveredSourceFile) -> Option<String> {
         .strip_prefix(source.scan_root.join("sessions"))
         .or_else(|_| source.source_path.strip_prefix(&source.scan_root))
         .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
         .and_then(|relative| rollout_session_path(relative).to_str().map(str::to_owned))
         .or_else(|| {
             rollout_session_path(Path::new(source.source_path.file_name()?))
@@ -224,7 +305,7 @@ fn directory_session_id(source: &DiscoveredSourceFile) -> Option<String> {
         })
 }
 
-fn scan_source(
+fn scan_source_strict(
     inner: &dyn Connector,
     ctx: &ScanContext,
     source: &DiscoveredSourceFile,
@@ -302,6 +383,242 @@ fn scan_source(
         }
         Ok(())
     });
+    (result, consumer_failed.get())
+}
+
+fn prefix_session_id(ctx: &ScanContext, source: &DiscoveredSourceFile) -> Option<String> {
+    archives::session_id(ctx, source).or_else(|| {
+        if source.scan_root != source.source_path {
+            return directory_session_id(source);
+        }
+        // Match FAD's explicit-file contract before substituting a private
+        // parser path. A filename-only ID would duplicate dated sessions.
+        source
+            .source_path
+            .ancestors()
+            .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "sessions"))
+            .and_then(|sessions| source.source_path.strip_prefix(sessions).ok())
+            .and_then(|relative| rollout_session_path(relative).to_str().map(str::to_owned))
+            .or_else(|| directory_session_id(source))
+    })
+}
+
+fn attach_prefix_receipt(
+    conversation: &mut NormalizedConversation,
+    receipt: &StablePrefixReceipt,
+) -> Result<()> {
+    if !conversation.metadata.is_object() {
+        conversation.metadata = serde_json::json!({});
+    }
+    let cass = conversation
+        .metadata
+        .as_object_mut()
+        .expect("metadata is an object")
+        .entry("cass")
+        .or_insert_with(|| serde_json::json!({}));
+    if !cass.is_object() {
+        *cass = serde_json::json!({});
+    }
+    cass["codex_stable_prefix"] = serde_json::to_value(receipt)?;
+    Ok(())
+}
+
+/// Parse one immutable bounded view through the pinned FAD parser and the
+/// existing enrichment path. Host hooks only observe the original identity.
+fn scan_source(
+    inner: &dyn Connector,
+    ctx: &ScanContext,
+    source: &DiscoveredSourceFile,
+    hooks: &mut SourceScanHooks<'_>,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    admission: &ScanAdmission,
+    enrich: &mut dyn FnMut(&mut NormalizedConversation) -> Result<()>,
+) -> (Result<()>, bool) {
+    if !stable_prefix::eligible(&source.source_path) {
+        return scan_source_strict(
+            inner,
+            ctx,
+            source,
+            hooks,
+            on_conversation,
+            admission,
+            enrich,
+        );
+    }
+    let consumer_failed = Cell::new(false);
+    let result = (|| -> Result<()> {
+        // Exclusions ran on the real source before reaching this function.
+        // In particular, the host may veto copying any bytes at all.
+        stable_prefix::clear_previous_prefix_receipt();
+        let source = source.clone().with_fs_metadata();
+        if !hooks
+            .should_scan_source
+            .as_mut()
+            .is_none_or(|predicate| predicate(&source))
+        {
+            stable_prefix::clear_previous_prefix_receipt();
+            return Ok(());
+        }
+        let previous = stable_prefix::take_previous_prefix_receipt(&source.source_path)?;
+        if admission.exclusions.excludes(&source.source_path) {
+            return Ok(());
+        }
+        let limit = admission.limits.for_path(&source.source_path);
+        if let Some(size) = super::observed_over_limit_with_limit(&source, limit) {
+            let mut state = super::ScanState {
+                limits: admission.limits,
+                incomplete: admission.limits.incomplete(),
+                ..super::ScanState::default()
+            };
+            state.reject(&source.source_path, size);
+            return Err(state.incomplete.into());
+        }
+        // Preserve the existing source-missing diagnostic on a deletion race.
+        std::fs::symlink_metadata(&source.source_path)?;
+        if !stable_prefix::eligible(&source.source_path) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Codex source identity changed during prefix admission",
+            )
+            .into());
+        }
+        let Some(snapshot) = StablePrefixSnapshot::capture(
+            &source.source_path,
+            limit,
+            previous.as_ref(),
+            ctx.progress_tick.as_deref(),
+        )?
+        else {
+            // Inputs with no admitted record boundary retain their existing
+            // strict semantics. The original host predicate already ran.
+            let mut admitted = |_: &DiscoveredSourceFile| true;
+            let mut complete = |done: &SourceCompletion| {
+                hooks
+                    .on_source_complete
+                    .as_mut()
+                    .map_or(Ok(()), |sink| sink(done))
+            };
+            let mut strict_hooks = SourceScanHooks {
+                should_scan_source: Some(&mut admitted),
+                on_source_complete: Some(&mut complete),
+            };
+            let (result, failed) = scan_source_strict(
+                inner,
+                ctx,
+                &source,
+                &mut strict_hooks,
+                on_conversation,
+                admission,
+                enrich,
+            );
+            consumer_failed.set(failed);
+            return result;
+        };
+        let mut parser_ctx = scoped_context(ctx, &source);
+        parser_ctx.scan_roots = parser_ctx
+            .scan_roots
+            .iter()
+            .map(|root| root.with_path(snapshot.path().to_path_buf()))
+            .collect();
+        let seen = Cell::new(false);
+        let completed = Cell::new(false);
+        let emitted = Cell::new(0_usize);
+        let receipt = std::cell::RefCell::new(None::<StablePrefixReceipt>);
+        let mut before = |observed: &DiscoveredSourceFile| {
+            let matches = observed.source_path == snapshot.path();
+            seen.set(seen.get() || matches);
+            matches
+        };
+        let mut complete_view = |done: &SourceCompletion| {
+            anyhow::ensure!(
+                done.source.source_path == snapshot.path()
+                    && done.conversations_emitted == emitted.get(),
+                "Codex prefix parser completed an unexpected source"
+            );
+            completed.set(true);
+            Ok(())
+        };
+        let mut deliver = |mut conversation: NormalizedConversation| {
+            anyhow::ensure!(
+                conversation.source_path == snapshot.path() && emitted.get() == 0,
+                "Codex prefix parser delivered an unexpected source"
+            );
+            snapshot.validate(ctx.progress_tick.as_deref())?;
+            conversation.source_path.clone_from(&source.source_path);
+            conversation.external_id = prefix_session_id(ctx, &source);
+            let evidence = snapshot.receipt_for(Some(&conversation), previous.as_ref())?;
+            attach_prefix_receipt(&mut conversation, &evidence)?;
+            {
+                let _delivery = PrefixDeliveryGuard::enter(evidence.clone());
+                on_conversation(conversation).inspect_err(|_| consumer_failed.set(true))?;
+            }
+            // Delivery may have side effects. Never certify a changed source,
+            // even if an earlier bounded canonical batch already committed.
+            snapshot.validate(ctx.progress_tick.as_deref())?;
+            *receipt.borrow_mut() = Some(evidence);
+            emitted.set(1);
+            Ok(())
+        };
+        let _parser_view = stable_prefix::PrefixParserViewGuard::enter(&snapshot);
+        scan_with_admission(
+            inner,
+            &parser_ctx,
+            &mut SourceScanHooks {
+                should_scan_source: Some(&mut before),
+                on_source_complete: Some(&mut complete_view),
+            },
+            &mut deliver,
+            admission,
+            enrich,
+        )?;
+        anyhow::ensure!(
+            seen.get() && (completed.get() || emitted.get() == 0),
+            "Codex immutable parser view was not completely consumed"
+        );
+        if emitted.get() == 0 {
+            // scan_with_admission already ran the real zero-output validator.
+            // A valid header-only/blank prefix is not a fabricated completion.
+            // With an unfinished suffix it made no ingest progress at all:
+            // retain the existing zero-message failure/retry contract.
+            snapshot.validate(ctx.progress_tick.as_deref())?;
+            let evidence = snapshot.receipt_for(None, None)?;
+            if evidence.committed_bytes < evidence.admitted_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Codex source has an unfinished tail and no complete messages",
+                )
+                .into());
+            }
+            anyhow::ensure!(
+                previous
+                    .as_ref()
+                    .is_none_or(|receipt| receipt.message_count == 0),
+                "Codex source no longer projects its previously published messages"
+            );
+            return Ok(());
+        }
+        let evidence = match receipt.into_inner() {
+            Some(receipt) => snapshot.finish_receipt(receipt)?,
+            None => snapshot.receipt_for(None, previous.as_ref())?,
+        };
+        let mut completed_source = source;
+        if evidence.partial {
+            // Existing generic consumers must not mistake this callback for
+            // whole-file stability. Only the scoped typed evidence authorizes
+            // CASS's distinct prefix-publication receipt.
+            completed_source.size_bytes = None;
+            completed_source.modified_at_ms = None;
+        }
+        let _completion = PrefixDeliveryGuard::enter_completion(evidence);
+        hooks.on_source_complete.as_mut().map_or(Ok(()), |sink| {
+            sink(&SourceCompletion {
+                source: completed_source,
+                required_sidecars: Vec::new(),
+                conversations_emitted: emitted.get(),
+            })
+            .inspect_err(|_| consumer_failed.set(true))
+        })
+    })();
     (result, consumer_failed.get())
 }
 

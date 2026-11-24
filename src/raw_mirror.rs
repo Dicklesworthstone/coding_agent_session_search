@@ -146,6 +146,44 @@ pub fn capture_source_file(
     result
 }
 
+/// Preserve exactly the Codex bytes admitted by a stable-prefix delivery.
+///
+/// Source policy always uses the original source name. The private view is a
+/// parser/capture input only: it must never become a manifest identity or a
+/// full-source cache entry, and a later append must not change this capture.
+pub(crate) fn capture_codex_prefix(
+    input: RawMirrorCaptureInput<'_>,
+    receipt: &crate::connectors::codex::StablePrefixReceipt,
+) -> anyhow::Result<RawMirrorCaptureRecord> {
+    if !capture_enabled() {
+        return Err(RawMirrorCaptureDisabled.into());
+    }
+    exclusions::ensure_allowed(input.source_path)?;
+    anyhow::ensure!(
+        input.provider == "codex" && input.source_path == receipt.source_path.as_path(),
+        "Codex prefix capture does not match its admitted source"
+    );
+    // Physical ownership remains authoritative even when a caller labels a
+    // sensitive store as Codex. Check before making another copy of its bytes.
+    if zcode_source_is_sensitive(input.source_path)? {
+        anyhow::bail!(
+            "disabled_sensitive_container: ZCode database and store files cannot be raw-mirrored"
+        );
+    }
+    let policy = RawMirrorRetentionPolicy::from_env()?;
+    let snapshot = receipt.capture_view()?;
+    let result = store::policy::capture_codex_prefix(
+        input.clone(),
+        receipt,
+        snapshot.path(),
+        TRANSCRIPT_CHUNK_BYTES as u64,
+        TRANSCRIPT_CHUNK_BYTES,
+        policy,
+    );
+    index_maintenance::observe_capture_result(&input, &result);
+    result
+}
+
 #[cfg(test)]
 pub(crate) fn capture_source_file_with_chunk_policy(
     input: RawMirrorCaptureInput<'_>,
@@ -168,6 +206,9 @@ pub(crate) fn capture_source_file_with_chunk_policy(
 
 #[cfg(test)]
 mod append_tests;
+
+#[cfg(all(test, unix))]
+mod prefix_tests;
 
 #[cfg(all(test, unix))]
 mod tests {

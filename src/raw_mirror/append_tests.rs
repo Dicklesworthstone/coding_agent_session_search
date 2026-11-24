@@ -27,7 +27,7 @@ fn lines(start: usize, count: usize) -> Vec<u8> {
     bytes
 }
 
-fn read_capture(data: &Path, record: &RawMirrorCaptureRecord) -> Vec<u8> {
+pub(super) fn read_capture(data: &Path, record: &RawMirrorCaptureRecord) -> Vec<u8> {
     let root = data.join("raw-mirror/v1");
     let manifest: Value = serde_json::from_slice(
         &fs::read(root.join(&record.manifest_relative_path)).expect("manifest"),

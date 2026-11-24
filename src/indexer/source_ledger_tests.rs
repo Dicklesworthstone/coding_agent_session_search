@@ -33,6 +33,404 @@ fn legacy_row(source: &DiscoveredSourceFile) -> String {
     )
 }
 
+#[cfg(unix)]
+fn codex_prefix_fixture(temp: &TempDir) -> Result<(PathBuf, ScanContext, StreamingProducerConfig)> {
+    let path = temp.path().join("rollout-ledger-prefix.jsonl");
+    fs::write(&path, b"{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"first\"}}\n")?;
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir)?;
+    let ctx = ScanContext::with_roots(data_dir.clone(), vec![ScanRoot::local(path.clone())], None);
+    Ok((path, ctx, diagnostic_ledger_config(data_dir)))
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn codex_prefix_startup_keeps_partial_receipts_and_rediscovers_appends() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (path, ctx, mut config) = codex_prefix_fixture(&temp)?;
+    let mut writer = OpenOptions::new().append(true).open(&path)?;
+    let connector = crate::connectors::codex::CodexConnector::new();
+    let (first, mut entries) = collect_ledger_scan(&connector, &ctx, &config, "codex")?;
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].messages.len(), 1);
+    let entry = entries.pop().context("first prefix receipt")?;
+    let value: serde_json::Value = serde_json::from_str(&entry.observation)?;
+    assert_eq!(value["codex_prefix"]["partial"], true);
+    assert!(!source_ledger_matches(
+        &entry.observation,
+        &discovered(&path, "codex")
+    ));
+    assert!(
+        config
+            .active_source_filter
+            .take_deferred_sources()
+            .contains(&path)
+    );
+    config.source_ledger = Arc::new(HashMap::from([(entry.key, entry.observation)]));
+    writer.write_all(b"{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"second\"}}\n")?;
+    let (next, entries) = collect_ledger_scan(&connector, &ctx, &config, "codex")?;
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].messages.len(), 2);
+    assert_eq!(next[0].messages[0].content, "first");
+    assert_eq!(next[0].messages[1].content, "second");
+    assert_eq!(next[0].external_id, first[0].external_id);
+    assert_eq!(entries.len(), 1);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn codex_prefix_startup_discards_delivery_rejected_by_final_validation() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (path, ctx, config) = codex_prefix_fixture(&temp)?;
+    let connector = crate::connectors::codex::CodexConnector::new();
+    let (tx, rx) = bounded(8);
+    let mut sender =
+        StreamingBatchSender::new(&tx, Arc::clone(&config.flow_limiter), "codex", true);
+    let result = scan_with_durable_source_boundaries(
+        &connector,
+        &ctx,
+        &config,
+        &mut sender,
+        |conversation| {
+            let bytes = fs::read_to_string(&path)?.replace("first", "other");
+            fs::write(&path, bytes)?;
+            Ok(Some(conversation))
+        },
+    );
+    assert!(
+        result.is_err(),
+        "the real adapter must reject the post-delivery mutation"
+    );
+    sender.flush()?;
+    assert!(
+        rx.try_iter().next().is_none(),
+        "no Batch fallback may publish the rejected view"
+    );
+    assert!(sender.partial_sources_observed);
+    assert!(
+        config
+            .active_source_filter
+            .take_deferred_sources()
+            .contains(&path)
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn codex_prefix_startup_refused_proof_does_not_starve_later_siblings() -> Result<()> {
+    use crate::connector_ingest_diagnostics::IngestFailureKind;
+    for refusal in ["mutation", "truncation", "replacement", "malformed"] {
+        for remote in [false, true] {
+            let temp = TempDir::new()?;
+            let (refused, _, mut config) = codex_prefix_fixture(&temp)?;
+            let root = if remote {
+                ScanRoot::remote(temp.path().to_path_buf(), Origin::remote("proof-test"), None)
+            } else {
+                ScanRoot::local(temp.path().to_path_buf())
+            };
+            let ctx = ScanContext::with_roots(config.data_dir.clone(), vec![root], None);
+            let connector = crate::connectors::codex::CodexConnector::new();
+            let (_, mut entries) = collect_ledger_scan(&connector, &ctx, &config, "codex")?;
+            let mut entry = entries.pop().context("initial prior proof")?;
+            let original = fs::read_to_string(&refused)?;
+            match refusal {
+                "mutation" => fs::write(&refused, original.replace("first", "other"))?,
+                "truncation" => fs::write(&refused, b"{")?,
+                "replacement" => {
+                    fs::rename(&refused, refused.with_extension("retained"))?;
+                    fs::write(&refused, &original)?;
+                }
+                "malformed" => entry.observation = serde_json::json!({
+                    "codex_prefix": {"schema_version": 0},
+                }).to_string(),
+                _ => unreachable!(),
+            }
+            let healthy = temp.path().join("rollout-z-healthy.jsonl");
+            fs::write(&healthy, &original)?;
+            File::open(&healthy)?.set_modified(SystemTime::now() - Duration::from_secs(7200))?;
+            let inventory = connector.discover_source_files(&ctx)?;
+            assert_eq!(inventory[0].source_path, refused, "bad source must precede its sibling");
+            let saved = HashMap::from([(entry.key.clone(), entry.observation.clone())]);
+            config.source_ledger = Arc::new(saved.clone());
+            config.incomplete_remote_sources.store(false, Ordering::Relaxed);
+            config.active_source_filter.take_deferred_sources();
+            let scan = collect_diagnostic_ledger_scan(&connector, &ctx, &config, "codex", || Ok(()))?;
+            let error = scan.scan_error.as_ref().context("refused proof certified a complete scan")?;
+            assert_eq!(scan.conversations.len(), 1, "{refusal}, remote={remote}");
+            assert_eq!(scan.conversations[0].source_path, healthy);
+            assert_eq!(scan.entries.len(), 1);
+            assert_ne!(scan.entries[0].key, entry.key);
+            let mut failed_paths = Vec::new();
+            assert!(crate::connectors::codex::for_each_source_failure(error, |path, _| {
+                failed_paths.push(path.to_path_buf());
+            }));
+            assert_eq!(failed_paths, vec![refused.clone()]);
+            let expected = if refusal == "malformed" {
+                IngestFailureKind::UnparseableSource
+            } else {
+                IngestFailureKind::SourceChanged
+            };
+            assert!(scan.report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.source_path == refused.display().to_string()
+                    && diagnostic.failure_kind == expected
+            }));
+            assert_eq!(scan.report.summary.total(), 2);
+            assert_eq!(scan.report.summary.with_content(), 1);
+            assert!(config.active_source_filter.take_deferred_sources().contains(&refused));
+            assert_eq!(config.incomplete_remote_sources.load(Ordering::Relaxed), remote);
+            assert_eq!(*config.source_ledger, saved, "refusal must preserve prior evidence");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn codex_prefix_startup_reports_admission_and_parser_failures_at_their_sources() -> Result<()> {
+    use crate::connectors::codex::SourceFailureReason;
+    let temp = TempDir::new()?;
+    let (refused, _, mut config) = codex_prefix_fixture(&temp)?;
+    let parser_failed = temp.path().join("rollout-m-parser-failure.jsonl");
+    let healthy = temp.path().join("rollout-z-healthy.jsonl");
+    fs::write(&parser_failed, b"\xff\n")?;
+    fs::write(&healthy, fs::read(&refused)?)?;
+    let ctx = ScanContext::with_roots(config.data_dir.clone(),
+        vec![ScanRoot::local(temp.path().to_path_buf())], None);
+    let connector = crate::connectors::codex::CodexConnector::new();
+    let source = connector.discover_source_files(&ctx)?.into_iter()
+        .find(|source| source.source_path == refused).context("refused source")?;
+    config.source_ledger = Arc::new(HashMap::from([(
+        source_ledger_key(&source, &ctx).context("source key")?,
+        serde_json::json!({"codex_prefix": "malformed"}).to_string(),
+    )]));
+    let scan = collect_diagnostic_ledger_scan(&connector, &ctx, &config, "codex", || Ok(()))?;
+    assert_eq!(scan.conversations.len(), 1);
+    assert_eq!(scan.conversations[0].source_path, healthy);
+    let error = scan.scan_error.as_ref().context("mixed failures were lost")?;
+    let mut failures = Vec::new();
+    assert!(crate::connectors::codex::for_each_source_failure(error, |path, reason| {
+        failures.push((path.to_path_buf(), reason));
+    }));
+    assert_eq!(failures.len(), 2);
+    for path in [refused, parser_failed] {
+        assert!(failures.contains(&(path.clone(), SourceFailureReason::InvalidSourceData)));
+        assert!(scan.report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.source_path == path.display().to_string()
+                && diagnostic.failure_kind == crate::connector_ingest_diagnostics::IngestFailureKind::UnparseableSource
+        }));
+    }
+    assert_eq!(scan.report.summary.total(), 3);
+    assert_eq!(scan.report.summary.with_content(), 1);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn codex_prefix_startup_consumer_failure_remains_terminal_after_source_refusal() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (refused, _, mut config) = codex_prefix_fixture(&temp)?;
+    let first = temp.path().join("rollout-y-delivery-failure.jsonl");
+    let later = temp.path().join("rollout-z-must-not-deliver.jsonl");
+    for path in [&first, &later] {
+        fs::write(path, fs::read(&refused)?)?;
+    }
+    let ctx = ScanContext::with_roots(config.data_dir.clone(),
+        vec![ScanRoot::local(temp.path().to_path_buf())], None);
+    let connector = crate::connectors::codex::CodexConnector::new();
+    let source = connector.discover_source_files(&ctx)?.into_iter()
+        .find(|source| source.source_path == refused).context("refused source")?;
+    config.source_ledger = Arc::new(HashMap::from([(
+        source_ledger_key(&source, &ctx).context("source key")?,
+        serde_json::json!({"codex_prefix": "malformed"}).to_string(),
+    )]));
+    let (tx, rx) = bounded(8);
+    drop(rx);
+    let mut sender = StreamingBatchSender::new(&tx, Arc::clone(&config.flow_limiter), "codex", true);
+    let mut prepared = Vec::new();
+    let error = scan_with_durable_source_boundaries(&connector, &ctx, &config, &mut sender, |conversation| {
+        prepared.push(conversation.source_path.clone());
+        Ok(Some(conversation))
+    }).err().context("disconnected consumer was hidden")?;
+    assert!(is_streaming_consumer_disconnected(&error));
+    assert_eq!(prepared, vec![first]);
+    assert!(config.active_source_filter.take_deferred_sources().contains(&refused));
+    Ok(())
+}
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn codex_prefix_full_rebuild_preserves_overlap_but_disables_reuse() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (path, ctx, config) = codex_prefix_fixture(&temp)?;
+    let (_, mut entries) = collect_ledger_scan(
+        &crate::connectors::codex::CodexConnector::new(),
+        &ctx,
+        &config,
+        "codex",
+    )?;
+    let entry = entries.pop().context("prefix receipt")?;
+    let original: serde_json::Value = serde_json::from_str(&entry.observation)?;
+    let preserved = prefix_integrity_observations(HashMap::from([
+        (entry.key.clone(), entry.observation),
+        (
+            "ordinary".to_string(),
+            saved_row(&discovered(&path, "codex"), Vec::new()),
+        ),
+    ]))?;
+    assert_eq!(preserved.len(), 1);
+    let marker = &preserved[&entry.key];
+    let value: serde_json::Value = serde_json::from_str(marker)?;
+    assert_eq!(value["codex_prefix"], original["codex_prefix"]);
+    assert_eq!(value["publication_invalidated"], true);
+    assert_eq!(value["watch_published"], false);
+    assert!(!source_ledger_matches(marker, &discovered(&path, "codex")));
+    fs::write(&path, fs::read_to_string(&path)?.replace("first", "other"))?;
+    assert!(crate::connectors::codex::set_previous_prefix_receipt(&path, Some(marker)).is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn codex_prefix_full_receipt_checks_content_even_when_metadata_claim_matches() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (path, ctx, config) = codex_prefix_fixture(&temp)?;
+    File::open(&path)?.set_modified(SystemTime::now() - Duration::from_secs(7200))?;
+    let (_, mut entries) = collect_ledger_scan(
+        &crate::connectors::codex::CodexConnector::new(),
+        &ctx,
+        &config,
+        "codex",
+    )?;
+    let entry = entries.pop().context("settled prefix receipt")?;
+    let mut saved: serde_json::Value = serde_json::from_str(&entry.observation)?;
+    assert_eq!(saved["codex_prefix"]["partial"], false);
+    assert!(source_ledger_matches(
+        &entry.observation,
+        &discovered(&path, "codex")
+    ));
+    fs::write(&path, fs::read_to_string(&path)?.replace("first", "other"))?;
+    // Supply current metadata deliberately: content verification must be an
+    // independent gate, rather than another spelling of the stat comparator.
+    saved["primary"] = source_file_observation(&path).unwrap();
+    assert!(!source_ledger_matches(
+        &saved.to_string(),
+        &discovered(&path, "codex")
+    ));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn consume_codex_prefix_for_test(
+    storage: &FrankenStorage,
+    config: &StreamingProducerConfig,
+    conversations: Vec<NormalizedConversation>,
+    completion: crate::storage::sqlite::SourceIngestLedgerEntry,
+) -> Result<NonWatchIngestOutcome> {
+    let (tx, rx) = bounded(8);
+    tx.send(IndexMessage::SourceComplete {
+        connector_name: "codex",
+        conversations,
+        completion,
+        byte_reservation: 0,
+    })?;
+    tx.send(IndexMessage::Done {
+        connector_name: "codex",
+        scan_ms: 1,
+        is_discovered: true,
+        scan_succeeded: true,
+        active_source_skipped: false,
+    })?;
+    drop(tx);
+    run_streaming_consumer(
+        rx,
+        1,
+        storage,
+        &config.data_dir,
+        None,
+        Arc::clone(&config.flow_limiter),
+        &None,
+        LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+        Some(123_456),
+        None,
+    )
+    .map(|(_, outcome)| outcome)
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn codex_prefix_consumer_replay_appends_without_duplicate_canonical_messages() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (path, ctx, mut config) = codex_prefix_fixture(&temp)?;
+    let mut writer = OpenOptions::new().append(true).open(&path)?;
+    let storage = FrankenStorage::open(&config.data_dir.join("archive.db"))?;
+    let connector = crate::connectors::codex::CodexConnector::new();
+    for (pass, expected_inserted) in [(0, 1), (1, 1), (2, 0)] {
+        if pass == 1 {
+            writer.write_all(b"{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"second\"}}\n")?;
+        }
+        config.source_ledger = Arc::new(storage.source_ingest_ledger_entries()?);
+        let (conversations, mut entries) = collect_ledger_scan(&connector, &ctx, &config, "codex")?;
+        let outcome = consume_codex_prefix_for_test(
+            &storage,
+            &config,
+            conversations,
+            entries.pop().context("prefix completion")?,
+        )?;
+        assert_eq!(outcome.inserted_messages, expected_inserted);
+        assert!(outcome.deferred_sources.contains(&path));
+        assert!(outcome.scanned_connectors.is_empty());
+        assert_eq!(storage.get_connector_last_scan_ts("codex")?, None);
+    }
+    let rows: i64 = storage
+        .raw()
+        .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))?;
+    assert_eq!(rows, 2);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn codex_prefix_consumer_rejects_queued_mutation_without_erasing_prior_evidence() -> Result<()> {
+    let temp = TempDir::new()?;
+    let (path, ctx, config) = codex_prefix_fixture(&temp)?;
+    let (conversations, mut entries) = collect_ledger_scan(
+        &crate::connectors::codex::CodexConnector::new(),
+        &ctx,
+        &config,
+        "codex",
+    )?;
+    let entry = entries.pop().context("prefix completion")?;
+    let storage = FrankenStorage::open(&config.data_dir.join("archive.db"))?;
+    let prior = invalidated_prefix_observation(&entry.observation)?.unwrap();
+    storage.raw().execute_compat(
+        "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+        &[
+            ParamValue::from(entry.key.as_str()),
+            ParamValue::from(prior.as_str()),
+        ],
+    )?;
+    let saved = storage.source_ingest_ledger_entries()?;
+    fs::write(&path, fs::read_to_string(&path)?.replace("first", "other"))?;
+    let outcome = consume_codex_prefix_for_test(&storage, &config, conversations, entry)?;
+    assert_eq!(outcome.inserted_messages, 0);
+    assert!(outcome.scan_had_errors);
+    assert!(outcome.deferred_sources.contains(&path));
+    assert!(outcome.incomplete_remote_sources);
+    assert_eq!(storage.get_connector_last_scan_ts("codex")?, None);
+    assert_eq!(storage.source_ingest_ledger_entries()?, saved);
+    Ok(())
+}
+
 #[test]
 fn gh538_source_ledger_identity_preserves_existing_unicode_keys() {
     let temp = TempDir::new().unwrap();
@@ -1148,11 +1546,7 @@ fn gh555_real_source_reuse_skips_repeated_jsonl_diagnostics() -> Result<()> {
     fs::write(&path, transcript)?;
     let data_dir = temp.path().join("data");
     fs::create_dir(&data_dir)?;
-    let ctx = ScanContext::with_roots(
-        data_dir.clone(),
-        vec![ScanRoot::local(path.clone())],
-        None,
-    );
+    let ctx = ScanContext::with_roots(data_dir.clone(), vec![ScanRoot::local(path.clone())], None);
     let mut config = diagnostic_ledger_config(data_dir);
     let connector = crate::connectors::claude_code::ClaudeCodeConnector::new();
     let first = collect_diagnostic_ledger_scan(&connector, &ctx, &config, "claude", || Ok(()))?;
@@ -1233,11 +1627,7 @@ fn gh555_primary_changed_after_capture_still_receives_diagnostics() -> Result<()
     fs::write(&path, transcript)?;
     let data_dir = temp.path().join("data");
     fs::create_dir(&data_dir)?;
-    let ctx = ScanContext::with_roots(
-        data_dir.clone(),
-        vec![ScanRoot::local(path.clone())],
-        None,
-    );
+    let ctx = ScanContext::with_roots(data_dir.clone(), vec![ScanRoot::local(path.clone())], None);
     let mut config = diagnostic_ledger_config(data_dir);
     let connector = crate::connectors::claude_code::ClaudeCodeConnector::new();
     let first = collect_diagnostic_ledger_scan(&connector, &ctx, &config, "claude", || Ok(()))?;
@@ -1298,6 +1688,11 @@ fn gh555_failed_sibling_preserves_reuse_and_later_source_diagnostics() -> Result
     fs::write(&paths[0], format!("not-json\n{}", message("retained")))?;
     fs::write(&paths[1], message("before failure"))?;
     fs::write(&paths[2], message("before change"))?;
+    // Reuse requires settled EOF. A live prefix deliberately never grants
+    // whole-source reuse, even when its current bytes have not changed.
+    for path in &paths {
+        File::open(path)?.set_modified(SystemTime::now() - Duration::from_secs(7200))?;
+    }
     let data_dir = temp.path().join("data");
     fs::create_dir(&data_dir)?;
     let ctx = ScanContext::with_roots(
@@ -1320,10 +1715,12 @@ fn gh555_failed_sibling_preserves_reuse_and_later_source_diagnostics() -> Result
             .collect(),
     );
 
-    // The real Codex adapter reports invalid UTF-8 as a typed source failure,
-    // continues to the following rollout, and withholds the failed receipt.
+    // Truncating a receipt-protected source now fails its prior byte proof
+    // before parsing. The next source retains its indexed prefix and appends
+    // a new contribution; only the rejected sibling withholds its receipt.
     fs::write(&paths[1], b"\xff\n")?;
-    fs::write(&paths[2], message("new contribution"))?;
+    OpenOptions::new().append(true).open(&paths[2])?
+        .write_all(message("new contribution").as_bytes())?;
     let next = collect_diagnostic_ledger_scan(&connector, &ctx, &config, "codex", || Ok(()))?;
     assert!(next.scan_error.is_some());
     let reuse_enabled = env!("CASS_SOURCE_INGEST_REUSE") == "true";
@@ -1332,7 +1729,7 @@ fn gh555_failed_sibling_preserves_reuse_and_later_source_diagnostics() -> Result
     assert!(
         next.conversations.iter().any(|conversation| {
             conversation.source_path == paths[2]
-                && conversation.messages[0].content == "new contribution"
+                && conversation.messages.iter().any(|message| message.content == "new contribution")
         }),
         "a failed source must not starve the later admitted rollout"
     );
@@ -1342,7 +1739,7 @@ fn gh555_failed_sibling_preserves_reuse_and_later_source_diagnostics() -> Result
     let failed_path = paths[1].display().to_string();
     assert!(next.report.diagnostics.iter().any(|diagnostic| {
         diagnostic.source_path == failed_path
-            && diagnostic.failure_kind == IngestFailureKind::UnparseableSource
+            && diagnostic.failure_kind == IngestFailureKind::SourceChanged
     }));
     if reuse_enabled {
         assert_eq!(next.reused_sources, vec![paths[0].clone()]);

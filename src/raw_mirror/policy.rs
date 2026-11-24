@@ -810,6 +810,32 @@ pub(crate) fn capture(
     chunk_size: usize,
     policy: RawMirrorRetentionPolicy,
 ) -> Result<RawMirrorCaptureRecord> {
+    capture_with_view(input, threshold, chunk_size, policy, None)
+}
+
+pub(crate) fn capture_codex_prefix(
+    input: RawMirrorCaptureInput<'_>,
+    receipt: &crate::connectors::codex::StablePrefixReceipt,
+    view: &Path,
+    threshold: u64,
+    chunk_size: usize,
+    policy: RawMirrorRetentionPolicy,
+) -> Result<RawMirrorCaptureRecord> {
+    anyhow::ensure!(
+        input.provider == "codex" && input.source_path == receipt.source_path.as_path(),
+        "Codex prefix capture does not match its admitted source"
+    );
+    receipt.validate_source()?;
+    capture_with_view(input, threshold, chunk_size, policy, Some((view, receipt)))
+}
+
+fn capture_with_view(
+    input: RawMirrorCaptureInput<'_>,
+    threshold: u64,
+    chunk_size: usize,
+    policy: RawMirrorRetentionPolicy,
+    prefix: Option<(&Path, &crate::connectors::codex::StablePrefixReceipt)>,
+) -> Result<RawMirrorCaptureRecord> {
     if crate::raw_mirror::is_sensitive_container_provider(input.provider) {
         anyhow::bail!(
             "disabled_sensitive_container: {} source files cannot be raw-mirrored",
@@ -846,12 +872,36 @@ pub(crate) fn capture(
     }
     let root = ensure_raw_mirror_root(input.data_dir)?;
     let _mutation = acquire_raw_mirror_mutation_lock(&root)?;
-    // Admission inspected the pre-lock source. A regular replacement or an
-    // in-place rewrite must be classified afresh on the next capture.
+    // Ordinary admission is bound to the pre-lock source snapshot. A prefix
+    // instead supplies its original object/content proof below, allowing only
+    // appends outside the admitted bytes while the mutation lock was pending.
     let current = raw_mirror_symlink_metadata(input.source_path)?;
-    if current.file_type().is_symlink() || source_file_changed_during_capture(&metadata, &current) {
+    if current.file_type().is_symlink()
+        || !current.is_file()
+        || (prefix.is_none() && source_file_changed_during_capture(&metadata, &current))
+    {
         anyhow::bail!("raw mirror source changed identity while waiting for capture");
     }
+    // The original name owns privacy, provenance and manifest identity. A
+    // prefix view supplies only bytes and is independently held to the same
+    // immutable-file guards as an ordinary capture.
+    let view_input = RawMirrorCaptureInput {
+        source_path: prefix.map_or(input.source_path, |(view, _)| view),
+        ..input.clone()
+    };
+    let view_metadata = if let Some((view, receipt)) = prefix {
+        receipt.validate_source()?;
+        let observed = raw_mirror_symlink_metadata(view)?;
+        anyhow::ensure!(
+            observed.is_file()
+                && !observed.file_type().is_symlink()
+                && observed.len() == receipt.committed_bytes,
+            "Codex prefix capture view does not match its admitted boundary"
+        );
+        observed
+    } else {
+        metadata.clone()
+    };
     // Validate coordination even on a cache hit, but do not rewrite it until
     // this capture actually needs to publish something. Repeated watch scans
     // of unchanged sources must not create staging trees or mutation events.
@@ -863,7 +913,13 @@ pub(crate) fn capture(
         inventoried: false,
     };
     let key = raw_mirror_blob_cache_key(&input, &metadata, threshold, chunk_size);
-    let cached = cached_record(&root, &key);
+    // Publishing B bytes while the source has grown to N must not associate
+    // the B-byte blob with N's full-file fingerprint, even on a later process.
+    let cached = if prefix.is_none() {
+        cached_record(&root, &key)
+    } else {
+        None
+    };
     let was_cached = cached.is_some();
     let mut staging = Staging::new(&root);
     let prepared = match cached {
@@ -873,8 +929,8 @@ pub(crate) fn capture(
         },
         None => prepare_bounded(
             &root,
-            &input,
-            &metadata,
+            &view_input,
+            &view_metadata,
             threshold,
             chunk_size,
             &mut staging,
@@ -882,6 +938,16 @@ pub(crate) fn capture(
         )?,
     };
     let record = prepared.record;
+    if let Some((_, receipt)) = prefix {
+        anyhow::ensure!(
+            record.source_size_bytes == receipt.committed_bytes
+                && record.source_content_blake3 == receipt.blake3,
+            "Codex prefix capture bytes do not match the parsed source receipt"
+        );
+        // No content-addressed blob or manifest is visible yet. Reject a
+        // replacement or in-place edit before the publication reservation.
+        receipt.validate_source()?;
+    }
     let path_hash = raw_mirror_original_path_blake3(&input.source_path.display().to_string());
     let id = raw_mirror_manifest_id(
         input.provider,
@@ -995,7 +1061,7 @@ pub(crate) fn capture(
     } else {
         publish_manifest_bytes_create_new(&root, &path, &bytes, &record.blob_blake3)?;
     }
-    if !was_cached {
+    if !was_cached && prefix.is_none() {
         // Cache admission is optional; successfully preserving the source must
         // not be reported as a failed capture merely because its cache cannot fit.
         if let Err(error) = save_cache(&root, key, record.clone(), &mut staging, &mut budget) {

@@ -9137,7 +9137,7 @@ fn collect_new_messages_for_existing_conversation<'a>(
         }
 
         let incoming_replay = replay_fingerprint_from_merge(&incoming_fingerprint);
-        if existing_replay_fingerprints.contains(&incoming_replay) {
+        if !codex_prefix_packet(conv) && existing_replay_fingerprints.contains(&incoming_replay) {
             tracing::debug!(
                 conversation_id,
                 idx = msg.idx,
@@ -15717,22 +15717,28 @@ impl FrankenStorage {
         )? {
             ConversationInsertStatus::Inserted(conv_id) => conv_id,
             ConversationInsertStatus::Existing(existing_id) => {
-                let ExistingMessageLookup {
-                    by_idx: mut existing_messages,
-                    replay: mut existing_replay_fingerprints,
-                } = franken_existing_message_lookup(&tx, existing_id, &conv.messages)?;
                 let ExistingConversationNewMessages {
                     messages: new_messages,
                     new_chars: _planned_new_chars,
                     idx_collision_count,
                     first_collision_idx,
-                } = collect_new_messages_for_existing_conversation(
-                    existing_id,
-                    conv,
-                    &mut existing_messages,
-                    &mut existing_replay_fingerprints,
-                    "skipping replay-equivalent recovered message with shifted idx",
-                );
+                } = if let Some(plan) =
+                    franken_validate_codex_prefix_overlap(&tx, existing_id, conv)?
+                {
+                    plan
+                } else {
+                    let ExistingMessageLookup {
+                        by_idx: mut existing_messages,
+                        replay: mut existing_replay_fingerprints,
+                    } = franken_existing_message_lookup(&tx, existing_id, &conv.messages)?;
+                    collect_new_messages_for_existing_conversation(
+                        existing_id,
+                        conv,
+                        &mut existing_messages,
+                        &mut existing_replay_fingerprints,
+                        "skipping replay-equivalent recovered message with shifted idx",
+                    )
+                };
                 let (inserted_last_idx, inserted_last_created_at) =
                     borrowed_messages_tail_state(&new_messages);
                 let mut inserted_indices = Vec::new();
@@ -15858,6 +15864,7 @@ impl FrankenStorage {
             }
             let incoming_replay = message_replay_fingerprint(msg);
             if conv.agent_slug != "grok_bot"
+                && !codex_prefix_packet(conv)
                 && pending_replay_fingerprints.contains(&incoming_replay)
             {
                 tracing::debug!(
@@ -16013,6 +16020,7 @@ impl FrankenStorage {
 
             let incoming_replay = message_replay_fingerprint(msg);
             if conv.agent_slug != "grok_bot"
+                && !codex_prefix_packet(conv)
                 && pending_replay_fingerprints.contains(&incoming_replay)
             {
                 tracing::debug!(
@@ -16161,6 +16169,8 @@ impl FrankenStorage {
         })?;
         let existing_id = existing.id;
 
+        let prefix_plan = franken_validate_codex_prefix_overlap(&tx, existing_id, conv)?;
+
         let existing_idx_lookup_start = Instant::now();
         let append_tail_state = existing.tail_state;
         let append_tail_ended_at = append_tail_state.and_then(|state| state.ended_at);
@@ -16171,7 +16181,7 @@ impl FrankenStorage {
                 state.last_message_created_at,
             )
         });
-        let used_append_tail_plan = existing_plan.is_some();
+        let used_append_tail_plan = prefix_plan.is_none() && existing_plan.is_some();
         profile.existing_idx_lookup_duration += existing_idx_lookup_start.elapsed();
 
         let dedupe_filter_start = Instant::now();
@@ -16180,7 +16190,9 @@ impl FrankenStorage {
             new_chars,
             idx_collision_count,
             first_collision_idx,
-        } = if let Some(existing_plan) = existing_plan {
+        } = if let Some(prefix_plan) = prefix_plan {
+            prefix_plan
+        } else if let Some(existing_plan) = existing_plan {
             existing_plan
         } else {
             let ExistingMessageLookup {
@@ -16355,6 +16367,7 @@ impl FrankenStorage {
         defer_lexical_updates: bool,
         defer_analytics_updates: bool,
     ) -> Result<InsertOutcome> {
+        let prefix_plan = franken_validate_codex_prefix_overlap(tx, conversation_id, conv)?;
         let append_tail_ended_at = append_tail_state.and_then(|state| state.ended_at);
         let append_plan = append_tail_state.as_ref().and_then(|state| {
             collect_append_only_tail_messages(
@@ -16363,13 +16376,15 @@ impl FrankenStorage {
                 state.last_message_created_at,
             )
         });
-        let used_append_tail_plan = append_plan.is_some();
+        let used_append_tail_plan = prefix_plan.is_none() && append_plan.is_some();
         let ExistingConversationNewMessages {
             messages: new_messages,
             new_chars: _planned_new_chars,
             idx_collision_count,
             first_collision_idx,
-        } = if let Some(append_plan) = append_plan {
+        } = if let Some(prefix_plan) = prefix_plan {
+            prefix_plan
+        } else if let Some(append_plan) = append_plan {
             append_plan
         } else {
             let ExistingMessageLookup {
@@ -16521,9 +16536,7 @@ impl FrankenStorage {
     /// must be retired, not recreated by a full-archive transaction after the
     /// canonical deletion commits (GH #565). The caller still rebuilds the
     /// authoritative lexical index before clearing the privacy fence.
-    pub(crate) fn rebuild_search_fallback_after_forget(
-        &self,
-    ) -> Result<ForgetFtsRebuildOutcome> {
+    pub(crate) fn rebuild_search_fallback_after_forget(&self) -> Result<ForgetFtsRebuildOutcome> {
         self.rebuild_search_fallback_after_forget_with_bound(fts_shadow_max_messages())
     }
 
@@ -19223,6 +19236,7 @@ impl FrankenStorage {
                             let incoming_replay = message_replay_fingerprint(msg);
                             if pending_messages.contains_key(&msg.idx)
                                 || (!native_messages_are_reconciled(conv)
+                                    && !codex_prefix_packet(conv)
                                     && pending_replay_fingerprints.contains(&incoming_replay))
                             {
                                 continue;
@@ -21034,10 +21048,12 @@ fn franken_append_insert_new_messages<'a>(
 ) -> Result<Vec<(i64, &'a Message)>> {
     let mut inserted = Vec::with_capacity(messages.len());
     for msg in messages {
-        if native_messages_are_reconciled(conv) {
+        if native_messages_are_reconciled(conv) || codex_prefix_packet(conv) {
             // Native-ID reconciliation proved this index new in this
             // transaction. A conflicting writer must abort/retry the packet,
             // never silently discard its new native entry via OR IGNORE.
+            // Codex prefixes have likewise checked every occupied incoming
+            // index against canonical content in this transaction.
             inserted.push((franken_insert_new_message(tx, conversation_id, msg)?, *msg));
             continue;
         }
@@ -21484,6 +21500,115 @@ fn franken_existing_message_lookup_with_pending(
     Ok(lookup)
 }
 
+fn codex_prefix_packet(conv: &Conversation) -> bool {
+    conv.agent_slug == "codex"
+        && conv
+            .metadata_json
+            .pointer("/cass/codex_stable_prefix")
+            .is_some()
+}
+
+/// A source receipt proves the parser's bytes, not that an older archive used
+/// the same message projection. Check actual canonical rows before any append
+/// or replay shortcut, including archives created before prefix receipts.
+///
+/// The caller has resolved the real conversation ID inside this transaction
+/// and supplied normalized, already-redacted messages. Do not re-read source
+/// text or compare against the unredacted parser digest here. Each indexed
+/// equality query returns at most one integer; stored transcript bodies are
+/// never materialized into a second, unbounded in-memory collection.
+fn franken_validate_codex_prefix_overlap<'a>(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    conv: &'a Conversation,
+) -> Result<Option<ExistingConversationNewMessages<'a>>> {
+    if !codex_prefix_packet(conv) {
+        return Ok(None);
+    }
+    let receipt: crate::connectors::codex::StablePrefixReceipt = serde_json::from_value(
+        conv.metadata_json
+            .pointer("/cass/codex_stable_prefix")
+            .expect("prefix packet has a receipt")
+            .clone(),
+    )
+    .context("invalid Codex prefix metadata at canonical admission")?;
+    let projection_len = i64::try_from(receipt.message_count)
+        .context("Codex prefix message count exceeds canonical index range")?;
+    anyhow::ensure!(
+        receipt.schema_version == 1
+            && receipt.committed_bytes > 0
+            && receipt.committed_bytes <= receipt.admitted_bytes
+            && projection_len > 0
+            && conv.messages.len() <= receipt.message_count,
+        "invalid Codex prefix projection at canonical admission"
+    );
+    // A packet may be one bounded slice of a larger admitted projection. Its
+    // final idx is not the source boundary; the unchanged receipt carries it.
+    for direction in ["ASC", "DESC"] {
+        let sql = format!(
+            "SELECT idx FROM messages INDEXED BY sqlite_autoindex_messages_1 \
+             WHERE conversation_id = ?1 ORDER BY idx {direction} LIMIT 1"
+        );
+        let canonical_idx = tx
+            .query_row_map(&sql, fparams![conversation_id], |row| {
+                row.get_typed::<i64>(0)
+            })
+            .optional()?;
+        if canonical_idx.is_some_and(|idx| idx < 0 || idx >= projection_len) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Codex prefix is shorter than canonical history; reconciliation is required",
+            )
+            .into());
+        }
+    }
+    let mut previous_idx = None;
+    let mut messages = Vec::new();
+    let mut new_chars = 0_i64;
+    for message in &conv.messages {
+        anyhow::ensure!(
+            message.idx >= 0
+                && message.idx < projection_len
+                && previous_idx.is_none_or(|previous| message.idx > previous),
+            "Codex prefix slice has invalid or repeated message indices"
+        );
+        previous_idx = Some(message.idx);
+        let matches = tx
+            .query_row_map(
+                "SELECT CASE WHEN \
+                 (CASE WHEN role = 'assistant' THEN 'agent' ELSE role END) IS ?3 \
+                 AND author IS ?4 AND created_at IS ?5 AND content IS ?6 \
+                 THEN 1 ELSE 0 END \
+             FROM messages INDEXED BY sqlite_autoindex_messages_1 \
+             WHERE conversation_id = ?1 AND idx = ?2 LIMIT 1",
+                fparams![
+                    conversation_id,
+                    message.idx,
+                    role_as_str(&message.role),
+                    message.author.as_deref(),
+                    message.created_at,
+                    message.content.as_str()
+                ],
+                |row| row.get_typed::<i64>(0),
+            )
+            .optional()?;
+        if matches == Some(0) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                format!("Codex prefix differs from canonical message idx {}; reconciliation is required", message.idx)).into());
+        }
+        if matches.is_none() {
+            messages.push(message);
+            new_chars = new_chars.saturating_add(i64::try_from(message.content.len())?);
+        }
+    }
+    Ok(Some(ExistingConversationNewMessages {
+        messages,
+        new_chars,
+        idx_collision_count: 0,
+        first_collision_idx: None,
+    }))
+}
+
 fn franken_collect_batched_existing_new_messages<'a>(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
@@ -21496,6 +21621,9 @@ fn franken_collect_batched_existing_new_messages<'a>(
     HashMap<i64, MessageMergeFingerprint>,
     HashSet<MessageReplayFingerprint>,
 )> {
+    if let Some(plan) = franken_validate_codex_prefix_overlap(tx, conversation_id, conv)? {
+        return Ok((plan, HashMap::new(), HashSet::new()));
+    }
     if native_messages_are_reconciled(conv) {
         return Ok((
             reconciled_native_messages(conv),
@@ -26331,9 +26459,7 @@ impl<'conn> ForgetMessageStatisticsReader<'conn> {
                 .dated_messages
                 .checked_add(page_dated_count)
                 .context("dated message count overflow")?;
-            statistics.payload_bytes = statistics
-                .payload_bytes
-                .saturating_add(page_payload_bytes);
+            statistics.payload_bytes = statistics.payload_bytes.saturating_add(page_payload_bytes);
             if page_count < FORGET_MESSAGE_STATISTICS_PAGE_SIZE {
                 break;
             }
@@ -26403,7 +26529,8 @@ fn classify_forget_source(
                 continue;
             }
             if selection.before_ms.is_some()
-                && !message_statistics.read(candidate.id, false)?
+                && !message_statistics
+                    .read(candidate.id, false)?
                     .matches_before(selection.before_ms)
             {
                 continue;
@@ -26971,6 +27098,10 @@ fn agent_kind_str(kind: AgentKind) -> String {
 #[cfg(test)]
 #[path = "sqlite/semantic_coverage_tests.rs"]
 mod semantic_coverage_tests;
+
+#[cfg(test)]
+#[path = "sqlite/codex_prefix_tests.rs"]
+mod codex_prefix_tests;
 
 #[cfg(test)]
 mod tests {
@@ -32303,7 +32434,9 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             .find_map(|(op, p1, p2)| (op == "OpenRead" && *p2 == rootpage).then_some(*p1))
             .expect("the token page must open the rowid table");
         assert!(
-            opcodes.iter().any(|(op, p1, _)| op == "Next" && *p1 == cursor)
+            opcodes
+                .iter()
+                .any(|(op, p1, _)| op == "Next" && *p1 == cursor)
                 && opcodes.iter().any(|(op, _, _)| op == "ResultRow")
                 && opcodes.iter().any(|(op, _, _)| op == "DecrJumpZero"),
             "token pages must stream rows and stop at their LIMIT: {opcodes:?}"
@@ -44498,7 +44631,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             }
         );
         assert!(storage.source_ingest_ledger_entries()?.is_empty());
-        assert_eq!(storage.read_mirror_scan_fingerprint("remote-fixture")?, None);
+        assert_eq!(
+            storage.read_mirror_scan_fingerprint("remote-fixture")?,
+            None
+        );
         assert_eq!(
             storage.get_last_embedded_message_id("minilm-384")?,
             None,
@@ -50132,7 +50268,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
         );
 
         let purge = storage.purge_agent_archive_data("shelley")?;
-        assert_eq!((purge.conversations_deleted, purge.messages_deleted), (1, 2));
+        assert_eq!(
+            (purge.conversations_deleted, purge.messages_deleted),
+            (1, 2)
+        );
         assert!(
             shared_cache.lock().values().all(|&id| id != removed_id),
             "a shared writer must not retain either deleted-agent cache entry"
@@ -50183,7 +50322,10 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             |row| row.get_typed(0),
         )?;
         let purge = storage.purge_agent_archive_data("openclaw")?;
-        assert_eq!((purge.conversations_deleted, purge.messages_deleted), (1, 2));
+        assert_eq!(
+            (purge.conversations_deleted, purge.messages_deleted),
+            (1, 2)
+        );
 
         // Force reuse rather than depending on the engine's rowid allocator.
         // A stale cache would satisfy the foreign key while silently assigning
@@ -50989,16 +51131,16 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             fparams![],
             |row| row.get_typed(0),
         )?;
-        let columns: Vec<(i64, String)> = storage.raw().query_map_collect(
-            "PRAGMA table_info(messages)",
-            fparams![],
-            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-        )?;
+        let columns: Vec<(i64, String)> =
+            storage
+                .raw()
+                .query_map_collect("PRAGMA table_info(messages)", fparams![], |row| {
+                    Ok((row.get_typed(0)?, row.get_typed(1)?))
+                })?;
         let payload_columns: Vec<_> = columns
             .into_iter()
             .filter_map(|(index, name)| {
-                matches!(name.as_str(), "content" | "extra_json" | "extra_bin")
-                    .then_some(index)
+                matches!(name.as_str(), "content" | "extra_json" | "extra_bin").then_some(index)
             })
             .collect();
         assert_eq!(payload_columns.len(), 3);
@@ -51036,9 +51178,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             );
             let table_cursor = opcodes
                 .iter()
-                .find_map(|(op, p1, p2)| {
-                    (op == "OpenRead" && *p2 == table_rootpage).then_some(*p1)
-                })
+                .find_map(|(op, p1, p2)| (op == "OpenRead" && *p2 == table_rootpage).then_some(*p1))
                 .expect("forget statistics must read the selected message timestamp");
             let reads_payload = opcodes.iter().any(|(op, p1, p2)| {
                 op == "Column" && *p1 == table_cursor && payload_columns.contains(p2)

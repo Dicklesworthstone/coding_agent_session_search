@@ -116,7 +116,10 @@ fn codex_tool_output_rows_survive_the_real_large_session_compaction_threshold() 
     assert_eq!(messages[4].content, long_output);
     for message in &messages[1..5] {
         assert_eq!(
-            message.extra.pointer("/payload/type").and_then(Value::as_str),
+            message
+                .extra
+                .pointer("/payload/type")
+                .and_then(Value::as_str),
             Some("function_call_output")
         );
     }
@@ -175,7 +178,10 @@ fn codex_tool_output_rows_survive_the_real_large_session_compaction_threshold() 
     }
     for message in &large[0].messages[5..] {
         assert_eq!(
-            message.extra.pointer("/payload/type").and_then(Value::as_str),
+            message
+                .extra
+                .pointer("/payload/type")
+                .and_then(Value::as_str),
             Some("tool_result")
         );
     }
@@ -333,8 +339,9 @@ fn gh553_codex_enrichment_recovers_modern_records_after_a_torn_prefix() {
         serde_json::json!({"type":"response_item","timestamp":"2026-01-01T00:00:04Z","payload":{"type":"custom_tool_call","name":"apply_patch","call_id":"patch-1","input":patch}}),
     ];
 
-    // Each suffix object is complete even when its damaged physical line has
-    // no final newline. The primary parser already retains the custom call;
+    // In a settled rollout each suffix object is complete even when its damaged
+    // physical line has no final newline. Active prefixes separately require
+    // LF (codex_stable_prefix.rs). The primary parser retains the custom call;
     // enrichment must add its input and the two event-only messages once.
     for ending in ["\n", "\r\n", ""] {
         let root = TempDir::new().unwrap();
@@ -344,6 +351,10 @@ fn gh553_codex_enrichment_recovers_modern_records_after_a_torn_prefix() {
             records[0], records[1], records[2], records[3], records[4]
         );
         fs::write(&path, &body).unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+            .unwrap();
         let before = fs::metadata(&path).unwrap().modified().unwrap();
         let context = ScanContext::with_roots(
             root.path().to_path_buf(),

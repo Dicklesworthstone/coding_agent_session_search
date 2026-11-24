@@ -64,6 +64,9 @@ pub(crate) fn can_attempt_active_jsonl_source(path: &Path) -> bool {
 }
 
 fn can_attempt_active_jsonl_source_with_limit(path: &Path, limit: u64) -> bool {
+    if crate::connectors::codex::stable_prefix::can_attempt(path, limit) {
+        return true;
+    }
     let Ok(file) = open_active_source(path) else {
         return false;
     };
@@ -101,6 +104,9 @@ fn open_active_source(path: &Path) -> io::Result<File> {
 /// Reopening here also preserves advisory-lock deferral if an idle writable
 /// descriptor caused the writer census to return before checking locks.
 pub(crate) fn guarded_active_jsonl_source(path: &Path) -> bool {
+    if crate::connectors::codex::stable_prefix::guarded_prefix_delivery(path) {
+        return true;
+    }
     COMPLETE_CODEX_DELIVERY.with(|current| {
         let current = current.borrow();
         let Some(observation) = current.as_ref().filter(|value| value.path == path) else {
@@ -269,7 +275,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::super::super::augment_modern_codex_messages;
-    use super::super::{EnrichmentBudgetExceeded, MAX_AUGMENT_ROLLOUT_BYTES, scan};
+    use super::super::{EnrichmentBudgetExceeded, MAX_AUGMENT_ROLLOUT_BYTES, scan_guarded as scan};
 
     fn content(extension: &str, text: &str) -> String {
         let message = serde_json::json!({"role": "user", "content": text});

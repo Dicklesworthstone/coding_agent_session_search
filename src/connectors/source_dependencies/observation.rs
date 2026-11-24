@@ -110,6 +110,16 @@ pub(crate) fn ledger_matches(
     if saved["producer_contract"].as_str() != Some(producer_contract) {
         return false;
     }
+    // Metadata equality is insufficient authority for a partial publication
+    // or an admitted prefix. The host must validate a full prefix's content
+    // certificate before asking this metadata-only matcher to reuse it.
+    if saved.get("codex_prefix").is_some()
+        || saved
+            .get("publication_invalidated")
+            .is_some_and(|value| value.as_bool() != Some(false))
+    {
+        return false;
+    }
     // Missing or unreadable primaries cannot prove a completed parse. Do not
     // turn an observation error into JSON null (which a corrupt row can match).
     let Some(primary) = file_observation(source_path) else {
@@ -230,6 +240,32 @@ mod tests {
         }
         let row = saved(&path, vec![serde_json::json!({"path": 7})]);
         assert!(!ledger_matches(&row, &path, false, CONTRACT));
+    }
+
+    #[test]
+    fn prefix_and_invalidated_publications_are_not_metadata_only_certificates() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("rollout-prefix.jsonl");
+        fs::write(&path, b"{\"type\":\"session_meta\"}\n").unwrap();
+        let original = saved(&path, vec![]);
+        assert!(ledger_matches(&original, &path, false, CONTRACT));
+        for marker in [
+            serde_json::json!(true),
+            serde_json::json!("true"),
+            Value::Null,
+        ] {
+            let mut row: Value = serde_json::from_str(&original).unwrap();
+            row["publication_invalidated"] = marker;
+            assert!(!ledger_matches(&row.to_string(), &path, false, CONTRACT));
+        }
+        for partial in [true, false] {
+            let mut row: Value = serde_json::from_str(&original).unwrap();
+            row["codex_prefix"] = serde_json::json!({"partial": partial});
+            assert!(
+                !ledger_matches(&row.to_string(), &path, false, CONTRACT),
+                "a caller-provided flag cannot replace byte validation"
+            );
+        }
     }
 
     #[test]

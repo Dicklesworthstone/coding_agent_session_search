@@ -182,6 +182,25 @@ impl ActiveSessionSourceFilter {
         self.writer_probe
             .active_writer_reason(path, self.recent_write_window)
     }
+
+    fn defer_source(&self, path: &Path) {
+        ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
+        self.deferred_sources
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(path.to_path_buf());
+    }
+}
+
+/// A published record prefix still owes a later source census. The parser's
+/// scoped evidence, rather than conversation-authored metadata, authorizes it.
+fn defer_partial_codex_source(filter: &ActiveSessionSourceFilter, path: &Path) -> bool {
+    let partial = crate::connectors::codex::current_prefix_receipt(path)
+        .is_some_and(|receipt| receipt.partial);
+    if partial {
+        filter.defer_source(path);
+    }
+    partial
 }
 
 fn should_skip_active_session_source(
@@ -194,9 +213,8 @@ fn should_skip_active_session_source(
     })
 }
 
-/// A quiet writer may keep a complete Codex rollout open indefinitely. Permit
-/// an attempt for that one guarded parser; a successful filename preflight is
-/// not enough for the post-parse filter, which requires its delivery evidence.
+/// Admit an attempt only for the bounded Codex parser. Filename eligibility
+/// never authorizes post-parse delivery, which requires its scoped byte proof.
 fn should_skip_active_session_source_before_parse(
     active_source_filter: &ActiveSessionSourceFilter,
     source_kind: SourceKind,
@@ -225,21 +243,17 @@ fn should_skip_active_session_source_unless(
         reason,
         ActiveSessionSourceReason::WritableFileDescriptor
             | ActiveSessionSourceReason::RecentlyModified
+            | ActiveSessionSourceReason::AdvisoryLock
     ) && complete_codex_source()
     {
         tracing::debug!(
             source_path = %source_path.display(),
             ?reason,
-            "admitting complete Codex source through guarded whole-file read"
+            "admitting guarded Codex record prefix"
         );
         return false;
     }
-    ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
-    active_source_filter
-        .deferred_sources
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(source_path.to_path_buf());
+    active_source_filter.defer_source(source_path);
     tracing::info!(
         source_path = %source_path.display(),
         ?reason,
@@ -15471,6 +15485,12 @@ struct StreamingBatchSender<'a> {
     /// Sources skipped because the source ledger shows them unchanged, for
     /// the scope's ingest report.
     reused_sources: Vec<PathBuf>,
+    /// A prefix may become partial during the delivery callback. Completion,
+    /// not only delivery, must keep the provider watermark conservative.
+    partial_sources_observed: bool,
+    /// The final Codex packet is provisional until its typed completion. A
+    /// post-delivery mutation must not turn this buffer into an ordinary batch.
+    pending_prefix_source: Option<PathBuf>,
 }
 
 fn remember_discovered_connector(discovered_names: &mut Vec<String>, connector_name: &'static str) {
@@ -15546,8 +15566,44 @@ fn source_ledger_matches_with_contract(
     source: &DiscoveredSourceFile,
     producer_contract: &str,
 ) -> bool {
+    let Ok(mut saved) = serde_json::from_str::<serde_json::Value>(observation) else {
+        return false;
+    };
+    let mut verified_observation = None;
+    if let Some(value) = saved.get("codex_prefix") {
+        if saved["producer_contract"].as_str() != Some(producer_contract)
+            || saved
+                .get("publication_invalidated")
+                .is_some_and(|value| value.as_bool() != Some(false))
+        {
+            return false;
+        }
+        let Ok(prefix) =
+            serde_json::from_value::<crate::connectors::codex::StablePrefixReceipt>(value.clone())
+        else {
+            return false;
+        };
+        if source.provider_slug != "codex"
+            || prefix.partial
+            || prefix.source_path != source.source_path
+            || prefix.committed_bytes != prefix.admitted_bytes
+            || prefix.validate_source().is_err()
+        {
+            return false;
+        }
+        // The shared matcher deliberately refuses prefix certificates on its
+        // own. Remove the marker only in this content-validated host path.
+        saved
+            .as_object_mut()
+            .expect("receipt is an object")
+            .remove("codex_prefix");
+        verified_observation = serde_json::to_string(&saved).ok();
+        if verified_observation.is_none() {
+            return false;
+        }
+    }
     crate::connectors::source_dependencies::observation::ledger_matches(
-        observation,
+        verified_observation.as_deref().unwrap_or(observation),
         &source.source_path,
         source_folder_is_dependency(source),
         producer_contract,
@@ -15614,6 +15670,110 @@ fn source_observations_after_scan(
     Some((primary, dependencies))
 }
 
+/// Serialize the actual Codex admission proof without promoting its byte
+/// boundary to whole-source coverage. Only the real parser's scoped callback
+/// can supply this evidence; arbitrary packet metadata cannot mint a receipt.
+fn codex_prefix_ledger_observation(
+    source: &DiscoveredSourceFile,
+    producer_contract: &str,
+    watch_published: bool,
+) -> Result<Option<serde_json::Value>> {
+    let Some(mut prefix) = crate::connectors::codex::current_prefix_receipt(&source.source_path)
+    else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        source.provider_slug == "codex" && prefix.source_path == source.source_path,
+        "Codex prefix proof does not match its admitted source"
+    );
+    prefix.validate_source()?;
+    let Some(primary) = source_file_observation(&source.source_path) else {
+        return Ok(None);
+    };
+    // A writer may append in the sink after the first delivery check. Preserve
+    // that debt even if the earlier packet's metadata described a full read.
+    prefix.partial |= source.fs_metadata_changed()
+        || prefix.committed_bytes != prefix.admitted_bytes
+        || primary["size"].as_u64() != Some(prefix.committed_bytes);
+    anyhow::ensure!(
+        !prefix.inactive_eof || !prefix.partial,
+        "inactive Codex EOF changed before completion"
+    );
+    let prefix = serde_json::to_value(prefix)?;
+    let mut observation = serde_json::json!({
+        "primary": primary,
+        "dependencies": [],
+        "producer_contract": producer_contract,
+        "codex_prefix": prefix,
+        "source_origin_remote": source.origin.is_remote(),
+    });
+    if watch_published {
+        observation["watch_published"] = serde_json::Value::Bool(true);
+    }
+    Ok(Some(observation))
+}
+
+/// Retain the admitted overlap across a crash without certifying publication.
+/// The final source transaction replaces this marker after canonical ingest;
+/// watch replaces it only after the corresponding lexical commit as well.
+fn invalidated_prefix_observation(observation: &str) -> Result<Option<String>> {
+    const MAX_PREFIX_OBSERVATION_BYTES: usize = 256 * 1024;
+    let mut value: serde_json::Value = serde_json::from_str(observation)?;
+    if value.get("codex_prefix").is_none() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        observation.len() <= MAX_PREFIX_OBSERVATION_BYTES,
+        "Codex prefix receipt exceeds its invalidation budget"
+    );
+    value["publication_invalidated"] = serde_json::Value::Bool(true);
+    value["watch_published"] = serde_json::Value::Bool(false);
+    let invalidated = serde_json::to_string(&value)?;
+    anyhow::ensure!(
+        invalidated.len() <= MAX_PREFIX_OBSERVATION_BYTES,
+        "Codex prefix receipt exceeds its invalidation budget"
+    );
+    Ok(Some(invalidated))
+}
+
+fn prefix_integrity_observations(
+    observations: HashMap<String, String>,
+) -> Result<HashMap<String, String>> {
+    let mut integrity = HashMap::new();
+    for (key, observation) in observations {
+        if let Some(invalidated) = invalidated_prefix_observation(&observation)? {
+            integrity.insert(key, invalidated);
+        }
+    }
+    Ok(integrity)
+}
+
+/// Recheck a completed parser view after an asynchronous queue or disk spool.
+/// This grants no fresh byte authority: only the captured proof is considered.
+fn revalidate_prefix_observation(
+    observation: &mut String,
+) -> Result<Option<crate::connectors::codex::StablePrefixReceipt>> {
+    let mut value: serde_json::Value = serde_json::from_str(observation)?;
+    let Some(encoded) = value.get("codex_prefix") else {
+        return Ok(None);
+    };
+    let mut prefix: crate::connectors::codex::StablePrefixReceipt =
+        serde_json::from_value(encoded.clone())?;
+    prefix.validate_source()?;
+    let unchanged = source_file_observation(&prefix.source_path).as_ref() == value.get("primary");
+    let idle = source_can_recover_incomplete_tail(&prefix.source_path);
+    anyhow::ensure!(
+        !prefix.inactive_eof || (unchanged && idle),
+        "inactive Codex EOF changed before publication"
+    );
+    if !prefix.partial && (!unchanged || !idle) {
+        prefix.partial = true;
+        value["codex_prefix"] = serde_json::to_value(&prefix)?;
+        *observation = serde_json::to_string(&value)?;
+    }
+    Ok(Some(prefix))
+}
+
 /// Keep only the final bounded batch until the connector certifies a source.
 /// Filtering or a changing reconstruction dependency withholds the marker.
 fn scan_with_durable_source_boundaries(
@@ -15667,7 +15827,20 @@ fn scan_with_durable_source_boundaries(
         Default::default()
     };
     let flush_error = std::cell::RefCell::new(None);
+    let source_failures = std::cell::RefCell::new(
+        crate::connectors::codex::SourceAdmissionFailures::default(),
+    );
+    let flush_source = || {
+        let mut sender = sender.borrow_mut();
+        if let Some(path) = &sender.pending_prefix_source {
+            config.active_source_filter.defer_source(path);
+        }
+        sender.flush()
+    };
     let mut should_scan = |source: &DiscoveredSourceFile| {
+        if flush_error.borrow().is_some() {
+            return false;
+        }
         if config
             .progress
             .as_ref()
@@ -15675,7 +15848,7 @@ fn scan_with_durable_source_boundaries(
         {
             return false;
         }
-        if let Err(error) = sender.borrow_mut().flush() {
+        if let Err(error) = flush_source() {
             *flush_error.borrow_mut() = Some(error);
             return false;
         }
@@ -15699,14 +15872,32 @@ fn scan_with_durable_source_boundaries(
         // an untracked sidecar appearing between discovery and admission.
         *before.borrow_mut() = dependencies_before.parent_for(&source.source_path).cloned();
         *primary_before.borrow_mut() = source_file_observation(&source.source_path);
+        let key = source_ledger_key(source, &ctx);
+        let saved = key.as_ref().and_then(|key| config.source_ledger.get(key));
         let skip = source_reuse_enabled
             && env!("CASS_SOURCE_INGEST_REUSE") == "true"
             && !filtered.get()
-            && source_ledger_key(source, &ctx)
-                .and_then(|key| config.source_ledger.get(&key))
-                .is_some_and(|saved| {
-                    source_ledger_matches_with_contract(saved, source, &producer_contract)
-                });
+            && saved.is_some_and(|saved| {
+                source_ledger_matches_with_contract(saved, source, &producer_contract)
+            });
+        if !skip
+            && source.provider_slug == "codex"
+            && let Err(error) = crate::connectors::codex::set_previous_prefix_receipt(
+                &source.source_path,
+                saved.map(String::as_str),
+            )
+        {
+            // A prior proof belongs to this source alone. Preserve its retry
+            // debt and report the refusal after scanning healthy siblings;
+            // only a failed sender/flush may latch the entire producer off.
+            config.active_source_filter.defer_source(&source.source_path);
+            sender.borrow_mut().partial_sources_observed = true;
+            if source.origin.is_remote() {
+                config.incomplete_remote_sources.store(true, Ordering::Relaxed);
+            }
+            source_failures.borrow_mut().record(source, error);
+            return false;
+        }
         tracing::debug!(connector=%source.provider_slug, skipped=skip,"source_ingest_observation");
         if skip {
             sender
@@ -15721,7 +15912,21 @@ fn scan_with_durable_source_boundaries(
         !skip
     };
     let mut complete = |completion: &franken_agent_detection::connectors::SourceCompletion| {
-        if completion.source.origin.is_remote() {
+        let prefix_observation =
+            codex_prefix_ledger_observation(&completion.source, &producer_contract, false)?;
+        let partial =
+            crate::connectors::codex::current_prefix_receipt(&completion.source.source_path)
+                .is_some_and(|receipt| receipt.partial)
+                || prefix_observation
+                    .as_ref()
+                    .is_some_and(|value| value["codex_prefix"]["partial"].as_bool() == Some(true));
+        if partial {
+            sender.borrow_mut().partial_sources_observed = true;
+            config
+                .active_source_filter
+                .defer_source(&completion.source.source_path);
+        }
+        if completion.source.origin.is_remote() && !partial {
             uncompleted_remote_sources
                 .borrow_mut()
                 .remove(&completion_key(&completion.source));
@@ -15729,31 +15934,39 @@ fn scan_with_durable_source_boundaries(
         if !source_reuse_enabled
             || filtered.get()
             || completion.conversations_emitted == 0
-            || completion.source.fs_metadata_changed()
+            || (prefix_observation.is_none() && completion.source.fs_metadata_changed())
             || completion
                 .required_sidecars
                 .iter()
                 .any(DiscoveredSourceFile::fs_metadata_changed)
         {
-            return sender.borrow_mut().flush();
+            return flush_source();
         }
-        let Some((primary, dependencies)) = source_observations_after_scan(
-            &completion.source,
-            &completion.required_sidecars,
-            primary_before.borrow().as_ref(),
-            before.borrow().as_ref(),
-            &dependencies_before.files,
-        ) else {
-            return sender.borrow_mut().flush();
+        let observation = if let Some(observation) = prefix_observation {
+            anyhow::ensure!(
+                completion.required_sidecars.is_empty(),
+                "Codex prefix receipt cannot certify unobserved sidecars"
+            );
+            observation
+        } else {
+            let Some((primary, dependencies)) = source_observations_after_scan(
+                &completion.source,
+                &completion.required_sidecars,
+                primary_before.borrow().as_ref(),
+                before.borrow().as_ref(),
+                &dependencies_before.files,
+            ) else {
+                return flush_source();
+            };
+            serde_json::json!({"primary": primary, "dependencies": dependencies,
+                "producer_contract": producer_contract})
         };
         let Some(key) = source_ledger_key(&completion.source, &ctx) else {
-            return sender.borrow_mut().flush();
+            return flush_source();
         };
         let entry = crate::storage::sqlite::SourceIngestLedgerEntry {
             key,
-            observation: serde_json::json!({"primary":primary,"dependencies":dependencies,
-                "producer_contract":producer_contract})
-            .to_string(),
+            observation: observation.to_string(),
         };
         sender.borrow_mut().complete_source(entry)
     };
@@ -15761,7 +15974,7 @@ fn scan_with_durable_source_boundaries(
         should_scan_source: Some(&mut should_scan),
         on_source_complete: Some(&mut complete),
     };
-    connector.scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
+    let result = connector.scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
         if config
             .progress
             .as_ref()
@@ -15769,17 +15982,27 @@ fn scan_with_durable_source_boundaries(
         {
             anyhow::bail!("indexing interrupted at source boundary");
         }
+        let prefix_source =
+            crate::connectors::codex::current_prefix_receipt(&conversation.source_path)
+                .map(|_| conversation.source_path.clone());
         match prepare(conversation)? {
-            Some(conversation) => sender.borrow_mut().push(conversation),
+            Some(conversation) => {
+                let mut sender = sender.borrow_mut();
+                sender.push(conversation)?;
+                sender.pending_prefix_source = prefix_source;
+                Ok(())
+            }
             None => {
                 filtered.set(true);
                 Ok(())
             }
         }
-    })?;
-    if let Some(error) = flush_error.into_inner() {
-        return Err(error);
-    }
+    });
+    let result = if sender.borrow().pending_prefix_source.is_some() {
+        flush_source().and(result)
+    } else {
+        result
+    };
     // FAD can omit completion for empty/header-only sessions and for a
     // transient read failure. Neither may certify the whole mirror as done;
     // completed siblings still retain their individual durable receipts.
@@ -15788,7 +16011,8 @@ fn scan_with_durable_source_boundaries(
             .incomplete_remote_sources
             .store(true, Ordering::Relaxed);
     }
-    Ok(())
+    let result = flush_error.into_inner().map_or(result, Err);
+    source_failures.into_inner().finish(result)
 }
 
 impl<'a> StreamingBatchSender<'a> {
@@ -15810,6 +16034,8 @@ impl<'a> StreamingBatchSender<'a> {
             retained_bytes: 0,
             byte_reservation: 0,
             reused_sources: Vec::new(),
+            partial_sources_observed: false,
+            pending_prefix_source: None,
         }
     }
 
@@ -15857,6 +16083,19 @@ impl<'a> StreamingBatchSender<'a> {
     }
 
     fn flush(&mut self) -> Result<()> {
+        if self.pending_prefix_source.take().is_some() {
+            // A bounded prefix whose final validation failed has never been
+            // authorized for canonical publication. Drop it and keep retry
+            // debt instead of flushing it at the next source boundary.
+            self.conversations.clear();
+            self.partial_sources_observed = true;
+            self.flow_limiter.release(self.byte_reservation);
+            self.byte_reservation = 0;
+            self.message_count = 0;
+            self.content_bytes = 0;
+            self.retained_bytes = 0;
+            return Ok(());
+        }
         if self.conversations.is_empty() {
             if self.byte_reservation > 0 {
                 self.flow_limiter.release(self.byte_reservation);
@@ -15902,6 +16141,7 @@ impl<'a> StreamingBatchSender<'a> {
         &mut self,
         completion: crate::storage::sqlite::SourceIngestLedgerEntry,
     ) -> Result<()> {
+        self.pending_prefix_source = None;
         if self.conversations.is_empty() {
             return Ok(());
         }
@@ -16236,6 +16476,7 @@ where
                     });
                 }
             }
+            active_source_skipped |= batch_sender.partial_sources_observed;
             ingest_diagnostics
                 .observe_reused_sources(std::mem::take(&mut batch_sender.reused_sources));
             record_connector_ingest_report(config.progress.as_ref(), ingest_diagnostics.finish());
@@ -16387,6 +16628,7 @@ where
                     });
                 }
             }
+            active_source_skipped |= batch_sender.partial_sources_observed;
             ingest_diagnostics
                 .observe_reused_sources(std::mem::take(&mut batch_sender.reused_sources));
             record_connector_ingest_report(config.progress.as_ref(), ingest_diagnostics.finish());
@@ -16636,6 +16878,7 @@ fn run_streaming_consumer(
     // Per-connector stats tracking (T7.4)
     let mut connector_stats: HashMap<String, ConnectorStats> = HashMap::new();
     let mut failed_scan_connectors = BTreeSet::new();
+    let mut partial_scan_connectors = BTreeSet::new();
     let source_commit_limit = dotenvy::var("CASS_INDEX_MAX_SOURCE_COMMITS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -16863,8 +17106,8 @@ fn run_streaming_consumer(
             }
             Ok(IndexMessage::SourceComplete {
                 connector_name,
-                conversations,
-                completion,
+                mut conversations,
+                mut completion,
                 byte_reservation,
             }) => {
                 let count = conversations.len();
@@ -16885,6 +17128,86 @@ fn run_streaming_consumer(
                 if let Some(p) = progress {
                     p.total.fetch_add(count, Ordering::Relaxed);
                     p.tick_activity();
+                }
+                let prefix = match revalidate_prefix_observation(&mut completion.observation) {
+                    Ok(prefix) => prefix,
+                    Err(error) => {
+                        // A queue delay may expose replacement, truncation or
+                        // mutation after parsing. Preserve prior durable
+                        // evidence and defer before any canonical write.
+                        let deferred: BTreeSet<_> = conversations
+                            .iter()
+                            .map(|conversation| conversation.source_path.clone())
+                            .collect();
+                        record_deferred_active_sources(progress.as_ref(), &deferred);
+                        ingest_outcome.deferred_sources.extend(deferred);
+                        ingest_outcome.incomplete_remote_sources = true;
+                        ingest_outcome.scan_had_errors = true;
+                        ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
+                        failed_scan_connectors.insert(connector_name.to_string());
+                        let stats = connector_stats
+                            .entry(connector_name.to_string())
+                            .or_insert_with(|| ConnectorStats {
+                                name: connector_name.to_string(),
+                                ..Default::default()
+                            });
+                        stats.error = Some(format!("Codex prefix publication deferred: {error:#}"));
+                        tracing::warn!(connector = connector_name, error = %error,
+                            "Codex prefix changed before canonical publication; retaining retry");
+                        drop(conversations);
+                        flow_limiter.release(byte_reservation);
+                        continue;
+                    }
+                };
+                if let Some(prefix) = &prefix {
+                    let encoded = serde_json::to_value(prefix)?;
+                    for conversation in &mut conversations {
+                        if conversation.source_path == prefix.source_path
+                            && let Some(value) = conversation
+                                .metadata
+                                .pointer_mut("/cass/codex_stable_prefix")
+                        {
+                            // Retain the same byte proof while reflecting a
+                            // completion/queue-time downgrade to partial.
+                            *value = encoded.clone();
+                        }
+                    }
+                }
+                if let Some(prefix) = prefix
+                    && prefix.partial
+                {
+                    ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
+                    partial_scan_connectors.insert(connector_name.to_string());
+                    record_deferred_active_sources(
+                        progress.as_ref(),
+                        &BTreeSet::from([prefix.source_path.clone()]),
+                    );
+                    ingest_outcome.deferred_sources.insert(prefix.source_path);
+                    let observation: serde_json::Value =
+                        serde_json::from_str(&completion.observation)?;
+                    ingest_outcome.incomplete_remote_sources |=
+                        observation["source_origin_remote"].as_bool() != Some(false);
+                }
+                if let Some(observation) = invalidated_prefix_observation(&completion.observation)?
+                {
+                    // Establish overlap before any canonical mutation, even
+                    // when a previous source failed or OOM recovery splits
+                    // this source and withholds its publication certificate.
+                    persist::with_ephemeral_writer(
+                        storage,
+                        defer_streaming_checkpoints,
+                        "recording admitted Codex prefix before canonical mutation",
+                        |writer| {
+                            writer.raw().execute_compat(
+                                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                                &[
+                                    ParamValue::from(completion.key.as_str()),
+                                    ParamValue::from(observation.as_str()),
+                                ],
+                            )?;
+                            Ok(())
+                        },
+                    )?;
                 }
                 let mut completion_written = !failed_scan_connectors.contains(connector_name);
                 let first = if should_inject_non_watch_ingest_test_oom(&conversations) {
@@ -17008,7 +17331,8 @@ fn run_streaming_consumer(
                 if is_discovered && effective_scan_succeeded {
                     let connector_watermark_safe = scan_start_ts.is_some()
                         && !scan_path_exclusions_active()
-                        && !active_source_skipped;
+                        && !active_source_skipped
+                        && !partial_scan_connectors.contains(connector_name);
                     if connector_watermark_safe {
                         ingest_outcome
                             .scanned_connectors
@@ -17256,22 +17580,23 @@ where
 
     // Create bounded channel for backpressure
     let (tx, rx) = bounded::<IndexMessage>(STREAMING_CHANNEL_SIZE);
+    let mut source_ledger = storage.source_ingest_ledger_entries()?;
+    if opts.full
+        || opts.force_rebuild
+        || matches!(
+            lexical_strategy,
+            LexicalPopulationStrategy::InlineRebuildFromScan
+        )
+    {
+        // Rebuilding disables reuse, not overlap verification. Canonical rows
+        // may survive these scans, so dropping a prior prefix proof would let
+        // a rewrite collide with existing message indices.
+        source_ledger = prefix_integrity_observations(source_ledger)?;
+    }
     let producer_config = StreamingProducerConfig {
         incomplete_remote_sources: Arc::new(AtomicBool::new(false)),
         raw_source_exclusions: Arc::new(RawSourceExclusions::load(storage)?),
-        source_ledger: Arc::new(
-            if opts.full
-                || opts.force_rebuild
-                || matches!(
-                    lexical_strategy,
-                    LexicalPopulationStrategy::InlineRebuildFromScan
-                )
-            {
-                HashMap::new()
-            } else {
-                storage.source_ingest_ledger_entries()?
-            },
-        ),
+        source_ledger: Arc::new(source_ledger),
         flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
         data_dir: opts.data_dir.clone(),
         additional_scan_roots: additional_scan_roots.clone(),
@@ -17684,6 +18009,16 @@ where
                     // reporting another transcript's failure. Keep those
                     // chats and retain the failure to hold the watermark.
                     if let Err(e) = conn.scan_with_callback(&ctx, &mut |mut conversation| {
+                        // The legacy collector has no atomic per-source receipt
+                        // boundary. Keep active prefixes pending in this mode;
+                        // the streaming and watch paths publish them durably.
+                        if defer_partial_codex_source(
+                            active_source_filter.as_ref(),
+                            &conversation.source_path,
+                        ) {
+                            active_source_skipped = true;
+                            return Ok(());
+                        }
                         if should_skip_active_session_source(
                             active_source_filter.as_ref(),
                             SourceKind::Local,
@@ -17770,6 +18105,13 @@ where
                         );
                         active_source_skipped |= preparse_active_source_skipped;
                         if let Err(e) = conn.scan_with_callback(&ctx, &mut |mut conversation| {
+                            if defer_partial_codex_source(
+                                active_source_filter.as_ref(),
+                                &conversation.source_path,
+                            ) {
+                                active_source_skipped = true;
+                                return Ok(());
+                            }
                             if should_skip_active_session_source(
                                 active_source_filter.as_ref(),
                                 root.origin.kind,
@@ -36897,7 +37239,7 @@ fn reindex_paths_with_semantic_delta(
             )?
         };
         let mut source_ledger = watch_source_ledger::WatchSourceLedger::default();
-        let scan_error = match source_ledger.scan(
+        let scan_error = match source_ledger.scan_with_ledger_lookup(
             conn.as_ref(),
             kind.slug(),
             &ctx,
@@ -36906,6 +37248,16 @@ fn reindex_paths_with_semantic_delta(
             replay_canonical,
             active_source_filter,
             opts.progress.as_deref(),
+            &mut |key| {
+                // Only incomplete-cache misses reach this indexed read. Keep
+                // the lock scoped to the bounded metadata query, never source
+                // verification, parsing, raw capture, or spool delivery.
+                let storage = storage.lock()
+                    .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+                watch_source_cache::lookup_watch_source_observation(
+                    &storage, key, opts.progress.as_deref(),
+                )
+            },
             &mut |mut conversation| {
                 if let Some(progress) = &opts.progress {
                     progress.check_stop()?;
@@ -36961,6 +37313,13 @@ fn reindex_paths_with_semantic_delta(
                 Some(message)
             }
         };
+        source_ledger.revalidate_prefixes(active_source_filter, opts.progress.as_deref())?;
+        // A typed Codex prefix remains provisional until its final source
+        // validation. A failed post-delivery check must not publish the packet
+        // that was already buffered in memory or spilled to the watch spool.
+        convs
+            .entries
+            .retain(|entry| source_ledger.may_publish_source(&entry.key.source_path));
         drop(saved_source_ledger);
         if let Some(progress) = &opts.progress {
             progress.check_stop()?;
@@ -37230,6 +37589,7 @@ fn reindex_paths_with_semantic_delta(
                 if let Some(progress) = &opts.progress {
                     progress.check_stop()?;
                 }
+                source_ledger.align_prefix_metadata(conv)?;
                 capture_prepared_conversation(&opts.data_dir, conv, &raw_source_exclusions);
                 if let Some(progress) = &opts.progress {
                     progress.check_stop()?;
@@ -40398,6 +40758,18 @@ fn capture_discovered_source_file_before_parse(
     if raw_source_exclusions.excludes(&source.source_path) {
         return;
     }
+    // The bounded parser owns the admitted bytes of a plain Codex rollout.
+    // Capture its exact prefix after parsing instead of a different preflight
+    // snapshot (or an unbounded append) under the same source identity.
+    if provider == "codex"
+        && source.role == crate::connectors::DiscoveredSourceRole::PrimarySessionLog
+        && source
+            .source_path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+    {
+        return;
+    }
     if provider == "copilot"
         && crate::connectors::copilot::source_is_proven_chat_free(&source.source_path)
     {
@@ -40581,6 +40953,14 @@ fn capture_scan_root_file_before_parse(
     if !crate::raw_mirror::capture_enabled() || raw_source_exclusions.excludes(&root.path) {
         return false;
     }
+    if provider == "codex"
+        && root
+            .path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+    {
+        return false;
+    }
     // Failed/empty discovery cannot prove that this fallback file contains
     // only admitted workspaces. Defer capture until a parsed conversation
     // reaches the normal workspace gate, just as discovered transcripts do.
@@ -40651,7 +41031,7 @@ fn attach_raw_mirror_capture(
     }
 
     let (source_id, origin_kind, origin_host) = raw_mirror_origin_from_metadata(&conv.metadata);
-    match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
+    let input = crate::raw_mirror::RawMirrorCaptureInput {
         data_dir,
         provider: &conv.agent_slug,
         source_id: &source_id,
@@ -40662,7 +41042,24 @@ fn attach_raw_mirror_capture(
         // transaction returns an actual conversation id. Persist batches add
         // those authoritative links in one manifest update per source.
         db_links: &[],
-    }) {
+    };
+    let capture = if let Some(value) = conv.metadata.pointer("/cass/codex_stable_prefix") {
+        // Watch capture runs after spooling, outside the parser's scoped
+        // callback. Revalidate its byte/object proof; never reopen the growing
+        // source using the ordinary whole-file capture contract.
+        serde_json::from_value::<crate::connectors::codex::StablePrefixReceipt>(value.clone())
+            .map_err(anyhow::Error::from)
+            .and_then(|receipt| {
+                anyhow::ensure!(
+                    conv.agent_slug == "codex" && receipt.source_path == conv.source_path,
+                    "raw mirror prefix proof does not match its conversation"
+                );
+                crate::raw_mirror::capture_codex_prefix(input, &receipt)
+            })
+    } else {
+        crate::raw_mirror::capture_source_file(input)
+    };
+    match capture {
         Ok(record) => {
             attach_raw_mirror_metadata(conv, &record);
             tracing::debug!(

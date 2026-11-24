@@ -49,7 +49,7 @@ class HarnessTests(unittest.TestCase):
         manifest += '[dev-dependencies]\nzstd={version="0.13",default-features=false}\n'
         (self.root / "Cargo.toml").write_text(manifest, encoding="utf-8")
         (self.root / "Cargo.lock").write_text(f'version=4\n[[package]]\nname="{FAD}"\nversion="0.3.10"\nsource="{SOURCE}"\n', encoding="utf-8")
-        for test in ("connector_codex", "connector_codex_exclusions", "codex_source_containment"):
+        for test in ("connector_codex", "connector_codex_exclusions", "codex_source_containment", "codex_stable_prefix"):
             (self.root / f"tests/{test}.rs").write_text('// unchanged integration fixture\n', encoding="utf-8")
         self.real_fixture = self.root / "tests/fixtures/codex_real/sessions/2025/11/26/rollout-tool-call.jsonl"
         self.real_fixture.write_text('{"role":"user","content":"fixture 🔑"}\n', encoding="utf-8")
@@ -119,7 +119,7 @@ class HarnessTests(unittest.TestCase):
     def test_public_codex_routes_run_with_byte_identical_real_fixtures(self):
         self.run_harness()
         targets = {target["name"]: target["path"] for target in self.generated["test"]}
-        self.assertEqual(set(targets), {"connector_codex", "connector_codex_exclusions", "codex_source_containment"})
+        self.assertEqual(set(targets), {"connector_codex", "connector_codex_exclusions", "codex_source_containment", "codex_stable_prefix"})
         self.assertEqual(targets["connector_codex"], str(self.root / "tests/connector_codex.rs"))
         self.assertEqual(self.staged_fixtures, {
             self.real_fixture.relative_to(self.root).as_posix(): self.real_fixture.read_bytes(),

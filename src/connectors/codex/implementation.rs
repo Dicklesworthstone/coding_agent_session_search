@@ -1,11 +1,15 @@
 mod exclusions;
+#[path = "implementation/message_order.rs"]
+mod message_order;
 mod source_budget;
+
+pub(crate) use message_order::physical_line_ends_in_user_event;
 
 #[cfg(test)]
 pub(crate) use source_budget::over_budget_scan_error;
 pub(crate) use source_budget::{
-    SourceFailureReason, can_attempt_active_jsonl_source, for_each_source_failure,
-    guarded_active_jsonl_source, over_budget_sources, source_read_budget,
+    SourceAdmissionFailures, SourceFailureReason, can_attempt_active_jsonl_source,
+    for_each_source_failure, guarded_active_jsonl_source, over_budget_sources, source_read_budget,
 };
 
 use std::collections::HashMap;
@@ -220,6 +224,13 @@ fn augment_modern_codex_reader(
     // The primary parser keeps exact output text but compacts raw extras on
     // large rollouts. Match source occurrences against this initial inventory;
     // newly enriched rows must never replenish it.
+    let mut source_order =
+        if super::stable_prefix::guarded_parser_view(&conversation.source_path) {
+            Some(message_order::SourceOrder::new(&conversation.messages)?)
+        } else {
+            None
+        };
+    let mut record_ordinal = 0_usize;
     let mut signature_writer = BufWriter::new(blake3::Hasher::new());
     let mut message_indices_by_signature = HashMap::new();
     let mut message_indices_by_call_id = HashMap::new();
@@ -250,9 +261,8 @@ fn augment_modern_codex_reader(
             }
         }
         message_indices_by_signature.insert(signature, index);
-        message_indices_by_call_id.extend(
-            modern_codex_message_call_ids(message).map(|call_id| (call_id, index)),
-        );
+        message_indices_by_call_id
+            .extend(modern_codex_message_call_ids(message).map(|call_id| (call_id, index)));
         message_indices_by_raw_entry.insert(raw_signature, index);
     }
     let mut added = false;
@@ -272,7 +282,7 @@ fn augment_modern_codex_reader(
         bytes_read += count as u64;
         line_no += 1;
         let terminated = line.ends_with('\n');
-        let text = if line_no == 1 {
+        let text = if line_no == 1 || source_order.is_some() {
             line.trim_start_matches('\u{feff}').trim()
         } else {
             line.trim()
@@ -344,6 +354,13 @@ fn augment_modern_codex_reader(
             }
         };
         for raw in parsed.into_iter().chain(recovered) {
+            let ordinal = record_ordinal;
+            record_ordinal += 1;
+            let observation = if let Some(order) = source_order.as_mut() {
+                order.observe(&raw, ordinal, line_no)?
+            } else {
+                message_order::Observation::default()
+            };
             let output = primary_codex_tool_output(&raw);
             let primary_signature = if output.is_some() {
                 Some(modern_codex_raw_signature(&mut signature_writer, &raw)?)
@@ -406,6 +423,14 @@ fn augment_modern_codex_reader(
                 modern_codex_message_call_ids(&message)
                     .find_map(|id| message_indices_by_call_id.get(&id).copied())
                     .filter(|index| native_web_search(&conversation.messages[*index]))
+            } else if let Some(index) = observation.index {
+                Some(index)
+            } else if observation.primary {
+                // A discarded or unmatched native occurrence must not borrow
+                // a learned raw, call-ID, or text alias from a different row.
+                None
+            } else if source_order.is_some() && message_order::is_enrichment_event(&raw) {
+                source_order.as_mut().and_then(|order| order.match_event(&message))
             } else {
                 message_indices_by_raw_entry
                     .get(&raw_signature)
@@ -428,6 +453,9 @@ fn augment_modern_codex_reader(
             };
 
             if let Some(existing_index) = existing_index {
+                if let Some(order) = source_order.as_mut() {
+                    order.note(existing_index, ordinal);
+                }
                 let existing = &mut conversation.messages[existing_index];
                 if merge_modern_codex_tool_call(existing, &message) {
                     message_indices_by_signature
@@ -442,6 +470,9 @@ fn augment_modern_codex_reader(
             }
 
             let message_index = conversation.messages.len();
+            if let Some(order) = source_order.as_mut() {
+                order.push(ordinal);
+            }
             conversation.messages.push(message);
             let stored = &conversation.messages[message_index];
             message_indices_by_signature.insert(message_signature, message_index);
@@ -453,7 +484,21 @@ fn augment_modern_codex_reader(
         }
     }
 
-    if added {
+    if let Some(order) = source_order {
+        order.finish(&mut conversation.messages)?;
+        // Physical order is append-stable even when timestamps are equal or
+        // backdated. Retain chronological bounds, including primary metadata.
+        for timestamp in conversation
+            .messages
+            .iter()
+            .filter_map(|message| message.created_at)
+        {
+            conversation.started_at =
+                Some(conversation.started_at.map_or(timestamp, |old| old.min(timestamp)));
+            conversation.ended_at =
+                Some(conversation.ended_at.map_or(timestamp, |old| old.max(timestamp)));
+        }
+    } else if added {
         conversation.messages.sort_by(|left, right| {
             left.created_at
                 .cmp(&right.created_at)
@@ -1789,7 +1834,8 @@ mod tests {
     }
 
     #[test]
-    fn every_connector_route_withholds_an_unfinished_source_then_retries() -> Result<()> {
+    #[cfg(unix)]
+    fn every_connector_route_admits_the_complete_prefix_then_retries_its_tail() -> Result<()> {
         use super::super::ScanRoot;
         use franken_agent_detection::connectors::{SourceCompletion, SourceScanHooks};
         let dir = tempfile::tempdir()?;
@@ -1803,46 +1849,63 @@ mod tests {
             None,
         );
         let connector = CodexConnector::new();
-        assert!(
-            connector.scan(&ctx).is_err(),
-            "batch scan must not return a partial success"
-        );
-        let mut emitted = Vec::new();
-        assert!(
-            connector
-                .scan_with_callback(&ctx, &mut |conversation| {
-                    emitted.push(conversation);
-                    Ok(())
-                })
-                .is_err()
-        );
-        assert!(emitted.is_empty());
-        let mut completions = 0;
-        {
-            let mut complete = |_: &SourceCompletion| {
+        let unfinished = std::fs::read(&path)?;
+        let mut previous_id = None;
+        for route in 0..3 {
+            let mut emitted = Vec::new();
+            let mut completions = 0;
+            let mut complete = |done: &SourceCompletion| {
+                assert_eq!(done.source.source_path, path);
+                assert_eq!(done.source.size_bytes, None);
+                assert_eq!(done.source.modified_at_ms, None);
+                let receipt = super::super::current_prefix_receipt(&path).unwrap();
+                assert!(
+                    receipt.partial,
+                    "the unfinished EOF must remain discoverable"
+                );
+                assert_eq!(receipt.committed_bytes, first.to_string().len() as u64 + 1);
+                assert_eq!(receipt.admitted_bytes, unfinished.len() as u64);
                 completions += 1;
                 Ok(())
             };
-            let mut hooks = SourceScanHooks {
-                should_scan_source: None,
-                on_source_complete: Some(&mut complete),
-            };
-            assert!(
-                connector
-                    .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
+            match route {
+                0 => emitted = connector.scan(&ctx)?,
+                1 => connector.scan_with_callback(&ctx, &mut |conversation| {
+                    emitted.push(conversation);
+                    Ok(())
+                })?,
+                _ => connector.scan_with_source_boundaries(
+                    &ctx,
+                    &mut SourceScanHooks {
+                        should_scan_source: None,
+                        on_source_complete: Some(&mut complete),
+                    },
+                    &mut |conversation| {
                         emitted.push(conversation);
                         Ok(())
-                    })
-                    .is_err()
+                    },
+                )?,
+            }
+            assert_eq!(emitted.len(), 1);
+            assert_eq!(emitted[0].messages.len(), 1);
+            assert!(emitted[0].messages[0].content.contains("canonical_prefix"));
+            assert!(!emitted[0].messages[0].content.contains("retried_tail"));
+            assert_eq!(
+                emitted[0].metadata["cass"]["codex_stable_prefix"]["partial"],
+                true
             );
+            assert_eq!(completions, usize::from(route == 2));
+            if route == 0 {
+                previous_id = emitted[0].external_id.clone();
+            } else {
+                assert_eq!(emitted[0].external_id, previous_id);
+            }
+            assert_eq!(std::fs::read(&path)?, unfinished);
         }
-        assert!(emitted.is_empty());
-        assert_eq!(
-            completions, 0,
-            "failed enrichment must not certify source completion"
-        );
         std::fs::write(&path, format!("{first}\n{second}\n"))?;
         let before = std::fs::read(&path)?;
+        let mut emitted = Vec::new();
+        let mut completions = 0;
         {
             let mut complete = |_: &SourceCompletion| {
                 completions += 1;
@@ -1860,8 +1923,60 @@ mod tests {
         assert_eq!(emitted.len(), 1);
         assert_eq!(completions, 1);
         assert_eq!(emitted[0].messages.len(), 2);
+        assert_eq!(emitted[0].external_id, previous_id);
+        assert!(emitted[0].messages[0].content.contains("canonical_prefix"));
         assert!(emitted[0].messages[1].content.contains("retried_tail"));
         assert_eq!(std::fs::read(&path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn every_connector_route_withholds_unfinished_input_without_file_identity() -> Result<()> {
+        use super::super::ScanRoot;
+        use franken_agent_detection::connectors::{SourceCompletion, SourceScanHooks};
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-incomplete.jsonl");
+        let first = custom_call("patch-1", "canonical_prefix");
+        let second = custom_call("patch-2", "retried_tail").to_string();
+        std::fs::write(&path, format!("{first}\n{}", &second[..second.len() - 1]))?;
+        let ctx = ScanContext::with_roots(
+            dir.path().join("cass-data"),
+            vec![ScanRoot::local(path.clone())],
+            None,
+        );
+        let connector = CodexConnector::new();
+        assert!(connector.scan(&ctx).is_err());
+        for with_boundaries in [false, true] {
+            let mut emitted = 0;
+            let mut completed = 0;
+            let mut deliver = |_: NormalizedConversation| {
+                emitted += 1;
+                Ok(())
+            };
+            let mut complete = |_: &SourceCompletion| {
+                completed += 1;
+                Ok(())
+            };
+            let result = if with_boundaries {
+                connector.scan_with_source_boundaries(
+                    &ctx,
+                    &mut SourceScanHooks {
+                        should_scan_source: None,
+                        on_source_complete: Some(&mut complete),
+                    },
+                    &mut deliver,
+                )
+            } else {
+                connector.scan_with_callback(&ctx, &mut deliver)
+            };
+            assert!(result.is_err());
+            assert_eq!((emitted, completed), (0, 0));
+        }
+        std::fs::write(&path, format!("{first}\n{second}\n"))?;
+        let retry = connector.scan(&ctx)?;
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].messages.len(), 2);
         Ok(())
     }
 }

@@ -1,0 +1,428 @@
+{
+  "schema_version": 1,
+  "subject": "Codex bounded stable-prefix ingestion",
+  "initial_candidate": {
+    "base_commit": "710435869716073a3b5aa015ad3f9872426e2e4a",
+    "fad_commit": "a0dd013a8c1e374d6a80949637e5e51cbb45550b",
+    "fad_version": "0.3.10",
+    "toolchain": "nightly-2026-08-31",
+    "patch_sha256": "97ec4c70edb985ffa8a8de623c8fd3e8dcc89419e9f594ee5957b399c87be923",
+    "patch_bytes": 276282,
+    "changed_files": 29,
+    "evidence_zip_sha256": "4678bcc6c624a5105d324f925dc05b651cbc28ad55ffdc2be46e6635b79fb615",
+    "evidence_json_sha256": "98ead1726b0f293dcee8ab01eba348ba282d3a31416019cb92e11fa09113a315",
+    "recovery": {
+      "patch_sha256_verified": true,
+      "complete_new_file_git_blobs_verified": 7,
+      "previously_uploaded_git_blobs_verified": 18,
+      "does_not_constitute_runtime_validation": true
+    }
+  },
+  "execution_policy": "DSR only; no GitHub Actions or dependency substitution",
+  "executed": [
+    {
+      "lane": "frozen original Codex contract",
+      "receipt": "cass-prefix-final-focused/20261123T235219-QnrAMyOx/receipt.json",
+      "passed": 238,
+      "failed": 0,
+      "ignored": 1,
+      "clippy": "passed --all-targets -- -D warnings",
+      "rustfmt": "passed",
+      "scope": "Production Codex adapter and writer probe with exact pinned FAD; standalone harness omits unrelated FAD SQLite/cryptography features."
+    },
+    {
+      "lane": "frozen original source observation matcher",
+      "receipt": "cass-prefix-final-focused/20261123T235219-QnrAMyOx/receipt.json",
+      "passed": 13,
+      "failed": 0,
+      "ignored": 1,
+      "scope": "Exact production observation matcher, not host/watch publication or storage; ignored test is a benchmark."
+    },
+    {
+      "lane": "Python harness generation",
+      "passed": 12,
+      "failed": 0,
+      "scope": "Includes reporter syntax/help only; does not execute real CLI reproduction."
+    },
+    {
+      "lane": "frozen original patch reconstruction",
+      "receipt": "cass-prefix-final-patch/20261124T000020-4cJ1TUKj/receipt.json",
+      "passed": 2,
+      "failed": 0,
+      "scope": "All29 file hashes and41 focused inputs checked against clean baseline."
+    },
+    {
+      "lane": "projection diagnostics before fix",
+      "receipt": "cass-codex-prefix-contract/20261124T002917-qse8ayaK/receipt.json",
+      "passed": 238,
+      "failed": 3,
+      "ignored": 1,
+      "scope": "Three new regressions reproduced prompt-pair projection change, timestamp reordering and pending-prompt frontier behavior."
+    },
+    {
+      "lane": "full production library, measured watchdog",
+      "receipt": "cass-prefix-measured-full-check/20261124T002309-JXMr9sjq/receipt.json",
+      "command": "cargo check --locked --offline --no-default-features --lib",
+      "exit_code": 125,
+      "reached_cass": false,
+      "stopped_in": "Asupersync 0.5.0",
+      "duration_seconds": 70.448,
+      "termination": "watchdog SIGTERM",
+      "compiler_stack_mib": 16,
+      "runtime_test_stack_mib": 128,
+      "virtual_address_limit_gib": 32,
+      "aggregate_rss_limit_gib": 5,
+      "minimum_available_mib": 2048,
+      "sampling_ms": 100,
+      "initial_available_kib": 7813924,
+      "lowest_available_kib": 2096540,
+      "peak_process_tree_rss_kib": 5239540,
+      "peak_process_tree_vas_kib": 7836360,
+      "peak_asupersync_rss_kib": 5101944,
+      "peak_asupersync_vas_kib": 7440108,
+      "peak_asupersync_rustc_threads": 3,
+      "qualification": "Earlier4/6GiB VAS-capped builds failed allocation before CASS. Larger VAS clarified reservations, but safe resident-memory/headroom limits still blocked production compilation."
+    },
+    {
+      "lane": "pinned UBS gate",
+      "receipt": "cass-prefix-ubs-cached/20261124T003209-QCt8Lc4a/receipt.json",
+      "ubs_version": "5.4.4",
+      "ubs_commit": "fc05825ed970a3928f71bfa083a1d703e4429b1a",
+      "ast_grep_version": "0.51.3",
+      "real_gate_functions": true,
+      "real_rust_ast_probe": true,
+      "scanned_files": 27,
+      "rust_files": 24,
+      "python_files": 3,
+      "critical": 86,
+      "warnings": 22542,
+      "info": 5421,
+      "stage_exit": "STAGE=ubs EXIT=1",
+      "status": "failed",
+      "qualification": "Sampled findings are not proof that all findings are false positives. One new reporter subprocess timeout was fixed afterward and was not rescanned."
+    }
+  ],
+  "not_executed": [
+    "Full production crate compilation or test suite",
+    "Host/watch/cache, raw-mirror and canonical-storage regression runtime lanes",
+    "Real CLI20MB +0.5MB still/reopen/held reproduction",
+    "Post-fix semantic frontier, source ordering, cache fallback and admission-failure regression tests",
+    "Post-fix rustfmt, Clippy and UBS",
+    "Merged upstream raw-mirror append regression",
+    "Final integration with upstream native web actions, streaming fingerprints, and FIFO-safe source admission"
+  ],
+  "environment_loss": {
+    "known": true,
+    "compiler_or_scanner_active": false,
+    "cause": "unknown",
+    "impact": "No further native execution; follow-up source reviewed and recovered through GitHub/Library. Original candidate bundle is durable; later raw execution logs were in the unavailable workspace."
+  },
+  "qualification": "Runtime evidence applies only to the exact frozen original candidate and explicitly named diagnostic snapshots. Later integrated edits are source-reviewed only. No full integration, release, real-watch latency, cross-platform or broad Bead completion claim.",
+  "followup_run_metadata": {
+    "status": "Execution environment became unavailable after completed runs; no post-fix native qualification",
+    "baseline_commit": "710435869716073a3b5aa015ad3f9872426e2e4a",
+    "fad_revision": "a0dd013a8c1e374d6a80949637e5e51cbb45550b",
+    "measured_compile": {
+      "command": "cargo check --locked --offline --no-default-features --lib",
+      "worktree": "validation/candidate-7-final",
+      "compiler_stack_bytes": 16777216,
+      "actual_test_stack_bytes": 134217728,
+      "address_space_cap_bytes": 34359738368,
+      "cargo_jobs": 1,
+      "rustflags": "-Z threads=1",
+      "aggregate_rss_cap_kib": 5242880,
+      "mem_available_minimum_kib": 2097152,
+      "sample_interval_ms": 100,
+      "duration_seconds": 70.448,
+      "initial_mem_available_kib": 7813924,
+      "lowest_mem_available_kib": 2096540,
+      "peak_aggregate_rss_kib": 5239540,
+      "peak_aggregate_vas_kib": 7836360,
+      "rustc_asupersync_peak_rss_kib": 5101944,
+      "rustc_asupersync_peak_vas_kib": 7440108,
+      "rustc_asupersync_peak_threads": 3,
+      "stopped_by": "Our watchdog: MemAvailable fell below2GiB",
+      "cargo_exit_signal": "SIGTERM (-15)",
+      "dsr_check_exit": 125,
+      "dependency_reached": "asupersync0.5.0",
+      "cass_reached": false,
+      "receipt": "validation/dsr-logs/cass-prefix-measured-full-check/20261124T002309-JXMr9sjq/receipt.json",
+      "raw_trace": "validation/followup-measured-check/memory.jsonl",
+      "result": "validation/followup-measured-check/result.json"
+    },
+    "projection_before": {
+      "source_inputs_frozen": 42,
+      "worktree": "validation/followup-projection-before",
+      "production_logic_changed": false,
+      "native_passed": 238,
+      "failed": 3,
+      "ignored": 1,
+      "failures": [
+        [
+          "active_user_event_frontier_can_finish_as_a_paired_response_on_the_next_scan",
+          "source_changed: Codex message projection changed before its published boundary; source reconciliation is required"
+        ],
+        [
+          "enrichment_occurrences_keep_source_order_across_equal_and_older_timestamps",
+          "source_changed: Codex message projection changed before its published boundary; source reconciliation is required"
+        ],
+        [
+          "inactive_policy_can_finalize_an_unpaired_user_event_without_altering_earlier_messages",
+          "projection_tests.rs:108 expected1message, actual2"
+        ]
+      ],
+      "receipt": "validation/dsr-logs/cass-codex-prefix-contract/20261124T002917-qse8ayaK/receipt.json",
+      "source_unchanged": true,
+      "config_unchanged": true,
+      "post_fix_executed": false
+    },
+    "ubs": {
+      "scope": "Exact unmodified UBS stage and actual changed-file selection from scripts/gate.sh; full batch not claimed",
+      "version": "v5.4.4",
+      "commit": "fc05825ed970a3928f71bfa083a1d703e4429b1a",
+      "runner_sha256": "bdeccbb35f2056e6177c73b3f0f9966d20d1cbeff22b7f084133c4a6ac625ee2",
+      "contract_sha256": "7319b2e5e085d0dd2434e5114291b2dee9fbbb96e2cfe02027eb263abcb06ac3",
+      "ast_grep_version": "0.51.3",
+      "ast_grep_asset_sha256": "22803eb0c5bf83164fb7fd76d4721d355ecf0c8466ef47342c1ec7d80897ca47",
+      "ast_grep_binary_sha256": "9abc33cdb0e75c909bead3cefb94deccb1e4d71751392ff5f5bff7d1d09d6861",
+      "actual_rust_ast_probe": "passed",
+      "files": 27,
+      "rust_files": 24,
+      "python_files": 3,
+      "critical": 86,
+      "warnings": 22542,
+      "info": 5421,
+      "stage": "STAGE=ubs EXIT=1",
+      "gate_passed": false,
+      "receipt": "validation/dsr-logs/cass-prefix-ubs-cached/20261124T003209-QCt8Lc4a/receipt.json",
+      "critical_categories": {
+        "rust_panic_macros": 70,
+        "rust_possible_hardcoded_secrets": 8,
+        "rust_constant_time_comparisons": 2,
+        "rust_shell_command_c": 3,
+        "rust_dynamic_executable": 1,
+        "python_environment_to_subprocess": 2
+      },
+      "qualifications": [
+        "Sampled panic findings are test assertions; full70 not independently classified",
+        "Shown hardcoded-secret samples are existing token_daily_stats table-name constants",
+        "Shown timing comparisons include DiscoveredSourceRole equality and workspace policy fingerprint",
+        "No blanket suppression and no assertion that every finding is a false positive",
+        "Root fixed real new reporter warning by bounding --version subprocess with timeout15",
+        "Initial cold loader was interrupted before scanning because it serially acquired348helpers; no terminal DSR receipt for that interruption, explicit interruption record was saved"
+      ],
+      "cold_interruption": "validation/followup-pinned-ubs/acquisition-interruption.json"
+    },
+    "upstream_preflight": {
+      "patch_sha256": "81bcc8d9bc66dfae11d29b3aa7fb7e7e61d1f8be9c583fca1bb36fd9e14725cc",
+      "result": "failed: src/raw_mirror/policy.rs:846 patch does not apply",
+      "files_modified_by_preflight": false,
+      "receipt": "validation/dsr-logs/cass-prefix-upstream-preflight/20261124T003616-zlGeoOh3/receipt.json",
+      "later_action_by_root": "Root applied13unconflicted files and manually merged policy.rs; new source not yet formatted/snapshotted by validation agent"
+    },
+    "unexecuted_current_changes": [
+      "Semantic prompt frontier and source-occurrence ordering with twelve regressions, scoped to a live private snapshot",
+      "Bounded exact-key receipt lookup for incomplete watch caches",
+      "Source-local admission failure isolation, including direct budget-only admission errors",
+      "Upstream raw source/header-lock overlap integration and concurrent-append raw regression",
+      "Integration with current native web-action handling, streaming raw fingerprints and nonblocking source opener",
+      "Post-fix full CASS host/raw/storage tests, compiler, formatter, Clippy and UBS"
+    ],
+    "environment_loss": "No compiler or scanner remained active at notification; cause unconfirmed."
+  },
+  "integration": {
+    "source_only": true,
+    "upstream_reviewed_through": "4d060bf9ba16c13482aaee2397d2b238894358fd",
+    "projection_regressions": 12,
+    "verification": "Exact-context source integration, Git blob identity verification, and independent source review. No post-fix native execution.",
+    "unchanged_contracts": [
+      "Pinned toolchain and dependencies",
+      "Strict non-prefix snapshot routes",
+      "Existing inactivity and abandoned-tail recovery",
+      "Raw-mirror privacy and retention policy",
+      "No GitHub Actions or workflow additions"
+    ],
+    "remaining_limits": [
+      "No full production build qualification",
+      "UBS gate remains red",
+      "No real CLI still/reopen/held runtime",
+      "Unix regular plain JSONL only",
+      "Advisory locks still defer",
+      "Non-monotonic published projections require reconciliation"
+    ],
+    "reviewed_upstream_tree": "edfeecedf582997abfe0246dae1ca10b3f84ccc5",
+    "fifo_merge": "Both upstream source-admission patches reconstruct their exact preimages, apply uniquely to the candidate, and reverse to the candidate byte-for-byte. Existing upstream FIFO/symlink tests preserved; no post-merge native execution.",
+    "source_files": [
+      {
+        "path": "README.md",
+        "git_blob_sha1": "bc09b40db5b9ef617814f2915cc3e2bf3d0dbb43",
+        "mode": "100644"
+      },
+      {
+        "path": "scripts/test_codex_contract.py",
+        "git_blob_sha1": "553a9afc796d9564886c026843d64d371efc4daa",
+        "mode": "100755"
+      },
+      {
+        "path": "scripts/tests/codex_growing_repro.py",
+        "git_blob_sha1": "a821a1b07a2329ff7a836fcbcf65b1c1e4783d19",
+        "mode": "100644"
+      },
+      {
+        "path": "scripts/tests/test_codex_contract_harness.py",
+        "git_blob_sha1": "e122d186c768980d604e0540e67436897f126494",
+        "mode": "100644"
+      },
+      {
+        "path": "src/connectors/source_dependencies/observation.rs",
+        "git_blob_sha1": "3e06f9116eabb9b9372d327e8e575b1c36a22a51",
+        "mode": "100644"
+      },
+      {
+        "path": "src/indexer/mod.rs",
+        "git_blob_sha1": "d50badab3957454849e32296c97e2571133d12b1",
+        "mode": "100644"
+      },
+      {
+        "path": "src/indexer/source_ledger_tests.rs",
+        "git_blob_sha1": "c210f1a2d25d310f1dbbc55aec8f96054889f07a",
+        "mode": "100644"
+      },
+      {
+        "path": "src/indexer/watch_source_cache.rs",
+        "git_blob_sha1": "c716886aa1b258c762225d126f9840fad65942e8",
+        "mode": "100644"
+      },
+      {
+        "path": "src/indexer/watch_source_ledger.rs",
+        "git_blob_sha1": "c8c5e1388de3f7c9019c7bfcc14e4ef1f2cfd1bf",
+        "mode": "100644"
+      },
+      {
+        "path": "src/indexer/watch_source_ledger_tests.rs",
+        "git_blob_sha1": "d3296a117c8af4c7506c7df467ad58a80c5a62a5",
+        "mode": "100644"
+      },
+      {
+        "path": "src/raw_mirror.rs",
+        "git_blob_sha1": "f0a7ca27a4d384892d3701fb43222c8c6fdf740a",
+        "mode": "100644"
+      },
+      {
+        "path": "src/raw_mirror/append_tests.rs",
+        "git_blob_sha1": "b34b55e1951973a5fea0f730b4e3942cf0d9ba00",
+        "mode": "100644"
+      },
+      {
+        "path": "src/raw_mirror/policy.rs",
+        "git_blob_sha1": "b76add9a127b330bdeb0662fb9699094c09f7a0d",
+        "mode": "100644"
+      },
+      {
+        "path": "src/raw_mirror/prefix_tests.rs",
+        "git_blob_sha1": "089412180100912e7ffe37bb91216a60cc63840d",
+        "mode": "100644"
+      },
+      {
+        "path": "src/storage/sqlite.rs",
+        "git_blob_sha1": "19d4a56c2bac8d6b2adebcae6c19c7193387a6f6",
+        "mode": "100644"
+      },
+      {
+        "path": "src/storage/sqlite/codex_prefix_tests.rs",
+        "git_blob_sha1": "1f4ef36acc31ccd4060b143a0eacae78cb7b1aa0",
+        "mode": "100644"
+      },
+      {
+        "path": "tests/codex_stable_prefix.rs",
+        "git_blob_sha1": "7434e5c55d4646cdb705a75716c8149eab8d9d12",
+        "mode": "100644"
+      },
+      {
+        "path": "tests/connector_codex.rs",
+        "git_blob_sha1": "46f21e319481919cadd3f3e0811cbf1206c4f453",
+        "mode": "100644"
+      },
+      {
+        "path": "src/connectors/codex/stable_prefix.rs",
+        "git_blob_sha1": "43d84b7790fbd6bd286c6249325aa0d0cd54a2b2",
+        "mode": "100644"
+      },
+      {
+        "path": "src/connectors/codex/stable_prefix/tests.rs",
+        "git_blob_sha1": "484282dd7651d9cd0fa4f3177d74fadf2b41f0df",
+        "mode": "100644"
+      },
+      {
+        "path": "src/connectors/codex.rs",
+        "git_blob_sha1": "ca12a092f35293a2f0f70a4d79c026fdc0de6f6d",
+        "mode": "100644"
+      },
+      {
+        "path": "src/connectors/codex/archives/tests.rs",
+        "git_blob_sha1": "893d1a13f8515468cad12acc75271da24627eb96",
+        "mode": "100644"
+      },
+      {
+        "path": "src/connectors/codex/implementation.rs",
+        "git_blob_sha1": "395b51146f5e3b06aa0f280e21a47bd026c22be7",
+        "mode": "100644"
+      },
+      {
+        "path": "src/connectors/codex/source_budget/recovery.rs",
+        "git_blob_sha1": "dc98d3a2c1f1f6ac9616f589c78393c24fbb0f31",
+        "mode": "100644"
+      },
+      {
+        "path": "src/connectors/codex/source_budget/recovery/contract_tests.rs",
+        "git_blob_sha1": "7f94668d22fcec042fd4bf0caffea4b333f9ab04",
+        "mode": "100644"
+      },
+      {
+        "path": "src/connectors/codex/source_budget/recovery/resume_tests.rs",
+        "git_blob_sha1": "a4d35be30980cc4994b6674b0eb7fe273966a97c",
+        "mode": "100644"
+      },
+      {
+        "path": "src/connectors/codex/source_budget/recovery/tests.rs",
+        "git_blob_sha1": "ba293b59c6c08fa6ffc1bbd72050b2a9b5c7a176",
+        "mode": "100644"
+      },
+      {
+        "path": "src/connectors/codex/source_budget/snapshot.rs",
+        "git_blob_sha1": "215419bf862776ec6aa4584e3e669e4803ef9d85",
+        "mode": "100644"
+      },
+      {
+        "path": "src/connectors/codex/source_budget.rs",
+        "git_blob_sha1": "a3e9b0431db9e04592468edaa6434b3d91c43aef",
+        "mode": "100644"
+      },
+      {
+        "path": "src/connector_ingest_diagnostics.rs",
+        "git_blob_sha1": "9211296b5690bd4b2be59aedc9c564f6c025bdbc",
+        "mode": "100644"
+      },
+      {
+        "path": "src/connectors/codex/implementation/message_order.rs",
+        "git_blob_sha1": "aa115e69556578e08a6945e421e8e05bb89b4c0c",
+        "mode": "100644"
+      },
+      {
+        "path": "src/connectors/codex/stable_prefix/tail.rs",
+        "git_blob_sha1": "92c8ee98571dfbd39497ba242ad5f4cb9a0020c8",
+        "mode": "100644"
+      },
+      {
+        "path": "src/connectors/codex/stable_prefix/projection_tests.rs",
+        "git_blob_sha1": "9b124140c8d845c9fa04ae75469c032e49385a00",
+        "mode": "100644"
+      }
+    ],
+    "implementation_notes": {
+      "path": "docs/planning/CODEX_STABLE_PREFIX_INGEST_2026-11-23.md",
+      "git_blob_sha1": "c08d4fa597acc80a715cfd6891771ef608baa776"
+    },
+    "changed_paths_including_this_record": 35
+  }
+}

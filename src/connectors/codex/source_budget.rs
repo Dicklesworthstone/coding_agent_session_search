@@ -15,7 +15,7 @@ mod empty_source;
 mod recovery;
 mod snapshot;
 
-pub(crate) use recovery::{SourceFailureReason, for_each_source_failure};
+pub(crate) use recovery::{SourceAdmissionFailures, SourceFailureReason, for_each_source_failure};
 pub(crate) use snapshot::{can_attempt_active_jsonl_source, guarded_active_jsonl_source};
 
 use std::cell::RefCell;

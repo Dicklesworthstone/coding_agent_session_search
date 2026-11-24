@@ -1,7 +1,9 @@
 use super::*;
 use crate::connectors::codex::CodexConnector;
 use franken_agent_detection::{Origin, Platform, SourceCompletion, SourceScanHooks};
+use std::io::Write;
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 
 const ACTIVE: &str = "rollout-2026-09-18T12-00-00-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl";
 const ARCHIVED: &str = "rollout-2026-09-17T12-00-00-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl";
@@ -56,7 +58,30 @@ fn assert_routes(ctx: &ScanContext, expected: &[PathBuf]) -> Result<()> {
         true
     };
     let mut complete = |done: &SourceCompletion| {
-        assert!(inventory.contains(&done.source));
+        let mut original = inventory
+            .iter()
+            .find(|source| source.source_path == done.source.source_path)
+            .expect("completion must preserve an admitted original source")
+            .clone();
+        if let Some(receipt) =
+            crate::connectors::codex::current_prefix_receipt(&done.source.source_path)
+        {
+            receipt.validate_source()?;
+            assert_eq!(
+                receipt.committed_bytes,
+                fs::metadata(&original.source_path)?.len()
+            );
+            if receipt.partial {
+                // The original path, root, role and remote provenance still
+                // match exactly. Only whole-file metadata authority is absent.
+                original.size_bytes = None;
+                original.modified_at_ms = None;
+                assert!(done.source.fs_metadata_changed());
+            } else {
+                assert!(!done.source.fs_metadata_changed());
+            }
+        }
+        assert_eq!(done.source, original);
         assert_eq!(done.conversations_emitted, 1);
         completed.push(done.source.source_path.clone());
         Ok(())
@@ -201,6 +226,108 @@ fn remote_archive_provenance_and_scoped_ids_are_preserved() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn unfinished_archive_does_not_hide_active_or_other_archived_history() -> Result<()> {
+    let (temp, home, paths) = fixture()?;
+    let broken = home.join(ARCHIVE).join("rollout-incomplete.jsonl");
+    let prefix = message("unfinished archive");
+    let later = message("finished archive");
+    let cut = later.len() - 3;
+    let bytes = format!("{prefix}{}", &later[..cut]);
+    fs::write(&broken, &bytes)?;
+    let ctx = ScanContext::with_roots(temp.path().join("cass"), vec![ScanRoot::local(home)], None);
+    let mut delivered = Vec::new();
+    CodexConnector::new().scan_with_callback(&ctx, &mut |item| {
+        delivered.push(item);
+        Ok(())
+    })?;
+    let initial = delivered
+        .iter()
+        .find(|item| item.source_path == broken)
+        .unwrap();
+    assert_eq!(initial.messages.len(), 1);
+    assert_eq!(initial.messages[0].content, "unfinished archive");
+    let receipt = initial
+        .metadata
+        .pointer("/cass/codex_stable_prefix")
+        .unwrap();
+    assert_eq!(receipt["committed_bytes"], prefix.len() as u64);
+    assert_eq!(receipt["admitted_bytes"], bytes.len() as u64);
+    assert_eq!(receipt["partial"], true);
+    let previous = serde_json::json!({"codex_prefix": receipt}).to_string();
+    let original_id = initial.external_id.clone();
+    let mut observed: Vec<_> = delivered
+        .iter()
+        .map(|item| item.source_path.clone())
+        .collect();
+    observed.sort();
+    let mut expected = paths.clone();
+    expected.push(broken.clone());
+    expected.sort();
+    assert_eq!(observed, expected);
+    assert_eq!(fs::read_to_string(&broken)?, bytes);
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&broken)?
+        .write_all(&later.as_bytes()[cut..])?;
+    fs::File::open(&broken)?.set_modified(SystemTime::now() - Duration::from_secs(7200))?;
+    let mut completed = Vec::new();
+    let mut before = |source: &DiscoveredSourceFile| {
+        if source.source_path == broken {
+            crate::connectors::codex::set_previous_prefix_receipt(&broken, Some(&previous))
+                .unwrap();
+        }
+        true
+    };
+    let mut complete = |done: &SourceCompletion| {
+        completed.push(done.source.source_path.clone());
+        Ok(())
+    };
+    let mut finished = Vec::new();
+    CodexConnector::new().scan_with_source_boundaries(
+        &ctx,
+        &mut SourceScanHooks {
+            should_scan_source: Some(&mut before),
+            on_source_complete: Some(&mut complete),
+        },
+        &mut |item| {
+            finished.push(item);
+            Ok(())
+        },
+    )?;
+    completed.sort();
+    assert_eq!(completed, expected);
+    let final_archive = finished
+        .iter()
+        .find(|item| item.source_path == broken)
+        .unwrap();
+    assert_eq!(final_archive.external_id, original_id);
+    assert_eq!(
+        final_archive
+            .messages
+            .iter()
+            .map(|item| item.content.as_str())
+            .collect::<Vec<_>>(),
+        ["unfinished archive", "finished archive"]
+    );
+    assert_eq!(
+        final_archive
+            .metadata
+            .pointer("/cass/codex_stable_prefix/partial"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    let repeated = CodexConnector::new().scan(&ctx)?;
+    assert_eq!(
+        serde_json::to_value(&finished)?,
+        serde_json::to_value(&repeated)?
+    );
+    assert_eq!(fs::read_to_string(&broken)?, format!("{prefix}{later}"));
+    Ok(())
+}
+
+#[cfg(not(unix))]
 #[test]
 fn unfinished_archive_does_not_hide_active_or_other_archived_history() -> Result<()> {
     let (temp, home, paths) = fixture()?;
@@ -224,6 +351,46 @@ fn unfinished_archive_does_not_hide_active_or_other_archived_history() -> Result
     expected.sort();
     assert_eq!(delivered, expected);
     assert_eq!(fs::read_to_string(broken)?, bytes);
+    Ok(())
+}
+
+#[test]
+fn invalid_archive_record_encoding_remains_a_source_error_and_preserves_neighbors() -> Result<()> {
+    let (temp, home, paths) = fixture()?;
+    let broken = home.join(ARCHIVE).join("rollout-invalid-encoding.jsonl");
+    let bytes = [message("unpublishable archive").as_bytes(), b"\xff\n"].concat();
+    fs::write(&broken, &bytes)?;
+    let ctx = ScanContext::with_roots(temp.path().join("cass"), vec![ScanRoot::local(home)], None);
+    let mut delivered = Vec::new();
+    let mut completed = Vec::new();
+    let mut complete = |done: &SourceCompletion| {
+        completed.push(done.source.source_path.clone());
+        Ok(())
+    };
+    let error = CodexConnector::new()
+        .scan_with_source_boundaries(
+            &ctx,
+            &mut SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut complete),
+            },
+            &mut |item| {
+                delivered.push(item.source_path);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<io::Error>().unwrap().kind(),
+        io::ErrorKind::InvalidData
+    );
+    let mut expected = paths;
+    expected.sort();
+    delivered.sort();
+    completed.sort();
+    assert_eq!(delivered, expected);
+    assert_eq!(completed, expected);
+    assert_eq!(fs::read(broken)?, bytes);
     Ok(())
 }
 
@@ -335,6 +502,11 @@ fn archive_inventory_reuses_completed_sources_and_admits_new_old_mtime_moves() -
     use std::collections::HashMap;
 
     let (temp, home, paths) = fixture()?;
+    for path in &paths {
+        // This regression is about reuse of complete inactive files. Recent
+        // prefix publications deliberately do not grant that authority.
+        fs::File::open(path)?.set_modified(SystemTime::now() - Duration::from_secs(7200))?;
+    }
     let mut ctx = ScanContext::with_roots(
         temp.path().join("cass"),
         vec![ScanRoot::local(home.clone())],
@@ -362,6 +534,12 @@ fn archive_inventory_reuses_completed_sources_and_admits_new_old_mtime_moves() -
             true
         };
         let mut complete = |done: &SourceCompletion| {
+            if let Some(receipt) =
+                crate::connectors::codex::current_prefix_receipt(&done.source.source_path)
+            {
+                assert!(!receipt.partial);
+            }
+            assert!(!done.source.fs_metadata_changed());
             ledger
                 .borrow_mut()
                 .insert(done.source.source_path.clone(), done.source.clone());
@@ -392,6 +570,57 @@ fn archive_inventory_reuses_completed_sources_and_admits_new_old_mtime_moves() -
                 assert!(delivered.is_empty());
             }
         }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn recent_archive_prefixes_cannot_be_reused_as_whole_file_observations() -> Result<()> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    let (temp, home, paths) = fixture()?;
+    let ctx = ScanContext::with_roots(temp.path().join("cass"), vec![ScanRoot::local(home)], None);
+    let ledger = RefCell::new(HashMap::<PathBuf, DiscoveredSourceFile>::new());
+    for _ in 0..2 {
+        let mut admitted = Vec::new();
+        let mut before = |source: &DiscoveredSourceFile| {
+            assert_ne!(
+                ledger.borrow().get(&source.source_path),
+                Some(source),
+                "a recent prefix must not match a whole-source admission"
+            );
+            admitted.push(source.source_path.clone());
+            true
+        };
+        let mut complete = |done: &SourceCompletion| {
+            let receipt =
+                crate::connectors::codex::current_prefix_receipt(&done.source.source_path)
+                    .expect("recent plain rollout must carry typed prefix evidence");
+            assert!(receipt.partial);
+            assert!(done.source.fs_metadata_changed());
+            assert_eq!(done.source.size_bytes, None);
+            assert_eq!(done.source.modified_at_ms, None);
+            ledger
+                .borrow_mut()
+                .insert(done.source.source_path.clone(), done.source.clone());
+            Ok(())
+        };
+        let mut delivered = Vec::new();
+        CodexConnector::new().scan_with_source_boundaries(
+            &ctx,
+            &mut SourceScanHooks {
+                should_scan_source: Some(&mut before),
+                on_source_complete: Some(&mut complete),
+            },
+            &mut |item| {
+                delivered.push(item);
+                Ok(())
+            },
+        )?;
+        assert_eq!(admitted, paths);
+        assert_eq!(delivered.len(), paths.len());
     }
     Ok(())
 }

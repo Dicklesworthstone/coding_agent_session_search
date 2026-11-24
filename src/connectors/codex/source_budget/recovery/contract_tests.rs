@@ -50,6 +50,9 @@ fn custom_remote_roots_keep_distinct_ids_and_original_provenance() -> Result<()>
         let directory = mirror.join(name);
         fs::create_dir_all(&directory)?;
         fs::write(directory.join("rollout-same.jsonl"), message(name))?;
+        // This test compares complete EOF identities, not partial receipts.
+        fs::File::open(directory.join("rollout-same.jsonl"))?
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))?;
     }
     let ctx = ScanContext::with_roots(
         root.path().join("cass"),
@@ -205,6 +208,143 @@ fn reports_bound_samples_and_preserve_budget_only_schema() -> Result<()> {
         assert_eq!(json["omitted_source_count"], 8);
     }
     Ok(())
+}
+
+#[test]
+fn host_admission_failures_bound_samples_and_preserve_typed_causes() -> Result<()> {
+    let path = PathBuf::from("private\n\"rollout.jsonl");
+    let source = DiscoveredSourceFile::new(
+        "codex", &ScanRoot::local(path.clone()), path.clone(),
+        DiscoveredSourceRole::PrimarySessionLog, true,
+    );
+    let mut admissions = SourceAdmissionFailures::default();
+    for index in 0..MAX_REJECTION_SAMPLES + 8 {
+        let error = if index % 2 == 0 {
+            io::Error::new(io::ErrorKind::Interrupted, "raw-private-body").into()
+        } else {
+            anyhow::anyhow!("raw-private-body")
+        };
+        admissions.record(&source, error);
+    }
+    let error = admissions.finish(Ok(())).unwrap_err();
+    let summary = error.to_string();
+    assert!(!summary.contains('\n'));
+    assert!(!summary.contains("raw-private-body"));
+    let json: serde_json::Value = serde_json::from_str(
+        summary.strip_prefix("Codex scan incomplete: ").unwrap(),
+    )?;
+    assert_eq!(json["reason"], "source_admission_failures");
+    assert_eq!(json["failed_source_count"], MAX_REJECTION_SAMPLES + 8);
+    assert_eq!(json["omitted_source_count"], 8);
+    let mut observed = Vec::new();
+    assert!(for_each_source_failure(&error, |path, reason| {
+        observed.push((path.to_path_buf(), reason));
+    }));
+    assert_eq!(observed.len(), MAX_REJECTION_SAMPLES);
+    for (index, (observed_path, reason)) in observed.iter().enumerate() {
+        assert_eq!(observed_path, &path);
+        assert_eq!(*reason, if index % 2 == 0 {
+            SourceFailureReason::SourceChanged
+        } else {
+            SourceFailureReason::InvalidSourceData
+        });
+    }
+    Ok(())
+}
+
+#[test]
+fn host_admission_failures_keep_parser_and_budget_sibling_evidence() {
+    let admission_path = PathBuf::from("rollout-a-prior-proof.jsonl");
+    let parser_path = PathBuf::from("rollout-b-parser.jsonl");
+    let source = |path: &PathBuf| DiscoveredSourceFile::new(
+        "codex", &ScanRoot::local(path.clone()), path.clone(),
+        DiscoveredSourceRole::PrimarySessionLog, true,
+    );
+    for budget_only in [false, true] {
+        let mut admissions = SourceAdmissionFailures::default();
+        admissions.record(&source(&admission_path),
+            io::Error::new(io::ErrorKind::Interrupted, "changed prefix").into());
+        let mut parser = Failures::default();
+        let parser_error = if budget_only {
+            IncompleteScan {
+                rejected_source_count: 1,
+                rejected_sources: vec![RejectedSource {
+                    source_path: parser_path.to_string_lossy().into_owned(),
+                    observed_bytes: super::super::MAX_AUGMENT_ROLLOUT_BYTES + 1,
+                    limit_bytes: None,
+                }],
+                ..IncompleteScan::default()
+            }.into()
+        } else {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "unfinished sibling").into()
+        };
+        parser.record(&source(&parser_path), parser_error);
+        let error = admissions.finish(parser.finish()).unwrap_err();
+        let mut observed = Vec::new();
+        assert!(for_each_source_failure(&error, |path, reason| {
+            observed.push((path.to_path_buf(), reason));
+        }));
+        assert_eq!(observed.len(), 2);
+        assert!(observed.contains(&(admission_path.clone(), SourceFailureReason::SourceChanged)));
+        assert!(observed.contains(&(parser_path.clone(), if budget_only {
+            SourceFailureReason::ReadBudgetExceeded
+        } else {
+            SourceFailureReason::UnfinishedSource
+        })));
+        if budget_only {
+            assert!(error.downcast_ref::<IncompleteScan>().is_some());
+        }
+    }
+}
+
+#[test]
+fn host_admission_failures_keep_direct_typed_budget_refusals() {
+    let path = PathBuf::from("rollout-prior-proof-over-budget.jsonl");
+    let source = DiscoveredSourceFile::new(
+        "codex",
+        &ScanRoot::local(path.clone()),
+        path.clone(),
+        DiscoveredSourceRole::PrimarySessionLog,
+        true,
+    );
+    let mut admissions = SourceAdmissionFailures::default();
+    admissions.record(
+        &source,
+        IncompleteScan {
+            rejected_source_count: 1,
+            rejected_sources: vec![RejectedSource {
+                source_path: path.to_string_lossy().into_owned(),
+                observed_bytes: super::super::MAX_AUGMENT_ROLLOUT_BYTES + 1,
+                limit_bytes: None,
+            }],
+            ..IncompleteScan::default()
+        }
+        .into(),
+    );
+    let error = admissions.finish(Ok(())).unwrap_err();
+    assert!(error.downcast_ref::<IncompleteScan>().is_some());
+    let mut observed = Vec::new();
+    assert!(for_each_source_failure(&error, |path, reason| {
+        observed.push((path.to_path_buf(), reason));
+    }));
+    assert_eq!(observed, [(path, SourceFailureReason::ReadBudgetExceeded)]);
+}
+
+#[test]
+fn host_admission_failures_preserve_terminal_delivery_error_identity() {
+    let source = DiscoveredSourceFile::new(
+        "codex", &ScanRoot::local(PathBuf::from("root")),
+        PathBuf::from("root/rollout-refused.jsonl"),
+        DiscoveredSourceRole::PrimarySessionLog, true,
+    );
+    let mut admissions = SourceAdmissionFailures::default();
+    admissions.record(&source, anyhow::anyhow!("malformed prior evidence"));
+    let error = admissions.finish(Err(io::Error::new(
+        io::ErrorKind::BrokenPipe, "terminal consumer failure",
+    ).into())).unwrap_err();
+    assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), io::ErrorKind::BrokenPipe);
+    assert!(format!("{error:#}").contains("terminal consumer failure"));
+    assert!(SourceAdmissionFailures::default().finish(Ok(())).is_ok());
 }
 
 #[test]

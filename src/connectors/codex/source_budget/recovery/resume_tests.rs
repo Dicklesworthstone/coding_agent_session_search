@@ -12,7 +12,9 @@ use crate::connectors::codex::CodexConnector;
 #[test]
 fn completed_sources_are_reused_while_the_failed_source_retries() -> Result<()> {
     let (_root, paths, mut ctx) = corpus()?;
-    fs::write(&paths[1], format!("{}{{", message("incomplete")))?;
+    // No complete record exists yet, so the source still fails locally while
+    // the settled sibling controls retain their full metadata receipts.
+    fs::write(&paths[1], "{\"type\":\"incomplete\",\"payload\":")?;
     // Model the host's metadata reuse decisions, not its persistence layer.
     let ledger = RefCell::new(HashMap::<PathBuf, DiscoveredSourceFile>::new());
     let connector = CodexConnector::new();
