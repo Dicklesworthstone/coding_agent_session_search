@@ -88,8 +88,13 @@ pub(crate) fn is_sensitive_json_field(key: &str) -> bool {
             | "credential"
             | "credentials"
             | "authorization"
+            | "proxyauthorization"
+            | "httpauthorization"
+            | "httpproxyauthorization"
             | "cookie"
             | "setcookie"
+            | "httpcookie"
+            | "httpsetcookie"
             | "privatekey"
             | "privatekeypem"
             | "secretkeybase"
@@ -156,6 +161,32 @@ pub(crate) const OPENAI_API_KEY_PATTERN: &str =
 pub(crate) const ANTHROPIC_API_KEY_PATTERN: &str =
     r"(?-u:\b)sk-ant-(?:api[0-9]{2}-)?[A-Za-z0-9_-]{19,}[A-Za-z0-9_](?-u:\b)";
 pub(crate) const BEARER_TOKEN_PATTERN: &str = r"(?i)(?-u:\b)Bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}";
+// Authentication schemes carry credentials after a separating space, which
+// the generic assignment pattern cannot cover. Token68 schemes have a narrow
+// payload; parameter schemes occupy the complete logical header value. Only
+// HTTP folded continuations cross a newline, never the next unindented header.
+// An already-redacted payload is not admitted as a credential.
+pub(crate) const HTTP_AUTHORIZATION_PATTERN: &str = concat!(
+    r"(?i)(?-u:\b)(?:http[_-])?(?:proxy[_-])?authorization[ \t]*[:=]",
+    r"(?:[ \t]|\r?\n[ \t]+)*",
+    r"(?:",
+    r"(?:basic|negotiate|ntlm|token)(?:[ \t]|\r?\n[ \t]+)+[A-Za-z0-9._~+/-]+=*|",
+    r"bearer[ \t]*\r?\n[ \t]+[A-Za-z0-9._~+/-]+=*|",
+    r"(?:digest|aws|aws4-hmac-sha256|oauth)(?:[ \t]|\r?\n[ \t]+)+",
+    r"[A-Za-z][^\r\n]*(?:\r?\n[ \t]+[^\r\n]+)*",
+    r")",
+);
+// Cookie headers can carry opaque session credentials with no token prefix.
+// Require an actual cookie-name assignment after the explicit header/CGI key,
+// rather than matching cookie prose. Quoted CGI values retain the existing
+// multiline/truncated-secret policy; unquoted values stop at the next header.
+pub(crate) const HTTP_COOKIE_PATTERN: &str = concat!(
+    r"(?i)(?-u:\b)(?:http[_-])?(?:set[_-])?cookie[ \t]*[:=]",
+    r"(?:[ \t]|\r?\n[ \t]+)*",
+    r#"(?:"[ \t]*[!#$%&'*+.^_\x60|~0-9A-Za-z-]+[ \t]*=(?:\\(?s:.)|[^"\\])*(?:"|(?:\\)?\z)|"#,
+    r#"'[ \t]*[!#$%&'*+.^_\x60|~0-9A-Za-z-]+[ \t]*=(?:\\(?s:.)|[^'\\])*(?:'|(?:\\)?\z)|"#,
+    r"[!#$%&'*+.^_\x60|~0-9A-Za-z-]+[ \t]*=[^\r\n]*(?:\r?\n[ \t]+[^\r\n]+)*)",
+);
 pub(crate) const JWT_PATTERN: &str =
     r"(?-u:\b)eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+(?-u:\b)";
 pub(crate) const PRIVATE_KEY_BLOCK_PATTERN: &str = concat!(
@@ -217,6 +248,14 @@ static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         SecretPattern {
             pattern: BEARER_TOKEN_PATTERN,
             regex: Regex::new(BEARER_TOKEN_PATTERN).expect("bearer token regex"),
+        },
+        SecretPattern {
+            pattern: HTTP_AUTHORIZATION_PATTERN,
+            regex: Regex::new(HTTP_AUTHORIZATION_PATTERN).expect("HTTP authorization regex"),
+        },
+        SecretPattern {
+            pattern: HTTP_COOKIE_PATTERN,
+            regex: Regex::new(HTTP_COOKIE_PATTERN).expect("HTTP cookie regex"),
         },
         // JWT tokens (eyJ...)
         SecretPattern {
@@ -1487,6 +1526,223 @@ mod tests {
         let input = "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature";
         let output = redact_text(input);
         assert!(!output.contains("eyJhbGci"));
+    }
+
+    #[test]
+    fn redacts_http_authentication_without_consuming_the_next_header() -> Result<(), String> {
+        let mut memoized = MemoizingRedactor::with_capacity(16);
+        for header in [
+            "Authorization: Basic dXNlcjpwYXNz",
+            "Proxy-Authorization: Basic dTo=",
+            "HTTP_AUTHORIZATION=NTLM YWJjZGVm",
+            "HTTP_PROXY_AUTHORIZATION=Negotiate YWJjZGVm",
+            "authorization: Token opaque-credential",
+            "Authorization:\r\n Basic dXNlcjpwYXNz",
+            "Authorization: Basic\r\n\tdXNlcjpwYXNz",
+            "Authorization: Bearer\r\n\topaque-credential",
+            "Authorization: Digest username=\"Mufasa\", realm=\"http-auth\", response=\"inert-response\"",
+            "Proxy-Authorization: Digest username=\"Mufasa\",\r\n\tresponse=\"inert-response\"",
+            "Authorization: AWS4-HMAC-SHA256 Credential=inert-id, SignedHeaders=host, Signature=inert-signature",
+            "Authorization: AWS inert-id:inert-signature",
+            "Authorization: OAuth oauth_consumer_key=\"inert-client\", oauth_signature=\"inert-signature\"",
+        ] {
+            let input = format!("café 界\n{header}\r\nX-Public: visible");
+            let expected = "café 界\n[REDACTED]\r\nX-Public: visible";
+            if redact_text(&input) != expected || redact_content(&input) != expected {
+                return Err("HTTP credential or neighboring header was handled incorrectly".into());
+            }
+            // Exercise both cache insertion and reuse through production entry points.
+            for _ in 0..2 {
+                if memoized.redact_text(&input) != expected
+                    || memoized.redact_content(&input) != expected
+                {
+                    return Err("memoized HTTP credential policy diverged".into());
+                }
+            }
+            if redact_content(expected) != expected {
+                return Err("HTTP redaction was not idempotent".into());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn http_authentication_redaction_preserves_noncredential_context() -> Result<(), String> {
+        let input = "curl -H 'Proxy-Authorization: Basic dTo=' --version";
+        if redact_text(input) != "curl -H '[REDACTED]' --version" {
+            return Err("token68 redaction consumed surrounding command syntax".into());
+        }
+        for benign in [
+            "Basic dXNlcjpwYXNz is an example without an authorization field",
+            "authorization_status=Basic dXNlcjpwYXNz",
+            "Authorization: Basic [REDACTED]",
+            "Authorization: Digest [REDACTED]",
+            "Explain basic authentication; café 界",
+        ] {
+            if redact_content(benign) != benign {
+                return Err("HTTP redaction changed noncredential context".into());
+            }
+        }
+        if Regex::new(HTTP_AUTHORIZATION_PATTERN)
+            .map_err(|error| error.to_string())?
+            .is_match("Authorization: [REDACTED]")
+        {
+            return Err("HTTP detector matched an existing redaction marker".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn redacts_structured_proxy_and_cgi_authorization_fields() -> Result<(), String> {
+        let original = serde_json::json!({
+            "Proxy-Authorization": "Basic dXNlcjpwYXNz",
+            "HTTP_AUTHORIZATION": "NTLM YWJjZGVm",
+            "HTTP_PROXY_AUTHORIZATION": "Basic dTo=",
+            "authorization_mode": "Basic",
+            "message_index": 7,
+            "null_header": {"Proxy-Authorization": null}
+        });
+        let expected = serde_json::json!({
+            "Proxy-Authorization": REDACTED,
+            "HTTP_AUTHORIZATION": REDACTED,
+            "HTTP_PROXY_AUTHORIZATION": REDACTED,
+            "authorization_mode": "Basic",
+            "message_index": 7,
+            "null_header": {"Proxy-Authorization": null}
+        });
+        let mut memoized = MemoizingRedactor::with_capacity(16);
+        if redact_json(&original) != expected
+            || memoized.redact_json(&original) != expected
+            || redact_json(&expected) != expected
+        {
+            return Err("structured authorization policy diverged or changed public fields".into());
+        }
+        let encoded = serde_json::Value::String(original.to_string());
+        let protected = redact_json(&encoded);
+        let decoded = serde_json::from_str::<serde_json::Value>(
+            protected
+                .as_str()
+                .ok_or("encoded metadata changed JSON type")?,
+        )
+        .map_err(|error| error.to_string())?;
+        if decoded != expected {
+            return Err("JSON-encoded proxy credentials were not protected".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn redacts_http_cookie_headers_and_cgi_values() -> Result<(), String> {
+        let mut memoized = MemoizingRedactor::with_capacity(16);
+        for header in [
+            "Cookie: session=inert-session; csrf=inert-csrf",
+            "Set-Cookie: __Host-session=\"inert-session\"; Path=/; Secure; HttpOnly; SameSite=Lax",
+            "Cookie: session=\"inert-session\"; csrf=\"inert-csrf\"",
+            "HTTP_COOKIE=session=inert-session; csrf=inert-csrf",
+            "HTTP_COOKIE=\"session=inert-session; csrf=inert-csrf\"",
+            "HTTP_COOKIE='session=inert-session; csrf=inert-csrf'",
+            "HTTP_SET_COOKIE=\"__Host-session=inert-session; HttpOnly\"",
+            "Cookie: session=inert-session;\r\n\tcsrf=inert-csrf",
+            "Set-Cookie:\r\n __Secure-session=inert-session; Secure",
+            "Set-Cookie: session=\"inert-truncated",
+            "Cookie: session=",
+            "cookie: a=1",
+            "HTTP_COOKIE=\"session=inert-session;\ncsrf=inert-csrf\"",
+        ] {
+            let input = format!("café 界\n{header}\r\nX-Public: visible");
+            let expected = "café 界\n[REDACTED]\r\nX-Public: visible";
+            if redact_text(&input) != expected || redact_content(&input) != expected {
+                return Err("HTTP cookie or neighboring header was handled incorrectly".into());
+            }
+            for _ in 0..2 {
+                if memoized.redact_text(&input) != expected
+                    || memoized.redact_content(&input) != expected
+                {
+                    return Err("memoized HTTP cookie policy diverged".into());
+                }
+            }
+            if redact_content(expected) != expected {
+                return Err("HTTP cookie redaction was not idempotent".into());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn http_cookie_redaction_preserves_context_and_masks_truncated_cgi() -> Result<(), String> {
+        for benign in [
+            "Discuss cookie persistence and CSRF validation; café 界",
+            "cookie_count=3",
+            "cookie_recipe=chocolate",
+            "cookies: session=inert-session",
+            "Cookie: [REDACTED]",
+            "Set-Cookie: [REDACTED]",
+            "cookie: \"recommendations for baking\"",
+            "session=inert-session; csrf=inert-csrf",
+        ] {
+            if redact_content(benign) != benign {
+                return Err(
+                    "HTTP cookie policy changed unrelated prose or a redaction marker".into(),
+                );
+            }
+        }
+        let quoted = "HTTP_COOKIE=\"session=inert-session\" --next public";
+        if redact_content(quoted) != "[REDACTED] --next public" {
+            return Err("quoted CGI cookie redaction consumed trailing command syntax".into());
+        }
+        for truncated in [
+            "HTTP_COOKIE=\"session=inert-truncated\nstill-private",
+            "HTTP_COOKIE='session=inert-truncated\nstill-private",
+            "HTTP_COOKIE=\"session=inert-truncated\\",
+        ] {
+            if redact_content(truncated) != REDACTED {
+                return Err("truncated CGI cookie retained private suffix bytes".into());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn redacts_structured_http_cookie_fields() -> Result<(), String> {
+        let original = serde_json::json!({
+            "Cookie": "session=inert-session; csrf=inert-csrf",
+            "Set-Cookie": "__Host-session=inert-session; Secure",
+            "HTTP_COOKIE": "session=inert-session",
+            "HTTP_SET_COOKIE": ["session=inert-session", "csrf=inert-csrf"],
+            "cookie_count": 2,
+            "cookie_policy": "same-origin",
+            "null_header": {"HTTP_COOKIE": null}
+        });
+        let expected = serde_json::json!({
+            "Cookie": REDACTED,
+            "Set-Cookie": REDACTED,
+            "HTTP_COOKIE": REDACTED,
+            "HTTP_SET_COOKIE": REDACTED,
+            "cookie_count": 2,
+            "cookie_policy": "same-origin",
+            "null_header": {"HTTP_COOKIE": null}
+        });
+        let mut memoized = MemoizingRedactor::with_capacity(16);
+        if redact_json(&original) != expected
+            || memoized.redact_json(&original) != expected
+            || redact_json(&expected) != expected
+        {
+            return Err(
+                "structured HTTP cookie policy changed credentials or public metadata".into(),
+            );
+        }
+        let encoded = serde_json::Value::String(original.to_string());
+        let protected = redact_json(&encoded);
+        let decoded = serde_json::from_str::<serde_json::Value>(
+            protected
+                .as_str()
+                .ok_or("encoded cookie metadata changed JSON type")?,
+        )
+        .map_err(|error| error.to_string())?;
+        if decoded != expected {
+            return Err("JSON-encoded HTTP cookies were not protected".into());
+        }
+        Ok(())
     }
 
     #[test]

@@ -1757,6 +1757,98 @@ mod tests {
     }
 
     #[test]
+    fn export_privacy_protects_http_headers_and_honors_explicit_consent() -> Result<(), String> {
+        let original = serde_json::json!({
+            "role": "tool",
+            "message_index": 7,
+            "content": "café 界\nAuthorization: Basic dXNlcjpwYXNz\r\nX-Public: visible",
+            "headers": {
+                "Proxy-Authorization": "Digest username=\"Mufasa\", response=\"inert-response\"",
+                "Accept": "application/json"
+            }
+        });
+        let mut messages = [original.clone()];
+        let mut title = Some("HTTP_AUTHORIZATION=Basic dTo=".to_owned());
+        let mut privacy = ExportPrivacy::new(false);
+        privacy.redact_messages(&mut messages);
+        privacy.redact_optional_text(&mut title);
+        if messages[0]["content"] != "café 界\n[REDACTED]\r\nX-Public: visible"
+            || messages[0]["headers"]["Proxy-Authorization"] != "[REDACTED]"
+            || messages[0]["headers"]["Accept"] != "application/json"
+            || messages[0]["message_index"] != 7
+            || messages[0]["role"] != "tool"
+            || title.as_deref() != Some("[REDACTED]")
+            || privacy.metadata()["redaction_applied"] != true
+        {
+            return Err(
+                "default export did not protect HTTP credentials and public identity".into(),
+            );
+        }
+        let protected = messages.clone();
+        let mut repeated = ExportPrivacy::new(false);
+        repeated.redact_messages(&mut messages);
+        if messages != protected || repeated.metadata()["redaction_applied"] != false {
+            return Err("already-protected export was changed again".into());
+        }
+
+        let mut raw = [original.clone()];
+        let mut consented = ExportPrivacy::new(true);
+        consented.redact_messages(&mut raw);
+        if raw[0] != original
+            || consented.metadata()["redaction_applied"] != false
+            || consented.metadata()["sensitive_output"] != true
+        {
+            return Err("explicit include-secrets policy was not preserved".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn export_privacy_protects_http_cookie_headers_and_honors_consent() -> Result<(), String> {
+        let original = serde_json::json!({
+            "role": "tool",
+            "message_index": 8,
+            "content": "café 界\nCookie: session=inert-session; csrf=inert-csrf\r\nX-Public: visible",
+            "headers": {
+                "HTTP_SET_COOKIE": ["__Host-session=inert-session; Secure", "csrf=inert-csrf"],
+                "Accept": "application/json"
+            }
+        });
+        let mut messages = [original.clone()];
+        let mut title = Some("Set-Cookie: __Host-session=\"inert-session\"; HttpOnly".to_owned());
+        let mut privacy = ExportPrivacy::new(false);
+        privacy.redact_messages(&mut messages);
+        privacy.redact_optional_text(&mut title);
+        if messages[0]["content"] != "café 界\n[REDACTED]\r\nX-Public: visible"
+            || messages[0]["headers"]["HTTP_SET_COOKIE"] != "[REDACTED]"
+            || messages[0]["headers"]["Accept"] != "application/json"
+            || messages[0]["message_index"] != 8
+            || messages[0]["role"] != "tool"
+            || title.as_deref() != Some("[REDACTED]")
+            || privacy.metadata()["redaction_applied"] != true
+        {
+            return Err("default export did not protect HTTP cookies and public identity".into());
+        }
+        let protected = messages.clone();
+        let mut repeated = ExportPrivacy::new(false);
+        repeated.redact_messages(&mut messages);
+        if messages != protected || repeated.metadata()["redaction_applied"] != false {
+            return Err("already-protected cookie export was changed again".into());
+        }
+
+        let mut raw = [original.clone()];
+        let mut consented = ExportPrivacy::new(true);
+        consented.redact_messages(&mut raw);
+        if raw[0] != original
+            || consented.metadata()["redaction_applied"] != false
+            || consented.metadata()["sensitive_output"] != true
+        {
+            return Err("explicit cookie include-secrets policy was not preserved".into());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn export_privacy_preserves_benign_text_and_marks_explicit_raw_output() {
         let benign = serde_json::json!({"content": "Discuss password rotation; café 界", "idx": 3});
         let mut messages = [benign.clone()];

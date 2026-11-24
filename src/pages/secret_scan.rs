@@ -5,8 +5,9 @@ use crate::franken_sync::params;
 use crate::indexer::redact_secrets::{
     ANTHROPIC_API_KEY_PATTERN, AWS_ACCESS_KEY_PATTERN, AWS_SECRET_KEY_PATTERN,
     AWS_SESSION_TOKEN_PATTERN, BEARER_TOKEN_PATTERN, DATABASE_URL_PATTERN,
-    GENERIC_SECRET_ASSIGNMENT_PATTERN, GITHUB_TOKEN_PATTERN, JWT_PATTERN, OPENAI_API_KEY_PATTERN,
-    PRIVATE_KEY_BLOCK_PATTERN, SLACK_TOKEN_PATTERN, STRIPE_KEY_PATTERN,
+    GENERIC_SECRET_ASSIGNMENT_PATTERN, GITHUB_TOKEN_PATTERN, HTTP_AUTHORIZATION_PATTERN,
+    HTTP_COOKIE_PATTERN, JWT_PATTERN, OPENAI_API_KEY_PATTERN, PRIVATE_KEY_BLOCK_PATTERN,
+    SLACK_TOKEN_PATTERN, STRIPE_KEY_PATTERN,
 };
 use anyhow::{Context, Result, bail};
 use console::{Term, style};
@@ -255,6 +256,16 @@ static BUILTIN_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
             id: "stripe_key",
             severity: SecretSeverity::High,
             regex: Regex::new(STRIPE_KEY_PATTERN).expect("stripe key regex"),
+        },
+        SecretPattern {
+            id: "http_authorization",
+            severity: SecretSeverity::High,
+            regex: Regex::new(HTTP_AUTHORIZATION_PATTERN).expect("HTTP authorization regex"),
+        },
+        SecretPattern {
+            id: "http_cookie",
+            severity: SecretSeverity::High,
+            regex: Regex::new(HTTP_COOKIE_PATTERN).expect("HTTP cookie regex"),
         },
     ]
 });
@@ -2940,6 +2951,110 @@ mod tests {
     // =========================================================================
     // Edge case tests — malformed input robustness (br-ig84)
     // =========================================================================
+
+    #[test]
+    fn scan_text_reports_http_credentials_without_exposing_them() -> Result<(), String> {
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)
+            .map_err(|error| error.to_string())?;
+        let ctx = ScanContext {
+            agent: None,
+            workspace: None,
+            source_path: Some("fixture.jsonl".into()),
+            conversation_id: Some(1),
+            message_id: Some(1),
+            message_idx: Some(0),
+        };
+        for header in [
+            "Authorization: Basic dXNlcjpwYXNz",
+            "Proxy-Authorization: Digest username=\"Mufasa\",\r\n\tresponse=\"inert-response\"",
+            "Authorization: AWS4-HMAC-SHA256 Credential=inert-id, Signature=inert-signature",
+        ] {
+            let text = format!("café 界\n{header}\r\nX-Public: visible");
+            let mut findings = Vec::new();
+            let mut seen = Vec::new();
+            let mut truncated = false;
+            scan_text(
+                &text,
+                SecretLocation::MessageContent,
+                &ctx,
+                &config,
+                &mut findings,
+                &mut seen,
+                &mut truncated,
+            );
+            let [finding] = findings.as_slice() else {
+                return Err("expected one HTTP credential occurrence".into());
+            };
+            if truncated
+                || finding.kind != "http_authorization"
+                || finding.severity != SecretSeverity::High
+                || !finding.context.contains("X-Public: visible")
+                || [
+                    "dXNlcjpwYXNz",
+                    "Mufasa",
+                    "inert-response",
+                    "inert-id",
+                    "inert-signature",
+                ]
+                .iter()
+                .any(|&secret| finding.context.contains(secret))
+            {
+                return Err(
+                    "HTTP finding leaked credentials or changed its neighboring header".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scan_text_reports_http_cookie_credentials_without_exposing_them() -> Result<(), String> {
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)
+            .map_err(|error| error.to_string())?;
+        let ctx = ScanContext {
+            agent: None,
+            workspace: None,
+            source_path: Some("fixture.jsonl".into()),
+            conversation_id: Some(1),
+            message_id: Some(1),
+            message_idx: Some(0),
+        };
+        for header in [
+            "Cookie: session=inert-session; csrf=inert-csrf",
+            "Set-Cookie: __Host-session=\"inert-session\"; Path=/; Secure; HttpOnly",
+            "HTTP_COOKIE=\"session=inert-session;\ncsrf=inert-csrf\"",
+        ] {
+            let text = format!("café 界\n{header}\r\nX-Public: visible");
+            let mut findings = Vec::new();
+            let mut seen = Vec::new();
+            let mut truncated = false;
+            scan_text(
+                &text,
+                SecretLocation::MessageContent,
+                &ctx,
+                &config,
+                &mut findings,
+                &mut seen,
+                &mut truncated,
+            );
+            let [finding] = findings.as_slice() else {
+                return Err("expected one HTTP cookie occurrence".into());
+            };
+            if truncated
+                || finding.kind != "http_cookie"
+                || finding.severity != SecretSeverity::High
+                || !finding.context.contains("X-Public: visible")
+                || ["inert-session", "inert-csrf"]
+                    .iter()
+                    .any(|&secret| finding.context.contains(secret))
+            {
+                return Err(
+                    "cookie finding leaked credentials or changed its neighboring header".into(),
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn scan_text_empty_text_no_findings() {
