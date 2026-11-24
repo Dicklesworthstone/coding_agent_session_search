@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 r"""Compare real serial and batched forget operations on synthetic archives.
 
+For current-binary GH565 archive-scale qualification, use the separate mode:
+
+    python3 scripts/benchmark_forget.py qualify --help
+
+That mode adds deterministic skewed archives, cgroup limits, RSS/phase telemetry,
+canonical digests and interruption recovery. The GH544 comparison below retains
+its existing workload and evidence contract.
+
 Both binaries must be built with the same toolchain, features and profile. This
 driver does not build them, accept an existing archive, drop caches, or estimate
 unmeasured timings. Run it through the repository's DSR quality route. Example:
@@ -566,6 +574,10 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["qualify"]:
+        from forget_archive_qualification import main as qualification_main
+
+        sys.exit(qualification_main(sys.argv[2:]))
     arguments = parse_args()
     try:
         completed = run(arguments)
