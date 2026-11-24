@@ -704,6 +704,104 @@ mod tests {
     }
 
     #[test]
+    fn binary_archive_metadata_supersedes_legacy_shadows_in_pages() -> Result<()> {
+        let temp = TempDir::new()?;
+        let source = temp.path().join("source.db");
+        let output = temp.path().join("export.db");
+        setup_source_db(&source)?;
+        let conn = open_franken_db(&source)?;
+        conn.execute_batch(
+            r#"
+            ALTER TABLE conversations ADD COLUMN metadata_bin BLOB;
+            ALTER TABLE messages ADD COLUMN extra_json TEXT;
+            ALTER TABLE messages ADD COLUMN extra_bin BLOB;
+            UPDATE conversations SET metadata_json = '{"old":"stale-conversation"}' WHERE id = 1;
+            UPDATE conversations SET metadata_bin = X'', metadata_json = '{"legacy":true}' WHERE id = 2;
+            UPDATE messages SET extra_json = '{"model":"stale-model","attachments":["stale-ref"]}';
+            "#,
+        )?;
+        let metadata = serde_json::json!({"current": "alice@example.com"});
+        let extra = serde_json::json!({"model": "current-model", "attachments": ["current-ref"]});
+        conn.execute_compat(
+            "UPDATE conversations SET metadata_bin = ?1 WHERE id = 1",
+            fparams![rmp_serde::to_vec_named(&metadata)?],
+        )?;
+        conn.execute_compat(
+            "UPDATE messages SET extra_bin = ?1 WHERE id = 1",
+            fparams![rmp_serde::to_vec_named(&extra)?],
+        )?;
+        conn.close()?;
+
+        let filter = ExportFilter {
+            agents: None,
+            workspaces: None,
+            since: None,
+            until: None,
+            path_mode: PathMode::Full,
+        };
+        let engine =
+            ExportEngine::new(&source, &output, filter).with_share_profile(ShareProfile::Team);
+        engine.execute(|_, _| {}, None)?;
+        let exported = open_franken_db(&output)?;
+        let current: serde_json::Value = serde_json::from_str(&query_string(
+            &exported,
+            "SELECT metadata_json FROM conversations WHERE id = 1",
+        )?)?;
+        assert_eq!(current, serde_json::json!({"current": "[EMAIL_REDACTED]"}));
+        assert_eq!(
+            query_string(
+                &exported,
+                "SELECT metadata_json FROM conversations WHERE id = 2"
+            )?,
+            r#"{"legacy":true}"#,
+        );
+        assert_eq!(
+            query_string(&exported, "SELECT model FROM messages WHERE id = 1")?,
+            "current-model",
+        );
+        assert_eq!(
+            query_string(
+                &exported,
+                "SELECT attachment_refs FROM messages WHERE id = 1"
+            )?,
+            r#"["current-ref"]"#,
+        );
+        assert_eq!(
+            query_string(&exported, "SELECT model FROM messages WHERE id = 2")?,
+            "stale-model", // This row has only the legacy representation.
+        );
+        exported.close()?;
+
+        // Neither a malformed conversation blob nor a message blob with
+        // trailing data may publish the legacy shadow over a valid export.
+        let before = std::fs::read(&output)?;
+        for (sql, column) in [
+            (
+                "UPDATE conversations SET metadata_bin = X'c1' WHERE id = 1",
+                "conversations.metadata_bin",
+            ),
+            (
+                "UPDATE messages SET extra_bin = X'c0c0' WHERE id = 1",
+                "messages.extra_bin",
+            ),
+        ] {
+            let conn = open_franken_db(&source)?;
+            conn.execute_compat(
+                "UPDATE conversations SET metadata_bin = ?1 WHERE id = 1",
+                fparams![rmp_serde::to_vec_named(&metadata)?],
+            )?;
+            conn.execute(sql)?;
+            conn.close()?;
+            let error = engine
+                .execute(|_, _| {}, None)
+                .expect_err("damaged source must refuse export");
+            assert!(format!("{error:#}").contains(column), "{error:#}");
+            assert_eq!(std::fs::read(&output)?, before);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_export_filter_workspace() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let source_path = temp_dir.path().join("source.db");

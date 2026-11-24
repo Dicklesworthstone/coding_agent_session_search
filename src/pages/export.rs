@@ -284,6 +284,9 @@ impl ExportEngine {
             };
 
             let export_result = (|| -> Result<(usize, usize)> {
+                let conversation_cols = table_columns_in_transaction(&src_tx, "conversations")?;
+                let conversation_metadata =
+                    metadata_projection(&conversation_cols, "c", "metadata_json", "metadata_bin");
                 let message_cols = table_columns_in_transaction(&src_tx, "messages")?;
                 let has_snippets_table = table_exists_in_transaction(&src_tx, "snippets")?;
                 let msg_query = build_message_export_query(&message_cols);
@@ -418,7 +421,7 @@ impl ExportEngine {
                 let query = format!(
                     "SELECT c.id, COALESCE(a.slug, 'unknown') as agent, w.path as workspace, c.title, c.source_path, c.started_at, c.ended_at,
              (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count,
-             c.metadata_json
+             {conversation_metadata}
              {from_where}
              ORDER BY c.id"
                 );
@@ -434,6 +437,7 @@ impl ExportEngine {
                     Option<i64>,
                     i64,
                     Option<String>,
+                    Option<Vec<u8>>,
                 );
                 let mut conv_rows: Vec<ConversationExportRow> =
                     src_tx.query_map_collect(&query, &params, |row: &FrankenRow| {
@@ -447,9 +451,10 @@ impl ExportEngine {
                             row.get_typed::<Option<i64>>(6)?,
                             row.get_typed::<i64>(7)?,
                             row.get_typed::<Option<String>>(8)?,
+                            row.get_typed::<Option<Vec<u8>>>(9)?,
                         ))
                     })?;
-                conv_rows.retain(|(id, _, workspace, title, _, _, _, _, _)| {
+                conv_rows.retain(|(id, _, workspace, title, _, _, _, _, _, _)| {
                     !self.exclusions.should_exclude(
                         workspace.as_deref(),
                         *id,
@@ -472,6 +477,7 @@ impl ExportEngine {
                     ended_at,
                     message_count,
                     metadata_json,
+                    metadata_bin,
                 ) in &conv_rows
                 {
                     if let Some(r) = &running
@@ -499,8 +505,16 @@ impl ExportEngine {
                         self.share_redact(value, false, &mut redactions)
                             .into_owned()
                     });
-                    let shared_metadata = metadata_json
+                    let canonical_metadata = super::decode_metadata_blob(
+                        metadata_bin.as_deref(),
+                        "conversations.metadata_bin",
+                        *id,
+                    )?
+                    .map(|value| serde_json::to_string(&value))
+                    .transpose()?;
+                    let shared_metadata = canonical_metadata
                         .as_deref()
+                        .or(metadata_json.as_deref())
                         .map(|value| self.share_redact_json(value, &mut redactions));
 
                     tx.execute_compat(
@@ -534,6 +548,7 @@ impl ExportEngine {
                                 row.get_typed::<Option<String>>(6)?,
                                 row.get_typed::<Option<String>>(7)?,
                                 row.get_typed::<Option<String>>(8)?,
+                                row.get_typed::<Option<Vec<u8>>>(9)?,
                             ))
                         },
                     )?;
@@ -548,13 +563,20 @@ impl ExportEngine {
                         model,
                         attachment_refs,
                         extra_json,
+                        extra_bin,
                     ) in &msg_rows
                     {
+                        let extra = super::decode_metadata_blob(
+                            extra_bin.as_deref(),
+                            "messages.extra_bin",
+                            *source_message_id,
+                        )?
+                        .or_else(|| serde_json::from_str(extra_json.as_deref()?).ok());
                         let resolved_model = normalize_optional_text(model.clone())
-                            .or_else(|| derive_message_model(extra_json.as_deref()));
+                            .or_else(|| derive_message_model(extra.as_ref()?));
                         let resolved_attachment_refs =
                             normalize_optional_text(attachment_refs.clone())
-                                .or_else(|| derive_attachment_refs(extra_json.as_deref()))
+                                .or_else(|| derive_attachment_refs(extra.as_ref()?))
                                 .map(|refs| self.share_redact_json(&refs, &mut redactions));
                         // The search indexes are built from the same redacted
                         // text, so the bundle's FTS cannot find what the
@@ -975,6 +997,7 @@ type MessageExportRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<Vec<u8>>,
 );
 
 fn table_columns_in_transaction(conn: &Transaction<'_>, table_name: &str) -> Result<Vec<String>> {
@@ -998,33 +1021,40 @@ fn table_exists_in_transaction(conn: &Transaction<'_>, table_name: &str) -> Resu
         .with_context(|| format!("Failed to inspect source table {table_name}"))
 }
 
-fn build_message_export_query(columns: &[String]) -> String {
-    let has_updated_at = columns.iter().any(|col| col == "updated_at");
-    let has_model = columns.iter().any(|col| col == "model");
-    let has_attachment_refs = columns.iter().any(|col| col == "attachment_refs");
-    let has_extra_json = columns.iter().any(|col| col == "extra_json");
+fn optional_column<'a>(columns: &[String], name: &'a str) -> &'a str {
+    if columns.iter().any(|column| column == name) {
+        name
+    } else {
+        "NULL"
+    }
+}
 
+/// Select only the authoritative representation. A populated binary column
+/// must supersede even a stale or unreadable legacy shadow.
+fn metadata_projection(columns: &[String], table: &str, json: &str, binary: &str) -> String {
+    let legacy = if columns.iter().any(|column| column == json) {
+        format!("{table}.{json}")
+    } else {
+        String::from("NULL")
+    };
+    if columns.iter().any(|column| column == binary) {
+        format!("CASE WHEN length({table}.{binary}) > 0 THEN NULL ELSE {legacy} END, {table}.{binary}")
+    } else {
+        format!("{legacy}, NULL")
+    }
+}
+
+fn build_message_export_query(columns: &[String]) -> String {
+    let updated_at = optional_column(columns, "updated_at");
+    let model = optional_column(columns, "model");
+    let attachment_refs = optional_column(columns, "attachment_refs");
+    let extra = metadata_projection(columns, "messages", "extra_json", "extra_bin");
     format!(
-        "SELECT id, role, content, created_at, idx, {}, {}, {}, {}
+        "SELECT id, role, content, created_at, idx, {updated_at}, {model},
+                {attachment_refs}, {extra}
          FROM messages
          WHERE conversation_id = ?1
-         ORDER BY idx ASC",
-        if has_updated_at {
-            "updated_at"
-        } else {
-            "NULL AS updated_at"
-        },
-        if has_model { "model" } else { "NULL AS model" },
-        if has_attachment_refs {
-            "attachment_refs"
-        } else {
-            "NULL AS attachment_refs"
-        },
-        if has_extra_json {
-            "extra_json"
-        } else {
-            "NULL AS extra_json"
-        }
+         ORDER BY idx ASC"
     )
 }
 
@@ -1039,9 +1069,7 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
     })
 }
 
-fn derive_message_model(extra_json: Option<&str>) -> Option<String> {
-    let value: Value = serde_json::from_str(extra_json?).ok()?;
-
+fn derive_message_model(value: &Value) -> Option<String> {
     [
         value.pointer("/model"),
         value.pointer("/cass/model"),
@@ -1058,9 +1086,7 @@ fn derive_message_model(extra_json: Option<&str>) -> Option<String> {
     .map(ToOwned::to_owned)
 }
 
-fn derive_attachment_refs(extra_json: Option<&str>) -> Option<String> {
-    let value: Value = serde_json::from_str(extra_json?).ok()?;
-
+fn derive_attachment_refs(value: &Value) -> Option<String> {
     [
         value.pointer("/attachment_refs"),
         value.pointer("/attachments"),

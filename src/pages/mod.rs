@@ -35,6 +35,35 @@ pub mod summary;
 pub mod verify;
 pub mod wizard;
 
+/// A nonempty archive MessagePack column supersedes its legacy JSON shadow.
+fn decode_metadata_blob(
+    binary: Option<&[u8]>,
+    binary_column: &str,
+    row_id: i64,
+) -> Result<Option<serde_json::Value>> {
+    use serde::Deserialize;
+    use std::io::Cursor;
+
+    let Some(bytes) = binary.filter(|bytes| !bytes.is_empty()) else {
+        return Ok(None);
+    };
+    let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(bytes));
+    let value = serde_json::Value::deserialize(&mut deserializer).with_context(|| {
+        format!(
+            "Failed to decode non-empty {binary_column} MessagePack for row {row_id}; refusing legacy JSON fallback"
+        )
+    })?;
+    let consumed = usize::try_from(deserializer.get_ref().position()).with_context(|| {
+        format!("Decoded {binary_column} position does not fit usize for row {row_id}")
+    })?;
+    if consumed != bytes.len() {
+        bail!(
+            "Non-empty {binary_column} for row {row_id} contains trailing bytes after its MessagePack value; refusing legacy JSON fallback"
+        );
+    }
+    Ok(Some(value))
+}
+
 /// Content/recovery companions whose presence means a Pages SQLite export is
 /// not a self-contained main file. These are the finite companions emitted by
 /// the pinned FrankenSQLite 0.3.8 producer; publication must preserve and
