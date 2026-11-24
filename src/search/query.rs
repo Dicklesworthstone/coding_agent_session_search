@@ -293,16 +293,6 @@ type TantivyHydratedContentMaps = (
     HashMap<TantivyContentExactKey, String>,
     HashMap<TantivyContentFallbackKey, String>,
 );
-type SqliteFtsHydratedRow = (
-    i64,
-    Option<i64>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-);
 type SqliteFtsMessageRow = (
     i64,
     String,
@@ -742,6 +732,12 @@ struct SqliteMessageScanRequest<'a> {
     scan_page_rows: usize,
     field_mask: FieldMask,
     query_match_type: MatchType,
+}
+
+#[derive(Clone, Copy)]
+struct SqliteFtsSchema {
+    uses_message_id: bool,
+    stores_text: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9319,22 +9315,25 @@ impl SearchClient {
         })
     }
 
-    fn sqlite_fts_uses_message_id_column(conn: &SearchSqliteConnection) -> Result<bool> {
-        let params: [ParamValue; 0] = [];
-        let ddl_rows: Vec<String> = franken_query_map_collect_retry(
-            conn,
+    fn sqlite_fts_schema(snapshot: &SearchReadTransaction<'_>) -> Result<SqliteFtsSchema> {
+        let ddl_rows: Vec<String> = snapshot.query_map_collect(
             "SELECT COALESCE(sql, '')
              FROM sqlite_master
              WHERE name = 'fts_messages'
              ORDER BY rowid DESC
              LIMIT 1",
-            &params,
-            |row: &crate::franken_sync::Row| row.get_typed::<String>(0),
+            &[],
+            |row| row.get_typed(0),
         )?;
-        Ok(ddl_rows
-            .first()
-            .map(|sql| sql.to_ascii_lowercase().contains("message_id"))
-            .unwrap_or(false))
+        let ddl = ddl_rows.first().context("missing FTS schema")?;
+        let normalized = ddl
+            .split_whitespace()
+            .collect::<String>()
+            .to_ascii_lowercase();
+        Ok(SqliteFtsSchema {
+            uses_message_id: normalized.contains("message_id"),
+            stores_text: !normalized.contains("content=''") && !normalized.contains("content=\"\""),
+        })
     }
 
     fn sqlite_fts_match_mode(conn: &SearchSqliteConnection) -> Result<SqliteFtsMatchMode> {
@@ -9377,7 +9376,9 @@ impl SearchClient {
     fn sqlite_fts5_match_clause(match_mode: SqliteFtsMatchMode) -> &'static str {
         match match_mode {
             SqliteFtsMatchMode::Table => "fts_messages MATCH ?",
-            SqliteFtsMatchMode::IndexedColumns => "(content MATCH ? OR title MATCH ?)",
+            SqliteFtsMatchMode::IndexedColumns => {
+                "(fts_messages.content MATCH ? OR fts_messages.title MATCH ?)"
+            }
         }
     }
 
@@ -9411,60 +9412,44 @@ impl SearchClient {
 
     fn sqlite_fts5_rank_query(
         fts_query: &str,
-        _filters: &SearchFilters,
         limit: usize,
         offset: usize,
-        _uses_message_id: bool,
+        schema: SqliteFtsSchema,
         match_mode: SqliteFtsMatchMode,
     ) -> (String, Vec<ParamValue>) {
         let match_clause = Self::sqlite_fts5_match_clause(match_mode);
-        let mut sql = format!(
-            "SELECT rowid,
-                    bm25(fts_messages)
+        // FTS is a derived ranking index. A shadow row has no independent
+        // authority to disclose a deleted message or its conversation. Check
+        // both canonical keys before applying the visible page boundary.
+        let message_key = if schema.uses_message_id {
+            "fts_messages.message_id"
+        } else {
+            "fts_messages.rowid"
+        };
+        // Older content-bearing indexes can keep posting lists for text that
+        // has since been cleared or edited. A NULL key tells the caller to
+        // retry the entire query against canonical text. Current contentless
+        // indexes never read either payload during the ranking phase.
+        let checked_id = if schema.stores_text {
+            "CASE WHEN COALESCE(fts_messages.content, '') = COALESCE(m.content, '') \
+                  AND COALESCE(fts_messages.title, '') = COALESCE(c.title, '') \
+             THEN m.id END"
+        } else {
+            "m.id"
+        };
+        let sql = format!(
+            "SELECT {checked_id}, bm25(fts_messages)
              FROM fts_messages
-             WHERE {match_clause}"
+             JOIN messages m ON m.id = {message_key}
+             JOIN conversations c ON c.id = m.conversation_id
+             WHERE {match_clause}
+             ORDER BY bm25(fts_messages), fts_messages.rowid LIMIT ? OFFSET ?"
         );
-        let mut params = Vec::with_capacity(9);
+        let mut params = Vec::with_capacity(4);
         Self::push_sqlite_fts5_match_params(&mut params, fts_query, match_mode);
-
-        sql.push_str(" ORDER BY bm25(fts_messages), rowid LIMIT ? OFFSET ?");
-        params.push(ParamValue::from(limit as i64));
-        params.push(ParamValue::from(offset as i64));
-
+        params.push(ParamValue::from(i64::try_from(limit).unwrap_or(i64::MAX)));
+        params.push(ParamValue::from(i64::try_from(offset).unwrap_or(i64::MAX)));
         (sql, params)
-    }
-
-    fn sqlite_fts5_hydrate_query(
-        row_count: usize,
-        field_mask: FieldMask,
-        uses_message_id: bool,
-    ) -> String {
-        let title_expr = if field_mask.wants_title() {
-            "fts_messages.title"
-        } else {
-            "NULL"
-        };
-        // Noise classification precedes the caller's field projection.
-        let content_expr = "fts_messages.content";
-        let message_key_expr = if uses_message_id {
-            "CAST(fts_messages.message_id AS INTEGER)"
-        } else {
-            "rowid"
-        };
-        let placeholders = sql_placeholders(row_count);
-
-        format!(
-            "SELECT rowid,
-                    {message_key_expr},
-                    {title_expr},
-                    {content_expr},
-                    fts_messages.agent,
-                    fts_messages.workspace,
-                    fts_messages.source_path,
-                    CAST(fts_messages.created_at AS INTEGER)
-             FROM fts_messages
-             WHERE rowid IN ({placeholders})"
-        )
     }
 
     fn sqlite_fts5_message_hydrate_query(message_ids: &[i64], field_mask: FieldMask) -> String {
@@ -9494,7 +9479,7 @@ impl SearchClient {
                     c.origin_host,
                     s.kind
              FROM messages m
-             LEFT JOIN conversations c ON m.conversation_id = c.id
+             JOIN conversations c ON m.conversation_id = c.id
              LEFT JOIN sources s ON c.source_id = s.id
              LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
@@ -9713,7 +9698,7 @@ impl SearchClient {
                     COALESCE(m.content, ''),
                     COALESCE(c.title, '')
              FROM messages m
-             LEFT JOIN conversations c ON m.conversation_id = c.id
+             JOIN conversations c ON m.conversation_id = c.id
              LEFT JOIN sources s ON c.source_id = s.id
              LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
@@ -10078,15 +10063,6 @@ impl SearchClient {
             );
             return self.search_sqlite_message_scan(conn, scan_request);
         }
-        let uses_message_id =
-            if let Ok(uses_message_id) = Self::sqlite_fts_uses_message_id_column(conn) {
-                uses_message_id
-            } else {
-                tracing::warn!(
-                    "sqlite FTS fallback is present but not queryable; skipping fallback search"
-                );
-                return self.search_sqlite_message_scan(conn, scan_request);
-            };
         let match_mode = match Self::sqlite_fts_match_mode(conn) {
             Ok(match_mode) => match_mode,
             Err(err) => {
@@ -10104,106 +10080,73 @@ impl SearchClient {
             return self.search_sqlite_message_scan(conn, scan_request);
         }
 
-        let post_filter = Self::sqlite_fts5_filters_need_post_hydration(&filters);
-        let target_hits = if post_filter {
-            offset.saturating_add(limit)
-        } else {
-            limit
-        };
-        let rank_batch_limit = if post_filter {
-            target_hits.clamp(1, SQLITE_FTS5_POST_FILTER_SCAN_CHUNK)
-        } else {
-            limit
-        };
-        let mut rank_offset = if post_filter { 0 } else { offset };
-        let mut scanned_rows = 0usize;
-        let mut hits = Vec::with_capacity(target_hits.min(rank_batch_limit));
+        // Keep ranking, authority checks, and canonical hydration on the same
+        // generation. End the transaction before a source-scan retry opens its
+        // own snapshot.
+        let mut snapshot =
+            SearchReadTransaction::begin(conn).context("starting SQLite FTS read snapshot")?;
+        let result = Self::ranked_sqlite_fts5_hits(&snapshot, &fts_query, match_mode, scan_request);
+        snapshot
+            .rollback()
+            .context("closing SQLite FTS read snapshot")?;
+        match result {
+            Ok(hits) if !hits.is_empty() => Ok(hits),
+            Ok(_) => self.search_sqlite_message_scan(conn, scan_request),
+            Err(error) => {
+                tracing::warn!(%error, "SQLite FTS ranking failed; using canonical source scan");
+                self.search_sqlite_message_scan(conn, scan_request)
+            }
+        }
+    }
 
+    fn ranked_sqlite_fts5_hits(
+        snapshot: &SearchReadTransaction<'_>,
+        fts_query: &str,
+        match_mode: SqliteFtsMatchMode,
+        request: SqliteMessageScanRequest<'_>,
+    ) -> Result<Vec<SearchHit>> {
+        let schema = Self::sqlite_fts_schema(snapshot)?;
+        // In a stored-text shadow, a stale or duplicate rank before OFFSET
+        // also changes the requested page. Admit those earlier candidates too.
+        let post_filter =
+            schema.stores_text || Self::sqlite_fts5_filters_need_post_hydration(request.filters);
+        let mut seen_legacy_ids = HashSet::new();
+        let mut skip = if post_filter { request.offset } else { 0 };
+        let mut rank_offset = if post_filter { 0 } else { request.offset };
+        let mut rank_batch_limit = if post_filter {
+            request
+                .limit
+                .saturating_add(skip)
+                .clamp(1, SQLITE_FTS5_POST_FILTER_SCAN_CHUNK)
+        } else {
+            request.limit
+        };
+        let mut hits = Vec::new();
         loop {
             let (rank_sql, rank_params) = Self::sqlite_fts5_rank_query(
-                fts_query.as_str(),
-                &filters,
+                fts_query,
                 rank_batch_limit,
                 rank_offset,
-                uses_message_id,
+                schema,
                 match_mode,
             );
-            let ranked_rows: Vec<(i64, f64)> =
-                match franken_query_map_collect_retry(conn, &rank_sql, &rank_params, |row| {
+            let candidates: Vec<(Option<i64>, f64)> =
+                snapshot.query_map_collect(&rank_sql, &rank_params, |row| {
                     Ok((row.get_typed(0)?, row.get_typed(1)?))
-                }) {
-                    Ok(rows) => rows,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "sqlite FTS fallback rank query failed; returning no fallback hits"
-                        );
-                        return self.search_sqlite_message_scan(conn, scan_request);
-                    }
-                };
-            if ranked_rows.is_empty() {
-                break;
-            }
-
-            scanned_rows = scanned_rows.saturating_add(ranked_rows.len());
-            let bm25_by_rowid: HashMap<i64, f64> = ranked_rows.iter().copied().collect();
-            let mut fts_rows_by_rowid = HashMap::with_capacity(ranked_rows.len());
-            let mut message_ids = Vec::with_capacity(ranked_rows.len());
-            let mut seen_message_ids = HashSet::with_capacity(ranked_rows.len());
-
-            for rank_chunk in Self::sqlite_fts5_hydrate_row_chunks(&ranked_rows) {
-                let hydrate_sql =
-                    Self::sqlite_fts5_hydrate_query(rank_chunk.len(), field_mask, uses_message_id);
-                let hydrate_params = rank_chunk
-                    .iter()
-                    .map(|(fts_rowid, _)| ParamValue::from(*fts_rowid))
-                    .collect::<Vec<_>>();
-                let rows: Vec<SqliteFtsHydratedRow> = match franken_query_map_collect_retry(
-                    conn,
-                    &hydrate_sql,
-                    &hydrate_params,
-                    |row| {
-                        Ok((
-                            row.get_typed(0)?,
-                            row.get_typed(1)?,
-                            row.get_typed(2)?,
-                            row.get_typed(3)?,
-                            row.get_typed(4)?,
-                            row.get_typed(5)?,
-                            row.get_typed(6)?,
-                            row.get_typed(7)?,
-                        ))
-                    },
-                ) {
-                    Ok(rows) => rows,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "sqlite FTS fallback rowid hydration query failed; returning no fallback hits"
-                        );
-                        return self.search_sqlite_message_scan(conn, scan_request);
-                    }
-                };
-
-                for row in rows {
-                    let fts_rowid = row.0;
-                    let message_id = row.1.unwrap_or(fts_rowid);
-                    if seen_message_ids.insert(message_id) {
-                        message_ids.push(message_id);
-                    }
-                    fts_rows_by_rowid.insert(fts_rowid, row);
+                })?;
+            let candidate_count = candidates.len();
+            let mut ranked_rows = Vec::with_capacity(candidate_count);
+            for (id, score) in candidates {
+                let id = id.context("stored FTS text differs from the canonical message")?;
+                if !schema.uses_message_id || seen_legacy_ids.insert(id) {
+                    ranked_rows.push((id, score));
                 }
             }
-
-            let mut metadata_by_message_id = HashMap::with_capacity(message_ids.len());
-            for message_chunk in message_ids.chunks(SQLITE_FTS5_HYDRATE_PARAM_CHUNK) {
-                let metadata_sql =
-                    Self::sqlite_fts5_message_hydrate_query(message_chunk, field_mask);
-                let metadata_rows: Vec<SqliteFtsMessageRow> = match franken_query_map_collect_retry(
-                    conn,
-                    &metadata_sql,
-                    &[],
-                    |row| {
+            for rank_chunk in Self::sqlite_fts5_hydrate_row_chunks(&ranked_rows) {
+                let ids: Vec<i64> = rank_chunk.iter().map(|(id, _)| *id).collect();
+                let hydrate_sql = Self::sqlite_fts5_message_hydrate_query(&ids, request.field_mask);
+                let rows: Vec<SqliteFtsMessageRow> =
+                    snapshot.query_map_collect(&hydrate_sql, &[], |row| {
                         Ok((
                             row.get_typed(0)?,
                             row.get_typed(1)?,
@@ -10214,194 +10157,95 @@ impl SearchClient {
                             row.get_typed(6)?,
                             row.get_typed(7)?,
                             row.get_typed(8)?,
-                            row.get_typed::<Option<String>>(9)?,
+                            row.get_typed(9)?,
                             row.get_typed(10)?,
                             row.get_typed(11)?,
                         ))
-                    },
-                ) {
-                    Ok(rows) => rows,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "sqlite FTS fallback message hydration query failed; returning no fallback hits"
-                        );
-                        return self.search_sqlite_message_scan(conn, scan_request);
-                    }
-                };
-                metadata_by_message_id.extend(metadata_rows.into_iter().map(|row| (row.0, row)));
-            }
-
-            let mut hits_by_rowid = HashMap::with_capacity(ranked_rows.len());
-            for (
-                fts_rowid,
-                fts_message_id,
-                fts_title,
-                fts_content,
-                fts_agent,
-                fts_workspace,
-                fts_source_path,
-                fts_created_at,
-            ) in fts_rows_by_rowid.into_values()
-            {
-                let Some(&bm25_score) = bm25_by_rowid.get(&fts_rowid) else {
-                    continue;
-                };
-                let message_id = fts_message_id.unwrap_or(fts_rowid);
-                let (
-                    title,
-                    raw_content,
-                    agent,
-                    workspace,
-                    source_path,
-                    created_at,
-                    idx,
-                    conversation_id,
-                    raw_source_id,
-                    origin_host,
-                    raw_origin_kind,
-                ) = match metadata_by_message_id.remove(&message_id) {
-                    Some((
+                    })?;
+                let mut canonical: HashMap<_, _> =
+                    rows.into_iter().map(|row| (row.0, row)).collect();
+                for (id, bm25_score) in rank_chunk {
+                    let (
                         _,
-                        metadata_title,
-                        metadata_content,
-                        metadata_agent,
-                        metadata_workspace,
-                        metadata_source_path,
-                        metadata_created_at,
-                        metadata_idx,
-                        metadata_conversation_id,
-                        metadata_raw_source_id,
-                        metadata_origin_host,
-                        metadata_raw_origin_kind,
-                    )) => (
-                        if metadata_title.is_empty() {
-                            fts_title.unwrap_or_default()
+                        title,
+                        content,
+                        agent,
+                        workspace,
+                        source_path,
+                        created_at,
+                        idx,
+                        conversation_id,
+                        raw_source_id,
+                        origin_host,
+                        raw_origin_kind,
+                    ) = canonical
+                        .remove(id)
+                        .context("FTS candidate has no canonical message")?;
+                    let source_id = normalized_search_hit_source_id_parts(
+                        raw_source_id.as_deref().unwrap_or_default(),
+                        raw_origin_kind.as_deref().unwrap_or_default(),
+                        origin_host.as_deref(),
+                    );
+                    let origin_kind =
+                        normalized_search_hit_origin_kind(&source_id, raw_origin_kind.as_deref());
+                    let line_number = idx
+                        .and_then(|i| usize::try_from(i).ok())
+                        .map(|i| i.saturating_add(1));
+                    let snippet = if request.field_mask.wants_snippet() {
+                        snippet_from_content(&content)
+                    } else {
+                        String::new()
+                    };
+                    let content_hash = stable_hit_hash(
+                        if content.is_empty() { &snippet } else { &content },
+                        &source_path,
+                        line_number,
+                        created_at,
+                    );
+                    let hit = SearchHit {
+                        title,
+                        snippet,
+                        content,
+                        content_hash,
+                        conversation_id,
+                        score: (-bm25_score) as f32,
+                        source_path,
+                        agent,
+                        workspace,
+                        workspace_original: None,
+                        created_at,
+                        line_number,
+                        match_type: request.query_match_type,
+                        source_id,
+                        origin_kind,
+                        origin_host,
+                    };
+                    if Self::sqlite_fts5_hit_matches_filters(&hit, request.filters) {
+                        if skip > 0 {
+                            skip -= 1;
                         } else {
-                            metadata_title
-                        },
-                        if metadata_content.is_empty() {
-                            fts_content.unwrap_or_default()
-                        } else {
-                            metadata_content
-                        },
-                        if metadata_agent.is_empty() {
-                            fts_agent.unwrap_or_default()
-                        } else {
-                            metadata_agent
-                        },
-                        // Canonical NULL is authoritative too: a legacy
-                        // content-bearing FTS row can retain an old attribution.
-                        metadata_workspace,
-                        if metadata_source_path.is_empty() {
-                            fts_source_path.unwrap_or_default()
-                        } else {
-                            metadata_source_path
-                        },
-                        metadata_created_at.or(fts_created_at),
-                        metadata_idx,
-                        metadata_conversation_id,
-                        metadata_raw_source_id.unwrap_or_else(default_source_id),
-                        metadata_origin_host,
-                        metadata_raw_origin_kind,
-                    ),
-                    None => (
-                        fts_title.unwrap_or_default(),
-                        fts_content.unwrap_or_default(),
-                        fts_agent.unwrap_or_default(),
-                        fts_workspace.unwrap_or_default(),
-                        fts_source_path.unwrap_or_default(),
-                        fts_created_at,
-                        None,
-                        None,
-                        default_source_id(),
-                        None,
-                        None,
-                    ),
-                };
-
-                let source_id = normalized_search_hit_source_id_parts(
-                    raw_source_id.as_str(),
-                    raw_origin_kind.as_deref().unwrap_or_default(),
-                    origin_host.as_deref(),
-                );
-                let origin_kind = normalized_search_hit_origin_kind(
-                    source_id.as_str(),
-                    raw_origin_kind.as_deref(),
-                );
-                let line_number = idx
-                    .and_then(|i| usize::try_from(i).ok())
-                    .map(|i| i.saturating_add(1));
-                let snippet = if field_mask.wants_snippet() {
-                    snippet_from_content(&raw_content)
-                } else {
-                    String::new()
-                };
-                let content = raw_content;
-                let content_hash = if content.is_empty() {
-                    stable_hit_hash(&snippet, &source_path, line_number, created_at)
-                } else {
-                    stable_hit_hash(&content, &source_path, line_number, created_at)
-                };
-
-                let hit = SearchHit {
-                    title,
-                    snippet,
-                    content,
-                    content_hash,
-                    conversation_id,
-                    score: (-bm25_score) as f32,
-                    source_path,
-                    agent,
-                    workspace,
-                    workspace_original: None,
-                    created_at,
-                    line_number,
-                    match_type: query_match_type,
-                    source_id,
-                    origin_kind,
-                    origin_host,
-                };
-                hits_by_rowid.insert(fts_rowid, hit);
-            }
-
-            for (fts_rowid, _) in &ranked_rows {
-                if let Some(hit) = hits_by_rowid.remove(fts_rowid)
-                    && Self::sqlite_fts5_hit_matches_filters(&hit, &filters)
-                {
-                    hits.push(hit);
-                    if hits.len() >= target_hits {
-                        break;
+                            hits.push(hit);
+                            if hits.len() == request.limit {
+                                return Ok(hits);
+                            }
+                        }
                     }
                 }
             }
 
-            if hits.len() >= target_hits
-                || !post_filter
-                || ranked_rows.len() < rank_batch_limit
-                || scanned_rows >= SQLITE_FTS5_POST_FILTER_SCAN_LIMIT
-            {
+            rank_offset = rank_offset.saturating_add(candidate_count);
+            if !post_filter || candidate_count < rank_batch_limit {
                 break;
             }
-            rank_offset = rank_offset.saturating_add(ranked_rows.len());
-        }
-
-        if post_filter {
-            let hits = hits
-                .into_iter()
-                .skip(offset)
-                .take(limit)
-                .collect::<Vec<_>>();
-            if hits.is_empty() {
-                self.search_sqlite_message_scan(conn, scan_request)
-            } else {
-                Ok(hits)
+            if rank_offset >= SQLITE_FTS5_POST_FILTER_SCAN_LIMIT {
+                // A partly filled page cannot establish that all lower-ranked
+                // in-scope hits were exhausted. Complete it from the archive.
+                bail!("SQLite FTS post-filter scan limit reached");
             }
-        } else if hits.is_empty() {
-            self.search_sqlite_message_scan(conn, scan_request)
-        } else {
-            Ok(hits)
+            rank_batch_limit = SQLITE_FTS5_POST_FILTER_SCAN_CHUNK
+                .min(SQLITE_FTS5_POST_FILTER_SCAN_LIMIT - rank_offset);
         }
+        Ok(hits)
     }
 
     /// Browse messages ordered by date, without any text query.
@@ -15100,6 +14944,107 @@ mod tests {
         assert_eq!(hits[0].workspace, "/legacy");
         assert_eq!(hits[0].line_number, Some(5));
         assert_eq!(hits[0].content, "legacy auth token failure");
+
+        // The FTS projection outlives a canonical edit and deletion. Neither
+        // a cleared field nor an orphan has authority to expose shadow text.
+        {
+            let guard = client.sqlite_guard()?;
+            let conn = guard.as_ref().expect("legacy fixture");
+            conn.execute_batch_sync(
+                "UPDATE messages SET content='', created_at=NULL WHERE id=42;
+                 UPDATE conversations SET title='auth current', source_path='' WHERE id=1;
+                 INSERT INTO fts_messages(
+                    rowid, content, title, agent, workspace, source_path, created_at, message_id
+                 ) VALUES(2,'auth privateorphan','privateorphan','codex','/legacy','/stale',99,88);
+                 INSERT INTO messages(id, conversation_id, idx, content)
+                   VALUES(88,9999,0,'auth privateorphan');",
+            )?;
+        }
+        let live = client.search_sqlite_fts5(
+            Path::new(":memory:"),
+            "auth",
+            SearchFilters::default(),
+            5,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].title, "auth current");
+        assert!(live[0].content.is_empty());
+        assert!(live[0].snippet.is_empty());
+        assert!(live[0].source_path.is_empty());
+        assert_eq!(live[0].created_at, None);
+        for retired in ["privateorphan", "failure"] {
+            assert!(
+                client
+                    .search(retired, SearchFilters::default(), 5, 0, FieldMask::FULL)?
+                    .is_empty(),
+                "retired text must not identify a live conversation"
+            );
+        }
+        Ok(())
+    }
+
+    // Exercise the actual FTS5 rank statement even on FrankenSQLite versions
+    // whose MATCH emulation routes the public search through the source scan.
+    #[test]
+    fn sqlite_fts5_ranks_only_live_owners_before_offset() -> Result<()> {
+        for stores_text in [false, true] {
+            let db = rusqlite::Connection::open_in_memory()?;
+            let virtual_columns = if stores_text {
+                "message_id UNINDEXED"
+            } else {
+                "content=''"
+            };
+            db.execute_batch(&format!(
+                "CREATE TABLE conversations(id INTEGER PRIMARY KEY, title TEXT);
+                 CREATE TABLE messages(id INTEGER PRIMARY KEY, conversation_id INTEGER, content TEXT);
+                 CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, {virtual_columns});
+                 INSERT INTO conversations VALUES(1,'topic');
+                 INSERT INTO messages VALUES(10,1,'needle'), (20,1,'needle'), (30,999,'needle');"
+            ))?;
+            // Identical match text makes FTS rowid the stable tie breaker.
+            // The first row names a deleted message, the second an absent
+            // conversation. Explicit legacy message IDs differ from rowids.
+            for (legacy_row, message_id) in [(1, 5), (2, 30), (3, 10), (4, 20)] {
+                if stores_text {
+                    db.execute(
+                        "INSERT INTO fts_messages(rowid,content,title,message_id)
+                         VALUES(?1,'needle','topic',?2)",
+                        rusqlite::params![legacy_row, message_id],
+                    )?;
+                } else {
+                    db.execute(
+                        "INSERT INTO fts_messages(rowid,content,title) VALUES(?1,'needle','topic')",
+                        [message_id],
+                    )?;
+                }
+            }
+
+            let (rank, _) = SearchClient::sqlite_fts5_rank_query(
+                "needle",
+                1,
+                1,
+                SqliteFtsSchema {
+                    uses_message_id: stores_text,
+                    stores_text,
+                },
+                SqliteFtsMatchMode::Table,
+            );
+            let page = |offset: i64| -> rusqlite::Result<Option<i64>> {
+                db.query_row(
+                    &rank,
+                    rusqlite::params!["{content title} : (needle)", 1, offset],
+                    |row| row.get(0),
+                )
+            };
+            assert_eq!(page(0)?, Some(10));
+            assert_eq!(page(1)?, Some(20));
+            if stores_text {
+                db.execute("UPDATE messages SET content='revised' WHERE id=10", [])?;
+                assert_eq!(page(0)?, None, "stale legacy rank requires a source scan");
+            }
+        }
         Ok(())
     }
 
@@ -15911,46 +15856,28 @@ mod tests {
     fn sqlite_fts5_ranked_phase_defers_content_decode_until_after_limit() {
         let (rank_sql, params) = SearchClient::sqlite_fts5_rank_query(
             "auth",
-            &SearchFilters::default(),
             50,
             0,
-            false,
+            SqliteFtsSchema {
+                uses_message_id: false,
+                stores_text: false,
+            },
             SqliteFtsMatchMode::Table,
         );
-        let hydrate_sql = SearchClient::sqlite_fts5_hydrate_query(
-            2,
-            FieldMask::new(true, true, true, true),
-            false,
-        );
+        let hydrate_sql = SearchClient::sqlite_fts5_message_hydrate_query(&[1, 2], FieldMask::FULL);
 
         assert!(
-            !rank_sql.contains("fts_messages.content"),
-            "rank query must not decode large content rows before LIMIT"
+            !rank_sql.contains("fts_messages.content") && !rank_sql.contains("m.content"),
+            "a contentless index ranks keys without decoding canonical message bodies"
         );
-        assert!(
-            hydrate_sql.contains("fts_messages.content"),
-            "hydration query should still provide requested content"
-        );
-        assert!(
-            rank_sql.contains("LIMIT ? OFFSET ?"),
-            "rank query must apply page bounds before hydration"
-        );
+        assert!(hydrate_sql.contains("m.content"));
+        assert!(!hydrate_sql.contains("fts_messages"));
+        assert!(rank_sql.contains("LIMIT ? OFFSET ?"));
         assert_eq!(params.len(), 3, "fts query plus limit and offset params");
     }
 
     #[test]
     fn sqlite_fts5_hydration_chunks_stay_below_bind_variable_limit() {
-        let oversized_row_count = SQLITE_MAX_VARIABLE_NUMBER + 1;
-        let unchunked_sql = SearchClient::sqlite_fts5_hydrate_query(
-            oversized_row_count,
-            FieldMask::new(true, true, true, true),
-            false,
-        );
-        assert!(
-            unchunked_sql.matches('?').count() > SQLITE_MAX_VARIABLE_NUMBER,
-            "the pre-fix one-shot hydration query would exceed frankensqlite's bind limit"
-        );
-
         let ranked_rows: Vec<(i64, f64)> = (0..(SQLITE_FTS5_HYDRATE_PARAM_CHUNK + 17))
             .map(|idx| (idx as i64, idx as f64))
             .collect();
@@ -15958,16 +15885,11 @@ mod tests {
             .map(<[(i64, f64)]>::len)
             .collect();
 
-        assert_eq!(
-            chunk_sizes,
-            vec![SQLITE_FTS5_HYDRATE_PARAM_CHUNK, 17],
-            "large fallback pages must hydrate in bounded chunks while preserving rank windows"
-        );
+        assert_eq!(chunk_sizes, vec![SQLITE_FTS5_HYDRATE_PARAM_CHUNK, 17]);
         assert!(
             chunk_sizes
                 .iter()
-                .all(|chunk_size| *chunk_size <= SQLITE_MAX_VARIABLE_NUMBER),
-            "every hydration chunk must fit under frankensqlite's bind-variable ceiling"
+                .all(|size| *size <= SQLITE_MAX_VARIABLE_NUMBER)
         );
     }
 
