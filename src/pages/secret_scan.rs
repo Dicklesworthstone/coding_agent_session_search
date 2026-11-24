@@ -551,7 +551,6 @@ fn scan_database_snapshot(
     let schema = SecretScanSchema::detect(conn)?;
 
     let mut findings: Vec<SecretFinding> = Vec::new();
-    let mut seen = Vec::new();
     let mut truncated = false;
 
     // LEFT JOIN + COALESCE on agents so secret scanning also covers legacy
@@ -634,25 +633,23 @@ fn scan_database_snapshot(
             .into_iter()
             .flatten()
             {
-                scan_text(
+                scan_field(
                     provenance,
                     SecretLocation::ConversationMetadata,
                     &ctx,
                     config,
                     &mut findings,
-                    &mut seen,
                     &mut truncated,
                 );
             }
 
             if let Some(title_text) = title {
-                scan_text(
+                scan_field(
                     &title_text,
                     SecretLocation::ConversationTitle,
                     &ctx,
                     config,
                     &mut findings,
-                    &mut seen,
                     &mut truncated,
                 );
             }
@@ -663,27 +660,14 @@ fn scan_database_snapshot(
                 "conversations.metadata_json",
                 conv_id,
             )? {
-                let first_metadata_finding = findings.len();
-                scan_text(
-                    &meta.text,
+                scan_structured_metadata(
+                    &meta,
                     SecretLocation::ConversationMetadata,
                     &ctx,
                     config,
                     &mut findings,
-                    &mut seen,
                     &mut truncated,
                 );
-                redact_structured_metadata_contexts(&mut findings[first_metadata_finding..]);
-                if let Some(value) = meta.value.as_ref() {
-                    scan_sensitive_json_fields(
-                        value,
-                        SecretLocation::ConversationMetadata,
-                        &ctx,
-                        config,
-                        &mut findings,
-                        &mut truncated,
-                    );
-                }
             }
 
             if truncated {
@@ -714,12 +698,11 @@ fn scan_database_snapshot(
         let has_extra_bin = table_has_column(conn, "messages", "extra_bin")?;
         let extra_bin_projection = if has_extra_bin { "m.extra_bin" } else { "NULL" };
         let has_attachment_refs = table_has_column(conn, "messages", "attachment_refs")?;
-        let attachment_refs_projection =
-            if schema == SecretScanSchema::PagesExport && has_attachment_refs {
-                "m.attachment_refs"
-            } else {
-                "NULL"
-            };
+        let attachment_refs_projection = if has_attachment_refs {
+            "m.attachment_refs"
+        } else {
+            "NULL"
+        };
         let has_model = table_has_column(conn, "messages", "model")?;
         let model_projection = if has_model { "m.model" } else { "NULL" };
         let (msg_where, msg_params) = build_where_clause_for_columns(
@@ -786,37 +769,49 @@ fn scan_database_snapshot(
                     message_idx: Some(msg_idx),
                 };
 
-                scan_text(
+                scan_field(
                     &content,
                     SecretLocation::MessageContent,
                     &ctx,
                     config,
                     &mut findings,
-                    &mut seen,
                     &mut truncated,
                 );
                 if let Some(attachment_refs) = attachment_refs.as_deref() {
-                    scan_text(
-                        attachment_refs,
-                        SecretLocation::MessageMetadata,
-                        &ctx,
-                        config,
-                        &mut findings,
-                        &mut seen,
-                        &mut truncated,
-                    );
+                    // Some older archives store a single plain attachment
+                    // reference. Structured references carry arbitrary metadata.
+                    if attachment_refs.trim_start().starts_with(['{', '[']) {
+                        let refs =
+                            parse_json_metadata(attachment_refs, "messages.attachment_refs", msg_id)?;
+                        scan_structured_metadata(
+                            &refs,
+                            SecretLocation::MessageMetadata,
+                            &ctx,
+                            config,
+                            &mut findings,
+                            &mut truncated,
+                        );
+                    } else {
+                        scan_field(
+                            attachment_refs,
+                            SecretLocation::MessageMetadata,
+                            &ctx,
+                            config,
+                            &mut findings,
+                            &mut truncated,
+                        );
+                    }
                 }
                 for metadata_text in [Some(role.as_str()), model.as_deref()]
                     .into_iter()
                     .flatten()
                 {
-                    scan_text(
+                    scan_field(
                         metadata_text,
                         SecretLocation::MessageMetadata,
                         &ctx,
                         config,
                         &mut findings,
-                        &mut seen,
                         &mut truncated,
                     );
                 }
@@ -827,27 +822,14 @@ fn scan_database_snapshot(
                     "messages.extra_json",
                     msg_id,
                 )? {
-                    let first_metadata_finding = findings.len();
-                    scan_text(
-                        &extra.text,
+                    scan_structured_metadata(
+                        &extra,
                         SecretLocation::MessageMetadata,
                         &ctx,
                         config,
                         &mut findings,
-                        &mut seen,
                         &mut truncated,
                     );
-                    redact_structured_metadata_contexts(&mut findings[first_metadata_finding..]);
-                    if let Some(value) = extra.value.as_ref() {
-                        scan_sensitive_json_fields(
-                            value,
-                            SecretLocation::MessageMetadata,
-                            &ctx,
-                            config,
-                            &mut findings,
-                            &mut truncated,
-                        );
-                    }
                 }
 
                 if truncated {
@@ -933,34 +915,31 @@ fn scan_database_snapshot(
                     message_idx: Some(msg_idx),
                 };
 
-                scan_text(
+                scan_field(
                     &snippet_text,
                     SecretLocation::MessageSnippet,
                     &ctx,
                     config,
                     &mut findings,
-                    &mut seen,
                     &mut truncated,
                 );
                 if let Some(snippet_file_path) = snippet_file_path.as_deref() {
-                    scan_text(
+                    scan_field(
                         snippet_file_path,
                         SecretLocation::MessageMetadata,
                         &ctx,
                         config,
                         &mut findings,
-                        &mut seen,
                         &mut truncated,
                     );
                 }
                 if let Some(snippet_language) = snippet_language.as_deref() {
-                    scan_text(
+                    scan_field(
                         snippet_language,
                         SecretLocation::MessageMetadata,
                         &ctx,
                         config,
                         &mut findings,
-                        &mut seen,
                         &mut truncated,
                     );
                 }
@@ -1090,15 +1069,46 @@ fn structured_metadata_scan_text(
     let Some(text) = legacy_json.filter(|text| !text.trim().is_empty()) else {
         return Ok(None);
     };
-    let value = serde_json::from_str(text).with_context(|| {
+    parse_json_metadata(text, legacy_column, row_id).map(Some)
+}
+
+fn parse_json_metadata(text: &str, column: &str, row_id: i64) -> Result<StructuredMetadataScan> {
+    let decode_error = || {
         format!(
-            "Failed to decode non-empty {legacy_column} JSON for row {row_id}; refusing a text-only scan that could miss credential-bearing fields"
+            "Failed to decode non-empty {column} JSON for row {row_id}; refusing a text-only scan that could miss credential-bearing fields"
         )
-    })?;
-    Ok(Some(StructuredMetadataScan {
+    };
+    if crate::indexer::redact_secrets::json_has_duplicate_keys(text).with_context(decode_error)? {
+        bail!("Duplicate JSON keys in {column} for row {row_id}; cannot certify every value");
+    }
+    let value = serde_json::from_str(text).with_context(decode_error)?;
+    Ok(StructuredMetadataScan {
         text: text.to_owned(),
         value: Some(value),
-    }))
+    })
+}
+
+fn scan_structured_metadata(
+    metadata: &StructuredMetadataScan,
+    location: SecretLocation,
+    ctx: &ScanContext,
+    config: &SecretScanConfig,
+    findings: &mut Vec<SecretFinding>,
+    truncated: &mut bool,
+) {
+    let first = findings.len();
+    scan_field(
+        &metadata.text,
+        location.clone(),
+        ctx,
+        config,
+        findings,
+        truncated,
+    );
+    redact_structured_metadata_contexts(&mut findings[first..]);
+    if let Some(value) = &metadata.value {
+        scan_sensitive_json_fields(value, location, ctx, config, findings, truncated);
+    }
 }
 
 fn redact_structured_metadata_contexts(findings: &mut [SecretFinding]) {
@@ -1418,6 +1428,27 @@ pub fn wizard_secret_scan<P: AsRef<Path>>(
     let report = scan_database(db_path, filters, config, None, Some(&progress))?;
     progress.finish_and_clear();
     Ok(report)
+}
+
+/// Detector offsets refer to this field's bytes. Two fields of the same row
+/// may carry different credentials at exactly the same offsets.
+fn scan_field(
+    text: &str,
+    location: SecretLocation,
+    ctx: &ScanContext,
+    config: &SecretScanConfig,
+    findings: &mut Vec<SecretFinding>,
+    truncated: &mut bool,
+) {
+    scan_text(
+        text,
+        location,
+        ctx,
+        config,
+        findings,
+        &mut Vec::new(),
+        truncated,
+    );
 }
 
 fn scan_text(
@@ -2359,15 +2390,15 @@ mod tests {
                 attachment_refs
             ) VALUES (
                 8, 1, 1, 'assistant', 'safe content', 1700000000001,
-                'safe safe safe safe safe safe safe safe safe safe AUX_MODEL_CREDENTIAL',
-                'AUX_ATTACHMENT_CREDENTIAL'
+                'AUX_MODEL_CREDENTIAL',
+                '{"marker":"AUX_ATTACHMENT_CREDENTIAL","pin":"short-pin-canary"}'
             );
             INSERT INTO snippets (
                 id, message_id, file_path, language, snippet_text
             ) VALUES (
                 9, 8,
-                'safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe AUX_PATH_CREDENTIAL',
-                'safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe AUX_LANGUAGE_CREDENTIAL',
+                'AUX_PATH_CREDENTIAL',
+                'AUX_LANGUAGE_CREDENTIAL',
                 'safe snippet'
             );
             "#,
@@ -2411,7 +2442,26 @@ mod tests {
         assert!(auxiliary_findings.iter().all(|finding| {
             finding.message_id == Some(8) && finding.location == SecretLocation::MessageMetadata
         }));
+        assert!(attestation.report.findings.iter().any(|finding| {
+            finding.message_id == Some(8)
+                && finding.kind == "sensitive_metadata_field"
+                && finding.severity == SecretSeverity::High
+        }));
+        assert!(!serde_json::to_string(&attestation.report)?.contains("short-pin-canary"));
         Ok(())
+    }
+
+    #[test]
+    fn metadata_scan_refuses_duplicate_decoded_keys_without_echoing_values() {
+        let text = r#"{"attachment":{"pin":"private-canary","p\u0069n":null}}"#;
+        let result = parse_json_metadata(text, "messages.attachment_refs", 41);
+        let Err(error) = result else {
+            panic!("duplicate keys hid the first attachment field");
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("messages.attachment_refs"));
+        assert!(message.contains("41"));
+        assert!(!message.contains("private-canary"));
     }
 
     #[test]
