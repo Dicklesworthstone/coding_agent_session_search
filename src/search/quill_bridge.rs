@@ -33,8 +33,8 @@ use frankensearch::quill::cass::{
 };
 use frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA;
 use frankensearch::quill::{
-    ConcatMergeRun, DEFAULT_CONCAT_MERGE_RUN_CONCURRENCY, KeeperSnapshot, QuillConfig, QuillIndex,
-    QuillSearchIndex, SchemaDocument,
+    ConcatMergeError, ConcatMergeRun, DEFAULT_CONCAT_MERGE_RUN_CONCURRENCY, KeeperError,
+    KeeperSnapshot, QuillConfig, QuillIndex, QuillIndexError, QuillSearchIndex, SchemaDocument,
 };
 use rayon::prelude::*;
 
@@ -1613,9 +1613,11 @@ impl QuillCassIndex {
         .max_by_key(Vec::len) else {
             return Ok(false);
         };
-        self.concat_merge_run(&run)?;
-        self.note_merged(now_ms);
-        Ok(true)
+        let merged = self.concat_merge_run(&run, 1)?;
+        if merged {
+            self.note_merged(now_ms);
+        }
+        Ok(merged)
     }
 
     /// Fold the published segments into as few as the merge-output byte cap
@@ -1720,7 +1722,9 @@ impl QuillCassIndex {
     ) -> Result<()> {
         if concurrency.get() == 1 || planned.len() < 2 {
             for run in planned {
-                self.concat_merge_planned(run)?;
+                if !self.concat_merge_planned(run)? {
+                    self.fold_smaller_runs(run, planned, FoldRetry::Rebuild)?;
+                }
             }
             return Ok(());
         }
@@ -1733,30 +1737,49 @@ impl QuillCassIndex {
         // Runs publish in plan order, so the published ones are a prefix: each
         // is one unit of completed work, as in the one-run path. A published
         // run's sources have left the manifest and its output has joined it.
-        let published = match &outcome {
-            Ok(_) => planned.len(),
-            Err(_) => {
-                let live = self.published_segment_profile().unwrap_or_default();
-                let is_live = |segment_id: u64| live.iter().any(|(id, _)| *id == segment_id);
-                planned
-                    .iter()
-                    .take_while(|run| {
-                        is_live(run.output_segment_id)
-                            && !run.source_segment_ids.iter().copied().any(is_live)
-                    })
-                    .count()
+        let error = match outcome {
+            Ok(_) => {
+                for _ in planned {
+                    self.tick_heartbeat();
+                }
+                return Ok(());
             }
+            Err(error) => error,
         };
+        let live = self.published_segment_profile().with_context(|| {
+            format!("reading the Quill CASS publication after a failed concat merge: {error}")
+        })?;
+        let is_live = |segment_id: u64| live.iter().any(|(id, _)| *id == segment_id);
+        let published = planned
+            .iter()
+            .take_while(|run| {
+                is_live(run.output_segment_id)
+                    && !run.source_segment_ids.iter().copied().any(is_live)
+            })
+            .count();
         for _ in 0..published {
             self.tick_heartbeat();
         }
-        outcome.map(|_| ()).map_err(|error| {
-            // The one-run path's message, naming the run that failed.
-            let sources = planned
-                .get(published)
-                .map_or(0, |run| run.source_segment_ids.len());
-            anyhow!("concat-merging {sources} Quill CASS segments: {error}")
-        })
+        let Some((failed, remaining)) = planned[published..].split_first() else {
+            return Err(anyhow!(
+                "confirming the published Quill CASS merges: {error}"
+            ));
+        };
+        if !matches!(
+            error,
+            QuillIndexError::Keeper(KeeperError::ConcatMerge {
+                source: ConcatMergeError::OutputTooLarge
+            })
+        ) {
+            return Err(anyhow!(
+                "concat-merging {} Quill CASS segments: {error}",
+                failed.source_segment_ids.len()
+            ));
+        }
+        self.fold_smaller_runs(failed, remaining, FoldRetry::Rebuild)?;
+        // Keep the already published prefix. The remaining runs are disjoint
+        // from every piece of the refused run and retain their output IDs.
+        self.publish_fold_runs(remaining, NonZeroUsize::MIN)
     }
 
     /// The fold profile of every published segment, in manifest (docid)
@@ -1825,8 +1848,12 @@ impl QuillCassIndex {
             if sub_runs.is_empty() {
                 break;
             }
+            let mut merged_this_pass = false;
             for sub_run in sub_runs {
-                self.concat_merge_run(&sub_run)?;
+                merged_this_pass |= self.concat_merge_run(&sub_run, usize::MAX)?;
+            }
+            if !merged_this_pass {
+                break;
             }
             merged_any = true;
         }
@@ -1836,20 +1863,84 @@ impl QuillCassIndex {
     /// Q1-preserving concat merge of one consecutive manifest run into a
     /// fresh segment. The output id is random and collision-checked against
     /// the live manifest, matching the engine's own id discipline.
-    fn concat_merge_run(&mut self, source_segment_ids: &[u64]) -> Result<()> {
+    fn concat_merge_run(&mut self, source_segment_ids: &[u64], limit: usize) -> Result<bool> {
         let output_segment_id = fresh_segment_id(&self.published_segment_profile()?);
-        self.concat_merge_planned(&ConcatMergeRun {
+        let run = ConcatMergeRun {
             source_segment_ids: source_segment_ids.to_vec(),
             output_segment_id,
             created_unix_s: unix_now_s(),
-        })
+        };
+        if self.concat_merge_planned(&run)? {
+            return Ok(true);
+        }
+        self.fold_smaller_runs(&run, &[], FoldRetry::Incremental { limit })
     }
 
-    /// One concat merge under an identity chosen by the caller.
-    fn concat_merge_planned(&mut self, run: &ConcatMergeRun) -> Result<()> {
+    /// Bisect only a run refused by the engine's pre-publication size check.
+    /// Each candidate is an uninterrupted slice of the original MANIFEST.
+    /// An unrepresentable pair stays live as two independently readable segments.
+    fn fold_smaller_runs(
+        &mut self,
+        refused: &ConcatMergeRun,
+        reserved: &[ConcatMergeRun],
+        retry: FoldRetry,
+    ) -> Result<bool> {
+        let ids = &refused.source_segment_ids;
+        if ids.len() <= 2 {
+            return Ok(false);
+        }
+        let profile = self.published_segment_profile()?;
+        let sources = profile
+            .iter()
+            .position(|&(id, _)| id == ids[0])
+            .and_then(|start| profile[start..].get(..ids.len()))
+            .filter(|sources| sources.iter().map(|&(id, _)| id).eq(ids.iter().copied()))
+            .context("refused Quill CASS merge sources are no longer consecutive")?;
+        // Reserve pending publication IDs as well as the live IDs. Sibling
+        // pieces can publish before later pieces or later planned runs.
+        let mut taken = profile.clone();
+        taken.extend(reserved.iter().map(|run| (run.output_segment_id, 0)));
+        let (left, right) = sources.split_at(sources.len().div_ceil(2));
+        let mut pending = vec![right, left];
+        let mut published = 0;
+        while let Some(mut part) = pending.pop() {
+            if part.len() < 2 {
+                continue;
+            }
+            if let FoldRetry::Incremental { .. } = retry {
+                // A balanced run can have unbalanced halves (#479).
+                // Retain the incremental policy's minimum 50% growth.
+                if let Some((offset, len)) = balanced_segment_subrun(part) {
+                    part = &part[offset..offset + len];
+                } else if part.len() != 2 || !comparable_merge_pair(part[0].1, part[1].1) {
+                    continue;
+                }
+            }
+            let output_segment_id = fresh_segment_id(&taken);
+            let child = ConcatMergeRun {
+                source_segment_ids: part.iter().map(|&(id, _)| id).collect(),
+                output_segment_id,
+                created_unix_s: refused.created_unix_s,
+            };
+            if self.concat_merge_planned(&child)? {
+                taken.push((output_segment_id, 0));
+                published += 1;
+                if matches!(retry, FoldRetry::Incremental { limit } if published >= limit) {
+                    break;
+                }
+            } else if part.len() > 2 {
+                let (left, right) = part.split_at(part.len().div_ceil(2));
+                pending.extend([right, left]);
+            }
+        }
+        Ok(published > 0)
+    }
+
+    /// Return false only for a typed, pre-publication output-layout refusal.
+    fn concat_merge_planned(&mut self, run: &ConcatMergeRun) -> Result<bool> {
         let source_segment_ids = run.source_segment_ids.as_slice();
         let (output_segment_id, created_unix_s) = (run.output_segment_id, run.created_unix_s);
-        self.with_engine_liveness(|| {
+        let outcome = self.with_engine_liveness(|| {
             drive(|cx| {
                 let index = &self.index;
                 async move {
@@ -1858,17 +1949,20 @@ impl QuillCassIndex {
                         .await
                 }
             })
-        })?
-        .map(|_| ())
-        .map_err(|error| {
-            anyhow!(
+        })?;
+        match outcome {
+            Ok(_) => {
+                self.tick_heartbeat();
+                Ok(true)
+            }
+            Err(QuillIndexError::Keeper(KeeperError::ConcatMerge {
+                source: ConcatMergeError::OutputTooLarge,
+            })) => Ok(false),
+            Err(error) => Err(anyhow!(
                 "concat-merging {} Quill CASS segments: {error}",
                 source_segment_ids.len()
-            )
-        })?;
-        // One merged run is one unit of completed work.
-        self.tick_heartbeat();
-        Ok(())
+            )),
+        }
     }
 
     /// Density-driven tombstone compaction; a no-op on an append-only index.
@@ -1898,6 +1992,12 @@ impl QuillCassIndex {
     /// equivalent knob and nothing to relax. Retained as a no-op so the
     /// caller's bulk-load sequence keeps its shape.
     pub const fn configure_bulk_load_merge_policy(&self) {}
+}
+
+#[derive(Clone, Copy)]
+enum FoldRetry {
+    Rebuild,
+    Incremental { limit: usize },
 }
 
 /// Upper bound on bounded-merge passes per `optimize_if_idle` call. Each pass
@@ -2019,6 +2119,10 @@ fn balanced_segment_subrun(profile: &[(u64, u64)]) -> Option<(usize, usize)> {
     best
 }
 
+fn comparable_merge_pair(left: u64, right: u64) -> bool {
+    left.min(right) > 0 && u128::from(left.max(right)) <= 2 * u128::from(left.min(right))
+}
+
 /// A byte-cap split must retain geometric balance too: a balanced overall
 /// run can otherwise become an expensive large-plus-tiny prefix after capping.
 fn plan_capped_balanced_merge_runs(
@@ -2061,10 +2165,9 @@ fn plan_capped_balanced_merge_runs(
         for (pair, pair_folds) in run.windows(2).zip(run_folds.windows(2)) {
             let (left_id, left) = pair[0];
             let (right_id, right) = pair[1];
-            if left == 0 || right == 0 || used.contains(&left_id) || used.contains(&right_id) {
-                continue;
-            }
-            if u128::from(left.max(right)) <= 2 * u128::from(left.min(right))
+            if !used.contains(&left_id)
+                && !used.contains(&right_id)
+                && comparable_merge_pair(left, right)
                 && fold_fits(pair_folds, max_output_bytes)
             {
                 used.insert(left_id);
@@ -2734,7 +2837,7 @@ mod tests {
             if run_docs >= LARGE_SEGMENT_DOCS {
                 if run.len() > 1 {
                     index
-                        .concat_merge_run(&run)
+                        .concat_merge_run(&run, usize::MAX)
                         .expect("fold into one large segment");
                 }
                 run.clear();
@@ -3158,6 +3261,114 @@ mod tests {
     }
 
     const FOLD_QUERIES: [&str; 5] = ["fold", "token3", "wave1 message", "token*", "fold-7"];
+
+    /// Publish a large allocated-ID gap without creating a large segment.
+    /// Every input remains dense. Only a concat crossing the gap would need
+    /// multi-GiB dense metadata, so Quill's real size check refuses it.
+    fn gh556_sparse_fold_fixture() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("sparse fold directory");
+        for half in 0..2 {
+            if half == 1 {
+                let path = directory.path();
+                drive(|cx| async move {
+                    let mut keeper =
+                        KeeperSnapshot::open_writer(&cx, path, CASS_SEMANTIC_SCHEMA).await?;
+                    let mut next = keeper.snapshot()?.next_manifest()?;
+                    next.docid_high_watermark = 1 << 29;
+                    keeper
+                        .publish_with_intent(
+                            &cx,
+                            &next,
+                            frankensearch::quill::PublishIntent::PreserveLiveDocuments,
+                        )
+                        .await?;
+                    Ok::<(), KeeperError>(())
+                })
+                .expect("drive fixture publication")
+                .expect("publish reserved document IDs");
+            }
+            let mut index =
+                QuillCassIndex::open_or_create(directory.path()).expect("open fixture writer");
+            for offset in 0..4 {
+                index
+                    .add_cass_documents(&[sample("sparse", 4 * half + offset, "fold sparse")])
+                    .expect("append searchable document");
+                index.commit().expect("publish dense segment");
+            }
+        }
+        directory
+    }
+
+    #[test]
+    fn gh556_oversized_fold_keeps_published_prefix_and_finishes_remaining_runs() {
+        for concurrency in [NonZeroUsize::MIN, NonZeroUsize::new(3).expect("nonzero")] {
+            let directory = gh556_sparse_fold_fixture();
+            let mut index = QuillCassIndex::open_or_create(directory.path()).expect("reopen");
+            let before = manifest_segments(&index);
+            assert_eq!(before.len(), 8);
+            assert!(before[4].docid_lo >= 1 << 29);
+            let ids: Vec<_> = before.iter().map(|segment| segment.segment_id).collect();
+            let planned = [
+                fixed_fold_run(&ids[..2], 0xF01D_0101),
+                fixed_fold_run(&ids[2..6], 0xF01D_0102),
+                fixed_fold_run(&ids[6..], 0xF01D_0103),
+            ];
+            let hits = |index: &QuillCassIndex| {
+                generation_witness(index, &["fold"])
+                    .into_iter()
+                    .filter(|line| !line.starts_with("segment "))
+                    .collect::<Vec<_>>()
+            };
+            let expected = hits(&index);
+            assert!(!index.concat_merge_planned(&planned[1]).expect("size check"));
+            assert_eq!(manifest_segments(&index), before, "refusal must not publish");
+            index
+                .publish_fold_runs(&planned, concurrency)
+                .expect("fold both sides of the refused run and its neighbors");
+            let after = manifest_segments(&index);
+            assert_eq!(after.len(), 4);
+            assert_eq!(after[0].segment_id, planned[0].output_segment_id);
+            assert_eq!(after[3].segment_id, planned[2].output_segment_id);
+            for (merged, sources) in after.iter().zip(before.chunks_exact(2)) {
+                assert_eq!(merged.docid_lo, sources[0].docid_lo);
+                assert_eq!(merged.docid_hi, sources[1].docid_hi);
+                assert_eq!(merged.doc_count, 2);
+            }
+            // The irreducible two-segment refusal is a no-op, without a
+            // phantom publication or a retry against the same pair.
+            let across = [after[1].segment_id, after[2].segment_id];
+            assert!(
+                !index
+                    .concat_merge_run(&across, usize::MAX)
+                    .expect("leave pair")
+            );
+            assert_eq!(manifest_segments(&index), after);
+            drop(index);
+            let mut reopened = QuillCassIndex::open_or_create(directory.path()).expect("reopen");
+            assert_eq!(hits(&reopened), expected, "ranks, identities and counts");
+            reopened
+                .add_cass_documents(&[sample("sparse", 8, "next append")])
+                .expect("append after bounded fold");
+            reopened.commit().expect("publish later document");
+            assert_eq!(reopened.doc_count().expect("count later document"), 9);
+        }
+    }
+
+    #[test]
+    fn gh556_mid_ingest_fold_publishes_at_most_one_smaller_run() {
+        let directory = gh556_sparse_fold_fixture();
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("reopen");
+        let _cap = lexical_merge_max_output_bytes_for_test(u64::MAX);
+        assert!(
+            index
+                .fold_largest_small_run(i64::MAX)
+                .expect("bounded fold")
+        );
+        let after = manifest_segments(&index);
+        assert_eq!(after.len(), 5);
+        assert_eq!(after[0].doc_count, 4);
+        assert!(after[1..].iter().all(|segment| segment.doc_count == 1));
+    }
 
     /// Under the same output identities, the concurrent fold publishes the
     /// serial fold's segments byte for byte (same `file_xxh3`, length, docid
