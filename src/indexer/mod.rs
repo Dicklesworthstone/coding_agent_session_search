@@ -23,6 +23,8 @@ mod source_writer_probe;
 pub(crate) mod staging_reclaim;
 #[cfg(test)]
 mod watch_ingestion_tests;
+#[cfg(all(test, unix))]
+mod watch_codex_preflight_tests;
 mod watch_source_cache;
 mod watch_source_ledger;
 mod watch_source_stability;
@@ -31789,6 +31791,115 @@ fn ingest_batch_with_semantic_delta(
     Ok(batch_outcome)
 }
 
+#[derive(Default)]
+struct WatchCodexPreflightOutcome {
+    deferred_conversations: usize,
+    first_refusal: Option<crate::storage::sqlite::CodexCanonicalRefusal>,
+    capture_allowed: Vec<bool>,
+}
+
+/// Refuse only conflicts observed before a canonical write. This deliberately
+/// does not catch a later persistence failure: another writer may change the
+/// archive after this probe, and the transactional guard remains authoritative.
+fn preflight_watch_codex_sources(
+    storage: &FrankenStorage,
+    ledger: &mut watch_source_ledger::WatchSourceLedger,
+    conversations: &mut Vec<NormalizedConversation>,
+    progress: &Option<Arc<IndexingProgress>>,
+) -> Result<WatchCodexPreflightOutcome> {
+    // Preserve strict provider-aware proof alignment for every admitted
+    // packet, including Claude. A remembered canonical refusal is already
+    // ineligible and will be counted/filtered below; aligning it again would
+    // mistake deliberate deferral for missing certification.
+    for conversation in conversations.iter_mut() {
+        if let Some(progress) = progress {
+            progress.check_stop()?;
+        }
+        if ledger.may_publish_source(&conversation.source_path) {
+            ledger.align_prefix_metadata(conversation)?;
+        }
+    }
+    if !conversations.iter().any(|conv| conv.agent_slug == "codex") {
+        let original_len = conversations.len();
+        conversations.retain(|conv| ledger.may_publish_source(&conv.source_path));
+        return Ok(WatchCodexPreflightOutcome {
+            deferred_conversations: original_len - conversations.len(),
+            capture_allowed: vec![true; conversations.len()],
+            ..Default::default()
+        });
+    }
+    let admitted = persist::preflight_conversation_retention(storage, conversations)?;
+    let heartbeat = persist::PersistHeartbeat::new(progress.as_deref(), None);
+    let _persist_in_progress = PersistInProgressGuard::engage(progress.as_deref());
+    let mut first_refusal = None;
+    for (conversation, admitted) in conversations.iter().zip(&admitted) {
+        if !admitted
+            || conversation.agent_slug != "codex"
+            || !ledger.may_publish_source(&conversation.source_path)
+        {
+            continue;
+        }
+        if let Some(progress) = progress {
+            progress.check_stop()?;
+        }
+        if let Some(refusal) = persist::preflight_codex_canonical_source(
+            storage,
+            conversation,
+            heartbeat,
+            persist::PersistSliceLimits::DEFAULT,
+        )? {
+            anyhow::ensure!(
+                refusal.provider == crate::connectors::codex::StablePrefixProvider::Codex
+                    && refusal.source_path == conversation.source_path
+                    && refusal.external_id == conversation.external_id,
+                "Codex canonical preflight returned a foreign source identity"
+            );
+            ledger.defer_canonical_source(&conversation.source_path)?;
+            tracing::warn!(
+                source = %refusal.source_path.display(),
+                canonical_conversation_id = refusal.conversation_id,
+                error = %refusal,
+                "Codex watch source requires canonical reconciliation; preserving its proof and retry"
+            );
+            first_refusal.get_or_insert(refusal);
+        }
+    }
+
+    // A later packet may refuse a source whose earlier packet was clean.
+    // Filter only after every probe, and retain refusal eligibility across
+    // later chunks and aliases with the same durable source key.
+    let original_len = conversations.len();
+    let mut position = 0;
+    let mut capture_allowed = Vec::with_capacity(original_len);
+    conversations.retain(|conversation| {
+        let keep = ledger.may_publish_source(&conversation.source_path);
+        if keep {
+            capture_allowed.push(admitted[position]);
+        }
+        position += 1;
+        keep
+    });
+    Ok(WatchCodexPreflightOutcome {
+        deferred_conversations: original_len - conversations.len(),
+        first_refusal,
+        capture_allowed,
+    })
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static WATCH_CODEX_PREFLIGHT_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_watch_codex_preflight_test_hook() {
+    let hook = WATCH_CODEX_PREFLIGHT_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 #[derive(Debug, Default)]
 struct WatchIngestBatchOutcome {
     batch_outcome: persist::PersistBatchOutcome,
@@ -37270,6 +37381,7 @@ fn reindex_paths_with_semantic_delta(
         RawSourceExclusions::load(&storage)?
     };
     let mut first_source_scan_error = None;
+    let mut first_canonical_preflight_refusal = None;
 
     let mut semantic_delta = semantic_delta;
     let preserve_watch_watermark = scan_path_exclusions_active();
@@ -37732,6 +37844,7 @@ fn reindex_paths_with_semantic_delta(
         let mut quarantined_conversations = 0usize;
         let mut deferred_conversations = nomem_backoff_held;
         let mut lexical_replay_deferred = false;
+        let mut canonical_preflight_error = None;
         let mut published_conversations = absent_source_recovery.published_conversations;
         let mut remaining_conversations = conv_count;
         let current_debt = WatchLexicalReplayDebt::for_root(kind, &root);
@@ -37764,12 +37877,48 @@ fn reindex_paths_with_semantic_delta(
             if connector_name.is_none() {
                 connector_name = chunk.first().map(|conv| conv.agent_slug.clone());
             }
-            for conv in &mut chunk {
+            let preflight = {
+                let storage = storage
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+                preflight_watch_codex_sources(
+                    &storage, &mut source_ledger, &mut chunk, &opts.progress,
+                )?
+            };
+            deferred_conversations = deferred_conversations
+                .saturating_add(preflight.deferred_conversations);
+            if let Some(refusal) = preflight.first_refusal {
+                canonical_preflight_error.get_or_insert_with(|| {
+                    format!("Codex canonical source deferred: {refusal}")
+                });
+                if let Some(progress) = &opts.progress
+                    && let Ok(mut stats) = progress.stats.lock()
+                {
+                    stats.scan_had_errors = true;
+                }
+                // Continuous watch must return its healthy publication work
+                // and retry paths so canonical semantic maintenance can run.
+                // A one-shot selection instead reports its incomplete request
+                // after every healthy source has had the chance to finish.
+                if explicit_watch_once {
+                    first_canonical_preflight_refusal.get_or_insert(refusal);
+                }
+            }
+            if chunk.is_empty() {
+                continue;
+            }
+            #[cfg(test)]
+            run_watch_codex_preflight_test_hook();
+            // Do not publish new raw material for a known canonical conflict
+            // or a deliberately ignored packet. Keep raw I/O outside the
+            // storage lock; a later race is still checked transactionally.
+            for (conv, capture_allowed) in chunk.iter_mut().zip(preflight.capture_allowed) {
                 if let Some(progress) = &opts.progress {
                     progress.check_stop()?;
                 }
-                source_ledger.align_prefix_metadata(conv)?;
-                capture_prepared_conversation(&opts.data_dir, conv, &raw_source_exclusions);
+                if capture_allowed {
+                    capture_prepared_conversation(&opts.data_dir, conv, &raw_source_exclusions);
+                }
                 if let Some(progress) = &opts.progress {
                     progress.check_stop()?;
                     progress.tick_activity();
@@ -37967,7 +38116,8 @@ fn reindex_paths_with_semantic_delta(
                         // publication again merely to keep that debt alive.
                         remaining_conversations == 0
                             && !publication_complete
-                            && !absent_source_recovery.unresolved_source,
+                            && !absent_source_recovery.unresolved_source
+                            && !source_ledger.has_canonical_refusals(),
                     )?;
                 }
             }
@@ -38045,7 +38195,7 @@ fn reindex_paths_with_semantic_delta(
                 conversations: conv_count,
                 messages: inserted_messages,
                 scan_ms,
-                error: scan_error,
+                error: scan_error.or(canonical_preflight_error),
             };
             if let Some(index) = failed_stats_index {
                 stats.connectors[index] = connector_stats;
@@ -38129,9 +38279,12 @@ fn reindex_paths_with_semantic_delta(
     // Reset phase to idle if progress exists
     reset_progress_to_idle(opts.progress.as_ref());
 
-    match first_source_scan_error {
-        Some(error) => Err(ConnectorScanFailure(error).into()),
-        None => Ok(outcome),
+    if let Some(error) = first_source_scan_error {
+        Err(ConnectorScanFailure(error).into())
+    } else if let Some(refusal) = first_canonical_preflight_refusal {
+        Err(refusal.into())
+    } else {
+        Ok(outcome)
     }
 }
 
@@ -43763,10 +43916,18 @@ pub mod persist {
     /// Shared-store session tombstones survive a sibling's source-file change;
     /// single-session source stamps retain their existing change/reingest rule.
     /// Workspace exclusions are prospective and never remove archived rows.
-    fn retain_admitted_conversations(
+    struct ConversationRetentionPlan {
+        keep: Vec<bool>,
+        changed_sources: Vec<String>,
+    }
+
+    /// Read policy without clearing forgotten-source stamps. Preflight must
+    /// not resurrect a forgotten source or mistake deliberate exclusion for
+    /// a disagreement with canonical history.
+    fn conversation_retention_plan(
         storage: &FrankenStorage,
         convs: &[NormalizedConversation],
-    ) -> Result<Option<Vec<NormalizedConversation>>> {
+    ) -> Result<ConversationRetentionPlan> {
         // Bound retention checks to this batch. Loading every historical
         // exclusion for every source completion multiplies work on full scans.
         let tombstones = {
@@ -43799,7 +43960,10 @@ pub mod persist {
             && forgotten_sessions.is_empty()
             && workspace_policy.patterns.is_empty()
         {
-            return Ok(None);
+            return Ok(ConversationRetentionPlan {
+                keep: vec![true; convs.len()],
+                changed_sources: Vec::new(),
+            });
         }
         let mut keep = Vec::with_capacity(convs.len());
         let mut changed = Vec::new();
@@ -43840,18 +44004,36 @@ pub mod persist {
             }
             keep.push(!forgotten_and_unchanged);
         }
-        if !changed.is_empty() {
-            changed.sort();
-            changed.dedup();
-            storage.clear_forgotten_sources(&changed)?;
+        changed.sort();
+        changed.dedup();
+        Ok(ConversationRetentionPlan {
+            keep,
+            changed_sources: changed,
+        })
+    }
+
+    pub(super) fn preflight_conversation_retention(
+        storage: &FrankenStorage,
+        convs: &[NormalizedConversation],
+    ) -> Result<Vec<bool>> {
+        Ok(conversation_retention_plan(storage, convs)?.keep)
+    }
+
+    fn retain_admitted_conversations(
+        storage: &FrankenStorage,
+        convs: &[NormalizedConversation],
+    ) -> Result<Option<Vec<NormalizedConversation>>> {
+        let plan = conversation_retention_plan(storage, convs)?;
+        if !plan.changed_sources.is_empty() {
+            storage.clear_forgotten_sources(&plan.changed_sources)?;
         }
-        if keep.iter().all(|kept| *kept) {
+        if plan.keep.iter().all(|kept| *kept) {
             return Ok(None);
         }
         Ok(Some(
             convs
                 .iter()
-                .zip(keep)
+                .zip(plan.keep)
                 .filter(|(_, kept)| *kept)
                 .map(|(conv, _)| conv.clone())
                 .collect(),
@@ -43951,6 +44133,69 @@ pub mod persist {
             metadata: conv.metadata.clone(),
             messages,
         }
+    }
+
+    #[cfg(test)]
+    std::thread_local! {
+        pub(super) static CODEX_PREFLIGHT_PROJECTION_OBSERVATION:
+            std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    }
+
+    /// Check every bounded projection slice before this source can reach a
+    /// writer. A clean check grants no admission authority: each subsequent
+    /// canonical transaction still validates the current stored overlap.
+    pub(super) fn preflight_codex_canonical_source(
+        storage: &FrankenStorage,
+        conv: &NormalizedConversation,
+        heartbeat: PersistHeartbeat<'_>,
+        limits: PersistSliceLimits,
+    ) -> Result<Option<crate::storage::sqlite::CodexCanonicalRefusal>> {
+        if conv.agent_slug != "codex" {
+            return Ok(None);
+        }
+        // Unlike the write append shortcut, this read-only check uses indexed
+        // message identities and does not need timestamps. Bound untimed
+        // rollouts too; retain the existing one-oversized-message exception.
+        let ranges = persist_slice_ranges(conv, limits);
+        let sliced = ranges.len() > 1;
+        let last = ranges.len() - 1;
+        for (index, range) in ranges.into_iter().enumerate() {
+            if let Some(progress) = heartbeat.progress {
+                progress.check_stop()?;
+            }
+            heartbeat.tick();
+            // Preserve the same header/provenance and full prefix receipt as
+            // actual persistence. Only one persistence slice and its redacted
+            // projection/memoizer live at a time. Unsliced inputs are borrowed.
+            let slice;
+            let input = if sliced {
+                slice = persist_conversation_slice(conv, range, index == last);
+                &slice
+            } else {
+                conv
+            };
+            let mut redactor = super::redact_secrets::MemoizingRedactor::new();
+            let internal = map_to_internal_with_redactor_and_heartbeat(
+                input, Some(&mut redactor), heartbeat,
+            );
+            if let Some(progress) = heartbeat.progress {
+                progress.check_stop()?;
+            }
+            #[cfg(test)]
+            CODEX_PREFLIGHT_PROJECTION_OBSERVATION.with(|observed| {
+                let (calls, largest) = observed.get();
+                observed.set((calls + 1, largest.max(internal.messages.len())));
+            });
+            let refusal = storage.codex_canonical_preflight_refusal(&internal)?;
+            heartbeat.tick();
+            if let Some(progress) = heartbeat.progress {
+                progress.check_stop()?;
+            }
+            if refusal.is_some() {
+                return Ok(refusal);
+            }
+        }
+        Ok(None)
     }
 
     #[allow(clippy::too_many_arguments)]

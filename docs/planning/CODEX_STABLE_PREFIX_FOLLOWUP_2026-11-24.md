@@ -294,14 +294,14 @@ writer-close precedence. Four existing storage tests gain typed reason and
 identity assertions. These are authored native regressions with independent
 source review; no runtime pass is claimed.
 
-### Remaining isolation work
+### Isolation scope of the startup increment
 
-This increment is limited to source-exclusive startup boundaries. A canonical
-refusal in a mixed watch batch remains terminal because earlier source/slice
-outcomes and derived-index work can already have committed. It needs explicit
-partial-outcome accounting before safe per-source continuation. This change
-adds no unsafe retry-by-bisection or historical canonical backfill. The broader
-stable-prefix bead remains open.
+At the startup increment's publication boundary, a canonical refusal in a mixed
+watch batch remained terminal because earlier source/slice outcomes and derived
+work could already have committed. The later watch preflight below isolates
+known conflicts before writes. Race-late mixed failures still remain terminal
+and recover through durable watch debt; no unsafe retry-by-bisection or historical
+canonical backfill was added. The broader stable-prefix bead remains open.
 
 ## Final scoped formatter and scanner attempt
 
@@ -371,3 +371,110 @@ These changes have source review and exact source-identity checks, not final
 native compilation or runtime qualification. The original frozen candidate's
 earlier passing tests do not qualify these follow-ups. No release, real-watch
 latency, cross-platform or broad-bead completion is claimed.
+
+
+## Watch preflight for known canonical conflicts
+
+The watch path now checks existing Codex canonical history before opening a
+canonical writer for a collected batch. A read-only preflight identifies only
+the three typed canonical disagreements: missing required prefix admission,
+retained history beyond the admitted projection, and a conflicting occupied
+message index. Sources with a known disagreement retain their existing
+invalidated proof and root replay debt. Healthy sources can persist, commit
+lexical publication and publish their own receipts.
+
+This is a negative preflight, not admission authority. A clean result does not
+certify the source or authorize a write. Actual canonical transactions repeat
+the authoritative checks. A conflict that appears after preflight, a native
+database failure, malformed evidence, metadata corruption, or a cleanup
+failure remains terminal. Earlier committed slices are never assumed to have
+rolled back, and no generic retry-by-bisection was added.
+
+### Canonical identity and bounded read checks
+
+Preflight resolves only the normalized source ID, actual Codex agent ID and
+external ID through the canonical unique tuple. Missing external IDs yield no
+preflight conclusion. A missing derived lookup is supported without repair;
+a present lookup must agree with the canonical tuple. The transactional
+validator also checks the exact provider/source/external-ID tuple, protecting
+the real write against a derived-cache misbinding after a clean probe. Source
+path aliases remain valid when the parser evidence names the actual alias.
+
+The existing strict combined 256 KiB metadata bound and MessagePack precedence
+remain in effect. Incoming provider, path, boundary and message-index evidence
+is validated; prospective protocol-marker shape and output budget are checked
+before an overlap disagreement can become a typed source refusal. The shared
+overlap planner performs only indexed reads and returns no transcript-row
+collection. Only the authoritative write wrapper publishes metadata and rows.
+The read transaction must explicitly roll back successfully before a typed
+refusal is returned.
+
+The host uses the normal redacted projection and persistence slice limits:
+16,384 messages or 32 MiB of message content per slice, retaining the existing
+single oversized-message exception. Preflight applies those limits to untimed
+rollouts as well. Only one normalized slice and one redacted projection are
+mapped at a time; actual persistence retains its existing slicing policy.
+Retention decisions are read-only during preflight. Clearing changed
+forgotten-source stamps remains the responsibility of normal persistence.
+
+### Publication, retry and privacy behavior
+
+All packets for a known refused source are excluded from a chunk, including
+an earlier clean packet whose later sibling exposed the conflict. Explicit
+bounded refusal state persists across later chunks, and paths sharing a
+durable source key remain ineligible. The refusal identities have an 8 MiB
+content budget and 65,536-entry bounds. Absence of an optional completion
+record cannot make a refused source eligible again.
+
+Raw capture now follows the preflight and retention decision. Known refused
+and policy-excluded packets receive no new raw capture. Existing prefix
+receipt alignment remains strict for eligible packets; already deferred
+packets are discarded without trying to re-certify their invalidated
+completion. This preserves retry progress across chunks while retaining the
+concurrent provider-specific proof checks.
+
+Healthy receipts publish only after lexical commit. Known refusals keep
+cumulative deferral counts and root replay debt, so root watermarks and global
+completion certification remain withheld. Live watch returns healthy progress
+with retry information, allowing existing canonical semantic maintenance to
+continue. An explicit one-shot invocation reports the first known refusal
+after processing healthy sources.
+
+The existing watch recovery mechanism remains authoritative: debt and receipt
+invalidation precede canonical writes, restart drops a retained dirty writer,
+replay has no wall-clock cutoff, and debt is cleared only after committed
+publication. No parallel checkpoint schema or global debt-clearing shortcut
+was introduced.
+
+### Integration and qualification
+
+This increment was reconciled against 90e68ceac093444aeae549b257dc0cf011ea4e94 and preserves
+its concurrent Claude stable-prefix implementation, provider-bound receipts,
+shared canonical guard, raw capture, and tests. Publication uses the later
+8128079d71ad1d059fc84c3a7b64af5c276b543a tree, preserving its six unrelated
+forget-benchmark Python/documentation/test paths without modifying them. Watch preflight remains scoped
+to Codex. The generalized transactional identity check uses the already
+validated provider, and shared planning retains foreign-provider rejection.
+
+The 22 new regression entrypoints (ten storage, ten host, two ledger) cover
+storage identity and metadata behavior,
+watch sibling progress and retries, policy/redaction behavior, aliases and
+bounded state, untimed slices, and deterministic post-probe races. The exact
+source identities and full entrypoint list are recorded in the companion
+validation JSON.
+
+All final files have independent source review and exact source reconstruction.
+The cached pinned rustfmt 1.10.0-nightly (9085017724 2026-08-30) parsed the final
+host `mod.rs` and `watch_source_ledger.rs` using `--emit stdout` with child
+traversal disabled; both exited zero without rewriting source. It also
+formatted the new host regression module in place before its final hash was
+frozen, exiting zero. These are per-file parsing/formatting operations, not a
+whole-project formatting-cleanliness result or a Rust typecheck.
+
+No Rust compilation, scanner result, SQL runtime or native test result is
+claimed for this increment. The final storage files have source review only.
+The earlier recorded reserve-stopped DSR checks and ENOSPC native preflight
+remain the attempted runtime/gate evidence; they do not qualify the newer code. Known preflight
+conflicts no longer require generic partial-outcome salvage, but race-late
+mixed watch failures remain terminal and recover through existing debt.
+The broader stable-prefix bead remains open.

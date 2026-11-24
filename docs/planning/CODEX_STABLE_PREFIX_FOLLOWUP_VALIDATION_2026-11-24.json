@@ -2,8 +2,8 @@
   "schema": "cass.stable_prefix.followup_validation.v1",
   "date_utc": "2026-11-24",
   "base_commit": "f9d7a0a8014e877482190f92498ff5eb28020c9a",
-  "scope": "Advisory-probe FIFO admission, nonempty active zero-boundary deferral, observation root validation, and per-source rebuild integrity preparation, and a transactional canonical prefix-protocol requirement across parser/ledger-key changes; budgeted direct-descriptor Codex prefix raw capture without an unbudgeted second full-prefix copy; typed source-exclusive startup canonical refusal isolation with durable lexical-repair debt",
-  "qualification": "Final sources have exact-context reconstruction and independent source review. The exact-366 native attempt stopped during dependency compilation with zero test binaries. Both the original eleven-file scoped run and the rebased scoped run stopped at the unchanged memory reserve; neither completed formatting or scanner qualification. The subsequent native preflight encountered ENOSPC and insufficient starting memory, so no compiler or test launched. No final compiler, formatting, Clippy, scanner, host/storage, CLI, release or broad-bead qualification is claimed.",
+  "scope": "Advisory-probe FIFO admission, nonempty active zero-boundary deferral, observation root validation, and per-source rebuild integrity preparation, and a transactional canonical prefix-protocol requirement across parser/ledger-key changes; budgeted direct-descriptor Codex prefix raw capture without an unbudgeted second full-prefix copy; typed source-exclusive startup canonical refusal isolation with durable lexical-repair debt; bounded read-only Codex watch canonical preflight with exact identity fencing, healthy sibling publication and preserved retry debt",
+  "qualification": "Final sources have exact-context reconstruction and independent source review, not native compilation or runtime qualification. The exact-366 native attempt stopped during dependency compilation with zero test binaries. Both recorded eleven-file DSR scoped runs stopped at the unchanged memory reserve; neither completed formatting or scanner qualification. A later native preflight encountered ENOSPC and insufficient starting memory, so no compiler or test launched. Limited per-file host rustfmt operations are recorded separately with their exact final host-source scope; they are not a full-project format, typecheck or test result. No final Clippy, scanner, SQL runtime, CLI, release or broad-bead qualification is claimed.",
   "captured_execution_attempt": {
     "schema": "cass.stable_prefix.restored_environment_validation.v1",
     "date_utc": "2026-11-24",
@@ -213,89 +213,40 @@
   "captured_execution_sha256": "718716073e1905aa5b9a7765678e9c50a4801ad54282cc45d6bcfcae94071379",
   "source_identity": [
     {
-      "path": "src/indexer/source_writer_probe.rs",
-      "git_blob_sha1": "f4a4ea1fb1105aceaaf0a862222e99ef75b49a85",
-      "sha256": "1cb081cfdb69e46ac35465bd25acc00eda8a1d03e5ea9e56e06884c7bebf95c5"
-    },
-    {
-      "path": "src/indexer/source_writer_probe/advisory_tests.rs",
-      "git_blob_sha1": "90b81e4d773a1332b82493d216d4001505b40ff8",
-      "sha256": "6ff5f78ef7885b2dc7734296b8bb04d5ca36622473368869feacce81e51c39dd"
-    },
-    {
-      "path": "src/connectors/codex/source_budget/recovery.rs",
-      "git_blob_sha1": "badafcdbe8e321401f56973298e86a757d3b9a6e",
-      "sha256": "2c60248c0e87d42f81bd11c1b15a88cff37b5e753457f863286be408ae8669ff"
-    },
-    {
-      "path": "src/connectors/codex/stable_prefix.rs",
-      "git_blob_sha1": "80e2adb78d2882fcdf5d47751e9795a923a151ea",
-      "sha256": "ac15c04aae78a61f4216f8c86c91a9cef5a2a9b98e013960c2ea607e5b84ad40"
-    },
-    {
-      "path": "src/connectors/codex/stable_prefix/zero_boundary_tests.rs",
-      "git_blob_sha1": "2536b75d1401e490296d131f0c96660f5abe207f",
-      "sha256": "96c142ace88d429dc4e0c1c59fcb7a4bc3032cb4c709031c9d8fcabf86914932"
-    },
-    {
-      "path": "src/connectors/codex/stable_prefix/receipt_shape_tests.rs",
-      "git_blob_sha1": "9a04663667eb99f67873121d4b30ae53a140dab5",
-      "sha256": "c3f9f8c8b0d843e959f29b6f046a1f3dd553c868f7b73fb3cfbaabbfc2cb0379"
-    },
-    {
-      "path": "src/connectors/codex/source_budget/snapshot.rs",
-      "git_blob_sha1": "166d82a7f33af9deef62dcde2c2f1edc3ee32b08",
-      "sha256": "c35cee6ffaf78389eaa8475c6111a0e2cc2f406e1a16a15d251c03f1a8d6a70f"
-    },
-    {
-      "path": "src/indexer/mod.rs",
-      "git_blob_sha1": "4b75a587310e51ce0e94f58c907e0dbee09969a2",
-      "sha256": "aa6c708e91dec59623313a37a21d405d1f46b56dc96ac20742241b58366d72e1"
-    },
-    {
-      "path": "src/indexer/source_ledger_tests.rs",
-      "git_blob_sha1": "9f0799cfff8c7a4f10c92ea7a652eb50461a4942",
-      "sha256": "8d156a56048dff7bb4355653140728703ada1b3bfef6416e23d19e1a0a5de055"
-    },
-    {
       "path": "src/storage/sqlite.rs",
-      "git_blob_sha1": "e2e70fb76dfe3e6e3d6363802797c15fc2dab643",
-      "sha256": "0b37561c41fa9cf49e0b491391ad042bca983eba380638ef49451e390e91b0a5"
+      "git_blob_sha1": "15c49a67512c8a6c5e893fdfac769f1b489d39e5",
+      "sha256": "fe1cd9862261596e28621fa9dc0789be66f00e268432e843a806d89be6e9b67e",
+      "bytes": 2183366
     },
     {
       "path": "src/storage/sqlite/codex_prefix_tests.rs",
-      "git_blob_sha1": "ecd25a61abfa0e941fe5a4424388903ed1c5c320",
-      "sha256": "902b1e2c9ef5c352b7359fc8d6ec4fd7b2b3123089cc57524a9f5e7be66b752a"
+      "git_blob_sha1": "416c67fc0441a2b2a0cbf5a31f7b8353ab074b39",
+      "sha256": "6612b211980463cca3ddc3aa76a9fd6e0f7180575509c7b3b76becab86e70466",
+      "bytes": 33085
     },
     {
-      "path": "src/connectors/codex/stable_prefix/tests.rs",
-      "git_blob_sha1": "3960d2bda0ba7746f6feeb7760f9c385cbfd8306",
-      "sha256": "dabd2b4779b2411c0b35521d932d8e1815c9499d4ae6064af65763e4e0a0ff5a"
+      "path": "src/storage/sqlite/codex_prefix_tests/preflight_tests.rs",
+      "git_blob_sha1": "d92c638c7d87d42a667094c58b1326ed32cc6dd6",
+      "sha256": "9087fcca1ffd7407b86b4809f9fb8ef7295a36043e8b5b23d4fb01cb57e0f04e",
+      "bytes": 24091
     },
     {
-      "path": "src/raw_mirror.rs",
-      "git_blob_sha1": "8240e3280dcbc2e0012a2024146f2344bfdca803",
-      "sha256": "49d0930c7bed3e79a440c44cf5392c41fbf5caa8269844088f47b2e31249ef34"
+      "path": "src/indexer/mod.rs",
+      "git_blob_sha1": "187781c044f5de6e0102e5d804cd82d5d1c80f35",
+      "sha256": "7fe4a9c2031990868c86ad26855dc562ce4c89ad02b81ac3eb69f345675227d2",
+      "bytes": 3623709
     },
     {
-      "path": "src/raw_mirror/policy.rs",
-      "git_blob_sha1": "b4caa2803e2ff0ba589038c8d3f064850ac15fe6",
-      "sha256": "772cc3820db9659f73c29bb3d62b657ec0d5224cb51d5a72beb868dab12b5d61"
+      "path": "src/indexer/watch_source_ledger.rs",
+      "git_blob_sha1": "0c3961acdcba0957211d81192f1b3c968ce854d6",
+      "sha256": "7281e3cf3940abdce5d7d35448a67d8e0b5b3f9fa42c21ccc484b3907b6d2b52",
+      "bytes": 39223
     },
     {
-      "path": "src/raw_mirror/prefix_tests.rs",
-      "git_blob_sha1": "c63da26e03499efc32d3758bc41a954561cc93c8",
-      "sha256": "047a0876bf68e8c0d06bb03fecd719ea608cebb47bcb7f1efe71410c5404d89f"
-    },
-    {
-      "path": "src/raw_mirror/prefix_tests/budgeted_tests.rs",
-      "git_blob_sha1": "63ae99b2514ff61e42ba9484ba4065a9d6149b14",
-      "sha256": "c2fef36005fdd44a882e71843544abc9da56d0c33254aabec03425ff51e3de40"
-    },
-    {
-      "path": "src/raw_mirror/policy_tests.rs",
-      "git_blob_sha1": "347c6b6e50ee293d782bfc96db42d9eb34b73ef4",
-      "sha256": "56474054dc0a6f18d2b8b4ed0c23764e0a30ace86bbd1c59490a14ad408ae316"
+      "path": "src/indexer/watch_codex_preflight_tests.rs",
+      "git_blob_sha1": "2c12886827c7f2940d03e6d6c4dab0a468220203",
+      "sha256": "d5d28fd23bb96f3c74f4d50c07eceacaad531343bd679fde794bf5f020ec31f0",
+      "bytes": 37326
     }
   ],
   "recovery": {
@@ -375,9 +326,19 @@
       {
         "sha": "c2c5cc529a3b9e89ee35d88b8cdc935c979f536e",
         "title": "fix(daemon): stream canonical replacement embeddings into private writer [skip ci]"
+      },
+      {
+        "sha": "90e68ceac093444aeae549b257dc0cf011ea4e94",
+        "title": "feat(ingest): index verified Claude JSONL prefixes during active sessions [skip ci]"
+      },
+      {
+        "sha": "8128079d71ad1d059fc84c3a7b64af5c276b543a",
+        "title": "fix(bench): require quiescent archives before forget recovery [skip ci]"
       }
     ],
-    "direct_main_authorized": true
+    "direct_main_authorized": true,
+    "startup_isolation_commit": "72dd31cc57c74f39d5a209a8544267ba27f0abb0",
+    "watch_preflight_parent": "8128079d71ad1d059fc84c3a7b64af5c276b543a"
   },
   "canonical_storage": {
     "requirement": "/cass/codex_prefix_required",
@@ -1639,5 +1600,483 @@
       "DSR source-before/after labels the minimal archive not-a-git-repo; the complete independent16-input manifest identifies eleven exact Rust sources plus five support inputs.",
       "Unchanged source hashes do not provide runtime qualification; prior successful historical tests do not transfer."
     ]
+  },
+  "previous_publication_source_identity": {
+    "commit": "72dd31cc57c74f39d5a209a8544267ba27f0abb0",
+    "files": [
+      {
+        "path": "src/indexer/source_writer_probe.rs",
+        "git_blob_sha1": "f4a4ea1fb1105aceaaf0a862222e99ef75b49a85",
+        "sha256": "1cb081cfdb69e46ac35465bd25acc00eda8a1d03e5ea9e56e06884c7bebf95c5"
+      },
+      {
+        "path": "src/indexer/source_writer_probe/advisory_tests.rs",
+        "git_blob_sha1": "90b81e4d773a1332b82493d216d4001505b40ff8",
+        "sha256": "6ff5f78ef7885b2dc7734296b8bb04d5ca36622473368869feacce81e51c39dd"
+      },
+      {
+        "path": "src/connectors/codex/source_budget/recovery.rs",
+        "git_blob_sha1": "badafcdbe8e321401f56973298e86a757d3b9a6e",
+        "sha256": "2c60248c0e87d42f81bd11c1b15a88cff37b5e753457f863286be408ae8669ff"
+      },
+      {
+        "path": "src/connectors/codex/stable_prefix.rs",
+        "git_blob_sha1": "80e2adb78d2882fcdf5d47751e9795a923a151ea",
+        "sha256": "ac15c04aae78a61f4216f8c86c91a9cef5a2a9b98e013960c2ea607e5b84ad40"
+      },
+      {
+        "path": "src/connectors/codex/stable_prefix/zero_boundary_tests.rs",
+        "git_blob_sha1": "2536b75d1401e490296d131f0c96660f5abe207f",
+        "sha256": "96c142ace88d429dc4e0c1c59fcb7a4bc3032cb4c709031c9d8fcabf86914932"
+      },
+      {
+        "path": "src/connectors/codex/stable_prefix/receipt_shape_tests.rs",
+        "git_blob_sha1": "9a04663667eb99f67873121d4b30ae53a140dab5",
+        "sha256": "c3f9f8c8b0d843e959f29b6f046a1f3dd553c868f7b73fb3cfbaabbfc2cb0379"
+      },
+      {
+        "path": "src/connectors/codex/source_budget/snapshot.rs",
+        "git_blob_sha1": "166d82a7f33af9deef62dcde2c2f1edc3ee32b08",
+        "sha256": "c35cee6ffaf78389eaa8475c6111a0e2cc2f406e1a16a15d251c03f1a8d6a70f"
+      },
+      {
+        "path": "src/indexer/mod.rs",
+        "git_blob_sha1": "4b75a587310e51ce0e94f58c907e0dbee09969a2",
+        "sha256": "aa6c708e91dec59623313a37a21d405d1f46b56dc96ac20742241b58366d72e1"
+      },
+      {
+        "path": "src/indexer/source_ledger_tests.rs",
+        "git_blob_sha1": "9f0799cfff8c7a4f10c92ea7a652eb50461a4942",
+        "sha256": "8d156a56048dff7bb4355653140728703ada1b3bfef6416e23d19e1a0a5de055"
+      },
+      {
+        "path": "src/storage/sqlite.rs",
+        "git_blob_sha1": "e2e70fb76dfe3e6e3d6363802797c15fc2dab643",
+        "sha256": "0b37561c41fa9cf49e0b491391ad042bca983eba380638ef49451e390e91b0a5"
+      },
+      {
+        "path": "src/storage/sqlite/codex_prefix_tests.rs",
+        "git_blob_sha1": "ecd25a61abfa0e941fe5a4424388903ed1c5c320",
+        "sha256": "902b1e2c9ef5c352b7359fc8d6ec4fd7b2b3123089cc57524a9f5e7be66b752a"
+      },
+      {
+        "path": "src/connectors/codex/stable_prefix/tests.rs",
+        "git_blob_sha1": "3960d2bda0ba7746f6feeb7760f9c385cbfd8306",
+        "sha256": "dabd2b4779b2411c0b35521d932d8e1815c9499d4ae6064af65763e4e0a0ff5a"
+      },
+      {
+        "path": "src/raw_mirror.rs",
+        "git_blob_sha1": "8240e3280dcbc2e0012a2024146f2344bfdca803",
+        "sha256": "49d0930c7bed3e79a440c44cf5392c41fbf5caa8269844088f47b2e31249ef34"
+      },
+      {
+        "path": "src/raw_mirror/policy.rs",
+        "git_blob_sha1": "b4caa2803e2ff0ba589038c8d3f064850ac15fe6",
+        "sha256": "772cc3820db9659f73c29bb3d62b657ec0d5224cb51d5a72beb868dab12b5d61"
+      },
+      {
+        "path": "src/raw_mirror/prefix_tests.rs",
+        "git_blob_sha1": "c63da26e03499efc32d3758bc41a954561cc93c8",
+        "sha256": "047a0876bf68e8c0d06bb03fecd719ea608cebb47bcb7f1efe71410c5404d89f"
+      },
+      {
+        "path": "src/raw_mirror/prefix_tests/budgeted_tests.rs",
+        "git_blob_sha1": "63ae99b2514ff61e42ba9484ba4065a9d6149b14",
+        "sha256": "c2fef36005fdd44a882e71843544abc9da56d0c33254aabec03425ff51e3de40"
+      },
+      {
+        "path": "src/raw_mirror/policy_tests.rs",
+        "git_blob_sha1": "347c6b6e50ee293d782bfc96db42d9eb34b73ef4",
+        "sha256": "56474054dc0a6f18d2b8b4ed0c23764e0a30ace86bbd1c59490a14ad408ae316"
+      }
+    ]
+  },
+  "source_identity_scope": {
+    "kind": "owned files for watch preflight increment",
+    "reconciliation_base": "90e68ceac093444aeae549b257dc0cf011ea4e94",
+    "publication_parent": "8128079d71ad1d059fc84c3a7b64af5c276b543a",
+    "unrelated_last_commit": "six forget benchmark Python/documentation/test paths; no overlap with these owned paths or the companion planning records"
+  },
+  "watch_canonical_preflight": {
+    "base_commit": "90e68ceac093444aeae549b257dc0cf011ea4e94",
+    "publication_parent": "8128079d71ad1d059fc84c3a7b64af5c276b543a",
+    "storage_manifest_blob": "84f59e2202704f803b90bcfd9bf61e28549957d3",
+    "storage_manifest": {
+      "schema": "cass.codex_prefix.watch_preflight_storage.v2",
+      "base_commit": "90e68ceac093444aeae549b257dc0cf011ea4e94",
+      "api": "FrankenStorage::codex_canonical_preflight_refusal(&Conversation) -> Result<Option<CodexCanonicalRefusal>>",
+      "authority": "None means only no known refusal. It grants no source admission, write, source-completion, reuse, or publication authority. The API is Codex-only; authoritative guards remain generalized to Codex and Claude.",
+      "files": [
+        {
+          "path": "src/storage/sqlite.rs",
+          "base_blob": "3cb0877d2f3d3515cfb7c6458292b81d0c3eabfd",
+          "blob": "15c49a67512c8a6c5e893fdfac769f1b489d39e5",
+          "sha256": "fe1cd9862261596e28621fa9dc0789be66f00e268432e843a806d89be6e9b67e",
+          "bytes": 2183366,
+          "additions": 176,
+          "deletions": 11,
+          "hunks": 5
+        },
+        {
+          "path": "src/storage/sqlite/codex_prefix_tests.rs",
+          "base_blob": "1eeba531b35a79d745b4e35c030ade2017da13d4",
+          "blob": "416c67fc0441a2b2a0cbf5a31f7b8353ab074b39",
+          "sha256": "6612b211980463cca3ddc3aa76a9fd6e0f7180575509c7b3b76becab86e70466",
+          "bytes": 33085,
+          "additions": 3,
+          "deletions": 0,
+          "hunks": 1
+        },
+        {
+          "path": "src/storage/sqlite/codex_prefix_tests/preflight_tests.rs",
+          "base_blob": "0000000000000000000000000000000000000000",
+          "blob": "d92c638c7d87d42a667094c58b1326ed32cc6dd6",
+          "sha256": "9087fcca1ffd7407b86b4809f9fb8ef7295a36043e8b5b23d4fb01cb57e0f04e",
+          "bytes": 24091,
+          "additions": 512,
+          "deletions": 0,
+          "hunks": 1
+        }
+      ],
+      "ordered_edit_bundle": "30fcab604668adef14cfcb318093e9a418ad68ff",
+      "diff": {
+        "blob": "e0ebfd026472a968724031af604d7b2885c59780",
+        "sha256": "478dd29103111e6cbb71007b8fdfafcd527f4b254af0decfc685c3cf3c3cd813",
+        "bytes": 35766
+      },
+      "source_verification": {
+        "all_exact_contexts_unique": true,
+        "minimal_diff_reconstructs_exact_old_and_new_files": true,
+        "uploaded_blob_hashes_verified": true,
+        "upstream90_retained": "Provider-aware receipt parsing, path/provider/index validation, metadata bounds, foreign canonical provider rejection, typed refusal provider, generalized authoritative call sites and all upstream tests preserved.",
+        "generalized_tuple_fence": "Validated provider slug plus normalized source_id/external_id; path aliases remain valid. Present derived-cache misbinding is terminal and never an isolatable refusal.",
+        "malformed_metadata_precedence": "Pure prospective marker shape and encoded budget are validated before typed history refusal; no bytes are persisted by preflight.",
+        "cleanup_precedence": "Explicit rollback must succeed before any typed refusal is returned.",
+        "test_count": 10,
+        "reviewers": [
+          "root",
+          "validation_next"
+        ],
+        "runtime_results": "No build, test, Clippy, rustfmt or daemon/runtime execution performed for this rebased storage source. Source-level review only."
+      },
+      "no_remote_refs_changed": true
+    },
+    "host_ordered_edits_blob": "151bc7ff304f67a2f9cde11b0baf598f75cd30e0",
+    "source_verification": {
+      "root_exact_reconstruction": true,
+      "all_contexts_unique": true,
+      "all_git_blobs_and_sha256_matched": true,
+      "latest_upstream_has_no_owned_file_overlap": true
+    },
+    "source_review": {
+      "root": "Reviewed full production, final reconciliation and all22 new regression entrypoints.",
+      "independent": "storage_rebase and validation_next reviewed storage/host; validation_next independently reviewed final non-Codex eligibility correction.",
+      "qualification": "Source correctness review only; no final CASS typecheck, SQL runtime or native regression execution."
+    },
+    "authority": "Negative preflight only. None grants no source admission, write, reuse or publication authority. Actual transactional guards remain mandatory; post-probe and non-domain failures remain terminal.",
+    "scope": "Only known Codex canonical conflicts are isolated before writing. Shared canonical planning and exact tuple fencing preserve upstream Codex/Claude provider-specific guards. No generic partial-outcome retry, bisection, historical backfill, new checkpoint schema or global-debt shortcut.",
+    "boundedness": {
+      "message_projection": {
+        "messages": 16384,
+        "content_bytes": 33554432,
+        "single_oversized_message_exception": true,
+        "untimed_inputs_sliced": true,
+        "one_mapped_slice_at_a_time": true
+      },
+      "metadata_combined_bytes": 262144,
+      "refusal_identity_bytes": 8388608,
+      "refusal_path_entries": 65536,
+      "refusal_key_entries": 65536
+    },
+    "privacy": "Preflight uses existing read-only retention decisions and the same redacted projection as persistence. Only normal persistence clears changed forgotten-source stamps. Known refused/policy-excluded packets receive no new raw capture.",
+    "durability": "Existing root replay debt and receipt invalidation precede canonical writes. Refused sources retain proof/debt and cannot publish; healthy receipts require lexical commit. Cumulative deferrals withhold root watermarks/global certificates. Live results retain healthy progress for canonical semantic maintenance; explicit one-shot reports refusal after healthy work.",
+    "reconciliation_fixes": [
+      "Provider binding retained in preflight refusal identity.",
+      "Strict eligible-packet proof alignment preserved for Codex and Claude.",
+      "Previously refused later-chunk packets are filtered without re-certification.",
+      "Non-Codex fast path also filters and counts ledger-ineligible packets.",
+      "Generalized actual writer checks normalized source/provider/external tuple before canonical metadata."
+    ],
+    "regressions": [
+      {
+        "path": "src/storage/sqlite/codex_prefix_tests/preflight_tests.rs",
+        "entrypoints": [
+          "codex_preflight_preserves_legacy_metadata_and_missing_derived_lookup",
+          "codex_preflight_returns_only_typed_exact_history_refusals",
+          "codex_preflight_uses_exact_external_identity_and_allows_path_aliases",
+          "codex_preflight_preserves_ordinary_packets_and_rejects_malformed_unknown_prefixes",
+          "codex_preflight_metadata_checks_keep_binary_precedence_and_output_budget",
+          "codex_preflight_success_cannot_bypass_a_later_canonical_conflict",
+          "codex_preflight_and_writers_reject_a_raced_foreign_derived_lookup",
+          "codex_preflight_query_failure_is_terminal_and_ends_the_snapshot",
+          "codex_preflight_preserves_foreign_provider_error_precedence",
+          "codex_preflight_does_not_certify_claude_or_weaken_its_write_guard"
+        ]
+      },
+      {
+        "path": "src/indexer/watch_source_ledger.rs",
+        "entrypoints": [
+          "canonical_refusal_shared_key_aliases_cannot_publish_or_consume_remaining_packets",
+          "canonical_refusal_without_completion_stays_explicit_and_budget_failure_is_atomic"
+        ]
+      },
+      {
+        "path": "src/indexer/watch_codex_preflight_tests.rs",
+        "entrypoints": [
+          "watch_codex_preflight_local_and_remote_bad_first_middle_last_publish_healthy_sources",
+          "watch_codex_preflight_multiple_chunks_and_restart_preserve_healthy_receipts",
+          "watch_codex_preflight_all_refused_and_explicit_selection_remain_incomplete",
+          "watch_codex_preflight_untimed_late_slice_is_bounded_and_writes_nothing",
+          "watch_codex_preflight_policy_exclusion_and_changed_tombstones_are_read_only",
+          "watch_codex_preflight_refuses_all_same_source_packets_and_later_chunks",
+          "watch_codex_preflight_preserves_strict_provider_and_source_alignment",
+          "watch_codex_preflight_compares_the_same_redacted_projection_as_persistence",
+          "watch_codex_preflight_clean_probe_late_conflict_remains_terminal",
+          "watch_codex_preflight_malformed_canonical_metadata_is_not_a_domain_deferral"
+        ]
+      }
+    ],
+    "regression_entrypoints": 22,
+    "host_manifest_blob": "4d6e5c2a65f34ac520669bf6f133e3dc6350ce4f",
+    "host_manifest": {
+      "base": "90e68ceac093444aeae549b257dc0cf011ea4e94",
+      "base_blobs": {
+        "src/indexer/mod.rs": "c9cb122f8bd9620057b8e6522aced28faa1f0e1c",
+        "src/indexer/watch_source_ledger.rs": "99c4fef66ba42c5791350ea9224b3729cb492fb0"
+      },
+      "ordered_edit_bundle_blob": "151bc7ff304f67a2f9cde11b0baf598f75cd30e0",
+      "ordered_edit_count": 25,
+      "diff_blob": "9a0e0167c0c2d8c0aaf1729368f31f8e74706033",
+      "files": [
+        {
+          "path": "src/indexer/watch_source_ledger.rs",
+          "bytes": 39223,
+          "sha256": "7281e3cf3940abdce5d7d35448a67d8e0b5b3f9fa42c21ccc484b3907b6d2b52",
+          "git_blob": "0c3961acdcba0957211d81192f1b3c968ce854d6",
+          "added": 131,
+          "removed": 4
+        },
+        {
+          "path": "src/indexer/mod.rs",
+          "bytes": 3623709,
+          "sha256": "7fe4a9c2031990868c86ad26855dc562ce4c89ad02b81ac3eb69f345675227d2",
+          "git_blob": "187781c044f5de6e0102e5d804cd82d5d1c80f35",
+          "added": 263,
+          "removed": 18
+        },
+        {
+          "path": "src/indexer/watch_codex_preflight_tests.rs",
+          "bytes": 37326,
+          "sha256": "d5d28fd23bb96f3c74f4d50c07eceacaad531343bd679fde794bf5f020ec31f0",
+          "git_blob": "2c12886827c7f2940d03e6d6c4dab0a468220203",
+          "added": 1034,
+          "removed": 0
+        }
+      ],
+      "new_host_tests": 10,
+      "new_ledger_tests": 2,
+      "test_entrypoints": [
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_local_and_remote_bad_first_middle_last_publish_healthy_sources",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_multiple_chunks_and_restart_preserve_healthy_receipts",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_all_refused_and_explicit_selection_remain_incomplete",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_untimed_late_slice_is_bounded_and_writes_nothing",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_policy_exclusion_and_changed_tombstones_are_read_only",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_refuses_all_same_source_packets_and_later_chunks",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_preserves_strict_provider_and_source_alignment",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_compares_the_same_redacted_projection_as_persistence",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_clean_probe_late_conflict_remains_terminal",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_malformed_canonical_metadata_is_not_a_domain_deferral",
+        "indexer::watch_source_ledger::canonical_refusal_tests::canonical_refusal_shared_key_aliases_cannot_publish_or_consume_remaining_packets",
+        "indexer::watch_source_ledger::canonical_refusal_tests::canonical_refusal_without_completion_stays_explicit_and_budget_failure_is_atomic"
+      ],
+      "validation": {
+        "base": "90e68ceac093444aeae549b257dc0cf011ea4e94",
+        "scope": "Owner source parsing/formatting evidence only. These operations are not compiler, runtime, DSR, CI, or whole-repository cargo-fmt qualification.",
+        "formatter_version": "rustfmt 1.10.0-nightly (9085017724 2026-08-30)",
+        "version_query": {
+          "command": "/workspace/scratch/94df4d950735/validation-restored-20261124/rustup-home/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustfmt --version",
+          "exit_code": 0
+        },
+        "operations": [
+          {
+            "source": "/workspace/scratch/94df4d950735/watch-preflight-90e68cea/source/src/indexer/mod.rs",
+            "command": "/workspace/scratch/94df4d950735/validation-restored-20261124/rustup-home/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustfmt --edition 2024 --emit stdout --config skip_children=true /workspace/scratch/94df4d950735/watch-preflight-90e68cea/source/src/indexer/mod.rs > /dev/null",
+            "exit_code": 0,
+            "rewrote_source": false,
+            "result": "Rust syntax parsed and formatting generated to discarded stdout; child modules were not traversed. Not a formatting-cleanliness check. Repeated only after the final three-line eligibility correction, with exit0 and no source rewrite."
+          },
+          {
+            "source": "/workspace/scratch/94df4d950735/watch-preflight-90e68cea/source/src/indexer/watch_source_ledger.rs",
+            "command": "/workspace/scratch/94df4d950735/validation-restored-20261124/rustup-home/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustfmt --edition 2024 --emit stdout --config skip_children=true /workspace/scratch/94df4d950735/watch-preflight-90e68cea/source/src/indexer/watch_source_ledger.rs > /dev/null",
+            "exit_code": 0,
+            "rewrote_source": false,
+            "result": "Rust syntax parsed and formatting generated to discarded stdout; child modules were not traversed. Not a formatting-cleanliness check."
+          },
+          {
+            "source": "/workspace/scratch/94df4d950735/watch-preflight-90e68cea/source/src/indexer/watch_codex_preflight_tests.rs",
+            "command": "/workspace/scratch/94df4d950735/validation-restored-20261124/rustup-home/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustfmt --edition 2024 /workspace/scratch/94df4d950735/watch-preflight-90e68cea/source/src/indexer/watch_codex_preflight_tests.rs",
+            "exit_code": 0,
+            "rewrote_source": true,
+            "result": "New regression module formatted in place after the final eligibility assertion was added and before the final file hashes were frozen."
+          }
+        ],
+        "native_typecheck_executed": false,
+        "runtime_tests_executed": [],
+        "new_test_entrypoints": [
+          "indexer::watch_codex_preflight_tests::watch_codex_preflight_local_and_remote_bad_first_middle_last_publish_healthy_sources",
+          "indexer::watch_codex_preflight_tests::watch_codex_preflight_multiple_chunks_and_restart_preserve_healthy_receipts",
+          "indexer::watch_codex_preflight_tests::watch_codex_preflight_all_refused_and_explicit_selection_remain_incomplete",
+          "indexer::watch_codex_preflight_tests::watch_codex_preflight_untimed_late_slice_is_bounded_and_writes_nothing",
+          "indexer::watch_codex_preflight_tests::watch_codex_preflight_policy_exclusion_and_changed_tombstones_are_read_only",
+          "indexer::watch_codex_preflight_tests::watch_codex_preflight_refuses_all_same_source_packets_and_later_chunks",
+          "indexer::watch_codex_preflight_tests::watch_codex_preflight_preserves_strict_provider_and_source_alignment",
+          "indexer::watch_codex_preflight_tests::watch_codex_preflight_compares_the_same_redacted_projection_as_persistence",
+          "indexer::watch_codex_preflight_tests::watch_codex_preflight_clean_probe_late_conflict_remains_terminal",
+          "indexer::watch_codex_preflight_tests::watch_codex_preflight_malformed_canonical_metadata_is_not_a_domain_deferral",
+          "indexer::watch_source_ledger::canonical_refusal_tests::canonical_refusal_shared_key_aliases_cannot_publish_or_consume_remaining_packets",
+          "indexer::watch_source_ledger::canonical_refusal_tests::canonical_refusal_without_completion_stays_explicit_and_budget_failure_is_atomic"
+        ],
+        "source_review_status": "Root independently reconstructed the final25-edit bundle and verified all Git blob/SHA256 hashes, then approved the final eligibility fast path/regression. validation_next independently approved final90 reconciliation including that fast path/regression. storage_rebase approved the90 reconciliation before the final three-line fast-path filter; acknowledgment of that last delta is pending. All reviews are source-level only.",
+        "source_files": [
+          {
+            "path": "src/indexer/watch_source_ledger.rs",
+            "bytes": 39223,
+            "sha256": "7281e3cf3940abdce5d7d35448a67d8e0b5b3f9fa42c21ccc484b3907b6d2b52",
+            "git_blob": "0c3961acdcba0957211d81192f1b3c968ce854d6",
+            "added": 131,
+            "removed": 4
+          },
+          {
+            "path": "src/indexer/mod.rs",
+            "bytes": 3623709,
+            "sha256": "7fe4a9c2031990868c86ad26855dc562ce4c89ad02b81ac3eb69f345675227d2",
+            "git_blob": "187781c044f5de6e0102e5d804cd82d5d1c80f35",
+            "added": 263,
+            "removed": 18
+          },
+          {
+            "path": "src/indexer/watch_codex_preflight_tests.rs",
+            "bytes": 37326,
+            "sha256": "d5d28fd23bb96f3c74f4d50c07eceacaad531343bd679fde794bf5f020ec31f0",
+            "git_blob": "2c12886827c7f2940d03e6d6c4dab0a468220203",
+            "added": 1034,
+            "removed": 0
+          }
+        ]
+      },
+      "scope": [
+        "Read-only policy and canonical compatibility preflight before source/chunk mutation; exact normalized, redacted bounded projection slices.",
+        "Explicit provider/path/external ID match; Codex-only SQL probe; preserves upstream provider-aware receipt alignment for Claude and Codex.",
+        "Known source refusals exclude all packets in the current chunk and later chunks, including shared-key aliases and relabeled packets; retain proof/root debt and prohibit publication.",
+        "Healthy canonical/lexical receipts and live-watch canonical semantic maintenance continue; explicit one-shot reports incomplete selection after healthy sources finish.",
+        "No broad persistence catch, bisection, or partial-outcome salvage; later races, SQL, metadata, rollback and I/O errors remain terminal.",
+        "Read-only policy preflight never clears changed forgotten-source stamps; actual accepted persistence owns those changes.",
+        "Existing write-ahead watch debt remains authoritative; no new schema/global checkpoint/prospective consumption certificate."
+      ],
+      "limits": [
+        "Only predictable already-existing canonical history conflicts are isolated.",
+        "Preflight is not authority; the actual transactional guard must repeat.",
+        "Bounded by the existing per-slice limits, with the existing one-oversized-message exception.",
+        "No live watch latency/runtime/platform qualification from source review or rustfmt parsing."
+      ],
+      "integration": {
+        "parent_observed_by_root": "8128079d71ad1d059fc84c3a7b64af5c276b543a",
+        "tree_observed_by_root": "61285670729082b0fb2093cc24351544db63cb6d",
+        "basis": "Root compared90e68cea to8128079d: only six unrelated forget-benchmark Python/documentation/test paths changed; no overlap with these three owned source paths."
+      },
+      "validation_evidence_blob": "65725fd1b03e0c00016a658e5c56defedf689adb"
+    },
+    "host_validation_evidence_blob": "65725fd1b03e0c00016a658e5c56defedf689adb",
+    "host_validation_evidence": {
+      "base": "90e68ceac093444aeae549b257dc0cf011ea4e94",
+      "scope": "Owner source parsing/formatting evidence only. These operations are not compiler, runtime, DSR, CI, or whole-repository cargo-fmt qualification.",
+      "formatter_version": "rustfmt 1.10.0-nightly (9085017724 2026-08-30)",
+      "version_query": {
+        "command": "/workspace/scratch/94df4d950735/validation-restored-20261124/rustup-home/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustfmt --version",
+        "exit_code": 0
+      },
+      "operations": [
+        {
+          "source": "/workspace/scratch/94df4d950735/watch-preflight-90e68cea/source/src/indexer/mod.rs",
+          "command": "/workspace/scratch/94df4d950735/validation-restored-20261124/rustup-home/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustfmt --edition 2024 --emit stdout --config skip_children=true /workspace/scratch/94df4d950735/watch-preflight-90e68cea/source/src/indexer/mod.rs > /dev/null",
+          "exit_code": 0,
+          "rewrote_source": false,
+          "result": "Rust syntax parsed and formatting generated to discarded stdout; child modules were not traversed. Not a formatting-cleanliness check. Repeated only after the final three-line eligibility correction, with exit0 and no source rewrite."
+        },
+        {
+          "source": "/workspace/scratch/94df4d950735/watch-preflight-90e68cea/source/src/indexer/watch_source_ledger.rs",
+          "command": "/workspace/scratch/94df4d950735/validation-restored-20261124/rustup-home/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustfmt --edition 2024 --emit stdout --config skip_children=true /workspace/scratch/94df4d950735/watch-preflight-90e68cea/source/src/indexer/watch_source_ledger.rs > /dev/null",
+          "exit_code": 0,
+          "rewrote_source": false,
+          "result": "Rust syntax parsed and formatting generated to discarded stdout; child modules were not traversed. Not a formatting-cleanliness check."
+        },
+        {
+          "source": "/workspace/scratch/94df4d950735/watch-preflight-90e68cea/source/src/indexer/watch_codex_preflight_tests.rs",
+          "command": "/workspace/scratch/94df4d950735/validation-restored-20261124/rustup-home/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustfmt --edition 2024 /workspace/scratch/94df4d950735/watch-preflight-90e68cea/source/src/indexer/watch_codex_preflight_tests.rs",
+          "exit_code": 0,
+          "rewrote_source": true,
+          "result": "New regression module formatted in place after the final eligibility assertion was added and before the final file hashes were frozen."
+        }
+      ],
+      "native_typecheck_executed": false,
+      "runtime_tests_executed": [],
+      "new_test_entrypoints": [
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_local_and_remote_bad_first_middle_last_publish_healthy_sources",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_multiple_chunks_and_restart_preserve_healthy_receipts",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_all_refused_and_explicit_selection_remain_incomplete",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_untimed_late_slice_is_bounded_and_writes_nothing",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_policy_exclusion_and_changed_tombstones_are_read_only",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_refuses_all_same_source_packets_and_later_chunks",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_preserves_strict_provider_and_source_alignment",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_compares_the_same_redacted_projection_as_persistence",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_clean_probe_late_conflict_remains_terminal",
+        "indexer::watch_codex_preflight_tests::watch_codex_preflight_malformed_canonical_metadata_is_not_a_domain_deferral",
+        "indexer::watch_source_ledger::canonical_refusal_tests::canonical_refusal_shared_key_aliases_cannot_publish_or_consume_remaining_packets",
+        "indexer::watch_source_ledger::canonical_refusal_tests::canonical_refusal_without_completion_stays_explicit_and_budget_failure_is_atomic"
+      ],
+      "source_review_status": "Root independently reconstructed the final25-edit bundle and verified all Git blob/SHA256 hashes, then approved the final eligibility fast path/regression. validation_next independently approved final90 reconciliation including that fast path/regression. storage_rebase approved the90 reconciliation before the final three-line fast-path filter; acknowledgment of that last delta is pending. All reviews are source-level only.",
+      "source_files": [
+        {
+          "path": "src/indexer/watch_source_ledger.rs",
+          "bytes": 39223,
+          "sha256": "7281e3cf3940abdce5d7d35448a67d8e0b5b3f9fa42c21ccc484b3907b6d2b52",
+          "git_blob": "0c3961acdcba0957211d81192f1b3c968ce854d6",
+          "added": 131,
+          "removed": 4
+        },
+        {
+          "path": "src/indexer/mod.rs",
+          "bytes": 3623709,
+          "sha256": "7fe4a9c2031990868c86ad26855dc562ce4c89ad02b81ac3eb69f345675227d2",
+          "git_blob": "187781c044f5de6e0102e5d804cd82d5d1c80f35",
+          "added": 263,
+          "removed": 18
+        },
+        {
+          "path": "src/indexer/watch_codex_preflight_tests.rs",
+          "bytes": 37326,
+          "sha256": "d5d28fd23bb96f3c74f4d50c07eceacaad531343bd679fde794bf5f020ec31f0",
+          "git_blob": "2c12886827c7f2940d03e6d6c4dab0a468220203",
+          "added": 1034,
+          "removed": 0
+        }
+      ]
+    },
+    "diff": {
+      "storage": {
+        "blob": "e0ebfd026472a968724031af604d7b2885c59780",
+        "additions": 691,
+        "deletions": 11
+      },
+      "host": {
+        "blob": "9a0e0167c0c2d8c0aaf1729368f31f8e74706033",
+        "additions": 1428,
+        "deletions": 22
+      },
+      "rust_files": 6,
+      "additions": 2119,
+      "deletions": 33
+    },
+    "executed_validation_scope": "Pinned cached rustfmt parsed the final two host production files with child traversal disabled and formatted the new host test module; each operation exited0. These are per-file syntax/formatting operations, not formatting-cleanliness, compiler, native test, full DSR or CI qualification. No storage parser/compiler/runtime run was performed for this final increment."
   }
 }

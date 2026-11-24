@@ -779,3 +779,6 @@ fn codex_prefix_regular_to_explicit_symlink_cannot_downgrade_canonical_admission
     }
     Ok(())
 }
+
+#[path = "codex_prefix_tests/preflight_tests.rs"]
+mod preflight_tests;

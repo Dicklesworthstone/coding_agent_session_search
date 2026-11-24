@@ -11011,6 +11011,90 @@ pub struct MessageForEmbedding {
 // =========================================================================
 
 impl FrankenStorage {
+    /// Detect a known Codex history conflict before a watch batch writes any
+    /// canonical rows. The caller supplies the same normalized, redacted
+    /// projection used for persistence; this method never reads source bytes.
+    ///
+    /// None means no known refusal, never admission or publication authority.
+    /// Only the exact source/agent/external-ID identity can yield a conclusion.
+    /// A missing external ID is left to the existing authoritative write path;
+    /// no source-path, fuzzy, promotion or derived-cache repair is attempted.
+    /// The write transaction must always repeat its own overlap validation.
+    pub(crate) fn codex_canonical_preflight_refusal(
+        &self,
+        conv: &Conversation,
+    ) -> Result<Option<CodexCanonicalRefusal>> {
+        if conv.agent_slug != "codex" {
+            return Ok(None);
+        }
+        let normalized = normalized_conversation_for_storage(conv);
+        let conv = normalized.as_ref();
+        let receipt = source_prefix_receipt(conv)?;
+        let Some(external_id) = conv.external_id.as_deref() else {
+            return Ok(None);
+        };
+
+        let mut tx = self.conn.transaction()?;
+        let result = (|| -> Result<()> {
+            let agent_id: Option<i64> = tx
+                .query_row_map(
+                    "SELECT id FROM agents WHERE slug = 'codex' LIMIT 1",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )
+                .optional()?;
+            let Some(agent_id) = agent_id else {
+                return Ok(());
+            };
+            // Query the canonical UNIQUE(source_id, agent_id, external_id)
+            // identity directly, including archives with no derived lookup.
+            let existing: Option<i64> = tx
+                .query_row_map(
+                    "SELECT id FROM conversations
+                     WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3
+                     LIMIT 1",
+                    fparams![conv.source_id.as_str(), agent_id, external_id],
+                    |row| row.get_typed(0),
+                )
+                .optional()?;
+            let lookup_key =
+                conversation_external_lookup_key(&conv.source_id, agent_id, external_id);
+            if let Some(cached) = franken_find_external_conversation_lookup(&tx, &lookup_key)? {
+                anyhow::ensure!(
+                    existing == Some(cached),
+                    "Codex derived lookup disagrees with its exact canonical identity"
+                );
+            }
+            if let Some(conversation_id) = existing {
+                franken_check_source_canonical_identity(
+                    &tx,
+                    conversation_id,
+                    conv,
+                    crate::connectors::codex::StablePrefixProvider::Codex,
+                )?;
+                let metadata = franken_source_integrity_metadata(&tx, conversation_id)?;
+                if let Some(receipt) = &receipt {
+                    let _ = source_prefix_metadata_update(&metadata, receipt.provider)?;
+                }
+                let _ = franken_plan_source_prefix_overlap(&tx, conversation_id, conv, &metadata)?;
+            }
+            Ok(())
+        })();
+        // Cleanup failure is terminal even when the read found an isolatable
+        // history conflict. Never discard it through transaction Drop or keep
+        // a refusal in its downcast chain.
+        tx.rollback()
+            .context("roll back Codex canonical preflight read snapshot")?;
+        match result {
+            Ok(()) => Ok(None),
+            Err(error) => match error.downcast::<CodexCanonicalRefusal>() {
+                Ok(refusal) => Ok(Some(refusal)),
+                Err(error) => Err(error),
+            },
+        }
+    }
+
+
     /// Compare the normalized, redacted packet before the indexer admits a
     /// canonical write. Revisions need a durable lexical repair checkpoint:
     /// they leave both message count and the rowid watermark unchanged.
@@ -21745,6 +21829,40 @@ fn franken_source_integrity_metadata(
     }
 }
 
+/// The external key is the canonical identity; source-path aliases are valid.
+/// A stale or misbound derived lookup must never direct a prefix append at a
+/// foreign canonical row after a successful earlier preflight.
+fn franken_check_source_canonical_identity(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    conv: &Conversation,
+    provider: crate::connectors::codex::StablePrefixProvider,
+) -> Result<()> {
+    let Some(external_id) = conv.external_id.as_deref() else {
+        return Ok(());
+    };
+    let matches: Option<i64> = tx
+        .query_row_map(
+            "SELECT 1 FROM conversations
+             WHERE id = ?1 AND source_id = ?2 AND external_id = ?3
+               AND agent_id = (SELECT id FROM agents WHERE slug = ?4)
+             LIMIT 1",
+            fparams![
+                conversation_id,
+                conv.source_id.as_str(),
+                external_id,
+                provider.slug()
+            ],
+            |row| row.get_typed(0),
+        )
+        .optional()?;
+    anyhow::ensure!(
+        matches == Some(1),
+        "source canonical target disagrees with its exact external identity"
+    );
+    Ok(())
+}
+
 /// A source receipt proves the parser's bytes, not that an older archive used
 /// the same message projection. Check actual canonical rows before any append
 /// or replay shortcut, including archives created before prefix receipts.
@@ -21754,17 +21872,19 @@ fn franken_source_integrity_metadata(
 /// text or compare against the unredacted parser digest here. Each indexed
 /// equality query returns at most one integer; stored transcript bodies are
 /// never materialized into a second, unbounded in-memory collection.
-fn franken_validate_source_prefix_overlap<'a>(
+/// Identity has already been checked before the bounded metadata read. This
+/// planner is read-only; the write wrapper alone persists the protocol marker.
+fn franken_plan_source_prefix_overlap<'a>(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
     conv: &'a Conversation,
+    canonical_metadata: &serde_json::Value,
 ) -> Result<Option<ExistingConversationNewMessages<'a>>> {
     use crate::connectors::codex::StablePrefixProvider;
     let receipt = source_prefix_receipt(conv)?;
     let Some(provider) = StablePrefixProvider::from_slug(&conv.agent_slug) else {
         return Ok(None);
     };
-    let mut canonical_metadata = franken_source_integrity_metadata(tx, conversation_id)?;
     let requires_prefix = |candidate: StablePrefixProvider| {
         canonical_metadata.get("cass").is_some_and(|cass| {
             cass.get(candidate.requirement_key()).is_some()
@@ -21853,9 +21973,59 @@ fn franken_validate_source_prefix_overlap<'a>(
             new_chars = new_chars.saturating_add(i64::try_from(message.content.len())?);
         }
     }
-    if set_source_prefix_requirement(&mut canonical_metadata, provider)? {
-        let (json, binary) = franken_metadata_insert_payload(&canonical_metadata)?;
-        ensure_source_prefix_metadata_budget(json.as_deref(), binary.as_deref())?;
+    Ok(Some(ExistingConversationNewMessages {
+        messages,
+        new_chars,
+        idx_collision_count: 0,
+        first_collision_idx: None,
+    }))
+}
+
+/// Prepare the prospective protocol marker entirely in memory. Both read
+/// preflight and the write transaction validate the same metadata shape and
+/// encoded budget; only the write wrapper publishes these bytes.
+fn source_prefix_metadata_update(
+    metadata: &serde_json::Value,
+    provider: crate::connectors::codex::StablePrefixProvider,
+) -> Result<Option<MetadataInsertPayload<'static>>> {
+    let mut metadata = metadata.clone();
+    if !set_source_prefix_requirement(&mut metadata, provider)? {
+        return Ok(None);
+    }
+    let (json, binary) = franken_metadata_insert_payload(&metadata)?;
+    ensure_source_prefix_metadata_budget(json.as_deref(), binary.as_deref())?;
+    Ok(Some((
+        json.map(|text| Cow::Owned(text.into_owned())),
+        binary,
+    )))
+}
+
+/// Repeat identity and overlap checks inside the canonical write transaction,
+/// then persist the protocol requirement with its rows and completion receipt.
+fn franken_validate_source_prefix_overlap<'a>(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    conv: &'a Conversation,
+) -> Result<Option<ExistingConversationNewMessages<'a>>> {
+    use crate::connectors::codex::StablePrefixProvider;
+    // Validate foreign/malformed prefix evidence before skipping unsupported
+    // agents, as required by the shared Codex/Claude admission contract.
+    let receipt = source_prefix_receipt(conv)?;
+    let Some(provider) = StablePrefixProvider::from_slug(&conv.agent_slug) else {
+        return Ok(None);
+    };
+    franken_check_source_canonical_identity(tx, conversation_id, conv, provider)?;
+    let canonical_metadata = franken_source_integrity_metadata(tx, conversation_id)?;
+    // Structural/encoded-budget failures are terminal, even when the same
+    // source would also disagree with retained canonical messages.
+    let metadata_update = if receipt.is_some() {
+        source_prefix_metadata_update(&canonical_metadata, provider)?
+    } else {
+        None
+    };
+    let plan =
+        franken_plan_source_prefix_overlap(tx, conversation_id, conv, &canonical_metadata)?;
+    if let Some((json, binary)) = metadata_update {
         let updated = tx.execute_compat(
             "UPDATE conversations SET metadata_json = ?1, metadata_bin = ?2 WHERE id = ?3",
             fparams![json.as_deref(), binary.as_deref(), conversation_id],
@@ -21865,12 +22035,7 @@ fn franken_validate_source_prefix_overlap<'a>(
             "canonical source metadata disappeared during prefix admission"
         );
     }
-    Ok(Some(ExistingConversationNewMessages {
-        messages,
-        new_chars,
-        idx_collision_count: 0,
-        first_collision_idx: None,
-    }))
+    Ok(plan)
 }
 
 fn franken_collect_batched_existing_new_messages<'a>(

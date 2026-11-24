@@ -22,6 +22,7 @@ const MAX_RECEIPT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RECEIPT_ENTRY_BYTES: usize = 256 * 1024;
 const MAX_REUSED_PATH_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INVALIDATION_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CANONICAL_REFUSAL_BYTES: usize = 8 * 1024 * 1024;
 
 struct Completion {
     remaining: usize,
@@ -38,6 +39,9 @@ pub(super) struct WatchSourceLedger {
     admitted_keys: BTreeSet<String>,
     prefix_invalidations: HashMap<String, String>,
     invalidation_bytes: usize,
+    canonical_refused_paths: HashSet<PathBuf>,
+    canonical_refused_keys: HashSet<String>,
+    canonical_refusal_bytes: usize,
     reused_path_bytes: usize,
     pub(super) reused_sources: Vec<PathBuf>,
     pub(super) active_sources_skipped: usize,
@@ -51,16 +55,55 @@ impl WatchSourceLedger {
     pub(super) fn completed_source_paths(&self) -> impl Iterator<Item = &PathBuf> {
         self.completions
             .iter()
-            .filter(|(_, completion)| completion.certified && !completion.partial)
+            .filter(|(path, completion)| {
+                self.may_publish_source(path) && completion.certified && !completion.partial
+            })
             .map(|(path, _)| path)
     }
 
     /// Typed prefix packets enter the spool provisionally. A missing final
     /// validation must discard that packet, not demote it to ordinary ingest.
     pub(super) fn may_publish_source(&self, path: &Path) -> bool {
-        self.completions
-            .get(path)
-            .is_none_or(|completion| completion.certified)
+        !self.canonical_refused_paths.contains(path)
+            && self.completions.get(path).is_none_or(|completion| {
+                completion.certified
+                    && !self.canonical_refused_keys.contains(&completion.entry.key)
+            })
+    }
+
+    /// A read-only canonical preflight refused this source before mutation.
+    /// Keep explicit eligibility state even without an optimization receipt:
+    /// absence must never turn a refused source back into ordinary admission.
+    /// Aliases sharing the same durable source key remain refused as well.
+    pub(super) fn defer_canonical_source(&mut self, path: &Path) -> Result<()> {
+        let key = self.completions.get(path).map(|entry| &entry.entry.key);
+        let new_path = !self.canonical_refused_paths.contains(path);
+        let new_key = key.is_some_and(|key| !self.canonical_refused_keys.contains(key));
+        let bytes = self.canonical_refusal_bytes
+            .saturating_add(if new_path { path.as_os_str().len() } else { 0 })
+            .saturating_add(if new_key { key.map_or(0, String::len) } else { 0 });
+        anyhow::ensure!(
+            (!new_path || self.canonical_refused_paths.len() < MAX_RECEIPT_ENTRIES)
+                && (!new_key || self.canonical_refused_keys.len() < MAX_RECEIPT_ENTRIES)
+                && bytes <= MAX_CANONICAL_REFUSAL_BYTES,
+            "watch canonical refusal identities exceed their retention budget"
+        );
+        if let Some(key) = key.filter(|_| new_key) {
+            self.canonical_refused_keys.insert(key.clone());
+        }
+        if new_path {
+            self.canonical_refused_paths.insert(path.to_path_buf());
+        }
+        if let Some(completion) = self.completions.get_mut(path) {
+            completion.certified = false;
+        }
+        self.canonical_refusal_bytes = bytes;
+        self.unstable_sources = true;
+        Ok(())
+    }
+
+    pub(super) fn has_canonical_refusals(&self) -> bool {
+        !self.canonical_refused_paths.is_empty()
     }
 
     pub(super) fn align_prefix_metadata(
@@ -650,6 +693,9 @@ impl WatchSourceLedger {
     ) -> Result<()> {
         let mut ready = Vec::new();
         for conversation in conversations {
+            if !self.may_publish_source(&conversation.source_path) {
+                continue;
+            }
             if let Some(completion) = self.completions.get_mut(&conversation.source_path)
                 && completion.certified
             {
@@ -722,6 +768,87 @@ fn observation_has_watch_publication(observation: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(observation)
         .ok()
         .is_some_and(|value| value["watch_published"].as_bool() == Some(true))
+}
+
+#[cfg(test)]
+mod canonical_refusal_tests {
+    use super::*;
+
+    fn completion(key: &str, remaining: usize) -> Completion {
+        Completion {
+            remaining,
+            entry: SourceIngestLedgerEntry {
+                key: key.to_owned(),
+                observation: "{\"watch_published\":true}".to_owned(),
+            },
+            partial: false,
+            certified: true,
+            budget_bytes: 0,
+        }
+    }
+
+    fn packet(path: &Path) -> NormalizedConversation {
+        NormalizedConversation {
+            agent_slug: "codex".to_owned(),
+            external_id: Some("alias-fixture".to_owned()),
+            title: None,
+            workspace: None,
+            source_path: path.to_path_buf(),
+            started_at: None,
+            ended_at: None,
+            metadata: serde_json::Value::Null,
+            messages: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn canonical_refusal_shared_key_aliases_cannot_publish_or_consume_remaining_packets() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let storage = FrankenStorage::open(&temp.path().join("archive.db"))?;
+        let path = temp.path().join("rollout.jsonl");
+        let alias = temp.path().join("alias.jsonl");
+        let key = "source_ingest_v1:canonical-refusal-alias";
+        let proof = "{\"watch_published\":false,\"publication_invalidated\":true}";
+        storage.raw().execute_compat(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+            &[ParamValue::from(key), ParamValue::from(proof)],
+        )?;
+        let mut ledger = WatchSourceLedger::default();
+        ledger.completions.insert(path.clone(), completion(key, 2));
+        ledger.completions.insert(alias.clone(), completion(key, 1));
+        ledger.defer_canonical_source(&path)?;
+        assert!(!ledger.may_publish_source(&path));
+        assert!(!ledger.may_publish_source(&alias));
+        assert_eq!(ledger.completed_source_paths().count(), 0);
+        let charged = ledger.canonical_refusal_bytes;
+        ledger.defer_canonical_source(&path)?;
+        assert_eq!(ledger.canonical_refusal_bytes, charged, "duplicate deferral is idempotent");
+        ledger.publish_batch(&storage, &[packet(&path), packet(&path), packet(&alias)], &[], false)?;
+        assert_eq!(ledger.completions[&path].remaining, 2);
+        assert_eq!(ledger.completions[&alias].remaining, 1);
+        assert_eq!(storage.source_ingest_ledger_entries()?.get(key).map(String::as_str), Some(proof));
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_refusal_without_completion_stays_explicit_and_budget_failure_is_atomic() -> Result<()> {
+        let path = PathBuf::from("/source/without-completion.jsonl");
+        let mut ledger = WatchSourceLedger::default();
+        assert!(ledger.may_publish_source(&path));
+        ledger.defer_canonical_source(&path)?;
+        assert!(!ledger.may_publish_source(&path), "missing completion must not restore authority");
+        ledger.completions.insert(path.clone(), completion("source_ingest_v1:late", 1));
+        assert!(!ledger.may_publish_source(&path), "a later completion must not erase a refusal");
+        ledger.canonical_refusal_bytes = MAX_CANONICAL_REFUSAL_BYTES;
+        let other = PathBuf::from("/source/over-budget.jsonl");
+        let error = ledger.defer_canonical_source(&other).unwrap_err();
+        assert!(error.to_string().contains("retention budget"));
+        assert!(!ledger.canonical_refused_paths.contains(&other));
+        assert!(ledger.canonical_refused_keys.is_empty());
+        assert!(!ledger.may_publish_source(&path));
+        assert!(ledger.has_canonical_refusals());
+        Ok(())
+    }
 }
 
 #[derive(Default)]
