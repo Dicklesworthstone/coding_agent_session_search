@@ -10711,18 +10711,21 @@ fn run_forget_command(
         })
         .transpose()?;
     // GH #565: a writable open can hydrate the entire optional FTS5 shadow
-    // before the first canonical deletion. Inspect without writes first,
-    // then use the indexer's deferred-FTS retirement preflight under the
-    // maintenance lease. A genuine no-op must leave derived assets alone.
+    // before the first canonical deletion. Inspect without canonical writes
+    // first, permitting only locked WAL-index recovery after a typed
+    // BusyRecovery refusal. An interrupted forget must reach its pending
+    // repair even when every selected conversation was already deleted.
+    // Then use the indexer's deferred-FTS retirement preflight under the
+    // maintenance lease. A healthy no-op leaves derived assets alone.
     let mut no_op_report = None;
     if apply && !exclusion_action {
         let inspection =
-            FrankenStorage::open_strict_readonly(&db_path).map_err(|error| CliError {
+            FrankenStorage::open_applied_forget_inspection(&db_path).map_err(|error| CliError {
                 code: 5,
                 kind: "forget",
-                message: format!("failed to inspect canonical database: {error}"),
+                message: format!("failed to inspect canonical database: {error:#}"),
                 hint: None,
-                retryable: false,
+                retryable: crate::storage::sqlite::retryable_franken_anyhow(&error),
             })?;
         let mut preview = inspection
             .forget_conversations(

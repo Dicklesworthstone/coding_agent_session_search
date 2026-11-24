@@ -8,8 +8,9 @@ It preserves the existing GH544 serial versus batch benchmark.
 
 The inspected application baseline is `710435869716073a3b5aa015ad3f9872426e2e4a`. The relevant
 implementation is already on main, including `f8956006`, `bcbb3d24` and
-`17cddb59`. This change adds qualification code; it does not alter deletion,
-repair, publication, privacy-fence, or dependency behavior.
+`17cddb59`. The harness preserves those bounded deletion and repair paths.
+Applied forget also has the narrowly scoped WAL-index recovery described below;
+the benchmark's observation probes remain strictly read-only.
 
 ## Evidence status
 
@@ -268,6 +269,24 @@ interrupted state and requires pending readers to return `forget-repair-pending`
 canonical deletion resumes with the same selectors. An interruption after
 lexical rebuilding begins also tests `index --full` as the recovery route when
 all canonical deletion has committed. Normal verification then runs again.
+
+Applied forget inspects through a strict read-only connection first. If the
+engine returns the exact `BusyRecovery` error, the command can recover only the
+derived WAL index under the existing maintenance and archive-writer leases,
+doctor admission, and native recovery locks. The inspection still cannot write
+the canonical database or WAL. It does not enter the ordinary opener's schema
+salvage or dirty-WAL checkpoint fallbacks. This lets the same selectors reach
+pending repair after their canonical rows were already deleted. Healthy no-op
+applies, previews, and strict readers retain their existing behavior; unrelated
+open failures are not converted into repair permission.
+
+The native regressions cover real stale SHM from successive FrankenSQLite WAL
+generations and the existing stock-SQLite interoperability fixture, database/WAL
+byte preservation, live-writer refusal, retry after a failed lexical publication,
+durable tombstones, and pending-reader fencing.
+Their source is included in the existing GH477 storage and GH565 CLI tests;
+they still require execution through the native quality gate. These correctness
+checks do not substitute for the archive-scale memory matrix.
 
 A strict read-only probe can refuse an interrupted WAL index that requires
 recovery. The driver retains that failed probe receipt and the untouched

@@ -6160,6 +6160,79 @@ impl FrankenStorage {
         Ok(storage)
     }
 
+    /// Inspect selectors for an applied forget after acquiring both the
+    /// data-directory maintenance lease and the canonical archive writer lease.
+    ///
+    /// A healthy archive takes the same strict read-only lane as a preview. If
+    /// that lane reports exactly `BusyRecovery`, an interrupted writer may
+    /// have left the derived WAL index stale. Recover only that index through
+    /// the engine's read-only recovery API, under its native recovery locks
+    /// and the doctor admission guard. Database/WAL writes, checkpoints,
+    /// migrations, FTS repairs and forget-fence changes are not authorized by
+    /// this opener. The caller must close the inspection without checkpointing
+    /// before entering the existing bounded FTS preflight and deletion paths.
+    pub(crate) fn open_applied_forget_inspection(path: &Path) -> Result<Self> {
+        Self::open_applied_forget_inspection_with_timeout(
+            path,
+            DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT,
+        )
+    }
+
+    fn open_applied_forget_inspection_with_timeout(
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let path_str = path.to_string_lossy().to_string();
+        let deadline = Instant::now() + timeout;
+        // Waiting for an existing doctor owner remains part of the same
+        // deadline. A healthy no-op must not create a doctor lock directory.
+        let _strict_guard = acquire_existing_doctor_mutation_db_open_guard(path, timeout)?;
+        let mut recovery_guard = None;
+        let mut backoff = Duration::from_millis(4);
+        let conn = loop {
+            let opening = if recovery_guard.is_some() {
+                FrankenConnection::open_schema_only_with_wal_index_recovery(&path_str)
+            } else {
+                // One observation, with no BusyRecovery wait before the
+                // explicitly admitted recovery lane. Other transient errors
+                // still retry here and may subsequently become BusyRecovery.
+                open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
+            };
+            match opening {
+                Ok(conn) => break conn,
+                Err(err) => {
+                    let now = Instant::now();
+                    let remaining = deadline.saturating_duration_since(now);
+                    if now < deadline
+                        && recovery_guard.is_none()
+                        && matches!(&err, crate::franken_sync::FrankenError::BusyRecovery)
+                    {
+                        recovery_guard =
+                            Some(acquire_doctor_mutation_db_open_guard(path, remaining)?);
+                        continue;
+                    }
+                    if now < deadline && retryable_franken_error(&err) {
+                        sleep_with_franken_retry_backoff(
+                            &mut backoff,
+                            remaining,
+                            Duration::from_millis(128),
+                        );
+                    } else {
+                        return Err(err).with_context(|| {
+                            format!(
+                                "opening applied-forget inspection at {}",
+                                path.display()
+                            )
+                        });
+                    }
+                }
+            }
+        };
+        let storage = Self::new(conn, path.to_path_buf());
+        storage.apply_readonly_config()?;
+        Ok(storage)
+    }
+
     pub fn close(self) -> Result<()> {
         let mut this = self;
         this.close_cached_ephemeral_writer_best_effort_in_place();
@@ -31250,7 +31323,7 @@ if sys.argv[2] == 'writer':
         const FIXTURE_WAIT: Duration = Duration::from_secs(120);
 
         let dir = TempDir::new().unwrap();
-        for opener in ["raw", "storage", "owner"] {
+        for opener in ["raw", "storage", "owner", "applied-forget"] {
             for header_only in [false, true] {
                 for writer in [false, true] {
                     let case_dir = dir.path().join(format!("{opener}-{header_only}-{writer}"));
@@ -31354,10 +31427,16 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                             assert_eq!(rows[0].get_typed::<i64>(0)?, 30);
                             assert!(conn.execute_sync("INSERT INTO t VALUES(99)").is_err());
                             conn.close_without_checkpoint_sync()?;
-                        } else if opener == "storage" {
-                            let storage = FrankenStorage::open_readonly_with_doctor_lock_timeout(
-                                &path, timeout,
-                            )?;
+                        } else if matches!(opener, "storage" | "applied-forget") {
+                            let storage = if opener == "applied-forget" {
+                                FrankenStorage::open_applied_forget_inspection_with_timeout(
+                                    &path, timeout,
+                                )?
+                            } else {
+                                FrankenStorage::open_readonly_with_doctor_lock_timeout(
+                                    &path, timeout,
+                                )?
+                            };
                             let rows = storage.raw().query("SELECT sum(n) FROM t")?;
                             assert_eq!(rows[0].get_typed::<i64>(0)?, 30);
                             assert!(storage.raw().execute("INSERT INTO t VALUES(99)").is_err());

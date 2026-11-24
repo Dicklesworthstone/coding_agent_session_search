@@ -123,16 +123,47 @@ class ProcessMeasurementTests(unittest.TestCase):
         self.assertTrue(Path(receipt["receipt_path"]).is_file())
 
     def test_timeout_contains_descendant_process_group(self) -> None:
+        # Give interpreter startup a realistic budget. A pipe acknowledgement
+        # proves the descendant reached its own body before the parent emits
+        # its PID; a short import/startup timeout must not masquerade as a
+        # descendant-containment test.
         receipt = self.child(
-            "import subprocess,sys,time; "
-            "p=subprocess.Popen([sys.executable,'-I','-S','-c','import time; time.sleep(30)']); "
-            "print(p.pid,flush=True); time.sleep(30)", timeout=0.3)
-        pid = int(Path(receipt["stdout_path"]).read_text().strip())
-        status = Path(f"/proc/{pid}/stat")
-        if status.exists():
-            stat = status.read_text()
-            self.assertEqual(stat[stat.rfind(")") + 2:].split()[0], "Z")
+            textwrap.dedent("""
+                import os, time
+                ready_read, ready_write = os.pipe()
+                pid = os.fork()
+                if pid == 0:
+                    os.close(ready_read)
+                    os.write(ready_write, b'1')
+                    os.close(ready_write)
+                    time.sleep(30)
+                    os._exit(0)
+                os.close(ready_write)
+                assert os.read(ready_read, 1) == b'1'
+                os.close(ready_read)
+                print(pid, flush=True)
+                time.sleep(30)
+            """), timeout=3.0)
+        output = Path(receipt["stdout_path"]).read_text().strip()
+        self.assertTrue(output.isdecimal(), "descendant did not acknowledge readiness before timeout")
+        pid = int(output)
+        self.assertTrue(receipt["timed_out"])
+        self.assertEqual(receipt["status"], "timeout")
         self.assertEqual(receipt["exit_code"], -9)
+        telemetry = [json.loads(line) for line in Path(receipt["telemetry_path"]).read_text().splitlines()]
+        self.assertTrue(any(row["event"] == "sample" and row["process_count"] >= 2
+                            for row in telemetry), "descendant was never observed in the process group")
+        status = Path(f"/proc/{pid}/stat")
+        deadline = time.monotonic() + 2.0
+        while True:
+            try:
+                stat = status.read_text()
+            except FileNotFoundError:
+                break
+            if stat[stat.rfind(")") + 2:].split()[0] == "Z":
+                break
+            self.assertLess(time.monotonic(), deadline, "descendant was not contained")
+            time.sleep(0.01)
         self.assertGreaterEqual(receipt["sampled_process_tree_peak_rss_bytes"],
                                 receipt["sampled_root_peak_rss_bytes"])
 

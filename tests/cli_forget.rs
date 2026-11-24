@@ -2475,12 +2475,153 @@ fn a_failed_lexical_purge_is_repaired_by_retrying_the_same_forget() -> TestResul
 
 #[test]
 fn gh565_forget_retries_with_retired_fallback_and_publishes_lexical_index() -> TestResult {
+    use coding_agent_search::franken_sync::compat::RowExt;
+    use coding_agent_search::search::privacy;
     use coding_agent_search::storage::sqlite::FrankenStorage;
 
-    let (archive, forgotten) = indexed_archive(&[])?;
+    // Leave a real native WAL generation with SHM from its predecessor. Only
+    // the derived SHM is replaced after its owner closes; the database inode,
+    // current WAL and engine certificate companions remain in place. This
+    // deliberately stale-index fixture does not claim to reproduce a kill.
+    #[cfg(unix)]
+    fn stale_wal_index(database: &Path) -> TestResult {
+        use coding_agent_search::franken_sync::Connection;
+
+        let sidecar = |suffix: &str| {
+            let mut name = database.as_os_str().to_os_string();
+            name.push(suffix);
+            PathBuf::from(name)
+        };
+        let writer = Connection::open_existing_schema_only(
+            database.to_str().ok_or("non-utf8 database path")?,
+        )?;
+        writer.execute("PRAGMA journal_mode=WAL")?;
+        writer.execute("PRAGMA wal_autocheckpoint=0")?;
+        writer.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('gh565_wal_fixture','old')",
+        )?;
+        let old = fs::read(sidecar("-shm"))?;
+        let checkpoint = writer.query("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        assert_eq!(checkpoint[0].get_typed::<i64>(0)?, 0);
+        writer.execute("UPDATE meta SET value='new' WHERE key='gh565_wal_fixture'")?;
+        let current = fs::read(sidecar("-shm"))?;
+        assert!(old.len() >= 40 && current.len() >= 40);
+        assert_ne!(
+            &old[32..40],
+            &current[32..40],
+            "fixture needs two WAL generations"
+        );
+        writer.close_without_checkpoint()?;
+        assert!(fs::metadata(sidecar("-wal"))?.len() > 32);
+        fs::write(sidecar("-shm"), old)?;
+        Ok(())
+    }
+
+    let home = TempDir::new()?;
+    let data_dir = home.path().join("cass-data");
+    fs::create_dir_all(&data_dir)?;
+    let codex_home = home.path().join(".codex");
+    let forgotten = write_codex_rollout(&codex_home, FORGOTTEN_SESSION, FORGOTTEN_MARKER)?;
+    write_codex_rollout(&codex_home, "keep-b", KEPT_MARKER)?;
+    let archive = Archive { home, data_dir };
+    let mut seed = archive.cmd();
+    seed.env_remove("CASS_DEFER_ANALYTICS_UPDATES")
+        .env("CASS_INLINE_ANALYTICS_UPDATES", "1");
+    let seeded = archive.run_step(
+        "seed forget recovery archive with complete token ledger",
+        seed,
+        &["index", "--full", "--json", "--no-progress-events"],
+    )?;
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
     let forgotten_str = forgotten.to_str().ok_or("non-utf8 fixture path")?;
+    let original_source = fs::read(&forgotten)?;
+    let path = archive.data_dir.join("agent_search.db");
     assert!(!archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
     assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+
+    let storage = FrankenStorage::open(&path)?;
+    storage.rebuild_fts()?;
+    assert_eq!(
+        storage
+            .raw()
+            .query("SELECT COUNT(*) FROM fts_messages_docsize")?[0]
+            .get_typed::<i64>(0)?,
+        4,
+        "negative control: retirement must start with a populated FTS shadow"
+    );
+    let kept_id = storage
+        .raw()
+        .query("SELECT id FROM conversations WHERE external_id = 'keep-b'")?[0]
+        .get_typed::<i64>(0)?;
+    let retained_rows = |storage: &FrankenStorage| -> TestResult<BTreeMap<String, Vec<String>>> {
+        let mut snapshot = BTreeMap::new();
+        for (table, key) in [
+            ("conversations", "id"),
+            ("messages", "conversation_id"),
+            ("token_usage", "conversation_id"),
+        ] {
+            let mut rows: Vec<_> = storage
+                .raw()
+                .query(&format!("SELECT * FROM {table} WHERE {key} = {kept_id}"))?
+                .into_iter()
+                .map(|row| format!("{:?}", row.values()))
+                .collect();
+            rows.sort();
+            snapshot.insert(table.to_string(), rows);
+        }
+        Ok(snapshot)
+    };
+    let kept_before = retained_rows(&storage)?;
+    assert_eq!(kept_before["conversations"].len(), 1);
+    assert_eq!(kept_before["messages"].len(), 2);
+    assert_eq!(kept_before["token_usage"].len(), 2);
+    storage.close_without_checkpoint()?;
+
+    let bundle = || -> TestResult<BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)>> {
+        let mut snapshot = BTreeMap::new();
+        for suffix in ["", "-wal", "-shm"] {
+            let file = archive.data_dir.join(format!("agent_search.db{suffix}"));
+            match fs::read(&file) {
+                Ok(bytes) => {
+                    let modified = fs::metadata(&file)?.modified()?;
+                    snapshot.insert(file, (bytes, modified));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(snapshot)
+    };
+    #[cfg(unix)]
+    let install_stale_index = |label: &str| -> TestResult {
+        use coding_agent_search::franken_sync::{
+            FrankenError,
+            compat::{OpenFlags, open_with_flags},
+        };
+
+        stale_wal_index(&path)?;
+        let before = bundle()?;
+        let error = open_with_flags(
+            path.to_str().ok_or("non-utf8 database path")?,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect_err("negative control: strict admission must refuse this real stale SHM");
+        assert!(
+            matches!(&error, FrankenError::BusyRecovery),
+            "{label}: {error:?}"
+        );
+        assert_eq!(
+            bundle()?,
+            before,
+            "strict refusal must leave the bundle untouched"
+        );
+        Ok(())
+    };
+
     let args = [
         "forget",
         "--source-path",
@@ -2488,40 +2629,114 @@ fn gh565_forget_retries_with_retired_fallback_and_publishes_lexical_index() -> T
         "--apply",
         "--json",
     ];
-    let mut failing = archive.cmd();
-    failing
-        .env("CASS_FTS_SHADOW_MAX_MESSAGES", "1")
-        .env("CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE", "1");
-    let failed = archive.run_step(
-        "forget with oversized fallback and lexical failure",
-        failing,
-        &args,
-    )?;
-    assert_eq!(failed.status.code(), Some(5));
-    let stderr = String::from_utf8_lossy(&failed.stderr);
-    let envelope: Value = serde_json::from_str(
-        stderr
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .ok_or("missing forget failure envelope")?,
-    )?;
-    assert_eq!(envelope["error"]["kind"], "lexical-rebuild");
+    let mut pending_state: Option<BTreeMap<String, Vec<String>>> = None;
+    for attempt in 0..2 {
+        if attempt == 1 {
+            #[cfg(unix)]
+            install_stale_index("gh565-failed-retry")?;
+        }
+        // Do not open an ordinary readonly storage handle between the stale
+        // SHM control and this command: it would heal the condition we test.
+        let mut failing = archive.cmd();
+        failing
+            .env("CASS_FTS_SHADOW_MAX_MESSAGES", "1")
+            .env("CASS_TEST_FORGET_LEXICAL_REBUILD_FAILURE", "1");
+        let failed = archive.run_step(
+            &format!("forget with lexical failure, attempt {attempt}"),
+            failing,
+            &args,
+        )?;
+        assert_eq!(failed.status.code(), Some(5));
+        assert!(failed.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&failed.stderr);
+        let envelope: Value = serde_json::from_str(
+            stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .ok_or("missing forget failure envelope")?,
+        )?;
+        assert_eq!(
+            envelope["error"]["kind"],
+            "lexical-rebuild",
+            "same-selector retry must pass WAL admission and attempt pending repair: {stderr}"
+        );
 
-    let path = archive.data_dir.join("agent_search.db");
-    let storage = FrankenStorage::open_readonly(&path)?;
-    assert_eq!(storage.total_conversation_count()?, 1);
-    assert_eq!(storage.total_message_count()?, 2);
-    assert!(storage.forget_derived_rebuild_pending()?);
-    assert!(
-        storage
-            .raw()
-            .query("SELECT name FROM sqlite_master WHERE name = 'fts_messages' OR name LIKE 'fts_messages_%'")?
-            .is_empty(),
-        "forget must retire an oversized fallback before reaching lexical rebuilding"
-    );
-    storage.close_without_checkpoint()?;
+        let storage = FrankenStorage::open_readonly(&path)?;
+        assert_eq!(storage.total_conversation_count()?, 1);
+        assert_eq!(storage.total_message_count()?, 2);
+        assert_eq!(retained_rows(&storage)?, kept_before);
+        assert!(storage.forget_derived_rebuild_pending()?);
+        assert_eq!(
+            storage
+                .raw()
+                .query(
+                    "SELECT value FROM meta WHERE key = 'forget_derived_rebuild_pending'"
+                )?
+                .len(),
+            1,
+            "SQL repair marker must survive each failed publication"
+        );
+        assert!(
+            storage
+                .raw()
+                .query(
+                    "SELECT name FROM sqlite_master WHERE name = 'fts_messages' OR name LIKE 'fts_messages_%'"
+                )?
+                .is_empty(),
+            "failed repair must not recreate the retired fallback"
+        );
+        storage.close_without_checkpoint()?;
+        assert!(privacy::repair_pending(&path)?);
+        let state = forget_state(&archive)?;
+        assert_eq!(state["forgotten_sources"].len(), 1);
+        assert!(state["forgotten_conversations"].is_empty());
+        if let Some(before) = &pending_state {
+            for table in ["forgotten_sources", "forgotten_conversations"] {
+                assert_eq!(state[table], before[table], "retry changed {table}");
+            }
+        } else {
+            // Preview on a healthy pending archive must never perform repair.
+            // The stale fixture's strict engine refusal is checked separately,
+            // without spending the CLI's 30-second admission retry budget.
+            let before_bundle = bundle()?;
+            let before_assets = derived_assets(&archive.data_dir)?;
+            let fence = privacy::state_path_for_database(&path);
+            let before_fence = fs::read(&fence)?;
+            let preview = archive.forget_selected(&["--source-path", forgotten_str], false)?;
+            assert_eq!(preview["conversations_matched"], 0);
+            assert_eq!(preview["conversations_deleted"], 0);
+            assert_eq!(preview["derived_rebuilt"], false);
+            assert_eq!(bundle()?, before_bundle);
+            assert_eq!(derived_assets(&archive.data_dir)?, before_assets);
+            assert_eq!(fs::read(&fence)?, before_fence);
+            assert_eq!(forget_state(&archive)?, state);
+            pending_state = Some(state);
+        }
 
+        let blocked = archive.run_step(
+            "pending stale-index recovery fences lexical search",
+            archive.cmd(),
+            &["search", FORGOTTEN_MARKER, "--mode", "lexical", "--robot"],
+        )?;
+        assert_eq!(blocked.status.code(), Some(9));
+        assert!(
+            blocked.stdout.is_empty(),
+            "pending reader must emit no content"
+        );
+        let stderr = String::from_utf8_lossy(&blocked.stderr);
+        let error: Value = serde_json::from_str(
+            stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .ok_or("missing pending-reader error envelope")?,
+        )?;
+        assert_eq!(error["error"]["kind"], "forget-repair-pending");
+    }
+
+    #[cfg(unix)]
+    install_stale_index("gh565-successful-retry")?;
     let mut retry = archive.cmd();
     retry.env("CASS_FTS_SHADOW_MAX_MESSAGES", "1");
     let repaired = archive.run_step("retry forget with retired fallback", retry, &args)?;
@@ -2531,10 +2746,22 @@ fn gh565_forget_retries_with_retired_fallback_and_publishes_lexical_index() -> T
         String::from_utf8_lossy(&repaired.stderr)
     );
     let report: Value = serde_json::from_slice(&repaired.stdout)?;
+    assert_eq!(report["conversations_matched"], 0);
     assert_eq!(report["conversations_deleted"], 0);
     assert_eq!(report["derived_rebuilt"], true);
+    assert_eq!(report["fallback_fts"]["status"], "retired");
+    assert_eq!(report["fallback_fts"]["corpus_messages"], 2);
+    assert_eq!(report["fallback_fts"]["bound_messages"], 1);
+    assert_eq!(report["rebuild_profile"]["name"], "bounded");
     let storage = FrankenStorage::open_readonly(&path)?;
+    assert_eq!(retained_rows(&storage)?, kept_before);
     assert!(!storage.forget_derived_rebuild_pending()?);
+    assert!(
+        storage
+            .raw()
+            .query("SELECT value FROM meta WHERE key = 'forget_derived_rebuild_pending'")?
+            .is_empty()
+    );
     assert!(
         storage
             .raw()
@@ -2543,12 +2770,28 @@ fn gh565_forget_retries_with_retired_fallback_and_publishes_lexical_index() -> T
         "a retry must not recreate the retired fallback"
     );
     storage.close_without_checkpoint()?;
+    assert!(!privacy::repair_pending(&path)?);
+    assert_archive_counts(&archive, 1, 2)?;
+    let repaired_state = forget_state(&archive)?;
+    let pending_state = pending_state.ok_or("missing interrupted-forget snapshot")?;
+    for table in ["forgotten_sources", "forgotten_conversations"] {
+        assert_eq!(repaired_state[table], pending_state[table]);
+    }
     assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
     assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
-    assert!(
-        forgotten.is_file(),
-        "forget preserves the original source file"
-    );
+    assert_eq!(fs::read(&forgotten)?, original_source);
+
+    // The original transcript remains on disk: a real full rescan must honor
+    // the same durable tombstone, including after stale WAL-index recovery.
+    archive.index(&["--full"])?;
+    assert_archive_counts(&archive, 1, 2)?;
+    assert!(archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty());
+    assert!(!archive.search_hit_paths(KEPT_MARKER)?.is_empty());
+    let rescanned = forget_state(&archive)?;
+    for table in ["forgotten_sources", "forgotten_conversations"] {
+        assert_eq!(rescanned[table], pending_state[table]);
+    }
+    assert_eq!(fs::read(&forgotten)?, original_source);
     Ok(())
 }
 
