@@ -1,0 +1,606 @@
+{
+  "kind": "Final eleven-file Codex stable-prefix scoped DSR gates",
+  "base_commit": "366a6e5903ae74524c483f05cc9bd9c887b2059f",
+  "host_ordered_edit_blob": "c119fb3ce5196705c3618ed8b4e076eb8d5bd220",
+  "raw_manifest_blob": "f8a7eae6de1a103d87e107d6bce5e8a4856dbf49",
+  "source_manifest": {
+    "src/connectors/codex/stable_prefix.rs": {
+      "sha256": "ac15c04aae78a61f4216f8c86c91a9cef5a2a9b98e013960c2ea607e5b84ad40",
+      "git_blob_sha": "80e2adb78d2882fcdf5d47751e9795a923a151ea",
+      "bytes": 24662
+    },
+    "src/connectors/codex/stable_prefix/tests.rs": {
+      "sha256": "dabd2b4779b2411c0b35521d932d8e1815c9499d4ae6064af65763e4e0a0ff5a",
+      "git_blob_sha": "3960d2bda0ba7746f6feeb7760f9c385cbfd8306",
+      "bytes": 16264
+    },
+    "src/indexer/mod.rs": {
+      "sha256": "aa6c708e91dec59623313a37a21d405d1f46b56dc96ac20742241b58366d72e1",
+      "git_blob_sha": "4b75a587310e51ce0e94f58c907e0dbee09969a2",
+      "bytes": 3608942
+    },
+    "src/indexer/source_ledger_tests.rs": {
+      "sha256": "8d156a56048dff7bb4355653140728703ada1b3bfef6416e23d19e1a0a5de055",
+      "git_blob_sha": "9f0799cfff8c7a4f10c92ea7a652eb50461a4942",
+      "bytes": 94380
+    },
+    "src/raw_mirror.rs": {
+      "sha256": "49d0930c7bed3e79a440c44cf5392c41fbf5caa8269844088f47b2e31249ef34",
+      "git_blob_sha": "8240e3280dcbc2e0012a2024146f2344bfdca803",
+      "bytes": 14266
+    },
+    "src/raw_mirror/policy.rs": {
+      "sha256": "772cc3820db9659f73c29bb3d62b657ec0d5224cb51d5a72beb868dab12b5d61",
+      "git_blob_sha": "b4caa2803e2ff0ba589038c8d3f064850ac15fe6",
+      "bytes": 43392
+    },
+    "src/raw_mirror/policy_tests.rs": {
+      "sha256": "56474054dc0a6f18d2b8b4ed0c23764e0a30ace86bbd1c59490a14ad408ae316",
+      "git_blob_sha": "347c6b6e50ee293d782bfc96db42d9eb34b73ef4",
+      "bytes": 39290
+    },
+    "src/raw_mirror/prefix_tests.rs": {
+      "sha256": "047a0876bf68e8c0d06bb03fecd719ea608cebb47bcb7f1efe71410c5404d89f",
+      "git_blob_sha": "c63da26e03499efc32d3758bc41a954561cc93c8",
+      "bytes": 20788
+    },
+    "src/raw_mirror/prefix_tests/budgeted_tests.rs": {
+      "sha256": "c2fef36005fdd44a882e71843544abc9da56d0c33254aabec03425ff51e3de40",
+      "git_blob_sha": "63ae99b2514ff61e42ba9484ba4065a9d6149b14",
+      "bytes": 6375
+    },
+    "src/storage/sqlite.rs": {
+      "sha256": "9b697c39c318c058678ad772e4e6b6e58e1a9fade1da1790f5d6524f5832708c",
+      "git_blob_sha": "c6b685a106b027f989174fdd52bd26a0f65bcc79",
+      "bytes": 2162289
+    },
+    "src/storage/sqlite/codex_prefix_tests.rs": {
+      "sha256": "902b1e2c9ef5c352b7359fc8d6ec4fd7b2b3123089cc57524a9f5e7be66b752a",
+      "git_blob_sha": "ecd25a61abfa0e941fe5a4424388903ed1c5c320",
+      "bytes": 25987
+    }
+  },
+  "after_sha256": {
+    "src/connectors/codex/stable_prefix.rs": "ac15c04aae78a61f4216f8c86c91a9cef5a2a9b98e013960c2ea607e5b84ad40",
+    "src/connectors/codex/stable_prefix/tests.rs": "dabd2b4779b2411c0b35521d932d8e1815c9499d4ae6064af65763e4e0a0ff5a",
+    "src/indexer/mod.rs": "aa6c708e91dec59623313a37a21d405d1f46b56dc96ac20742241b58366d72e1",
+    "src/indexer/source_ledger_tests.rs": "8d156a56048dff7bb4355653140728703ada1b3bfef6416e23d19e1a0a5de055",
+    "src/raw_mirror.rs": "49d0930c7bed3e79a440c44cf5392c41fbf5caa8269844088f47b2e31249ef34",
+    "src/raw_mirror/policy.rs": "772cc3820db9659f73c29bb3d62b657ec0d5224cb51d5a72beb868dab12b5d61",
+    "src/raw_mirror/policy_tests.rs": "56474054dc0a6f18d2b8b4ed0c23764e0a30ace86bbd1c59490a14ad408ae316",
+    "src/raw_mirror/prefix_tests.rs": "047a0876bf68e8c0d06bb03fecd719ea608cebb47bcb7f1efe71410c5404d89f",
+    "src/raw_mirror/prefix_tests/budgeted_tests.rs": "c2fef36005fdd44a882e71843544abc9da56d0c33254aabec03425ff51e3de40",
+    "src/storage/sqlite.rs": "9b697c39c318c058678ad772e4e6b6e58e1a9fade1da1790f5d6524f5832708c",
+    "src/storage/sqlite/codex_prefix_tests.rs": "902b1e2c9ef5c352b7359fc8d6ec4fd7b2b3123089cc57524a9f5e7be66b752a"
+  },
+  "source_changes": [],
+  "dsr_receipt": {
+    "tool": "cass-final-prefix-scoped",
+    "status": "failed",
+    "dry_run": false,
+    "skipped": false,
+    "dsr_version": "0.2.3",
+    "config_path": "/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/config.yaml",
+    "config_snapshot_path": "/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/logs/cass-final-prefix-scoped/20261124T122410-9r5W1uLu/checks-config.yaml",
+    "config_sha256": "ccda42914c4be36075a3c82f3535ec199460973c55d166213cab62134b80bd3d",
+    "config_sha256_after": "ccda42914c4be36075a3c82f3535ec199460973c55d166213cab62134b80bd3d",
+    "source_before": "not-a-git-repo|e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|9da30f9b11c6a40c224a7ab2cdaf315275c031e58928c0636fde9da4542d0004",
+    "source_after": "not-a-git-repo|e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|9da30f9b11c6a40c224a7ab2cdaf315275c031e58928c0636fde9da4542d0004",
+    "run_dir": "/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/logs/cass-final-prefix-scoped/20261124T122410-9r5W1uLu",
+    "checks": [
+      {
+        "command": "python3 /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/guarded_run.py --evidence /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/evidence-fmt -- rustfmt --edition 2024 --check --config skip_children=true src/connectors/codex/stable_prefix.rs src/connectors/codex/stable_prefix/tests.rs src/indexer/mod.rs src/indexer/source_ledger_tests.rs src/raw_mirror.rs src/raw_mirror/policy.rs src/raw_mirror/policy_tests.rs src/raw_mirror/prefix_tests.rs src/raw_mirror/prefix_tests/budgeted_tests.rs src/storage/sqlite.rs src/storage/sqlite/codex_prefix_tests.rs",
+        "status": "failed",
+        "executed": true,
+        "passed": false,
+        "exit_code": 125,
+        "cwd": "/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/source",
+        "duration_ms": 2553,
+        "timeout_seconds": 600,
+        "output_preview": ";\n             }\n             anyhow::ensure!(\n                 previous.source_path == source,\nDiff in /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/source/src/connectors/codex/stable_prefix/tests.rs:405:\n     let foreign = directory.path().join(\"rollout-foreign.jsonl\");\n     fs::write(&foreign, fs::read(&path)?)?;\n     assert!(\n-        receipt.validate_opened_source(&File::open(&foreign)?).is_err(),\n+        receipt\n+            .validate_opened_source(&File::open(&foreign)?)\n+            .is_err(),\n         \"identical bytes in another opened object are not the admitted descriptor\"\n     );\n     let retained = path.with_extension(\"retained\");\nVALIDATION_RESOURCE_RESULT {\"duration_seconds\": 2.117, \"initial_mem_available_kib\": 2224548, \"lowest_mem_available_kib\": 2088860, \"peak_aggregate_rss_kib\": 316404, \"peak_aggregate_vas_kib\": 2228348, \"stop_reason\": \"Memory guard: MemAvailable below 2 GiB\", \"child_returncode\": -15, \"supervisor_returncode\": 125}\n\n# exit_code: 125\n",
+        "log_path": "/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/logs/cass-final-prefix-scoped/20261124T122410-9r5W1uLu/check-1.log",
+        "log_sha256": "e5daea714f52657c96477a792bead4ac2ec6b8a69679d098ea055c9d3adffa1e"
+      },
+      {
+        "command": "python3 /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/guarded_run.py --evidence /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/evidence-ubs -- bash /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/run-ubs-stage.sh src/connectors/codex/stable_prefix.rs src/connectors/codex/stable_prefix/tests.rs src/indexer/mod.rs src/indexer/source_ledger_tests.rs src/raw_mirror.rs src/raw_mirror/policy.rs src/raw_mirror/policy_tests.rs src/raw_mirror/prefix_tests.rs src/raw_mirror/prefix_tests/budgeted_tests.rs src/storage/sqlite.rs src/storage/sqlite/codex_prefix_tests.rs",
+        "status": "failed",
+        "executed": true,
+        "passed": false,
+        "exit_code": 125,
+        "cwd": "/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/source",
+        "duration_ms": 1016,
+        "timeout_seconds": 600,
+        "output_preview": "bdeccbb35f2056e6177c73b3f0f9966d20d1cbeff22b7f084133c4a6ac625ee2\nUBS_MODULE_DIR=/tmp/cass-final-prefix-scoped/cass-gate-ubs.OmW3uN/modules\nUBS_CONTRACT_SHA256=7319b2e5e085d0dd2434e5114291b2dee9fbbb96e2cfe02027eb263abcb06ac3\nUBS_FILE=src/connectors/codex/stable_prefix.rs\nUBS_FILE=src/connectors/codex/stable_prefix/tests.rs\nUBS_FILE=src/indexer/mod.rs\nUBS_FILE=src/indexer/source_ledger_tests.rs\nUBS_FILE=src/raw_mirror.rs\nUBS_FILE=src/raw_mirror/policy.rs\nUBS_FILE=src/raw_mirror/policy_tests.rs\nUBS_FILE=src/raw_mirror/prefix_tests.rs\nUBS_FILE=src/raw_mirror/prefix_tests/budgeted_tests.rs\nUBS_FILE=src/storage/sqlite.rs\nUBS_FILE=src/storage/sqlite/codex_prefix_tests.rs\nVALIDATION_RESOURCE_RESULT {\"duration_seconds\": 0.614, \"initial_mem_available_kib\": 2167124, \"lowest_mem_available_kib\": 2087392, \"peak_aggregate_rss_kib\": 94860, \"peak_aggregate_vas_kib\": 114740, \"stop_reason\": \"Memory guard: MemAvailable below 2 GiB\", \"child_returncode\": -15, \"supervisor_returncode\": 125}\n\n# exit_code: 125\n",
+        "log_path": "/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/logs/cass-final-prefix-scoped/20261124T122410-9r5W1uLu/check-2.log",
+        "log_sha256": "a41215c45fa9a065d2099ae43234678dcd699a75d872c0dc1abbb183e1c83d2b"
+      }
+    ],
+    "observed": 2,
+    "executed": 2,
+    "passed": 0,
+    "failed": 2,
+    "planned": 0,
+    "interrupted": 0,
+    "not_run": 0,
+    "total": 2,
+    "duration_ms": 3796,
+    "timeout_seconds": 600
+  },
+  "logs": {
+    "check-2.log": "# dsr quality check\n# argv: python3 /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/guarded_run.py --evidence /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/evidence-ubs -- bash /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/run-ubs-stage.sh src/connectors/codex/stable_prefix.rs src/connectors/codex/stable_prefix/tests.rs src/indexer/mod.rs src/indexer/source_ledger_tests.rs src/raw_mirror.rs src/raw_mirror/policy.rs src/raw_mirror/policy_tests.rs src/raw_mirror/prefix_tests.rs src/raw_mirror/prefix_tests/budgeted_tests.rs src/storage/sqlite.rs src/storage/sqlite/codex_prefix_tests.rs\n# cwd: /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/source\n# env: PATH=/workspace/scratch/94df4d950735/validation-restored-20261124/ubs-5.4.4:/workspace/scratch/94df4d950735/validation-restored-20261124/cargo-home/bin:/workspace/scratch/94df4d950735/validation-restored-20261124/tools:/workspace/scratch/94df4d950735/validation-restored-20261124/dsr-source:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/override:/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/node/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin:/opt/codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/agent/.local/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/fallback\n# env: DSR_QUALITY_RUN_DIR=/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/logs/cass-final-prefix-scoped/20261124T122410-9r5W1uLu\n# env: DSR_QUALITY_TIMEOUT=600\n# env: CARGO_NET_OFFLINE=true\n# env: DSR_CACHE_DIR=/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/cache\n# env: DSR_REPOS_FILE=/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/config.yaml\n# env: DSR_CURRENT_CMD=quality\n# env: CARGO_TARGET_DIR=/workspace/scratch/94df4d950735/validation-restored-20261124/target\n# env: CARGO_NET_GIT_FETCH_WITH_CLI=true\n# env: DSR_CONFIG_DIR=/workspace/scratch/94df4d950735/validation-restored-20261124/dsr-config\n# env: RUST_MIN_STACK=134217728\n# env: DSR_STATE_DIR=/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/state\n# env: DSR_CURRENT_HOST=\n# env: CARGO_PROFILE_DEV_DEBUG=0\n# env: DSR_KEEP_BUILD_STAGES=1\n# env: DSR_RUN_ID=run-1795541050-2\n# env: CARGO_HOME=/workspace/scratch/94df4d950735/validation-restored-20261124/cargo-home\n# env: CARGO_PROFILE_TEST_DEBUG=0\n# env: RUSTFLAGS=-Zthreads=1\n# env: CARGO_BUILD_JOBS=1\n# env: CARGO_NET_RETRY=1\n# env: RUSTUP_HOME=/workspace/scratch/94df4d950735/validation-restored-20261124/rustup-home\n# env: CARGO_HTTP_USER_AGENT=coding_agent_session_search-agent (+https://github.com/Dicklesworthstone/coding_agent_session_search)\n# env: DSR_CURRENT_TOOL=\n# env: CARGO_HTTP_TIMEOUT=60\n# env: CARGO_INCREMENTAL=0\n# env: DSR_QUALITY_LOG_DIR=/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/logs\n# env: DSR_RUST_NATIVE_ENV_NAMES\n# started_monotonic_ms: 7592754\n# timeout_seconds: 600\n# ----\nUBS_VERSION=UBS Meta-Runner v5.4.4 UBS_PIN=v5.4.4 UBS_SHA256=bdeccbb35f2056e6177c73b3f0f9966d20d1cbeff22b7f084133c4a6ac625ee2\nUBS_MODULE_DIR=/tmp/cass-final-prefix-scoped/cass-gate-ubs.OmW3uN/modules\nUBS_CONTRACT_SHA256=7319b2e5e085d0dd2434e5114291b2dee9fbbb96e2cfe02027eb263abcb06ac3\nUBS_FILE=src/connectors/codex/stable_prefix.rs\nUBS_FILE=src/connectors/codex/stable_prefix/tests.rs\nUBS_FILE=src/indexer/mod.rs\nUBS_FILE=src/indexer/source_ledger_tests.rs\nUBS_FILE=src/raw_mirror.rs\nUBS_FILE=src/raw_mirror/policy.rs\nUBS_FILE=src/raw_mirror/policy_tests.rs\nUBS_FILE=src/raw_mirror/prefix_tests.rs\nUBS_FILE=src/raw_mirror/prefix_tests/budgeted_tests.rs\nUBS_FILE=src/storage/sqlite.rs\nUBS_FILE=src/storage/sqlite/codex_prefix_tests.rs\nVALIDATION_RESOURCE_RESULT {\"duration_seconds\": 0.614, \"initial_mem_available_kib\": 2167124, \"lowest_mem_available_kib\": 2087392, \"peak_aggregate_rss_kib\": 94860, \"peak_aggregate_vas_kib\": 114740, \"stop_reason\": \"Memory guard: MemAvailable below 2 GiB\", \"child_returncode\": -15, \"supervisor_returncode\": 125}\n\n# exit_code: 125\n",
+    "check-1.log": "# dsr quality check\n# argv: python3 /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/guarded_run.py --evidence /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/evidence-fmt -- rustfmt --edition 2024 --check --config skip_children=true src/connectors/codex/stable_prefix.rs src/connectors/codex/stable_prefix/tests.rs src/indexer/mod.rs src/indexer/source_ledger_tests.rs src/raw_mirror.rs src/raw_mirror/policy.rs src/raw_mirror/policy_tests.rs src/raw_mirror/prefix_tests.rs src/raw_mirror/prefix_tests/budgeted_tests.rs src/storage/sqlite.rs src/storage/sqlite/codex_prefix_tests.rs\n# cwd: /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/source\n# env: PATH=/workspace/scratch/94df4d950735/validation-restored-20261124/ubs-5.4.4:/workspace/scratch/94df4d950735/validation-restored-20261124/cargo-home/bin:/workspace/scratch/94df4d950735/validation-restored-20261124/tools:/workspace/scratch/94df4d950735/validation-restored-20261124/dsr-source:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/override:/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/node/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin:/opt/codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/agent/.local/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/fallback\n# env: DSR_QUALITY_RUN_DIR=/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/logs/cass-final-prefix-scoped/20261124T122410-9r5W1uLu\n# env: DSR_QUALITY_TIMEOUT=600\n# env: CARGO_NET_OFFLINE=true\n# env: DSR_CACHE_DIR=/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/cache\n# env: DSR_REPOS_FILE=/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/config.yaml\n# env: DSR_CURRENT_CMD=quality\n# env: CARGO_TARGET_DIR=/workspace/scratch/94df4d950735/validation-restored-20261124/target\n# env: CARGO_NET_GIT_FETCH_WITH_CLI=true\n# env: DSR_CONFIG_DIR=/workspace/scratch/94df4d950735/validation-restored-20261124/dsr-config\n# env: RUST_MIN_STACK=134217728\n# env: DSR_STATE_DIR=/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/state\n# env: DSR_CURRENT_HOST=\n# env: CARGO_PROFILE_DEV_DEBUG=0\n# env: DSR_KEEP_BUILD_STAGES=1\n# env: DSR_RUN_ID=run-1795541050-2\n# env: CARGO_HOME=/workspace/scratch/94df4d950735/validation-restored-20261124/cargo-home\n# env: CARGO_PROFILE_TEST_DEBUG=0\n# env: RUSTFLAGS=-Zthreads=1\n# env: CARGO_BUILD_JOBS=1\n# env: CARGO_NET_RETRY=1\n# env: RUSTUP_HOME=/workspace/scratch/94df4d950735/validation-restored-20261124/rustup-home\n# env: CARGO_HTTP_USER_AGENT=coding_agent_session_search-agent (+https://github.com/Dicklesworthstone/coding_agent_session_search)\n# env: DSR_CURRENT_TOOL=\n# env: CARGO_HTTP_TIMEOUT=60\n# env: CARGO_INCREMENTAL=0\n# env: DSR_QUALITY_LOG_DIR=/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/logs\n# env: DSR_RUST_NATIVE_ENV_NAMES\n# started_monotonic_ms: 7590105\n# timeout_seconds: 600\n# ----\nDiff in /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/source/src/connectors/codex/stable_prefix.rs:385:\n         require_unlocked(&file)?;\n         if let Some(previous) = previous {\n             if before.len() < previous.admitted_bytes {\n-                return Err(changed(\"Codex admission length moved behind its previous receipt\"));\n+                return Err(changed(\n+                    \"Codex admission length moved behind its previous receipt\",\n+                ));\n             }\n             anyhow::ensure!(\n                 previous.source_path == source,\nDiff in /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/source/src/connectors/codex/stable_prefix/tests.rs:405:\n     let foreign = directory.path().join(\"rollout-foreign.jsonl\");\n     fs::write(&foreign, fs::read(&path)?)?;\n     assert!(\n-        receipt.validate_opened_source(&File::open(&foreign)?).is_err(),\n+        receipt\n+            .validate_opened_source(&File::open(&foreign)?)\n+            .is_err(),\n         \"identical bytes in another opened object are not the admitted descriptor\"\n     );\n     let retained = path.with_extension(\"retained\");\nVALIDATION_RESOURCE_RESULT {\"duration_seconds\": 2.117, \"initial_mem_available_kib\": 2224548, \"lowest_mem_available_kib\": 2088860, \"peak_aggregate_rss_kib\": 316404, \"peak_aggregate_vas_kib\": 2228348, \"stop_reason\": \"Memory guard: MemAvailable below 2 GiB\", \"child_returncode\": -15, \"supervisor_returncode\": 125}\n\n# exit_code: 125\n"
+  },
+  "resource": {
+    "evidence-fmt": {
+      "context": {
+        "command": [
+          "rustfmt",
+          "--edition",
+          "2024",
+          "--check",
+          "--config",
+          "skip_children=true",
+          "src/connectors/codex/stable_prefix.rs",
+          "src/connectors/codex/stable_prefix/tests.rs",
+          "src/indexer/mod.rs",
+          "src/indexer/source_ledger_tests.rs",
+          "src/raw_mirror.rs",
+          "src/raw_mirror/policy.rs",
+          "src/raw_mirror/policy_tests.rs",
+          "src/raw_mirror/prefix_tests.rs",
+          "src/raw_mirror/prefix_tests/budgeted_tests.rs",
+          "src/storage/sqlite.rs",
+          "src/storage/sqlite/codex_prefix_tests.rs"
+        ],
+        "cwd": "/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/source",
+        "address_space_cap_bytes": 34359738368,
+        "aggregate_rss_cap_kib": 5242880,
+        "mem_available_minimum_kib": 2097152,
+        "sample_interval_seconds": 0.2,
+        "disk_reserves_bytes": {
+          "/tmp": 536870912,
+          "/dev/shm": 536870912,
+          "/workspace": 67108864
+        },
+        "env": {
+          "CARGO_HOME": "/workspace/scratch/94df4d950735/validation-restored-20261124/cargo-home",
+          "RUSTUP_HOME": "/workspace/scratch/94df4d950735/validation-restored-20261124/rustup-home",
+          "CARGO_TARGET_DIR": "/workspace/scratch/94df4d950735/validation-restored-20261124/target",
+          "CARGO_BUILD_JOBS": "1",
+          "RUSTFLAGS": "-Zthreads=1",
+          "RUST_MIN_STACK": "134217728",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "CARGO_INCREMENTAL": "0"
+        }
+      },
+      "result": {
+        "duration_seconds": 2.117,
+        "initial_mem_available_kib": 2224548,
+        "lowest_mem_available_kib": 2088860,
+        "peak_aggregate_rss_kib": 316404,
+        "peak_aggregate_vas_kib": 2228348,
+        "stop_reason": "Memory guard: MemAvailable below 2 GiB",
+        "child_returncode": -15,
+        "supervisor_returncode": 125
+      },
+      "samples": [
+        {
+          "elapsed_seconds": 0.015,
+          "mem_available_kib": 2241020,
+          "rss_kib": 1000,
+          "vas_kib": 19420,
+          "members": [
+            {
+              "pid": 116,
+              "name": "rustfmt",
+              "rss_kib": 1000,
+              "vas_kib": 19420,
+              "threads": 1
+            }
+          ],
+          "disk_free_bytes": {
+            "/tmp": 2100658176,
+            "/dev/shm": 5222871040,
+            "/workspace": 96083968
+          }
+        },
+        {
+          "elapsed_seconds": 0.242,
+          "mem_available_kib": 2271400,
+          "rss_kib": 36268,
+          "vas_kib": 326480,
+          "members": [
+            {
+              "pid": 116,
+              "name": "rustfmt",
+              "rss_kib": 36268,
+              "vas_kib": 326480,
+              "threads": 1
+            }
+          ],
+          "disk_free_bytes": {
+            "/tmp": 2100658176,
+            "/dev/shm": 5222866944,
+            "/workspace": 96079872
+          }
+        },
+        {
+          "elapsed_seconds": 0.468,
+          "mem_available_kib": 2273892,
+          "rss_kib": 63864,
+          "vas_kib": 352932,
+          "members": [
+            {
+              "pid": 116,
+              "name": "rustfmt",
+              "rss_kib": 63864,
+              "vas_kib": 352932,
+              "threads": 1
+            }
+          ],
+          "disk_free_bytes": {
+            "/tmp": 2100510720,
+            "/dev/shm": 5223948288,
+            "/workspace": 96075776
+          }
+        },
+        {
+          "elapsed_seconds": 0.67,
+          "mem_available_kib": 2246808,
+          "rss_kib": 95636,
+          "vas_kib": 390692,
+          "members": [
+            {
+              "pid": 116,
+              "name": "rustfmt",
+              "rss_kib": 95636,
+              "vas_kib": 390692,
+              "threads": 1
+            }
+          ],
+          "disk_free_bytes": {
+            "/tmp": 2100510720,
+            "/dev/shm": 5223948288,
+            "/workspace": 96075776
+          }
+        },
+        {
+          "elapsed_seconds": 0.872,
+          "mem_available_kib": 2255112,
+          "rss_kib": 97108,
+          "vas_kib": 440056,
+          "members": [
+            {
+              "pid": 116,
+              "name": "rustfmt",
+              "rss_kib": 97108,
+              "vas_kib": 440056,
+              "threads": 1
+            }
+          ],
+          "disk_free_bytes": {
+            "/tmp": 2100510720,
+            "/dev/shm": 5223948288,
+            "/workspace": 96075776
+          }
+        },
+        {
+          "elapsed_seconds": 1.073,
+          "mem_available_kib": 2268868,
+          "rss_kib": 97864,
+          "vas_kib": 405080,
+          "members": [
+            {
+              "pid": 116,
+              "name": "rustfmt",
+              "rss_kib": 97864,
+              "vas_kib": 405080,
+              "threads": 1
+            }
+          ],
+          "disk_free_bytes": {
+            "/tmp": 2100510720,
+            "/dev/shm": 5223948288,
+            "/workspace": 96075776
+          }
+        },
+        {
+          "elapsed_seconds": 1.276,
+          "mem_available_kib": 2279864,
+          "rss_kib": 98864,
+          "vas_kib": 405044,
+          "members": [
+            {
+              "pid": 116,
+              "name": "rustfmt",
+              "rss_kib": 98864,
+              "vas_kib": 405044,
+              "threads": 1
+            }
+          ],
+          "disk_free_bytes": {
+            "/tmp": 2100510720,
+            "/dev/shm": 5223948288,
+            "/workspace": 96075776
+          }
+        },
+        {
+          "elapsed_seconds": 1.478,
+          "mem_available_kib": 2272604,
+          "rss_kib": 100136,
+          "vas_kib": 405044,
+          "members": [
+            {
+              "pid": 116,
+              "name": "rustfmt",
+              "rss_kib": 100136,
+              "vas_kib": 405044,
+              "threads": 1
+            }
+          ],
+          "disk_free_bytes": {
+            "/tmp": 2100510720,
+            "/dev/shm": 5223948288,
+            "/workspace": 96075776
+          }
+        },
+        {
+          "elapsed_seconds": 1.68,
+          "mem_available_kib": 2228500,
+          "rss_kib": 163752,
+          "vas_kib": 2228348,
+          "members": [
+            {
+              "pid": 116,
+              "name": "rustfmt",
+              "rss_kib": 163752,
+              "vas_kib": 2228348,
+              "threads": 1
+            }
+          ],
+          "disk_free_bytes": {
+            "/tmp": 2096836608,
+            "/dev/shm": 5223948288,
+            "/workspace": 96075776
+          }
+        },
+        {
+          "elapsed_seconds": 1.882,
+          "mem_available_kib": 2124532,
+          "rss_kib": 258392,
+          "vas_kib": 2228348,
+          "members": [
+            {
+              "pid": 116,
+              "name": "rustfmt",
+              "rss_kib": 258392,
+              "vas_kib": 2228348,
+              "threads": 1
+            }
+          ],
+          "disk_free_bytes": {
+            "/tmp": 2096836608,
+            "/dev/shm": 5223948288,
+            "/workspace": 96075776
+          }
+        },
+        {
+          "elapsed_seconds": 2.085,
+          "mem_available_kib": 2088860,
+          "rss_kib": 316404,
+          "vas_kib": 2228348,
+          "members": [
+            {
+              "pid": 116,
+              "name": "rustfmt",
+              "rss_kib": 316404,
+              "vas_kib": 2228348,
+              "threads": 1
+            }
+          ],
+          "disk_free_bytes": {
+            "/tmp": 2096836608,
+            "/dev/shm": 5223948288,
+            "/workspace": 96075776
+          }
+        }
+      ]
+    },
+    "evidence-ubs": {
+      "context": {
+        "command": [
+          "bash",
+          "/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/run-ubs-stage.sh",
+          "src/connectors/codex/stable_prefix.rs",
+          "src/connectors/codex/stable_prefix/tests.rs",
+          "src/indexer/mod.rs",
+          "src/indexer/source_ledger_tests.rs",
+          "src/raw_mirror.rs",
+          "src/raw_mirror/policy.rs",
+          "src/raw_mirror/policy_tests.rs",
+          "src/raw_mirror/prefix_tests.rs",
+          "src/raw_mirror/prefix_tests/budgeted_tests.rs",
+          "src/storage/sqlite.rs",
+          "src/storage/sqlite/codex_prefix_tests.rs"
+        ],
+        "cwd": "/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/source",
+        "address_space_cap_bytes": 34359738368,
+        "aggregate_rss_cap_kib": 5242880,
+        "mem_available_minimum_kib": 2097152,
+        "sample_interval_seconds": 0.2,
+        "disk_reserves_bytes": {
+          "/tmp": 536870912,
+          "/dev/shm": 536870912,
+          "/workspace": 67108864
+        },
+        "env": {
+          "CARGO_HOME": "/workspace/scratch/94df4d950735/validation-restored-20261124/cargo-home",
+          "RUSTUP_HOME": "/workspace/scratch/94df4d950735/validation-restored-20261124/rustup-home",
+          "CARGO_TARGET_DIR": "/workspace/scratch/94df4d950735/validation-restored-20261124/target",
+          "CARGO_BUILD_JOBS": "1",
+          "RUSTFLAGS": "-Zthreads=1",
+          "RUST_MIN_STACK": "134217728",
+          "CARGO_PROFILE_DEV_DEBUG": "0",
+          "CARGO_PROFILE_TEST_DEBUG": "0",
+          "CARGO_INCREMENTAL": "0"
+        }
+      },
+      "result": {
+        "duration_seconds": 0.614,
+        "initial_mem_available_kib": 2167124,
+        "lowest_mem_available_kib": 2087392,
+        "peak_aggregate_rss_kib": 94860,
+        "peak_aggregate_vas_kib": 114740,
+        "stop_reason": "Memory guard: MemAvailable below 2 GiB",
+        "child_returncode": -15,
+        "supervisor_returncode": 125
+      },
+      "samples": [
+        {
+          "elapsed_seconds": 0.004,
+          "mem_available_kib": 2167216,
+          "rss_kib": 860,
+          "vas_kib": 2472,
+          "members": [
+            {
+              "pid": 178,
+              "name": "bash",
+              "rss_kib": 860,
+              "vas_kib": 2472,
+              "threads": 1
+            }
+          ],
+          "disk_free_bytes": {
+            "/tmp": 2094964736,
+            "/dev/shm": 5223948288,
+            "/workspace": 96055296
+          }
+        },
+        {
+          "elapsed_seconds": 0.207,
+          "mem_available_kib": 2109292,
+          "rss_kib": 18332,
+          "vas_kib": 23944,
+          "members": [
+            {
+              "pid": 178,
+              "name": "bash",
+              "rss_kib": 16448,
+              "vas_kib": 19060,
+              "threads": 1
+            },
+            {
+              "pid": 190,
+              "name": "cp",
+              "rss_kib": 1884,
+              "vas_kib": 4884,
+              "threads": 1
+            }
+          ],
+          "disk_free_bytes": {
+            "/tmp": 2092470272,
+            "/dev/shm": 5223948288,
+            "/workspace": 96051200
+          }
+        },
+        {
+          "elapsed_seconds": 0.409,
+          "mem_available_kib": 2108984,
+          "rss_kib": 94860,
+          "vas_kib": 114740,
+          "members": [
+            {
+              "pid": 178,
+              "name": "bash",
+              "rss_kib": 16448,
+              "vas_kib": 19060,
+              "threads": 1
+            },
+            {
+              "pid": 202,
+              "name": "bash",
+              "rss_kib": 16652,
+              "vas_kib": 19136,
+              "threads": 1
+            },
+            {
+              "pid": 206,
+              "name": "bash",
+              "rss_kib": 15520,
+              "vas_kib": 19136,
+              "threads": 1
+            },
+            {
+              "pid": 207,
+              "name": "bash",
+              "rss_kib": 15536,
+              "vas_kib": 19136,
+              "threads": 1
+            },
+            {
+              "pid": 211,
+              "name": "bash",
+              "rss_kib": 15436,
+              "vas_kib": 19136,
+              "threads": 1
+            },
+            {
+              "pid": 212,
+              "name": "bash",
+              "rss_kib": 15268,
+              "vas_kib": 19136,
+              "threads": 1
+            }
+          ],
+          "disk_free_bytes": {
+            "/tmp": 2088599552,
+            "/dev/shm": 5223948288,
+            "/workspace": 96051200
+          }
+        },
+        {
+          "elapsed_seconds": 0.61,
+          "mem_available_kib": 2087392,
+          "rss_kib": 26692,
+          "vas_kib": 56416,
+          "members": [
+            {
+              "pid": 178,
+              "name": "bash",
+              "rss_kib": 16496,
+              "vas_kib": 19060,
+              "threads": 1
+            },
+            {
+              "pid": 239,
+              "name": "python3",
+              "rss_kib": 10196,
+              "vas_kib": 37356,
+              "threads": 1
+            }
+          ],
+          "disk_free_bytes": {
+            "/tmp": 2087436288,
+            "/dev/shm": 5223948288,
+            "/workspace": 96051200
+          }
+        }
+      ]
+    }
+  },
+  "validation_files": {
+    "run.sh": "#!/usr/bin/env bash\nset -eu\nsource /workspace/scratch/94df4d950735/validation-restored-20261124/environment.sh\nexport PATH=/workspace/scratch/94df4d950735/validation-restored-20261124/ubs-5.4.4:$PATH\nexport TMPDIR=/tmp/cass-final-prefix-scoped\nexport CARGO_NET_OFFLINE=true\nexport UBS_MODULE_TIMEOUT=300\nexport DSR_STATE_DIR=/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/state\nexport DSR_CACHE_DIR=/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/cache\nexport DSR_QUALITY_LOG_DIR=/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/logs\nexport DSR_REPOS_FILE=/workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/config.yaml\nexec dsr quality --tool cass-final-prefix-scoped --work-dir /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/source --check-timeout 600\n",
+    "config.yaml": "tools:\n  cass-final-prefix-scoped:\n    repo: Dicklesworthstone/coding_agent_session_search\n    local_path: /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/source\n    checks:\n      - >-\n        python3 /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/guarded_run.py --evidence /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/evidence-fmt\n        -- rustfmt --edition 2024 --check --config skip_children=true src/connectors/codex/stable_prefix.rs src/connectors/codex/stable_prefix/tests.rs src/indexer/mod.rs src/indexer/source_ledger_tests.rs src/raw_mirror.rs src/raw_mirror/policy.rs src/raw_mirror/policy_tests.rs src/raw_mirror/prefix_tests.rs src/raw_mirror/prefix_tests/budgeted_tests.rs src/storage/sqlite.rs src/storage/sqlite/codex_prefix_tests.rs\n      - >-\n        python3 /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/guarded_run.py --evidence /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/evidence-ubs\n        -- bash /workspace/scratch/94df4d950735/validation-final-scoped-366a6e5/run-ubs-stage.sh src/connectors/codex/stable_prefix.rs src/connectors/codex/stable_prefix/tests.rs src/indexer/mod.rs src/indexer/source_ledger_tests.rs src/raw_mirror.rs src/raw_mirror/policy.rs src/raw_mirror/policy_tests.rs src/raw_mirror/prefix_tests.rs src/raw_mirror/prefix_tests/budgeted_tests.rs src/storage/sqlite.rs src/storage/sqlite/codex_prefix_tests.rs\n",
+    "guarded_run.py": "#!/usr/bin/env python3\n\"\"\"Run one owned validation process group with retained resource evidence.\"\"\"\n\nimport argparse\nimport json\nimport os\nfrom pathlib import Path\nimport resource\nimport signal\nimport subprocess\nimport sys\nimport time\n\n\ndef available_kib():\n    for line in Path('/proc/meminfo').read_text().splitlines():\n        if line.startswith('MemAvailable:'):\n            return int(line.split()[1])\n    raise RuntimeError('MemAvailable unavailable; cannot enforce memory guard')\n\n\ndef group_memory(group):\n    members = []\n    for path in Path('/proc').iterdir():\n        if not path.name.isdigit():\n            continue\n        try:\n            fields = (path / 'stat').read_text().rsplit(')', 1)[1].split()\n            if int(fields[2]) != group:\n                continue\n            status = dict(line.split(':', 1) for line in (path / 'status').read_text().splitlines())\n            members.append({\n                'pid': int(path.name),\n                'name': status['Name'].strip(),\n                'rss_kib': int(status.get('VmRSS', '0 kB').split()[0]),\n                'vas_kib': int(status.get('VmSize', '0 kB').split()[0]),\n                'threads': int(status.get('Threads', '0').strip()),\n            })\n        except (FileNotFoundError, ProcessLookupError, PermissionError):\n            continue\n    return members\n\n\ndef child_limits():\n    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n    cap = 32 * 1024**3\n    resource.setrlimit(resource.RLIMIT_AS, (cap, cap))\n\n\ndef stop_group(child):\n    if child is None:\n        return\n    try:\n        os.killpg(child.pid, signal.SIGTERM)\n    except ProcessLookupError:\n        return\n    try:\n        child.wait(timeout=3)\n    except subprocess.TimeoutExpired:\n        pass\n    try:\n        os.killpg(child.pid, signal.SIGKILL)\n    except ProcessLookupError:\n        pass\n    child.wait()\n\n\ndef main():\n    parser = argparse.ArgumentParser()\n    parser.add_argument('--evidence', type=Path, required=True)\n    parser.add_argument('command', nargs=argparse.REMAINDER)\n    args = parser.parse_args()\n    command = args.command\n    if command and command[0] == '--':\n        command = command[1:]\n    if not command:\n        parser.error('a command is required')\n    args.evidence.mkdir(parents=True, exist_ok=False)\n    context = {\n        'command': command, 'cwd': str(Path.cwd()),\n        'address_space_cap_bytes': 32 * 1024**3,\n        'aggregate_rss_cap_kib': 5 * 1024**2,\n        'mem_available_minimum_kib': 2 * 1024**2,\n        'sample_interval_seconds': 0.2,\n        'disk_reserves_bytes': {'/tmp': 512 * 1024**2, '/dev/shm': 512 * 1024**2, '/workspace': 64 * 1024**2},\n        'env': {key: os.environ.get(key) for key in (\n            'CARGO_HOME', 'RUSTUP_HOME', 'CARGO_TARGET_DIR', 'CARGO_BUILD_JOBS',\n            'RUSTFLAGS', 'RUST_MIN_STACK', 'CARGO_PROFILE_DEV_DEBUG',\n            'CARGO_PROFILE_TEST_DEBUG', 'CARGO_INCREMENTAL',\n        )},\n    }\n    (args.evidence / 'context.json').write_text(json.dumps(context, indent=2) + '\\n')\n    start = time.monotonic()\n    initial_available = available_kib()\n    lowest_available = initial_available\n    peak_rss = peak_vas = 0\n    stop_reason = None\n    received_signal = None\n    child = None\n    result_code = 125\n\n    def on_signal(signum, _frame):\n        nonlocal received_signal\n        received_signal = signum\n\n    signal.signal(signal.SIGTERM, on_signal)\n    signal.signal(signal.SIGINT, on_signal)\n    try:\n        if initial_available < context['mem_available_minimum_kib']:\n            stop_reason = 'Memory guard refused to start: less than 2 GiB available'\n        else:\n            child = subprocess.Popen(command, start_new_session=True, preexec_fn=child_limits)\n            with (args.evidence / 'memory.jsonl').open('x') as trace:\n                while child.poll() is None:\n                    members = group_memory(child.pid)\n                    available = available_kib()\n                    rss = sum(member['rss_kib'] for member in members)\n                    vas = sum(member['vas_kib'] for member in members)\n                    lowest_available = min(lowest_available, available)\n                    peak_rss, peak_vas = max(peak_rss, rss), max(peak_vas, vas)\n                    trace.write(json.dumps({\n                        'elapsed_seconds': round(time.monotonic() - start, 3),\n                        'mem_available_kib': available, 'rss_kib': rss,\n                        'vas_kib': vas, 'members': members,\n                        'disk_free_bytes': {p: os.statvfs(p).f_bavail * os.statvfs(p).f_frsize for p in context['disk_reserves_bytes']},\n                    }) + '\\n')\n                    trace.flush()\n                    if received_signal is not None:\n                        stop_reason = f'Validation supervisor received signal {received_signal}'\n                    elif available < context['mem_available_minimum_kib']:\n                        stop_reason = 'Memory guard: MemAvailable below 2 GiB'\n                    elif rss > context['aggregate_rss_cap_kib']:\n                        stop_reason = 'Memory guard: owned process RSS exceeded 5 GiB'\n                    if stop_reason is None and any(os.statvfs(p).f_bavail * os.statvfs(p).f_frsize < floor for p, floor in context['disk_reserves_bytes'].items()):\n                        stop_reason = 'Disk guard: a validation volume fell below its recorded reserve'\n                    if stop_reason is not None:\n                        break\n                    time.sleep(0.2)\n            if stop_reason is None:\n                result_code = child.wait()\n    finally:\n        stop_group(child)\n        result = {\n            'duration_seconds': round(time.monotonic() - start, 3),\n            'initial_mem_available_kib': initial_available,\n            'lowest_mem_available_kib': lowest_available,\n            'peak_aggregate_rss_kib': peak_rss,\n            'peak_aggregate_vas_kib': peak_vas,\n            'stop_reason': stop_reason,\n            'child_returncode': None if child is None else child.returncode,\n            'supervisor_returncode': result_code,\n        }\n        (args.evidence / 'result.json').write_text(json.dumps(result, indent=2) + '\\n')\n        print('VALIDATION_RESOURCE_RESULT ' + json.dumps(result), flush=True)\n    return result_code if result_code >= 0 else 128 - result_code\n\n\nif __name__ == '__main__':\n    sys.exit(main())\n",
+    "run-ubs-stage.sh": "#!/usr/bin/env bash\nset -o pipefail\nverify_ubs_rust_engine() {\n    local engine=\"$1\" proof_dir=\"$2\" probe matches errors\n    if [ -z \"$engine\" ] || [ ! -x \"$engine\" ]; then\n        echo \"gate: Rust UBS requires an executable ast-grep; refusing a partial scan\" >&2\n        return 2\n    fi\n    probe=\"$proof_dir/ubs-rust-engine-probe.rs\"\n    matches=\"$proof_dir/ubs-rust-engine-probe.jsonl\"\n    errors=\"$proof_dir/ubs-rust-engine-probe.stderr\"\n    printf '%s\\n' 'pub fn gate_probe() { panic!(\"scanner engine control\"); }' > \"$probe\" || return 2\n    if ! timeout 30 \"$engine\" run --lang rust --pattern 'panic!($$$ARGS)' --json=stream \"$probe\" > \"$matches\" 2> \"$errors\"; then\n        cat \"$errors\" >&2\n        echo \"gate: ast-grep failed its Rust parser control; refusing a partial scan\" >&2\n        return 2\n    fi\n    # A conditional heredoc is corrupted by Bash 5.2's declare -f output.\n    # Keep the validator as a quoted argument so the remote batch preserves it.\n    if ! python3 -c '\nimport json\nimport sys\nfrom pathlib import Path\n\nprobe = Path(sys.argv[1]).resolve()\nmatches = [json.loads(line) for line in Path(sys.argv[2]).read_text().splitlines() if line.strip()]\nif len(matches) != 1:\n    raise SystemExit(\"Rust parser control must report exactly one match\")\nif Path(matches[0][\"file\"]).resolve() != probe:\n    raise SystemExit(\"Rust parser control returned another source\")\nif not matches[0][\"text\"].startswith(\"panic!\"):\n    raise SystemExit(\"Rust parser control did not recognize the panic\")\n' \"$probe\" \"$matches\"; then\n        echo \"gate: ast-grep returned an invalid Rust parser control; refusing a partial scan\" >&2\n        return 2\n    fi\n    echo \"UBS_RUST_AST_ENGINE=$engine UBS_RUST_AST_PROBE=passed\"\n}\n\nrun_ubs() {\n    local expected actual scanner installed installed_modules expected_sha expected_contract_sha tool_dir\n    local source rust_source=0 ast_engine=\"\" ast_sha=\"\" scanner_rc\n    expected=\"$(tr -d '[:space:]' < scripts/ubs-version.txt)\"\n    # The runner verifies its language modules against embedded release hashes.\n    # Updating the pin also requires reviewing the new runner digest here.\n    if [ \"$expected\" != v5.4.4 ]; then\n        echo \"gate: no reviewed UBS runner digest for ${expected}\" >&2\n        return 1\n    fi\n    expected_sha=bdeccbb35f2056e6177c73b3f0f9966d20d1cbeff22b7f084133c4a6ac625ee2\n    expected_contract_sha=7319b2e5e085d0dd2434e5114291b2dee9fbbb96e2cfe02027eb263abcb06ac3\n    # Keep both runner and modules private: a different pinned UBS invocation\n    # would otherwise replace the shared module cache while this one scans.\n    tool_dir=\"$(mktemp -d -t cass-gate-ubs.XXXXXX)\" || return 1\n    scanner=\"$tool_dir/ubs\"\n    installed=\"$(command -v ubs || true)\"\n    if [ -n \"$installed\" ] && [ \"$(sha256sum \"$installed\" | cut -d' ' -f1)\" = \"$expected_sha\" ]; then\n        cp \"$installed\" \"$scanner\" || return 1\n        # Reuse the pinned bundle without sharing its writable cache. The\n        # runner still verifies every copied module/helper against its pins.\n        installed_modules=\"$(dirname \"$installed\")/modules\"\n        if [ -d \"$installed_modules\" ]; then\n            cp -R \"$installed_modules\" \"$tool_dir/modules\" || return 1\n        fi\n    else\n        echo \"gate: acquiring pinned UBS ${expected} in ${tool_dir}\"\n        curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \\\n            --max-time 60 --user-agent 'cass-gate (+https://github.com/Dicklesworthstone/coding_agent_session_search)' \\\n            \"https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/${expected}/ubs\" \\\n            --output \"$scanner\" || return 1\n    fi\n    if [ \"$(sha256sum \"$scanner\" | cut -d' ' -f1)\" != \"$expected_sha\" ]; then\n        echo \"gate: UBS runner bytes differ from the pinned release\" >&2\n        return 1\n    fi\n    # Multi-file language routing runs before module acquisition. A private\n    # runner without its contract would classify every explicit target as\n    # unsupported and exit without scanning anything.\n    mkdir -p \"$tool_dir/modules\" || return 1\n    if [ ! -f \"$tool_dir/modules/contract.json\" ] || \\\n       [ \"$(sha256sum \"$tool_dir/modules/contract.json\" | cut -d' ' -f1)\" != \"$expected_contract_sha\" ]; then\n        curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \\\n            --max-time 60 --user-agent 'cass-gate (+https://github.com/Dicklesworthstone/coding_agent_session_search)' \\\n            \"https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/${expected}/modules/contract.json\" \\\n            --output \"$tool_dir/modules/contract.json\" || return 1\n    fi\n    if [ \"$(sha256sum \"$tool_dir/modules/contract.json\" | cut -d' ' -f1)\" != \"$expected_contract_sha\" ]; then\n        echo \"gate: UBS routing contract bytes differ from the pinned release\" >&2\n        return 1\n    fi\n    actual=\"$(bash \"$scanner\" --version)\" || return 1\n    echo \"UBS_VERSION=${actual} UBS_PIN=${expected} UBS_SHA256=${expected_sha}\"\n    echo \"UBS_MODULE_DIR=${tool_dir}/modules\"\n    echo \"UBS_CONTRACT_SHA256=${expected_contract_sha}\"\n    if [ \"$#\" -eq 0 ]; then\n        echo \"UBS_FILES=0 (no changed scanner-supported source files)\"\n        return 0\n    fi\n    printf 'UBS_FILE=%s\\n' \"$@\"\n    for source in \"$@\"; do\n        [[ \"$source\" = *.rs ]] && rust_source=1\n    done\n    if [ \"$rust_source\" -eq 1 ]; then\n        ast_engine=\"$(command -v ast-grep)\" || ast_engine=\"\"\n        if [ -n \"$ast_engine\" ]; then\n            ast_sha=\"$(sha256sum \"$ast_engine\" | cut -d' ' -f1)\" || return 2\n        fi\n        verify_ubs_rust_engine \"$ast_engine\" \"$tool_dir\" || return 2\n        echo \"UBS_RUST_AST_SHA256=$ast_sha\"\n    fi\n    # Text retains categories and source samples needed to diagnose a red gate.\n    bash \"$scanner\" --module-dir=\"$tool_dir/modules\" --no-auto-update --format=text --ci --fail-on-warning \"$@\"\n    scanner_rc=$?\n    if [ \"$rust_source\" -eq 1 ] && [ \"$(sha256sum \"$ast_engine\" | cut -d' ' -f1)\" != \"$ast_sha\" ]; then\n        echo \"gate: ast-grep changed during the Rust scan; refusing its result\" >&2\n        return 2\n    fi\n    return \"$scanner_rc\"\n}\n\nrun_ubs \"$@\"\nstatus=$?\necho \"STAGE=ubs EXIT=$status\"\nexit \"$status\"\n"
+  },
+  "limitations": [
+    "rustfmt was interrupted after reporting two formatting differences; no full parse or formatting pass.",
+    "UBS runner and routing contract verified, but guard stopped before completed AST positive control or scanning result.",
+    "No compiler or native test launched in this scoped lane.",
+    "No source edits performed by formatter/scanner.",
+    "DSR minimal snapshot source identity uses not-a-git-repo; independent exact eleven-file Git/SHA256 manifest is authoritative.",
+    "Earlier native attempt evidence5ff8f9ad also stopped during FAD dependency compilation before any tests."
+  ]
+}

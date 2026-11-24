@@ -2,8 +2,8 @@
   "schema": "cass.stable_prefix.followup_validation.v1",
   "date_utc": "2026-11-24",
   "base_commit": "f9d7a0a8014e877482190f92498ff5eb28020c9a",
-  "scope": "Advisory-probe FIFO admission, nonempty active zero-boundary deferral, observation root validation, and per-source rebuild integrity preparation, and a transactional canonical prefix-protocol requirement across parser/ledger-key changes; budgeted direct-descriptor Codex prefix raw capture without an unbudgeted second full-prefix copy",
-  "qualification": "Final sources have exact-context reconstruction and independent source review only. No test binary executed in this restored attempt. No final compiler, formatter, Clippy, UBS, host/storage or CLI pass is claimed.",
+  "scope": "Advisory-probe FIFO admission, nonempty active zero-boundary deferral, observation root validation, and per-source rebuild integrity preparation, and a transactional canonical prefix-protocol requirement across parser/ledger-key changes; budgeted direct-descriptor Codex prefix raw capture without an unbudgeted second full-prefix copy; typed source-exclusive startup canonical refusal isolation with durable lexical-repair debt",
+  "qualification": "Final sources have exact-context reconstruction and independent source review. The exact-366 native attempt stopped during dependency compilation with zero test binaries. Both the original eleven-file scoped run and the rebased scoped run stopped at the unchanged memory reserve; neither completed formatting or scanner qualification. The subsequent native preflight encountered ENOSPC and insufficient starting memory, so no compiler or test launched. No final compiler, formatting, Clippy, scanner, host/storage, CLI, release or broad-bead qualification is claimed.",
   "captured_execution_attempt": {
     "schema": "cass.stable_prefix.restored_environment_validation.v1",
     "date_utc": "2026-11-24",
@@ -229,8 +229,8 @@
     },
     {
       "path": "src/connectors/codex/stable_prefix.rs",
-      "git_blob_sha1": "53b4b31b500162d0500507f2fe75b695e4613232",
-      "sha256": "a60c8c72c22aead16285899ccdfcba601848ad8a25b5323c141da9da535f098f"
+      "git_blob_sha1": "80e2adb78d2882fcdf5d47751e9795a923a151ea",
+      "sha256": "ac15c04aae78a61f4216f8c86c91a9cef5a2a9b98e013960c2ea607e5b84ad40"
     },
     {
       "path": "src/connectors/codex/stable_prefix/zero_boundary_tests.rs",
@@ -249,23 +249,53 @@
     },
     {
       "path": "src/indexer/mod.rs",
-      "git_blob_sha1": "ca0af2335458ff213bda2410f49fb91d06fe9e19",
-      "sha256": "acf65d392886cbce71b0a79f9a3cb923efa84f5858df54e7a070304dd4840ed0"
+      "git_blob_sha1": "4b75a587310e51ce0e94f58c907e0dbee09969a2",
+      "sha256": "aa6c708e91dec59623313a37a21d405d1f46b56dc96ac20742241b58366d72e1"
     },
     {
       "path": "src/indexer/source_ledger_tests.rs",
-      "git_blob_sha1": "c4fdefb0b76f80cf52a54e2186e44e61d23d43f7",
-      "sha256": "1160ef6a43728b1baa7b87bb3ec60bc75061294bdf2de7fb763cb6426a15e8be"
+      "git_blob_sha1": "9f0799cfff8c7a4f10c92ea7a652eb50461a4942",
+      "sha256": "8d156a56048dff7bb4355653140728703ada1b3bfef6416e23d19e1a0a5de055"
     },
     {
       "path": "src/storage/sqlite.rs",
-      "git_blob_sha1": "b610d40b21e029da4777ffee3053d97943f6d1f6",
-      "sha256": "5dcd3090e98415d1102ba4599203170b7146ccd170fb72e769b40170bdd2e5d5"
+      "git_blob_sha1": "e2e70fb76dfe3e6e3d6363802797c15fc2dab643",
+      "sha256": "0b37561c41fa9cf49e0b491391ad042bca983eba380638ef49451e390e91b0a5"
     },
     {
       "path": "src/storage/sqlite/codex_prefix_tests.rs",
-      "git_blob_sha1": "f1b8f0736b454898ace4bdfb307b61637b400015",
-      "sha256": "254341f5cf546dfaa2c5205812a4d641cb7b517aff51c60eb27413073d0fb372"
+      "git_blob_sha1": "ecd25a61abfa0e941fe5a4424388903ed1c5c320",
+      "sha256": "902b1e2c9ef5c352b7359fc8d6ec4fd7b2b3123089cc57524a9f5e7be66b752a"
+    },
+    {
+      "path": "src/connectors/codex/stable_prefix/tests.rs",
+      "git_blob_sha1": "3960d2bda0ba7746f6feeb7760f9c385cbfd8306",
+      "sha256": "dabd2b4779b2411c0b35521d932d8e1815c9499d4ae6064af65763e4e0a0ff5a"
+    },
+    {
+      "path": "src/raw_mirror.rs",
+      "git_blob_sha1": "8240e3280dcbc2e0012a2024146f2344bfdca803",
+      "sha256": "49d0930c7bed3e79a440c44cf5392c41fbf5caa8269844088f47b2e31249ef34"
+    },
+    {
+      "path": "src/raw_mirror/policy.rs",
+      "git_blob_sha1": "b4caa2803e2ff0ba589038c8d3f064850ac15fe6",
+      "sha256": "772cc3820db9659f73c29bb3d62b657ec0d5224cb51d5a72beb868dab12b5d61"
+    },
+    {
+      "path": "src/raw_mirror/prefix_tests.rs",
+      "git_blob_sha1": "c63da26e03499efc32d3758bc41a954561cc93c8",
+      "sha256": "047a0876bf68e8c0d06bb03fecd719ea608cebb47bcb7f1efe71410c5404d89f"
+    },
+    {
+      "path": "src/raw_mirror/prefix_tests/budgeted_tests.rs",
+      "git_blob_sha1": "63ae99b2514ff61e42ba9484ba4065a9d6149b14",
+      "sha256": "c2fef36005fdd44a882e71843544abc9da56d0c33254aabec03425ff51e3de40"
+    },
+    {
+      "path": "src/raw_mirror/policy_tests.rs",
+      "git_blob_sha1": "347c6b6e50ee293d782bfc96db42d9eb34b73ef4",
+      "sha256": "56474054dc0a6f18d2b8b4ed0c23764e0a30ace86bbd1c59490a14ad408ae316"
     }
   ],
   "recovery": {
@@ -299,7 +329,55 @@
     "github_actions_used": false,
     "admission_and_rebuild_commit": "c6dfcc5aad95a96180260debe80edfb5f93d0977",
     "concurrent_upstream_preserved": "46f433f6bb9dd296dcd50b1691de26af11aa5a89",
-    "canonical_requirement_commit": "366a6e5903ae74524c483f05cc9bd9c887b2059f"
+    "canonical_requirement_commit": "366a6e5903ae74524c483f05cc9bd9c887b2059f",
+    "previous_blocked_continuation": {
+      "status": "prepared; not committed",
+      "last_verified_main": "366a6e5903ae74524c483f05cc9bd9c887b2059f",
+      "direct_main_requested": true,
+      "pull_request_created": false,
+      "blocker": "GitHub primary API rate limit (HTTP 403) on create_tree",
+      "attempts_utc": [
+        "2026-11-24T17:23:09Z",
+        "2026-11-24T17:28:03Z"
+      ],
+      "retry_policy": "Stopped API retries after five-minute backoff returned the same primary rate-limit response; no reset headers were exposed.",
+      "raw_source_manifest_blob": "f8a7eae6de1a103d87e107d6bce5e8a4856dbf49",
+      "host_source_manifest_blob": "4b63a3d6d9fe491c53bba233ff4eaf40a14cd9db",
+      "native_evidence_blob": "5ff8f9ad493221f05bf9b5ecc09a9b382ebc4b3a",
+      "raw_notes_blob": "1ebd820c63225af32ecbcfbdb334be203d5b9a3b",
+      "raw_report_blob": "d857fb27e2f8cc4b4ada2ba46bb46ec8b9412d4b",
+      "working_tree_preserved": true,
+      "combined_patch": {
+        "path": "codex-stable-prefix-followup.patch",
+        "base_commit": "366a6e5903ae74524c483f05cc9bd9c887b2059f",
+        "sha256": "df6a24ce43e9d90f8a32af0d42dd4d43105b6226230cb9cffe06507b3c611460",
+        "files": 11,
+        "additions": 1006,
+        "deletions": 85,
+        "git_apply_cached_check": "passed against a temporary exact-366 index; not a runtime test"
+      }
+    },
+    "raw_capture_commit": "308378f8d940d49e736429cddfb3ccca02cf99ce",
+    "startup_isolation_parent": "308378f8d940d49e736429cddfb3ccca02cf99ce",
+    "preserved_upstream_commits": [
+      {
+        "sha": "4a3fe6d0a144b4aa9d6fbe56704bfa7de06d4bb3",
+        "title": "fix(forget): bound token traversal and verify repair publication [skip ci]"
+      },
+      {
+        "sha": "e115e20dc8f02f3be19067fe913c1168d901d5b6",
+        "title": "fix(pages): detect encoded credentials before export approval [skip ci]"
+      },
+      {
+        "sha": "3805fca6c5cd0544c7fdbd74154914ac2399a35e",
+        "title": "fix(daemon): publish verified semantic generations and stream first builds [skip ci]"
+      },
+      {
+        "sha": "c2c5cc529a3b9e89ee35d88b8cdc935c979f536e",
+        "title": "fix(daemon): stream canonical replacement embeddings into private writer [skip ci]"
+      }
+    ],
+    "direct_main_authorized": true
   },
   "canonical_storage": {
     "requirement": "/cass/codex_prefix_required",
@@ -497,6 +575,1069 @@
       "No Clippy, rustfmt check, or UBS scan ran in this attempt.",
       "DSR source_before/after labels this minimal archive not-a-git-repo; the complete independent 44-file manifest is the authoritative source proof.",
       "Compilation resources include tmpfs effects through global MemAvailable monitoring; external pressure attribution is not proven."
+    ]
+  },
+  "historical_followup_source_identity": [
+    {
+      "path": "src/indexer/source_writer_probe.rs",
+      "git_blob_sha1": "f4a4ea1fb1105aceaaf0a862222e99ef75b49a85",
+      "sha256": "1cb081cfdb69e46ac35465bd25acc00eda8a1d03e5ea9e56e06884c7bebf95c5"
+    },
+    {
+      "path": "src/indexer/source_writer_probe/advisory_tests.rs",
+      "git_blob_sha1": "90b81e4d773a1332b82493d216d4001505b40ff8",
+      "sha256": "6ff5f78ef7885b2dc7734296b8bb04d5ca36622473368869feacce81e51c39dd"
+    },
+    {
+      "path": "src/connectors/codex/source_budget/recovery.rs",
+      "git_blob_sha1": "badafcdbe8e321401f56973298e86a757d3b9a6e",
+      "sha256": "2c60248c0e87d42f81bd11c1b15a88cff37b5e753457f863286be408ae8669ff"
+    },
+    {
+      "path": "src/connectors/codex/stable_prefix.rs",
+      "git_blob_sha1": "53b4b31b500162d0500507f2fe75b695e4613232",
+      "sha256": "a60c8c72c22aead16285899ccdfcba601848ad8a25b5323c141da9da535f098f"
+    },
+    {
+      "path": "src/connectors/codex/stable_prefix/zero_boundary_tests.rs",
+      "git_blob_sha1": "2536b75d1401e490296d131f0c96660f5abe207f",
+      "sha256": "96c142ace88d429dc4e0c1c59fcb7a4bc3032cb4c709031c9d8fcabf86914932"
+    },
+    {
+      "path": "src/connectors/codex/stable_prefix/receipt_shape_tests.rs",
+      "git_blob_sha1": "9a04663667eb99f67873121d4b30ae53a140dab5",
+      "sha256": "c3f9f8c8b0d843e959f29b6f046a1f3dd553c868f7b73fb3cfbaabbfc2cb0379"
+    },
+    {
+      "path": "src/connectors/codex/source_budget/snapshot.rs",
+      "git_blob_sha1": "166d82a7f33af9deef62dcde2c2f1edc3ee32b08",
+      "sha256": "c35cee6ffaf78389eaa8475c6111a0e2cc2f406e1a16a15d251c03f1a8d6a70f"
+    },
+    {
+      "path": "src/indexer/mod.rs",
+      "git_blob_sha1": "ca0af2335458ff213bda2410f49fb91d06fe9e19",
+      "sha256": "acf65d392886cbce71b0a79f9a3cb923efa84f5858df54e7a070304dd4840ed0"
+    },
+    {
+      "path": "src/indexer/source_ledger_tests.rs",
+      "git_blob_sha1": "c4fdefb0b76f80cf52a54e2186e44e61d23d43f7",
+      "sha256": "1160ef6a43728b1baa7b87bb3ec60bc75061294bdf2de7fb763cb6426a15e8be"
+    },
+    {
+      "path": "src/storage/sqlite.rs",
+      "git_blob_sha1": "b610d40b21e029da4777ffee3053d97943f6d1f6",
+      "sha256": "5dcd3090e98415d1102ba4599203170b7146ccd170fb72e769b40170bdd2e5d5"
+    },
+    {
+      "path": "src/storage/sqlite/codex_prefix_tests.rs",
+      "git_blob_sha1": "f1b8f0736b454898ace4bdfb307b61637b400015",
+      "sha256": "254341f5cf546dfaa2c5205812a4d641cb7b517aff51c60eb27413073d0fb372"
+    }
+  ],
+  "startup_canonical_refusal": {
+    "base_commit": "308378f8d940d49e736429cddfb3ccca02cf99ce",
+    "recovery_manifest_blob": "4b63a3d6d9fe491c53bba233ff4eaf40a14cd9db",
+    "ordered_edit_blob": "c119fb3ce5196705c3618ed8b4e076eb8d5bd220",
+    "unified_diff_blob": "0f3c77fed5727402afae22d6f6ec001131535760",
+    "unified_diff_sha256": "4b4a409878c78d81e45dd8d1bf91f254e3d76e0849752fa372dffca1bbcc3827",
+    "source_identity": [
+      {
+        "path": "src/storage/sqlite.rs",
+        "blob_sha": "e2e70fb76dfe3e6e3d6363802797c15fc2dab643",
+        "bytes": 2174566,
+        "sha256": "0b37561c41fa9cf49e0b491391ad042bca983eba380638ef49451e390e91b0a5",
+        "additions": 54,
+        "deletions": 9
+      },
+      {
+        "path": "src/storage/sqlite/codex_prefix_tests.rs",
+        "blob_sha": "ecd25a61abfa0e941fe5a4424388903ed1c5c320",
+        "bytes": 25987,
+        "sha256": "902b1e2c9ef5c352b7359fc8d6ec4fd7b2b3123089cc57524a9f5e7be66b752a",
+        "additions": 16,
+        "deletions": 0
+      },
+      {
+        "path": "src/indexer/mod.rs",
+        "blob_sha": "4b75a587310e51ce0e94f58c907e0dbee09969a2",
+        "bytes": 3608942,
+        "sha256": "aa6c708e91dec59623313a37a21d405d1f46b56dc96ac20742241b58366d72e1",
+        "additions": 130,
+        "deletions": 6
+      },
+      {
+        "path": "src/indexer/source_ledger_tests.rs",
+        "blob_sha": "9f0799cfff8c7a4f10c92ea7a652eb50461a4942",
+        "bytes": 94380,
+        "sha256": "8d156a56048dff7bb4355653140728703ada1b3bfef6416e23d19e1a0a5de055",
+        "additions": 403,
+        "deletions": 0
+      }
+    ],
+    "typed_reasons": [
+      "PrefixRequired",
+      "HistoryBeyondPrefix",
+      "ProjectionMismatch"
+    ],
+    "isolation_boundary": "Exactly one Codex conversation with exact source-path and external-ID agreement; startup source boundary only.",
+    "durability": "Retain invalidated proof and withhold source completion; detach dirty lexical writer; atomically fsync CanonicalMetadataRepair checkpoint before healthy continuation; existing authoritative rebuild derives actual canonical totals.",
+    "cleanup": "Checkpoint I/O failure stays terminal and releases reservation; writer-close error takes precedence over isolatable domain refusal; batch fallback cannot regain the detached writer.",
+    "regressions": [
+      "codex_canonical_refusal_startup_preserves_healthy_sibling_receipts",
+      "codex_canonical_refusal_stop_counts_only_the_later_successful_source",
+      "codex_canonical_refusal_late_slice_keeps_committed_rows_and_repair_debt",
+      "codex_canonical_refusal_marker_io_failure_stays_terminal_and_releases_bytes",
+      "codex_canonical_refusal_classification_is_typed_and_source_exclusive"
+    ],
+    "independent_review": "Root reconstituted production blobs; two independent source reviews examined classification, singleton consumer control flow, partial-slice writes, lexical detach/rebuild, durable repair debt, cleanup failures and authored tests. This is not native execution.",
+    "limitations": [
+      "Mixed watch-batch canonical refusal remains terminal pending explicit partial-outcome accounting.",
+      "No historical canonical backfill or migration.",
+      "No compiler or native test result for these final changes."
+    ],
+    "original_review_base_commit": "366a6e5903ae74524c483f05cc9bd9c887b2059f",
+    "rebase": {
+      "manifest_blob": "09e3f56e666d238f58111c4cc85ef57fb68dd033",
+      "schema": "cass.codex_prefix.canonical_refusal_rebase.v1",
+      "base_commit": "c2c5cc529a3b9e89ee35d88b8cdc935c979f536e",
+      "prior_base_commit": "366a6e5903ae74524c483f05cc9bd9c887b2059f",
+      "prior_ordered_patch_blob": "c119fb3ce5196705c3618ed8b4e076eb8d5bd220",
+      "file": {
+        "path": "src/storage/sqlite.rs",
+        "base_commit": "c2c5cc529a3b9e89ee35d88b8cdc935c979f536e",
+        "base_blob": "3c49f4d2682ab590d5576e2da99f48c15ff073ba",
+        "base_sha256": "02f454cece4f298080eb7f60722574d496f048995e373e5ccd3fe9ed2fbe47c9",
+        "final_blob": "e2e70fb76dfe3e6e3d6363802797c15fc2dab643",
+        "final_sha256": "0b37561c41fa9cf49e0b491391ad042bca983eba380638ef49451e390e91b0a5",
+        "final_bytes": 2174566,
+        "exact_patch_edit_count": 4,
+        "reverses_to_exact_upstream": true,
+        "unchanged_paths": [
+          "src/indexer/mod.rs",
+          "src/indexer/source_ledger_tests.rs",
+          "src/storage/sqlite/codex_prefix_tests.rs"
+        ]
+      },
+      "diff": {
+        "blob": "1d67c35c9b27ca91d6f9bbfa883e6b365abaa260",
+        "sha256": "513f498c7e77895f0d832da4fbfc774da0f3d080821134007c6167396c8d3220",
+        "bytes": 3599,
+        "additions": 54,
+        "deletions": 9
+      },
+      "unchanged_other_host_files": [
+        {
+          "path": "src/storage/sqlite/codex_prefix_tests.rs",
+          "blob": "ecd25a61abfa0e941fe5a4424388903ed1c5c320",
+          "sha256": "902b1e2c9ef5c352b7359fc8d6ec4fd7b2b3123089cc57524a9f5e7be66b752a"
+        },
+        {
+          "path": "src/indexer/mod.rs",
+          "blob": "4b75a587310e51ce0e94f58c907e0dbee09969a2",
+          "sha256": "aa6c708e91dec59623313a37a21d405d1f46b56dc96ac20742241b58366d72e1"
+        },
+        {
+          "path": "src/indexer/source_ledger_tests.rs",
+          "blob": "9f0799cfff8c7a4f10c92ea7a652eb50461a4942",
+          "sha256": "8d156a56048dff7bb4355653140728703ada1b3bfef6416e23d19e1a0a5de055"
+        }
+      ],
+      "upstream_preservation": {
+        "commits": [
+          {
+            "sha": "4a3fe6d0a144b4aa9d6fbe56704bfa7de06d4bb3",
+            "title": "fix(forget): bound token traversal and verify repair publication [skip ci]"
+          },
+          {
+            "sha": "e115e20dc8f02f3be19067fe913c1168d901d5b6",
+            "title": "fix(pages): detect encoded credentials before export approval [skip ci]"
+          },
+          {
+            "sha": "3805fca6c5cd0544c7fdbd74154914ac2399a35e",
+            "title": "fix(daemon): publish verified semantic generations and stream first builds [skip ci]"
+          },
+          {
+            "sha": "c2c5cc529a3b9e89ee35d88b8cdc935c979f536e",
+            "title": "fix(daemon): stream canonical replacement embeddings into private writer [skip ci]"
+          }
+        ],
+        "complete_compare_file_count": 18,
+        "touched_owned_files": [
+          "src/storage/sqlite.rs"
+        ],
+        "sqlite_changes": "Forget token-usage scalar index bounds, counted rowid pages, and associated tests only; all below unchanged Codex admission functions.",
+        "sqlite_upstream_patch_sha256": "005e6e079928ce3d0553a2c3633c0f3dffb9acaedbb1ba7e64b3665089494277",
+        "proof": "All four reviewed oldText contexts matched exactly once; replacing newText with oldText in reverse order reproduces the entire current upstream SQLite string byte-for-byte. Generated minimal unified hunks independently replay to the uploaded final source."
+      },
+      "source_review": "The canonical prefix requirement, metadata-budget/decoding guards, and canonical-overlap semantics are unchanged except for the three explicit typed refusal return sites. Upstream forget repair additions remain byte-identical.",
+      "execution": "Source reconstruction and pure-JavaScript hash/hunk verification only. No compiler, formatter, scanner, SQL runtime or native test was executed by this rebase agent.",
+      "local_path": "/workspace/scratch/94df4d950735/stable-prefix-rebase-c2c5/source/src/storage/sqlite.rs",
+      "publication": "Source/diff/manifest blobs only; root owns all tree, commit and ref updates."
+    }
+  },
+  "final_scoped_attempt": {
+    "evidence_path": "docs/planning/CODEX_STABLE_PREFIX_SCOPED_ATTEMPT_2026-11-24.json",
+    "evidence_blob": "058d190543ff0219538281ca9e63b6af96f76684",
+    "evidence_sha256": "2932a66fd70e9fd14d16dceb1046b27375f55906d7ab3c8177d32eb329c1fae6",
+    "base_commit": "366a6e5903ae74524c483f05cc9bd9c887b2059f",
+    "source_file_count": 11,
+    "source_changes": [],
+    "terminal_dsr": {
+      "status": "failed",
+      "observed": 2,
+      "executed": 2,
+      "passed": 0,
+      "failed": 2,
+      "check_exit_codes": [
+        125,
+        125
+      ]
+    },
+    "formatting": "Stopped by memory reserve after two emitted style differences; no completed formatting check or all-source parsing result.",
+    "ubs": "Pinned runner/contract verified and eleven paths enumerated; no completed AST control or scanner result.",
+    "native_tests_executed": 0,
+    "limitations": [
+      "rustfmt was interrupted after reporting two formatting differences; no full parse or formatting pass.",
+      "UBS runner and routing contract verified, but guard stopped before completed AST positive control or scanning result.",
+      "No compiler or native test launched in this scoped lane.",
+      "No source edits performed by formatter/scanner.",
+      "DSR minimal snapshot source identity uses not-a-git-repo; independent exact eleven-file Git/SHA256 manifest is authoritative.",
+      "Earlier native attempt evidence5ff8f9ad also stopped during FAD dependency compilation before any tests."
+    ]
+  },
+  "rebased_scoped_attempt": {
+    "evidence_path": "docs/planning/CODEX_STABLE_PREFIX_REBASED_ATTEMPT_2026-11-24.json",
+    "evidence_blob": "d13ceab6723f54b6f479c2e16f6a67213b1965c5",
+    "evidence_sha256": "14325d533b042e9e1133c7a0eb855104a43fb82dc9cdf27a10ccfefe3846e6d9",
+    "published_raw_commit": "308378f8d940d49e736429cddfb3ccca02cf99ce",
+    "rebased_sqlite_blob": "e2e70fb76dfe3e6e3d6363802797c15fc2dab643",
+    "source_file_count": 11,
+    "support_file_count": 5,
+    "source_changes": [],
+    "terminal_dsr": {
+      "outer_exit_code": 1,
+      "status": "failed",
+      "observed": 2,
+      "executed": 2,
+      "passed": 0,
+      "check_exit_codes": [
+        125,
+        125
+      ]
+    },
+    "resource": {
+      "fmt": {
+        "context": {
+          "command": [
+            "rustfmt",
+            "--edition",
+            "2024",
+            "--check",
+            "--config",
+            "skip_children=true",
+            "src/connectors/codex/stable_prefix.rs",
+            "src/connectors/codex/stable_prefix/tests.rs",
+            "src/indexer/mod.rs",
+            "src/indexer/source_ledger_tests.rs",
+            "src/raw_mirror.rs",
+            "src/raw_mirror/policy.rs",
+            "src/raw_mirror/policy_tests.rs",
+            "src/raw_mirror/prefix_tests.rs",
+            "src/raw_mirror/prefix_tests/budgeted_tests.rs",
+            "src/storage/sqlite.rs",
+            "src/storage/sqlite/codex_prefix_tests.rs"
+          ],
+          "cwd": "/workspace/scratch/94df4d950735/validation-prefix-308378f8-20261124/scoped/source",
+          "address_space_cap_bytes": 34359738368,
+          "aggregate_rss_cap_kib": 5242880,
+          "mem_available_minimum_kib": 2097152,
+          "sample_interval_seconds": 0.2,
+          "disk_reserves_bytes": {
+            "/tmp": 536870912,
+            "/dev/shm": 536870912,
+            "/workspace": 67108864
+          },
+          "env": {
+            "CARGO_HOME": "/workspace/scratch/94df4d950735/validation-restored-20261124/cargo-home",
+            "RUSTUP_HOME": "/workspace/scratch/94df4d950735/validation-restored-20261124/rustup-home",
+            "CARGO_TARGET_DIR": "/workspace/scratch/94df4d950735/validation-restored-20261124/target",
+            "CARGO_BUILD_JOBS": "1",
+            "RUSTFLAGS": "-Zthreads=1",
+            "RUST_MIN_STACK": "134217728",
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+            "CARGO_PROFILE_TEST_DEBUG": "0",
+            "CARGO_INCREMENTAL": "0"
+          }
+        },
+        "result": {
+          "duration_seconds": 5.216,
+          "initial_mem_available_kib": 4792776,
+          "lowest_mem_available_kib": 2054652,
+          "peak_aggregate_rss_kib": 916264,
+          "peak_aggregate_vas_kib": 2228212,
+          "stop_reason": "Memory guard: MemAvailable below 2 GiB",
+          "child_returncode": -15,
+          "supervisor_returncode": 125
+        },
+        "samples": [
+          {
+            "elapsed_seconds": 0.01,
+            "mem_available_kib": 4795892,
+            "rss_kib": 860,
+            "vas_kib": 19412,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 860,
+                "vas_kib": 19412,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3495571456,
+              "/dev/shm": 4975222784,
+              "/workspace": 484028416
+            }
+          },
+          {
+            "elapsed_seconds": 0.215,
+            "mem_available_kib": 4619360,
+            "rss_kib": 49776,
+            "vas_kib": 338452,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 49776,
+                "vas_kib": 338452,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3495522304,
+              "/dev/shm": 4975222784,
+              "/workspace": 477663232
+            }
+          },
+          {
+            "elapsed_seconds": 0.417,
+            "mem_available_kib": 4498672,
+            "rss_kib": 94944,
+            "vas_kib": 383272,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 94944,
+                "vas_kib": 383272,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3495477248,
+              "/dev/shm": 4975222784,
+              "/workspace": 471896064
+            }
+          },
+          {
+            "elapsed_seconds": 0.621,
+            "mem_available_kib": 4372496,
+            "rss_kib": 96324,
+            "vas_kib": 397736,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 96324,
+                "vas_kib": 397736,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3495477248,
+              "/dev/shm": 4975222784,
+              "/workspace": 465862656
+            }
+          },
+          {
+            "elapsed_seconds": 0.822,
+            "mem_available_kib": 4261880,
+            "rss_kib": 97164,
+            "vas_kib": 404784,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 97164,
+                "vas_kib": 404784,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3495477248,
+              "/dev/shm": 4975222784,
+              "/workspace": 461864960
+            }
+          },
+          {
+            "elapsed_seconds": 1.023,
+            "mem_available_kib": 4137576,
+            "rss_kib": 98016,
+            "vas_kib": 397996,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 98016,
+                "vas_kib": 397996,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3495325696,
+              "/dev/shm": 4975222784,
+              "/workspace": 457216000
+            }
+          },
+          {
+            "elapsed_seconds": 1.225,
+            "mem_available_kib": 3997452,
+            "rss_kib": 98572,
+            "vas_kib": 397996,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 98572,
+                "vas_kib": 397996,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3495325696,
+              "/dev/shm": 4975222784,
+              "/workspace": 448040960
+            }
+          },
+          {
+            "elapsed_seconds": 1.433,
+            "mem_available_kib": 3897588,
+            "rss_kib": 99488,
+            "vas_kib": 405044,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 99488,
+                "vas_kib": 405044,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3495071744,
+              "/dev/shm": 4975222784,
+              "/workspace": 446382080
+            }
+          },
+          {
+            "elapsed_seconds": 1.634,
+            "mem_available_kib": 3792392,
+            "rss_kib": 106800,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 106800,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3495010304,
+              "/dev/shm": 4975222784,
+              "/workspace": 446382080
+            }
+          },
+          {
+            "elapsed_seconds": 1.835,
+            "mem_available_kib": 3621320,
+            "rss_kib": 211756,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 211756,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3495006208,
+              "/dev/shm": 4975222784,
+              "/workspace": 443990016
+            }
+          },
+          {
+            "elapsed_seconds": 2.039,
+            "mem_available_kib": 3591028,
+            "rss_kib": 292580,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 292580,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3494932480,
+              "/dev/shm": 4975222784,
+              "/workspace": 443985920
+            }
+          },
+          {
+            "elapsed_seconds": 2.247,
+            "mem_available_kib": 3536296,
+            "rss_kib": 323468,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 323468,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3494932480,
+              "/dev/shm": 4975222784,
+              "/workspace": 443985920
+            }
+          },
+          {
+            "elapsed_seconds": 2.457,
+            "mem_available_kib": 3418612,
+            "rss_kib": 383248,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 383248,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3494932480,
+              "/dev/shm": 4975222784,
+              "/workspace": 443985920
+            }
+          },
+          {
+            "elapsed_seconds": 2.666,
+            "mem_available_kib": 3231136,
+            "rss_kib": 462032,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 462032,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3494813696,
+              "/dev/shm": 4975222784,
+              "/workspace": 443985920
+            }
+          },
+          {
+            "elapsed_seconds": 2.867,
+            "mem_available_kib": 3032240,
+            "rss_kib": 541748,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 541748,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3494666240,
+              "/dev/shm": 4975222784,
+              "/workspace": 443985920
+            }
+          },
+          {
+            "elapsed_seconds": 3.068,
+            "mem_available_kib": 2844908,
+            "rss_kib": 592624,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 592624,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3494572032,
+              "/dev/shm": 4975222784,
+              "/workspace": 443981824
+            }
+          },
+          {
+            "elapsed_seconds": 3.269,
+            "mem_available_kib": 2827252,
+            "rss_kib": 613060,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 613060,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3494391808,
+              "/dev/shm": 4975222784,
+              "/workspace": 443981824
+            }
+          },
+          {
+            "elapsed_seconds": 3.472,
+            "mem_available_kib": 2848828,
+            "rss_kib": 633188,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 633188,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3494465536,
+              "/dev/shm": 4975222784,
+              "/workspace": 443850752
+            }
+          },
+          {
+            "elapsed_seconds": 3.673,
+            "mem_available_kib": 2790572,
+            "rss_kib": 664260,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 664260,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3494465536,
+              "/dev/shm": 4975222784,
+              "/workspace": 443850752
+            }
+          },
+          {
+            "elapsed_seconds": 3.876,
+            "mem_available_kib": 2607400,
+            "rss_kib": 736876,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 736876,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3494379520,
+              "/dev/shm": 4975222784,
+              "/workspace": 443850752
+            }
+          },
+          {
+            "elapsed_seconds": 4.077,
+            "mem_available_kib": 2426716,
+            "rss_kib": 814156,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 814156,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3494379520,
+              "/dev/shm": 4975222784,
+              "/workspace": 443850752
+            }
+          },
+          {
+            "elapsed_seconds": 4.279,
+            "mem_available_kib": 2304196,
+            "rss_kib": 847352,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 847352,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3494252544,
+              "/dev/shm": 4975222784,
+              "/workspace": 443850752
+            }
+          },
+          {
+            "elapsed_seconds": 4.485,
+            "mem_available_kib": 2247104,
+            "rss_kib": 864396,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 864396,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3494195200,
+              "/dev/shm": 4975222784,
+              "/workspace": 443850752
+            }
+          },
+          {
+            "elapsed_seconds": 4.69,
+            "mem_available_kib": 2192188,
+            "rss_kib": 887008,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 887008,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3494195200,
+              "/dev/shm": 4975222784,
+              "/workspace": 443850752
+            }
+          },
+          {
+            "elapsed_seconds": 4.892,
+            "mem_available_kib": 2149176,
+            "rss_kib": 894836,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 894836,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3494195200,
+              "/dev/shm": 4975222784,
+              "/workspace": 443850752
+            }
+          },
+          {
+            "elapsed_seconds": 5.097,
+            "mem_available_kib": 2054652,
+            "rss_kib": 916264,
+            "vas_kib": 2228212,
+            "members": [
+              {
+                "pid": 117,
+                "name": "rustfmt",
+                "rss_kib": 916264,
+                "vas_kib": 2228212,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3493007360,
+              "/dev/shm": 4975222784,
+              "/workspace": 443850752
+            }
+          }
+        ]
+      },
+      "ubs": {
+        "context": {
+          "command": [
+            "bash",
+            "/workspace/scratch/94df4d950735/validation-prefix-308378f8-20261124/scoped/run-ubs-stage.sh",
+            "src/connectors/codex/stable_prefix.rs",
+            "src/connectors/codex/stable_prefix/tests.rs",
+            "src/indexer/mod.rs",
+            "src/indexer/source_ledger_tests.rs",
+            "src/raw_mirror.rs",
+            "src/raw_mirror/policy.rs",
+            "src/raw_mirror/policy_tests.rs",
+            "src/raw_mirror/prefix_tests.rs",
+            "src/raw_mirror/prefix_tests/budgeted_tests.rs",
+            "src/storage/sqlite.rs",
+            "src/storage/sqlite/codex_prefix_tests.rs"
+          ],
+          "cwd": "/workspace/scratch/94df4d950735/validation-prefix-308378f8-20261124/scoped/source",
+          "address_space_cap_bytes": 34359738368,
+          "aggregate_rss_cap_kib": 5242880,
+          "mem_available_minimum_kib": 2097152,
+          "sample_interval_seconds": 0.2,
+          "disk_reserves_bytes": {
+            "/tmp": 536870912,
+            "/dev/shm": 536870912,
+            "/workspace": 67108864
+          },
+          "env": {
+            "CARGO_HOME": "/workspace/scratch/94df4d950735/validation-restored-20261124/cargo-home",
+            "RUSTUP_HOME": "/workspace/scratch/94df4d950735/validation-restored-20261124/rustup-home",
+            "CARGO_TARGET_DIR": "/workspace/scratch/94df4d950735/validation-restored-20261124/target",
+            "CARGO_BUILD_JOBS": "1",
+            "RUSTFLAGS": "-Zthreads=1",
+            "RUST_MIN_STACK": "134217728",
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+            "CARGO_PROFILE_TEST_DEBUG": "0",
+            "CARGO_INCREMENTAL": "0"
+          }
+        },
+        "result": {
+          "duration_seconds": 0.842,
+          "initial_mem_available_kib": 2410936,
+          "lowest_mem_available_kib": 2070660,
+          "peak_aggregate_rss_kib": 36660,
+          "peak_aggregate_vas_kib": 56416,
+          "stop_reason": "Memory guard: MemAvailable below 2 GiB",
+          "child_returncode": -15,
+          "supervisor_returncode": 125
+        },
+        "samples": [
+          {
+            "elapsed_seconds": 0.008,
+            "mem_available_kib": 2409372,
+            "rss_kib": 2656,
+            "vas_kib": 5664,
+            "members": [
+              {
+                "pid": 210,
+                "name": "bash",
+                "rss_kib": 2656,
+                "vas_kib": 5664,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3491553280,
+              "/dev/shm": 4975222784,
+              "/workspace": 443830272
+            }
+          },
+          {
+            "elapsed_seconds": 0.209,
+            "mem_available_kib": 2353228,
+            "rss_kib": 18332,
+            "vas_kib": 23944,
+            "members": [
+              {
+                "pid": 210,
+                "name": "bash",
+                "rss_kib": 16448,
+                "vas_kib": 19060,
+                "threads": 1
+              },
+              {
+                "pid": 221,
+                "name": "cp",
+                "rss_kib": 1884,
+                "vas_kib": 4884,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3489423360,
+              "/dev/shm": 4975222784,
+              "/workspace": 442859520
+            }
+          },
+          {
+            "elapsed_seconds": 0.424,
+            "mem_available_kib": 2259344,
+            "rss_kib": 31408,
+            "vas_kib": 36640,
+            "members": [
+              {
+                "pid": 210,
+                "name": "bash",
+                "rss_kib": 16448,
+                "vas_kib": 19060,
+                "threads": 1
+              },
+              {
+                "pid": 233,
+                "name": "bash",
+                "rss_kib": 14960,
+                "vas_kib": 17580,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3486720000,
+              "/dev/shm": 4975222784,
+              "/workspace": 442568704
+            }
+          },
+          {
+            "elapsed_seconds": 0.635,
+            "mem_available_kib": 2135148,
+            "rss_kib": 36660,
+            "vas_kib": 53040,
+            "members": [
+              {
+                "pid": 210,
+                "name": "bash",
+                "rss_kib": 16492,
+                "vas_kib": 19060,
+                "threads": 1
+              },
+              {
+                "pid": 254,
+                "name": "bash",
+                "rss_kib": 15228,
+                "vas_kib": 19060,
+                "threads": 1
+              },
+              {
+                "pid": 255,
+                "name": "sha256sum",
+                "rss_kib": 3312,
+                "vas_kib": 11120,
+                "threads": 1
+              },
+              {
+                "pid": 256,
+                "name": "cut",
+                "rss_kib": 1628,
+                "vas_kib": 3800,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3486720000,
+              "/dev/shm": 4975222784,
+              "/workspace": 442568704
+            }
+          },
+          {
+            "elapsed_seconds": 0.84,
+            "mem_available_kib": 2070660,
+            "rss_kib": 26664,
+            "vas_kib": 56416,
+            "members": [
+              {
+                "pid": 210,
+                "name": "bash",
+                "rss_kib": 16496,
+                "vas_kib": 19060,
+                "threads": 1
+              },
+              {
+                "pid": 271,
+                "name": "python3",
+                "rss_kib": 10168,
+                "vas_kib": 37356,
+                "threads": 1
+              }
+            ],
+            "disk_free_bytes": {
+              "/tmp": 3486711808,
+              "/dev/shm": 4975222784,
+              "/workspace": 442568704
+            }
+          }
+        ]
+      }
+    },
+    "native_preflight": {
+      "native_started": false,
+      "start_minimum_available_kib": 6291456,
+      "blocked_preflight_observation": {
+        "time_utc": "2026-11-24T20:36:49Z",
+        "mem_available_kib": 4156468,
+        "workspace_free_bytes": 0,
+        "tmp_free_bytes": 3220119552,
+        "shm_free_bytes": 4846362624
+      },
+      "initial_preflight_persistence_error": "OSError [Errno28] No space left on device writing native/preflight.json; no compiler was launched",
+      "current_collection_resources": {
+        "time_utc": "2026-11-24T20:37:35Z",
+        "mem_available_kib": 3907292,
+        "disk": {
+          "/workspace": {
+            "total": 20957446144,
+            "used": 19722952704,
+            "free": 143974400
+          },
+          "/tmp": {
+            "total": 5225709568,
+            "used": 2314997760,
+            "free": 2910711808
+          },
+          "/dev/shm": {
+            "total": 5225709568,
+            "used": 411496448,
+            "free": 4814213120
+          }
+        }
+      }
+    },
+    "limits": [
+      "Both scoped checks returned125 after host memory fell below the unchanged2GiB reserve.",
+      "Rustfmt emitted two style differences but did not finish all-source parsing or formatting check.",
+      "UBS verified its pinned runner/contract and enumerated eleven targets but no completed AST control or scanner result.",
+      "No compiler or native test launched in this continuation.",
+      "Native run was not admitted: under6GiB available and workspace full during its preflight.",
+      "DSR source-before/after labels the minimal archive not-a-git-repo; the complete independent16-input manifest identifies eleven exact Rust sources plus five support inputs.",
+      "Unchanged source hashes do not provide runtime qualification; prior successful historical tests do not transfer."
     ]
   }
 }

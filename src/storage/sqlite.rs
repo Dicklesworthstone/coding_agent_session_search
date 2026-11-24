@@ -21581,6 +21581,44 @@ fn franken_existing_message_lookup_with_pending(
     Ok(lookup)
 }
 
+/// An expected disagreement between one Codex source and retained canonical
+/// history. Only this typed domain refusal may be isolated by a source-scoped
+/// caller; malformed metadata, database failures and cleanup failures remain
+/// terminal. The identity never contains transcript payloads.
+#[derive(Debug, Error)]
+#[error("{reason}")]
+pub(crate) struct CodexCanonicalRefusal {
+    pub(crate) source_path: PathBuf,
+    pub(crate) external_id: Option<String>,
+    pub(crate) conversation_id: i64,
+    pub(crate) reason: CodexCanonicalRefusalReason,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum CodexCanonicalRefusalReason {
+    #[error("Codex canonical history requires prefix admission; parser-mode reconciliation is required")]
+    PrefixRequired,
+    #[error("Codex prefix is shorter than canonical history; reconciliation is required")]
+    HistoryBeyondPrefix,
+    #[error("Codex prefix differs from canonical message idx {0}; reconciliation is required")]
+    ProjectionMismatch(i64),
+}
+
+impl CodexCanonicalRefusal {
+    fn new(
+        conv: &Conversation,
+        conversation_id: i64,
+        reason: CodexCanonicalRefusalReason,
+    ) -> Self {
+        Self {
+            source_path: conv.source_path.clone(),
+            external_id: conv.external_id.clone(),
+            conversation_id,
+            reason,
+        }
+    }
+}
+
 fn codex_prefix_packet(conv: &Conversation) -> bool {
     conv.agent_slug == "codex"
         && conv
@@ -21680,10 +21718,12 @@ fn franken_validate_codex_prefix_overlap<'a>(
         if canonical_metadata.pointer("/cass/codex_prefix_required").is_some()
             || canonical_metadata.pointer("/cass/codex_stable_prefix").is_some()
         {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Codex canonical history requires prefix admission; parser-mode reconciliation is required",
-            ).into());
+            return Err(CodexCanonicalRefusal::new(
+                conv,
+                conversation_id,
+                CodexCanonicalRefusalReason::PrefixRequired,
+            )
+            .into());
         }
         return Ok(None);
     }
@@ -21717,9 +21757,10 @@ fn franken_validate_codex_prefix_overlap<'a>(
             })
             .optional()?;
         if canonical_idx.is_some_and(|idx| idx < 0 || idx >= projection_len) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Codex prefix is shorter than canonical history; reconciliation is required",
+            return Err(CodexCanonicalRefusal::new(
+                conv,
+                conversation_id,
+                CodexCanonicalRefusalReason::HistoryBeyondPrefix,
             )
             .into());
         }
@@ -21755,8 +21796,12 @@ fn franken_validate_codex_prefix_overlap<'a>(
             )
             .optional()?;
         if matches == Some(0) {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
-                format!("Codex prefix differs from canonical message idx {}; reconciliation is required", message.idx)).into());
+            return Err(CodexCanonicalRefusal::new(
+                conv,
+                conversation_id,
+                CodexCanonicalRefusalReason::ProjectionMismatch(message.idx),
+            )
+            .into());
         }
         if matches.is_none() {
             messages.push(message);

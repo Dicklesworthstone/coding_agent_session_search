@@ -16874,6 +16874,53 @@ fn streaming_combine_max_bytes() -> usize {
         .unwrap_or(STREAMING_MAX_BYTES_IN_FLIGHT / 2)
 }
 
+/// Deliberate canonical refusals are recoverable only at a proven single-source
+/// boundary. Never infer this classification from display text, InvalidData,
+/// or a mixed batch whose earlier source outcomes may have been lost.
+fn source_exclusive_codex_canonical_refusal<'a>(
+    error: &'a anyhow::Error,
+    connector_name: &str,
+    conversations: &[NormalizedConversation],
+) -> Option<&'a crate::storage::sqlite::CodexCanonicalRefusal> {
+    let [conversation] = conversations else {
+        return None;
+    };
+    let refusal = error.downcast_ref::<crate::storage::sqlite::CodexCanonicalRefusal>()?;
+    (connector_name == "codex"
+        && conversation.agent_slug == "codex"
+        && conversation.source_path == refusal.source_path
+        && conversation.external_id == refusal.external_id)
+        .then_some(refusal)
+}
+
+/// Earlier slices of this source may already have committed canonical rows
+/// and staged lexical additions. Persist repair debt before accepting another
+/// source: a crash after a healthy sibling's canonical receipt must not turn
+/// those unreported writes into an apparently complete lexical generation.
+fn defer_startup_codex_canonical_refusal(
+    storage: &FrankenStorage,
+    data_dir: &Path,
+    refusal: &crate::storage::sqlite::CodexCanonicalRefusal,
+) -> Result<NonWatchIngestOutcome> {
+    let index_path = index_dir(data_dir)?;
+    let db_path = storage.database_path()?;
+    let mut state = LexicalRebuildState::new(
+        deferred_lexical_rebuild_db_state(&db_path, 0),
+        LEXICAL_REBUILD_PAGE_SIZE,
+    );
+    state.set_execution_mode(LexicalRebuildExecutionMode::CanonicalMetadataRepair);
+    // This atomic checkpoint writer fsyncs both the file and parent directory.
+    // Its I/O failure stays terminal; it must not become a source refusal.
+    persist_lexical_rebuild_state(&index_path, &state)?;
+    Ok(NonWatchIngestOutcome {
+        lexical_update_deferred: true,
+        scan_had_errors: true,
+        incomplete_remote_sources: true,
+        deferred_sources: BTreeSet::from([refusal.source_path.clone()]),
+        ..NonWatchIngestOutcome::default()
+    })
+}
+
 /// Run the streaming indexing consumer.
 ///
 /// Receives batches from producer threads and ingests them into storage.
@@ -16888,7 +16935,7 @@ fn run_streaming_consumer(
     mut t_index: Option<&mut TantivyIndex>,
     flow_limiter: Arc<StreamingByteLimiter>,
     progress: &Option<Arc<IndexingProgress>>,
-    lexical_strategy: LexicalPopulationStrategy,
+    mut lexical_strategy: LexicalPopulationStrategy,
     scan_start_ts: Option<i64>,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<(Vec<String>, NonWatchIngestOutcome)> {
@@ -16912,6 +16959,9 @@ fn run_streaming_consumer(
     // Per-connector stats tracking (T7.4)
     let mut connector_stats: HashMap<String, ConnectorStats> = HashMap::new();
     let mut failed_scan_connectors = BTreeSet::new();
+    // A source-exclusive canonical refusal holds provider coverage without
+    // revoking a later sibling's independent canonical completion receipt.
+    let mut canonically_refused_connectors = BTreeSet::new();
     let mut partial_scan_connectors = BTreeSet::new();
     let source_commit_limit = dotenvy::var("CASS_INDEX_MAX_SOURCE_COMMITS")
         .ok()
@@ -17279,7 +17329,54 @@ fn run_streaming_consumer(
                     }
                     result => result,
                 };
-                if let Ok(outcome) = &result
+                let mut isolated_canonical_refusal = false;
+                let result = match result {
+                    Err(error) => {
+                        if let Some(refusal) = source_exclusive_codex_canonical_refusal(
+                            &error,
+                            connector_name,
+                            &conversations,
+                        ) {
+                            isolated_canonical_refusal = true;
+                            completion_written = false;
+                            // The failing call may have committed earlier slices.
+                            // Permanently detach this consumer from the dirty
+                            // lexical writer; pacing, interruption and later
+                            // packets must not publish its untracked additions.
+                            // run_index drops the owner and rebuilds from the
+                            // archive when lexical_update_deferred is returned.
+                            t_index = None;
+                            lexical_strategy =
+                                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild;
+                            let deferred = defer_startup_codex_canonical_refusal(
+                                storage, data_dir, refusal,
+                            );
+                            if deferred.is_ok() {
+                                canonically_refused_connectors.insert(connector_name.to_string());
+                                connector_stats
+                                    .entry(connector_name.to_string())
+                                    .or_insert_with(|| ConnectorStats {
+                                        name: connector_name.to_string(),
+                                        ..Default::default()
+                                    })
+                                    .error = Some(format!("Codex canonical source deferred: {error}"));
+                                tracing::warn!(
+                                    connector = connector_name,
+                                    source = %refusal.source_path.display(),
+                                    canonical_conversation_id = refusal.conversation_id,
+                                    error = %error,
+                                    "Codex source requires canonical reconciliation; retaining retry and rebuilding lexical state"
+                                );
+                            }
+                            deferred
+                        } else {
+                            Err(error)
+                        }
+                    }
+                    result => result,
+                };
+                if !isolated_canonical_refusal
+                    && let Ok(outcome) = &result
                     && conversations.iter().any(|conversation| {
                         outcome.deferred_sources.contains(&conversation.source_path)
                     })
@@ -17347,8 +17444,9 @@ fn run_streaming_consumer(
                 active_source_skipped,
             }) => {
                 active_producers -= 1;
-                let effective_scan_succeeded =
-                    scan_succeeded && !failed_scan_connectors.contains(connector_name);
+                let effective_scan_succeeded = scan_succeeded
+                    && !failed_scan_connectors.contains(connector_name)
+                    && !canonically_refused_connectors.contains(connector_name);
 
                 // Record scan timing in connector stats
                 let stats = connector_stats
@@ -17814,12 +17912,20 @@ where
                 progress.current.load(Ordering::Relaxed),
             ))
         });
+        // A boundary pass may have detached a dirty lexical writer after a
+        // source-local canonical refusal. The fallback must preserve that
+        // transition until run_index discards the owner and rebuilds.
+        let (remaining_index, remaining_strategy) = if completed.lexical_update_deferred {
+            (None, LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild)
+        } else {
+            (t_index, lexical_strategy)
+        };
         let remaining = run_batch_index_with_connector_factories(
             storage,
-            t_index,
+            remaining_index,
             opts,
             since_ts,
-            lexical_strategy,
+            remaining_strategy,
             additional_scan_roots,
             local_connector_roots,
             fallback,
@@ -42471,9 +42577,27 @@ pub mod persist {
                         context,
                         "failed to close short-lived writer cleanly after write error"
                     );
+                    return Err(error_after_writer_close_failure(err, close_err));
                 }
                 Err(err)
             }
+        }
+    }
+
+    /// A failed writer close cannot be hidden behind a domain refusal that a
+    /// source-scoped caller may continue past. Preserve the native close cause
+    /// without retaining the refusal in its downcast chain.
+    pub(super) fn error_after_writer_close_failure(
+        write_error: anyhow::Error,
+        close_error: anyhow::Error,
+    ) -> anyhow::Error {
+        if write_error
+            .downcast_ref::<crate::storage::sqlite::CodexCanonicalRefusal>()
+            .is_some()
+        {
+            close_error
+        } else {
+            write_error
         }
     }
 

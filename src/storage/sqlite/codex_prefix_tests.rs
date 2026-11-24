@@ -144,6 +144,12 @@ fn codex_prefix_rejects_divergent_legacy_overlap_before_canonical_or_receipt_com
                 "{field}: {error:#}"
             );
             assert!(!error.to_string().contains("unrelated legacy variant"));
+            let refusal = error.downcast_ref::<CodexCanonicalRefusal>()
+                .context("canonical overlap lost its typed refusal")?;
+            assert_eq!(refusal.source_path, fixture.conversation.source_path);
+            assert_eq!(refusal.external_id, fixture.conversation.external_id);
+            assert_eq!(refusal.conversation_id, id);
+            assert!(matches!(refusal.reason, CodexCanonicalRefusalReason::ProjectionMismatch(0)));
             assert_eq!(fixture.rows(id)?, before, "{field}, batched={batched}");
             assert!(fixture.storage.source_ingest_ledger_entries()?.is_empty());
         }
@@ -265,6 +271,10 @@ fn codex_prefix_slices_use_whole_receipt_boundary_and_reject_shorter_history() -
         .err()
         .context("short source accepted")?;
     assert!(error.to_string().contains("shorter than canonical history"));
+    assert!(matches!(
+        error.downcast_ref::<CodexCanonicalRefusal>().map(|refusal| &refusal.reason),
+        Some(CodexCanonicalRefusalReason::HistoryBeyondPrefix)
+    ));
     assert_eq!(shorter.rows(id)?, before);
     assert!(shorter.storage.source_ingest_ledger_entries()?.is_empty());
     Ok(())
@@ -320,6 +330,8 @@ fn codex_prefix_absent_metadata_preserves_legacy_behavior_but_malformed_proof_fa
         .err()
         .context("malformed proof accepted")?;
     assert!(error.to_string().contains("invalid Codex prefix metadata"));
+    assert!(error.downcast_ref::<CodexCanonicalRefusal>().is_none(),
+        "malformed metadata is not an isolatable canonical disagreement");
     assert_eq!(fixture.rows(id)?, before);
     assert!(fixture.storage.source_ingest_ledger_entries()?.is_empty());
     Ok(())
@@ -391,6 +403,10 @@ fn codex_prefix_requirement_blocks_downgrade_for_new_and_existing_receipt_metada
             strict.messages[0].content = "rewritten prefix under another parser mode".to_owned();
             let error = fixture.ingest(&strict, batched).err().context("parser downgrade merged")?;
             assert!(error.to_string().contains("requires prefix admission"));
+            assert!(matches!(
+                error.downcast_ref::<CodexCanonicalRefusal>().map(|refusal| &refusal.reason),
+                Some(CodexCanonicalRefusalReason::PrefixRequired)
+            ));
             assert_eq!(fixture.rows(id)?, rows);
             assert_eq!(fixture.metadata_columns(id)?, metadata);
             assert!(fixture.storage.source_ingest_ledger_entries()?.is_empty());

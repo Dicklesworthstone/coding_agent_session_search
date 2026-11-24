@@ -248,6 +248,123 @@ tool provenance and exact input manifest. Its Git blob is
 5ff8f9ad493221f05bf9b5ecc09a9b382ebc4b3a and its SHA256 is
 bb0d55e05bab76f18aba62f0efb70c9346a480d24fcf666a3b7bff0dfce89e4b.
 
+
+## Continue healthy startup sources after a canonical-history refusal
+
+One Codex rollout that disagreed with retained canonical history previously
+terminated the startup consumer, preventing later healthy sources from
+persisting. Storage now identifies three deliberate disagreements with a
+typed `CodexCanonicalRefusal`: a required prefix protocol is missing,
+canonical history extends beyond the admitted projection, or an occupied
+canonical message index disagrees with the incoming projection. Its identity
+contains the source path, external ID and canonical conversation ID; its reason
+contains no transcript payload.
+
+The consumer isolates this type only for one Codex conversation with matching
+source path and external ID. Textual lookalikes, malformed proofs or metadata,
+native database errors, unrelated I/O and mixed packets remain terminal.
+The refused source retains its invalidated prefix proof and receives no
+completion receipt or successful-source count. Provider/root coverage remains
+incomplete, while subsequent healthy sources can receive their own canonical
+completion receipts. This is a canonical reconciliation diagnostic, not an
+active-writer diagnostic.
+
+Earlier persistence slices may already have committed before a later slice
+refuses the source. The consumer therefore permanently detaches its borrowed
+lexical writer, switches subsequent ingestion to the existing deferred
+authoritative-rebuild strategy, and atomically persists an incomplete
+`CanonicalMetadataRepair` checkpoint before continuing. The checkpoint writer
+syncs the file and parent directory. If that write fails, the error remains
+terminal and the current byte reservation is released.
+
+The existing finalization path drops the actual lexical writer and rebuilds
+from canonical rows. The persistent checkpoint preserves repair debt across
+interruption after healthy sibling receipts have committed. The implementation
+does not infer rollback of earlier slices or publish the abandoned staged
+lexical additions. The streaming-disabled boundary adapter also preserves the
+deferred strategy and cannot hand that writer to its fallback pass. A failed
+writer close takes precedence over a typed refusal, preventing source isolation
+from hiding cleanup failure.
+
+Five new host regression entrypoints cover bad-first/bad-middle order for
+local and remote sources; source-commit interruption after the later healthy
+source; a real late-slice refusal after an earlier committed insert; checkpoint
+rename failure; and strict typed/singleton identity classification including
+writer-close precedence. Four existing storage tests gain typed reason and
+identity assertions. These are authored native regressions with independent
+source review; no runtime pass is claimed.
+
+### Remaining isolation work
+
+This increment is limited to source-exclusive startup boundaries. A canonical
+refusal in a mixed watch batch remains terminal because earlier source/slice
+outcomes and derived-index work can already have committed. It needs explicit
+partial-outcome accounting before safe per-source continuation. This change
+adds no unsafe retry-by-bisection or historical canonical backfill. The broader
+stable-prefix bead remains open.
+
+## Final scoped formatter and scanner attempt
+
+A separate genuine DSR 0.2.3 run used the exact eleven final Rust files from
+the raw-budget and startup-isolation increments. Independent Git blob and
+SHA256 checks matched the reviewed postimages, and every after-run source hash
+was unchanged. It ran no compiler or native test.
+
+Both checks were stopped by the unchanged two GiB available-memory reserve.
+Rustfmt ran for 2.117 seconds and emitted two style differences before SIGTERM:
+one existing expression in `stable_prefix.rs` and one newly added test
+expression. It did not finish checking all files, so this is neither a
+formatting pass nor an all-source parsing result. The UBS stage verified its
+pinned v5.4.4 runner and contract and enumerated the eleven targets, then
+stopped after 0.614 seconds before a completed AST positive control or scanner
+result.
+
+The terminal receipt records two executed checks, zero passed, both check
+exit codes 125, and status failed. No automatic formatting, gate weakening,
+compiler retry or additional scanner run followed.
+[The complete scoped-attempt record](CODEX_STABLE_PREFIX_SCOPED_ATTEMPT_2026-11-24.json)
+preserves both full logs, the receipt, resource samples, exact file identities
+and validation scripts. Its Git blob is
+058d190543ff0219538281ca9e63b6af96f76684 and its SHA256 is
+2932a66fd70e9fd14d16dceb1046b27375f55906d7ab3c8177d32eb329c1fae6.
+
+
+## Direct publication and rebased validation
+
+The raw-budget increment was published directly to main as
+[308378f](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/308378f8d940d49e736429cddfb3ccca02cf99ce).
+Four intervening upstream commits through c2c5cc529a3b9e89ee35d88b8cdc935c979f536e
+were preserved. Only the startup patch's SQLite path overlapped them.
+Its four reviewed edits matched the newer source exactly once; reversing those
+edits reproduces the entire upstream file byte for byte. Independent root
+reconstruction matched the rebased blob
+e2e70fb76dfe3e6e3d6363802797c15fc2dab643. The other three startup files were
+unchanged by the intervening commits.
+
+A new genuine DSR run froze the seven published raw files and four startup
+files, including the rebased SQLite source. Both current UBS gate functions
+were reproduced byte for byte, and all sixteen input hashes, including the
+eleven Rust targets, were unchanged after execution.
+
+The scoped rustfmt and UBS checks again stopped at the unchanged two GiB
+available-memory reserve. Rustfmt ran 5.216 seconds, emitted the two previously
+recorded style differences, and did not complete all-file checking. UBS setup
+ran 0.842 seconds and did not complete its AST positive control or scanner.
+The terminal receipt records outer exit 1, two executed checks, zero passed,
+and supervised exits 125 and 125.
+
+The separately prepared native harness was not launched. Its preflight
+encountered ENOSPC while recording the result; a read-only observation then
+found zero workspace bytes free and 4,156,468 KiB available memory, below the
+authorized six GiB starting threshold. No source was modified and no further
+compiler, formatter or scanner retry was performed.
+
+[The complete rebased-attempt record](CODEX_STABLE_PREFIX_REBASED_ATTEMPT_2026-11-24.json)
+contains both full logs, the terminal receipt, resource observations, exact
+source identities, unchanged gate functions and the native-preflight failure.
+Its Git blob is d13ceab6723f54b6f479c2e16f6a67213b1965c5 and its SHA256 is
+14325d533b042e9e1133c7a0eb855104a43fb82dc9cdf27a10ccfefe3846e6d9.
+
 ## Qualification boundaries
 
 These changes have source review and exact source-identity checks, not final

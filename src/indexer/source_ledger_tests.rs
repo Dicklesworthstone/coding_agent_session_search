@@ -1867,3 +1867,406 @@ fn gh555_failed_sibling_preserves_reuse_and_later_source_diagnostics() -> Result
     assert_eq!(fs::read(&paths[1])?, b"\xff\n");
     Ok(())
 }
+
+#[cfg(unix)]
+struct CanonicalRefusalTestEnv {
+    limit: Option<std::ffi::OsString>,
+    cadence: Option<std::ffi::OsString>,
+}
+
+#[cfg(unix)]
+impl CanonicalRefusalTestEnv {
+    fn new(stop_after_first_success: bool) -> Self {
+        let guard = Self {
+            limit: std::env::var_os("CASS_INDEX_MAX_SOURCE_COMMITS"),
+            cadence: std::env::var_os("CASS_STREAMING_CONSUMER_COMMIT_SECS"),
+        };
+        // SAFETY: every caller is a serial test, and Drop restores both keys.
+        unsafe {
+            if stop_after_first_success {
+                std::env::set_var("CASS_INDEX_MAX_SOURCE_COMMITS", "1");
+            } else {
+                std::env::remove_var("CASS_INDEX_MAX_SOURCE_COMMITS");
+            }
+            std::env::set_var("CASS_STREAMING_CONSUMER_COMMIT_SECS", "3600");
+        }
+        guard
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CanonicalRefusalTestEnv {
+    fn drop(&mut self) {
+        // SAFETY: this serial test guard restores only its own two changes.
+        unsafe {
+            for (key, previous) in [
+                ("CASS_INDEX_MAX_SOURCE_COMMITS", &self.limit),
+                ("CASS_STREAMING_CONSUMER_COMMIT_SECS", &self.cadence),
+            ] {
+                if let Some(value) = previous {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn canonical_refusal_packet(
+    root: &Path,
+    config: &StreamingProducerConfig,
+    name: &str,
+    messages: usize,
+    remote: bool,
+) -> Result<(
+    NormalizedConversation,
+    crate::storage::sqlite::SourceIngestLedgerEntry,
+)> {
+    let source = root.join(format!("rollout-{name}.jsonl"));
+    let mut bytes = String::new();
+    for idx in 0..messages {
+        bytes.push_str(&serde_json::json!({
+            "type": "response_item",
+            "timestamp": format!("2026-11-23T12:00:{idx:02}Z"),
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": format!("canonical isolation fixture {name} message {idx}")
+            }
+        }).to_string());
+        bytes.push('\n');
+    }
+    fs::write(&source, bytes)?;
+    File::open(&source)?.set_modified(SystemTime::now() - Duration::from_secs(7200))?;
+    let scan_root = if remote {
+        ScanRoot::remote(source, Origin::remote("canonical-refusal-fixture"), None)
+    } else {
+        ScanRoot::local(source)
+    };
+    let ctx = ScanContext::with_roots(config.data_dir.clone(), vec![scan_root], None);
+    let (mut packets, mut entries) = collect_ledger_scan(
+        &crate::connectors::codex::CodexConnector::new(),
+        &ctx,
+        config,
+        "codex",
+    )?;
+    assert_eq!(packets.len(), 1);
+    assert_eq!(entries.len(), 1);
+    let packet = packets.remove(0);
+    let entry = entries.remove(0);
+    let observation: serde_json::Value = serde_json::from_str(&entry.observation)?;
+    assert_eq!(observation["codex_prefix"]["partial"], false);
+    Ok((packet, entry))
+}
+
+#[cfg(unix)]
+fn send_canonical_refusal_packet(
+    tx: &Sender<IndexMessage>,
+    limiter: &StreamingByteLimiter,
+    packet: NormalizedConversation,
+    completion: crate::storage::sqlite::SourceIngestLedgerEntry,
+) -> Result<()> {
+    let byte_reservation = limiter.acquire(1024)?;
+    tx.send(IndexMessage::SourceComplete {
+        connector_name: "codex",
+        conversations: vec![packet],
+        completion,
+        byte_reservation,
+    })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn send_canonical_refusal_done(tx: &Sender<IndexMessage>) -> Result<()> {
+    tx.send(IndexMessage::Done {
+        connector_name: "codex",
+        scan_ms: 1,
+        is_discovered: true,
+        scan_succeeded: true,
+        active_source_skipped: false,
+    })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assert_canonical_refusal_repair_pending(data_dir: &Path) -> Result<()> {
+    let state = load_lexical_rebuild_state(&index_dir(data_dir)?)?
+        .context("canonical refusal lost its durable lexical repair debt")?;
+    assert!(state.is_incomplete());
+    assert_eq!(
+        state.effective_execution_mode(),
+        LexicalRebuildExecutionMode::CanonicalMetadataRepair
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn codex_canonical_refusal_startup_preserves_healthy_sibling_receipts() -> Result<()> {
+    let _env = CanonicalRefusalTestEnv::new(false);
+    for remote in [false, true] {
+        for refused_first in [false, true] {
+            let temp = TempDir::new()?;
+            let data_dir = temp.path().join("data");
+            fs::create_dir(&data_dir)?;
+            let config = diagnostic_ledger_config(data_dir.clone());
+            let db_path = data_dir.join("archive.db");
+            let storage = FrankenStorage::open(&db_path)?;
+            let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir)?)?;
+            let before = canonical_refusal_packet(temp.path(), &config, "a-healthy", 1, remote)?;
+            let refused = canonical_refusal_packet(temp.path(), &config, "b-refused", 1, remote)?;
+            let after = canonical_refusal_packet(temp.path(), &config, "c-healthy", 1, remote)?;
+            let mut legacy = refused.0.clone();
+            legacy.metadata["cass"].as_object_mut().unwrap().remove("codex_stable_prefix");
+            legacy.messages[0].content = "retained divergent canonical history".to_owned();
+            persist::persist_conversation(&storage, &mut index, &legacy)?;
+            index.commit()?;
+            assert_eq!(index.doc_count()?, 1);
+            let refused_proof = invalidated_prefix_observation(&refused.1.observation)?.unwrap();
+            let refused_path = refused.0.source_path.clone();
+            let refused_key = refused.1.key.clone();
+            let healthy_receipts = [
+                (before.1.key.clone(), before.1.observation.clone()),
+                (after.1.key.clone(), after.1.observation.clone()),
+            ];
+            let (tx, rx) = bounded(8);
+            let packets = if refused_first {
+                vec![refused, before, after]
+            } else {
+                vec![before, refused, after]
+            };
+            for (packet, receipt) in packets {
+                send_canonical_refusal_packet(&tx, &config.flow_limiter, packet, receipt)?;
+            }
+            send_canonical_refusal_done(&tx)?;
+            drop(tx);
+            let progress = Arc::new(IndexingProgress::default());
+            let (_, outcome) = run_streaming_consumer(
+                rx,
+                1,
+                &storage,
+                &data_dir,
+                Some(&mut index),
+                Arc::clone(&config.flow_limiter),
+                &Some(Arc::clone(&progress)),
+                LexicalPopulationStrategy::IncrementalInline,
+                Some(123_456),
+                None,
+            )?;
+            assert_eq!(config.flow_limiter.bytes_in_flight(), 0);
+            assert_eq!(outcome.inserted_conversations, 2);
+            assert_eq!(outcome.inserted_messages, 2);
+            assert!(outcome.lexical_update_deferred);
+            assert!(outcome.scan_had_errors);
+            assert!(outcome.incomplete_remote_sources);
+            assert_eq!(outcome.deferred_sources, BTreeSet::from([refused_path]));
+            assert!(outcome.scanned_connectors.is_empty());
+            assert_eq!(storage.get_connector_last_scan_ts("codex")?, None);
+            let saved = storage.source_ingest_ledger_entries()?;
+            assert_eq!(saved.get(&refused_key), Some(&refused_proof));
+            for (key, observation) in healthy_receipts {
+                assert_eq!(saved.get(&key), Some(&observation));
+            }
+            let stats = progress.stats.lock().unwrap();
+            assert_eq!(stats.deferred_active_sources, 0, "canonical refusal is not an active writer");
+            assert!(stats.connectors.iter().any(|connector| connector.error.as_deref()
+                .is_some_and(|error| error.contains("canonical source deferred"))));
+            drop(stats);
+            assert_canonical_refusal_repair_pending(&data_dir)?;
+            assert_eq!(index.doc_count()?, 1, "no abandoned staged documents may publish");
+
+            // Mirror run_index's existing finalization boundary: drop the owner,
+            // then rebuild from actual canonical rows rather than lost counts.
+            drop(index);
+            rebuild_tantivy_from_db_deferred_startup(&db_path, &data_dir, 3, None)?;
+            let index = TantivyIndex::open_or_create(&index_dir(&data_dir)?)?;
+            assert_eq!(index.doc_count()?, 3);
+            assert_eq!(count_total_messages_exact(&storage)?, 3);
+            assert_eq!(storage.source_ingest_ledger_entries()?, saved);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn codex_canonical_refusal_stop_counts_only_the_later_successful_source() -> Result<()> {
+    let _env = CanonicalRefusalTestEnv::new(true);
+    let temp = TempDir::new()?;
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir)?;
+    let config = diagnostic_ledger_config(data_dir.clone());
+    let storage = FrankenStorage::open(&data_dir.join("archive.db"))?;
+    let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir)?)?;
+    let (refused, receipt) =
+        canonical_refusal_packet(temp.path(), &config, "refused-stop", 1, false)?;
+    let (healthy, healthy_receipt) =
+        canonical_refusal_packet(temp.path(), &config, "healthy-stop", 1, false)?;
+    let mut legacy = refused.clone();
+    legacy.metadata["cass"].as_object_mut().unwrap().remove("codex_stable_prefix");
+    legacy.messages[0].content = "retained legacy variant before interruption".to_owned();
+    persist::persist_conversation(&storage, &mut index, &legacy)?;
+    index.commit()?;
+    let invalidated = invalidated_prefix_observation(&receipt.observation)?.unwrap();
+    let refused_key = receipt.key.clone();
+    let healthy_key = healthy_receipt.key.clone();
+    let healthy_observation = healthy_receipt.observation.clone();
+    let (tx, rx) = bounded(8);
+    send_canonical_refusal_packet(&tx, &config.flow_limiter, refused, receipt)?;
+    send_canonical_refusal_packet(&tx, &config.flow_limiter, healthy, healthy_receipt)?;
+    send_canonical_refusal_done(&tx)?;
+    drop(tx);
+    let progress = Arc::new(IndexingProgress::default());
+    let error = run_streaming_consumer(
+        rx, 1, &storage, &data_dir, Some(&mut index),
+        Arc::clone(&config.flow_limiter), &Some(progress),
+        LexicalPopulationStrategy::IncrementalInline, Some(123_456), None,
+    ).err().context("source-commit stop did not interrupt")?;
+    assert!(error.downcast_ref::<IndexInterrupted>().is_some());
+    assert_eq!(config.flow_limiter.bytes_in_flight(), 0);
+    let saved = storage.source_ingest_ledger_entries()?;
+    assert_eq!(saved.get(&refused_key), Some(&invalidated));
+    assert_eq!(saved.get(&healthy_key), Some(&healthy_observation),
+        "the refused attempt must not consume the one-successful-source limit");
+    assert_canonical_refusal_repair_pending(&data_dir)?;
+    assert_eq!(index.doc_count()?, 1, "interruption must not commit the detached writer");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn codex_canonical_refusal_late_slice_keeps_committed_rows_and_repair_debt() -> Result<()> {
+    let temp = TempDir::new()?;
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir)?;
+    let config = diagnostic_ledger_config(data_dir.clone());
+    let db_path = data_dir.join("archive.db");
+    let storage = FrankenStorage::open(&db_path)?;
+    let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir)?)?;
+    let (packet, receipt) = canonical_refusal_packet(temp.path(), &config, "late-slice", 4, false)?;
+    let mut legacy = packet.clone();
+    legacy.metadata["cass"].as_object_mut().unwrap().remove("codex_stable_prefix");
+    legacy.messages = vec![legacy.messages[0].clone(), legacy.messages[3].clone()];
+    legacy.messages[1].content = "canonical conflict in a later slice".to_owned();
+    persist::persist_conversation(&storage, &mut index, &legacy)?;
+    index.commit()?;
+    let invalidated = invalidated_prefix_observation(&receipt.observation)?.unwrap();
+    storage.raw().execute_compat(
+        "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+        &[ParamValue::from(receipt.key.as_str()), ParamValue::from(invalidated.as_str())],
+    )?;
+    let error = persist::persist_conversations_batched_sliced(
+        &storage, Some(&mut index), std::slice::from_ref(&packet),
+        LexicalPopulationStrategy::IncrementalInline, true, false, Some(&data_dir),
+        persist::PersistHeartbeat::NONE, Some(&receipt),
+        persist::PersistSliceLimits { messages: 2, content_bytes: usize::MAX },
+    ).err().context("late divergent slice was accepted")?;
+    let refusal = source_exclusive_codex_canonical_refusal(&error, "codex", std::slice::from_ref(&packet))
+        .context("late conflict lost its typed source identity")?;
+    assert_eq!(count_total_messages_exact(&storage)?, 3,
+        "the first slice committed idx 1; the failing second transaction rolled back idx 2");
+    let outcome = defer_startup_codex_canonical_refusal(&storage, &data_dir, refusal)?;
+    assert!(outcome.lexical_update_deferred);
+    assert!(outcome.scan_had_errors);
+    assert_eq!(outcome.deferred_sources, BTreeSet::from([packet.source_path]));
+    assert_eq!(storage.source_ingest_ledger_entries()?.get(&receipt.key), Some(&invalidated));
+    assert_canonical_refusal_repair_pending(&data_dir)?;
+    drop(index);
+    rebuild_tantivy_from_db_deferred_startup(&db_path, &data_dir, 1, None)?;
+    let index = TantivyIndex::open_or_create(&index_dir(&data_dir)?)?;
+    assert_eq!(index.doc_count()?, 3, "authoritative repair retains the actual earlier commit");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn codex_canonical_refusal_marker_io_failure_stays_terminal_and_releases_bytes() -> Result<()> {
+    let temp = TempDir::new()?;
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir)?;
+    let config = diagnostic_ledger_config(data_dir.clone());
+    let storage = FrankenStorage::open(&data_dir.join("archive.db"))?;
+    let (packet, receipt) = canonical_refusal_packet(temp.path(), &config, "marker-io", 1, false)?;
+    let mut legacy = persist::map_to_internal(&packet);
+    legacy.metadata_json["cass"].as_object_mut().unwrap().remove("codex_stable_prefix");
+    legacy.messages[0].content = "retained canonical marker failure variant".to_owned();
+    let agent = storage.ensure_agent(&crate::model::types::Agent {
+        id: None, slug: "codex".to_owned(), name: "Codex".to_owned(),
+        version: None, kind: crate::model::types::AgentKind::Cli,
+    })?;
+    storage.insert_conversation_tree_with_analytics(agent, None, &legacy, false)?;
+    // A directory at the file destination makes the atomic checkpoint rename
+    // fail without relying on permission behavior under privileged test users.
+    fs::create_dir_all(lexical_rebuild_state_path(&index_dir(&data_dir)?))?;
+    let (tx, rx) = bounded(8);
+    send_canonical_refusal_packet(&tx, &config.flow_limiter, packet, receipt)?;
+    send_canonical_refusal_done(&tx)?;
+    drop(tx);
+    let error = run_streaming_consumer(
+        rx, 1, &storage, &data_dir, None, Arc::clone(&config.flow_limiter), &None,
+        LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild, Some(123_456), None,
+    ).err().context("checkpoint I/O failure was swallowed")?;
+    assert!(error.downcast_ref::<crate::storage::sqlite::CodexCanonicalRefusal>().is_none());
+    assert!(error.downcast_ref::<std::io::Error>().is_some());
+    assert_eq!(config.flow_limiter.bytes_in_flight(), 0);
+    assert_eq!(storage.get_connector_last_scan_ts("codex")?, None);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn codex_canonical_refusal_classification_is_typed_and_source_exclusive() -> Result<()> {
+    use crate::storage::sqlite::{CodexCanonicalRefusal, CodexCanonicalRefusalReason};
+    let temp = TempDir::new()?;
+    let (_, ctx, config) = codex_prefix_fixture(&temp)?;
+    let (packets, _) = collect_ledger_scan(
+        &crate::connectors::codex::CodexConnector::new(), &ctx, &config, "codex",
+    )?;
+    let packet = &packets[0];
+    let refusal = || anyhow::Error::new(CodexCanonicalRefusal {
+        source_path: packet.source_path.clone(),
+        external_id: packet.external_id.clone(),
+        conversation_id: 42,
+        reason: CodexCanonicalRefusalReason::ProjectionMismatch(0),
+    }).context("canonical transaction");
+    let error = refusal();
+    assert!(source_exclusive_codex_canonical_refusal(&error, "codex", &packets).is_some());
+    assert!(source_exclusive_codex_canonical_refusal(&error, "claude_code", &packets).is_none());
+    assert!(source_exclusive_codex_canonical_refusal(&error, "codex", &[]).is_none());
+    assert!(source_exclusive_codex_canonical_refusal(
+        &error, "codex", &[packet.clone(), packet.clone()],
+    ).is_none());
+    for field in ["path", "external_id", "provider"] {
+        let mut changed = packet.clone();
+        match field {
+            "path" => changed.source_path = temp.path().join("different.jsonl"),
+            "external_id" => changed.external_id = Some("different-source".to_owned()),
+            "provider" => changed.agent_slug = "claude_code".to_owned(),
+            _ => unreachable!(),
+        }
+        assert!(source_exclusive_codex_canonical_refusal(&error, "codex", &[changed]).is_none());
+    }
+    let invalid_data = anyhow::Error::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData, error.to_string(),
+    ));
+    assert!(source_exclusive_codex_canonical_refusal(&invalid_data, "codex", &packets).is_none());
+    let database_error = anyhow::Error::new(crate::franken_sync::FrankenError::Busy);
+    assert!(source_exclusive_codex_canonical_refusal(&database_error, "codex", &packets).is_none());
+    let close_error = persist::error_after_writer_close_failure(
+        refusal(), anyhow::Error::new(crate::franken_sync::FrankenError::Busy),
+    );
+    assert!(close_error.downcast_ref::<CodexCanonicalRefusal>().is_none());
+    assert!(close_error.downcast_ref::<crate::franken_sync::FrankenError>().is_some());
+    let historical_error = persist::error_after_writer_close_failure(
+        anyhow::anyhow!("ordinary write failure"), anyhow::anyhow!("ordinary close failure"),
+    );
+    assert_eq!(historical_error.to_string(), "ordinary write failure");
+    Ok(())
+}
