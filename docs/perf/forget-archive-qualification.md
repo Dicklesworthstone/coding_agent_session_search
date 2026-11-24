@@ -310,6 +310,23 @@ canonical deletion resumes with the same selectors. An interruption after
 lexical rebuilding begins also tests `index --full` as the recovery route when
 all canonical deletion has committed. Normal verification then runs again.
 
+Recovery admission requires a clean requested-SIGKILL receipt and proof that
+the owned process containment has stopped. A capped command must reach
+`cgroup.events` `populated=0`, which includes nested child cgroups; an uncapped
+smoke command proves only that its original process group has no live members.
+Root exit and closed output pipes alone are insufficient. The observer records
+the containment scope and cleanup result, and reads final cgroup memory counters
+only after proving quiescence. The root's measured wall time excludes this
+separate cleanup interval.
+
+Timeouts, OOMs, truncated output, unresolved output pipes and observer failures
+cannot be accepted as the requested interruption. If a command or strict probe
+cannot establish quiescence, the driver starts no follow-up command and leaves
+`live-data` at its original path instead of parking or copying an archive that
+may still have a writer. The retained trial receipt explains the refusal; the
+next trial refuses to reuse that directory. A stopped but otherwise tainted
+command remains a failed observation, with its evidence retained normally.
+
 Applied forget inspects through a strict read-only connection first. If the
 engine returns the exact `BusyRecovery` error, the command can recover only the
 derived WAL index under the existing maintenance and archive-writer leases,

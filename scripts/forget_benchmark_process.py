@@ -12,6 +12,10 @@ as a startup floor. The parent RSS at launch and child-PID /proc HWM samples are
 recorded separately; no baseline is subtracted from a kernel peak. Cgroup
 memory.peak includes descendants and charged file cache. Phase times and sampled
 RSS are stderr-arrival observations, not exact internal phase instrumentation.
+The root remains waitable until cleanup finishes, reserving its process-group
+identity. A successful observation requires drained output and an empty owned
+scope; cgroup emptiness includes nested descendants. Uncapped smoke runs own
+only their original process group, not processes that deliberately leave it.
 """
 from __future__ import annotations
 
@@ -92,7 +96,7 @@ class _Cgroup:
                 stream.write(str(value))
             if target.read_text().strip() != str(value):
                 raise ValueError(f"kernel rejected {target}={value}")
-        for name in ("cgroup.procs", "cgroup.kill", "memory.current", "memory.peak", "memory.events"):
+        for name in ("cgroup.procs", "cgroup.events", "cgroup.kill", "memory.current", "memory.peak", "memory.events"):
             if not (self.path / name).is_file():
                 raise ValueError(f"required cgroup counter/control unavailable: {self.path / name}")
         self.initial = self.snapshot()
@@ -103,7 +107,27 @@ class _Cgroup:
                 "events": _counters(self.path / "memory.events")}
 
     def pids(self) -> list[int]:
-        return [int(value) for value in (self.path / "cgroup.procs").read_text().split()]
+        # cgroup.procs contains only direct members. Samples cover the entire
+        # owned subtree; cgroup.events, not this racing inventory, proves empty.
+        def fail(error: OSError) -> None:
+            raise error
+
+        pids: set[int] = set()
+        for directory, _, _ in os.walk(self.path, onerror=fail):
+            try:
+                pids.update(int(value) for value in
+                            (Path(directory) / "cgroup.procs").read_text().split())
+            except FileNotFoundError:
+                if Path(directory) == self.path:
+                    raise
+                # An owned nested cgroup may disappear while it is sampled.
+        return sorted(pids)
+
+    def populated(self) -> int:
+        value = _counters(self.path / "cgroup.events").get("populated")
+        if value not in (0, 1):
+            raise ValueError("cgroup.events lacks a valid recursive populated counter")
+        return value
 
     def kill(self) -> None:
         with (self.path / "cgroup.kill").open("w") as stream:
@@ -135,8 +159,19 @@ def _group_pids(group: int) -> list[int]:
                 fields = stat[stat.rfind(")") + 2:].split()
                 if int(fields[2]) == group and fields[0] not in ("Z", "X"):
                     pids.append(int(entry.name))
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
+            except (FileNotFoundError, ProcessLookupError):
                 continue
+            except PermissionError:
+                # An unreadable process must not disappear from an owned
+                # group. Skip it only when the kernel proves nonmembership
+                # or disappearance; unknown ownership is an observer error.
+                try:
+                    member_group = os.getpgid(int(entry.name))
+                except ProcessLookupError:
+                    continue
+                if member_group != group:
+                    continue
+                raise
     return pids
 
 
@@ -144,14 +179,16 @@ def run(argv: Sequence[str], *, label: str, env: Mapping[str, str], cwd: Path,
         log_dir: Path, timeout: float, memory_max: int | None = None,
         cgroup_parent: Path | None = None, interrupt_phase: str | None = None,
         interrupt_after_seconds: float | None = None, sample_interval: float = 0.1,
-        allow_uncapped: bool = False, max_output_bytes: int = 64 * 1024 * 1024) -> dict[str, Any]:
+        allow_uncapped: bool = False, max_output_bytes: int = 64 * 1024 * 1024,
+        cleanup_timeout: float = 5.0) -> dict[str, Any]:
     """Run and observe a command; the caller asserts the required outcome.
 
     Interruption delay is relative to first receipt of the selected phase, or
     launch if no phase was selected. Omit the delay for an immediate phase kill.
     Require interruption.sent AND exit_code == -9 before treating it as executed.
     Nonzero exits, timeout, requested kill, and OOM return receipts. Setup or
-    observation errors raise ProcessSetupError after writing their receipt.
+    observation/cleanup errors raise ProcessSetupError after writing their
+    receipt. Cleanup is bounded independently of the command timeout.
     """
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", label):
         raise ValueError("label must be a simple filename component")
@@ -174,7 +211,12 @@ def run(argv: Sequence[str], *, label: str, env: Mapping[str, str], cwd: Path,
         "output_bytes": {"stdout": 0, "stderr": 0}, "output_limit_bytes": max_output_bytes,
         "output_limit_exceeded": False,
         "memory": {"limited": False, "requested_max_bytes": memory_max, "swap_max_bytes": None,
-                   "cgroup_path": None, "peak_bytes": None, "events_delta": None},
+                   "cgroup_path": None, "peak_bytes": None, "events_delta": None,
+                   "final_observed_after_quiescence": False},
+        "containment": {"scope": "cgroup-v2" if memory_max is not None else "process-group",
+                        "quiescent": False, "observed_at_seconds": None,
+                        "cleanup_timed_out": False, "cleanup_timeout_seconds": cleanup_timeout,
+                        "cgroup_populated": None, "remaining_pids": []},
         "interruption": {"requested_phase": interrupt_phase, "delay_seconds": interrupt_after_seconds,
                          "phase_observed": False, "sent": False},
         "measurement_notes": {
@@ -185,10 +227,12 @@ def run(argv: Sequence[str], *, label: str, env: Mapping[str, str], cwd: Path,
             "tree_rss": "sampled process RSS sum; shared mappings may be counted more than once",
             "uncapped_scope": "uncapped containment and RSS observations cover the child process group"}}
     process = group = usage = pidfd = start = exited = phase = due = stop_at = None
+    last_signal_at = None
     stop_reason = None
     error = None
     pending = bytearray()
     dropping_line = False
+    open_pipes: dict[int, tuple[str, Any]] = {}
 
     with paths["stdout"].open("xb") as out, paths["stderr"].open("xb") as err, \
             paths["telemetry"].open("x", encoding="utf-8") as telemetry:
@@ -198,31 +242,70 @@ def run(argv: Sequence[str], *, label: str, env: Mapping[str, str], cwd: Path,
             telemetry.flush()
 
         def kill(reason: str) -> bool:
-            nonlocal stop_reason, stop_at
+            nonlocal stop_reason, stop_at, last_signal_at
+            stop_reason = stop_reason or reason
+            last_signal_at = time.perf_counter()
+            stop_at = stop_at if stop_at is not None else last_signal_at
             sent = False
+            failures = []
             if process is not None:
+                if process.returncode is not None:
+                    raise RuntimeError("refusing to signal a process group after its root was reaped")
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                     sent = True
                 except ProcessLookupError:
                     pass
+                except OSError as caught:
+                    failures.append(caught)
                 if group is not None:
-                    group.kill()
-            stop_reason = stop_reason or reason
-            stop_at = stop_at or time.perf_counter()
+                    try:
+                        group.kill()
+                    except OSError as caught:
+                        failures.append(caught)
             event("signal", signal="SIGKILL", reason=reason, sent=sent)
+            if failures:
+                raise failures[0]
             return sent
 
-        def reap(block: bool = False) -> bool:
-            nonlocal usage, exited
+        def observe_exit() -> bool:
+            nonlocal exited
+            if process is None or exited is not None:
+                return True
+            result = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            if result is not None:
+                exited = time.perf_counter()
+                code = result.si_status if result.si_code == os.CLD_EXITED else -result.si_status
+                receipt["observed_exit_code"] = code
+                event("process_exit", exit_code=code)
+            return exited is not None
+
+        def reap() -> bool:
+            nonlocal usage
             if process is None or process.returncode is not None:
                 return True
-            pid, status, result = os.wait4(process.pid, 0 if block else os.WNOHANG)
+            # Never block here, including after a cleanup deadline. A root in
+            # uninterruptible kernel I/O may still be alive after SIGKILL.
+            pid, status, result = os.wait4(process.pid, os.WNOHANG)
             if pid:
                 process.returncode = os.waitstatus_to_exitcode(status)
-                usage, exited = result, time.perf_counter()
-                event("process_exit", exit_code=process.returncode)
+                usage = result
+                event("root_reaped", exit_code=process.returncode)
             return process.returncode is not None
+
+        def observe_containment() -> bool:
+            state = receipt["containment"]
+            state.update(quiescent=False, observed_at_seconds=None)
+            populated = group.populated() if group is not None else None
+            remaining = ((group.pids() if populated else []) if group is not None
+                         else _group_pids(process.pid))
+            empty = populated == 0 if group is not None else not remaining
+            state.update(cgroup_populated=populated, remaining_pids=remaining,
+                         output_pipes_open=bool(open_pipes))
+            if exited is not None and empty and not open_pipes:
+                state.update(quiescent=True, observed_at_seconds=time.perf_counter() - start)
+                event("containment_quiescent", scope=state["scope"], cgroup_populated=populated)
+            return state["quiescent"]
 
         def parse(chunk: bytes) -> None:
             nonlocal phase, due, dropping_line
@@ -272,14 +355,77 @@ def run(argv: Sequence[str], *, label: str, env: Mapping[str, str], cwd: Path,
                         phase["sampled_cgroup_current_peak_bytes"] or 0, memory["current_bytes"])
             event("sample", root_rss_bytes=rss, root_hwm_bytes=hwm, process_tree_rss_bytes=tree,
                   process_count=len(pids), phase=phase["phase"] if phase else None, cgroup=memory)
+            if memory is not None:
+                receipt["memory"]["last_observed"] = memory
+
+        def read_output(fd: int, *, observe: bool = True) -> bool:
+            name, log = open_pipes[fd]
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                return True
+            if not chunk:
+                del open_pipes[fd]
+                return False
+            offset = receipt["output_bytes"][name]
+            receipt["output_bytes"][name] += len(chunk)
+            if not receipt["output_limit_exceeded"]:
+                log.write(chunk)
+                if observe:
+                    event("output", stream=name, byte_offset=offset, byte_count=len(chunk))
+                    if name == "stderr":
+                        parse(chunk)
+            if sum(receipt["output_bytes"].values()) > max_output_bytes:
+                receipt["output_limit_exceeded"] = True
+                if stop_reason is None:
+                    kill("output-limit")
+            return True
+
+        def cleanup_after_error() -> None:
+            def failure(caught: BaseException) -> None:
+                message = f"{type(caught).__name__}: {caught}"
+                failures = receipt.setdefault("cleanup_errors", [])
+                if message not in failures and len(failures) < 8:
+                    failures.append(message)
+
+            try:
+                kill("observer-error")
+            except BaseException as caught:
+                failure(caught)
+            deadline = min(value for value in (stop_at, exited) if value is not None) + cleanup_timeout
+            while True:
+                try:
+                    observe_exit()
+                    for fd in list(open_pipes):
+                        os.set_blocking(fd, False)
+                        read_output(fd, observe=False)
+                    if observe_containment():
+                        return
+                except BaseException as caught:
+                    receipt["containment"].update(quiescent=False, observed_at_seconds=None)
+                    failure(caught)
+                now = time.perf_counter()
+                if now >= deadline:
+                    receipt["containment"]["cleanup_timed_out"] = True
+                    if open_pipes:
+                        receipt["output_pipes_remained_open_after_kill"] = True
+                    return
+                try:
+                    if now - last_signal_at >= 0.1:
+                        kill("cleanup-retry")
+                    time.sleep(min(0.01, deadline - now))
+                except BaseException as caught:
+                    failure(caught)
 
         try:
-            if sys.platform != "linux" or not hasattr(os, "wait4"):
-                raise ValueError("Linux with wait4 is required")
+            if sys.platform != "linux" or not all(hasattr(os, key) for key in ("wait4", "waitid", "WNOWAIT")):
+                raise ValueError("Linux with wait4 and waitid(WNOWAIT) is required")
+            if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+                raise ValueError("default SIGCHLD disposition is required to retain the owned root until cleanup")
             if not argv or any(not isinstance(value, str) for value in argv):
                 raise ValueError("argv must contain an executable and string arguments")
-            if not all(math.isfinite(value) and value > 0 for value in (timeout, sample_interval)):
-                raise ValueError("timeout and sample interval must be finite and positive")
+            if not all(math.isfinite(value) and value > 0 for value in (timeout, sample_interval, cleanup_timeout)):
+                raise ValueError("timeouts and sample interval must be finite and positive")
             if max_output_bytes < 1:
                 raise ValueError("output ceiling must be positive")
             if interrupt_after_seconds is not None and (
@@ -306,29 +452,31 @@ def run(argv: Sequence[str], *, label: str, env: Mapping[str, str], cwd: Path,
             process = subprocess.Popen(command, cwd=Path(cwd), env=dict(env), stdin=subprocess.DEVNULL,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
             receipt.update(pid=process.pid, status="running")
+            for pipe, name, log in ((process.stdout, "stdout", out), (process.stderr, "stderr", err)):
+                open_pipes[pipe.fileno()] = (name, log)
+                os.set_blocking(pipe.fileno(), False)
             event("process_start", pid=process.pid)
             if interrupt_phase is None and interrupt_after_seconds is not None:
                 due = start + interrupt_after_seconds
             next_sample = start
             with selectors.DefaultSelector() as selector:
                 for pipe, name, log in ((process.stdout, "stdout", out), (process.stderr, "stderr", err)):
-                    os.set_blocking(pipe.fileno(), False)
                     selector.register(pipe, selectors.EVENT_READ, (name, log))
                 try:
                     pidfd = os.pidfd_open(process.pid)
                     selector.register(pidfd, selectors.EVENT_READ, ("pidfd", None))
-                    receipt["exit_observer"] = "pidfd readiness plus wait4"
+                    receipt["exit_observer"] = "pidfd readiness plus waitid(WNOWAIT); wait4 after cleanup"
                 except (AttributeError, OSError):
                     if pidfd is not None:
                         os.close(pidfd)
                         pidfd = None
-                    receipt["exit_observer"] = "wait4 polling at most every 10 ms"
+                    receipt["exit_observer"] = "waitid(WNOWAIT) polling at most every 10 ms; wait4 after cleanup"
                 while True:
                     now = time.perf_counter()
                     if now >= next_sample:
                         sample()
                         next_sample = now + sample_interval
-                    done = reap()
+                    done = observe_exit()
                     if not done and stop_reason is None and due is not None and now >= due:
                         receipt["interruption"].update(sent=kill("requested-interruption"),
                             sent_at_seconds=time.perf_counter() - start,
@@ -336,19 +484,20 @@ def run(argv: Sequence[str], *, label: str, env: Mapping[str, str], cwd: Path,
                     if not done and stop_reason is None and now >= start + timeout:
                         receipt["timed_out"] = True
                         kill("timeout")
-                    pipes = [key for key in selector.get_map().values() if key.data[0] != "pidfd"]
-                    if done and not pipes:
-                        remaining = group.pids() if group is not None else _group_pids(process.pid)
-                        if remaining and stop_reason is None:
+                    if done or stop_reason is not None:
+                        if observe_containment():
+                            break
+                        if done and stop_reason is None and (not open_pipes or now - exited > 0.25):
                             receipt["descendants_terminated_after_root_exit"] = True
                             kill("descendants-after-exit")
-                        break
-                    if done and now - exited > 0.25 and stop_reason is None:
-                        receipt["descendants_terminated_after_root_exit"] = True
-                        kill("descendants-after-exit")
-                    if done and stop_at is not None and now - stop_at > 2:
-                        receipt["output_pipes_remained_open_after_kill"] = True
-                        break
+                        cleanup_start = min(value for value in (stop_at, exited) if value is not None)
+                        if time.perf_counter() >= cleanup_start + cleanup_timeout:
+                            receipt["containment"]["cleanup_timed_out"] = True
+                            if open_pipes:
+                                receipt["output_pipes_remained_open_after_kill"] = True
+                            raise TimeoutError("owned containment/output did not quiesce before cleanup deadline")
+                        if stop_reason is not None and now - last_signal_at >= 0.1:
+                            kill("cleanup-retry")
                     waits = [max(0, next_sample - time.perf_counter())]
                     if stop_reason is None:
                         waits.append(max(0, start + timeout - time.perf_counter()))
@@ -356,30 +505,16 @@ def run(argv: Sequence[str], *, label: str, env: Mapping[str, str], cwd: Path,
                             waits.append(max(0, due - time.perf_counter()))
                     if pidfd is None:
                         waits.append(0.01)
+                    if done or stop_reason is not None:
+                        waits.append(0.01)
                     for key, _ in selector.select(min(waits)):
                         name, log = key.data
                         if name == "pidfd":
-                            reap()
+                            observe_exit()
                             selector.unregister(key.fileobj)
                             continue
-                        try:
-                            chunk = os.read(key.fd, 65536)
-                        except BlockingIOError:
-                            continue
-                        if not chunk:
+                        if not read_output(key.fd):
                             selector.unregister(key.fileobj)
-                            continue
-                        offset = receipt["output_bytes"][name]
-                        receipt["output_bytes"][name] += len(chunk)
-                        if not receipt["output_limit_exceeded"]:
-                            log.write(chunk)
-                            event("output", stream=name, byte_offset=offset, byte_count=len(chunk))
-                            if name == "stderr":
-                                parse(chunk)
-                        if sum(receipt["output_bytes"].values()) > max_output_bytes:
-                            receipt["output_limit_exceeded"] = True
-                            if stop_reason is None:
-                                kill("output-limit")
                 if pending and not dropping_line:
                     parse(b"\n")
                 sample()
@@ -389,19 +524,26 @@ def run(argv: Sequence[str], *, label: str, env: Mapping[str, str], cwd: Path,
             receipt.update(status="setup-error" if process is None else "observer-error",
                            error=f"{type(caught).__name__}: {caught}")
             if process is not None:
-                try:
-                    kill("observer-error")
-                finally:
-                    reap(block=True)
+                cleanup_after_error()
+                if receipt["containment"]["cleanup_timed_out"]:
+                    receipt["status"] = "cleanup-timeout"
             event("error", error=receipt["error"])
         finally:
             if pidfd is not None:
                 os.close(pidfd)
             if process is not None:
+                try:
+                    if observe_exit():
+                        if not reap():
+                            raise RuntimeError("wait4 did not reap the observed exited root")
+                except BaseException as caught:
+                    receipt.update(status="observer-error", error=f"root final observation: {caught}")
+                    error = error or caught
                 for pipe in (process.stdout, process.stderr):
                     if pipe is not None:
                         pipe.close()
                 receipt["exit_code"] = process.returncode
+                receipt["root_reaped"] = process.returncode is not None
             if start is not None:
                 ended = exited if exited is not None else time.perf_counter()
                 receipt["process_wall_ms"] = (ended - start) * 1000
@@ -411,12 +553,13 @@ def run(argv: Sequence[str], *, label: str, env: Mapping[str, str], cwd: Path,
                 receipt.update(peak_rss_kib=int(usage.ru_maxrss), cpu_user_seconds=usage.ru_utime,
                                cpu_system_seconds=usage.ru_stime)
             receipt["oom_killed"] = None
-            if group is not None:
+            if group is not None and receipt["containment"]["quiescent"]:
                 try:
                     final = group.snapshot()
                     changes = {key: value - group.initial["events"].get(key, 0)
                                for key, value in final["events"].items()}
-                    receipt["memory"].update(final=final, peak_bytes=final["peak_bytes"], events_delta=changes)
+                    receipt["memory"].update(final=final, peak_bytes=final["peak_bytes"], events_delta=changes,
+                                             final_observed_after_quiescence=True)
                     receipt["oom_killed"] = changes.get("oom_kill", 0) > 0
                 except (OSError, ValueError) as caught:
                     receipt.update(status="observer-error", error=f"cgroup final observation: {caught}")

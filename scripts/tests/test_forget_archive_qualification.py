@@ -259,6 +259,75 @@ class LexicalPublicationTests(unittest.TestCase):
                 qualification.validate_lexical_publication(incomplete, 7)
 
 
+class ObservationReceiptTests(unittest.TestCase):
+    @staticmethod
+    def interrupted() -> dict:
+        return {"status": "requested-interruption", "exit_code": -9, "timed_out": False,
+                "memory": {"limited": False, "events_delta": None},
+                "containment": {"scope": "process-group", "quiescent": True,
+                                "observed_at_seconds": 1.0, "cleanup_timed_out": False,
+                                "cleanup_timeout_seconds": 5.0, "cgroup_populated": None,
+                                "remaining_pids": []},
+                "interruption": {"requested_phase": "analytics", "phase_observed": True,
+                                 "sent": True, "last_observed_phase": "analytics"}}
+
+    def test_requested_signal_requires_its_own_clean_terminal_status(self) -> None:
+        receipt = self.interrupted()
+        self.assertTrue(qualification.clean_requested_interruption(receipt, "analytics"))
+        self.assertFalse(qualification.successful(receipt))
+        self.assertFalse(qualification.clean_requested_interruption(receipt, "canonical-delete"))
+        for changes in ({"status": "exited"}, {"status": "observer-error"}, {"exit_code": 0},
+                        {"exit_code": -15}, {"timed_out": True}, {"output_limit_exceeded": True},
+                        {"output_pipes_remained_open_after_kill": True},
+                        {"descendants_terminated_after_root_exit": True}, {"error": "observer failed"},
+                        {"memory": {"limited": False, "events_delta": {"oom_kill": 1}}}):
+            with self.subTest(changes=changes):
+                self.assertFalse(qualification.clean_requested_interruption(
+                    {**receipt, **changes}, "analytics"))
+        for field in ("sent", "phase_observed", "requested_phase"):
+            bad = copy.deepcopy(receipt)
+            bad["interruption"].pop(field)
+            with self.subTest(missing=field):
+                self.assertFalse(qualification.clean_requested_interruption(bad, "analytics"))
+        # A clean signal whose phase moved remains eligible for preservation
+        # and recovery; run_trial separately marks the missed phase inconclusive.
+        receipt["interruption"]["last_observed_phase"] = "lexical-index"
+        self.assertTrue(qualification.clean_requested_interruption(receipt, "analytics"))
+
+    def test_missing_failed_or_unobserved_containment_is_never_quiescence(self) -> None:
+        receipt = self.interrupted()
+        for containment in (None, {}, {**receipt["containment"], "quiescent": False},
+                            {**receipt["containment"], "cleanup_timed_out": True},
+                            {**receipt["containment"], "remaining_pids": [1234]},
+                            {**receipt["containment"], "observed_at_seconds": None},
+                            {**receipt["containment"], "observed_at_seconds": float("inf")},
+                            {**receipt["containment"], "scope": "unobserved"}):
+            with self.subTest(containment=containment):
+                bad = {**receipt, "containment": containment}
+                self.assertFalse(qualification.confirmed_quiescence(bad))
+                self.assertFalse(qualification.clean_requested_interruption(bad, "analytics"))
+
+    def test_capped_scope_requires_recursive_empty_state_and_final_oom_counters(self) -> None:
+        receipt = self.interrupted()
+        receipt["memory"] = {"limited": True, "events_delta": {"oom_kill": 0},
+                             "final_observed_after_quiescence": True}
+        receipt["containment"].update(scope="cgroup-v2", cgroup_populated=0)
+        self.assertTrue(qualification.clean_requested_interruption(receipt, "analytics"))
+        for changes in ({"scope": "process-group"}, {"cgroup_populated": None},
+                        {"cgroup_populated": 1}, {"cgroup_populated": False}):
+            bad = copy.deepcopy(receipt)
+            bad["containment"].update(changes)
+            with self.subTest(changes=changes):
+                self.assertFalse(qualification.clean_requested_interruption(bad, "analytics"))
+        for changes in ({"final_observed_after_quiescence": False}, {"events_delta": None},
+                        {"events_delta": {}}, {"events_delta": {"oom_kill": 1}}):
+            bad = copy.deepcopy(receipt)
+            bad["memory"].update(changes)
+            with self.subTest(changes=changes):
+                self.assertTrue(qualification.confirmed_quiescence(bad))
+                self.assertFalse(qualification.clean_requested_interruption(bad, "analytics"))
+
+
 class ReceiptAdapter:
     """Feed a stored JSON receipt into a predicate; does not start a process."""
     def __init__(self, receipt: dict):
@@ -289,7 +358,11 @@ class SearchReceiptTests(unittest.TestCase):
         stderr.write_text(json.dumps({"error": {"kind": kind}}) + "\n" if kind else "")
         return {"status": "exited", "exit_code": code, "timed_out": False,
                 "stdout_path": str(stdout), "stderr_path": str(stderr),
-                "memory": {"events_delta": {"oom_kill": 0}}, **extra}
+                "memory": {"limited": False, "events_delta": {"oom_kill": 0}},
+                "containment": {"scope": "process-group", "quiescent": True,
+                                "observed_at_seconds": 1.0, "cleanup_timed_out": False,
+                                "cleanup_timeout_seconds": 5.0, "cgroup_populated": None,
+                                "remaining_pids": []}, **extra}
 
     def query(self, receipt: dict, mode: str = "lexical", pending: bool = False):
         return qualification.search(ReceiptAdapter(receipt), "syntheticmarker", mode,

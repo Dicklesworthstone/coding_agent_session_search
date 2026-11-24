@@ -98,12 +98,51 @@ def successful(receipt: dict[str, Any]) -> bool:
     return clean_observation(receipt) and receipt.get("exit_code") == 0
 
 
-def clean_observation(receipt: dict[str, Any]) -> bool:
-    return (receipt.get("status") == "exited"
+def confirmed_quiescence(receipt: dict[str, Any]) -> bool:
+    containment = receipt.get("containment")
+    memory = receipt.get("memory")
+    if not isinstance(containment, dict) or not isinstance(memory, dict):
+        return False
+    observed = containment.get("observed_at_seconds")
+    if (containment.get("quiescent") is not True
+            or containment.get("cleanup_timed_out") is not False
+            or containment.get("remaining_pids") != []
+            or type(observed) not in (int, float) or not math.isfinite(observed) or observed < 0):
+        return False
+    if memory.get("limited") is True:
+        populated = containment.get("cgroup_populated")
+        return (containment.get("scope") == "cgroup-v2"
+                and type(populated) is int and populated == 0)
+    return (memory.get("limited") is False
+            and containment.get("scope") == "process-group")
+
+
+def clean_observation(receipt: dict[str, Any], *, expected_status: str = "exited") -> bool:
+    if not confirmed_quiescence(receipt):
+        return False
+    memory = receipt["memory"]
+    if memory["limited"]:
+        events = memory.get("events_delta")
+        if (memory.get("final_observed_after_quiescence") is not True
+                or not isinstance(events, dict)
+                or type(events.get("oom_kill")) is not int or events["oom_kill"] != 0):
+            return False
+    return (receipt.get("status") == expected_status
+            and not receipt.get("error")
             and not receipt.get("timed_out") and oom_kills(receipt) == 0
             and not receipt.get("output_limit_exceeded")
             and not receipt.get("descendants_terminated_after_root_exit")
             and not receipt.get("output_pipes_remained_open_after_kill"))
+
+
+def clean_requested_interruption(receipt: dict[str, Any], phase: str) -> bool:
+    interruption = receipt.get("interruption")
+    return (clean_observation(receipt, expected_status="requested-interruption")
+            and receipt.get("exit_code") == -9
+            and isinstance(interruption, dict)
+            and interruption.get("requested_phase") == phase
+            and interruption.get("phase_observed") is True
+            and interruption.get("sent") is True)
 
 
 class ProbeUnavailable(RuntimeError):
@@ -133,12 +172,30 @@ class Commands:
         if args.fts_shadow_max_messages is not None:
             self.env["CASS_FTS_SHADOW_MAX_MESSAGES"] = str(args.fts_shadow_max_messages)
         self.sequence = 0
+        self.archive_quiescent = True
 
     def invoke(self, binary: Path, argv: list[str], label: str, *,
                measured: bool = False,
                interrupt_phase: str | None = None,
                interrupt_after_seconds: float | None = None) -> dict[str, Any]:
+        require(self.archive_quiescent,
+                f"{label}: previous command's owned processes are not proven quiescent; archive reuse blocked")
+        self.archive_quiescent = False
         self.sequence += 1
+        try:
+            receipt = self._execute(binary, argv, label, measured=measured,
+                                    interrupt_phase=interrupt_phase,
+                                    interrupt_after_seconds=interrupt_after_seconds)
+        except process.ProcessSetupError as error:
+            self.archive_quiescent = confirmed_quiescence(error.receipt)
+            raise
+        self.archive_quiescent = confirmed_quiescence(receipt)
+        return receipt
+
+    def _execute(self, binary: Path, argv: list[str], label: str, *,
+                 measured: bool = False,
+                 interrupt_phase: str | None = None,
+                 interrupt_after_seconds: float | None = None) -> dict[str, Any]:
         return process.run(
             [str(binary), *argv], label=f"{self.sequence:04d}-{label}",
             env=self.env, cwd=self.home, log_dir=self.logs,
@@ -532,10 +589,8 @@ def run_trial(profile_root: Path, home: Path, manifest: dict[str, Any],
             measurement = commands.cass(argv, "forget", measured=True)
         result["measurement"] = measurement
         if interrupt:
-            require(measurement.get("interruption", {}).get("sent") is True
-                    and measurement.get("exit_code") == -9
-                    and oom_kills(measurement) == 0,
-                    "scheduled SIGKILL did not occur independently of OOM")
+            require(clean_requested_interruption(measurement, interrupt),
+                    "scheduled SIGKILL lacks a clean observation or confirmed owned-process quiescence")
             # Preserve the killed process's DB/WAL/SHM/fence bytes before a
             # reader or recovery command can alter any working-copy sidecar.
             result["interrupted_archive"] = preserve_interrupted_archive(live, trial_root)
@@ -549,6 +604,8 @@ def run_trial(profile_root: Path, home: Path, manifest: dict[str, Any],
                 # recovery anyway; do not repair through the evidence probe.
                 result["pre_recovery_probe"] = {
                     "status": "unavailable", "error": str(error), "measurement": error.receipt}
+                require(commands.archive_quiescent,
+                        "strict probe did not establish owned-process quiescence; recovery blocked")
                 result["inconclusive"] = (
                     "strict pre-recovery snapshot unavailable; committed-prefix and pending-reader "
                     "proof are missing even if application recovery succeeds")
@@ -638,9 +695,14 @@ def run_trial(profile_root: Path, home: Path, manifest: dict[str, Any],
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         result.update(status="failed", error=f"{type(error).__name__}: {error}")
     finally:
-        # Park only this owned copy, including failures and WAL/journal evidence.
+        # An unconfirmed writer may still use this pathname. Leave the owned
+        # archive in place so the next trial's admission guard stops reuse.
         if live.exists():
-            live.rename(trial_root / "archive")
+            if commands.archive_quiescent:
+                live.rename(trial_root / "archive")
+            else:
+                result.update(status="failed", unparked_archive={
+                    "path": str(live), "reason": "owned processes are not proven quiescent"})
         save(trial_root / "trial.json", result)
     return result
 

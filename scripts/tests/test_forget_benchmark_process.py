@@ -10,12 +10,14 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
 import time
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "forget_benchmark_process.py"
@@ -36,6 +38,37 @@ class ByteLimitTests(unittest.TestCase):
                 runner.parse_bytes(source)
 
 
+@unittest.skipUnless(sys.platform == "linux", "Linux process groups are required")
+class GroupInventoryTests(unittest.TestCase):
+    def scan_unreadable(self, ownership: int | BaseException) -> list[int]:
+        entry = mock.Mock()
+        entry.name = "12345"
+        entry.path = "/proc/12345"
+        with mock.patch.object(runner.os, "scandir") as scan, \
+                mock.patch.object(Path, "read_text", side_effect=PermissionError("stat unreadable")), \
+                mock.patch.object(runner.os, "getpgid", return_value=ownership,
+                                  side_effect=ownership if isinstance(ownership, BaseException) else None) as lookup:
+            scan.return_value.__enter__.return_value = [entry]
+            try:
+                return runner._group_pids(777)
+            finally:
+                lookup.assert_called_once_with(12345)
+
+    def test_unreadable_owned_member_is_not_an_empty_group(self) -> None:
+        with self.assertRaisesRegex(PermissionError, "stat unreadable"):
+            self.scan_unreadable(777)
+
+    def test_unreadable_confirmed_outside_member_can_be_skipped(self) -> None:
+        self.assertEqual(self.scan_unreadable(888), [])
+
+    def test_unreadable_member_that_disappeared_can_be_skipped(self) -> None:
+        self.assertEqual(self.scan_unreadable(ProcessLookupError("process exited")), [])
+
+    def test_unknown_group_ownership_cannot_be_skipped(self) -> None:
+        with self.assertRaisesRegex(PermissionError, "ownership unreadable"):
+            self.scan_unreadable(PermissionError("ownership unreadable"))
+
+
 @unittest.skipUnless(sys.platform == "linux", "Linux wait4 and /proc are required")
 class ProcessMeasurementTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -46,8 +79,28 @@ class ProcessMeasurementTests(unittest.TestCase):
     def child(self, source: str, label: str = "child", **kwargs):
         defaults = {"timeout": 5.0, "sample_interval": 0.01, "allow_uncapped": True}
         defaults.update(kwargs)
-        return runner.run([sys.executable, "-I", "-S", "-c", source], label=label,
-                          env=self.env, cwd=self.directory, log_dir=self.directory, **defaults)
+        receipt = runner.run([sys.executable, "-I", "-S", "-c", source], label=label,
+                             env=self.env, cwd=self.directory, log_dir=self.directory, **defaults)
+        self.assertTrue(receipt["containment"]["quiescent"])
+        self.assertFalse(receipt["containment"]["cleanup_timed_out"])
+        self.assertEqual(receipt["containment"]["remaining_pids"], [])
+        self.assertTrue(receipt["root_reaped"])
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(receipt["pid"], os.WNOHANG)
+        if receipt["memory"]["limited"]:
+            self.assertEqual(receipt["containment"]["scope"], "cgroup-v2")
+            self.assertEqual(receipt["containment"]["cgroup_populated"], 0)
+            self.assertTrue(receipt["memory"]["final_observed_after_quiescence"])
+        else:
+            self.assertEqual(receipt["containment"]["scope"], "process-group")
+        return receipt
+
+    def assert_not_live(self, pid: int) -> None:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except FileNotFoundError:
+            return
+        self.assertIn(stat[stat.rfind(")") + 2:].split()[0], ("Z", "X"))
 
     def test_drains_large_outputs_and_captures_split_phase_lines(self) -> None:
         receipt = self.child(
@@ -199,6 +252,194 @@ class ProcessMeasurementTests(unittest.TestCase):
         self.assertFalse(receipt["interruption"]["phase_observed"])
         self.assertFalse(receipt["interruption"]["sent"])
 
+    def test_interruption_quiesces_a_ready_descendant_before_returning(self) -> None:
+        receipt = self.child(textwrap.dedent("""
+            import os, time
+            read_end, write_end = os.pipe()
+            child = os.fork()
+            if child == 0:
+                os.close(read_end)
+                os.close(1)
+                os.close(2)
+                os.write(write_end, b'1')
+                os.close(write_end)
+                time.sleep(30)
+                os._exit(0)
+            os.close(write_end)
+            assert os.read(read_end, 1) == b'1'
+            os.close(read_end)
+            print(child, flush=True)
+            os.write(2, b'forget: analytics\\n')
+            time.sleep(30)
+        """), interrupt_phase="analytics")
+        self.assertEqual(receipt["status"], "requested-interruption")
+        self.assertEqual(receipt["exit_code"], -9)
+        self.assertTrue(receipt["interruption"]["sent"])
+        self.assert_not_live(int(Path(receipt["stdout_path"]).read_text()))
+        events = [json.loads(line)["event"]
+                  for line in Path(receipt["telemetry_path"]).read_text().splitlines()]
+        self.assertLess(events.index("process_exit"), events.index("containment_quiescent"))
+        self.assertLess(events.index("containment_quiescent"), events.index("root_reaped"))
+
+    def test_root_remains_waitable_until_inherited_pipes_drain(self) -> None:
+        receipt = self.child(textwrap.dedent("""
+            import os, time
+            parent = os.getpid()
+            def state(pid):
+                try:
+                    with open(f'/proc/{pid}/stat') as stream:
+                        stat = stream.read()
+                    return stat[stat.rfind(')') + 2:].split()[0]
+                except FileNotFoundError:
+                    return 'missing'
+            read_end, write_end = os.pipe()
+            child = os.fork()
+            if child == 0:
+                os.close(read_end)
+                os.setsid()
+                os.write(write_end, b'1')
+                os.close(write_end)
+                deadline = time.monotonic() + 3
+                while state(parent) not in ('Z', 'missing') and time.monotonic() < deadline:
+                    time.sleep(.01)
+                time.sleep(.35)
+                with open('root-reservation', 'w') as stream:
+                    stream.write(state(parent))
+                os._exit(0)
+            os.close(write_end)
+            assert os.read(read_end, 1) == b'1'
+            os.close(read_end)
+            print(child, flush=True)
+            os._exit(0)
+        """))
+        self.assertEqual((self.directory / "root-reservation").read_text(), "Z")
+        self.assertEqual(receipt["exit_code"], 0)
+        self.assert_not_live(int(Path(receipt["stdout_path"]).read_text()))
+        events = [json.loads(line) for line in Path(receipt["telemetry_path"]).read_text().splitlines()]
+        exited = next(row["elapsed_seconds"] for row in events if row["event"] == "process_exit")
+        self.assertLessEqual(receipt["process_wall_ms"], exited * 1000)
+        self.assertLessEqual(exited, receipt["containment"]["observed_at_seconds"])
+
+    def test_escaped_pipe_holder_cannot_certify_an_interruption(self) -> None:
+        # This child deliberately leaves the uncapped run's owned group. The
+        # harness must fail closed without signalling that other group. Release
+        # it cooperatively in finally; the fixture also has its own time bound.
+        started = time.monotonic()
+        try:
+            with self.assertRaises(runner.ProcessSetupError) as raised:
+                self.child(textwrap.dedent("""
+                    import os, time
+                    read_end, write_end = os.pipe()
+                    child = os.fork()
+                    if child == 0:
+                        os.close(read_end)
+                        os.setsid()
+                        with open('detached-pid', 'w') as stream:
+                            stream.write(str(os.getpid()))
+                        os.write(write_end, b'1')
+                        os.close(write_end)
+                        deadline = time.monotonic() + 10
+                        while not os.path.exists('release-detached') and time.monotonic() < deadline:
+                            time.sleep(.01)
+                        os._exit(0)
+                    os.close(write_end)
+                    assert os.read(read_end, 1) == b'1'
+                    os.close(read_end)
+                    os.write(2, b'forget: analytics\\n')
+                    time.sleep(30)
+                """), interrupt_phase="analytics", cleanup_timeout=0.2)
+            self.assertLess(time.monotonic() - started, 5)
+            receipt = raised.exception.receipt
+            self.assertEqual(receipt["status"], "cleanup-timeout")
+            self.assertEqual(receipt["exit_code"], -9)
+            self.assertTrue(receipt["interruption"]["sent"])
+            self.assertTrue(receipt["containment"]["cleanup_timed_out"])
+            self.assertFalse(receipt["containment"]["quiescent"])
+            self.assertTrue(receipt["output_pipes_remained_open_after_kill"])
+            self.assertFalse(receipt["memory"]["final_observed_after_quiescence"])
+            self.assertEqual(json.loads(Path(receipt["receipt_path"]).read_text()), receipt)
+            pid = int((self.directory / "detached-pid").read_text())
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            self.assertNotIn(stat[stat.rfind(")") + 2:].split()[0], ("Z", "X"))
+        finally:
+            (self.directory / "release-detached").write_text("release")
+            pid_file = self.directory / "detached-pid"
+            if pid_file.exists():
+                pid = int(pid_file.read_text())
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    try:
+                        self.assert_not_live(pid)
+                        break
+                    except AssertionError:
+                        time.sleep(.01)
+                self.assert_not_live(pid)
+
+    def test_observer_failure_retains_receipt_and_cleans_owned_root(self) -> None:
+        real_rss = runner._rss
+        def fail_child_sample(pid):
+            if pid != os.getpid():
+                raise OSError("injected RSS observation failure")
+            return real_rss(pid)
+        with mock.patch.object(runner, "_rss", side_effect=fail_child_sample):
+            with self.assertRaises(runner.ProcessSetupError) as raised:
+                self.child("import time; time.sleep(30)")
+        receipt = raised.exception.receipt
+        self.assertEqual(receipt["status"], "observer-error")
+        self.assertIn("injected RSS observation failure", receipt["error"])
+        self.assertTrue(receipt["containment"]["quiescent"])
+        self.assertTrue(receipt["root_reaped"])
+        self.assert_not_live(receipt["pid"])
+        self.assertEqual(json.loads(Path(receipt["receipt_path"]).read_text()), receipt)
+
+    def test_unknown_containment_never_becomes_an_empty_scope(self) -> None:
+        with mock.patch.object(runner, "_group_pids", side_effect=PermissionError("scope unreadable")):
+            with self.assertRaises(runner.ProcessSetupError) as raised:
+                self.child("import time; time.sleep(30)", cleanup_timeout=0.05)
+        receipt = raised.exception.receipt
+        self.assertFalse(receipt["containment"]["quiescent"])
+        self.assertTrue(receipt["containment"]["cleanup_timed_out"])
+        self.assertTrue(receipt["root_reaped"])
+        self.assert_not_live(receipt["pid"])
+        self.assertEqual(json.loads(Path(receipt["receipt_path"]).read_text()), receipt)
+
+    def test_unreadable_owned_process_stat_retains_failed_receipt(self) -> None:
+        launched = {}
+        real_popen, real_read = runner.subprocess.Popen, Path.read_text
+
+        def launch(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            launched["pid"] = child.pid
+            return child
+
+        def denied_read(path, *args, **kwargs):
+            if str(path) == f"/proc/{launched.get('pid')}/stat":
+                raise PermissionError("owned stat unreadable")
+            return real_read(path, *args, **kwargs)
+
+        with mock.patch.object(runner.subprocess, "Popen", side_effect=launch), \
+                mock.patch.object(Path, "read_text", new=denied_read):
+            with self.assertRaises(runner.ProcessSetupError) as raised:
+                self.child("import time; time.sleep(30)", timeout=0.3, cleanup_timeout=0.05)
+        receipt = raised.exception.receipt
+        self.assertEqual(receipt["pid"], launched["pid"])
+        self.assertIn("owned stat unreadable", receipt["error"])
+        self.assertEqual(receipt["status"], "cleanup-timeout")
+        self.assertFalse(receipt["containment"]["quiescent"])
+        self.assertTrue(receipt["root_reaped"])
+        self.assert_not_live(receipt["pid"])
+        self.assertEqual(json.loads(Path(receipt["receipt_path"]).read_text()), receipt)
+
+    def test_auto_reaping_sigchld_is_refused_before_launch(self) -> None:
+        previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        try:
+            with self.assertRaises(runner.ProcessSetupError) as raised:
+                self.child("open('unexpected-launch', 'w').write('unsafe')")
+        finally:
+            signal.signal(signal.SIGCHLD, previous)
+        self.assertEqual(raised.exception.receipt["status"], "setup-error")
+        self.assertFalse((self.directory / "unexpected-launch").exists())
+
     def test_uncapped_run_requires_explicit_opt_in(self) -> None:
         with self.assertRaises(runner.ProcessSetupError) as raised:
             self.child("raise Exception('must not launch')", allow_uncapped=False)
@@ -238,6 +479,50 @@ class ProcessMeasurementTests(unittest.TestCase):
         self.assertGreaterEqual(receipt["memory"]["events_delta"]["oom_kill"], 1)
         self.assertTrue(receipt["oom_killed"])
         self.assertFalse(receipt["timed_out"])
+
+    @unittest.skipUnless(os.environ.get("CASS_BENCH_TEST_CGROUP_PARENT"),
+                         "no explicitly delegated CASS_BENCH_TEST_CGROUP_PARENT; nested cgroup cleanup unmeasured")
+    def test_nested_cgroup_descendant_is_killed_and_observed_empty(self) -> None:
+        parent = Path(os.environ["CASS_BENCH_TEST_CGROUP_PARENT"]).resolve()
+        self.env["CASS_BENCH_TEST_PARENT"] = str(parent)
+        receipt = self.child(textwrap.dedent("""
+            import os, time
+            from pathlib import Path
+            parent = Path(os.environ['CASS_BENCH_TEST_PARENT'])
+            owned = next(path for path in parent.glob(f'cass-forget-bench-{os.getppid()}-*')
+                         if str(os.getpid()) in (path / 'cgroup.procs').read_text().split())
+            nested = owned / 'worker'
+            nested.mkdir()
+            read_end, write_end = os.pipe()
+            child = os.fork()
+            if child == 0:
+                os.close(read_end)
+                os.setsid()
+                (nested / 'cgroup.procs').write_text(str(os.getpid()))
+                memory = bytearray(8 * 1024 * 1024)
+                os.close(1)
+                os.close(2)
+                os.write(write_end, b'1')
+                os.close(write_end)
+                time.sleep(30)
+                os._exit(0)
+            os.close(write_end)
+            assert os.read(read_end, 1) == b'1'
+            os.close(read_end)
+            print(child, flush=True)
+            time.sleep(.1)
+            os._exit(0)
+        """), memory_max=64 * 1024 * 1024, cgroup_parent=parent,
+             allow_uncapped=False, timeout=10)
+        self.assertEqual(receipt["exit_code"], 0)
+        self.assertEqual(receipt["status"], "descendants-after-exit")
+        self.assert_not_live(int(Path(receipt["stdout_path"]).read_text()))
+        owned = Path(receipt["memory"]["cgroup_path"])
+        populated = dict(line.split() for line in (owned / "cgroup.events").read_text().splitlines())
+        self.assertEqual(populated["populated"], "0")
+        self.assertEqual((owned / "worker" / "cgroup.procs").read_text().strip(), "")
+        self.assertGreaterEqual(receipt["memory"]["peak_bytes"], 8 * 1024 * 1024)
+        self.assertEqual(receipt["memory"]["events_delta"]["oom_kill"], 0)
 
 
 if __name__ == "__main__":

@@ -79,8 +79,9 @@ class ReceiptCommands(qualification.Commands):
         self.recovered = False
         self.saved_copy_seen_before_probe = False
 
-    def invoke(self, binary: Path, argv: list[str], label: str, **kwargs) -> dict:
-        self.sequence += 1
+    def _execute(self, binary: Path, argv: list[str], label: str, **kwargs) -> dict:
+        # Keep Commands.invoke's actual quiescence state tracking and admission
+        # guard. Only the leaf process execution is replaced by receipt input.
         self.calls.append({"label": label, "argv": list(argv), **kwargs})
         status, code, payload, error = "exited", 0, {}, ""
         extra = {}
@@ -107,7 +108,9 @@ class ReceiptCommands(qualification.Commands):
             for relative in self.scenario["bundle_files"]:
                 (self.data / relative).write_bytes(b"interrupted:" + relative.encode())
             status, code = "requested-interruption", -9
-            extra["interruption"] = {"sent": True, "last_observed_phase": kwargs["interrupt_phase"]}
+            extra["interruption"] = {"sent": True, "phase_observed": True,
+                                     "requested_phase": kwargs["interrupt_phase"],
+                                     "last_observed_phase": kwargs["interrupt_phase"]}
         elif label == "interrupted-canonical":
             saved = self.root / "interrupted-archive" / "agent_search.db"
             self.saved_copy_seen_before_probe = saved.read_bytes() == b"interrupted:agent_search.db"
@@ -155,8 +158,15 @@ class ReceiptCommands(qualification.Commands):
         receipt = {"status": status, "exit_code": code, "timed_out": False,
                    "stdout_path": str(stdout), "stderr_path": str(stderr),
                    "receipt_path": f"{stem}.receipt.json", "harness_only": True,
-                   "memory": {"events_delta": {"oom_kill": 0}}, **extra}
+                   "memory": {"limited": False, "events_delta": {"oom_kill": 0}},
+                   "containment": {"scope": "process-group", "quiescent": True,
+                                   "observed_at_seconds": 1.0, "cleanup_timed_out": False,
+                                   "cleanup_timeout_seconds": 5.0, "cgroup_populated": None,
+                                   "remaining_pids": []}, **extra}
+        receipt.update(copy.deepcopy(self.scenario.get("receipt_overrides", {}).get(label, {})))
         qualification.save(Path(receipt["receipt_path"]), receipt)
+        if label in self.scenario.get("process_error_labels", ()):
+            raise qualification.process.ProcessSetupError("harness input: observer failed", receipt)
         return receipt
 
 
@@ -206,6 +216,94 @@ class RecoveryFlowTests(unittest.TestCase):
             result = qualification.run_trial(profile, home, scenario["manifest"], scenario["seed"],
                                              args, None, "batch", "trial", phase)
         return result, adapters[0]
+
+    def test_tainted_interruption_stops_before_copy_probe_or_recovery(self) -> None:
+        variants = ({"timed_out": True}, {"output_limit_exceeded": True},
+                    {"output_pipes_remained_open_after_kill": True},
+                    {"descendants_terminated_after_root_exit": True},
+                    {"status": "observer-error"}, {"status": "exited"},
+                    {"error": "observer failed"}, {"exit_code": -15},
+                    {"memory": {"limited": False, "events_delta": {"oom_kill": 1}}},
+                    {"interruption": {"sent": True, "phase_observed": False,
+                                      "requested_phase": "analytics"}},
+                    {"interruption": {"sent": True, "phase_observed": True,
+                                      "requested_phase": "lexical-index"}})
+        for index, changes in enumerate(variants):
+            with self.subTest(changes=changes):
+                profile, home, scenario = self.scenario(str(index))
+                scenario["receipt_overrides"] = {"interrupted-forget": changes}
+                with mock.patch.object(qualification, "preserve_interrupted_archive",
+                                       wraps=qualification.preserve_interrupted_archive) as preserve:
+                    result, adapter = self.run_scenario(profile, home, scenario)
+                self.assertEqual(result["status"], "failed")
+                self.assertIn("scheduled SIGKILL lacks a clean observation", result["error"])
+                self.assertEqual(adapter.calls[-1]["label"], "interrupted-forget")
+                preserve.assert_not_called()
+                self.assertNotIn("interrupted_archive", result)
+                self.assertNotIn("pre_recovery_probe", result)
+                self.assertNotIn("recovery", result)
+                self.assertFalse(adapter.recovered)
+
+    def test_unconfirmed_interruption_containment_keeps_live_archive_and_blocks_reuse(self) -> None:
+        variants = (None, {}, {"scope": "process-group", "quiescent": False},
+                    {"scope": "process-group", "quiescent": True, "cleanup_timed_out": True,
+                     "observed_at_seconds": 1.0, "remaining_pids": []},
+                    {"scope": "process-group", "quiescent": True, "cleanup_timed_out": False,
+                     "observed_at_seconds": 1.0, "remaining_pids": [1234]})
+        for index, containment in enumerate(variants):
+            with self.subTest(containment=containment):
+                profile, home, scenario = self.scenario(str(index))
+                scenario["receipt_overrides"] = {"interrupted-forget": {"containment": containment}}
+                with mock.patch.object(qualification, "preserve_interrupted_archive",
+                                       wraps=qualification.preserve_interrupted_archive) as preserve:
+                    result, adapter = self.run_scenario(profile, home, scenario)
+                self.assertEqual(result["status"], "failed")
+                preserve.assert_not_called()
+                self.assertEqual(adapter.calls[-1]["label"], "interrupted-forget")
+                self.assertFalse(adapter.archive_quiescent)
+                self.assertEqual(result["unparked_archive"]["path"], str(profile / "live-data"))
+                self.assertTrue((profile / "live-data").is_dir())
+                self.assertFalse((profile / "trials/trial/archive").exists())
+                calls = len(adapter.calls)
+                with self.assertRaisesRegex(RuntimeError, "archive reuse blocked"):
+                    adapter.cass(["index", "--full"], "unsafe-followup")
+                self.assertEqual(len(adapter.calls), calls)
+                with self.assertRaisesRegex(RuntimeError, "earlier trial was not parked"):
+                    qualification.run_trial(profile, home, scenario["manifest"], scenario["seed"],
+                                            adapter.args, None, "batch", "next-trial", "analytics")
+
+    def test_unquiescent_strict_probe_cannot_start_recovery_even_on_process_error(self) -> None:
+        for raises_error in (False, True):
+            with self.subTest(raises_error=raises_error):
+                profile, home, scenario = self.scenario(str(raises_error))
+                scenario["receipt_overrides"] = {"interrupted-canonical": {"containment": None}}
+                if raises_error:
+                    scenario["process_error_labels"] = ["interrupted-canonical"]
+                result, adapter = self.run_scenario(profile, home, scenario)
+                self.assertEqual(result["status"], "failed")
+                self.assertIn("quiescence; recovery blocked", result["error"])
+                self.assertEqual(result["pre_recovery_probe"]["status"], "unavailable")
+                self.assertTrue(Path(result["interrupted_archive"]["path"]).is_dir())
+                self.assertEqual(adapter.calls[-1]["label"], "interrupted-canonical")
+                self.assertNotIn("recovery", result)
+                self.assertNotIn("inconclusive", result)
+                self.assertFalse(adapter.recovered)
+                self.assertFalse(adapter.archive_quiescent)
+                self.assertTrue((profile / "live-data").is_dir())
+                self.assertFalse((profile / "trials/trial/archive").exists())
+
+    def test_unquiescent_setup_forget_and_rescan_errors_are_never_parked(self) -> None:
+        for label in ("admit-restored-seed", "forget", "full-rescan"):
+            with self.subTest(label=label):
+                profile, home, scenario = self.scenario(label)
+                scenario["receipt_overrides"] = {label: {"containment": None, "status": "observer-error"}}
+                scenario["process_error_labels"] = [label]
+                result, adapter = self.run_scenario(profile, home, scenario, None)
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(adapter.calls[-1]["label"], label)
+                self.assertFalse(adapter.archive_quiescent)
+                self.assertTrue((profile / "live-data").is_dir())
+                self.assertFalse((profile / "trials/trial/archive").exists())
 
     def test_unavailable_probe_retains_evidence_and_recovers_without_claiming_pass(self) -> None:
         for phase in ("canonical-delete", "analytics", "lexical-index"):
