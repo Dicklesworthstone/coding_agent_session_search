@@ -98,7 +98,7 @@ class ProcessMeasurementTests(unittest.TestCase):
     def assert_not_live(self, pid: int) -> None:
         try:
             stat = Path(f"/proc/{pid}/stat").read_text()
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             return
         self.assertIn(stat[stat.rfind(")") + 2:].split()[0], ("Z", "X"))
 

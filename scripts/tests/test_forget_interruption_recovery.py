@@ -31,13 +31,37 @@ def digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+def track_b_receipt(rows: list[dict]) -> dict:
+    """Literal schema input, not a simulated native rollup computation."""
+    expected = digest(["track-b-oracle", rows])
+    return {"schema_version": 1, "method": "canonical-ledger-conversations-v1",
+            "key_columns": ["day_id", "agent_slug", "source_id", "model_family"],
+            "verified_columns": ["api_call_count", "user_message_count", "assistant_message_count",
+                "tool_message_count", "total_input_tokens", "total_output_tokens",
+                "total_cache_read_tokens", "total_cache_creation_tokens", "total_thinking_tokens",
+                "grand_total_tokens", "total_content_chars", "total_tool_calls", "session_count"],
+            "ignored_columns": ["estimated_cost_usd", "last_updated"],
+            "expected_rows": 5, "actual_rows": 5,
+            "expected_sha256": expected, "actual_sha256": expected,
+            "matches": True, "mismatch_count": 0, "mismatch_examples": [],
+            "limits": {"max_buckets": 65536, "max_dimension_utf8_bytes": 256, "page_rows": 64}}
+
+
+def wrong_sessions(snapshot: dict) -> None:
+    snapshot["track_b_oracle"].update(matches=False, mismatch_count=1,
+        actual_sha256=digest("all session counters lost"),
+        mismatch_examples=[{"kind": "different",
+            "key": {"day_id": 2500, "agent_slug": "all", "source_id": "all", "model_family": "all"},
+            "differing_fields": ["session_count"]}])
+
+
 def inventory(rows: list[dict], removed: list[dict] = (), *, pending: bool = False) -> dict:
     messages = sum(row["message_count"] for row in rows)
     tokens = sum(row["token_usage_total_tokens"] for row in rows)
     tombstones = [{"source_path": row["source_path"], "size_bytes": 1234,
                    "mtime_ms": 1700000000000, "forgotten_at_ms": 1700000001000}
                   for row in removed]
-    return {"schema_version": 1, "conversations": copy.deepcopy(rows),
+    return {"schema_version": 2, "conversations": copy.deepcopy(rows),
             "canonical": {"conversations": len(rows), "messages": messages,
                           "content_bytes": sum(row["content_bytes"] for row in rows),
                           "token_usage_rows": messages, "orphan_messages": 0,
@@ -48,8 +72,13 @@ def inventory(rows: list[dict], removed: list[dict] = (), *, pending: bool = Fal
                 **{name: {"exists": True, "message_count_sum": messages}
                    for name in ("daily_stats", "usage_daily", "usage_hourly", "usage_models_daily")},
                 "token_usage": {"exists": True, "row_count": messages, "total_tokens_sum": tokens},
-                "token_daily_stats": {"exists": True, "row_count": 1,
+                "token_daily_stats": {"exists": True, "row_count": 5,
                                       "total_tokens_sum": tokens, "message_count_sum": messages}},
+            "track_b_oracle": track_b_receipt(rows),
+            "canonical_catalogs": {name: {"row_count": count, "sha256": digest([name, "unchanged"])}
+                                   for name, count in (("agents", 1), ("workspaces", 4), ("sources", 1))},
+            "canonical_catalog_limits": {"max_rows_per_table": 4096,
+                                         "max_value_bytes_per_table": 8388608},
             "tombstones": {"forgotten_sources": {"rows": tombstones, "sha256": digest(tombstones)},
                            "forgotten_conversations": {"rows": [], "sha256": digest([])}}}
 
@@ -128,7 +157,7 @@ class ReceiptCommands(qualification.Commands):
             if code:
                 error = "harness input: recovery failed\n"
         elif label in ("after-repair", "reopened-after-noop", "after-full-rescan"):
-            payload = self.scenario["after"]
+            payload = self.scenario.get("snapshots", {}).get(label, self.scenario["after"])
         elif label == "same-selector-noop":
             payload = {"conversations_deleted": 0, "derived_rebuilt": False}
         elif label == "full-rescan":
@@ -363,7 +392,7 @@ class RecoveryFlowTests(unittest.TestCase):
                          receipt["measurement"])
 
     def test_post_admission_canonical_and_derived_drift_abort_before_forget(self) -> None:
-        for field in ("total", "digest", "analytics", "tombstones"):
+        for field in ("total", "digest", "analytics", "tombstones", "catalogs"):
             with self.subTest(drift=field):
                 profile, home, scenario = self.scenario(field)
                 restored = copy.deepcopy(scenario["seed"])
@@ -373,6 +402,8 @@ class RecoveryFlowTests(unittest.TestCase):
                     restored["conversations"][2]["messages_sha256"] = digest("admission changed history")
                 elif field == "analytics":
                     restored["analytics"]["message_metrics"]["row_count"] = 0
+                elif field == "catalogs":
+                    restored["canonical_catalogs"]["workspaces"]["sha256"] = digest("changed workspace path")
                 else:
                     restored["tombstones"]["forgotten_sources"] = {
                         "rows": [{"source_path": scenario["rows"][0]["source_path"]}],
@@ -385,6 +416,93 @@ class RecoveryFlowTests(unittest.TestCase):
                                  ["admit-restored-seed", "restored-seed-lexical-publication", "restored-seed"])
                 self.assertNotIn("measurement", result)
                 self.assertIn("restored_seed_admission", result)
+
+    def test_copied_seed_equal_totals_still_require_complete_track_b_oracle(self) -> None:
+        profile, home, scenario = self.scenario()
+        restored = copy.deepcopy(scenario["seed"])
+        wrong_sessions(restored)
+        self.assertEqual(restored["analytics"], scenario["seed"]["analytics"])
+        scenario["restored"] = restored
+        result, adapter = self.run_scenario(profile, home, scenario)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Track B", result["error"])
+        self.assertEqual([call["label"] for call in adapter.calls],
+                         ["admit-restored-seed", "restored-seed-lexical-publication", "restored-seed"])
+        self.assertNotIn("measurement", result)
+
+    def test_completed_repair_oracle_mismatch_stops_before_search(self) -> None:
+        for phase in (None, "analytics", "lexical-index"):
+            with self.subTest(phase=phase):
+                profile, home, scenario = self.scenario(str(phase))
+                scenario.update(probe_unavailable=False, interrupted_snapshot=inventory(
+                    scenario["rows"][2:], scenario["rows"][:2], pending=True))
+                wrong_sessions(scenario["after"])
+                result, adapter = self.run_scenario(profile, home, scenario, phase)
+                self.assertEqual(result["status"], "failed")
+                self.assertIn("Track B", result["error"])
+                labels = [call["label"] for call in adapter.calls]
+                mutation = "forget" if phase is None else "recovery"
+                self.assertTrue(adapter.calls[labels.index(mutation)]["measured"])
+                self.assertEqual(labels[labels.index(mutation) + 1:],
+                                 ["after-repair-lexical-publication", "after-repair"])
+                self.assertNotIn("search_checks", result)
+                self.assertNotIn("canonical_checks", result)
+                if phase is not None:
+                    self.assertTrue(adapter.recovered)
+                    self.assertEqual(result["recovery"]["measurement"]["exit_code"], 0)
+
+    def test_pending_derived_mismatch_does_not_block_verified_recovery(self) -> None:
+        for phase in ("canonical-delete", "analytics", "lexical-index"):
+            with self.subTest(phase=phase):
+                profile, home, scenario = self.scenario(phase)
+                committed = 2 if phase == "lexical-index" else 1
+                interrupted = inventory(scenario["rows"][committed:],
+                                        scenario["rows"][:committed], pending=True)
+                wrong_sessions(interrupted)
+                scenario.update(probe_unavailable=False, interrupted_snapshot=interrupted)
+                result, adapter = self.run_scenario(profile, home, scenario, phase)
+                self.assertEqual(result["status"], "passed")
+                self.assertEqual(result["pre_recovery_probe"]["status"], "verified")
+                self.assertEqual(result["interrupted_state"]["deleted_conversations"], committed)
+                self.assertEqual(result["recovery"]["route"],
+                                 "index-full" if phase == "lexical-index" else "same-selector-forget")
+                self.assertTrue(adapter.recovered)
+
+    def test_missing_pending_oracle_is_failure_not_unavailable_probe(self) -> None:
+        profile, home, scenario = self.scenario()
+        interrupted = inventory(scenario["rows"][1:], scenario["rows"][:1], pending=True)
+        del interrupted["track_b_oracle"]
+        scenario.update(probe_unavailable=False, interrupted_snapshot=interrupted)
+        result, adapter = self.run_scenario(profile, home, scenario)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("independent Track B oracle", result["error"])
+        self.assertEqual(adapter.calls[-1]["label"], "interrupted-canonical")
+        self.assertFalse(adapter.recovered)
+        self.assertNotIn("inconclusive", result)
+        self.assertNotIn("pre_recovery_probe", result)
+        self.assertTrue(Path(result["interrupted_archive"]["path"]).is_dir())
+
+    def test_catalog_drift_is_rejected_at_pending_repaired_noop_and_rescan_checks(self) -> None:
+        for label in ("interrupted-canonical", "after-repair", "reopened-after-noop", "after-full-rescan"):
+            with self.subTest(label=label):
+                profile, home, scenario = self.scenario(label)
+                if label == "interrupted-canonical":
+                    changed = inventory(scenario["rows"][1:], scenario["rows"][:1], pending=True)
+                    scenario.update(probe_unavailable=False, interrupted_snapshot=changed)
+                else:
+                    changed = copy.deepcopy(scenario["after"])
+                    scenario["snapshots"] = {label: changed}
+                changed["canonical_catalogs"]["workspaces"]["sha256"] = digest("changed workspace metadata")
+                result, adapter = self.run_scenario(profile, home, scenario)
+                self.assertEqual(result["status"], "failed")
+                self.assertIn("catalog metadata", result["error"])
+                self.assertEqual(adapter.calls[-1]["label"], label)
+                if label == "interrupted-canonical":
+                    self.assertFalse(adapter.recovered)
+                if label == "after-full-rescan":
+                    self.assertIn("canonical_checks", result)
+                    self.assertNotIn("rescan_canonical_checks", result)
+                    self.assertNotIn("rescan_search_checks", result)
 
     def test_incomplete_seed_publication_aborts_before_any_probe_or_search(self) -> None:
         profile, home, scenario = self.scenario()

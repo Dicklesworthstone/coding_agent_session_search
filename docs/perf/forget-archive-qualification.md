@@ -17,9 +17,13 @@ the benchmark's observation probes remain strictly read-only.
 The delivered validation record distinguishes Python harness checks from CASS
 execution. No representative native CASS run, measured CASS peak RSS, or
 application throughput result is supplied by this implementation session.
-The native verifier has syntax/format validation but has not been built against
-the complete CASS dependency graph in this environment. Run the repository's
-native quality gate and a native smoke case before launching the large matrix.
+On 2026-11-24, scoped DSR validation ran 119 Python harness tests (117 passed,
+two delegated-cgroup tests skipped) and passed a pinned `rustfmt --check` on the native
+verifier. The formatter checks that file's syntax and formatting; the native
+oracle regressions, CASS compilation and complete native quality gate remain
+unrun. Run that gate and a native smoke case before launching the large matrix.
+Source review and Python receipt tests do not establish native correctness or
+performance.
 
 Never promote `plan_only`, `incomplete`, a skipped test, a setup refusal, an
 OOM-killed run, or an uncompiled helper into a qualification pass.
@@ -37,25 +41,26 @@ opener in `src/logical_archive/export.rs`.
 
 Ordinary indexing defers analytics and token-ledger writes. Seed ingestion uses
 the existing `CASS_INLINE_ANALYTICS_UPDATES=1` opt-in, then runs the public
-analytics rebuild for both tracks and checks one token-ledger row per message
-plus the derived totals. The measured forget environment has no inline-analytics
+analytics rebuild for both tracks and checks one token-ledger row per message,
+the derived totals, and exact Track B integer buckets against an independent
+canonical oracle. The measured forget environment has no inline-analytics
 override. The benchmark never clears a marker,
 relaxes a reader fence, injects SQL, disables an assertion, or defers repair.
 
 Token-rollup repair uses the existing conversation index to obtain each
 conversation's minimum and maximum ledger ID and exact row count. Its ordered
 rowid pages start at that minimum and request at most 128 remaining matching
-rows. The final page stops at the known row count instead of scanning the
-unrelated archive tail to discover that no matches remain. Page commits, model
-ordering, cancellation, and the pending privacy fence retain their existing
-contracts; no new index or migration is required.
+rows. The final page stops at the known row count without requesting a terminal
+empty page or depending on an upper predicate becoming an early range exit.
+Page commits, model ordering, cancellation, and the pending privacy fence retain
+their existing contracts; no new index or migration is required.
 
-This removes repeated unrelated prefix/tail traversal without claiming a
-general linear-time bound: interleaved ledger IDs can still require scanning
-unrelated rows inside a conversation's ID span. The native query-plan and
-correctness regressions must run through the normal gate, and the qualification
-matrix must still measure wall time and RSS. No native speedup is established
-by the source change alone.
+The lower bound and remaining count make the intended traversal explicit
+without establishing a general linear-time bound: interleaved ledger IDs can
+still require scanning unrelated rows inside a conversation's ID span. The
+native query-plan and correctness regressions must run through the normal gate,
+and the qualification matrix must still measure wall time and RSS. No native
+speedup is established by the source change alone.
 
 ## Synthetic profiles
 
@@ -119,12 +124,18 @@ cargo build --locked --profile release-perf --bin cass --example forget_qualific
 
 Keep the normal project quality gates, including the complete forget regressions,
 the GH565 library cases, all-target Clippy, formatting and strict UBS. The helper
-also has a typed-digest framing regression:
+also has native regressions for exact bucket attribution, counted ledger pages,
+the pinned engine's rowid query plan, oracle limits, catalog fingerprints and
+typed-digest framing:
 
 ```bash
 cargo test --locked --example forget_qualification_probe
 python3 -m unittest discover -s scripts/tests -p 'test_*forget*.py' -v
 ```
+
+The driver requires native probe receipt schema **2**, including the Track B
+oracle and canonical catalog fingerprints. Rebuild the probe together with CASS;
+an older helper is refused rather than accepted with weaker verification.
 
 Record a build receipt from the actual built files and the actual build commit
 of a clean checkout containing this harness and its probe. The inspected
@@ -240,8 +251,10 @@ Each copied seed first runs a recorded ordinary
 This admits the new database file identity through CASS's normal writable
 archive admission; copied namespace sidecars refer to the original inode and
 cannot be silently repaired through the strict oracle. The driver then requires
-canonical totals, every retained-row digest, analytics summaries and tombstones
-to match the seed, with no pending repair. Any drift aborts before forgetting.
+canonical totals, every retained-row digest, catalog fingerprints, analytics
+summaries and tombstones to match the seed, with no pending repair. The copied
+seed must also independently pass the complete analytics checks; equal summaries
+cannot hide incorrect buckets. Any drift aborts before forgetting.
 This preparation uses the verification cap and is excluded from forget timing.
 
 Immediately after copied-seed admission, the measured forget or recovery, and
@@ -280,11 +293,14 @@ Every ordinary trial requires all of the following:
 4. A new read-only native process hashes every remaining canonical conversation,
    every field of every remaining message, and all retained token-ledger rows.
    Exact counts and digests must preserve all unselected history, including IDs.
+   All stored fields of the retained `agents`, `workspaces` and `sources`
+   catalogs must also preserve their seed fingerprints.
 5. Source-file tombstones cover exactly the deleted Codex files. Shared-store
    session tombstones remain unchanged. Reopening and a zero-match retry must
    preserve the tombstones and perform no further rebuild.
-6. SQL and filesystem pending fences both clear. Analytics message totals and
-   token rollups agree with the canonical rows.
+6. SQL and filesystem pending fences both clear. Analytics message totals agree
+   with the canonical rows, and every Track B integer bucket agrees with the
+   independent ledger-and-conversation oracle described below.
 7. Lexical marker search returns no forgotten hit. Hybrid, semantic and fast
    semantic probes expose no selected source or forgotten marker. A typed
    semantic-unavailable refusal is reported separately, not as a served empty
@@ -295,11 +311,69 @@ Every ordinary trial requires all of the following:
 9. A real full rescan, while original transcripts remain present and unchanged,
    does not resurrect anything and keeps tombstones/pending state correct.
 
+### Analytics and catalog proof
+
+The verifier independently derives Track B expectations from canonical
+`token_usage` rows and conversations; it does not invoke the production
+`TokenStatsAggregator`. It compares every stored `(day_id, agent_slug, source_id,
+model_family)` bucket across the five supported aggregation axes, including
+sessions for conversations with no ledger rows and the last known model used
+for session attribution. It deduplicates axes when a stored dimension is
+literally `all`.
+
+The exact comparison covers these 13 integer columns:
+
+| Counters | Columns |
+| --- | --- |
+| Calls and roles | `api_call_count`, `user_message_count`, `assistant_message_count`, `tool_message_count` |
+| Token components | `total_input_tokens`, `total_output_tokens`, `total_cache_read_tokens`, `total_cache_creation_tokens`, `total_thinking_tokens` |
+| Other totals | `grand_total_tokens`, `total_content_chars`, `total_tool_calls`, `session_count` |
+
+Thinking tokens remain a separate component under the pinned token contract;
+the grand total is independently recomputed from input, output, cache-read and
+cache-creation tokens. The verifier does not trust the redundant ledger total
+as its expected bucket total. Missing, extra or differently attributed buckets
+fail even when global sums agree. Sorted typed fingerprints, row counts and up
+to eight mismatch examples remain in the probe receipt. The driver checks the
+receipt contract and consistency instead of trusting a lone `matches` flag.
+
+`estimated_cost_usd` and `last_updated` are explicit exclusions from this exact
+comparison. Track A and the other usage summaries retain their existing count
+and total checks; this does not establish per-message metrics, every hourly or
+workspace attribution, or pricing correctness. Ordinary full rescans may defer
+analytics, so their verification requires canonical/catalog preservation,
+tombstones, cleared privacy fences and current lexical publication without
+asserting a fresh complete analytics rebuild. Completed forget and recovery
+must pass the full analytics checks.
+
+An interrupted repair may legitimately have missing or partial rollups. The
+native probe returns valid mismatch evidence alongside the canonical snapshot
+instead of hiding it behind a failed command. Pending-state verification permits
+that derived mismatch; complete seed, forget and recovery validation does not.
+Malformed receipts, unsupported versions and inconsistent proof fields fail in
+either state. Catalog fingerprints must remain unchanged in partial states too.
+
+The verifier retains at most 65,536 expected and 65,536 actual scalar buckets,
+with each text dimension limited to 256 UTF-8 bytes. Canonical catalog scans
+admit at most 4,096 rows and 8 MiB of stored value bytes per table and hash every
+stored field, including provenance. They read 64 rows per page; the accepted
+byte limit is checked after page hydration, so it is not a hard bound on peak
+allocation or RSS. Exceeding a synthetic oracle limit refuses verification.
+
+Ledger verification uses indexed minimum, maximum and exact count bounds, then
+64-row pages limited by the remaining count. This avoids a final empty query and
+does not depend on the upper predicate becoming an early range exit.
+Interleaved IDs can still cause reads of unrelated rows inside a conversation's
+span. Probe commands have their own receipts and limits outside the measured
+forget process; these structural bounds are not application-memory measurements.
+
 The fixture intentionally does not claim mixed-provider shared-store coverage,
 native MiniLM relevance, retained reader/TUI lifetimes, or every foreign-key
 constraint. Those existing regression/privacy gates remain necessary. The helper
 checks missing conversation parents and optional physical `quick_check`; these
 are accurately named checks rather than a universal database-integrity claim.
+
+### Interrupted repair
 
 The recovery matrix sends an actual SIGKILL after observed `canonical-delete`,
 `analytics`, and `lexical-index` stderr phases. Before post-interruption probes

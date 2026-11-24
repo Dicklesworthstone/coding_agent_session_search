@@ -35,6 +35,15 @@ ROW_FIELDS = ("id", "source_path", "external_id", "source_id", "message_count",
               "content_bytes", "conversation_sha256", "messages_sha256",
               "token_usage_count", "token_usage_total_tokens", "token_usage_sha256")
 JSON_LIMIT = 64 * 1024 * 1024
+TRACK_B_KEYS = ["day_id", "agent_slug", "source_id", "model_family"]
+TRACK_B_COUNTERS = [
+    "api_call_count", "user_message_count", "assistant_message_count", "tool_message_count",
+    "total_input_tokens", "total_output_tokens", "total_cache_read_tokens",
+    "total_cache_creation_tokens", "total_thinking_tokens", "grand_total_tokens",
+    "total_content_chars", "total_tool_calls", "session_count",
+]
+TRACK_B_LIMITS = {"max_buckets": 65536, "max_dimension_utf8_bytes": 256, "page_rows": 64}
+CATALOG_LIMITS = {"max_rows_per_table": 4096, "max_value_bytes_per_table": 8388608}
 
 
 def require(condition: bool, message: str) -> None:
@@ -234,13 +243,93 @@ class Commands:
         # Keep all checks on an admitted snapshot outside the unavailable path.
         # A failed integrity/orphan assertion is evidence of a failure, not a
         # reason to downgrade the trial to inconclusive.
-        require(result.get("schema_version") == 1, "unsupported probe receipt")
+        validate_probe_contract(result)
         require(result["canonical"]["orphan_messages"] == 0, "orphan canonical messages")
         require(result["canonical"]["orphan_token_usage_conversations"] == 0,
                 "orphan canonical token ledger rows")
         if self.args.quick_check:
             require(result.get("quick_check", {}).get("ok") is True, "quick_check failed")
         return result
+
+
+def valid_sha256(value: Any) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value))
+
+
+def validate_probe_contract(snapshot: dict[str, Any]) -> None:
+    """Admit complete schema evidence without requiring a finished repair.
+
+    An interrupted reset can legitimately have missing or incorrect derived
+    buckets. Keep that evidence usable for recovery, but never accept an old
+    probe or inconsistent oracle report as a complete snapshot.
+    """
+    require(type(snapshot.get("schema_version")) is int and snapshot["schema_version"] == 2,
+            "unsupported probe receipt; schema 2 with Track B and canonical catalogs is required")
+    limits = snapshot.get("canonical_catalog_limits")
+    require(limits == CATALOG_LIMITS and all(type(value) is int for value in limits.values()),
+            "unsupported canonical catalog limits")
+    catalogs = snapshot.get("canonical_catalogs")
+    require(isinstance(catalogs, dict) and set(catalogs) == {"agents", "workspaces", "sources"},
+            "probe omitted canonical catalog evidence")
+    for name, catalog in catalogs.items():
+        require(isinstance(catalog, dict) and set(catalog) == {"row_count", "sha256"},
+                f"invalid canonical catalog evidence: {name}")
+        require(type(catalog["row_count"]) is int
+                and 0 <= catalog["row_count"] <= CATALOG_LIMITS["max_rows_per_table"]
+                and valid_sha256(catalog["sha256"]), f"invalid canonical catalog digest/count: {name}")
+    oracle = snapshot.get("track_b_oracle")
+    require(isinstance(oracle, dict), "probe omitted independent Track B oracle")
+    require(type(oracle.get("schema_version")) is int and oracle["schema_version"] == 1
+            and oracle.get("method") == "canonical-ledger-conversations-v1"
+            and oracle.get("key_columns") == TRACK_B_KEYS
+            and oracle.get("verified_columns") == TRACK_B_COUNTERS
+            and oracle.get("ignored_columns") == ["estimated_cost_usd", "last_updated"],
+            "unsupported Track B oracle schema/method/columns")
+    limits = oracle.get("limits")
+    require(limits == TRACK_B_LIMITS and all(type(value) is int for value in limits.values()),
+            "unsupported Track B oracle limits")
+    for field in ("expected_rows", "actual_rows"):
+        require(type(oracle.get(field)) is int and 0 <= oracle[field] <= TRACK_B_LIMITS["max_buckets"],
+                f"invalid Track B oracle {field}")
+    analytics = snapshot.get("analytics")
+    daily = analytics.get("token_daily_stats") if isinstance(analytics, dict) else None
+    require(isinstance(daily, dict) and type(daily.get("row_count")) is int
+            and daily["row_count"] == oracle["actual_rows"],
+            "Track B oracle row count disagrees with token_daily_stats inventory")
+    for field in ("expected_sha256", "actual_sha256"):
+        require(valid_sha256(oracle.get(field)), f"invalid Track B oracle {field}")
+    count = oracle.get("mismatch_count")
+    require(type(count) is int and abs(oracle["expected_rows"] - oracle["actual_rows"]) <= count
+            <= oracle["expected_rows"] + oracle["actual_rows"], "invalid Track B mismatch count")
+    matches = count == 0
+    require(oracle.get("matches") is matches, "inconsistent Track B oracle matches flag")
+    require((oracle["expected_rows"] == oracle["actual_rows"]
+             and oracle["expected_sha256"] == oracle["actual_sha256"]) == matches,
+            "Track B oracle digests/counts disagree with its mismatch evidence")
+    examples = oracle.get("mismatch_examples")
+    require(isinstance(examples, list) and len(examples) == min(count, 8),
+            "invalid Track B mismatch examples")
+    seen = set()
+    for example in examples:
+        require(isinstance(example, dict) and example.get("kind") in ("different", "missing", "extra"),
+                "invalid Track B mismatch kind")
+        key = example.get("key")
+        require(isinstance(key, dict) and set(key) == set(TRACK_B_KEYS),
+                "invalid Track B mismatch key")
+        require(type(key["day_id"]) is int and -(2**63) <= key["day_id"] < 2**63
+                and all(isinstance(key[field], str)
+                        and len(key[field].encode("utf-8")) <= TRACK_B_LIMITS["max_dimension_utf8_bytes"]
+                        for field in TRACK_B_KEYS[1:]), "invalid Track B mismatch dimensions")
+        identity = tuple(key[field] for field in TRACK_B_KEYS)
+        require(identity not in seen, "duplicate Track B mismatch key")
+        seen.add(identity)
+        fields = example.get("differing_fields")
+        require(isinstance(fields, list) and fields
+                and fields == [field for field in TRACK_B_COUNTERS if field in fields],
+                "invalid Track B mismatch counter evidence")
+        require(example["kind"] == "different" or fields == TRACK_B_COUNTERS,
+                "missing/extra Track B buckets must identify every verified counter")
 
 
 def rows_by_path(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -278,6 +367,7 @@ def validate_seed(snapshot: dict[str, Any], manifest: dict[str, Any]) -> None:
 
 
 def validate_analytics(snapshot: dict[str, Any]) -> None:
+    validate_probe_contract(snapshot)
     n = snapshot["canonical"]["messages"]
     analytics = snapshot["analytics"]
     require(analytics["message_metrics"]["row_count"] == n,
@@ -298,11 +388,17 @@ def validate_analytics(snapshot: dict[str, Any]) -> None:
     require(analytics["token_daily_stats"]["message_count_sum"]
             == snapshot["canonical"]["token_usage_rows"],
             "token rollup message count differs from canonical ledger")
+    require(snapshot["track_b_oracle"]["matches"] is True,
+            "Track B day/agent/source/model buckets or integer counters differ from the canonical oracle")
 
 
 def verify_snapshot(before: dict[str, Any], after: dict[str, Any],
                     selected_paths: set[str], *, partial: bool = False,
                     require_repaired: bool = True) -> dict[str, Any]:
+    validate_probe_contract(before)
+    validate_probe_contract(after)
+    require(after["canonical_catalogs"] == before["canonical_catalogs"],
+            "canonical agent/workspace/source catalog metadata changed")
     original, current = rows_by_path(before), rows_by_path(after)
     require(selected_paths <= original.keys(), "selector is outside the synthetic seed")
     removed = set(original) - set(current)
@@ -573,8 +669,11 @@ def run_trial(profile_root: Path, home: Path, manifest: dict[str, Any],
         require(restored["canonical"] == seed["canonical"], "copied seed canonical totals changed")
         require(rows_by_path(restored) == seed_rows, "copied seed canonical digests changed")
         require(restored["analytics"] == seed["analytics"], "copied seed analytics baseline changed")
+        require(restored["canonical_catalogs"] == seed["canonical_catalogs"],
+                "copied seed canonical catalogs changed")
         require(restored["tombstones"] == seed["tombstones"], "copied seed tombstones changed")
         require(not restored["pending"]["effective"], "copied seed has pending repair")
+        validate_analytics(restored)
         positive_target_control(commands, manifest, case)
         preview, _ = commands.json(["forget", "--json", *selectors(manifest, case)], "preview")
         expected_messages = sum(seed_rows[path]["message_count"] for path in chosen)

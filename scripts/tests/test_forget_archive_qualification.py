@@ -34,6 +34,31 @@ def table(rows: list[dict]) -> dict:
             "sha256": hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()}
 
 
+def track_b_receipt(rows: list[dict]) -> dict:
+    """Literal native receipt contract; digest inputs are predicate fixtures."""
+    digest = table(rows)["sha256"]
+    return {"schema_version": 1, "method": "canonical-ledger-conversations-v1",
+            "key_columns": ["day_id", "agent_slug", "source_id", "model_family"],
+            "verified_columns": ["api_call_count", "user_message_count", "assistant_message_count",
+                "tool_message_count", "total_input_tokens", "total_output_tokens",
+                "total_cache_read_tokens", "total_cache_creation_tokens", "total_thinking_tokens",
+                "grand_total_tokens", "total_content_chars", "total_tool_calls", "session_count"],
+            "ignored_columns": ["estimated_cost_usd", "last_updated"],
+            "expected_rows": 5, "actual_rows": 5,
+            "expected_sha256": digest, "actual_sha256": digest,
+            "matches": True, "mismatch_count": 0, "mismatch_examples": [],
+            "limits": {"max_buckets": 65536, "max_dimension_utf8_bytes": 256, "page_rows": 64}}
+
+
+def counter_mismatch(snapshot: dict, field: str = "session_count") -> None:
+    snapshot["track_b_oracle"].update(
+        matches=False, mismatch_count=1,
+        actual_sha256=hashlib.sha256(f"wrong {field}".encode()).hexdigest(),
+        mismatch_examples=[{"kind": "different",
+            "key": {"day_id": 2500, "agent_slug": "codex", "source_id": "local", "model_family": "gpt-5"},
+            "differing_fields": [field]}])
+
+
 def snapshot(rows: list[dict], removed: list[dict] | None = None) -> dict:
     messages = sum(item["message_count"] for item in rows)
     usage = sum(item["token_usage_count"] for item in rows)
@@ -41,7 +66,7 @@ def snapshot(rows: list[dict], removed: list[dict] | None = None) -> dict:
     sources = [{"source_path": item["source_path"], "file_size": 9876 + item["id"],
                 "file_mtime_ms": 1_700_000_000_000 + item["id"]}
                for item in removed or []]
-    return {"schema_version": 1, "conversations": copy.deepcopy(rows),
+    return {"schema_version": 2, "conversations": copy.deepcopy(rows),
             "canonical": {"conversations": len(rows), "messages": messages,
                           "content_bytes": sum(item["content_bytes"] for item in rows),
                           "token_usage_rows": usage, "orphan_messages": 0,
@@ -51,8 +76,14 @@ def snapshot(rows: list[dict], removed: list[dict] | None = None) -> dict:
                 **{name: {"exists": True, "message_count_sum": messages}
                    for name in ("daily_stats", "usage_daily", "usage_hourly", "usage_models_daily")},
                 "token_usage": {"exists": True, "row_count": usage, "total_tokens_sum": tokens},
-                "token_daily_stats": {"exists": True, "row_count": 4,
+                "token_daily_stats": {"exists": True, "row_count": 5,
                                       "message_count_sum": usage, "total_tokens_sum": tokens}},
+            "track_b_oracle": track_b_receipt(rows),
+            "canonical_catalogs": {name: {"row_count": count,
+                "sha256": hashlib.sha256(f"unchanged {name}".encode()).hexdigest()}
+                for name, count in (("agents", 1), ("workspaces", 4), ("sources", 1))},
+            "canonical_catalog_limits": {"max_rows_per_table": 4096,
+                                         "max_value_bytes_per_table": 8388608},
             "pending": {"effective": False, "sql_marker_present": False,
                         "sql_marker_value": None, "reader_pending": False},
             "tombstones": {"forgotten_sources": table(sources),
@@ -185,6 +216,150 @@ class VerificationTests(unittest.TestCase):
         incomplete["analytics"]["token_daily_stats"]["message_count_sum"] -= 1
         with self.assertRaises(RuntimeError):
             qualification.validate_seed(incomplete, manifest)
+
+
+class TrackBOracleTests(unittest.TestCase):
+    setUp = VerificationTests.setUp
+    verify = VerificationTests.verify
+
+    def test_equal_global_totals_do_not_hide_any_integer_counter_mismatch(self) -> None:
+        for field in track_b_receipt([])["verified_columns"]:
+            after = copy.deepcopy(self.after)
+            counter_mismatch(after, field)
+            self.assertEqual(after["analytics"], self.after["analytics"])
+            with self.subTest(counter=field), self.assertRaisesRegex(RuntimeError, "Track B.*differ"):
+                self.verify(after)
+
+    def test_equal_global_totals_do_not_hide_wrong_bucket_attribution(self) -> None:
+        original_key = {"day_id": 2500, "agent_slug": "codex", "source_id": "local", "model_family": "gpt-5"}
+        for dimension, wrong in (("day_id", 2501), ("agent_slug", "claude-code"),
+                                 ("source_id", "remote"), ("model_family", "unknown")):
+            after = copy.deepcopy(self.after)
+            oracle = after["track_b_oracle"]
+            changed_key = {**original_key, dimension: wrong}
+            oracle.update(matches=False, mismatch_count=2,
+                          actual_sha256=hashlib.sha256(f"wrong {dimension}".encode()).hexdigest(),
+                          mismatch_examples=[{"kind": kind, "key": key,
+                              "differing_fields": list(oracle["verified_columns"])}
+                              for kind, key in (("missing", original_key), ("extra", changed_key))])
+            self.assertEqual(after["analytics"], self.after["analytics"])
+            with self.subTest(dimension=dimension), self.assertRaisesRegex(RuntimeError, "Track B.*differ"):
+                self.verify(after)
+
+    def test_seed_needs_bucket_evidence_even_when_global_totals_match(self) -> None:
+        seed = copy.deepcopy(self.before)
+        counter_mismatch(seed)
+        manifest = {"conversations": [{"path": item["source_path"], "message_count": item["message_count"],
+                                       "content_bytes": item["content_bytes"]} for item in self.rows]}
+        with self.assertRaisesRegex(RuntimeError, "Track B.*differ"):
+            qualification.validate_seed(seed, manifest)
+
+    def test_partial_reset_keeps_valid_mismatch_evidence_for_recovery(self) -> None:
+        interrupted = snapshot(self.rows[1:], self.rows[:1])
+        interrupted["pending"].update(effective=True, sql_marker_present=True, reader_pending=True)
+        oracle = interrupted["track_b_oracle"]
+        oracle.update(actual_rows=0, actual_sha256=hashlib.sha256(b"empty buckets").hexdigest(),
+                      matches=False, mismatch_count=5,
+                      mismatch_examples=[{"kind": "missing",
+                          "key": {"day_id": 2500, "agent_slug": agent, "source_id": source, "model_family": model},
+                          "differing_fields": list(oracle["verified_columns"])}
+                          for agent, source, model in (("codex", "local", "gpt-5"), ("all", "local", "gpt-5"),
+                              ("codex", "all", "gpt-5"), ("codex", "local", "all"), ("all", "all", "all"))])
+        interrupted["analytics"]["token_daily_stats"].update(row_count=0, total_tokens_sum=0, message_count_sum=0)
+        result = self.verify(interrupted, partial=True, require_repaired=False)
+        self.assertEqual(result["deleted_conversations"], 1)
+        with self.assertRaises(RuntimeError):
+            qualification.validate_analytics(interrupted)
+        del interrupted["track_b_oracle"]
+        with self.assertRaisesRegex(RuntimeError, "independent Track B"):
+            self.verify(interrupted, partial=True, require_repaired=False)
+
+    def test_inconsistent_matching_claim_cannot_substitute_for_oracle_evidence(self) -> None:
+        for corruption in ("digest", "row_count", "matches", "mismatch_count", "examples"):
+            after = copy.deepcopy(self.after)
+            oracle = after["track_b_oracle"]
+            if corruption == "digest":
+                oracle["actual_sha256"] = "f" * 64
+            elif corruption == "row_count":
+                oracle["actual_rows"] += 1
+            elif corruption == "matches":
+                oracle["matches"] = 1
+            elif corruption == "mismatch_count":
+                oracle["mismatch_count"] = True
+            else:
+                oracle["mismatch_examples"] = [{"kind": "different"}]
+            with self.subTest(corruption=corruption), self.assertRaises(RuntimeError):
+                self.verify(after)
+
+    def test_older_narrower_or_unbounded_probe_contract_is_refused(self) -> None:
+        for corruption in ("old_schema", "missing_oracle", "method", "keys", "session_column",
+                           "ignored_columns", "limits", "row_cap", "bad_digest", "uppercase_digest"):
+            after = copy.deepcopy(self.after)
+            oracle = after["track_b_oracle"]
+            if corruption == "old_schema":
+                after["schema_version"] = 1
+            elif corruption == "missing_oracle":
+                del after["track_b_oracle"]
+            elif corruption == "method":
+                oracle["method"] = "shared-production-aggregator"
+            elif corruption == "keys":
+                oracle["key_columns"].remove("model_family")
+            elif corruption == "session_column":
+                oracle["verified_columns"].remove("session_count")
+            elif corruption == "ignored_columns":
+                oracle["ignored_columns"].append("session_count")
+            elif corruption == "limits":
+                oracle["limits"]["page_rows"] = 64000
+            elif corruption == "row_cap":
+                oracle["expected_rows"] = oracle["actual_rows"] = 65537
+                after["analytics"]["token_daily_stats"]["row_count"] = 65537
+            else:
+                oracle["expected_sha256"] = oracle["actual_sha256"] = (
+                    "A" * 64 if corruption == "uppercase_digest" else "unverified")
+            with self.subTest(corruption=corruption), self.assertRaises(RuntimeError):
+                self.verify(after, require_repaired=False)
+
+    def test_malformed_mismatch_diagnostics_are_not_usable_partial_evidence(self) -> None:
+        for corruption in ("missing_example", "unknown_counter", "oversize_dimension", "missing_counters"):
+            after = copy.deepcopy(self.after)
+            counter_mismatch(after)
+            example = after["track_b_oracle"]["mismatch_examples"][0]
+            if corruption == "missing_example":
+                after["track_b_oracle"]["mismatch_examples"] = []
+            elif corruption == "unknown_counter":
+                example["differing_fields"] = ["total_tokens"]
+            elif corruption == "oversize_dimension":
+                example["key"]["model_family"] = "é" * 129
+            else:
+                example["kind"] = "missing"
+            with self.subTest(corruption=corruption), self.assertRaises(RuntimeError):
+                self.verify(after, require_repaired=False)
+
+    def test_catalog_metadata_is_preserved_even_when_counts_and_history_match(self) -> None:
+        for name in ("agents", "workspaces", "sources"):
+            for partial in (False, True):
+                after = copy.deepcopy(self.after)
+                after["canonical_catalogs"][name]["sha256"] = hashlib.sha256(f"changed {name}".encode()).hexdigest()
+                self.assertEqual(after["canonical"], self.after["canonical"])
+                self.assertEqual(after["conversations"], self.after["conversations"])
+                with self.subTest(catalog=name, partial=partial), self.assertRaisesRegex(RuntimeError, "catalog metadata"):
+                    self.verify(after, require_repaired=not partial)
+
+    def test_missing_or_unbounded_catalog_evidence_is_refused(self) -> None:
+        for corruption in ("missing", "table", "limit", "rows", "digest"):
+            after = copy.deepcopy(self.after)
+            if corruption == "missing":
+                del after["canonical_catalogs"]
+            elif corruption == "table":
+                del after["canonical_catalogs"]["workspaces"]
+            elif corruption == "limit":
+                after["canonical_catalog_limits"]["max_value_bytes_per_table"] *= 2
+            elif corruption == "rows":
+                after["canonical_catalogs"]["workspaces"]["row_count"] = 4097
+            else:
+                after["canonical_catalogs"]["workspaces"]["sha256"] = None
+            with self.subTest(corruption=corruption), self.assertRaises(RuntimeError):
+                self.verify(after, require_repaired=False)
 
 
 def ready_lexical_status(documents: int = 7) -> dict:
