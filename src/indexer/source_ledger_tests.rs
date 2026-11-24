@@ -283,7 +283,7 @@ fn codex_prefix_full_rebuild_preserves_overlap_but_disables_reuse() -> Result<()
             "ordinary".to_string(),
             saved_row(&discovered(&path, "codex"), Vec::new()),
         ),
-    ]))?;
+    ]));
     assert_eq!(preserved.len(), 1);
     let marker = &preserved[&entry.key];
     let value: serde_json::Value = serde_json::from_str(marker)?;
@@ -293,6 +293,117 @@ fn codex_prefix_full_rebuild_preserves_overlap_but_disables_reuse() -> Result<()
     assert!(!source_ledger_matches(marker, &discovered(&path, "codex")));
     fs::write(&path, fs::read_to_string(&path)?.replace("first", "other"))?;
     assert!(crate::connectors::codex::set_previous_prefix_receipt(&path, Some(marker)).is_err());
+    Ok(())
+}
+
+#[test]
+fn codex_prefix_invalidation_bounds_input_before_json_parsing() {
+    // This is invalid JSON as well as oversized. The byte budget must reject
+    // it before serde attempts to parse or allocate a second representation.
+    let oversized = "{".repeat(256 * 1024 + 1);
+    let error = bounded_rebuild_prefix_observation(&oversized).unwrap_err();
+    assert!(error.to_string().contains("invalidation budget"));
+    let ordinary = serde_json::json!({"dependencies": "x".repeat(256 * 1024)}).to_string();
+    assert!(invalidated_prefix_observation(&ordinary).unwrap().is_none());
+    assert!(bounded_rebuild_prefix_observation(&ordinary).is_err());
+}
+
+#[test]
+fn codex_prefix_rebuild_keeps_unusable_integrity_keys_fail_closed() -> Result<()> {
+    let mut boundary = serde_json::json!({"codex_prefix": {}, "padding": ""});
+    let empty_len = boundary.to_string().len();
+    boundary["padding"] = serde_json::json!("x".repeat(256 * 1024 - empty_len));
+    let boundary = boundary.to_string();
+    assert_eq!(boundary.len(), 256 * 1024);
+    assert!(invalidated_prefix_observation(&boundary).is_err());
+
+    let valid = serde_json::json!({"codex_prefix": {"retained_proof": true}});
+    let rebuilt = prefix_integrity_observations(HashMap::from([
+        ("valid".to_owned(), valid.to_string()),
+        ("ordinary".to_owned(), "{\"primary\":{}}".to_owned()),
+        ("malformed".to_owned(), "{\"codex_prefix\":".to_owned()),
+        ("oversized".to_owned(), "{".repeat(256 * 1024 + 1)),
+        ("grows_past_bound".to_owned(), boundary),
+        ("null".to_owned(), "null".to_owned()),
+        ("boolean".to_owned(), "false".to_owned()),
+        ("string".to_owned(), "\"broken\"".to_owned()),
+        ("array".to_owned(), "[]".to_owned()),
+    ]));
+    assert_eq!(rebuilt.len(), 8);
+    assert!(!rebuilt.contains_key("ordinary"));
+    let preserved: serde_json::Value = serde_json::from_str(&rebuilt["valid"])?;
+    assert_eq!(preserved["codex_prefix"], valid["codex_prefix"]);
+    assert_eq!(preserved["publication_invalidated"], true);
+    assert_eq!(preserved["watch_published"], false);
+    for key in ["malformed", "oversized", "grows_past_bound", "null", "boolean", "string", "array"] {
+        let marker = &rebuilt[key];
+        assert!(marker.len() < 128, "unusable evidence must remain bounded");
+        assert!(
+            crate::connectors::codex::set_previous_prefix_receipt(
+                Path::new("rollout-refused-rebuild.jsonl"),
+                Some(marker),
+            )
+            .is_err(),
+            "the actual admission parser must reject {key} instead of forgetting its proof"
+        );
+        let value: serde_json::Value = serde_json::from_str(marker)?;
+        assert_eq!(value["publication_invalidated"], true);
+        assert_eq!(value["watch_published"], false);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn codex_prefix_full_rebuild_unusable_receipt_does_not_starve_siblings() -> Result<()> {
+    for malformed in [false, true] {
+        for remote in [false, true] {
+            let temp = TempDir::new()?;
+            let (refused, _, mut config) = codex_prefix_fixture(&temp)?;
+            let healthy = temp.path().join("rollout-z-rebuild-healthy.jsonl");
+            fs::write(&healthy, fs::read(&refused)?)?;
+            File::open(&healthy)?.set_modified(SystemTime::now() - Duration::from_secs(7200))?;
+            let root = if remote {
+                ScanRoot::remote(temp.path().to_path_buf(), Origin::remote("rebuild-proof"), None)
+            } else {
+                ScanRoot::local(temp.path().to_path_buf())
+            };
+            let ctx = ScanContext::with_roots(config.data_dir.clone(), vec![root], None);
+            let connector = crate::connectors::codex::CodexConnector::new();
+            let sources = connector.discover_source_files(&ctx)?;
+            assert_eq!(sources[0].source_path, refused);
+            let refused_key = source_ledger_key(&sources[0], &ctx).context("refused key")?;
+            let healthy_source = sources.iter().find(|source| source.source_path == healthy)
+                .context("healthy source")?;
+            let healthy_key = source_ledger_key(healthy_source, &ctx).context("healthy key")?;
+            let invalid = if malformed {
+                "{\"codex_prefix\":".to_owned()
+            } else {
+                serde_json::json!({"codex_prefix": {}, "padding": "x".repeat(256 * 1024)}).to_string()
+            };
+            config.source_ledger = Arc::new(prefix_integrity_observations(HashMap::from([
+                (refused_key.clone(), invalid),
+                (healthy_key.clone(), saved_row(healthy_source, Vec::new())),
+            ])));
+            let scan = collect_diagnostic_ledger_scan(&connector, &ctx, &config, "codex", || Ok(()))?;
+            let error = scan.scan_error.as_ref().context("unusable proof was forgotten")?;
+            assert_eq!(scan.conversations.len(), 1, "malformed={malformed}, remote={remote}");
+            assert_eq!(scan.conversations[0].source_path, healthy);
+            assert_eq!(scan.entries.len(), 1);
+            assert_eq!(scan.entries[0].key, healthy_key);
+            let mut failed_paths = Vec::new();
+            assert!(crate::connectors::codex::for_each_source_failure(error, |path, _| {
+                failed_paths.push(path.to_path_buf());
+            }));
+            assert_eq!(failed_paths, vec![refused.clone()]);
+            assert!(config.active_source_filter.take_deferred_sources().contains(&refused));
+            assert_eq!(config.incomplete_remote_sources.load(Ordering::Relaxed), remote);
+            assert!(config.source_ledger.contains_key(&refused_key));
+            assert!(!config.source_ledger.contains_key(&healthy_key), "rebuild must disable reuse");
+            assert!(scan.entries.iter().all(|entry| entry.key != refused_key));
+        }
+    }
     Ok(())
 }
 

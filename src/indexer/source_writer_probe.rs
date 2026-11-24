@@ -195,9 +195,23 @@ pub(super) fn source_file_id(_path: &Path) -> Option<SourceFileId> {
 }
 
 pub(super) fn source_file_has_active_advisory_lock(path: &Path) -> bool {
-    let Ok(file) = OpenOptions::new().read(true).open(path) else {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Discovery or the writer census may have observed a regular file
+        // before the pathname was replaced with a FIFO. Bound the actual open,
+        // including symlink targets, so this activity probe cannot wait for a
+        // writer before the connector gets to its own source-admission checks.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let Ok(file) = options.open(path) else {
         return false;
     };
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return false;
+    }
     // std's File::try_lock reports another holder as WouldBlock on every
     // platform; with fs2, Windows contention was a raw ERROR_LOCK_VIOLATION
     // that matched nothing here, so a file a writer held looked unlocked
@@ -1268,3 +1282,7 @@ fn parse_lsof_device(value: &str) -> Option<u64> {
 #[cfg(test)]
 #[path = "source_writer_probe/tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "source_writer_probe/advisory_tests.rs"]
+mod advisory_tests;

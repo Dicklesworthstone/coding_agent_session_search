@@ -489,8 +489,9 @@ fn scan_source(
             ctx.progress_tick.as_deref(),
         )?
         else {
-            // Inputs with no admitted record boundary retain their existing
-            // strict semantics. The original host predicate already ran.
+            // Empty inputs retain their existing strict semantics. Nonempty
+            // active inputs without a record boundary return a retry above.
+            // The original host predicate already ran.
             let mut admitted = |_: &DiscoveredSourceFile| true;
             let mut complete = |done: &SourceCompletion| {
                 hooks

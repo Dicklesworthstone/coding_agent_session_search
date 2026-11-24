@@ -396,11 +396,19 @@ mod tests {
         fs::write(&path, body.trim_end_matches('\n'))?;
         let writer = fs::OpenOptions::new().append(true).open(&path)?;
         let mut delivered = 0;
-        crate::connectors::codex::CodexConnector::new().scan_with_callback(&ctx, &mut |_| {
-            assert!(!guarded_active_jsonl_source(&path));
-            delivered += 1;
-            Ok(())
-        })?;
+        // Preserve the strict reader's historical EOF contract separately
+        // from the public router's active-prefix admission requirement.
+        scan(
+            &CodexConnector::new(),
+            &ctx,
+            &mut SourceScanHooks::default(),
+            &mut |_| {
+                assert!(!guarded_active_jsonl_source(&path));
+                delivered += 1;
+                Ok(())
+            },
+            |conversation| augment_modern_codex_messages(conversation, None),
+        )?;
         assert_eq!(
             delivered, 1,
             "the historical parser contract still permits complete EOF"

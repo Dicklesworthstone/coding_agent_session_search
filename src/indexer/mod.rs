@@ -15716,36 +15716,70 @@ fn codex_prefix_ledger_observation(
 /// Retain the admitted overlap across a crash without certifying publication.
 /// The final source transaction replaces this marker after canonical ingest;
 /// watch replaces it only after the corresponding lexical commit as well.
+const MAX_CODEX_PREFIX_OBSERVATION_BYTES: usize = 256 * 1024;
+
 fn invalidated_prefix_observation(observation: &str) -> Result<Option<String>> {
-    const MAX_PREFIX_OBSERVATION_BYTES: usize = 256 * 1024;
     let mut value: serde_json::Value = serde_json::from_str(observation)?;
     if value.get("codex_prefix").is_none() {
         return Ok(None);
     }
     anyhow::ensure!(
-        observation.len() <= MAX_PREFIX_OBSERVATION_BYTES,
+        observation.len() <= MAX_CODEX_PREFIX_OBSERVATION_BYTES,
         "Codex prefix receipt exceeds its invalidation budget"
     );
     value["publication_invalidated"] = serde_json::Value::Bool(true);
     value["watch_published"] = serde_json::Value::Bool(false);
     let invalidated = serde_json::to_string(&value)?;
     anyhow::ensure!(
-        invalidated.len() <= MAX_PREFIX_OBSERVATION_BYTES,
+        invalidated.len() <= MAX_CODEX_PREFIX_OBSERVATION_BYTES,
         "Codex prefix receipt exceeds its invalidation budget"
     );
     Ok(Some(invalidated))
 }
 
+fn bounded_rebuild_prefix_observation(observation: &str) -> Result<Option<String>> {
+    // Rebuild preparation receives arbitrary durable rows. Bound them before
+    // decoding; ordinary completion handling retains its existing behavior.
+    anyhow::ensure!(
+        observation.len() <= MAX_CODEX_PREFIX_OBSERVATION_BYTES,
+        "Codex prefix receipt exceeds its invalidation budget"
+    );
+    // A valid JSON object must begin with this token; the shared helper still
+    // validates the entire bounded document. Scalars are corrupt evidence,
+    // not legacy observations proving the absence of a prefix requirement.
+    anyhow::ensure!(
+        observation.trim_start().starts_with('{'),
+        "source integrity observation must be a JSON object"
+    );
+    invalidated_prefix_observation(observation)
+}
+
 fn prefix_integrity_observations(
     observations: HashMap<String, String>,
-) -> Result<HashMap<String, String>> {
+) -> HashMap<String, String> {
     let mut integrity = HashMap::new();
     for (key, observation) in observations {
-        if let Some(invalidated) = invalidated_prefix_observation(&observation)? {
-            integrity.insert(key, invalidated);
+        match bounded_rebuild_prefix_observation(&observation) {
+            Ok(Some(invalidated)) => {
+                integrity.insert(key, invalidated);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // This map only prepares the scan; it never replaces durable
+                // evidence. Keep the exact key present with an intentionally
+                // invalid prefix proof so Codex admission refuses this source
+                // locally instead of aborting every source in a rebuild. Do
+                // not omit an unreadable row: it may contain overlap evidence.
+                tracing::warn!(%error, "deferring source with unusable rebuild integrity evidence");
+                integrity.insert(
+                    key,
+                    r#"{"codex_prefix":null,"publication_invalidated":true,"watch_published":false}"#
+                        .to_owned(),
+                );
+            }
         }
     }
-    Ok(integrity)
+    integrity
 }
 
 /// Recheck a completed parser view after an asynchronous queue or disk spool.
@@ -17591,7 +17625,7 @@ where
         // Rebuilding disables reuse, not overlap verification. Canonical rows
         // may survive these scans, so dropping a prior prefix proof would let
         // a rewrite collide with existing message indices.
-        source_ledger = prefix_integrity_observations(source_ledger)?;
+        source_ledger = prefix_integrity_observations(source_ledger);
     }
     let producer_config = StreamingProducerConfig {
         incomplete_remote_sources: Arc::new(AtomicBool::new(false)),

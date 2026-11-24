@@ -347,7 +347,8 @@ fn copy_view(
 }
 
 impl StablePrefixSnapshot {
-    /// None leaves an input without any admitted record on the strict path.
+    /// None leaves empty or unsupported inputs on the strict path. A nonempty
+    /// active JSONL source must establish a record boundary before delivery.
     /// Existing inactive EOF/recovery policy is applied to a complete private
     /// view, while retaining any previously published prefix's overlap proof.
     pub(crate) fn capture(
@@ -398,18 +399,15 @@ impl StablePrefixSnapshot {
             return Err(changed("Codex admitted prefix boundary moved backwards"));
         }
         if boundary == 0 {
-            if copied.deferred_tail {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Codex trailing record awaits its neighbor or source inactivity",
-                )
-                .into());
-            }
-            anyhow::ensure!(
-                previous.is_none(),
-                "Codex source lost its previously published prefix"
-            );
-            return Ok(None);
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                if copied.deferred_tail {
+                    "Codex trailing record awaits its neighbor or source inactivity"
+                } else {
+                    "Codex active source has no newline-committed record; retry this source"
+                },
+            )
+            .into());
         }
         let (device, inode) = identity(&before)?;
         let receipt = StablePrefixReceipt {
@@ -620,6 +618,10 @@ pub(crate) fn set_previous_prefix_receipt(path: &Path, observation: Option<&str>
         return Ok(());
     };
     let value: serde_json::Value = serde_json::from_str(observation)?;
+    anyhow::ensure!(
+        value.is_object(),
+        "previous Codex source observation must be a JSON object"
+    );
     let Some(value) = value.get("codex_prefix") else {
         return Ok(());
     };
@@ -684,3 +686,9 @@ mod tests;
 
 #[cfg(all(test, unix))]
 mod projection_tests;
+
+#[cfg(all(test, unix))]
+mod zero_boundary_tests;
+
+#[cfg(test)]
+mod receipt_shape_tests;

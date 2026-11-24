@@ -1,0 +1,291 @@
+{
+  "schema": "cass.stable_prefix.followup_validation.v1",
+  "date_utc": "2026-11-24",
+  "base_commit": "f9d7a0a8014e877482190f92498ff5eb28020c9a",
+  "scope": "Advisory-probe FIFO admission, nonempty active zero-boundary deferral, observation root validation, and per-source rebuild integrity preparation",
+  "qualification": "Final sources have exact-context reconstruction and independent source review only. No test binary executed in this restored attempt. No final compiler, formatter, Clippy, UBS, host/storage or CLI pass is claimed.",
+  "captured_execution_attempt": {
+    "schema": "cass.stable_prefix.restored_environment_validation.v1",
+    "date_utc": "2026-11-24",
+    "baseline_commit": "f9d7a0a8014e877482190f92498ff5eb28020c9a",
+    "fad_revision": "a0dd013a8c1e374d6a80949637e5e51cbb45550b",
+    "environment_status": "Unavailable, confirmed by user environment update",
+    "loss_cause": "Unconfirmed; do not attribute environment loss to any compiler or process",
+    "validation_root": "/workspace/scratch/94df4d950735/validation-restored-20261124",
+    "native_scope": "Existing unchanged scripts/test_codex_contract.py on a frozen committed baseline; actual complete Codex modules and actual writer probe, real pinned FAD; not full CASS host/storage/CLI integration",
+    "executed": {
+      "toolchain_install_and_versions": true,
+      "dsr_quality_check_started": true,
+      "cargo_metadata_completed": true,
+      "cargo_test_command_started": true,
+      "dependency_compilation_reached": [
+        "libc 0.2.191",
+        "proc-macro2 1.0.107",
+        "unicode-ident 1.0.27",
+        "quote 1.0.47",
+        "jobserver 0.1.35",
+        "shlex 2.0.1",
+        "find-msvc-tools 0.1.15",
+        "cc 1.11.3",
+        "pkg-config 0.3.34",
+        "zstd-sys 2.1.3+zstd.1.5.7",
+        "syn 3.0.10",
+        "serde_core 1.0.229",
+        "cfg-if 1.0.5",
+        "autocfg 1.5.1"
+      ],
+      "codex_tests_executed": 0,
+      "test_result": "No test binary executed before resource guard stopped the process group",
+      "native_check_exit": 125,
+      "cargo_child_signal": "SIGTERM; child returncode -15",
+      "dsr_terminal_status": "Unknown: post-run source snapshot was still pending at last observation",
+      "dsr_aggregate_receipt_captured": false,
+      "dsr_session_id": 51896,
+      "dsr_invocation": "source environment.sh; DSR_REPOS_FILE=\"$CASS_VALIDATION_ROOT/dsr-config/baseline.yaml\" dsr quality --tool cass-codex-restored-baseline --work-dir \"$CASS_VALIDATION_ROOT/baseline-f9d7a0a\" --check-timeout 1800"
+    },
+    "resource_context": {
+      "command": [
+        "python3",
+        "scripts/test_codex_contract.py"
+      ],
+      "cwd": "/workspace/scratch/94df4d950735/validation-restored-20261124/baseline-f9d7a0a",
+      "address_space_cap_bytes": 34359738368,
+      "aggregate_rss_cap_kib": 5242880,
+      "mem_available_minimum_kib": 2097152,
+      "sample_interval_seconds": 0.2,
+      "env": {
+        "CARGO_HOME": "/workspace/scratch/94df4d950735/validation-restored-20261124/cargo-home",
+        "RUSTUP_HOME": "/workspace/scratch/94df4d950735/validation-restored-20261124/rustup-home",
+        "CARGO_TARGET_DIR": "/workspace/scratch/94df4d950735/validation-restored-20261124/target",
+        "CARGO_BUILD_JOBS": "1",
+        "RUSTFLAGS": "-Zthreads=1",
+        "RUST_MIN_STACK": "134217728",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0"
+      }
+    },
+    "resource_result": {
+      "duration_seconds": 92.059,
+      "initial_mem_available_kib": 3506368,
+      "lowest_mem_available_kib": 2091008,
+      "peak_aggregate_rss_kib": 291564,
+      "peak_aggregate_vas_kib": 2754200,
+      "stop_reason": "Memory guard: MemAvailable below 2 GiB",
+      "child_returncode": -15,
+      "supervisor_returncode": 125
+    },
+    "tool_versions": {
+      "rustc": "rustc 1.100.0-nightly (908501772 2026-08-30)\nbinary: rustc\ncommit-hash: 90850177249efe0321573c569aec5d12b257f8d6\ncommit-date: 2026-08-30\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0",
+      "cargo": "cargo 1.100.0-nightly (e8cb624d5 2026-08-22)\nrelease: 1.100.0-nightly\ncommit-hash: e8cb624d5701824f46a2ec5873cfd59ee3d2f66c\ncommit-date: 2026-08-22\nhost: x86_64-unknown-linux-gnu\nlibgit2: 1.9.6 (sys:0.21.0 vendored)\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)\nssl: OpenSSL 3.6.3 9 Jun 2026\nos: Debian 13.0.0 (trixie) [64-bit]",
+      "rustfmt": "rustfmt 1.10.0-nightly (9085017724 2026-08-30)",
+      "clippy": "clippy 0.1.100 (9085017724 2026-08-30)",
+      "dsr": "dsr version 0.2.3",
+      "yq": "yq (https://github.com/mikefarah/yq/) version v4.44.3",
+      "dsr_commit": "ed04eee4a02e510c66762cdbd720aa20ef359b86",
+      "baseline_commit": "f9d7a0a8014e877482190f92498ff5eb28020c9a"
+    },
+    "bootstrap": {
+      "rustup_installer": {
+        "url": "https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init",
+        "sha256": "b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55",
+        "official_sha256_matched": true
+      },
+      "yq": {
+        "version": "v4.44.3",
+        "url": "https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64",
+        "sha256": "a2c097180dd884a8d50c956ee16a9cec070f30a7947cf4ebf87d5f36213e9ed7",
+        "official_checksum_row_matched": true
+      },
+      "dsr": {
+        "repository": "https://github.com/Dicklesworthstone/doodlestein_self_releaser",
+        "commit": "ed04eee4a02e510c66762cdbd720aa20ef359b86",
+        "version": "0.2.3",
+        "unmodified": true
+      },
+      "ubs": {
+        "runner_sha256": "bdeccbb35f2056e6177c73b3f0f9966d20d1cbeff22b7f084133c4a6ac625ee2",
+        "contract_sha256": "7319b2e5e085d0dd2434e5114291b2dee9fbbb96e2cfe02027eb263abcb06ac3",
+        "module_files": 363,
+        "tag": "v5.4.4",
+        "resolved_commit": "fc05825ed970a3928f71bfa083a1d703e4429b1a",
+        "bulk_clone_completed": true,
+        "scanner_executed": false
+      },
+      "ast_grep": {
+        "url": "https://github.com/ast-grep/ast-grep/releases/download/0.51.3/app-x86_64-unknown-linux-gnu.zip",
+        "asset_sha256": "22803eb0c5bf83164fb7fd76d4721d355ecf0c8466ef47342c1ec7d80897ca47",
+        "binary_sha256": "9abc33cdb0e75c909bead3cefb94deccb1e4d71751392ff5f5bff7d1d09d6861",
+        "expected_asset_and_binary_identity_matched": true,
+        "version_pin": "0.51.3",
+        "rust_parser_probe_executed": false
+      }
+    },
+    "diagnostic_snapshot": {
+      "baseline_commit": "f9d7a0a8014e877482190f92498ff5eb28020c9a",
+      "purpose": "new negative regressions with unchanged baseline production logic",
+      "files": {
+        "src/connectors/codex/stable_prefix.rs": "fa92387fc42755bedf920e107eab60136b17ff745b34e34bafd39679b37ea49d",
+        "src/connectors/codex/stable_prefix/zero_boundary_tests.rs": "6005ed78bdbe967b8a7330a8d4211d028983c3543dc5f44f43b0024b679cb6df",
+        "src/indexer/source_writer_probe/advisory_tests.rs": "6ff5f78ef7885b2dc7734296b8bb04d5ca36622473368869feacce81e51c39dd",
+        "src/indexer/source_writer_probe.rs": "3bde383b3f706d3eae0b6c75b5b7ddac575e6869b43c6555aefd566564beab8b"
+      }
+    },
+    "probe_native_lane_preparations": [
+      {
+        "frozen": "/workspace/scratch/94df4d950735/validation-restored-20261124/probe-inputs-negative",
+        "files": 8,
+        "hashes": {
+          "Cargo.toml": "f7642b5e6ba5289bd7f4c45a5a5b4eab871eb950ea4be42cc362c4198da80eae",
+          "Cargo.lock": "9da30f9b11c6a40c224a7ab2cdaf315275c031e58928c0636fde9da4542d0004",
+          "rust-toolchain.toml": "7fab71eddf5e49029d9df39990f4ad5809b9218804a363a2e10d7c4ea2de06bc",
+          "src/indexer/source_writer_probe.rs": "3bde383b3f706d3eae0b6c75b5b7ddac575e6869b43c6555aefd566564beab8b",
+          "src/indexer/source_writer_probe/advisory_tests.rs": "6ff5f78ef7885b2dc7734296b8bb04d5ca36622473368869feacce81e51c39dd",
+          "src/indexer/source_writer_probe/tests.rs": "2adf7fe718275991b43326651abe0eb5ee0266013487d5ccad18a6736ba5bc14",
+          "scripts/guarded_run.py": "4eefab23845a33ad9636f8da5133feace5d0111d4abe06fd8df7caccc335dd08",
+          "scripts/run_probe_contract.py": "1d5a1faa8c872c4d7bd257ac819140e1421f363075baa518f19d79eef915928b"
+        }
+      },
+      {
+        "frozen": "/workspace/scratch/94df4d950735/validation-restored-20261124/probe-inputs-fixed",
+        "files": 8,
+        "hashes": {
+          "Cargo.toml": "f7642b5e6ba5289bd7f4c45a5a5b4eab871eb950ea4be42cc362c4198da80eae",
+          "Cargo.lock": "9da30f9b11c6a40c224a7ab2cdaf315275c031e58928c0636fde9da4542d0004",
+          "rust-toolchain.toml": "7fab71eddf5e49029d9df39990f4ad5809b9218804a363a2e10d7c4ea2de06bc",
+          "src/indexer/source_writer_probe.rs": "1cb081cfdb69e46ac35465bd25acc00eda8a1d03e5ea9e56e06884c7bebf95c5",
+          "src/indexer/source_writer_probe/advisory_tests.rs": "6ff5f78ef7885b2dc7734296b8bb04d5ca36622473368869feacce81e51c39dd",
+          "src/indexer/source_writer_probe/tests.rs": "2adf7fe718275991b43326651abe0eb5ee0266013487d5ccad18a6736ba5bc14",
+          "scripts/guarded_run.py": "4eefab23845a33ad9636f8da5133feace5d0111d4abe06fd8df7caccc335dd08",
+          "scripts/run_probe_contract.py": "1d5a1faa8c872c4d7bd257ac819140e1421f363075baa518f19d79eef915928b"
+        }
+      }
+    ],
+    "preparation_qualification": {
+      "diagnostic_snapshot": "Exact f9d7a0a production plus new zero-boundary and advisory-lock tests and their test-only module declarations; original production behavior retained",
+      "probe_inputs": "Complete byte-identical source_writer_probe.rs and all its native tests; frozen negative and fixed source sets with Cargo manifest/lock/toolchain and exact source hashes",
+      "probe_lane_executed": false,
+      "probe_dependency_resolution_executed": false,
+      "root_formatter": {
+        "session_id": 57985,
+        "status": "Parent reported only Session started; terminal result unknown",
+        "format_pass_claimed": false
+      },
+      "last_receipt_shape_followup": "No native snapshot or execution confirmed; implementation owner reported environment loss during its test-file edit"
+    },
+    "not_executed": [
+      "Existing restored baseline Codex runtime tests",
+      "New active B=0/no-LF negative controls",
+      "New advisory-lock FIFO negative and fixed controls",
+      "Fixed Codex candidate runtime tests",
+      "Reduced whole-module writer-probe test lane",
+      "New receipt-shape regressions",
+      "Full CASS indexer/raw-mirror/storage tests",
+      "Real CLI reporter reproduction matrix",
+      "Clippy in this restored attempt",
+      "Rustfmt or formatting check by this validation agent in this restored attempt",
+      "UBS scan or Rust AST engine gate probe in this restored attempt"
+    ],
+    "resources_last_captured": {
+      "disk": {
+        "total": 20957446144,
+        "used": 16202072064,
+        "free": 3664855040
+      },
+      "memory": {
+        "MemTotal": "10206468 kB",
+        "MemAvailable": "1537044 kB"
+      }
+    },
+    "task_owned_disk_last_completed_du_kib": {
+      "live_cass_checkout": 174716,
+      "entire_restored_validation_tree": 1232460
+    },
+    "logs_captured_as_decoded_text": {
+      "dsr-logs/cass-codex-restored-baseline/20261124T102641-Owxu1Nfn/check-1.log": "# dsr quality check\n# argv: python3 /workspace/scratch/94df4d950735/validation-restored-20261124/guarded_run.py --evidence /workspace/scratch/94df4d950735/validation-restored-20261124/evidence/baseline-native -- python3 scripts/test_codex_contract.py\n# cwd: /workspace/scratch/94df4d950735/validation-restored-20261124/baseline-f9d7a0a\n# env: PATH=/workspace/scratch/94df4d950735/validation-restored-20261124/cargo-home/bin:/workspace/scratch/94df4d950735/validation-restored-20261124/tools:/workspace/scratch/94df4d950735/validation-restored-20261124/dsr-source:/home/agent/.cargo/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/override:/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/node/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin:/opt/codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/agent/.local/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/fallback\n# env: DSR_QUALITY_RUN_DIR=/workspace/scratch/94df4d950735/validation-restored-20261124/dsr-logs/cass-codex-restored-baseline/20261124T102641-Owxu1Nfn\n# env: DSR_QUALITY_TIMEOUT=1800\n# env: DSR_CACHE_DIR=/workspace/scratch/94df4d950735/validation-restored-20261124/dsr-cache\n# env: DSR_REPOS_FILE=/workspace/scratch/94df4d950735/validation-restored-20261124/dsr-config/baseline.yaml\n# env: DSR_CURRENT_CMD=quality\n# env: CARGO_TARGET_DIR=/workspace/scratch/94df4d950735/validation-restored-20261124/target\n# env: CARGO_NET_GIT_FETCH_WITH_CLI=true\n# env: DSR_CONFIG_DIR=/workspace/scratch/94df4d950735/validation-restored-20261124/dsr-config\n# env: RUST_MIN_STACK=134217728\n# env: DSR_STATE_DIR=/workspace/scratch/94df4d950735/validation-restored-20261124/dsr-state\n# env: DSR_CURRENT_HOST=\n# env: CARGO_PROFILE_DEV_DEBUG=0\n# env: DSR_KEEP_BUILD_STAGES=1\n# env: DSR_RUN_ID=run-1795534001-5\n# env: CARGO_HOME=/workspace/scratch/94df4d950735/validation-restored-20261124/cargo-home\n# env: CARGO_PROFILE_TEST_DEBUG=0\n# env: RUSTFLAGS=-Zthreads=1\n# env: CARGO_BUILD_JOBS=1\n# env: CARGO_NET_RETRY=1\n# env: RUSTUP_HOME=/workspace/scratch/94df4d950735/validation-restored-20261124/rustup-home\n# env: CARGO_HTTP_USER_AGENT=coding_agent_session_search-agent (+https://github.com/Dicklesworthstone/coding_agent_session_search)\n# env: DSR_CURRENT_TOOL=\n# env: CARGO_HTTP_TIMEOUT=60\n# env: CARGO_INCREMENTAL=0\n# env: DSR_QUALITY_LOG_DIR=/workspace/scratch/94df4d950735/validation-restored-20261124/dsr-logs\n# env: DSR_RUST_NATIVE_ENV_NAMES\n# started_monotonic_ms: 628634\n# timeout_seconds: 1800\n# ----\n    Updating crates.io index\n    Updating git repository `https://github.com/Dicklesworthstone/franken_agent_detection`\n Downloading crates ...\n  Downloaded arrayvec v0.7.8\n  Downloaded bumpalo v3.20.4\n  Downloaded futures-core v0.3.34\n  Downloaded iana-time-zone v0.1.65\n  Downloaded bitflags v2.13.2\n  Downloaded dirs v7.0.0\n  Downloaded wasm-bindgen-macro v0.2.130\n  Downloaded cfg-if v1.0.5\n  Downloaded dotenvy v0.15.7\n  Downloaded chrono v0.4.45\n  Downloaded cpufeatures v0.3.1\n  Downloaded futures-task v0.3.34\n  Downloaded anyhow v1.0.104\n  Downloaded core-foundation-sys v0.8.7\n  Downloaded dirs-sys v0.5.0\n  Downloaded quote v1.0.47\n  Downloaded blake3 v1.8.7\n  Downloaded android_system_properties v0.1.6\n  Downloaded bloomfilter v3.0.2\n  Downloaded proc-macro2 v1.0.107\n  Downloaded cc v1.11.3\n  Downloaded errno v0.3.15\n  Downloaded libredox v0.1.25\n  Downloaded thiserror-impl v2.0.21\n  Downloaded constant_time_eq v0.4.2\n  Downloaded getrandom v0.2.17\n  Downloaded fastrand v2.5.0\n  Downloaded find-msvc-tools v0.1.15\n  Downloaded wasm-bindgen-shared v0.2.130\n  Downloaded jobserver v0.1.35\n  Downloaded getrandom v0.4.3\n  Downloaded windows-link v0.2.1\n  Downloaded rustversion v1.0.23\n  Downloaded windows-implement v0.60.2\n  Downloaded iana-time-zone-haiku v0.1.2\n  Downloaded windows-interface v0.59.3\n  Downloaded pin-project-lite v0.2.18\n  Downloaded wasi v0.11.1+wasi-snapshot-preview1\n  Downloaded option-ext v0.2.0\n  Downloaded same-file v1.0.6\n  Downloaded siphasher v1.0.4\n  Downloaded slab v0.4.12\n  Downloaded thiserror v2.0.21\n  Downloaded walkdir v2.5.1\n  Downloaded winapi-util v0.1.11\n  Downloaded windows-result v0.4.1\n  Downloaded windows-strings v0.5.1\n  Downloaded autocfg v1.5.1\n  Downloaded itoa v1.0.19\n  Downloaded pkg-config v0.3.34\n  Downloaded shlex v2.0.1\n  Downloaded wasm-bindgen-macro-support v0.2.130\n  Downloaded unicode-ident v1.0.27\n  Downloaded zstd v0.13.5\n  Downloaded redox_users v0.5.3\n  Downloaded tracing-attributes v0.1.31\n  Downloaded zmij v1.0.23\n  Downloaded serde_core v1.0.229\n  Downloaded tempfile v3.27.0\n  Downloaded wasm-bindgen v0.2.130\n  Downloaded windows-core v0.62.2\n  Downloaded once_cell v1.21.4\n  Downloaded tracing-core v0.1.36\n  Downloaded serde_derive v1.0.229\n  Downloaded zstd-safe v7.4.1\n  Downloaded num-traits v0.2.19\n  Downloaded r-efi v6.0.0\n  Downloaded memchr v2.8.3\n  Downloaded serde v1.0.229\n  Downloaded log v0.4.35\n  Downloaded futures-util v0.3.34\n  Downloaded js-sys v0.3.107\n  Downloaded serde_json v1.0.154\n  Downloaded syn v2.0.119\n  Downloaded syn v3.0.10\n  Downloaded zstd-sys v2.1.3+zstd.1.5.7\n  Downloaded tracing v0.1.44\n  Downloaded rustix v1.1.5\n  Downloaded libc v0.2.191\n  Downloaded windows-sys v0.61.2\n  Downloaded linux-raw-sys v0.12.1\nVerified FAD 0.3.10: git+https://github.com/Dicklesworthstone/franken_agent_detection?rev=a0dd013a8c1e374d6a80949637e5e51cbb45550b#a0dd013a8c1e374d6a80949637e5e51cbb45550b\n+ /workspace/scratch/94df4d950735/validation-restored-20261124/cargo-home/bin/cargo test --locked --manifest-path /workspace/scratch/94df4d950735/validation-restored-20261124/tmp/cass-codex-contract-dyvvhlfd/Cargo.toml --all-targets --no-fail-fast\n   Compiling libc v0.2.191\n   Compiling proc-macro2 v1.0.107\n   Compiling unicode-ident v1.0.27\n   Compiling quote v1.0.47\n   Compiling jobserver v0.1.35\n   Compiling shlex v2.0.1\n   Compiling find-msvc-tools v0.1.15\n   Compiling cc v1.11.3\n   Compiling pkg-config v0.3.34\n   Compiling zstd-sys v2.1.3+zstd.1.5.7\n   Compiling syn v3.0.10\n   Compiling serde_core v1.0.229\n   Compiling cfg-if v1.0.5\n   Compiling autocfg v1.5.1\nVALIDATION_RESOURCE_RESULT {\"duration_seconds\": 92.059, \"initial_mem_available_kib\": 3506368, \"lowest_mem_available_kib\": 2091008, \"peak_aggregate_rss_kib\": 291564, \"peak_aggregate_vas_kib\": 2754200, \"stop_reason\": \"Memory guard: MemAvailable below 2 GiB\", \"child_returncode\": -15, \"supervisor_returncode\": 125}\n\n# exit_code: 125\n"
+    },
+    "log_qualification": "Captured with Path.read_text(errors='replace') before environment loss; original binary file bytes and final DSR log digests were not separately captured",
+    "previous_artifact_qualification": "The earlier delivery ZIP does not contain these newly generated logs or records",
+    "remote_mutations": "This evidence preservation creates only an unreachable Git blob; no branch/ref/commit or PR changes",
+    "no_local_retries_after_unavailability": true
+  },
+  "captured_execution_blob": "7053befe2a8610dd5bde5ede574d5c2f03c6608f",
+  "captured_execution_sha256": "718716073e1905aa5b9a7765678e9c50a4801ad54282cc45d6bcfcae94071379",
+  "source_identity": [
+    {
+      "path": "src/indexer/source_writer_probe.rs",
+      "git_blob_sha1": "f4a4ea1fb1105aceaaf0a862222e99ef75b49a85",
+      "sha256": "1cb081cfdb69e46ac35465bd25acc00eda8a1d03e5ea9e56e06884c7bebf95c5"
+    },
+    {
+      "path": "src/indexer/source_writer_probe/advisory_tests.rs",
+      "git_blob_sha1": "90b81e4d773a1332b82493d216d4001505b40ff8",
+      "sha256": "6ff5f78ef7885b2dc7734296b8bb04d5ca36622473368869feacce81e51c39dd"
+    },
+    {
+      "path": "src/connectors/codex/source_budget/recovery.rs",
+      "git_blob_sha1": "badafcdbe8e321401f56973298e86a757d3b9a6e",
+      "sha256": "2c60248c0e87d42f81bd11c1b15a88cff37b5e753457f863286be408ae8669ff"
+    },
+    {
+      "path": "src/connectors/codex/stable_prefix.rs",
+      "git_blob_sha1": "53b4b31b500162d0500507f2fe75b695e4613232",
+      "sha256": "a60c8c72c22aead16285899ccdfcba601848ad8a25b5323c141da9da535f098f"
+    },
+    {
+      "path": "src/connectors/codex/stable_prefix/zero_boundary_tests.rs",
+      "git_blob_sha1": "2536b75d1401e490296d131f0c96660f5abe207f",
+      "sha256": "96c142ace88d429dc4e0c1c59fcb7a4bc3032cb4c709031c9d8fcabf86914932"
+    },
+    {
+      "path": "src/connectors/codex/stable_prefix/receipt_shape_tests.rs",
+      "git_blob_sha1": "9a04663667eb99f67873121d4b30ae53a140dab5",
+      "sha256": "c3f9f8c8b0d843e959f29b6f046a1f3dd553c868f7b73fb3cfbaabbfc2cb0379"
+    },
+    {
+      "path": "src/connectors/codex/source_budget/snapshot.rs",
+      "git_blob_sha1": "166d82a7f33af9deef62dcde2c2f1edc3ee32b08",
+      "sha256": "c35cee6ffaf78389eaa8475c6111a0e2cc2f406e1a16a15d251c03f1a8d6a70f"
+    },
+    {
+      "path": "src/indexer/mod.rs",
+      "git_blob_sha1": "ca0af2335458ff213bda2410f49fb91d06fe9e19",
+      "sha256": "acf65d392886cbce71b0a79f9a3cb923efa84f5858df54e7a070304dd4840ed0"
+    },
+    {
+      "path": "src/indexer/source_ledger_tests.rs",
+      "git_blob_sha1": "c4fdefb0b76f80cf52a54e2186e44e61d23d43f7",
+      "sha256": "1160ef6a43728b1baa7b87bb3ec60bc75061294bdf2de7fb763cb6426a15e8be"
+    }
+  ],
+  "recovery": {
+    "byte_identical_to_pre_loss_hash_capture": [
+      "src/indexer/source_writer_probe.rs",
+      "src/indexer/source_writer_probe/advisory_tests.rs",
+      "src/connectors/codex/source_budget/recovery.rs",
+      "src/connectors/codex/source_budget/snapshot.rs"
+    ],
+    "core_no_lf_only_pre_loss_sha256": "fabfed440dde2c3688d8fe63045229efedf4cbc1f93b4481c87ceb8b156e7267",
+    "core_final_adds_post_loss_object_shape_check": true,
+    "zero_boundary_tests": {
+      "regenerated_after_environment_loss": true,
+      "lost_diagnostic_sha256": "6005ed78bdbe967b8a7330a8d4211d028983c3543dc5f44f43b0024b679cb6df",
+      "final_sha256": "96c142ace88d429dc4e0c1c59fcb7a4bc3032cb4c709031c9d8fcabf86914932",
+      "runtime_claim": false
+    },
+    "host_files": "Reconstructed from exact ordered patches against f9d7a0a; final source shape refinement added after environment loss.",
+    "git_diff_check": "Passed on the earlier applied no-LF, strict-control, advisory-probe and initial host-isolation changes. Does not cover every final post-loss byte.",
+    "independent_review": "Reviewed source scopes, API/module visibility, FIFO lock/symlink preservation, receipt-root refusal, exact-key fail-closed markers, and unchanged uncapped-ledger caller."
+  },
+  "prior_gate": {
+    "record": "CODEX_STABLE_PREFIX_VALIDATION_2026-11-24.json",
+    "ubs_status": "Last previously executed UBS gate remains failed; not rerun in this restored attempt.",
+    "applies_to_final_revision": false
+  },
+  "publication": {
+    "branch": "main",
+    "pull_request": false,
+    "dependencies_or_toolchain_changed": false,
+    "github_actions_used": false
+  }
+}
