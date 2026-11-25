@@ -777,12 +777,121 @@ impl Default for ExportOptions {
     }
 }
 
-/// Export search results to the specified format
+/// Prepare an independent sharing copy before formatting or truncating it.
+///
+/// Search titles and snippets can be projections of indexed content. A
+/// credential label may lie outside an excerpt, and highlighting can split
+/// the label or value. When the source needs protection, withhold those
+/// projections rather than trying to certify them independently.
+fn prepare_search_hit_for_export(hit: &SearchHit, privacy: &mut ExportPrivacy) -> SearchHit {
+    let mut prepared = hit.clone();
+    let injections = ExportInjections::default();
+
+    // Decode only Quill's source escaping, once. Strip actual highlight
+    // markers before decoding so escaped source markup stays ordinary text.
+    // Decode ampersands last to avoid recursively interpreting source entities.
+    let visible_snippet = hit
+        .snippet
+        .replace("**", "")
+        .replace("<b>", "")
+        .replace("</b>", "")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    let hidden_injection = [&hit.content, &hit.title, &hit.snippet, &visible_snippet]
+        .into_iter()
+        .any(|text| injections.excludes(text));
+
+    privacy.redact_text(&mut prepared.content);
+    if hidden_injection {
+        prepared.content = "[REDACTED]".to_string();
+    }
+
+    if hidden_injection || prepared.content != hit.content {
+        prepared.title = "[REDACTED]".to_string();
+        prepared.snippet = "[REDACTED]".to_string();
+    } else {
+        // Preserve the original highlighting and entity spelling when clean.
+        let mut protected = visible_snippet.clone();
+        privacy.redact_text(&mut protected);
+        if protected != visible_snippet {
+            prepared.snippet = protected;
+        }
+    }
+
+    for text in [
+        &mut prepared.title,
+        &mut prepared.snippet,
+        &mut prepared.source_path,
+        &mut prepared.agent,
+        &mut prepared.workspace,
+        &mut prepared.source_id,
+        &mut prepared.origin_kind,
+    ] {
+        privacy.redact_text(text);
+    }
+    privacy.redact_optional_text(&mut prepared.workspace_original);
+    privacy.redact_optional_text(&mut prepared.origin_host);
+
+    prepared
+}
+
+/// Project selected search hits for the TUI's default JSON sharing action.
+/// Preserve source identity and numeric metadata while applying the same
+/// sharing policy as the other search-result export formats.
+pub(crate) fn bulk_export_records(hits: &[SearchHit]) -> Vec<Value> {
+    let mut privacy = ExportPrivacy::new(false);
+    hits.iter()
+        .map(|hit| {
+            let hit = prepare_search_hit_for_export(hit, &mut privacy);
+            serde_json::json!({
+                "source_id": hit.source_id,
+                "origin_kind": hit.origin_kind,
+                "origin_host": hit.origin_host,
+                "source_path": hit.source_path,
+                "line_number": hit.line_number,
+                "created_at": hit.created_at,
+                "content_hash": hit.content_hash,
+                "title": hit.title,
+                "agent": hit.agent,
+                "workspace": hit.workspace,
+                "score": hit.score,
+                "snippet": hit.snippet,
+            })
+        })
+        .collect()
+}
+
+/// Export search results with sharing-safe defaults, independently of the
+/// archive's ingestion-time redaction policy.
 pub fn export_results(hits: &[SearchHit], format: ExportFormat, options: &ExportOptions) -> String {
+    let mut privacy = ExportPrivacy::new(false);
+    let prepared: Vec<_> = hits
+        .iter()
+        .map(|hit| {
+            let mut prepared_hit = prepare_search_hit_for_export(hit, &mut privacy);
+            if !options.include_content {
+                prepared_hit.content = String::new();
+            }
+            prepared_hit
+        })
+        .collect();
+    let mut options = options.clone();
+    if options
+        .query
+        .as_deref()
+        .is_some_and(|query| ExportInjections::default().excludes(query))
+    {
+        options.query = Some("[REDACTED]".to_string());
+    }
+    privacy.redact_optional_text(&mut options.query);
+
     match format {
-        ExportFormat::Markdown => export_markdown(hits, options),
-        ExportFormat::Json => export_json(hits, options),
-        ExportFormat::PlainText => export_plain_text(hits, options),
+        ExportFormat::Markdown => export_markdown(&prepared, &options),
+        ExportFormat::Json => export_json(&prepared, &options),
+        ExportFormat::PlainText => export_plain_text(&prepared, &options),
     }
 }
 
@@ -1989,6 +2098,311 @@ mod tests {
             Some(&expected),
             "unexpected JSON field `{key}` in {value}"
         );
+    }
+
+    #[test]
+    fn bulk_export_records_redacts_credentials_in_every_text_surface()
+    -> Result<(), serde_json::Error> {
+        let mut hit = sample_hit();
+        hit.content = "Ordinary message with no credentials.".to_string();
+        hit.title = "Title DB_PASSWORD=fixture-title-credential".to_string();
+        hit.snippet =
+            r#"{"registration_token":"fixture-snippet-credential","status":"ok"}"#.to_string();
+        hit.source_path = "/sessions/password=fixture-path-credential".to_string();
+        hit.agent = "agent api_key=fixture-agent-credential".to_string();
+        hit.workspace = "/projects/password=fixture-workspace-credential".to_string();
+        hit.source_id = "remote_token=fixture-source-credential".to_string();
+        hit.origin_kind = "kind password=fixture-kind-credential".to_string();
+        hit.origin_host = Some("host token=fixture-host-credential".to_string());
+
+        let original = serde_json::to_value(&hit)?;
+        let rows = bulk_export_records(std::slice::from_ref(&hit));
+        let output = serde_json::to_string(&rows)?;
+        for secret in [
+            "fixture-title-credential",
+            "fixture-snippet-credential",
+            "fixture-path-credential",
+            "fixture-agent-credential",
+            "fixture-workspace-credential",
+            "fixture-source-credential",
+            "fixture-kind-credential",
+            "fixture-host-credential",
+        ] {
+            assert!(!output.contains(secret), "bulk export exposed {secret}");
+        }
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["line_number"], 42);
+        assert_eq!(rows[0]["created_at"], 1700000000000_i64);
+        assert_eq!(rows[0]["content_hash"], hit.content_hash);
+        assert_eq!(rows[0]["score"], 8.5);
+        assert!(rows[0].get("content").is_none());
+        assert_eq!(serde_json::to_value(&hit)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn search_result_exports_withhold_cropped_credential_projections()
+    -> Result<(), serde_json::Error> {
+        for (content, secret) in [
+            (
+                "DB_PASSWORD=fixture-cropped-assignment-credential",
+                "fixture-cropped-assignment-credential",
+            ),
+            (
+                r#"{"ok":true,"registration_token":"fixture-cropped-json-credential"}"#,
+                "fixture-cropped-json-credential",
+            ),
+        ] {
+            let mut hit = sample_hit();
+            hit.content = content.to_string();
+            // Neither projection contains the original credential label.
+            hit.title = secret.to_string();
+            hit.snippet = format!("... **{secret}** ...");
+            let original = serde_json::to_value(&hit)?;
+            let options = ExportOptions {
+                include_content: true,
+                query: Some("password=fixture-query-credential".to_string()),
+                max_snippet_len: 12,
+                ..Default::default()
+            };
+
+            for &format in ExportFormat::all() {
+                let output = export_results(std::slice::from_ref(&hit), format, &options);
+                assert!(!output.contains(secret), "{format:?}: {output}");
+                assert!(
+                    !output.contains("fixture-query-credential"),
+                    "{format:?}: {output}"
+                );
+                assert!(output.contains("REDACTED"), "{format:?}: {output}");
+            }
+
+            let rows = bulk_export_records(std::slice::from_ref(&hit));
+            assert_eq!(rows[0]["title"], "[REDACTED]");
+            assert_eq!(rows[0]["snippet"], "[REDACTED]");
+            assert!(!serde_json::to_string(&rows)?.contains(secret));
+            assert_eq!(rows[0]["source_id"], "local");
+            assert_eq!(rows[0]["source_path"], "/path/to/file.jsonl");
+            assert_eq!(serde_json::to_value(&hit)?, original);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn search_result_exports_redact_metadata_before_truncation() {
+        let mut hit = sample_hit();
+        hit.content = "Ordinary searchable content.".to_string();
+        hit.title = "Title password=fixture-title-credential".to_string();
+        hit.snippet = "password=fixture-snippet-credential".to_string();
+        hit.agent = "agent token=fixture-agent-credential".to_string();
+        hit.workspace = "/project/password=fixture-workspace-credential".to_string();
+        // The Markdown path renderer otherwise keeps only the final 57
+        // characters, which can remove the credential-bearing prefix.
+        hit.source_path = format!(
+            "/sessions/password={}fixture-path-credential",
+            "x".repeat(80)
+        );
+        let options = ExportOptions {
+            include_content: true,
+            query: Some(
+                r#"{"registration_token":"fixture-query-credential","task":"search"}"#.to_string(),
+            ),
+            max_snippet_len: 12,
+            ..Default::default()
+        };
+
+        for &format in ExportFormat::all() {
+            let output = export_results(std::slice::from_ref(&hit), format, &options);
+            for secret in [
+                "fixture-title-credential",
+                "fixture-snippet-credential",
+                "fixture-agent-credential",
+                "fixture-workspace-credential",
+                "fixture-path-credential",
+                "fixture-query-credential",
+            ] {
+                assert!(!output.contains(secret), "{format:?} exposed {secret}");
+            }
+            assert!(
+                output.contains("Ordinary searchable content."),
+                "{format:?}: {output}"
+            );
+        }
+
+        // The original options remain reusable; exporting is not a mutation.
+        assert!(
+            options
+                .query
+                .as_deref()
+                .is_some_and(|query| query.contains("fixture-query-credential"))
+        );
+    }
+
+    #[test]
+    fn search_result_exports_hide_skill_and_reminder_bodies() -> Result<(), serde_json::Error> {
+        for content in [
+            "Base directory for this skill: /private/skills/example\nPROPRIETARY_EXPORT_BODY",
+            "<system-reminder>PROPRIETARY_EXPORT_BODY</system-reminder>",
+            r#"{"skillInjection":{"matchedSkills":["example"],"body":"PROPRIETARY_EXPORT_BODY"}}"#,
+        ] {
+            let mut hit = sample_hit();
+            hit.content = content.to_string();
+            hit.title = "PROPRIETARY_EXPORT_BODY".to_string();
+            hit.snippet = "PROPRIETARY_EXPORT_BODY".to_string();
+            let options = ExportOptions {
+                include_content: true,
+                query: Some("ordinary query".to_string()),
+                ..Default::default()
+            };
+
+            for &format in ExportFormat::all() {
+                let output = export_results(std::slice::from_ref(&hit), format, &options);
+                assert!(
+                    !output.contains("PROPRIETARY_EXPORT_BODY"),
+                    "{format:?}: {output}"
+                );
+                assert!(!output.contains("/private/skills/"), "{format:?}: {output}");
+                assert!(output.contains("ordinary query"), "{format:?}: {output}");
+            }
+
+            let rows = bulk_export_records(std::slice::from_ref(&hit));
+            assert_eq!(rows[0]["title"], "[REDACTED]");
+            assert_eq!(rows[0]["snippet"], "[REDACTED]");
+            assert_eq!(rows[0]["source_path"], "/path/to/file.jsonl");
+            assert!(!serde_json::to_string(&rows)?.contains("PROPRIETARY_EXPORT_BODY"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bulk_export_records_checks_highlighting_without_rewriting_clean_results()
+    -> Result<(), serde_json::Error> {
+        for snippet in [
+            "**DB_PASSWORD**=fixture-highlighted-credential",
+            "DB_PASS**WORD**=fixture-highlighted-credential",
+            "<b>DB_PASSWORD</b>=fixture-highlighted-credential",
+        ] {
+            let mut hit = sample_hit();
+            hit.content.clear();
+            hit.snippet = snippet.to_string();
+            let rows = bulk_export_records(std::slice::from_ref(&hit));
+            assert!(
+                !serde_json::to_string(&rows)?.contains("fixture-highlighted-credential"),
+                "{rows:?}"
+            );
+            assert_eq!(rows[0]["title"], "Test Result");
+        }
+
+        let mut hit = sample_hit();
+        hit.snippet = "Ordinary **highlighted** café 界 text".to_string();
+        hit.source_id = "work-laptop".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("work-laptop".to_string());
+        let rows = bulk_export_records(std::slice::from_ref(&hit));
+        assert_eq!(
+            rows,
+            vec![serde_json::json!({
+                "source_id": "work-laptop",
+                "origin_kind": "ssh",
+                "origin_host": "work-laptop",
+                "source_path": "/path/to/file.jsonl",
+                "line_number": 42,
+                "created_at": 1700000000000_i64,
+                "content_hash": hit.content_hash,
+                "title": "Test Result",
+                "agent": "claude_code",
+                "workspace": "/projects/test",
+                "score": 8.5,
+                "snippet": "Ordinary **highlighted** café 界 text",
+            })]
+        );
+        assert!(bulk_export_records(&[]).is_empty());
+
+        let options = ExportOptions {
+            include_content: true,
+            query: Some("ordinary **query** café 界".to_string()),
+            ..Default::default()
+        };
+        let json: Value = serde_json::from_str(&export_results(
+            std::slice::from_ref(&hit),
+            ExportFormat::Json,
+            &options,
+        ))?;
+        assert_eq!(json["query"], "ordinary **query** café 界");
+        assert_eq!(json["hits"][0]["snippet"], hit.snippet);
+        assert_eq!(json["hits"][0]["content"], "Full content here");
+        assert_eq!(json["count"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn bulk_export_records_hides_highlighted_and_escaped_injections()
+    -> Result<(), serde_json::Error> {
+        for snippet in [
+            "Base **directory for this skill:** /private/skills/example\nPROPRIETARY_HIGHLIGHTED_BODY",
+            "Base <b>directory for this skill:</b> /private/skills/example\nPROPRIETARY_HIGHLIGHTED_BODY",
+            "&lt;system-reminder&gt;PROPRIETARY_HIGHLIGHTED_BODY&lt;/system-reminder&gt;",
+        ] {
+            let mut hit = sample_hit();
+            hit.content.clear();
+            hit.title = "PROPRIETARY_HIGHLIGHTED_BODY".to_string();
+            hit.snippet = snippet.to_string();
+
+            let rows = bulk_export_records(std::slice::from_ref(&hit));
+            assert_eq!(rows[0]["title"], "[REDACTED]");
+            assert_eq!(rows[0]["snippet"], "[REDACTED]");
+            assert!(!serde_json::to_string(&rows)?.contains("PROPRIETARY_HIGHLIGHTED_BODY"));
+
+            for &format in ExportFormat::all() {
+                let output = export_results(
+                    std::slice::from_ref(&hit),
+                    format,
+                    &ExportOptions::default(),
+                );
+                assert!(
+                    !output.contains("PROPRIETARY_HIGHLIGHTED_BODY"),
+                    "{format:?}: {output}"
+                );
+                assert!(!output.contains("/private/skills/"), "{format:?}: {output}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bulk_export_records_inspects_escaped_json_without_double_decoding_clean_text()
+    -> Result<(), serde_json::Error> {
+        for snippet in [
+            "{&quot;registration_token&quot;:&quot;fixture-escaped-credential&quot;}",
+            "{&quot;registration_token&quot;:&quot;fixture-escaped-**credential**&quot;}",
+        ] {
+            let mut hit = sample_hit();
+            hit.content.clear();
+            hit.snippet = snippet.to_string();
+
+            let rows = bulk_export_records(std::slice::from_ref(&hit));
+            let protected_text: String = serde_json::from_value(rows[0]["snippet"].clone())?;
+            let protected: Value = serde_json::from_str(&protected_text)?;
+            assert_eq!(protected["registration_token"], "[REDACTED]");
+
+            for &format in ExportFormat::all() {
+                let output = export_results(
+                    std::slice::from_ref(&hit),
+                    format,
+                    &ExportOptions::default(),
+                );
+                assert!(!output.contains("fixture-escaped-"), "{format:?}: {output}");
+            }
+        }
+
+        let mut hit = sample_hit();
+        hit.content.clear();
+        hit.snippet =
+            "Keep &amp;quot;literal&amp;quot; &amp;lt;system-reminder&amp;gt; labels".to_string();
+        let rows = bulk_export_records(std::slice::from_ref(&hit));
+        assert_eq!(rows[0]["snippet"], hit.snippet);
+        assert_eq!(rows[0]["title"], "Test Result");
+        Ok(())
     }
 
     #[test]

@@ -18891,25 +18891,7 @@ impl super::ftui_adapter::Model for CassApp {
                     }
                     2 => {
                         let selected_hits = self.selected_hits();
-                        let export: Vec<serde_json::Value> = selected_hits
-                            .iter()
-                            .map(|h| {
-                                serde_json::json!({
-                                    "source_id": h.source_id,
-                                    "origin_kind": h.origin_kind,
-                                    "origin_host": h.origin_host,
-                                    "source_path": h.source_path,
-                                    "line_number": h.line_number,
-                                    "created_at": h.created_at,
-                                    "content_hash": h.content_hash,
-                                    "title": h.title,
-                                    "agent": h.agent,
-                                    "workspace": h.workspace,
-                                    "score": h.score,
-                                    "snippet": h.snippet,
-                                })
-                            })
-                            .collect();
+                        let export = crate::export::bulk_export_records(&selected_hits);
                         let count = export.len();
                         match serde_json::to_string_pretty(&export) {
                             Ok(json) => match copy_to_clipboard(&json) {
@@ -36534,6 +36516,16 @@ not jsonl",
         app.panes[0].hits[1].source_id = "work-laptop".to_string();
         app.panes[0].hits[1].origin_kind = "ssh".to_string();
         app.panes[0].hits[1].origin_host = Some("work-laptop".to_string());
+        app.panes[0].hits[0].content = "Ordinary indexed message.".to_string();
+        app.panes[0].hits[0].title = "Title password=fixture-bulk-title-credential".to_string();
+        app.panes[0].hits[0].workspace =
+            "/shared/password=fixture-bulk-workspace-credential".to_string();
+        app.panes[0].hits[0].snippet =
+            "**DB_PASSWORD**=fixture-bulk-highlighted-credential".to_string();
+        app.panes[0].hits[1].content =
+            r#"{"registration_token":"fixture-bulk-body-credential"}"#.to_string();
+        app.panes[0].hits[1].title = "fixture-bulk-body-credential".to_string();
+        app.panes[0].hits[1].snippet = "... fixture-bulk-**body-credential** ...".to_string();
 
         app.selected = app.panes[0]
             .hits
@@ -36553,6 +36545,28 @@ not jsonl",
         assert_eq!(rows[1]["origin_host"], "work-laptop");
         assert!(rows[0].get("content_hash").is_some());
         assert!(rows[1].get("created_at").is_some());
+        // The existing capture checks the model's production export payload;
+        // it does not establish operating-system clipboard integration.
+        for secret in [
+            "fixture-bulk-title-credential",
+            "fixture-bulk-workspace-credential",
+            "fixture-bulk-highlighted-credential",
+            "fixture-bulk-body-credential",
+        ] {
+            assert!(!copied.contains(secret), "bulk action exposed {secret}");
+        }
+        assert_eq!(rows[1]["title"], "[REDACTED]");
+        assert_eq!(rows[1]["snippet"], "[REDACTED]");
+        assert!(
+            app.panes[0].hits[0]
+                .title
+                .contains("fixture-bulk-title-credential")
+        );
+        assert!(
+            app.panes[0].hits[1]
+                .content
+                .contains("fixture-bulk-body-credential")
+        );
     }
 
     #[test]
