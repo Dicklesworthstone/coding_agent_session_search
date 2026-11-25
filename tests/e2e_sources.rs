@@ -6384,3 +6384,120 @@ fn gh520_remote_mirrors_index_structural_agents_end_to_end() {
     assert_eq!(conversation_count(), i64::try_from(first.len()).unwrap());
     tracker.complete();
 }
+
+#[test]
+fn sources_reingest_recovers_wrapped_cline_and_cursor_database() {
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+    use coding_agent_search::sources::sync::path_to_safe_dirname;
+
+    let tracker = tracker_for("sources_reingest_recovers_wrapped_cline_and_cursor_database");
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let config = root.path().join("config");
+    let data = root.path().join("data");
+    fs::create_dir_all(&home).unwrap();
+
+    let cline = "~/Library/Application Support/Cursor/User/globalStorage/saoudrizwan.claude-dev";
+    let cursor = "~/Library/Application Support/Cursor/User/globalStorage/state.vscdb";
+    create_sources_config(
+        &config,
+        &format!(
+            "[[sources]]\nname = 'laptop'\ntype = 'ssh'\nhost = 'laptop.invalid'\npaths = [{cline:?}, {cursor:?}]\n"
+        ),
+    );
+    let mirror = data.join("remotes/laptop/mirror");
+    let task = mirror
+        .join(path_to_safe_dirname(cline))
+        .join("saoudrizwan.claude-dev/tasks/1785542400000");
+    fs::create_dir_all(&task).unwrap();
+    fs::write(
+        task.join("ui_messages.json"),
+        r#"[{"type":"say","say":"text","ts":1785542400000,"text":"clinefidelityneedle"}]"#,
+    )
+    .unwrap();
+
+    let db = mirror
+        .join(path_to_safe_dirname(cursor))
+        .join("state.vscdb");
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/cursor/headers_only_workspace_project_dir.json"
+    ))
+    .unwrap();
+    {
+        let conn =
+            coding_agent_search::franken_sync::Connection::open(db.to_string_lossy().into_owned())
+                .unwrap();
+        conn.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        let rows = std::iter::once((&fixture["composer_key"], &fixture["composer_data"])).chain(
+            fixture["bubble_rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| (&row["key"], &row["value"])),
+        );
+        for (key, value) in rows {
+            conn.execute_compat(
+                "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+                coding_agent_search::franken_sync::params![
+                    key.as_str().unwrap(),
+                    serde_json::to_string(value).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    for _ in 0..2 {
+        let mut cmd = tracker.cass_std_command();
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_RAW_MIRROR", "0")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(&home);
+        tracker.command_environment().apply_to_std(&mut cmd);
+        let output = cmd
+            .args([
+                "sources",
+                "reingest",
+                "--from-mirror",
+                "--source",
+                "laptop",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let db = data.join("agent_search.db");
+    let connection = coding_agent_search::franken_sync::compat::open_with_flags(
+        db.to_str().unwrap(),
+        coding_agent_search::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let records: Vec<(String, String, i64)> = connection
+        .query_map_collect(
+            "SELECT a.slug,c.source_id,count(*) FROM conversations c JOIN agents a ON a.id=c.agent_id GROUP BY 1,2 ORDER BY 1",
+            &[],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        records,
+        [
+            ("cline".into(), "laptop".into(), 1),
+            ("cursor".into(), "laptop".into(), 1)
+        ]
+    );
+}
