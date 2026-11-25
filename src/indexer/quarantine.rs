@@ -150,13 +150,7 @@ impl QuarantineState {
     #[must_use]
     pub fn load(data_dir: &Path) -> Self {
         let path = Self::path(data_dir);
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return Self {
-                storage_version: 1,
-                entries: BTreeMap::new(),
-            };
-        };
-        match serde_json::from_str::<Self>(&text) {
+        match checkpoint::read(&path) {
             Ok(state) => state,
             Err(_) => Self {
                 storage_version: 1,
@@ -171,19 +165,11 @@ impl QuarantineState {
     /// one and then overwrite the only remaining recovery metadata.
     pub(crate) fn load_for_operator(data_dir: &Path) -> std::io::Result<Self> {
         let path = Self::path(data_dir);
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(error) => return Err(error),
-        };
-        serde_json::from_str(&text).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid quarantine state {}: {error}", path.display()),
-            )
-        })
+        match checkpoint::read(&path) {
+            Ok(state) => Ok(state),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Stream, flush and atomically replace the recovery checkpoint. A failed
@@ -300,13 +286,8 @@ pub fn record_connector_line(
     let quarantine_dir = data_dir.join("quarantine");
     std::fs::create_dir_all(&quarantine_dir)?;
     let path = quarantine_dir.join("connector_ingest_lines.json");
-    let mut state: ConnectorLineQuarantineState = match std::fs::read_to_string(&path) {
-        Ok(json) => serde_json::from_str(&json).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid connector quarantine state: {error}"),
-            )
-        })?,
+    let mut state: ConnectorLineQuarantineState = match checkpoint::read(&path) {
+        Ok(state) => state,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
         Err(error) => return Err(error),
     };

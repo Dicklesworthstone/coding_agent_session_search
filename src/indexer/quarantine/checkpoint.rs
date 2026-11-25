@@ -1,16 +1,99 @@
-//! Failure-safe publication for both quarantine recovery ledgers.
+//! Failure-safe reading and publication for both quarantine recovery ledgers.
 //!
 //! Keep writer coordination at the caller: an atomic snapshot is not a merge
 //! of independently loaded states. This layer prevents shared scratch names,
 //! partial serialization and failed publication from damaging the old file.
 
-use std::io::{self, BufWriter, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use tempfile::NamedTempFile;
 
 const BUFFER_BYTES: usize = 8 * 1024;
+
+/// Read one regular checkpoint through a pinned descriptor. A FIFO or device
+/// must not stall indexing before JSON validation, especially while the caller
+/// holds the shared connector-quarantine mutex. No-follow and nonblocking open
+/// flags also cover a path replaced after the initial metadata check.
+///
+/// Stream JSON instead of retaining a second ledger-sized String. The opened
+/// file's length bounds the read even if another process keeps appending; one
+/// sentinel byte detects growth rather than accepting a truncated JSON prefix.
+/// This is a file-read bound, not a limit on the decoded state's heap usage.
+pub(super) fn read<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
+    read_inner(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot read quarantine state {}: {error}", path.display()),
+        )
+    })
+}
+
+fn read_inner<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
+    let observed = fs::symlink_metadata(path)?;
+    if !observed.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "checkpoint must be a regular, non-symlink file",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened checkpoint is not a regular file",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "opened checkpoint is a reparse point",
+            ));
+        }
+    }
+    read_opened(file, metadata.len())
+}
+
+fn read_opened<T: DeserializeOwned>(file: File, admitted_bytes: u64) -> io::Result<T> {
+    let limit = admitted_bytes.checked_add(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "checkpoint length exceeds read limit",
+        )
+    })?;
+    let mut reader = BufReader::with_capacity(BUFFER_BYTES, file.take(limit));
+    let state = serde_json::from_reader(&mut reader).map_err(|error| {
+        let kind = error.io_error_kind().unwrap_or(io::ErrorKind::InvalidData);
+        io::Error::new(kind, error)
+    })?;
+    if limit - reader.get_ref().limit() != admitted_bytes
+        || reader.get_ref().get_ref().metadata()?.len() != admitted_bytes
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "checkpoint length changed during reading; retry the operation",
+        ));
+    }
+    Ok(state)
+}
 
 /// The parent directory must already exist. Encode directly into a bounded
 /// writer instead of allocating a second, ledger-sized JSON String/Vec while
@@ -98,6 +181,198 @@ mod tests {
             chrono::DateTime::from_timestamp(1_774_113_351, 0).unwrap(),
         );
         state
+    }
+
+    #[test]
+    fn checkpoint_read_streams_complete_json_and_keeps_its_opened_file() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("checkpoint.json");
+        let expected = json!({
+            "generation": "old",
+            "value": "x".repeat(BUFFER_BYTES * 3),
+        });
+        fs::write(&path, serde_json::to_vec(&expected)?)?;
+        assert_eq!(read::<Value>(&path)?, expected);
+
+        // Once admitted, replacing the pathname must not switch the reader
+        // to another generation halfway through recovery.
+        let file = File::open(&path)?;
+        let admitted_bytes = file.metadata()?.len();
+        fs::rename(&path, dir.path().join("retained-checkpoint.json"))?;
+        fs::write(&path, br#"{"generation":"new"}"#)?;
+        assert_eq!(read_opened::<Value>(file, admitted_bytes)?, expected);
+        assert_eq!(read::<Value>(&path)?, json!({"generation": "new"}));
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_read_refuses_growth_and_truncation_after_admission() -> io::Result<()> {
+        for grow in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("checkpoint.json");
+            fs::write(&path, br#"{"generation":"original complete checkpoint"}"#)?;
+            let file = File::open(&path)?;
+            let admitted_bytes = file.metadata()?.len();
+            if grow {
+                // Trailing whitespace remains valid JSON. Only checking the
+                // parser result would incorrectly accept the changed file.
+                OpenOptions::new()
+                    .append(true)
+                    .open(&path)?
+                    .write_all(&vec![b' '; BUFFER_BYTES * 4])?;
+            } else {
+                // A shorter, complete document is also a valid JSON value.
+                fs::write(&path, br#"{"generation":"short"}"#)?;
+            }
+            let before = fs::read(&path)?;
+            let error = read_opened::<Value>(file, admitted_bytes).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("length changed"));
+            assert_eq!(fs::read(&path)?, before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_checkpoints_are_preserved_by_both_operator_paths() -> io::Result<()> {
+        for malformed in [
+            b"".as_slice(),
+            b"not JSON",
+            br#"{"entries":[]}"#,
+            br#"{"entries":{}} trailing"#,
+            br#"{"entries":{}} {}"#,
+            &[0xff],
+        ] {
+            let dir = tempfile::tempdir()?;
+            let session_path = QuarantineState::path(dir.path());
+            let quarantine_dir = dir.path().join("quarantine");
+            fs::create_dir(&quarantine_dir)?;
+            let line_path = quarantine_dir.join("connector_ingest_lines.json");
+            fs::write(&session_path, malformed)?;
+            fs::write(&line_path, malformed)?;
+
+            // The indexer keeps its documented best-effort fallback, but
+            // inspection/mutation must preserve the existing recovery ledger.
+            assert!(QuarantineState::load(dir.path()).is_empty());
+            let error = QuarantineState::load_for_operator(dir.path()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            let error = record_connector_line(
+                dir.path(),
+                "codebuff",
+                &dir.path().join("source.jsonl"),
+                1,
+                b"private malformed line",
+                "parse",
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(fs::read(&session_path)?, malformed);
+            assert_eq!(fs::read(&line_path)?, malformed);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonregular_checkpoint_reads_refuse_without_blocking() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        const CHILD_DIRECTORY: &str = "CASS_QUARANTINE_READ_TEST_DIRECTORY";
+        if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+            let directory = std::path::PathBuf::from(directory);
+            let session_path = QuarantineState::path(&directory);
+            let line_path = directory.join("quarantine/connector_ingest_lines.json");
+            let session_type = fs::symlink_metadata(&session_path)?.file_type();
+            let line_type = fs::symlink_metadata(&line_path)?.file_type();
+
+            assert!(QuarantineState::load(&directory).is_empty());
+            let error = QuarantineState::load_for_operator(&directory).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            let error = record_connector_line(
+                &directory,
+                "codebuff",
+                &directory.join("source.jsonl"),
+                1,
+                b"private malformed line",
+                "parse",
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(fs::symlink_metadata(&session_path)?.file_type(), session_type);
+            assert_eq!(fs::symlink_metadata(&line_path)?.file_type(), line_type);
+            assert_eq!(
+                read::<Value>(Path::new("/dev/zero")).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+
+            // The failed connector read must release the shared mutex so a
+            // different provider can still record and checkpoint its input.
+            record_connector_line(
+                &directory.join("healthy"),
+                "gemini",
+                &directory.join("other-source.jsonl"),
+                2,
+                b"another malformed line",
+                "parse",
+            )?;
+            fs::write(directory.join("probe-finished"), b"checked")?;
+            return Ok(());
+        }
+
+        let module = module_path!().split_once("::").unwrap().1;
+        let test_name = format!("{module}::nonregular_checkpoint_reads_refuse_without_blocking");
+        for kind in ["fifo", "socket", "directory", "symlink", "dangling_symlink"] {
+            let dir = tempfile::tempdir()?;
+            fs::create_dir(dir.path().join("quarantine"))?;
+            let target = dir.path().join("retained-target.json");
+            let target_bytes = serde_json::to_vec(&state("retained"))?;
+            fs::write(&target, &target_bytes)?;
+            let mut sockets = Vec::new();
+            for path in [
+                QuarantineState::path(dir.path()),
+                dir.path().join("quarantine/connector_ingest_lines.json"),
+            ] {
+                match kind {
+                    "fifo" => assert!(Command::new("mkfifo").arg(&path).status()?.success()),
+                    "socket" => sockets.push(UnixListener::bind(&path)?),
+                    "directory" => fs::create_dir(&path)?,
+                    "symlink" => symlink(&target, &path)?,
+                    "dangling_symlink" => symlink(dir.path().join("absent"), &path)?,
+                    _ => unreachable!(),
+                }
+            }
+
+            // Run the real public callers in a child: a FIFO regression must
+            // fail within a deadline instead of wedging the whole test suite.
+            let mut child = Command::new(std::env::current_exe()?)
+                .arg(&test_name)
+                .args(["--exact", "--nocapture", "--test-threads=1"])
+                .env(CHILD_DIRECTORY, dir.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    assert!(status.success(), "{kind} checkpoint probe failed: {status}");
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    child.kill()?;
+                    child.wait()?;
+                    panic!("{kind} checkpoint read blocked past the deadline");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Also prove the exact child test ran; zero matched tests is not
+            // evidence that a nonregular checkpoint was rejected.
+            assert_eq!(fs::read(dir.path().join("probe-finished"))?, b"checked");
+            assert_eq!(fs::read(&target)?, target_bytes);
+        }
+        Ok(())
     }
 
     #[test]
