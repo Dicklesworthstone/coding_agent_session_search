@@ -202,8 +202,12 @@ pub(crate) const PRIVATE_KEY_BLOCK_PATTERN: &str = concat!(
 );
 pub(crate) const DATABASE_URL_PATTERN: &str =
     r#"(?i)(?-u:\b)(postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s'"]{8,}"#;
+// Credential labels also use camelCase/PascalCase in YAML, TOML and shell
+// output. Admit the complete identifier before its sensitive suffix, just as
+// structured JSON does. The assignment delimiter must follow that suffix, so
+// token_count, passwordLength and accessKeyCount remain ordinary fields.
 pub(crate) const GENERIC_SECRET_ASSIGNMENT_PATTERN: &str = concat!(
-    r"(?i)(?-u:\b)(?:[A-Za-z0-9]*[_-])*(?:api[ _-]?(?:key|secret|token)|auth[ _-]?token|access[ _-]?(?:token|key)|secret[ _-]?key|session[ _-]?token|password|passwd|passphrase|token|secret|authorization)\s*[:=]\s*",
+    r"(?i)(?-u:\b)[A-Za-z0-9_-]*(?:api[ _-]?(?:key|secret|token)|auth[ _-]?token|access[ _-]?(?:token|key)|secret[ _-]?key|session[ _-]?token|password|passwd|passphrase|token|secret|authorization)\s*[:=]\s*",
     r#"(?:"(?:\\(?s:.)|[^"\\]){4,}(?:"|(?:\\)?\z)|"#,
     r#"'(?:\\(?s:.)|[^'\\]){4,}(?:'|(?:\\)?\z)|[^\s,;}\]]{8,})"#,
 );
@@ -955,9 +959,7 @@ fn redact_mixed_json_fragments(
         // A prose quote can end on a JSON object's first key quote: "{" is a
         // complete string, but consuming it would hide the object's opener.
         // Resume at that inner container, never at every intervening quote.
-        if quoted
-            && let Some(inner) = quoted_container_start(input, start + 1, end, false)
-        {
+        if quoted && let Some(inner) = quoted_container_start(input, start + 1, end, false) {
             if let Ok(keys) = serde_json::from_str::<EmbeddedJsonKeyCheck>(fragment) {
                 // This interpretation is speculative: only the final
                 // ambiguous result, not its decoded fields, is observable.
@@ -999,10 +1001,7 @@ fn redact_mixed_json_fragments(
                 JsonSourceSpan { start, end },
                 inspect_sensitive_values,
             ),
-            Err(_)
-                if quoted
-                    && quoted_container_start(input, start + 1, end, true).is_none() =>
-            {
+            Err(_) if quoted && quoted_container_start(input, start + 1, end, true).is_none() => {
                 // Windows paths and ordinary quoted prose need not be JSON
                 // strings. Without an actual (possibly encoded) container
                 // prefix, keep the original whole-text policy.
@@ -1610,8 +1609,11 @@ mod tests {
 
     #[test]
     fn original_spans_prevent_provider_replacements_from_hiding_outer_credentials() {
+        // Keep this outer label AWS-specific: a generic credential suffix
+        // would independently cover it after the inner replacement shrinks
+        // the value below the AWS pattern's forty-character minimum.
         let shrinking =
-            "awsSecretAccessKey=\"AKIAABCDEFGHIJKLMNOP abcdefghijklmnopqrst\nTAIL\"\nKEEP=public";
+            "awsSigningKey=\"AKIAABCDEFGHIJKLMNOP abcdefghijklmnopqrst\nTAIL\"\nKEEP=public";
         assert!(redact_text_reference(shrinking).contains("TAIL"));
         let private_key = concat!(
             "API_SECRET=-----BEGIN RSA PRIVATE KEY-----\n",
@@ -2197,6 +2199,45 @@ mod tests {
     }
 
     #[test]
+    fn camel_case_credential_assignments_redact_across_text_and_json_paths() {
+        let mut memo = MemoizingRedactor::with_capacity(32);
+        for key in [
+            "clientSecret",
+            "refreshToken",
+            "redisPassword",
+            "tenantApiKey",
+            "serviceAccessToken",
+            "ClientSecret",
+            "RefreshToken",
+            "redispassword",
+        ] {
+            assert!(is_sensitive_json_field(key));
+            for (assignment, suffix) in [
+                (format!("{key}: opaque-camel-fixture"), "\nKEEP=public"),
+                (format!("{key} = 'opaque camel fixture'"), "\nKEEP=public"),
+                (
+                    format!("{key}=\"opaque first line\nopaque second line\""),
+                    "\nKEEP=public",
+                ),
+                (format!("{key}=\"opaque truncated line\nopaque tail\\"), ""),
+            ] {
+                let input = format!("public café 界\n{assignment}{suffix}");
+                let expected = format!("public café 界\n{REDACTED}{suffix}");
+                assert_eq!(redact_text(&input), expected);
+                assert_eq!(redact_content(&input), expected);
+                assert_eq!(redact_json(&json!(input)), json!(expected));
+                // Both the first computation and a cached result must apply
+                // the same policy used for archived and direct-source exports.
+                for _ in 0..2 {
+                    assert_eq!(memo.redact_text(&input), expected);
+                    assert_eq!(memo.redact_content(&input), expected);
+                    assert_eq!(memo.redact_json(&json!(input)), json!(expected));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn gh547_assignment_prefixes_do_not_match_nonsecret_suffixes() {
         let mut memo = MemoizingRedactor::with_capacity(8);
         for input in [
@@ -2206,9 +2247,19 @@ mod tests {
             "MONKEY=ordinaryvalue",
             "TOKENIZER=ordinaryvalue",
             "GITHUB_TOKEN=short",
+            "token_count=1234567890",
+            "passwordLength='ordinary quoted value'",
+            "accessKeyCount=1234567890",
+            "apiKeyLabel='ordinary quoted value'",
+            "keyframe=ordinaryvalue",
+            "publicKey=ordinaryvalue",
+            "monkey=ordinaryvalue",
+            "tokenizer=ordinaryvalue",
         ] {
             assert_eq!(redact_text(input), input);
             assert_eq!(redact_text_reference(input), input);
+            assert_eq!(redact_content(input), input);
+            assert_eq!(redact_json(&json!(input)), json!(input));
             assert_eq!(memo.redact_text(input), input);
             assert_eq!(memo.redact_text(input), input);
         }
@@ -2351,8 +2402,14 @@ mod tests {
         assert_eq!(memo.redact_json(&input), expected);
         let misses = memo.stats().misses;
         let hits = memo.stats().hits;
-        assert!(misses > 0, "the original candidate-bearing text must be checked");
-        assert!(hits > 0, "the repeated plain leaf must reuse its cached result");
+        assert!(
+            misses > 0,
+            "the original candidate-bearing text must be checked"
+        );
+        assert!(
+            hits > 0,
+            "the repeated plain leaf must reuse its cached result"
+        );
         assert_eq!(memo.redact_json(&input), expected);
         assert_eq!(memo.stats().misses, misses);
         assert!(memo.stats().hits > hits);
@@ -2578,7 +2635,8 @@ mod tests {
             redact_json_with_text_redactor(&json!({"content": input}), &mut scalar),
             json!({"content": "before [CUSTOM] after"})
         );
-        let input = r#"before {"registration_token":"PRIVATE_BEGIN"} synthetic-tail PRIVATE_END after"#;
+        let input =
+            r#"before {"registration_token":"PRIVATE_BEGIN"} synthetic-tail PRIVATE_END after"#;
         assert_eq!(
             redact_content_with_text_redactor(input, &mut scalar),
             REDACTED
