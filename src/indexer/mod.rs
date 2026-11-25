@@ -40598,6 +40598,38 @@ fn additional_scan_roots_for_scan_or_watch(
         .collect()
 }
 
+/// Resolve a native input inside an opaque transport bucket while preserving
+/// the configured path on the scan root for ownership and provenance.
+fn native_mirror_scan_path(bucket: PathBuf, configured_path: &str) -> PathBuf {
+    let components: Vec<_> = configured_path.split(['/', '\\']).collect();
+    if components.ends_with(&["Cursor", "User", "globalStorage", "state.vscdb"]) {
+        let database = bucket.join("state.vscdb");
+        if database.symlink_metadata().is_ok_and(|meta| meta.is_file()) {
+            return database;
+        }
+    }
+    if let [
+        ..,
+        "globalStorage",
+        store @ ("saoudrizwan.claude-dev" | "rooveterinaryinc.roo-cline"),
+    ] = components.as_slice()
+    {
+        // Rsync can retain the extension directory. Flat mirrors already
+        // have their tasks directly under the bucket.
+        let nested = bucket.join(store);
+        if !bucket.join("tasks").is_dir()
+            && nested.symlink_metadata().is_ok_and(|meta| meta.is_dir())
+            && nested
+                .join("tasks")
+                .symlink_metadata()
+                .is_ok_and(|meta| meta.is_dir())
+        {
+            return nested;
+        }
+    }
+    bucket
+}
+
 /// When no storage is supplied, discover configured paths without opening the
 /// archive. This permits mirror previews before acquiring the indexing lock.
 pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Vec<ScanRoot> {
@@ -40642,8 +40674,12 @@ fn build_scan_roots_with_missing(
                     let mirror_path = mirror_base.join(&safe_name);
 
                     if mirror_path.exists() {
-                        let mut scan_root = ScanRoot::remote(mirror_path, origin.clone(), platform)
-                            .with_mirrored_source_path(path);
+                        let mut scan_root = ScanRoot::remote(
+                            native_mirror_scan_path(mirror_path, path),
+                            origin.clone(),
+                            platform,
+                        )
+                        .with_mirrored_source_path(path);
                         scan_root.workspace_rewrites = workspace_rewrites.clone();
                         roots.push(scan_root);
                         continue;
@@ -40658,9 +40694,12 @@ fn build_scan_roots_with_missing(
                                 let name = entry.file_name();
                                 let name_str = name.to_string_lossy();
                                 if name_str.ends_with(&safe_suffix) && entry.path().is_dir() {
-                                    let mut scan_root =
-                                        ScanRoot::remote(entry.path(), origin.clone(), platform)
-                                            .with_mirrored_source_path(path);
+                                    let mut scan_root = ScanRoot::remote(
+                                        native_mirror_scan_path(entry.path(), path),
+                                        origin.clone(),
+                                        platform,
+                                    )
+                                    .with_mirrored_source_path(path);
                                     scan_root.workspace_rewrites = workspace_rewrites.clone();
                                     roots.push(scan_root);
                                     break;
@@ -40759,8 +40798,12 @@ fn build_scan_roots_with_missing(
                             kind: source.kind,
                             host: source.host_label.clone(),
                         };
-                        let mut scan_root = ScanRoot::remote(mirror_path, origin, platform)
-                            .with_mirrored_source_path(path);
+                        let mut scan_root = ScanRoot::remote(
+                            native_mirror_scan_path(mirror_path, path),
+                            origin,
+                            platform,
+                        )
+                        .with_mirrored_source_path(path);
                         scan_root.workspace_rewrites = workspace_rewrites.clone();
                         roots.push(scan_root);
                     } else {
