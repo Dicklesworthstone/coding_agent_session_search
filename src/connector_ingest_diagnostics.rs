@@ -2155,7 +2155,7 @@ mod tests {
         use std::os::unix::fs::FileTypeExt;
 
         const CHILD: &str = "CASS_TEST_JSONL_DIAGNOSTIC_FIFO_CHILD";
-        if dotenvy::var(CHILD).as_deref() != Ok("1") {
+        if dotenvy::var(CHILD).ok().as_deref() != Some("1") {
             let output = assert_cmd::Command::new(std::env::current_exe()?)
                 .args([
                     "jsonl_inspection_rejects_non_regular_replacements_without_blocking",

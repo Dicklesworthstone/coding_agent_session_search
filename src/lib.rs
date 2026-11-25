@@ -56042,7 +56042,7 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
     // An explicit source can have been classified under another provider.
     // Check its physical identity before hashing, linking or recapturing it.
     if crate::connectors::zcode::owns_path(path)
-        || fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+        || std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
     {
         match crate::raw_mirror::zcode_source_is_sensitive(path) {
             Ok(true) => {
