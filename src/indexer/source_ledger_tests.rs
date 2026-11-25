@@ -2057,6 +2057,9 @@ fn canonical_refusal_packet_for_provider(
                 "uuid": format!("{name}-{idx}"),
                 "message": {"role": "user", "content": content}
             }),
+            StablePrefixProvider::PiAgent | StablePrefixProvider::Omp => {
+                unreachable!("this fixture exercises Codex and Claude canonical preflight")
+            }
         };
         bytes.push_str(&record.to_string());
         bytes.push('\n');
@@ -2078,6 +2081,9 @@ fn canonical_refusal_packet_for_provider(
             Box::new(crate::connectors::claude_code::ClaudeCodeConnector::new()),
             "claude",
         ),
+        StablePrefixProvider::PiAgent | StablePrefixProvider::Omp => {
+            unreachable!("this fixture exercises Codex and Claude canonical preflight")
+        }
     };
     let (mut packets, mut entries) =
         collect_ledger_scan(connector.as_ref(), &ctx, config, connector_name)?;
@@ -2162,6 +2168,10 @@ fn canonical_refusal_startup_preserves_healthy_sibling_receipts(
     let connector_name = match provider {
         crate::connectors::codex::StablePrefixProvider::Codex => "codex",
         crate::connectors::codex::StablePrefixProvider::ClaudeCode => "claude",
+        crate::connectors::codex::StablePrefixProvider::PiAgent
+        | crate::connectors::codex::StablePrefixProvider::Omp => {
+            unreachable!("this fixture exercises Codex and Claude canonical preflight")
+        }
     };
     let _env = CanonicalRefusalTestEnv::new(false);
     for remote in [false, true] {

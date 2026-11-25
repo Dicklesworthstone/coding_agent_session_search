@@ -110,14 +110,15 @@ impl WatchSourceLedger {
         &self,
         conversation: &mut NormalizedConversation,
     ) -> Result<()> {
-        let packet_has_prefix = conversation
-            .metadata
-            .pointer("/cass/codex_stable_prefix")
-            .is_some()
-            || conversation
-                .metadata
-                .pointer("/cass/claude_stable_prefix")
-                .is_some();
+        let packet_has_prefix = crate::connectors::codex::StablePrefixProvider::ALL
+            .iter()
+            .any(|provider| {
+                conversation
+                    .metadata
+                    .get("cass")
+                    .and_then(|cass| cass.get(provider.metadata_key()))
+                    .is_some()
+            });
         let completion = self
             .completions
             .get(&conversation.source_path)

@@ -33,8 +33,23 @@ impl Fixture {
         let source = directory.path().join(match provider {
             StablePrefixProvider::Codex => "rollout-legacy-admission.jsonl",
             StablePrefixProvider::ClaudeCode => "claude-legacy-admission.jsonl",
+            StablePrefixProvider::PiAgent => ".pi/agent/sessions/project/legacy_admission.jsonl",
+            StablePrefixProvider::Omp => ".omp/agent/sessions/project/legacy_admission.jsonl",
         });
+        std::fs::create_dir_all(source.parent().unwrap())?;
         let mut bytes = String::new();
+        if matches!(
+            provider,
+            StablePrefixProvider::PiAgent | StablePrefixProvider::Omp
+        ) {
+            bytes.push_str(
+                &serde_json::json!({
+                    "type":"session", "id":"pi-family-canonical-prefix", "version":3
+                })
+                .to_string(),
+            );
+            bytes.push('\n');
+        }
         for idx in 0..count {
             let content = if repeated {
                 "repeat the same legitimate record".to_owned()
@@ -48,6 +63,10 @@ impl Fixture {
                 }),
                 StablePrefixProvider::ClaudeCode => serde_json::json!({
                     "type": "user", "uuid": format!("claude-prefix-{idx}"),
+                    "message": {"role": "user", "content": content}
+                }),
+                StablePrefixProvider::PiAgent | StablePrefixProvider::Omp => serde_json::json!({
+                    "type": "message", "id": format!("pi-prefix-{idx}"),
                     "message": {"role": "user", "content": content}
                 }),
             };
@@ -70,6 +89,12 @@ impl Fixture {
             }
             StablePrefixProvider::ClaudeCode => {
                 crate::connectors::claude_code::ClaudeCodeConnector::new().scan(&ctx)?
+            }
+            StablePrefixProvider::PiAgent => {
+                crate::connectors::pi_agent::PiAgentConnector::new().scan(&ctx)?
+            }
+            StablePrefixProvider::Omp => {
+                crate::connectors::omp::OmpConnector::new().scan(&ctx)?
             }
         };
         assert_eq!(normalized.len(), 1);

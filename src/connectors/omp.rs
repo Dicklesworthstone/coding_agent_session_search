@@ -5,16 +5,148 @@
 //! discovery that must agree across detection, indexing, and watch scans. It
 //! also preserves named-profile provenance for direct `sessions` roots.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use franken_agent_detection::connectors::{SourceCompletion, SourceScanHooks};
 
-use super::{
-    Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, ScanContext, ScanRoot,
+use super::codex::stable_prefix::{
+    self, PI_FAMILY_MAX_SOURCE_BYTES, PrefixDeliveryGuard, StablePrefixProvider,
+    StablePrefixSnapshot,
 };
+use super::{
+    Connector, DetectionResult, DiscoveredSourceFile, DiscoveredSourceRole, NormalizedConversation,
+    ScanContext, ScanRoot,
+};
+
+#[cfg(all(test, unix))]
+mod prefix_tests;
+
+pub(crate) fn can_attempt_active_jsonl_source(provider: &str, path: &Path) -> bool {
+    StablePrefixProvider::from_slug(provider).is_some_and(|provider| {
+        matches!(
+            provider,
+            StablePrefixProvider::PiAgent | StablePrefixProvider::Omp
+        ) && stable_prefix::can_attempt_for(provider, path, PI_FAMILY_MAX_SOURCE_BYTES)
+    })
+}
+
+pub(crate) fn guarded_active_jsonl_source(path: &Path) -> bool {
+    stable_prefix::guarded_prefix_delivery_for(StablePrefixProvider::PiAgent, path)
+        || stable_prefix::guarded_prefix_delivery_for(StablePrefixProvider::Omp, path)
+}
+
+/// Consume the same pinned Pi-family parser through a verified immutable view.
+/// Discovery, exclusions and provider ownership have already admitted the
+/// original source; a private pathname never becomes a canonical identity.
+/// Return false only when the ordinary strict parser still owns this source.
+fn scan_prefix_source(
+    ctx: &ScanContext,
+    source: &DiscoveredSourceFile,
+    provider: StablePrefixProvider,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    on_complete: &mut dyn FnMut(&SourceCompletion) -> Result<()>,
+) -> Result<bool> {
+    let previous = stable_prefix::take_previous_prefix_receipt_for(provider, &source.source_path)?;
+    let eligible = source.provider_slug == provider.slug()
+        && !source.origin.is_remote()
+        && source.role == DiscoveredSourceRole::PrimarySessionLog
+        && stable_prefix::eligible_for(provider, &source.source_path);
+    if !eligible {
+        anyhow::ensure!(
+            previous.is_none(),
+            "Pi-family source requires its prior prefix admission; reconciliation is required"
+        );
+        return Ok(false);
+    }
+    let Some(snapshot) = StablePrefixSnapshot::capture_for(
+        provider,
+        &source.source_path,
+        PI_FAMILY_MAX_SOURCE_BYTES,
+        previous.as_ref(),
+        ctx.progress_tick.as_deref(),
+    )?
+    else {
+        return Ok(false);
+    };
+    let sessions = franken_agent_detection::connectors::pi_wire::sessions_dir(&source.scan_root);
+    let Some(mut conversation) = franken_agent_detection::connectors::pi_wire::parse_session_file(
+        snapshot.path(),
+        snapshot
+            .path()
+            .parent()
+            .context("Pi-family parser view has no parent")?,
+        provider.slug(),
+    ) else {
+        snapshot.validate(ctx.progress_tick.as_deref())?;
+        anyhow::ensure!(
+            previous
+                .as_ref()
+                .is_none_or(|receipt| receipt.message_count == 0),
+            "Pi-family source no longer projects its previously published messages"
+        );
+        let evidence = snapshot.receipt_for(None, None)?;
+        if evidence.partial {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Pi-family source remains active or unfinished with no complete messages; retry this source",
+            ).into());
+        }
+        // Match FAD's no-message contract: absence of a conversation does not
+        // certify source completion or advance the durable source ledger.
+        return Ok(true);
+    };
+    snapshot.validate(ctx.progress_tick.as_deref())?;
+    conversation.source_path.clone_from(&source.source_path);
+    conversation.external_id = source
+        .source_path
+        .strip_prefix(&sessions)
+        .ok()
+        .and_then(Path::to_str)
+        .or_else(|| {
+            source
+                .source_path
+                .file_stem()
+                .and_then(|name| name.to_str())
+        })
+        .map(str::to_owned);
+    // The session ID and profile adapters operate on the restored original
+    // path in the common delivery callback, just as on the strict path.
+    let receipt = snapshot.receipt_for(Some(&conversation), previous.as_ref())?;
+    conversation
+        .metadata
+        .as_object_mut()
+        .context("Pi-family parser metadata is not an object")?
+        .entry("cass")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("Pi-family parser CASS metadata is not an object")?
+        .insert(
+            provider.metadata_key().to_owned(),
+            serde_json::to_value(&receipt)?,
+        );
+    {
+        let _delivery = PrefixDeliveryGuard::enter(receipt.clone());
+        on_conversation(conversation)?;
+    }
+    snapshot.validate(ctx.progress_tick.as_deref())?;
+    let receipt = snapshot.finish_receipt(receipt)?;
+    let mut completed_source = source.clone();
+    if receipt.partial {
+        completed_source.size_bytes = None;
+        completed_source.modified_at_ms = None;
+    }
+    let _completion = PrefixDeliveryGuard::enter_completion(receipt);
+    on_complete(&SourceCompletion {
+        source: completed_source,
+        required_sidecars: Vec::new(),
+        conversations_emitted: 1,
+    })?;
+    Ok(true)
+}
 
 pub struct OmpConnector {
     inner: franken_agent_detection::OmpConnector,
@@ -195,9 +327,37 @@ impl PiFamilyOwnership {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         let mut seen = HashSet::new();
+        let provider = StablePrefixProvider::from_slug(agent_slug)
+            .filter(|provider| {
+                matches!(
+                    provider,
+                    StablePrefixProvider::PiAgent | StablePrefixProvider::Omp
+                )
+            })
+            .context("unsupported Pi-family prefix provider")?;
         let should_scan_source = &mut hooks.should_scan_source;
         let on_source_complete = &mut hooks.on_source_complete;
+        let consumer_failed = Cell::new(false);
+        let terminal_error = RefCell::new(None);
+        let failures = RefCell::new(super::codex::SourceAdmissionFailures::default());
+        let complete = RefCell::new(|completion: &SourceCompletion| {
+            on_source_complete
+                .as_mut()
+                .map_or_else(|| Ok(()), |sink| sink(completion))
+                .inspect_err(|_| consumer_failed.set(true))
+        });
+        let prepare = RefCell::new(|mut conversation: NormalizedConversation| {
+            if agent_slug == "omp" {
+                fill_missing_profiles(std::slice::from_mut(&mut conversation), self);
+            }
+            promote_transcript_session_ids(std::slice::from_mut(&mut conversation));
+            on_conversation(conversation).inspect_err(|_| consumer_failed.set(true))
+        });
         let mut should_scan = |source: &DiscoveredSourceFile| {
+            stable_prefix::clear_previous_prefix_receipt();
+            if terminal_error.borrow().is_some() {
+                return false;
+            }
             let owned = match agent_slug {
                 "omp" => self.owner(&source.source_path) == PiFamilyOwner::Omp,
                 "pi_agent" => self.owner(&source.source_path) != PiFamilyOwner::Omp,
@@ -208,35 +368,55 @@ impl PiFamilyOwnership {
             }
             let canonical = fs::canonicalize(&source.source_path)
                 .unwrap_or_else(|_| source.source_path.clone());
-            seen.insert(canonical)
-                && should_scan_source
+            if !seen.insert(canonical)
+                || !should_scan_source
                     .as_mut()
                     .is_none_or(|predicate| predicate(source))
+            {
+                stable_prefix::clear_previous_prefix_receipt();
+                return false;
+            }
+            match scan_prefix_source(
+                ctx,
+                source,
+                provider,
+                &mut |conversation| (prepare.borrow_mut())(conversation),
+                &mut |completion| (complete.borrow_mut())(completion),
+            ) {
+                Ok(consumed) => !consumed,
+                Err(error) => {
+                    if consumer_failed.get() {
+                        *terminal_error.borrow_mut() = Some(error);
+                    } else {
+                        failures.borrow_mut().record(source, error);
+                    }
+                    false
+                }
+            }
         };
-        let mut complete = |completion: &SourceCompletion| {
-            on_source_complete
-                .as_mut()
-                .map_or_else(|| Ok(()), |sink| sink(completion))
-        };
+        let mut forward_complete =
+            |completion: &SourceCompletion| (complete.borrow_mut())(completion);
+        let mut forward_conversation = |conversation| (prepare.borrow_mut())(conversation);
         let mut filtered_hooks = SourceScanHooks {
             should_scan_source: Some(&mut should_scan),
-            on_source_complete: Some(&mut complete),
+            on_source_complete: Some(&mut forward_complete),
         };
-        let mut prepare = |mut conversation: NormalizedConversation| {
-            if agent_slug == "omp" {
-                fill_missing_profiles(std::slice::from_mut(&mut conversation), self);
-            }
-            promote_transcript_session_ids(std::slice::from_mut(&mut conversation));
-            on_conversation(conversation)
-        };
-        connector.scan_with_source_boundaries(ctx, &mut filtered_hooks, &mut prepare)?;
+        connector.scan_with_source_boundaries(
+            ctx,
+            &mut filtered_hooks,
+            &mut forward_conversation,
+        )?;
         franken_agent_detection::connectors::pi_wire::scan_roots_with_boundaries(
             additional_roots,
             ctx,
             agent_slug,
             &mut filtered_hooks,
-            &mut prepare,
-        )
+            &mut forward_conversation,
+        )?;
+        if let Some(error) = terminal_error.into_inner() {
+            return Err(error);
+        }
+        failures.into_inner().finish(Ok(()))
     }
 
     #[must_use]

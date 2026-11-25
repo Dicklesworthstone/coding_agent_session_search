@@ -289,7 +289,14 @@ fn unsupported_formats_empty_input_and_budget_edges_keep_strict_semantics() -> R
     assert!(StablePrefixSnapshot::capture(&path, 1024, None, None)?.is_none());
     fs::write(&path, b"{\"valid\":true}")?;
     assert!(!can_attempt(&path, 1024));
-    assert!(StablePrefixSnapshot::capture(&path, 1024, None, None)?.is_none());
+    let error = match StablePrefixSnapshot::capture(&path, 1024, None, None) {
+        Err(error) => error,
+        Ok(_) => anyhow::bail!("an active first record without LF must retain retry debt"),
+    };
+    assert_eq!(
+        error.downcast_ref::<io::Error>().map(io::Error::kind),
+        Some(io::ErrorKind::UnexpectedEof),
+    );
     Ok(())
 }
 

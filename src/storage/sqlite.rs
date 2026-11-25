@@ -21711,7 +21711,9 @@ impl CodexCanonicalRefusal {
 
 fn source_prefix_packet(conv: &Conversation) -> bool {
     conv.metadata_json.pointer("/cass").is_some_and(|cass| {
-        cass.get("codex_stable_prefix").is_some() || cass.get("claude_stable_prefix").is_some()
+        crate::connectors::codex::StablePrefixProvider::ALL
+            .iter()
+            .any(|provider| cass.get(provider.metadata_key()).is_some())
     })
 }
 
@@ -21891,10 +21893,7 @@ fn franken_plan_source_prefix_overlap<'a>(
                 || cass.get(candidate.metadata_key()).is_some()
         })
     };
-    let providers = [
-        StablePrefixProvider::Codex,
-        StablePrefixProvider::ClaudeCode,
-    ];
+    let providers = StablePrefixProvider::ALL;
     anyhow::ensure!(
         !providers
             .iter()

@@ -3078,37 +3078,41 @@ Re-index affected files
 - **Debounce**: 2 seconds (wait for burst of changes to settle)
 - **Max wait**: 5 seconds (don't wait forever during continuous activity)
 
-The debounce only batches events. On Unix, plain Codex `rollout-*.jsonl` files
-can publish a bounded prefix while a writer continues appending, including a
-writer that keeps its writable descriptor open. Admission fixes a byte limit
+The debounce only batches events. On Unix, regular Codex `rollout-*.jsonl`
+files, primary Claude Code JSONL logs, and local Pi Agent / Oh My Pi `.jsonl`
+logs can publish a bounded prefix while a writer continues appending, including
+a writer that keeps its writable descriptor open. Admission fixes a byte limit
 and captures only records ending in a newline within that limit. The parser
 and enrichment read the same private immutable view; file identity and a
-content hash bind it to the original rollout. Later appends wait for another
+content hash bind it to the original source. Later appends wait for another
 pass. A trailing partial record, even valid JSON without its newline, is not
-admitted by this live-prefix path.
+admitted by this live-prefix path. Pi/OMP retain the pinned parser's 100 MiB
+source limit and preserve native session IDs, branch order, and OMP profiles.
 
 Prefix publication does not certify EOF. Its durable receipt retains the byte
 boundary and normalized-message overlap, and the source stays queued for
 retry without advancing a complete-source watermark. Each retry reparses a
 bounded prefix through the pinned parser and validates the earlier projection
-before the archive's existing message deduplication. Truncation, replacement,
+before canonical message insertion. Truncation, replacement,
 in-place edits, or changes to already published message indices fail closed
 and require source reconciliation. Raw-mirror capture, when enabled, retains
 the same admitted bytes. An advisory lock still defers the source. Settled EOF
 and abandoned-tail recovery retain their existing inactivity checks.
 
-Compressed Codex rollouts, non-Unix systems, and other providers retain their
-existing conservative admission behavior. For sources that remain deferred,
+Compressed Codex rollouts, Claude Desktop sidecars, Pi/OMP SQLite stores and
+remote mirrors, non-Unix systems, and other formats retain their existing
+admission behavior. For sources that remain deferred,
 recent writes wait for `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` (default
 120 seconds), and open-writer or advisory-lock evidence can defer them longer.
-For Claude Code, 123 s, 139 s and 189 s were measured on a synthetic appended
-session. Lowering the window shortens that wait, at the cost of parsing files
+For the earlier conservative Claude Code path, 123 s, 139 s and 189 s were
+measured on a synthetic appended session. Lowering the window shortens that
+wait, at the cost of parsing files
 that may still be changing. No sub-ten-second end-to-end latency is guaranteed
 by the debounce settings.
 
-The Codex change does not qualify the broader multi-provider stable-prefix
+These prefix paths do not qualify the broader multi-provider stable-prefix
 bead or establish a measured watch-to-search latency. See
-[the implementation and qualification notes](docs/planning/CODEX_STABLE_PREFIX_INGEST_2026-11-23.md)
+[the Codex implementation and qualification notes](docs/planning/CODEX_STABLE_PREFIX_INGEST_2026-11-23.md)
 for the byte/receipt contract, regression matrix, and remaining boundaries.
 
 ### Path Classification

@@ -8,10 +8,7 @@ fn receipt_provider_binding_preserves_legacy_codex_and_refuses_cross_parser_mark
     let path = directory.path().join("rollout-shared-name.jsonl");
     fs::write(&path, b"{\"record\":true}\n")?;
     let mut receipts = Vec::new();
-    for provider in [
-        StablePrefixProvider::Codex,
-        StablePrefixProvider::ClaudeCode,
-    ] {
+    for provider in StablePrefixProvider::ALL {
         let snapshot = StablePrefixSnapshot::capture_for(provider, &path, 1024, None, None)?
             .context("complete record")?;
         let receipt = snapshot.receipt_for(None, None)?;
@@ -20,7 +17,7 @@ fn receipt_provider_binding_preserves_legacy_codex_and_refuses_cross_parser_mark
             StablePrefixProvider::Codex => {
                 assert!(!encoded.as_object().unwrap().contains_key("provider"))
             }
-            StablePrefixProvider::ClaudeCode => assert_eq!(encoded["provider"], "claude_code"),
+            _ => assert_eq!(encoded["provider"], provider.slug()),
         }
         let observation = json!({provider.observation_key(): encoded.clone()});
         assert_eq!(observation_receipt(&observation)?, Some(receipt.clone()));
@@ -30,7 +27,7 @@ fn receipt_provider_binding_preserves_legacy_codex_and_refuses_cross_parser_mark
         );
         let other = match provider {
             StablePrefixProvider::Codex => StablePrefixProvider::ClaudeCode,
-            StablePrefixProvider::ClaudeCode => StablePrefixProvider::Codex,
+            _ => StablePrefixProvider::Codex,
         };
         assert!(
             set_previous_prefix_receipt_for(other, &path, Some(&observation.to_string())).is_err()
@@ -95,8 +92,19 @@ fn claude_admission_does_not_expand_codex_or_sidecar_eligibility() -> Result<()>
         StablePrefixProvider::from_slug("claude_code"),
         Some(StablePrefixProvider::ClaudeCode)
     );
-    for provider in ["claude", "pi_agent", "omp", "opencode", "unknown"] {
+    for provider in ["claude", "opencode", "unknown"] {
         assert!(StablePrefixProvider::from_slug(provider).is_none());
+    }
+    for provider in [StablePrefixProvider::PiAgent, StablePrefixProvider::Omp] {
+        assert_eq!(
+            StablePrefixProvider::from_slug(provider.slug()),
+            Some(provider)
+        );
+        assert!(can_attempt_for(provider, &path, 1024));
+        assert!(!can_attempt_for(provider, &rewritten, 1024));
+        let database = directory.path().join("session.sqlite");
+        fs::write(&database, b"SQLite format 3\0")?;
+        assert!(!can_attempt_for(provider, &database, 1024));
     }
     Ok(())
 }

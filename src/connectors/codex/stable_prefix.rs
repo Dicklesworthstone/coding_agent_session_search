@@ -29,13 +29,19 @@ pub(crate) enum StablePrefixProvider {
     #[default]
     Codex,
     ClaudeCode,
+    PiAgent,
+    Omp,
 }
 
 impl StablePrefixProvider {
+    pub(crate) const ALL: [Self; 4] = [Self::Codex, Self::ClaudeCode, Self::PiAgent, Self::Omp];
+
     pub(crate) fn from_slug(slug: &str) -> Option<Self> {
         match slug {
             "codex" => Some(Self::Codex),
             "claude_code" => Some(Self::ClaudeCode),
+            "pi_agent" => Some(Self::PiAgent),
+            "omp" => Some(Self::Omp),
             _ => None,
         }
     }
@@ -44,6 +50,8 @@ impl StablePrefixProvider {
         match self {
             Self::Codex => "codex",
             Self::ClaudeCode => "claude_code",
+            Self::PiAgent => "pi_agent",
+            Self::Omp => "omp",
         }
     }
 
@@ -51,6 +59,8 @@ impl StablePrefixProvider {
         match self {
             Self::Codex => "codex_prefix",
             Self::ClaudeCode => "claude_prefix",
+            Self::PiAgent => "pi_prefix",
+            Self::Omp => "omp_prefix",
         }
     }
 
@@ -58,6 +68,8 @@ impl StablePrefixProvider {
         match self {
             Self::Codex => "codex_stable_prefix",
             Self::ClaudeCode => "claude_stable_prefix",
+            Self::PiAgent => "pi_stable_prefix",
+            Self::Omp => "omp_stable_prefix",
         }
     }
 
@@ -65,6 +77,8 @@ impl StablePrefixProvider {
         match self {
             Self::Codex => "codex_prefix_required",
             Self::ClaudeCode => "claude_prefix_required",
+            Self::PiAgent => "pi_prefix_required",
+            Self::Omp => "omp_prefix_required",
         }
     }
 
@@ -89,6 +103,7 @@ impl StablePrefixProvider {
                         Some("claude-code-sessions" | "local-agent-mode-sessions")
                     )
                 }),
+                Self::PiAgent | Self::Omp => true,
             }
     }
 
@@ -96,9 +111,13 @@ impl StablePrefixProvider {
         match self {
             Self::Codex => super::source_read_budget(path),
             Self::ClaudeCode => crate::connectors::claude_code::source_read_budget(),
+            // The pinned pi_wire parser uses this same 100 MiB read cap.
+            Self::PiAgent | Self::Omp => Ok(PI_FAMILY_MAX_SOURCE_BYTES),
         }
     }
 }
+
+pub(crate) const PI_FAMILY_MAX_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -128,10 +147,7 @@ fn named_receipt(
     key: impl Fn(StablePrefixProvider) -> &'static str,
 ) -> Result<Option<StablePrefixReceipt>> {
     let mut found = None;
-    for provider in [
-        StablePrefixProvider::Codex,
-        StablePrefixProvider::ClaudeCode,
-    ] {
+    for provider in StablePrefixProvider::ALL {
         let Some(value) = object.get(key(provider)) else {
             continue;
         };

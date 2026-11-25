@@ -53,6 +53,105 @@ fn claude_watch_prefix_fixture(temp: &TempDir) -> Result<(PathBuf, ScanContext)>
 #[cfg(unix)]
 #[test]
 #[serial]
+fn pi_family_prefix_watch_requires_certified_matching_completion() -> Result<()> {
+    use crate::connectors::codex::StablePrefixProvider;
+
+    for provider in [StablePrefixProvider::PiAgent, StablePrefixProvider::Omp] {
+        let temp = TempDir::new()?;
+        let root = temp
+            .path()
+            .join(if provider == StablePrefixProvider::PiAgent {
+                ".pi/agent"
+            } else {
+                ".omp/agent"
+            });
+        let path = root.join("sessions/project/2026-11-24_watch.jsonl");
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type":"message", "id":"first",
+                    "message":{"role":"user", "content":"published prefix"}
+                })
+            ),
+        )?;
+        let _writer = OpenOptions::new().append(true).open(&path)?;
+        let ctx = ScanContext::with_roots(
+            temp.path().join("archive"),
+            vec![ScanRoot::local(root)],
+            None,
+        );
+        let connector: Box<dyn Connector> = if provider == StablePrefixProvider::PiAgent {
+            Box::new(crate::connectors::pi_agent::PiAgentConnector::new())
+        } else {
+            Box::new(crate::connectors::omp::OmpConnector::new())
+        };
+        let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+        let mut ledger = WatchSourceLedger::default();
+        let mut conversations = Vec::new();
+        ledger.scan(
+            connector.as_ref(),
+            provider.slug(),
+            &ctx,
+            &HashMap::new(),
+            true,
+            false,
+            &filter,
+            None,
+            &mut |conversation| {
+                conversations.push(conversation);
+                Ok(true)
+            },
+        )?;
+        assert_eq!(conversations.len(), 1);
+        let conversation = &mut conversations[0];
+        ledger.align_prefix_metadata(conversation)?;
+        assert_eq!(
+            conversation.metadata["cass"][provider.metadata_key()]["partial"],
+            true
+        );
+        assert!(ledger.completed_source_paths().next().is_none());
+        assert!(ledger.may_publish_source(&path));
+
+        let mut completion = ledger.completions.remove(&path).unwrap();
+        assert!(
+            ledger.align_prefix_metadata(conversation).is_err(),
+            "missing completion must refuse a Pi-family packet"
+        );
+        let metadata = conversation.metadata.clone();
+        conversation.metadata["cass"][provider.metadata_key()] = serde_json::Value::Null;
+        assert!(
+            ledger.align_prefix_metadata(conversation).is_err(),
+            "malformed evidence still requires a completion"
+        );
+        conversation.metadata = metadata;
+        completion.certified = false;
+        ledger.completions.insert(path.clone(), completion);
+        assert!(
+            ledger.align_prefix_metadata(conversation).is_err(),
+            "provisional delivery cannot certify publication"
+        );
+        let completion = ledger.completions.get_mut(&path).unwrap();
+        completion.certified = true;
+        let mut saved: serde_json::Value = serde_json::from_str(&completion.entry.observation)?;
+        saved
+            .as_object_mut()
+            .unwrap()
+            .remove(provider.observation_key());
+        completion.entry.observation = saved.to_string();
+        assert!(
+            ledger.align_prefix_metadata(conversation).is_err(),
+            "stripped completion evidence must refuse publication"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
 fn claude_prefix_watch_receipt_survives_publication_while_writer_and_debt_remain() -> Result<()> {
     let temp = TempDir::new()?;
     let (path, ctx) = claude_watch_prefix_fixture(&temp)?;

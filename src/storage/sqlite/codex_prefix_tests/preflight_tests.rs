@@ -314,7 +314,7 @@ fn codex_preflight_success_cannot_bypass_a_later_canonical_conflict() -> Result<
 
 #[test]
 fn codex_preflight_and_writers_reject_a_raced_foreign_derived_lookup() -> Result<()> {
-    for provider in [StablePrefixProvider::Codex, StablePrefixProvider::ClaudeCode] {
+    for provider in StablePrefixProvider::ALL {
         for batched in [false, true] {
             for foreign_dimension in ["source", "agent", "external", "stale-external"] {
                 let fixture = Fixture::for_provider(3, false, true, provider)?;
@@ -331,7 +331,7 @@ fn codex_preflight_and_writers_reject_a_raced_foreign_derived_lookup() -> Result
                     "agent" => {
                         let foreign_slug = match provider {
                             StablePrefixProvider::Codex => "claude_code",
-                            StablePrefixProvider::ClaudeCode => "codex",
+                            _ => "codex",
                         };
                         foreign.agent_slug = foreign_slug.to_owned();
                         foreign_agent = fixture.storage.ensure_agent(&Agent {
@@ -384,7 +384,7 @@ fn codex_preflight_and_writers_reject_a_raced_foreign_derived_lookup() -> Result
                     assert!(error.downcast_ref::<CodexCanonicalRefusal>().is_none());
                     assert!(error.to_string().contains("exact canonical identity"), "{error:#}");
                 } else {
-                    // This Codex-only probe makes no conclusion for Claude,
+                    // This Codex-only probe makes no conclusion for other providers,
                     // including after its generalized write guard rejected.
                     assert!(read_only_probe(&fixture, &fixture.conversation)?.is_none());
                 }

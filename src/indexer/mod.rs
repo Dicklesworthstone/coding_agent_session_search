@@ -213,6 +213,7 @@ fn should_skip_active_session_source(
     should_skip_active_session_source_unless(active_source_filter, source_kind, source_path, || {
         crate::connectors::codex::guarded_active_jsonl_source(source_path)
             || crate::connectors::claude_code::guarded_active_jsonl_source(source_path)
+            || crate::connectors::omp::guarded_active_jsonl_source(source_path)
     })
 }
 
@@ -229,6 +230,9 @@ fn should_skip_active_session_source_before_parse(
             "codex" => crate::connectors::codex::can_attempt_active_jsonl_source(source_path),
             "claude" | "claude_code" => {
                 crate::connectors::claude_code::can_attempt_active_jsonl_source(source_path)
+            }
+            "pi_agent" | "omp" => {
+                crate::connectors::omp::can_attempt_active_jsonl_source(provider, source_path)
             }
             _ => false,
         }
@@ -15728,7 +15732,10 @@ const MAX_CODEX_PREFIX_OBSERVATION_BYTES: usize = 256 * 1024;
 
 fn invalidated_prefix_observation(observation: &str) -> Result<Option<String>> {
     let mut value: serde_json::Value = serde_json::from_str(observation)?;
-    if value.get("codex_prefix").is_none() && value.get("claude_prefix").is_none() {
+    if !crate::connectors::codex::StablePrefixProvider::ALL
+        .iter()
+        .any(|provider| value.get(provider.observation_key()).is_some())
+    {
         return Ok(None);
     }
     anyhow::ensure!(
@@ -16930,6 +16937,8 @@ fn source_exclusive_codex_canonical_refusal<'a>(
     let connector_provider = match connector_name {
         "codex" => crate::connectors::codex::StablePrefixProvider::Codex,
         "claude" | "claude_code" => crate::connectors::codex::StablePrefixProvider::ClaudeCode,
+        "pi_agent" => crate::connectors::codex::StablePrefixProvider::PiAgent,
+        "omp" => crate::connectors::codex::StablePrefixProvider::Omp,
         _ => return None,
     };
     let refusal = error.downcast_ref::<crate::storage::sqlite::CodexCanonicalRefusal>()?;
@@ -41093,7 +41102,8 @@ fn capture_discovered_source_file_before_parse(
     // The bounded parser owns the admitted bytes of a plain source transcript.
     // Capture its exact prefix after parsing instead of a different preflight
     // snapshot (or an unbounded append) under the same source identity.
-    if matches!(provider, "codex" | "claude" | "claude_code")
+    if (matches!(provider, "codex" | "claude" | "claude_code")
+        || (!source.origin.is_remote() && matches!(provider, "pi_agent" | "omp")))
         && source.role == crate::connectors::DiscoveredSourceRole::PrimarySessionLog
         && source
             .source_path
@@ -41285,7 +41295,8 @@ fn capture_scan_root_file_before_parse(
     if !crate::raw_mirror::capture_enabled() || raw_source_exclusions.excludes(&root.path) {
         return false;
     }
-    if matches!(provider, "codex" | "claude" | "claude_code")
+    if (matches!(provider, "codex" | "claude" | "claude_code")
+        || (!root.origin.is_remote() && matches!(provider, "pi_agent" | "omp")))
         && root
             .path
             .extension()
@@ -52261,7 +52272,7 @@ mod tests {
             &path,
             "codex",
         ));
-        for provider in ["gemini", "pi_agent", "omp", "opencode", "unknown"] {
+        for provider in ["gemini", "opencode", "unknown"] {
             assert!(should_skip_active_session_source_before_parse(
                 &filter,
                 SourceKind::Local,
@@ -52386,6 +52397,81 @@ mod tests {
                 SourceKind::Local,
                 &path,
                 provider,
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_pi_family_admission_requires_original_guarded_delivery() -> Result<()> {
+        for provider in ["pi_agent", "omp"] {
+            let tmp = TempDir::new()?;
+            let root = tmp.path().join(if provider == "pi_agent" {
+                ".pi/agent"
+            } else {
+                ".omp/agent"
+            });
+            let path = root.join("sessions/project/2026-11-24_active.jsonl");
+            fs::create_dir_all(path.parent().unwrap())?;
+            let bytes = b"{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"live Pi-family history\"}}\n";
+            fs::write(&path, bytes)?;
+            let _writer = fs::OpenOptions::new().append(true).open(&path)?;
+            let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(Some(
+                Duration::from_secs(3_600),
+            ));
+            assert!(!should_skip_active_session_source_before_parse(
+                &filter,
+                SourceKind::Local,
+                &path,
+                provider
+            ));
+            assert!(should_skip_active_session_source(
+                &filter,
+                SourceKind::Local,
+                &path
+            ));
+            let connector: Box<dyn Connector> = if provider == "pi_agent" {
+                Box::new(crate::connectors::pi_agent::PiAgentConnector::new())
+            } else {
+                Box::new(crate::connectors::omp::OmpConnector::new())
+            };
+            let ctx =
+                ScanContext::with_roots(tmp.path().join("data"), vec![ScanRoot::local(root)], None);
+            let mut delivered = 0;
+            connector.scan_with_callback(&ctx, &mut |conversation| {
+                assert_eq!(conversation.source_path, path);
+                assert_eq!(conversation.agent_slug, provider);
+                assert!(!should_skip_active_session_source(
+                    &filter,
+                    SourceKind::Local,
+                    &path
+                ));
+                assert_eq!(conversation.messages[0].content, "live Pi-family history");
+                delivered += 1;
+                Ok(())
+            })?;
+            assert_eq!(delivered, 1);
+            assert!(should_skip_active_session_source(
+                &filter,
+                SourceKind::Local,
+                &path
+            ));
+            assert_eq!(fs::read(&path)?, bytes);
+            fs::write(&path, &bytes[..bytes.len() - 1])?;
+            assert!(should_skip_active_session_source_before_parse(
+                &filter,
+                SourceKind::Local,
+                &path,
+                provider
+            ));
+            let sqlite = path.with_extension("sqlite");
+            fs::write(&sqlite, b"SQLite format 3\0\n")?;
+            assert!(should_skip_active_session_source_before_parse(
+                &filter,
+                SourceKind::Local,
+                &sqlite,
+                provider
             ));
         }
         Ok(())
