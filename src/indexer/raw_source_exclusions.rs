@@ -85,14 +85,22 @@ impl RawSourceExclusions {
         self.matches_container(&path)
             || canonicalize_existing_prefix(&path)
                 .is_some_and(|canonical| self.matches_container(&canonical))
-            || source_file_id(&path).is_some_and(|identity| self.file_ids.contains(&identity))
     }
 
     fn matches_container(&self, path: &Path) -> bool {
+        let matches_source = |source: &Path| {
+            self.paths.contains(source)
+                || (!self.file_ids.is_empty()
+                    && source_file_id(source)
+                        .is_some_and(|identity| self.file_ids.contains(&identity)))
+        };
         path.ancestors().any(|candidate| {
-            let matched = self.paths.contains(candidate)
+            // A hard-link alias retains a different canonical pathname.
+            // Recognize the protected container's identity beneath virtual
+            // session paths and newly created SQLite sidecars as well.
+            let matched = matches_source(candidate)
                 || sqlite_sidecar_source(candidate)
-                    .is_some_and(|source| self.paths.contains(&source));
+                    .is_some_and(|source| matches_source(&source));
             // A missing virtual ancestor may later return as an ordinary
             // directory. Its other files are not part of a shared container.
             matched && !candidate.is_dir()
@@ -218,6 +226,42 @@ mod tests {
         let missing = RawSourceExclusions::from_paths([alias.join("future/session")]);
         std::fs::write(physical.join("future"), b"newly available shared source")?;
         assert!(missing.excludes(&physical.join("future")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn late_sidecars_of_hard_linked_containers_remain_excluded() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let database = temp.path().join("private.db");
+        let public = temp.path().join("public.db");
+        std::fs::write(&database, b"forgotten private session")?;
+        std::fs::write(&public, b"retained public session")?;
+        let excluded = RawSourceExclusions::from_paths([database.join("forgotten-session")]);
+
+        // The alias and its sidecars appear after the exclusion snapshot.
+        // The database inode is protected, but no sidecar inode or alias
+        // pathname could have been recorded when the snapshot was taken.
+        let alias = temp.path().join("new-hard-link.db");
+        std::fs::hard_link(&database, &alias)?;
+        assert!(excluded.excludes(&alias));
+        assert!(excluded.excludes(&alias.join("retained-sibling")));
+        assert!(!excluded.excludes(&public));
+        assert!(!excluded.excludes(&public.join("retained-sibling")));
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let private_sidecar = temp.path().join(format!("new-hard-link.db{suffix}"));
+            let public_sidecar = temp.path().join(format!("public.db{suffix}"));
+            std::fs::write(&private_sidecar, b"forgotten bytes in a late sidecar")?;
+            std::fs::write(&public_sidecar, b"retained public sidecar")?;
+            let sidecar_alias = temp.path().join(format!("sidecar-alias{suffix}"));
+            std::os::unix::fs::symlink(&private_sidecar, &sidecar_alias)?;
+
+            assert!(excluded.excludes(&private_sidecar), "{suffix}");
+            assert!(excluded.excludes(&sidecar_alias), "{suffix} alias");
+            assert!(!excluded.excludes(&public_sidecar), "{suffix} sibling");
+        }
+        assert_eq!(std::fs::read(&database)?, b"forgotten private session");
+        assert_eq!(std::fs::read(&public)?, b"retained public session");
         Ok(())
     }
 
