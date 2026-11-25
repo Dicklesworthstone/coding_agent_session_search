@@ -257,7 +257,17 @@ impl SemanticIndexArtifact {
         };
         let fsvi_path = freeze(fsvi_path.into());
         let ann_path = ann_path.map(freeze);
-        reject_final_component_symlink("FSVI", &fsvi_path)?;
+        // The legacy engine opens both paths itself. Refuse observed special
+        // files before either blocking open, including an otherwise valid
+        // FSVI whose WAL was replaced by a FIFO. This preflight does not close
+        // the upstream pathname-reopen race; that requires a descriptor-based
+        // constructor or nonblocking opens inside the engine.
+        preflight_semantic_file("FSVI", &fsvi_path, true)?;
+        preflight_semantic_file(
+            "FSVI WAL",
+            &frankensearch::index::wal_path_for(&fsvi_path),
+            false,
+        )?;
         let index = VectorIndex::open_read_only(&fsvi_path)
             .with_context(|| format!("open semantic FSVI {}", fsvi_path.display()))?;
         let ann_unavailable_reason =
@@ -445,17 +455,38 @@ impl SemanticIndexArtifact {
     }
 }
 
-fn reject_final_component_symlink(role: &str, path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
-            "semantic {role} artifact must not be a final-component symlink: {}",
-            path.display()
+/// Reject observed special files without opening or reading their contents.
+/// Missing paths keep the engine's existing missing-index/absent-WAL behavior.
+/// The legacy WAL reader permits symlinks to regular files, unlike the exact
+/// FSVI path; preserve that distinction while checking the actual WAL target.
+fn preflight_semantic_file(
+    role: &str,
+    path: &std::path::Path,
+    reject_symlinks: bool,
+) -> std::io::Result<()> {
+    let metadata = if reject_symlinks {
+        std::fs::symlink_metadata(path)
+    } else {
+        std::fs::metadata(path)
+    };
+    match metadata {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "semantic {role} artifact must not be a final-component symlink: {}",
+                path.display()
+            ),
+        )),
+        Ok(metadata) if !metadata.is_file() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "semantic {role} artifact must be a regular file: {}",
+                path.display()
+            ),
         )),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("inspect semantic {role} path {}", path.display()))
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1080,6 +1111,143 @@ mod tests {
             artifact.ann_unavailable_reason(),
             Some(SemanticAnnUnavailableReason::SidecarMissing)
         );
+    }
+
+    #[test]
+    fn exact_artifact_preflight_preserves_regular_vectors_and_pending_wal() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let fsvi_path = dir.path().join("selected.fsvi");
+        let mut writer = VectorIndex::create_with_revision(
+            &fsvi_path,
+            "fnv1a-2",
+            "regular-artifact-revision",
+            2,
+            Quantization::F16,
+        )?;
+        writer.write_record("main-row", &[1.0, 0.0])?;
+        writer.finish()?;
+        let mut writer = VectorIndex::open_writer(&fsvi_path)?;
+        writer.append("wal-row", &[0.0, 1.0])?;
+        drop(writer);
+
+        let wal_path = frankensearch::index::wal_path_for(&fsvi_path);
+        let fsvi_before = std::fs::read(&fsvi_path)?;
+        let wal_before = std::fs::read(&wal_path)?;
+        let artifact = SemanticIndexArtifact::open(&fsvi_path, None)?;
+        assert_eq!(artifact.index().record_count(), 1);
+        assert_eq!(artifact.index().wal_record_count(), 1);
+        let hits = artifact.index().search_top_k(&[0.0, 1.0], 2, None)?;
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].doc_id, "wal-row");
+        assert_eq!(hits[1].doc_id, "main-row");
+        assert_eq!(std::fs::read(&fsvi_path)?, fsvi_before);
+        assert_eq!(std::fs::read(&wal_path)?, wal_before);
+
+        #[cfg(unix)]
+        {
+            // Existing legacy WAL symlinks to regular files remain readable.
+            // The main FSVI symlink refusal is tested independently below.
+            drop(artifact);
+            let retained_wal = dir.path().join("retained-regular.wal");
+            std::fs::rename(&wal_path, &retained_wal)?;
+            std::os::unix::fs::symlink(&retained_wal, &wal_path)?;
+            let reopened = SemanticIndexArtifact::open(&fsvi_path, None)?;
+            assert_eq!(reopened.index().wal_record_count(), 1);
+            assert_eq!(
+                reopened.index().search_top_k(&[0.0, 1.0], 1, None)?[0].doc_id,
+                "wal-row"
+            );
+            assert_eq!(std::fs::read(&retained_wal)?, wal_before);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_artifact_open_refuses_special_files_without_waiting() -> Result<()> {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        const CHILD_PATH: &str = "CASS_TEST_FSVI_SPECIAL_FILE_PATH";
+        const CHILD_ROLE: &str = "CASS_TEST_FSVI_SPECIAL_FILE_ROLE";
+        if let Ok(path) = dotenvy::var(CHILD_PATH) {
+            let role = dotenvy::var(CHILD_ROLE)?;
+            let error = SemanticIndexArtifact::open(PathBuf::from(path), None)
+                .expect_err("special files must not be admitted as semantic artifacts");
+            assert!(
+                error.to_string().contains(&format!(
+                    "semantic {role} artifact must be a regular file"
+                )),
+                "special-file refusal must identify the rejected role: {error:#}"
+            );
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        for role in ["FSVI", "FSVI WAL"] {
+            for kind in ["fifo", "socket", "directory"] {
+                let fsvi_path = dir.path().join(format!("{}-{kind}.fsvi", role.replace(' ', "-")));
+                let selected_path = if role == "FSVI WAL" {
+                    VectorIndex::create_with_revision(
+                        &fsvi_path,
+                        "fnv1a-2",
+                        "special-wal-revision",
+                        2,
+                        Quantization::F16,
+                    )?
+                    .finish()?;
+                    frankensearch::index::wal_path_for(&fsvi_path)
+                } else {
+                    fsvi_path.clone()
+                };
+                match kind {
+                    "fifo" => {
+                        let status = Command::new("mkfifo").arg(&selected_path).status()?;
+                        anyhow::ensure!(status.success(), "create FIFO test fixture: {status}");
+                    }
+                    "socket" => {
+                        drop(std::os::unix::net::UnixListener::bind(&selected_path)?);
+                    }
+                    "directory" => std::fs::create_dir(&selected_path)?,
+                    _ => unreachable!("test fixture kind"),
+                }
+
+                // Execute the real artifact constructor in a disposable child.
+                // A regression to the engine's blocking FIFO open must fail
+                // within this deadline instead of wedging the whole suite.
+                let test_name = concat!(
+                    "search::vector_index::tests::",
+                    "exact_artifact_open_refuses_special_files_without_waiting"
+                );
+                let mut child = Command::new(std::env::current_exe()?)
+                    .args(["--exact", test_name, "--nocapture"])
+                    .env(CHILD_PATH, &fsvi_path)
+                    .env(CHILD_ROLE, role)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let timed_out = loop {
+                    if child.try_wait()?.is_some() {
+                        break false;
+                    }
+                    if Instant::now() >= deadline {
+                        child.kill()?;
+                        break true;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                let output = child.wait_with_output()?;
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                anyhow::ensure!(
+                    !timed_out && output.status.success() && stdout.contains("1 passed"),
+                    "{role} {kind} admission failed (timed_out={timed_out}): {}\n{}",
+                    stdout,
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+        }
+        Ok(())
     }
 
     #[cfg(unix)]

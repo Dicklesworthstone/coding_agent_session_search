@@ -453,7 +453,7 @@ impl SemanticShardManifest {
 
     pub fn load(data_dir: &Path) -> Result<Option<Self>, ManifestError> {
         let path = Self::path(data_dir);
-        let bytes = match fs::read(&path) {
+        let bytes = match read_semantic_ledger(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
@@ -886,7 +886,7 @@ impl SemanticManifest {
     /// checkpoint save lands and the on-disk shape upgrades.
     pub fn load(data_dir: &Path) -> Result<Option<Self>, ManifestError> {
         let path = Self::path(data_dir);
-        let bytes = match fs::read(&path) {
+        let bytes = match read_semantic_ledger(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
@@ -2705,14 +2705,12 @@ impl SemanticGenerationManifestV1 {
                     }
                 }
             }
-            let file = OpenOptions::new()
-                .read(true)
-                .write(sync_for_seal)
-                .open(&joined)
-                .map_err(|error| SemanticGenerationError::ArtifactIo {
+            let file = open_regular_semantic_file(&joined, sync_for_seal).map_err(|error| {
+                SemanticGenerationError::ArtifactIo {
                     role: artifact.role,
                     source: error.to_string(),
-                })?;
+                }
+            })?;
             let metadata =
                 file.metadata()
                     .map_err(|error| SemanticGenerationError::ArtifactIo {
@@ -4641,7 +4639,7 @@ fn verify_path_still_names_open_file(
     path: &Path,
     expected: Option<PortableFileIdentity>,
 ) -> std::io::Result<()> {
-    let path_file = OpenOptions::new().read(true).open(path)?;
+    let path_file = open_regular_semantic_file(path, false)?;
     let path_metadata = path_file.metadata()?;
     if !path_metadata.is_file() {
         return Err(std::io::Error::new(
@@ -4665,8 +4663,61 @@ fn verify_path_still_names_open_file(
     Ok(())
 }
 
+/// Open an existing semantic asset without waiting for a FIFO peer. Inspect
+/// both the directory entry and the opened descriptor: a pathname check alone
+/// can race replacement before open. Do not create or truncate an asset here.
+fn open_regular_semantic_file(path: &Path, writable: bool) -> std::io::Result<fs::File> {
+    let ensure_regular = |metadata: &fs::Metadata| {
+        if !metadata.is_file() || metadata_is_link_or_reparse(metadata) {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "semantic asset is not a regular file",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    ensure_regular(&fs::symlink_metadata(path)?)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(writable);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    ensure_regular(&file.metadata()?)?;
+    Ok(file)
+}
+
+/// Mutable ledgers have no fixed shard-count limit. Read at most the length
+/// admitted from the opened regular file, plus one byte to detect growth, so a
+/// concurrently appended ledger cannot keep a readiness probe reading forever.
+/// This detects length changes, not same-length in-place rewrites.
+fn read_semantic_ledger(path: &Path) -> std::io::Result<Vec<u8>> {
+    let file = open_regular_semantic_file(path, false)?;
+    let length = file.metadata()?.len();
+    let mut bytes = Vec::new();
+    (&file)
+        .take(length.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != length || file.metadata()?.len() != length {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "semantic ledger changed length while reading",
+        ));
+    }
+    Ok(bytes)
+}
+
 fn read_bounded_file(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
-    let file = fs::File::open(path)?;
+    let file = open_regular_semantic_file(path, false)?;
     let metadata = file.metadata()?;
     let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
     if metadata.len() > max_bytes_u64 {
@@ -4685,6 +4736,140 @@ fn read_bounded_file(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> 
         ));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod file_admission_tests {
+    use super::{open_regular_semantic_file, read_bounded_file, read_semantic_ledger};
+    use std::fs;
+    use std::io::{self, Read};
+
+    #[test]
+    fn regular_semantic_reads_preserve_bytes_and_existing_limits() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("manifest.json");
+        let content = b"{\"manifest_version\":2,\"ordinary\":\"retained\"}\n";
+        fs::write(&path, content)?;
+
+        assert_eq!(read_semantic_ledger(&path)?, content);
+        assert_eq!(read_bounded_file(&path, content.len())?, content);
+        assert_eq!(
+            read_bounded_file(&path, content.len() - 1)
+                .expect_err("oversized manifest must be refused")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut writable = open_regular_semantic_file(&path, true)?;
+        let mut retained = Vec::new();
+        writable.read_to_end(&mut retained)?;
+        assert_eq!(retained, content, "seal admission must not truncate");
+        assert_eq!(fs::read(&path)?, content);
+
+        let empty = directory.path().join("empty.json");
+        fs::write(&empty, [])?;
+        assert!(read_semantic_ledger(&empty)?.is_empty());
+        assert!(read_bounded_file(&empty, 0)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_reads_preserve_missing_and_reject_directories() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let missing = directory.path().join("missing.json");
+        for result in [
+            read_semantic_ledger(&missing),
+            read_bounded_file(&missing, 128),
+        ] {
+            assert_eq!(
+                result.expect_err("missing asset").kind(),
+                io::ErrorKind::NotFound
+            );
+        }
+        for result in [
+            read_semantic_ledger(directory.path()),
+            read_bounded_file(directory.path(), 128),
+        ] {
+            assert_eq!(
+                result.expect_err("directory is not an asset").kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        assert!(!missing.exists(), "read admission must not create files");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semantic_special_files_are_refused_without_waiting() -> io::Result<()> {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        const PROBE_PATH: &str = "CASS_TEST_SEMANTIC_FILE_ADMISSION_PATH";
+        if let Ok(path) = dotenvy::var(PROBE_PATH) {
+            let path = std::path::Path::new(&path);
+            for writable in [false, true] {
+                assert!(open_regular_semantic_file(path, writable).is_err());
+            }
+            assert!(read_semantic_ledger(path).is_err());
+            assert!(read_bounded_file(path, 128).is_err());
+            assert!(super::verify_path_still_names_open_file(path, None).is_err());
+            return Ok(());
+        }
+
+        let directory = tempfile::tempdir()?;
+        let regular = directory.path().join("ordinary.json");
+        fs::write(&regular, b"ordinary retained control")?;
+        let link = directory.path().join("link.json");
+        symlink(&regular, &link)?;
+        let dangling = directory.path().join("dangling.json");
+        symlink(directory.path().join("absent.json"), &dangling)?;
+        let fifo = directory.path().join("fifo.json");
+        assert!(Command::new("mkfifo").arg(&fifo).status()?.success());
+        let socket = directory.path().join("socket.json");
+        let _listener = UnixListener::bind(&socket)?;
+
+        let test_name = std::thread::current()
+            .name()
+            .expect("test thread has its exact test name")
+            .to_owned();
+        for path in [link, dangling, fifo, socket, "/dev/null".into()] {
+            let mut child = Command::new(std::env::current_exe()?)
+                .args(["--exact", &test_name, "--nocapture"])
+                .env(PROBE_PATH, &path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()?;
+            let started = Instant::now();
+            loop {
+                if child.try_wait()?.is_some() {
+                    let output = child.wait_with_output()?;
+                    assert!(
+                        output.status.success(),
+                        "refusal failed for {}",
+                        path.display()
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                        "child must execute the populated file-admission test"
+                    );
+                    break;
+                }
+                if started.elapsed() >= Duration::from_secs(5) {
+                    child.kill()?;
+                    child.wait()?;
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("semantic file admission blocked on {}", path.display()),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(fs::read(&regular)?, b"ordinary retained control");
+        Ok(())
+    }
 }
 
 fn fingerprint_prefix(value: &str) -> &str {
