@@ -322,6 +322,225 @@ fn agent_exclusion_archive_rows_at(db_path: &Path) -> Vec<(i64, String, String, 
     rows
 }
 
+/// A stopped watch spool can contain sessions that never reached canonical
+/// storage. Full recovery must ingest that tail and publish it before clearing
+/// the exact database's debt; rebuilding only existing canonical rows cannot.
+#[test]
+#[cfg(target_os = "linux")]
+fn full_opencode_scan_finishes_interrupted_watch_publication() {
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+    use coding_agent_search::franken_sync::{Connection, params};
+    use std::collections::BTreeMap;
+
+    fn write_store(path: &Path, sessions: &[(&str, &str)]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let connection = Connection::open(path.to_string_lossy().as_ref()).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS session_v2 (
+                id TEXT PRIMARY KEY, title TEXT, directory TEXT, project_id TEXT,
+                time_created INTEGER, time_updated INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS session_message (
+                id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER,
+                data TEXT, time_created INTEGER
+             );",
+            )
+            .unwrap();
+        for (id, body) in sessions {
+            connection.execute_compat(
+                "INSERT INTO session_v2(id, title, directory, project_id, time_created, time_updated)
+                 VALUES (?1, ?1, '/watch-recovery', 'gh578', ?2, ?2)",
+                params![*id, 1_790_000_000_000_i64],
+            ).unwrap();
+            connection
+                .execute_compat(
+                    "INSERT INTO session_message(id, session_id, type, seq, data, time_created)
+                 VALUES (?1, ?2, 'user', 0, ?3, ?4)",
+                    params![
+                        format!("message-{id}"),
+                        *id,
+                        serde_json::json!({"text": body}).to_string(),
+                        1_790_000_000_000_i64
+                    ],
+                )
+                .unwrap();
+        }
+    }
+
+    fn debt(connector: &str, source_id: &str, path: &Path) -> (String, String) {
+        let value = serde_json::json!({
+            "connector": connector, "source_id": source_id, "path": path
+        })
+        .to_string();
+        let key = format!(
+            "watch_lexical_replay_v1:{}",
+            blake3::hash(value.as_bytes()).to_hex()
+        );
+        (key, value)
+    }
+
+    fn save_debts(archive: &Path, records: &[(String, String)]) {
+        let storage = FrankenStorage::open(archive).unwrap();
+        for (key, value) in records {
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)",
+                    params![key.as_str(), value.as_str()],
+                )
+                .unwrap();
+        }
+        storage.close().unwrap();
+    }
+
+    fn read_debts(archive: &Path) -> BTreeMap<String, String> {
+        let storage = FrankenStorage::open_readonly(archive).unwrap();
+        let rows: Vec<(String, String)> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT key, value FROM meta
+             WHERE key >= 'watch_lexical_replay_v1:' AND key < 'watch_lexical_replay_v1;'",
+                &[],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        storage.close_without_checkpoint().unwrap();
+        rows.into_iter().collect()
+    }
+
+    let tracker = tracker_for("full_opencode_scan_finishes_interrupted_watch_publication");
+    for streaming in ["1", "0"] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let config = temp.path().join("config");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&config).unwrap();
+        let archive = data.join("agent_search.db");
+        let primary = home.join(".local/share/opencode/opencode.db");
+        let secondary = home.join(".config/opencode/opencode.db");
+        let empty = config.join("opencode/opencode.db");
+        let failed = temp.path().join("failed.db");
+        write_store(&primary, &[("baseline-578", "watchfullbaseline578")]);
+        write_store(
+            &secondary,
+            &[
+                ("baseline-578", "watchfullsuppressedcopy578"),
+                ("secondary-578", "watchfullsecondary578"),
+            ],
+        );
+        write_store(&empty, &[]);
+        fs::write(&failed, b"not a SQLite database\n").unwrap();
+        let alias = temp.path().join("primary-alias.db");
+        std::os::unix::fs::symlink(&primary, &alias).unwrap();
+
+        let command = || {
+            let mut command = isolated_agent_exclusion_command(&tracker, &home, &config, &data);
+            command.env("CASS_STREAMING_INDEX", streaming);
+            // This failed higher-priority store must not be certified by a
+            // successful native sibling. Its read error is swallowed by FAD.
+            command.env("OPENCODE_SQLITE_DB", &failed);
+            command
+        };
+        let index = |arguments: &[&str]| {
+            command().args(arguments).assert().success();
+        };
+        let hits = |term: &str| -> Vec<Value> {
+            let output = command()
+                .args([
+                    "search",
+                    term,
+                    "--robot",
+                    "--mode",
+                    "lexical",
+                    "--no-daemon",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            serde_json::from_slice::<Value>(&output).unwrap()["hits"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+
+        index(&["index", "--full", "--json"]);
+        assert_eq!(hits("watchfullbaseline578").len(), 1);
+        assert!(hits("watchfullsuppressedcopy578").is_empty());
+        // This session predates the next incremental watermark, just like an
+        // unconsumed historical tail of an interrupted watch callback.
+        write_store(&primary, &[("unconsumed-578", "watchfullunconsumed578")]);
+        let primary_debt = debt("oc", "local", &primary);
+        let alias_debt = debt("OpenCode", "local", &alias);
+        let records = vec![
+            primary_debt.clone(),
+            alias_debt.clone(),
+            debt("oc", "local", &secondary),
+            debt("oc", "local", &empty),
+            debt("oc", "local", &failed),
+            debt("oc", "local", primary.parent().unwrap()),
+            debt("cx", "local", &primary),
+            debt("oc", "different-origin", &primary),
+            (
+                "watch_lexical_replay_v1:unreadable".into(),
+                "{incomplete".into(),
+            ),
+        ];
+        save_debts(&archive, &records);
+        let before = read_debts(&archive);
+
+        index(&["index", "--full", "--force-rebuild", "--json"]);
+        assert_eq!(
+            read_debts(&archive),
+            before,
+            "canonical-only rebuild lacks source coverage"
+        );
+        assert!(hits("watchfullunconsumed578").is_empty());
+        assert!(
+            !agent_exclusion_archive_rows(&data)
+                .iter()
+                .any(|row| row.5.contains("watchfullunconsumed578"))
+        );
+
+        index(&["index", "--full", "--json"]);
+        assert_eq!(hits("watchfullunconsumed578").len(), 1);
+        assert!(
+            agent_exclusion_archive_rows(&data)
+                .iter()
+                .any(|row| row.5.contains("watchfullunconsumed578"))
+        );
+        let mut expected = before;
+        expected.remove(&primary_debt.0);
+        expected.remove(&alias_debt.0);
+        assert_eq!(
+            read_debts(&archive),
+            expected,
+            "clear only the fully consumed and published exact store, preserving all other debt bytes"
+        );
+
+        // A verified unchanged full scan must also finish old publication
+        // debt; no new canonical insert is required to authorize recovery.
+        save_debts(&archive, std::slice::from_ref(&primary_debt));
+        index(&["index", "--full", "--json"]);
+        assert_eq!(read_debts(&archive), expected);
+
+        // Filtering the first DB cannot promote the secondary database into
+        // full coverage, even though it can emit a formerly suppressed ID.
+        save_debts(&archive, std::slice::from_ref(&primary_debt));
+        let excluded_before = read_debts(&archive);
+        command()
+            .env("CASS_EXCLUDE_PATHS", &primary)
+            .args(["index", "--full", "--json"])
+            .assert()
+            .success();
+        assert_eq!(read_debts(&archive), excluded_before);
+    }
+    tracker.complete();
+}
+
 // =============================================================================
 // sources list tests
 // =============================================================================
