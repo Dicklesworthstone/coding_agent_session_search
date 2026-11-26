@@ -1145,6 +1145,7 @@ struct NonWatchIngestOutcome {
     quarantined_conversations: usize,
     lexical_update_deferred: bool,
     scanned_connectors: BTreeSet<String>,
+    opencode_sqlite_coverage: OpenCodeSqliteScanCoverage,
     scan_had_errors: bool,
     /// An admitted mirror source did not certify completion. This includes
     /// legitimate empty sessions, so it prevents root caching without an error.
@@ -1158,6 +1159,8 @@ impl NonWatchIngestOutcome {
         scanned_connectors.extend(other.scanned_connectors);
         let mut deferred_sources = self.deferred_sources;
         deferred_sources.extend(other.deferred_sources);
+        let mut opencode_sqlite_coverage = self.opencode_sqlite_coverage;
+        opencode_sqlite_coverage.merge(other.opencode_sqlite_coverage);
         Self {
             canonical_mutations: self
                 .canonical_mutations
@@ -1167,6 +1170,7 @@ impl NonWatchIngestOutcome {
                 .saturating_add(other.quarantined_conversations),
             lexical_update_deferred: self.lexical_update_deferred || other.lexical_update_deferred,
             scanned_connectors,
+            opencode_sqlite_coverage,
             scan_had_errors: self.scan_had_errors || other.scan_had_errors,
             incomplete_remote_sources: self.incomplete_remote_sources
                 || other.incomplete_remote_sources,
@@ -19845,6 +19849,8 @@ fn run_index_with_storage_ownership(
     let mut scanned_connectors = BTreeSet::new();
     let mut scan_had_errors = false;
     let mut incomplete_remote_sources = false;
+    let mut opencode_sqlite_coverage = OpenCodeSqliteScanCoverage::default();
+    let mut post_scan_lexical_publication_completed = false;
     let mut stale_index_ingest_quarantine_retry_attempted = false;
     let mut deferred_watch_sources = BTreeSet::new();
 
@@ -20639,6 +20645,7 @@ fn run_index_with_storage_ownership(
                         scan_canonical_mutations.accumulate(scan_outcome.canonical_mutations);
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                     scanned_connectors.extend(scan_outcome.scanned_connectors);
+                    opencode_sqlite_coverage.merge(scan_outcome.opencode_sqlite_coverage);
                     scan_had_errors |= scan_outcome.scan_had_errors;
                     incomplete_remote_sources |= scan_outcome.incomplete_remote_sources;
                     deferred_watch_sources.extend(scan_outcome.deferred_sources);
@@ -20662,6 +20669,7 @@ fn run_index_with_storage_ownership(
                         scan_canonical_mutations.accumulate(scan_outcome.canonical_mutations);
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                     scanned_connectors.extend(scan_outcome.scanned_connectors);
+                    opencode_sqlite_coverage.merge(scan_outcome.opencode_sqlite_coverage);
                     scan_had_errors |= scan_outcome.scan_had_errors;
                     incomplete_remote_sources |= scan_outcome.incomplete_remote_sources;
                     deferred_watch_sources.extend(scan_outcome.deferred_sources);
@@ -20723,6 +20731,7 @@ fn run_index_with_storage_ownership(
                         Arc::clone(&progress_bump),
                     )?;
                     exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
+                    post_scan_lexical_publication_completed = true;
                     if let Some(observed_messages) = rebuild.observed_messages {
                         record_exact_total_counts_in_progress(
                             opts.progress.as_ref(),
@@ -20859,6 +20868,7 @@ fn run_index_with_storage_ownership(
                             Arc::clone(&progress_bump),
                         )?;
                         exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
+                        post_scan_lexical_publication_completed = true;
                         // Update stats to reflect the authoritative rebuild
                         // totals. The scan-phase stats tracked only what the
                         // connectors discovered; the DB rebuild is the source of
@@ -21737,6 +21747,31 @@ fn run_index_with_storage_ownership(
                 opts.db_path.display()
             )
         })?;
+    }
+
+    // GH #578: a full source census followed by verified lexical publication
+    // can finish an interrupted watch callback. A canonical-only rebuild or
+    // connector-wide success flag cannot prove that its unread source tail was
+    // consumed; require committed output from the exact SQLite store too.
+    if opts.full
+        && performed_scan
+        && (post_scan_lexical_publication_completed || skipped_noop_full_scan_authoritative_rebuild)
+        && scanned_connectors.contains(ConnectorKind::OpenCode.slug())
+        && !scan_had_errors
+        && !incomplete_remote_sources
+        && deferred_watch_sources.is_empty()
+        && !scan_watermark_preservation_active()
+        && !skip_subagents_active()
+        && WorkspaceExclusions::from_env()?.patterns.is_empty()
+    {
+        let acknowledged =
+            acknowledge_full_scan_opencode_replay_debt(&storage, &opencode_sqlite_coverage)?;
+        if acknowledged > 0 {
+            tracing::info!(
+                acknowledged,
+                "completed OpenCode watch recovery through the full source scan and lexical publication"
+            );
+        }
     }
 
     let fallback_fts_archive_fingerprint = skipped_noop_full_scan_authoritative_rebuild
@@ -31503,6 +31538,7 @@ fn ingest_batch_detailed_with_source_completion(
         quarantined_conversations: 0,
         lexical_update_deferred: batch_outcome.lexical_update_deferred,
         scanned_connectors: BTreeSet::new(),
+        opencode_sqlite_coverage: batch_outcome.opencode_sqlite_coverage,
         scan_had_errors: false,
         incomplete_remote_sources: false,
         deferred_sources: BTreeSet::new(),
@@ -31738,6 +31774,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
             quarantined_conversations: 0,
             lexical_update_deferred: true,
             scanned_connectors: BTreeSet::new(),
+            opencode_sqlite_coverage: OpenCodeSqliteScanCoverage::default(),
             scan_had_errors: true,
             incomplete_remote_sources: false,
             deferred_sources: BTreeSet::from([conv.source_path.clone()]),
@@ -31771,6 +31808,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         quarantined_conversations: 1,
         lexical_update_deferred: true,
         scanned_connectors: BTreeSet::new(),
+        opencode_sqlite_coverage: OpenCodeSqliteScanCoverage::default(),
         scan_had_errors: true,
         incomplete_remote_sources: false,
         deferred_sources: BTreeSet::from([conv.source_path.clone()]),
@@ -38428,6 +38466,145 @@ impl WatchLexicalReplayDebt {
     }
 }
 
+/// Evidence carried only by successful canonical persistence. The pinned
+/// OpenCode reader finishes every required SQLite query before emitting any
+/// conversation from a store; a failed store emits none. This follows its
+/// existing handling of malformed/unsupported individual message forms, not
+/// a claim that every raw row is valid.
+///
+/// Only the first emitted store per origin is eligible: later stores can have
+/// sessions suppressed by the reader's cross-store ID deduplication. An
+/// unresolved identity or any retention filtering makes coverage ineligible
+/// for that origin, including across later batches.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OpenCodeSqliteScanCoverage {
+    first_stores: BTreeMap<String, Option<PathBuf>>,
+}
+
+impl OpenCodeSqliteScanCoverage {
+    fn from_committed_batch(conversations: &[NormalizedConversation], all_retained: bool) -> Self {
+        let mut coverage = Self::default();
+        for conversation in conversations {
+            if conversation.agent_slug != ConnectorKind::OpenCode.slug()
+                || conversation
+                    .metadata
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("sqlite")
+            {
+                continue;
+            }
+            let (source_id, _) = persist::extract_provenance(&conversation.metadata);
+            let store = if all_retained && !conversation.messages.is_empty() {
+                // FAD uses physical_db.join(urlencoded_session_id). Resolve the
+                // actual file, not the nonexistent logical conversation path.
+                conversation
+                    .source_path
+                    .parent()
+                    .and_then(|path| fs::canonicalize(path).ok())
+                    .filter(|store| store.is_file())
+                    .map(|store| crate::normalize_path_identity(&store))
+            } else {
+                None
+            };
+            coverage
+                .first_stores
+                .entry(source_id)
+                .and_modify(|first| {
+                    if store.is_none() {
+                        *first = None;
+                    }
+                })
+                .or_insert(store);
+        }
+        coverage
+    }
+
+    fn merge(&mut self, other: Self) {
+        for (source_id, store) in other.first_stores {
+            self.first_stores
+                .entry(source_id)
+                .and_modify(|first| {
+                    if store.is_none() {
+                        *first = None;
+                    }
+                })
+                .or_insert(store);
+        }
+    }
+
+    fn covers(&self, debt: &WatchLexicalReplayDebt) -> bool {
+        debt.connector == ConnectorKind::OpenCode
+            && !debt.discovery_only
+            && self
+                .first_stores
+                .get(&debt.source_id)
+                .and_then(Option::as_ref)
+                .is_some_and(|store| *store == crate::normalize_path_identity(&debt.path))
+    }
+}
+
+fn acknowledge_full_scan_opencode_replay_debt(
+    storage: &FrankenStorage,
+    coverage: &OpenCodeSqliteScanCoverage,
+) -> Result<usize> {
+    if coverage.first_stores.is_empty() {
+        return Ok(0);
+    }
+    // Retain the stored key/value verbatim. Old origin/path/enum spellings can
+    // identify the same store without hashing to the current serialization.
+    let records: Vec<(String, String)> = storage.raw().query_map_collect(
+        "SELECT key, value FROM meta WHERE key >= ?1 AND key < ?2",
+        &[
+            ParamValue::from(WATCH_LEXICAL_REPLAY_DEBT_PREFIX),
+            ParamValue::from("watch_lexical_replay_v1;"),
+        ],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+    )?;
+    let mut completed = Vec::new();
+    for (key, value) in records {
+        let debt: WatchLexicalReplayDebt = match serde_json::from_str(&value) {
+            Ok(debt) => debt,
+            Err(error) => {
+                tracing::warn!(
+                    key,
+                    error = %error,
+                    "preserving unreadable watch replay debt after full index"
+                );
+                continue;
+            }
+        };
+        if coverage.covers(&debt) {
+            completed.push((key, value));
+        }
+    }
+    if completed.is_empty() {
+        return Ok(0);
+    }
+    persist::with_ephemeral_writer(
+        storage,
+        true,
+        "acknowledging full-scan OpenCode watch recovery",
+        |writer| {
+            let mut tx = writer.raw().transaction()?;
+            let mut acknowledged = 0;
+            for (key, value) in &completed {
+                #[cfg(test)]
+                inject_watch_lexical_test_failure(WatchLexicalTestFault::DebtClear)?;
+                acknowledged += tx.execute_compat(
+                    "DELETE FROM meta WHERE key = ?1 AND value = ?2",
+                    &[
+                        ParamValue::from(key.as_str()),
+                        ParamValue::from(value.as_str()),
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(acknowledged)
+        },
+    )
+}
+
 fn load_watch_lexical_replay_debt(storage: &FrankenStorage) -> Result<Vec<WatchLexicalReplayDebt>> {
     let rows: Vec<String> = storage.raw().query_map_collect(
         "SELECT value FROM meta WHERE key >= ?1 AND key < ?2",
@@ -41920,7 +42097,7 @@ pub mod persist {
     #[cfg(test)]
     use super::WatchLexicalTestFault;
     use super::{
-        LexicalPopulationStrategy, WorkspaceExclusions,
+        LexicalPopulationStrategy, OpenCodeSqliteScanCoverage, WorkspaceExclusions,
         lexical_population_strategy_requires_inline_tantivy,
     };
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -42248,6 +42425,7 @@ pub mod persist {
         /// All successfully persisted identities, including unchanged replay.
         /// Watch recovery cannot infer this set from inserted/revised counts.
         pub canonical_conversation_ids: BTreeSet<i64>,
+        pub(super) opencode_sqlite_coverage: OpenCodeSqliteScanCoverage,
         pub inserted_conversations: usize,
         pub inserted_messages: usize,
         pub updated_messages: usize,
@@ -42315,6 +42493,8 @@ pub mod persist {
         pub(super) fn merge(&mut self, other: Self) {
             self.canonical_conversation_ids
                 .extend(other.canonical_conversation_ids);
+            self.opencode_sqlite_coverage
+                .merge(other.opencode_sqlite_coverage);
             self.updated_messages = self.updated_messages.saturating_add(other.updated_messages);
             self.workspace_changes = self
                 .workspace_changes
@@ -43590,7 +43770,7 @@ pub mod persist {
     /// Looks for `metadata.cass.origin` object with source_id/kind/host fields and
     /// normalizes them the same way the lexical index does so host-only remote
     /// metadata does not get misclassified as local during persistence.
-    fn extract_provenance(metadata: &serde_json::Value) -> (String, Option<String>) {
+    pub(super) fn extract_provenance(metadata: &serde_json::Value) -> (String, Option<String>) {
         let cass_origin = metadata.get("cass").and_then(|c| c.get("origin"));
         let raw_source_id = cass_origin
             .and_then(|o| o.get("source_id"))
@@ -44541,6 +44721,7 @@ pub mod persist {
         source_completion: Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
         limits: PersistSliceLimits,
     ) -> Result<PersistBatchOutcome> {
+        let received = convs;
         let retained;
         let admitted = match retain_admitted_conversations(storage, convs)? {
             Some(kept) => {
@@ -44549,6 +44730,7 @@ pub mod persist {
             }
             None => convs,
         };
+        let all_retained = admitted.len() == received.len();
         if admitted.is_empty() {
             if !convs.is_empty()
                 && let Some(completion) = source_completion
@@ -44563,12 +44745,18 @@ pub mod persist {
                     |writer| writer.record_filtered_source_completion(completion),
                 )?;
             }
-            return Ok(PersistBatchOutcome::default());
+            return Ok(PersistBatchOutcome {
+                opencode_sqlite_coverage: OpenCodeSqliteScanCoverage::from_committed_batch(
+                    received,
+                    all_retained,
+                ),
+                ..PersistBatchOutcome::default()
+            });
         }
         let convs = admitted;
         let oversized = |conv: &NormalizedConversation| should_slice_conversation(conv, limits);
         if !convs.iter().any(oversized) {
-            return persist_conversations_batched_whole(
+            let mut outcome = persist_conversations_batched_whole(
                 storage,
                 t_index,
                 convs,
@@ -44579,7 +44767,10 @@ pub mod persist {
                 true,
                 heartbeat,
                 source_completion,
-            );
+            )?;
+            outcome.opencode_sqlite_coverage =
+                OpenCodeSqliteScanCoverage::from_committed_batch(received, all_retained);
+            return Ok(outcome);
         }
 
         // Runs of ordinary conversations still persist together; each giant
@@ -44687,6 +44878,8 @@ pub mod persist {
             }
             heartbeat.tick();
         }
+        outcome.opencode_sqlite_coverage =
+            OpenCodeSqliteScanCoverage::from_committed_batch(received, all_retained);
         Ok(outcome)
     }
 
@@ -79666,6 +79859,187 @@ c.close()
             fs::metadata(&missed).unwrap().modified().unwrap(),
             source_mtime
         );
+    }
+
+    #[test]
+    fn gh578_full_scan_coverage_keeps_first_store_and_sticky_refusals() -> Result<()> {
+        let temp = TempDir::new()?;
+        let first = temp.path().join("first.db");
+        let later = temp.path().join("later.db");
+        fs::write(&first, b"physical source identity")?;
+        fs::write(&later, b"physical source identity")?;
+        let conversation = |store: &Path, source_id: &str| {
+            let mut conv = norm_conv(Some("session"), vec![norm_msg(0, 1_700_000_000_000)]);
+            conv.agent_slug = "opencode".into();
+            conv.source_path = store.join("session");
+            conv.metadata = serde_json::json!({
+                "source": "sqlite",
+                "cass": {"origin": {"source_id": source_id, "kind": "local"}}
+            });
+            conv
+        };
+        let debt = WatchLexicalReplayDebt::for_root(
+            ConnectorKind::OpenCode,
+            &ScanRoot::local(first.clone()),
+        );
+        let later_debt = WatchLexicalReplayDebt::for_root(
+            ConnectorKind::OpenCode,
+            &ScanRoot::local(later.clone()),
+        );
+        let mut coverage = OpenCodeSqliteScanCoverage::from_committed_batch(
+            &[conversation(&first, LOCAL_SOURCE_ID)],
+            true,
+        );
+        coverage.merge(OpenCodeSqliteScanCoverage::from_committed_batch(
+            &[conversation(&later, LOCAL_SOURCE_ID)],
+            true,
+        ));
+        assert!(coverage.covers(&debt));
+        assert!(
+            !coverage.covers(&later_debt),
+            "deduplicated stores are not fully covered"
+        );
+        assert!(
+            !coverage.covers(&WatchLexicalReplayDebt::for_root(
+                ConnectorKind::OpenCode,
+                &ScanRoot::local(temp.path().to_path_buf()),
+            )),
+            "one database cannot discharge its ancestor's debt"
+        );
+        assert!(!coverage.covers(&WatchLexicalReplayDebt {
+            connector: ConnectorKind::Codex,
+            ..WatchLexicalReplayDebt::for_root(
+                ConnectorKind::OpenCode,
+                &ScanRoot::local(first.clone())
+            )
+        }));
+        assert!(!coverage.covers(&WatchLexicalReplayDebt {
+            source_id: "another-origin".into(),
+            ..WatchLexicalReplayDebt::for_root(
+                ConnectorKind::OpenCode,
+                &ScanRoot::local(first.clone())
+            )
+        }));
+
+        let mut empty = conversation(&later, LOCAL_SOURCE_ID);
+        empty.messages.clear();
+        for refused in [
+            empty,
+            conversation(&temp.path().join("missing.db"), LOCAL_SOURCE_ID),
+        ] {
+            let together = OpenCodeSqliteScanCoverage::from_committed_batch(
+                &[conversation(&first, LOCAL_SOURCE_ID), refused.clone()],
+                true,
+            );
+            let mut split = OpenCodeSqliteScanCoverage::from_committed_batch(
+                &[conversation(&first, LOCAL_SOURCE_ID)],
+                true,
+            );
+            split.merge(OpenCodeSqliteScanCoverage::from_committed_batch(
+                &[refused],
+                true,
+            ));
+            assert_eq!(together, split, "batch boundaries cannot erase a refusal");
+            assert!(!together.covers(&debt));
+        }
+
+        // A later retained subset cannot certify the earlier batch as a full
+        // store read, even when some conversations committed successfully.
+        coverage.merge(OpenCodeSqliteScanCoverage::from_committed_batch(
+            &[conversation(&later, LOCAL_SOURCE_ID)],
+            false,
+        ));
+        assert!(!coverage.covers(&debt));
+        coverage.merge(OpenCodeSqliteScanCoverage::from_committed_batch(
+            &[conversation(&first, LOCAL_SOURCE_ID)],
+            true,
+        ));
+        assert!(
+            !coverage.covers(&debt),
+            "a later batch cannot erase a refusal"
+        );
+
+        let mut unresolved = OpenCodeSqliteScanCoverage::from_committed_batch(
+            &[conversation(
+                &temp.path().join("missing.db"),
+                LOCAL_SOURCE_ID,
+            )],
+            true,
+        );
+        unresolved.merge(OpenCodeSqliteScanCoverage::from_committed_batch(
+            &[conversation(&later, LOCAL_SOURCE_ID)],
+            true,
+        ));
+        assert!(
+            !unresolved.covers(&later_debt),
+            "do not promote a later store"
+        );
+        assert!(!OpenCodeSqliteScanCoverage::default().covers(&debt));
+        Ok(())
+    }
+
+    #[test]
+    fn gh578_full_scan_ack_preserves_saved_keys_and_failure_debt() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store = temp.path().join("opencode.db");
+        fs::write(&store, b"physical source identity")?;
+        let mut conv = norm_conv(Some("session"), vec![norm_msg(0, 1_700_000_000_000)]);
+        conv.agent_slug = "opencode".into();
+        conv.source_path = store.join("session");
+        conv.metadata = serde_json::json!({"source": "sqlite"});
+        let coverage = OpenCodeSqliteScanCoverage::from_committed_batch(&[conv], true);
+        let storage = FrankenStorage::open(&temp.path().join("agent_search.db"))?;
+        // Deliberately retain the legacy enum alias and JSON property ordering:
+        // reserializing the parsed debt would compute a different key/value.
+        let value = serde_json::json!({
+            "path": store,
+            "source_id": LOCAL_SOURCE_ID,
+            "connector": "OpenCode"
+        })
+        .to_string();
+        let key = format!(
+            "{WATCH_LEXICAL_REPLAY_DEBT_PREFIX}{}",
+            blake3::hash(value.as_bytes())
+        );
+        let malformed_key = format!("{WATCH_LEXICAL_REPLAY_DEBT_PREFIX}malformed");
+        storage.raw().execute_compat(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+            &[
+                ParamValue::from(key.as_str()),
+                ParamValue::from(value.as_str()),
+            ],
+        )?;
+        storage.raw().execute_compat(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+            &[
+                ParamValue::from(malformed_key.as_str()),
+                ParamValue::from("incomplete json"),
+            ],
+        )?;
+        let read = |key: &str| -> Result<Vec<String>> {
+            Ok(storage.raw().query_map_collect(
+                "SELECT value FROM meta WHERE key = ?1",
+                &[ParamValue::from(key)],
+                |row| row.get_typed(0),
+            )?)
+        };
+        {
+            let _fault = WatchLexicalFaultGuard::set(WatchLexicalTestFault::DebtClear);
+            assert!(acknowledge_full_scan_opencode_replay_debt(&storage, &coverage).is_err());
+        }
+        assert_eq!(read(&key)?, vec![value]);
+        assert_eq!(
+            acknowledge_full_scan_opencode_replay_debt(&storage, &coverage)?,
+            1
+        );
+        assert!(read(&key)?.is_empty());
+        assert_eq!(read(&malformed_key)?, vec!["incomplete json".to_owned()]);
+        assert_eq!(
+            acknowledge_full_scan_opencode_replay_debt(&storage, &coverage)?,
+            0
+        );
+        storage.close()?;
+        Ok(())
     }
 
     /// txc9h: a replay debt saved under another spelling of the same root
