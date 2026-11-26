@@ -563,6 +563,7 @@ impl WatchSourceLedger {
                             entry,
                             partial: true,
                             certified: false,
+                            capture_pending: false,
                             budget_bytes: bytes,
                         },
                     );
