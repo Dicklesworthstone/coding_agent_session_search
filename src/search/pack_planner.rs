@@ -315,6 +315,10 @@ impl PackCandidate {
         }
     }
 
+    fn is_answer_context(&self) -> bool {
+        self.match_type == "answer_context"
+    }
+
     fn verified_line_range(&self) -> Option<(usize, usize)> {
         if !self.citation_verified {
             return None;
@@ -528,6 +532,7 @@ pub enum PackOmittedReason {
     SourceUnavailable,
     RedactedToEmpty,
     FieldMaskExcluded,
+    ContextNotSelected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1095,7 +1100,10 @@ pub fn plan_answer_pack(
                 first_slot.push(scored);
             }
 
-            if best.as_ref().is_none_or(|current| {
+            // Archive follow-ups are not search matches. Only the anchored
+            // decision-reply check below may select them; otherwise unrelated
+            // turn content could spend spare evidence slots on freshness alone.
+            if !candidate.is_answer_context() && best.as_ref().is_none_or(|current| {
                 candidate_ordering(
                     &scored,
                     &request.candidates[scored.index],
@@ -1219,7 +1227,11 @@ pub fn plan_answer_pack(
         );
         omitted.push(omitted_candidate(
             candidate,
-            PackOmittedReason::MaxEvidenceReached,
+            if candidate.is_answer_context() {
+                PackOmittedReason::ContextNotSelected
+            } else {
+                PackOmittedReason::MaxEvidenceReached
+            },
             score,
         ));
     }
@@ -1691,7 +1703,8 @@ fn preferred_decision_reply(
         .iter()
         .filter_map(|scored| {
             let prompt = &candidates[scored.index];
-            if fingerprints[scored.index] != Some(fingerprint)
+            if prompt.is_answer_context()
+                || fingerprints[scored.index] != Some(fingerprint)
                 || prompt.conversation_id.is_none()
                 || !matches!(
                     prompt.role,
@@ -2243,6 +2256,15 @@ fn readiness_warnings(
     let mut warnings = Vec::new();
     if no_evidence {
         warnings.push("no_evidence_found".to_string());
+    }
+    if request
+        .effective
+        .as_ref()
+        .and_then(|effective| effective.get("answer_context"))
+        .and_then(serde_json::Value::as_str)
+        == Some("unavailable")
+    {
+        warnings.push("answer_context_unavailable".to_string());
     }
     match request.readiness.lexical_readiness {
         PackLexicalReadiness::Ready => {}
@@ -3135,6 +3157,7 @@ fn omitted_reason_label(reason: PackOmittedReason) -> &'static str {
         PackOmittedReason::SourceUnavailable => "source_unavailable",
         PackOmittedReason::RedactedToEmpty => "redacted_to_empty",
         PackOmittedReason::FieldMaskExcluded => "field_mask_excluded",
+        PackOmittedReason::ContextNotSelected => "context_not_selected",
     }
 }
 
@@ -3638,6 +3661,134 @@ mod tests {
         let winner = first(&hits);
         assert_eq!(winner.excerpt, gzip);
         assert_eq!(winner.candidate.source_path, "/s/a.jsonl");
+    }
+
+    #[test]
+    fn unranked_answer_context_can_supply_the_canonical_decision_reply() {
+        let question = "What did we decide about the CSV format for Excel?";
+        let answer = "We chose UTF-8 with a BOM because the customer opens the CSV in Excel.";
+        let prompt = PackCandidate::from_search_hit(
+            &pack_search_hit(question, "/s/decision.jsonl", 1),
+            0,
+            1,
+        );
+        let mut answer_hit = pack_search_hit(answer, "/s/decision.jsonl", 2);
+        answer_hit.line_number = Some(2);
+        let mut reply = PackCandidate::from_search_hit(&answer_hit, 0, 0);
+        reply.match_type = "answer_context".into();
+        reply.lexical_score = None;
+        reply.semantic_score = None;
+        reply.hybrid_rank = None;
+        let mut unrelated_hit = pack_search_hit("The weather is sunny.", "/s/other.jsonl", 3);
+        unrelated_hit.conversation_id = Some(2);
+        unrelated_hit.line_number = Some(2);
+        let mut unrelated = PackCandidate::from_search_hit(&unrelated_hit, 0, 0);
+        unrelated.match_type = "answer_context".into();
+        unrelated.lexical_score = None;
+        unrelated.created_at_ms = Some(1_000_000);
+
+        for max_evidence in [1, 3] {
+            for reverse in [false, true] {
+                let mut candidates = vec![prompt.clone(), reply.clone(), unrelated.clone()];
+                if reverse {
+                    candidates.reverse();
+                }
+                let mut req = request(candidates);
+                req.limits.max_evidence = max_evidence;
+                let plan = plan_answer_pack(req).unwrap();
+                assert_eq!(plan.candidate_count, 3);
+                assert_eq!(plan.evidence[0].candidate, reply);
+                assert_eq!(plan.evidence[0].candidate.message_index, Some(2));
+                assert_eq!(plan.evidence[0].candidate.role, PackEvidenceRole::Unknown);
+                assert_eq!(plan.evidence[0].selection.relevance_score, 0.0);
+                assert_eq!(
+                    plan.evidence[0].selection.selected_reason,
+                    PackSelectedReason::DecisionReply
+                );
+                assert_eq!(plan.evidence.len(), max_evidence.min(2));
+                if max_evidence > 1 {
+                    assert_eq!(plan.evidence[1].candidate, prompt);
+                }
+                assert!(plan.omitted.iter().any(|item| {
+                    item.candidate_id == unrelated.candidate_id
+                        && item.reason == PackOmittedReason::ContextNotSelected
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn answer_context_never_fills_spare_slots_or_anchors_another_reply() {
+        let question = "Which compression codec did we choose for backups?";
+        let answer = "We selected zstd for the backup compression codec.";
+        let prompt = PackCandidate::from_search_hit(
+            &pack_search_hit(question, "/s/decision.jsonl", 1),
+            2,
+            0,
+        );
+        let mut answer_hit = pack_search_hit(answer, "/s/decision.jsonl", 2);
+        answer_hit.line_number = Some(2);
+        let mut reply = PackCandidate::from_search_hit(&answer_hit, 0, 0);
+        reply.match_type = "answer_context".into();
+        reply.lexical_score = None;
+
+        for context in [
+            PackCandidate {
+                excerpt: "I'll check the backup compression codec and get back to you.".into(),
+                ..reply.clone()
+            },
+            PackCandidate {
+                excerpt: "We chose PostgreSQL for account data.".into(),
+                ..reply.clone()
+            },
+            PackCandidate {
+                role: PackEvidenceRole::ToolResult,
+                ..reply.clone()
+            },
+            PackCandidate {
+                message_index: Some(3),
+                ..reply.clone()
+            },
+            PackCandidate {
+                conversation_id: Some(2),
+                ..reply.clone()
+            },
+        ] {
+            let plan = plan_answer_pack(request(vec![prompt.clone(), context.clone()])).unwrap();
+            assert_eq!(plan.evidence.len(), 1);
+            assert_eq!(plan.evidence[0].candidate, prompt);
+            assert_eq!(plan.omitted.len(), 1);
+            assert_eq!(plan.omitted[0].candidate_id, context.candidate_id);
+            assert_eq!(
+                plan.omitted[0].reason,
+                PackOmittedReason::ContextNotSelected
+            );
+        }
+
+        // A context row repeating the question is not an independently
+        // retrieved anchor for another session's reply.
+        let mut repeated_hit = pack_search_hit(question, "/s/other.jsonl", 3);
+        repeated_hit.conversation_id = Some(2);
+        let mut repeated = PackCandidate::from_search_hit(&repeated_hit, 0, 0);
+        repeated.match_type = "answer_context".into();
+        repeated.lexical_score = None;
+        answer_hit.source_path = repeated_hit.source_path;
+        answer_hit.conversation_id = repeated_hit.conversation_id;
+        let mut other_reply = PackCandidate::from_search_hit(&answer_hit, 0, 0);
+        other_reply.match_type = "answer_context".into();
+        other_reply.lexical_score = None;
+        let context_only =
+            plan_answer_pack(request(vec![repeated.clone(), other_reply.clone()])).unwrap();
+        assert!(context_only.evidence.is_empty());
+        assert!(
+            context_only
+                .omitted
+                .iter()
+                .all(|item| { item.reason == PackOmittedReason::ContextNotSelected })
+        );
+        let plan = plan_answer_pack(request(vec![prompt.clone(), repeated, other_reply])).unwrap();
+        assert_eq!(plan.evidence.len(), 1);
+        assert_eq!(plan.evidence[0].candidate, prompt);
     }
 
     #[test]
@@ -4556,6 +4707,69 @@ mod tests {
                 .iter()
                 .any(|warning| warning.starts_with("semantic_fallback"))
         );
+    }
+
+    /// Optional archive context does not replace a successful search result
+    /// or invent a semantic fallback when it cannot be read.
+    #[test]
+    fn render_unavailable_answer_context_preserves_evidence_and_mode() {
+        let plan = fallback_plan();
+        for (mode, joined, readiness) in [
+            ("lexical", false, PackSemanticReadiness::Disabled),
+            ("hybrid", true, PackSemanticReadiness::Joined),
+        ] {
+            let mut req = render_request(PackRenderFormat::Json);
+            req.search_mode = mode.to_string();
+            req.fallback_mode = None;
+            req.fallback_reason = None;
+            req.semantic_joined = joined;
+            req.readiness.semantic_readiness = readiness;
+            let ordinary = render_answer_pack_value_without_trust_correlation(&plan, &req).unwrap();
+            assert!(ordinary["_meta"].get("effective").is_none());
+            assert!(
+                !warning_list(&ordinary)
+                    .iter()
+                    .any(|warning| { warning == "answer_context_unavailable" })
+            );
+
+            req.effective = Some(serde_json::json!({
+                "command": "pack",
+                "answer_context": "unavailable",
+            }));
+            let unavailable =
+                render_answer_pack_value_without_trust_correlation(&plan, &req).unwrap();
+            assert_eq!(unavailable["evidence"].as_array().unwrap().len(), 1);
+            assert_eq!(unavailable["evidence"], ordinary["evidence"]);
+            assert_eq!(unavailable["realized"], ordinary["realized"]);
+            assert_eq!(unavailable["health"], ordinary["health"]);
+            assert_eq!(unavailable["realized"]["search_mode"], mode);
+            assert_eq!(unavailable["realized"]["semantic_joined"], joined);
+            assert!(unavailable["realized"]["fallback_mode"].is_null());
+            assert!(unavailable["realized"]["fallback_reason"].is_null());
+            assert_eq!(
+                unavailable["_meta"]["effective"]["answer_context"],
+                "unavailable"
+            );
+            let warnings = warning_list(&unavailable);
+            assert!(warnings.contains(&"answer_context_unavailable".to_string()));
+            assert_eq!(warnings.len(), warning_list(&ordinary).len() + 1);
+            assert!(
+                !warnings
+                    .iter()
+                    .any(|warning| warning.starts_with("semantic_fallback"))
+            );
+
+            req.effective = Some(serde_json::json!({"command": "pack"}));
+            let available =
+                render_answer_pack_value_without_trust_correlation(&plan, &req).unwrap();
+            assert!(
+                available["_meta"]["effective"]
+                    .get("answer_context")
+                    .is_none()
+            );
+            assert_eq!(warning_list(&available), warning_list(&ordinary));
+            assert_eq!(available["evidence"], ordinary["evidence"]);
+        }
     }
 
     /// Pack's own lexical selection is not an asset problem, so it must not
@@ -5604,6 +5818,7 @@ mod tests {
             (PackOmittedReason::SourceUnavailable, "source_unavailable"),
             (PackOmittedReason::RedactedToEmpty, "redacted_to_empty"),
             (PackOmittedReason::FieldMaskExcluded, "field_mask_excluded"),
+            (PackOmittedReason::ContextNotSelected, "context_not_selected"),
         ];
 
         for (reason, expected) in reasons {
