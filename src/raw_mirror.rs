@@ -143,7 +143,7 @@ pub fn capture_source_file(
     } else {
         store::policy::capture_default(input.clone(), policy)
     };
-    index_maintenance::observe_capture_result(&input, &result);
+    index_maintenance::observe_capture_result(&input, result.as_ref().err());
     result
 }
 
@@ -181,7 +181,7 @@ pub(crate) fn capture_codex_prefix(
         TRANSCRIPT_CHUNK_BYTES,
         policy,
     );
-    index_maintenance::observe_capture_result(&input, &result);
+    index_maintenance::observe_capture_result(&input, result.as_ref().err());
     result
 }
 
@@ -201,7 +201,7 @@ pub(crate) fn capture_source_file_with_chunk_policy(
         chunk_size_bytes,
         RawMirrorRetentionPolicy::from_env()?,
     );
-    index_maintenance::observe_capture_result(&input, &result);
+    index_maintenance::observe_capture_result(&input, result.as_ref().err());
     result
 }
 

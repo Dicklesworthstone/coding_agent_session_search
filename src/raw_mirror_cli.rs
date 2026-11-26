@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{RawMirrorCaptureInput, RawMirrorCapturePaused, RawMirrorCaptureRecord};
+use super::{RawMirrorCaptureInput, RawMirrorCapturePaused};
 use crate::search::semantic_manifest::{persist_named_temp, sync_parent_directory};
 
 const CAPTURE_REPORT_FILE: &str = "raw-mirror-capture.json";
@@ -94,10 +94,12 @@ impl CaptureReceipt {
 
 struct CaptureRunState {
     receipt: CaptureReceipt,
-    // Digests stay in memory. The flag tracks whether this source is still
-    // waiting for capture, independently of the historical refusal counters.
-    sources: HashMap<[u8; 32], bool>,
+    // Digests stay in memory. A later success clears pending recovery work
+    // without erasing the count of unique budget refusals in this run.
+    sources: HashSet<[u8; 32]>,
     refused_remote_origins: HashSet<blake3::Hash>,
+    pending: HashSet<[u8; 32]>,
+    pending_overflowed: bool,
     last_write: Option<Instant>,
     write_failure_reported: bool,
 }
@@ -130,8 +132,10 @@ impl CaptureRunState {
                 counters_exact: true,
                 last_pause: None,
             },
-            sources: HashMap::new(),
+            sources: HashSet::new(),
             refused_remote_origins: HashSet::new(),
+            pending: HashSet::new(),
+            pending_overflowed: false,
             last_write: None,
             write_failure_reported: false,
         }
@@ -160,13 +164,13 @@ impl CaptureRunState {
                 u64::MAX
             }
         };
-        if let Some(pending) = self.sources.get_mut(&identity) {
-            *pending = true;
-        } else if self.sources.len() < CAPTURE_SOURCE_LIMIT {
-            self.sources.insert(identity, true);
-            receipt.skipped_sources = self.sources.len() as u64;
-        } else {
-            receipt.skipped_sources_exact = false;
+        if !self.sources.contains(&identity) {
+            if self.sources.len() < CAPTURE_SOURCE_LIMIT {
+                self.sources.insert(identity);
+                receipt.skipped_sources = self.sources.len() as u64;
+            } else {
+                receipt.skipped_sources_exact = false;
+            }
         }
         receipt.last_pause = Some(paused.into());
     }
@@ -302,7 +306,8 @@ fn capture_identity(provider: &str, source_id: &str, path: &Path) -> [u8; 32] {
 pub(crate) fn capture_refused_for_origin(data_dir: &Path, source_id: &str) -> bool {
     active_capture_run(data_dir).is_some_and(|state| {
         let state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        !state.receipt.skipped_sources_exact
+        state.pending_overflowed
+            || !state.receipt.skipped_sources_exact
             || state.refused_remote_origins.contains(&blake3::hash(source_id.as_bytes()))
     })
 }
@@ -315,15 +320,17 @@ pub(crate) fn capture_refused_for_source(
 ) -> bool {
     active_capture_run(data_dir).is_some_and(|state| {
         let state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        !state.receipt.skipped_sources_exact
-            || (state.receipt.capture_paused
-                && state.sources.get(&capture_identity(provider, source_id, path)) == Some(&true))
+        if state.pending_overflowed || !state.receipt.skipped_sources_exact {
+            return true;
+        }
+        !state.pending.is_empty()
+            && state.pending.contains(&capture_identity(provider, source_id, path))
     })
 }
 
 pub(super) fn observe_capture_result(
     input: &RawMirrorCaptureInput<'_>,
-    result: &anyhow::Result<RawMirrorCaptureRecord>,
+    error: Option<&anyhow::Error>,
 ) {
     let Some(state) = active_capture_run(input.data_dir) else {
         return;
@@ -332,31 +339,40 @@ pub(super) fn observe_capture_result(
     if state.receipt.completed {
         return;
     }
-    if result.is_ok() {
-        if !state.sources.is_empty()
-            && let Some(pending) = state.sources.get_mut(&capture_identity(
+    let Some(error) = error else {
+        if !state.pending.is_empty() {
+            state.pending.remove(&capture_identity(
                 input.provider, input.source_id, input.source_path,
-            ))
-        {
-            *pending = false;
+            ));
         }
         return;
+    };
+    let paused = error.downcast_ref::<RawMirrorCapturePaused>();
+    // A later write/open failure can strand the same source after a budget
+    // recovers. Only typed filesystem failures or admission refusals require
+    // another capture; policy exclusions and disabled capture stay opt-outs.
+    if paused.is_none() && !error.is::<std::io::Error>() {
+        return;
     }
-    let Some(paused) = result
-        .as_ref()
-        .err()
-        .and_then(|error| error.downcast_ref::<RawMirrorCapturePaused>())
-    else {
+    if input.origin_kind == "ssh" {
+        let origin = blake3::hash(input.source_id.as_bytes());
+        if state.refused_remote_origins.len() < CAPTURE_SOURCE_LIMIT {
+            state.refused_remote_origins.insert(origin);
+        } else if !state.refused_remote_origins.contains(&origin) {
+            state.pending_overflowed = true;
+        }
+    }
+    let identity = capture_identity(input.provider, input.source_id, input.source_path);
+    if state.pending.len() < CAPTURE_SOURCE_LIMIT {
+        state.pending.insert(identity);
+    } else if !state.pending.contains(&identity) {
+        state.pending_overflowed = true;
+    }
+    let Some(paused) = paused else {
         return;
     };
     let first = !state.receipt.capture_paused;
-    state.observe(
-        capture_identity(input.provider, input.source_id, input.source_path),
-        *paused,
-    );
-    if input.origin_kind == "ssh" && state.refused_remote_origins.len() < CAPTURE_SOURCE_LIMIT {
-        state.refused_remote_origins.insert(blake3::hash(input.source_id.as_bytes()));
-    }
+    state.observe(identity, *paused);
     if first
         || state
             .last_write
@@ -610,7 +626,7 @@ mod tests {
             source_path: source,
             db_links: &[],
         };
-        observe_capture_result(&input, &Err(paused(bytes).into()));
+        observe_capture_result(&input, Some(&paused(bytes).into()));
     }
 
     #[test]
@@ -720,9 +736,35 @@ mod tests {
             source_path: Path::new("rollout.jsonl"),
             db_links: &[],
         };
-        observe_capture_result(&input, &Err(paused(1).into()));
+        observe_capture_result(&input, Some(&paused(1).into()));
         assert!(capture_refused_for_origin(data.path(), "mirror-a"));
         assert!(!capture_refused_for_origin(data.path(), "mirror-b"));
+    }
+
+    #[test]
+    fn gh542_io_failure_requires_recapture_without_inventing_budget_refusals() {
+        let data = tempfile::tempdir().unwrap();
+        let _guard = begin_capture_run(data.path());
+        let path = data.path().join("rollout.jsonl");
+        let input = RawMirrorCaptureInput {
+            data_dir: data.path(),
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &path,
+            db_links: &[],
+        };
+        let pending = || capture_refused_for_source(data.path(), "codex", "local", &path);
+        let error = anyhow::Error::new(std::io::Error::other("mirror write failed"))
+            .context("publishing the raw copy");
+        observe_capture_result(&input, Some(&error));
+        assert!(pending());
+        assert_eq!(read_capture_receipt(data.path()).unwrap().pause_attempts, 0);
+        observe_capture_result(&input, None);
+        assert!(!pending());
+        observe_capture_result(&input, Some(&anyhow::anyhow!("source deliberately omitted")));
+        assert!(!pending());
     }
 
     #[test]
