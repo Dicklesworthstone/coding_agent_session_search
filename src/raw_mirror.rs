@@ -9,7 +9,8 @@ mod exclusions;
 #[path = "raw_mirror_cli.rs"]
 mod index_maintenance;
 pub(crate) use index_maintenance::{
-    begin_capture_run, capture_pause_is_summarized, capture_status, capture_status_warning,
+    begin_capture_run, capture_pause_is_summarized, capture_refused_for_origin, capture_refused_for_source,
+    capture_status, capture_status_warning,
     maintain_for_index,
 };
 // Keep the policy next to the store's private validation/publication helpers.

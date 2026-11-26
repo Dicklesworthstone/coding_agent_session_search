@@ -29,6 +29,7 @@ struct Completion {
     entry: SourceIngestLedgerEntry,
     partial: bool,
     certified: bool,
+    capture_pending: bool,
     budget_bytes: usize,
 }
 
@@ -503,6 +504,7 @@ impl WatchSourceLedger {
                     entry,
                     partial,
                     certified: true,
+                    capture_pending: false,
                     budget_bytes: bytes,
                 },
             );
@@ -685,6 +687,12 @@ impl WatchSourceLedger {
         )
     }
 
+    pub(super) fn require_capture_retry(&mut self, path: &Path) {
+        if let Some(completion) = self.completions.get_mut(path) {
+            completion.capture_pending = true;
+        }
+    }
+
     pub(super) fn publish_batch(
         &mut self,
         storage: &FrankenStorage,
@@ -734,11 +742,19 @@ impl WatchSourceLedger {
                     let Some(completion) = self.completions.get(path) else {
                         continue;
                     };
+                    let observation = if completion.capture_pending {
+                        let mut value: serde_json::Value =
+                            serde_json::from_str(&completion.entry.observation)?;
+                        value["raw_capture_pending"] = serde_json::Value::Bool(true);
+                        Cow::Owned(serde_json::to_string(&value)?)
+                    } else {
+                        Cow::Borrowed(completion.entry.observation.as_str())
+                    };
                     tx.execute_compat(
                         "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
                         &[
                             ParamValue::from(completion.entry.key.as_str()),
-                            ParamValue::from(completion.entry.observation.as_str()),
+                            ParamValue::from(&*observation),
                         ],
                     )?;
                 }
@@ -784,6 +800,7 @@ mod canonical_refusal_tests {
             },
             partial: false,
             certified: true,
+            capture_pending: false,
             budget_bytes: 0,
         }
     }

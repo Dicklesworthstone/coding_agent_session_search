@@ -650,9 +650,22 @@ fn gh542_capture_budget_pause_is_bounded_visible_and_recovers_without_losing_sea
             "status and health must not rewrite the receipt"
         );
 
-        // The original sources remain unchanged. A full scan with the normal
-        // budget can preserve them and replace the last-run observation.
-        fixture.index(streaming, "", true);
+        let pending_captures = || {
+            SqliteStorage::open_readonly(&fixture.home.path().join("data/agent_search.db"))
+                .unwrap()
+                .source_ingest_ledger_entries()
+                .unwrap()
+                .values()
+                .filter(|raw| serde_json::from_str::<Value>(raw).unwrap()["raw_capture_pending"] == true)
+                .count()
+        };
+        if streaming == "1" && env!("CASS_SOURCE_INGEST_REUSE") == "true" {
+            assert!(pending_captures() >= 2, "both prefix sources must remain retryable");
+        }
+        // Streaming receipts for the two prefix transcripts must still allow
+        // retry, even though indexing succeeded and their mtimes predate the
+        // watermark. The legacy batch path is exercised with a full scan.
+        fixture.index(streaming, "", streaming == "0");
         assert_eq!(fixture.captured_sources(), fixture.all_sources());
         let receipt: Value = serde_json::from_slice(&fs::read(receipt_path).unwrap()).unwrap();
         assert_eq!(receipt["completed"], true);
@@ -661,6 +674,8 @@ fn gh542_capture_budget_pause_is_bounded_visible_and_recovers_without_losing_sea
         assert_eq!(receipt["pause_attempts"], 0);
         assert!(receipt["last_pause"].is_null());
         assert_ne!(Some(receipt["run_id"].clone()), observed_run_id);
+        assert_eq!(pending_captures(), 0);
+        fixture.assert_sources(&[&fixture.hidden, &fixture.archived, &fixture.public]);
         fixture.assert_hits("cassprivateproof9z", 1);
     }
 }

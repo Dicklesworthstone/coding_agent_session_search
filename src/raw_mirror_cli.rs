@@ -94,9 +94,10 @@ impl CaptureReceipt {
 
 struct CaptureRunState {
     receipt: CaptureReceipt,
-    // Only digests live in memory. Neither source identities nor their hashes
-    // belong in the on-disk receipt or in stderr diagnostics.
-    sources: HashSet<[u8; 32]>,
+    // Digests stay in memory. The flag tracks whether this source is still
+    // waiting for capture, independently of the historical refusal counters.
+    sources: HashMap<[u8; 32], bool>,
+    refused_remote_origins: HashSet<blake3::Hash>,
     last_write: Option<Instant>,
     write_failure_reported: bool,
 }
@@ -129,7 +130,8 @@ impl CaptureRunState {
                 counters_exact: true,
                 last_pause: None,
             },
-            sources: HashSet::new(),
+            sources: HashMap::new(),
+            refused_remote_origins: HashSet::new(),
             last_write: None,
             write_failure_reported: false,
         }
@@ -158,13 +160,13 @@ impl CaptureRunState {
                 u64::MAX
             }
         };
-        if !self.sources.contains(&identity) {
-            if self.sources.len() < CAPTURE_SOURCE_LIMIT {
-                self.sources.insert(identity);
-                receipt.skipped_sources = self.sources.len() as u64;
-            } else {
-                receipt.skipped_sources_exact = false;
-            }
+        if let Some(pending) = self.sources.get_mut(&identity) {
+            *pending = true;
+        } else if self.sources.len() < CAPTURE_SOURCE_LIMIT {
+            self.sources.insert(identity, true);
+            receipt.skipped_sources = self.sources.len() as u64;
+        } else {
+            receipt.skipped_sources_exact = false;
         }
         receipt.last_pause = Some(paused.into());
     }
@@ -282,10 +284,64 @@ impl Drop for CaptureRunGuard {
     }
 }
 
+fn capture_identity(provider: &str, source_id: &str, path: &Path) -> [u8; 32] {
+    let mut identity = blake3::Hasher::new();
+    for component in [
+        provider.as_bytes(),
+        source_id.as_bytes(),
+        path.as_os_str().as_encoded_bytes(),
+    ] {
+        identity.update(&(component.len() as u64).to_le_bytes());
+        identity.update(component);
+    }
+    *identity.finalize().as_bytes()
+}
+
+/// Parser and sync receipts may certify canonical rows after a budget refusal,
+/// but must still allow the refused recovery bytes to be captured later.
+pub(crate) fn capture_refused_for_origin(data_dir: &Path, source_id: &str) -> bool {
+    active_capture_run(data_dir).is_some_and(|state| {
+        let state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        !state.receipt.skipped_sources_exact
+            || state.refused_remote_origins.contains(&blake3::hash(source_id.as_bytes()))
+    })
+}
+
+pub(crate) fn capture_refused_for_source(
+    data_dir: &Path,
+    provider: &str,
+    source_id: &str,
+    path: &Path,
+) -> bool {
+    active_capture_run(data_dir).is_some_and(|state| {
+        let state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        !state.receipt.skipped_sources_exact
+            || (state.receipt.capture_paused
+                && state.sources.get(&capture_identity(provider, source_id, path)) == Some(&true))
+    })
+}
+
 pub(super) fn observe_capture_result(
     input: &RawMirrorCaptureInput<'_>,
     result: &anyhow::Result<RawMirrorCaptureRecord>,
 ) {
+    let Some(state) = active_capture_run(input.data_dir) else {
+        return;
+    };
+    let mut state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.receipt.completed {
+        return;
+    }
+    if result.is_ok() {
+        if !state.sources.is_empty()
+            && let Some(pending) = state.sources.get_mut(&capture_identity(
+                input.provider, input.source_id, input.source_path,
+            ))
+        {
+            *pending = false;
+        }
+        return;
+    }
     let Some(paused) = result
         .as_ref()
         .err()
@@ -293,26 +349,14 @@ pub(super) fn observe_capture_result(
     else {
         return;
     };
-    let Some(state) = active_capture_run(input.data_dir) else {
-        return;
-    };
-    let mut identity = blake3::Hasher::new();
-    for component in [
-        input.provider.as_bytes(),
-        input.source_id.as_bytes(),
-        input.source_path.as_os_str().as_encoded_bytes(),
-    ] {
-        identity.update(&(component.len() as u64).to_le_bytes());
-        identity.update(component);
-    }
-    let mut state = state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if state.receipt.completed {
-        return;
-    }
     let first = !state.receipt.capture_paused;
-    state.observe(*identity.finalize().as_bytes(), *paused);
+    state.observe(
+        capture_identity(input.provider, input.source_id, input.source_path),
+        *paused,
+    );
+    if input.origin_kind == "ssh" && state.refused_remote_origins.len() < CAPTURE_SOURCE_LIMIT {
+        state.refused_remote_origins.insert(blake3::hash(input.source_id.as_bytes()));
+    }
     if first
         || state
             .last_write
@@ -587,6 +631,10 @@ mod tests {
             &source,
             7,
         );
+        assert!(capture_refused_for_source(data.path(), "private-provider", "private-origin", &source));
+        assert!(!capture_refused_for_source(data.path(), "other-provider", "private-origin", &source));
+        assert!(!capture_refused_for_source(data.path(), "private-provider", "other-origin", &source));
+        assert!(!capture_refused_for_origin(data.path(), "private-origin"));
         let first = read_capture_receipt(data.path()).unwrap();
         assert_eq!(
             first.pause_attempts, 1,
@@ -657,6 +705,24 @@ mod tests {
                 .unwrap()
                 .contains("requested reservation bytes")
         );
+    }
+
+    #[test]
+    fn gh542_remote_budget_refusal_invalidates_only_its_origin() {
+        let data = tempfile::tempdir().unwrap();
+        let _guard = begin_capture_run(data.path());
+        let input = RawMirrorCaptureInput {
+            data_dir: data.path(),
+            provider: "codex",
+            source_id: "mirror-a",
+            origin_kind: "ssh",
+            origin_host: None,
+            source_path: Path::new("rollout.jsonl"),
+            db_links: &[],
+        };
+        observe_capture_result(&input, &Err(paused(1).into()));
+        assert!(capture_refused_for_origin(data.path(), "mirror-a"));
+        assert!(!capture_refused_for_origin(data.path(), "mirror-b"));
     }
 
     #[test]

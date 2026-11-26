@@ -15588,6 +15588,9 @@ fn source_ledger_matches_with_contract(
     let Ok(mut saved) = serde_json::from_str::<serde_json::Value>(observation) else {
         return false;
     };
+    if saved["raw_capture_pending"] == true && crate::raw_mirror::capture_enabled() {
+        return false;
+    }
     let mut verified_observation = None;
     let prefix = match crate::connectors::codex::observation_receipt(&saved) {
         Ok(prefix) => prefix,
@@ -15878,6 +15881,7 @@ fn scan_with_durable_source_boundaries(
             Ok(())
         });
     }
+    let mirror_provider = crate::connectors::archive_provider_slug(sender.connector_name);
     let mut ctx = ctx.clone();
     ctx.since_ts = None;
     sender.retain_final = true;
@@ -16030,7 +16034,7 @@ fn scan_with_durable_source_boundaries(
         {
             return flush_source();
         }
-        let observation = if let Some(observation) = prefix_observation {
+        let mut observation = if let Some(observation) = prefix_observation {
             anyhow::ensure!(
                 completion.required_sidecars.is_empty(),
                 "prefix receipt cannot certify unobserved sidecars"
@@ -16049,6 +16053,21 @@ fn scan_with_durable_source_boundaries(
             serde_json::json!({"primary": primary, "dependencies": dependencies,
                 "producer_contract": producer_contract})
         };
+        // Preserve the parser's overlap proof, including for unchanged prefix
+        // sources. A successful archive commit alone cannot certify raw capture.
+        if std::iter::once(&completion.source)
+            .chain(&completion.required_sidecars)
+            .any(|source| {
+                crate::raw_mirror::capture_refused_for_source(
+                    &config.data_dir,
+                    mirror_provider,
+                    &source.origin.source_id,
+                    &source.source_path,
+                )
+            })
+        {
+            observation["raw_capture_pending"] = serde_json::Value::Bool(true);
+        }
         let Some(key) = source_ledger_key(&completion.source, &ctx) else {
             return flush_source();
         };
@@ -20658,6 +20677,13 @@ fn run_index_with_storage_ownership(
                 // read failure behind the same zero-conversation outcome.
                 if !scan_had_errors && !incomplete_remote_sources {
                     for (source_id, fingerprint) in &mirror_fingerprints_to_store {
+                        // A matching whole-root receipt would bypass per-source
+                        // retry markers. Replace even an older matching receipt.
+                        let fingerprint = if crate::raw_mirror::capture_refused_for_origin(&opts.data_dir, source_id) {
+                            "raw_capture_pending"
+                        } else {
+                            fingerprint.as_str()
+                        };
                         if let Err(error) = persist::with_ephemeral_writer(
                             &storage,
                             !opts.watch,
@@ -37975,6 +38001,14 @@ fn reindex_paths_with_semantic_delta(
                 }
                 if capture_allowed {
                     capture_prepared_conversation(&opts.data_dir, conv, &raw_source_exclusions);
+                    if crate::raw_mirror::capture_refused_for_source(
+                        &opts.data_dir,
+                        &conv.agent_slug,
+                        &root.origin.source_id,
+                        &conv.source_path,
+                    ) {
+                        source_ledger.require_capture_retry(&conv.source_path);
+                    }
                 }
                 if let Some(progress) = &opts.progress {
                     progress.check_stop()?;
@@ -39220,6 +39254,7 @@ fn remote_mirror_scan_contract(policy: &WorkspaceExclusions) -> Option<String> {
         dotenvy::var("CASS_EXCLUDE_PATHS").ok(),
         excluded_paths,
         skip_subagents_active(),
+        crate::raw_mirror::capture_enabled(),
         crate::connectors::omp::PiFamilyOwnership::live().scan_reuse_context()?,
     ))
     .ok()?;
