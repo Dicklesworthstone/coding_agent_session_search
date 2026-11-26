@@ -956,6 +956,7 @@ struct SelectedState {
     sessions: HashSet<PackSessionKey>,
     span_hashes: HashSet<String>,
     content_hashes: HashSet<String>,
+    body_fingerprints: HashSet<blake3::Hash>,
     verified_ranges: Vec<VerifiedPackFileSpan>,
 }
 
@@ -992,6 +993,19 @@ pub fn plan_answer_pack(
             .iter()
             .filter_map(|candidate| finite_score(candidate.semantic_score)),
     );
+    // Search hit hashes can include source path, message ordinal and timestamp.
+    // Keep those public citation identities, but also recognize identical full
+    // bodies from different sessions. Hash original bytes once: truncation and
+    // redaction can make distinct evidence look alike, and code whitespace can
+    // be meaningful. Empty bodies remain subject to the normal empty omission.
+    let body_fingerprints = request
+        .candidates
+        .iter()
+        .map(|candidate| {
+            (!candidate.excerpt.trim().is_empty())
+                .then(|| blake3::hash(candidate.excerpt.as_bytes()))
+        })
+        .collect::<Vec<_>>();
     // Redact before truncation: cutting a credential first can hide its shape
     // from the detector. Budget the actual output, including expanding markers,
     // and prepare it once rather than repeating regex work during selection.
@@ -1026,9 +1040,13 @@ pub fn plan_answer_pack(
 
         for candidate_index in remaining.iter().copied() {
             let candidate = &request.candidates[candidate_index];
-            if let Some(reason) = hard_omission_reason(candidate, &request, &selected_state) {
+            let body_fingerprint = body_fingerprints[candidate_index];
+            if let Some(reason) =
+                hard_omission_reason(candidate, body_fingerprint, &request, &selected_state)
+            {
                 let score = score_candidate(
                     candidate,
+                    body_fingerprint,
                     &request,
                     &selected_state,
                     lexical_range,
@@ -1043,6 +1061,7 @@ pub fn plan_answer_pack(
             if excerpt.trim().is_empty() {
                 let score = score_candidate(
                     candidate,
+                    body_fingerprint,
                     &request,
                     &selected_state,
                     lexical_range,
@@ -1061,6 +1080,7 @@ pub fn plan_answer_pack(
             let token_cost = estimated_tokens(excerpt);
             let score = score_candidate(
                 candidate,
+                body_fingerprint,
                 &request,
                 &selected_state,
                 lexical_range,
@@ -1151,6 +1171,9 @@ pub fn plan_answer_pack(
         selected_state
             .content_hashes
             .insert(candidate.content_hash.clone());
+        if let Some(fingerprint) = body_fingerprints[best_candidate.index] {
+            selected_state.body_fingerprints.insert(fingerprint);
+        }
         if let Some(span) = VerifiedPackFileSpan::from_candidate(candidate) {
             selected_state.verified_ranges.push(span);
         }
@@ -1171,6 +1194,7 @@ pub fn plan_answer_pack(
         let candidate = &request.candidates[candidate_index];
         let score = score_candidate(
             candidate,
+            body_fingerprints[candidate_index],
             &request,
             &selected_state,
             lexical_range,
@@ -1333,6 +1357,7 @@ pub(crate) fn verify_pack_source_citations(
 
 fn hard_omission_reason(
     candidate: &PackCandidate,
+    body_fingerprint: Option<blake3::Hash>,
     request: &PackPlanRequest,
     selected_state: &SelectedState,
 ) -> Option<PackOmittedReason> {
@@ -1346,6 +1371,8 @@ fn hard_omission_reason(
         || selected_state
             .content_hashes
             .contains(&candidate.content_hash)
+        || body_fingerprint
+            .is_some_and(|fingerprint| selected_state.body_fingerprints.contains(&fingerprint))
         || selected_state
             .verified_ranges
             .iter()
@@ -1369,6 +1396,7 @@ fn is_stale_under_strict_policy(candidate: &PackCandidate, request: &PackPlanReq
 
 fn score_candidate(
     candidate: &PackCandidate,
+    body_fingerprint: Option<blake3::Hash>,
     request: &PackPlanRequest,
     selected_state: &SelectedState,
     lexical_range: ScoreRange,
@@ -1382,7 +1410,7 @@ fn score_candidate(
     let source_authority_score = source_authority_score(candidate);
     let role_score = role_score(candidate.role);
     let citation_quality_score = citation_quality_score(candidate);
-    let duplicate_penalty = duplicate_penalty(candidate, selected_state);
+    let duplicate_penalty = duplicate_penalty(candidate, body_fingerprint, selected_state);
     let score = 0.35 * relevance_score
         + 0.20 * coverage_score
         + 0.15 * freshness_score
@@ -1555,13 +1583,19 @@ fn citation_quality_score(candidate: &PackCandidate) -> f64 {
     }
 }
 
-fn duplicate_penalty(candidate: &PackCandidate, selected_state: &SelectedState) -> f64 {
+fn duplicate_penalty(
+    candidate: &PackCandidate,
+    body_fingerprint: Option<blake3::Hash>,
+    selected_state: &SelectedState,
+) -> f64 {
     if selected_state.span_hashes.contains(&candidate.span_hash) {
         return 1.0;
     }
     if selected_state
         .content_hashes
         .contains(&candidate.content_hash)
+        || body_fingerprint
+            .is_some_and(|fingerprint| selected_state.body_fingerprints.contains(&fingerprint))
     {
         return 0.5;
     }
@@ -3041,7 +3075,7 @@ mod tests {
             created_at_ms: Some(1_000_000),
             indexed_at_ms: Some(1_000_000),
             match_type: "exact".to_string(),
-            excerpt: "0123456789abcdef".to_string(),
+            excerpt: format!("Evidence for {id}."),
             role: PackEvidenceRole::AssistantConclusion,
             lexical_score: Some(score),
             semantic_score: None,
@@ -3256,6 +3290,216 @@ mod tests {
         assert_eq!(candidate.line_start, None);
         assert_eq!(candidate.line_end, None);
         assert!(!candidate.citation_verified);
+    }
+
+    fn pack_search_hit(content: &str, source_path: &str, hash: u64) -> SearchHit {
+        SearchHit {
+            title: "Decision lookup".to_string(),
+            snippet: content.to_string(),
+            content: content.to_string(),
+            content_hash: hash,
+            conversation_id: Some(1),
+            score: 10.0,
+            source_path: source_path.to_string(),
+            agent: "codex".to_string(),
+            workspace: "/work".to_string(),
+            workspace_original: None,
+            created_at: Some(990_000),
+            line_number: Some(1),
+            match_type: MatchType::Exact,
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        }
+    }
+
+    #[test]
+    fn repeated_search_hit_bodies_do_not_spend_the_evidence_budget_twice() {
+        let question = "What did we decide about the CSV format for Excel?";
+        let answer = "We chose UTF-8 with a BOM because the customer opens the CSV in Excel.";
+        for answer_in_newer_session in [false, true] {
+            let older = pack_search_hit(question, "/s/older.jsonl", 11);
+            let mut newer = pack_search_hit(question, "/s/newer.jsonl", 22);
+            newer.conversation_id = Some(2);
+            newer.created_at = Some(999_000);
+            newer.score = 9.0;
+            let (mut answered, mut deferred) = if answer_in_newer_session {
+                (newer.clone(), older.clone())
+            } else {
+                (older.clone(), newer.clone())
+            };
+            answered.content = answer.to_string();
+            answered.snippet = answered.content.clone();
+            answered.content_hash = 33;
+            answered.line_number = Some(2);
+            answered.score = 8.0;
+            deferred.content = "I'll check and get back to you.".to_string();
+            deferred.snippet = deferred.content.clone();
+            deferred.content_hash = 44;
+            deferred.line_number = Some(2);
+            deferred.score = 7.0;
+            let candidates = [older, newer, answered, deferred]
+                .iter()
+                .map(|hit| PackCandidate::from_search_hit(hit, 2, 0))
+                .collect::<Vec<_>>();
+            assert_ne!(candidates[0].content_hash, candidates[1].content_hash);
+            assert_ne!(candidates[0].span_hash, candidates[1].span_hash);
+            let expected_answer = candidates[2].clone();
+            let duplicate_id = candidates[1].candidate_id.clone();
+            for reverse in [false, true] {
+                let mut candidates = candidates.clone();
+                if reverse {
+                    candidates.reverse();
+                }
+                let mut req = request(candidates);
+                req.limits.max_evidence = 2;
+                let plan = plan_answer_pack(req).unwrap();
+                assert_eq!(plan.candidate_count, 4);
+                assert_eq!(plan.evidence.len(), 2);
+                assert_eq!(plan.evidence[0].excerpt, question);
+                assert_eq!(plan.evidence[1].excerpt, answer);
+                assert_eq!(plan.evidence[1].candidate, expected_answer);
+                assert_eq!(plan.evidence[1].id, expected_answer.candidate_id);
+                assert_eq!(
+                    plan.omitted
+                        .iter()
+                        .find(|item| item.candidate_id == duplicate_id)
+                        .unwrap()
+                        .reason,
+                    PackOmittedReason::DuplicateContent
+                );
+                let rendered = render_answer_pack_value_without_trust_correlation(
+                    &plan,
+                    &render_request(PackRenderFormat::Json),
+                )
+                .unwrap();
+                assert_eq!(
+                    rendered["evidence"][1]["citation"]["content_hash"],
+                    expected_answer.content_hash
+                );
+                assert_eq!(
+                    rendered["evidence"][1]["citation"]["span_hash"],
+                    expected_answer.span_hash
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn body_dedup_does_not_merge_distinct_truncated_redacted_or_indented_text() {
+        let cases = [
+            (
+                format!("{} first conclusion", "x".repeat(100)),
+                format!("{} second conclusion", "x".repeat(100)),
+                true,
+            ),
+            (
+                format!("Credential sk-{}", "a".repeat(24)),
+                format!("Credential sk-{}", "b".repeat(24)),
+                true,
+            ),
+            (
+                "if ready:\n    start()\n    finish()".to_string(),
+                "if ready:\n    start()\nfinish()".to_string(),
+                false,
+            ),
+        ];
+        for (first, second, same_rendered_excerpt) in cases {
+            let first = PackCandidate::from_search_hit(
+                &pack_search_hit(&first, "/s/first.jsonl", 51),
+                1,
+                0,
+            );
+            let second = PackCandidate::from_search_hit(
+                &pack_search_hit(&second, "/s/second.jsonl", 52),
+                1,
+                0,
+            );
+            let plan = plan_answer_pack(request(vec![first, second])).unwrap();
+            assert_eq!(plan.evidence.len(), 2);
+            assert!(plan.omitted.is_empty());
+            assert_eq!(
+                plan.evidence[0].excerpt == plan.evidence[1].excerpt,
+                same_rendered_excerpt
+            );
+            assert!(
+                plan.evidence
+                    .iter()
+                    .all(|item| !item.excerpt.contains("sk-"))
+            );
+        }
+    }
+
+    #[test]
+    fn body_dedup_keeps_empty_search_hits_on_the_empty_omission_path() {
+        let candidates = ["", " \n\t ", "Useful decision evidence."]
+            .into_iter()
+            .enumerate()
+            .map(|(index, body)| {
+                PackCandidate::from_search_hit(
+                    &pack_search_hit(body, &format!("/s/{index}.jsonl"), index as u64 + 61),
+                    1,
+                    0,
+                )
+            })
+            .collect();
+        let plan = plan_answer_pack(request(candidates)).unwrap();
+        assert_eq!(plan.evidence.len(), 1);
+        assert_eq!(plan.evidence[0].excerpt, "Useful decision evidence.");
+        assert_eq!(plan.omitted.len(), 2);
+        assert!(
+            plan.omitted
+                .iter()
+                .all(|item| item.reason == PackOmittedReason::RedactedToEmpty)
+        );
+    }
+
+    #[test]
+    fn body_dedup_preserves_the_selected_search_hit_source_citation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let first_path = temp.path().join("first.jsonl");
+        let second_path = temp.path().join("second.jsonl");
+        let body = "Repeated question with distinct source records.";
+        let record = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": body}]
+            }
+        })
+        .to_string();
+        let source = format!("\n{record}\n");
+        std::fs::write(&first_path, &source).unwrap();
+        std::fs::write(&second_path, &source).unwrap();
+        let mut first = pack_search_hit(body, first_path.to_str().unwrap(), 71);
+        first.created_at = None;
+        let mut second = pack_search_hit(body, second_path.to_str().unwrap(), 72);
+        second.created_at = None;
+        second.score = 9.0;
+        let first = PackCandidate::from_search_hit(&first, 1, 0);
+        let second = PackCandidate::from_search_hit(&second, 1, 0);
+        let mut plan = plan_answer_pack(request(vec![first.clone(), second])).unwrap();
+        assert_eq!(plan.evidence.len(), 1);
+        assert_eq!(plan.evidence[0].id, first.candidate_id);
+        verify_pack_source_citations(
+            &mut plan,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        let selected = &plan.evidence[0];
+        assert!(selected.candidate.citation_verified);
+        assert_eq!(selected.candidate.source_path, first.source_path);
+        assert_eq!(selected.candidate.content_hash, first.content_hash);
+        assert_eq!(selected.candidate.message_index, first.message_index);
+        assert_eq!(selected.candidate.line_start, Some(2));
+        assert_eq!(selected.candidate.line_end, Some(2));
+        assert_eq!(
+            selected.candidate.span_hash,
+            blake3::hash(record.as_bytes()).to_hex().to_string()
+        );
+        assert_eq!(selected.excerpt, body);
+        assert_eq!(std::fs::read_to_string(first_path).unwrap(), source);
+        assert_eq!(std::fs::read_to_string(second_path).unwrap(), source);
     }
 
     #[test]
@@ -3736,7 +3980,8 @@ mod tests {
 
     #[test]
     fn render_markdown_duplicate_omission_matches_golden_text() {
-        let first = candidate("a", "local", "/s/a.jsonl", 10.0);
+        let mut first = candidate("a", "local", "/s/a.jsonl", 10.0);
+        first.excerpt = "0123456789abcdef".to_string();
         let mut duplicate = candidate("b", "local", "/s/b.jsonl", 9.0);
         duplicate.content_hash = first.content_hash.clone();
         let plan = plan_answer_pack(request(vec![first, duplicate])).unwrap();
@@ -4386,7 +4631,7 @@ mod tests {
                         &format!("/s/expanded-{index}.jsonl"),
                         10.0,
                     );
-                    item.excerpt = format!("{}界e\u{301}", "~/x ".repeat(100));
+                    item.excerpt = format!("{}界e\u{301}{index}", "~/x ".repeat(100));
                     item
                 })
                 .collect();
