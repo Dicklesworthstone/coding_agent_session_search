@@ -1499,12 +1499,22 @@ fn decision_lookup_returns_the_cited_answer_with_one_evidence_slot() -> Result<(
             .timeout(std::time::Duration::from_secs(120))
             .assert()
             .success();
-        for query in [question, "CSV Excel"] {
+        // A strict phrase retrieves only the repeated question. The decision
+        // must come from canonical adjacent context, with its own citation.
+        let quoted_question = format!("\"{question}\"");
+        for query in [question, "CSV Excel", quoted_question.as_str()] {
             let output = isolated_cass_cmd(home.path())
                 .env("CASS_AUTO_REFRESH", "0")
                 .args([
-                    "pack", query, "--mode", "lexical", "--robot", "--max-evidence", "1",
-                    "--require-evidence", "--data-dir",
+                    "pack",
+                    query,
+                    "--mode",
+                    "lexical",
+                    "--robot",
+                    "--max-evidence",
+                    "1",
+                    "--require-evidence",
+                    "--data-dir",
                 ])
                 .arg(&data_dir)
                 .timeout(std::time::Duration::from_secs(60))
@@ -1518,10 +1528,57 @@ fn decision_lookup_returns_the_cited_answer_with_one_evidence_slot() -> Result<(
             assert_eq!(evidence[0]["excerpt"], answer, "{json}");
             let citation = &evidence[0]["citation"];
             assert_eq!(citation["verified"], true, "{json}");
-            assert!(citation["source_path"]
-                .as_str()
-                .is_some_and(|path| path.ends_with(files[answered_index])));
+            assert_eq!(citation["message_index"], 2, "{json}");
+            assert_eq!(citation["line_start"], 3, "{json}");
+            if query == quoted_question {
+                assert_eq!(citation["match_type"], "answer_context", "{json}");
+            }
+            assert!(
+                citation["source_path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with(files[answered_index]))
+            );
         }
+
+        // Identical prompts in another session do not authorize crossing a
+        // caller's explicit session filter to recover the better answer.
+        let selected_sessions = home.path().join("selected-sessions.txt");
+        fs::write(
+            &selected_sessions,
+            format!("{}\n", sessions.join(files[1 - answered_index]).display()),
+        )?;
+        let output = isolated_cass_cmd(home.path())
+            .env("CASS_AUTO_REFRESH", "0")
+            .args([
+                "pack",
+                &quoted_question,
+                "--mode",
+                "lexical",
+                "--robot",
+                "--max-evidence",
+                "1",
+                "--require-evidence",
+                "--sessions-from",
+            ])
+            .arg(&selected_sessions)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .timeout(std::time::Duration::from_secs(60))
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let scoped: Value = serde_json::from_slice(&output.stdout)?;
+        let evidence = scoped["evidence"]
+            .as_array()
+            .expect("scoped evidence array");
+        assert_eq!(evidence.len(), 1, "{scoped}");
+        assert_eq!(evidence[0]["excerpt"], question, "{scoped}");
+        assert!(
+            evidence[0]["citation"]["source_path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with(files[1 - answered_index]))
+        );
     }
     Ok(())
 }
