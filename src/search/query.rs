@@ -1431,33 +1431,23 @@ fn hybrid_candidate_budget(
     requested_limit: usize,
     effective_limit: usize,
     offset: usize,
-    total_docs: usize,
+    lexical_docs: usize,
 ) -> HybridCandidateBudget {
     let query_class = FsQueryClass::classify(query);
     let (lex_mult, sem_mult) = hybrid_stage_multipliers(query_class);
-    let total_docs = total_docs.max(1);
+    // Zero is the search API's unlimited sentinel. An empty lexical reader
+    // still gets a bounded request, so it can return its actual empty page.
+    let lexical_docs = lexical_docs.max(1);
 
-    // When no explicit limit is requested, keep "no limit" output semantics,
-    // but bound semantic fanout so hybrid doesn't try to score the entire corpus.
     if requested_limit == 0 {
         let planning_window = HYBRID_NO_LIMIT_PLANNING_WINDOW.max(offset.saturating_add(1));
-        // Cap the lexical fanout — without a ceiling a "no limit" hybrid
-        // query on a ~500k-row corpus asks Tantivy to materialize a
-        // `Vec<SearchHit>` the size of the entire index, which is the
-        // unboundedness fixed by `no_limit_result_cap()`.
-        let lexical = effective_limit.min(total_docs).min(no_limit_result_cap());
-        // Semantic fan-out can be wide in principle, but must never
-        // exceed the lexical cap — the pipeline fuses lexical+semantic
-        // candidates and returning more semantic candidates than
-        // lexical is both wasteful (semantic is the expensive tier)
-        // and breaks the pre-cap invariant that `semantic ≤ lexical`.
-        // On tiny boxes where `no_limit_result_cap()` hits the floor,
-        // this pulls semantic down with it.
+        let lexical = effective_limit.min(lexical_docs).min(no_limit_result_cap());
+        // Both stages observe the request's memory cap. Only the lexical
+        // stage is bounded by the size of the lexical publication.
         let semantic = fs_candidate_count(planning_window, 0, sem_mult)
             .max(planning_window)
             .min(HYBRID_NO_LIMIT_SEMANTIC_CAP.max(offset.saturating_add(planning_window)))
-            .min(total_docs)
-            .min(lexical);
+            .min(no_limit_result_cap());
         return HybridCandidateBudget {
             lexical_candidates: lexical,
             semantic_candidates: semantic,
@@ -1466,10 +1456,9 @@ fn hybrid_candidate_budget(
 
     let lexical = fs_candidate_count(requested_limit, offset, lex_mult.max(1))
         .max(requested_limit.saturating_add(offset))
-        .min(total_docs);
+        .min(lexical_docs);
     let semantic = fs_candidate_count(requested_limit, offset, sem_mult.max(1))
-        .max(requested_limit.saturating_add(offset))
-        .min(total_docs);
+        .max(requested_limit.saturating_add(offset));
 
     HybridCandidateBudget {
         lexical_candidates: lexical,
@@ -3353,6 +3342,18 @@ struct SemanticCandidateContext {
     artifacts: Arc<Vec<SemanticIndexArtifact>>,
     filter_maps: SemanticFilterMaps,
     roles: Option<HashSet<u8>>,
+}
+
+impl SemanticCandidateContext {
+    /// Physical rows safely bound distinct live messages, including a
+    /// main-empty shard whose records are all in its retained WAL.
+    fn physical_record_count(&self) -> usize {
+        self.artifacts.iter().fold(0usize, |total, artifact| {
+            total
+                .saturating_add(artifact.index().record_count())
+                .saturating_add(artifact.index().wal_record_count())
+        })
+    }
 }
 
 struct SemanticCandidateSearchRequest<'a> {
@@ -5920,11 +5921,7 @@ impl SearchClient {
         if !retry.exact_window_may_omit_competitor {
             return Ok((initial, retry));
         }
-        let record_count = context.artifacts.iter().fold(0usize, |total, artifact| {
-            total
-                .saturating_add(artifact.index().record_count())
-                .saturating_add(artifact.index().wal_record_count())
-        });
+        let record_count = context.physical_record_count();
         let return_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
         if streaming
             && let Some(hits) = message_stream::try_collect_retained_messages(
@@ -7635,22 +7632,11 @@ impl SearchClient {
                 );
             };
 
-            // A semantic-only client deliberately has no lexical reader. Use
-            // the complete retained vector view for an unlimited request's
-            // cap: durable WAL additions are searchable before consolidation,
-            // including when a shard has no main records. Main rows plus WAL
-            // rows safely bound live messages even when updates replace rows.
+            // Bound candidate work using the same retained artifacts that
+            // the engine will query, including WAL rows across all shards.
+            let physical_limit = candidate_context.physical_record_count().max(1);
             let limit = if limit == 0 {
-                candidate_context
-                    .artifacts
-                    .iter()
-                    .fold(0usize, |count, artifact| {
-                        count
-                            .saturating_add(artifact.index().record_count())
-                            .saturating_add(artifact.index().wal_record_count())
-                    })
-                    .min(no_limit_result_cap())
-                    .max(1)
+                physical_limit.min(no_limit_result_cap())
             } else {
                 limit
             };
@@ -7667,8 +7653,9 @@ impl SearchClient {
                 target_hits.saturating_mul(3).max(4096)
             } else {
                 target_hits.saturating_mul(3)
-            };
-            let mut fetch_limit = target_hits;
+            }
+            .min(physical_limit);
+            let mut fetch_limit = target_hits.min(physical_limit);
             loop {
                 if let Some(artifact) = retained {
                     artifact.verify_coverage_file()?;
@@ -8462,38 +8449,20 @@ impl SearchClient {
 
         self.refresh_lexical_generation()?;
         let requested_limit = limit;
-        // A missing lexical reader says nothing about the size of the
-        // canonical or semantic archive. Keep both candidate legs bounded by
-        // the shared cap instead of silently restricting each to one hit.
-        let total_docs = if self.has_tantivy() {
-            self.total_docs().max(1)
+        // Independent publications may cover different messages. A smaller
+        // lexical generation cannot bound the fused output or semantic leg.
+        let lexical_docs = if self.has_tantivy() {
+            self.total_docs()
         } else {
             no_limit_result_cap()
         };
         let limit = if requested_limit == 0 {
-            total_docs.min(no_limit_result_cap()).max(1)
+            no_limit_result_cap()
         } else {
             requested_limit
         };
-        let fetch = limit.saturating_add(offset);
-        if fetch == 0 {
-            return Ok((
-                SearchResult {
-                    hits: Vec::new(),
-                    wildcard_fallback: false,
-                    cache_stats: self.cache_stats(),
-                    suggestions: Vec::new(),
-                    ann_stats: None,
-                    ann_unavailable_reason: None,
-                    total_count: None,
-                    title_search: None,
-                },
-                None,
-            ));
-        }
-
         let budget =
-            hybrid_candidate_budget(semantic_query, requested_limit, limit, offset, total_docs);
+            hybrid_candidate_budget(semantic_query, requested_limit, limit, offset, lexical_docs);
         self.record_lexical_degrade_reason(None);
         let lexical = match self.search_with_fallback(
             lexical_query,
@@ -13761,6 +13730,10 @@ mod tests {
     }
 
     fn lexical_cache_fixture() -> Result<TempDir> {
+        lexical_cache_fixture_with_limit(usize::MAX)
+    }
+
+    fn lexical_cache_fixture_with_limit(count: usize) -> Result<TempDir> {
         let dir = TempDir::new()?;
         let mut index = TantivyIndex::open_or_create(dir.path())?;
         for (id, content) in [
@@ -13772,6 +13745,7 @@ mod tests {
             "cacheword fillerword twentyfour twentyfive twentysix twentyseven twentyeight",
         ]
         .into_iter()
+        .take(count)
         .enumerate()
         {
             index.add_conversation(&NormalizedConversation {
@@ -23025,6 +22999,63 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_keeps_vector_matches_beyond_a_partial_lexical_publication() -> Result<()> {
+        let lexical = lexical_cache_fixture_with_limit(1)?;
+        for sharded in [false, true] {
+            let fixture =
+                build_semantic_test_fixture_with_options(sharded, SemanticAnnFixtureMode::Missing)?;
+            let client = SearchClient::open(lexical.path(), fixture.client.sqlite_path.as_deref())?
+                .expect("one-document lexical reader");
+            assert_eq!(client.total_docs(), 1);
+            {
+                let guard = fixture.client.semantic.lock().unwrap();
+                let state = guard.as_ref().expect("semantic fixture");
+                client.set_semantic_artifacts_context(
+                    Arc::clone(&state.embedder),
+                    state.artifacts.as_ref().clone(),
+                    None,
+                    state.filter_maps.clone(),
+                    None,
+                )?;
+            }
+
+            // The lexical query has no matches. All three independently
+            // ranked semantic messages should remain eligible for fusion.
+            for limit in [0, 1, fixture.source_paths.len()] {
+                for offset in [0, 1, fixture.source_paths.len()] {
+                    let result = client.search_hybrid(
+                        "absentlexicalterm",
+                        "semantic fixture query",
+                        SearchFilters::default(),
+                        limit,
+                        offset,
+                        0,
+                        FieldMask::FULL,
+                        false,
+                    )?;
+                    let paths: Vec<_> = result
+                        .hits
+                        .iter()
+                        .map(|hit| hit.source_path.as_str())
+                        .collect();
+                    let expected: Vec<_> = fixture
+                        .source_paths
+                        .iter()
+                        .skip(offset)
+                        .take(if limit == 0 { usize::MAX } else { limit })
+                        .map(String::as_str)
+                        .collect();
+                    assert_eq!(
+                        paths, expected,
+                        "sharded={sharded} limit={limit} offset={offset}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn sqlite_only_result_cache_never_replays_forgotten_canonical_rows() -> Result<()> {
         let fixture = build_semantic_test_fixture()?;
         assert!(!fixture.client.has_tantivy());
@@ -25812,18 +25843,11 @@ mod tests {
             budget.lexical_candidates
         );
         assert!(budget.semantic_candidates <= HYBRID_NO_LIMIT_SEMANTIC_CAP);
-        // Invariant preserved by the `.min(lexical)` clamp inside
-        // hybrid_candidate_budget: semantic fanout never exceeds
-        // lexical fanout. On typical hosts lexical >> semantic, but
-        // the cheaper `<=` assertion also holds on edge-case tiny
-        // boxes where the overall cap pulls lexical down to the
-        // planning window.
-        assert!(
-            budget.semantic_candidates <= budget.lexical_candidates,
-            "semantic ({}) must not exceed lexical ({}) fanout",
-            budget.semantic_candidates,
-            budget.lexical_candidates
-        );
+        assert!(budget.semantic_candidates <= cap);
+
+        let partial = hybrid_candidate_budget("authentication middleware", 0, cap, 0, 1);
+        assert_eq!(partial.lexical_candidates, 1);
+        assert_eq!(partial.semantic_candidates, budget.semantic_candidates);
     }
 
     #[test]
