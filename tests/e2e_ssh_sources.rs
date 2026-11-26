@@ -424,6 +424,261 @@ fn ssh_sources_sync_rsync() {
     tracker.complete();
 }
 
+/// A real transfer must remain retryable when indexing is refused. The next
+/// process sees a genuine zero-transfer rsync report, not a substituted tool.
+#[test]
+#[ignore = "requires Docker, OpenSSH and rsync"]
+fn ssh_sources_sync_retries_index_after_zero_transfer() {
+    use fs2::FileExt;
+    use std::io::Write;
+    use serde_json::{Value, json};
+
+    assert!(docker_available(), "explicit retry test requires Docker");
+    assert!(
+        Command::new("rsync")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .status()
+            .expect("real rsync must be installed")
+            .success()
+    );
+    let tracker = tracker_for("ssh_sources_sync_retries_index_after_zero_transfer");
+    let server = DockerSshServer::start().expect("start real SSH server for index retry");
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let config = tmp.path().join("config");
+    let data = tmp.path().join("data");
+    for directory in [&home, &config, &data] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    fs::write(home.join(".env"), "").unwrap();
+
+    // Production transport enforces strict checking. Trust only the keys of
+    // this owned localhost fixture, using a real known_hosts file.
+    let port = server.port().to_string();
+    let keys = Command::new("ssh-keyscan")
+        .args(["-T", "5", "-p", &port, "127.0.0.1"])
+        .output()
+        .expect("read fixture SSH host keys");
+    assert!(
+        keys.status.success() && !keys.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&keys.stderr)
+    );
+    let known_hosts = home.join("known_hosts");
+    fs::write(&known_hosts, &keys.stdout).unwrap();
+    let ssh_config = home.join("ssh_config");
+    fs::write(
+        &ssh_config,
+        format!(
+            "Host retry-source\n    HostName 127.0.0.1\n    User root\n    Port {}\n    IdentityFile \"{}\"\n    IdentitiesOnly yes\n    StrictHostKeyChecking yes\n    UserKnownHostsFile \"{}\"\n",
+            server.port(),
+            server.key_path().display(),
+            known_hosts.display(),
+        ),
+    )
+    .unwrap();
+
+    let remote_dir = "/root/cass-sync-retry/.codex/sessions";
+    let remote_file = "/root/cass-sync-retry/.codex/sessions/rollout-retry.jsonl";
+    assert!(
+        Command::new("docker")
+            .args(["exec", &server.container_id, "mkdir", "-p", remote_dir])
+            .status()
+            .expect("create dedicated remote fixture")
+            .success()
+    );
+    let write_remote = |body: &str| {
+        let mut child = Command::new("docker")
+            .args(["exec", "-i", &server.container_id, "tee", remote_file])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("write remote session through Docker");
+        child
+            .stdin
+            .take()
+            .expect("fixture stdin")
+            .write_all(body.as_bytes())
+            .expect("write complete remote fixture");
+        let output = child.wait_with_output().expect("finish fixture write");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let initial = concat!(
+        "{\"timestamp\":\"2026-09-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"sync-index-retry\",\"cwd\":\"/synthetic/project\",\"cli_version\":\"0.42.0\"}}\n",
+        "{\"timestamp\":\"2026-09-01T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"syncindexretryfirstmarker\"}]}}\n",
+    );
+    write_remote(initial);
+    create_ssh_sources_config(
+        &config,
+        "retry-source",
+        "retry-source",
+        server.port(),
+        server.key_path(),
+        &[remote_dir],
+    );
+
+    let command = || {
+        let mut command = tracker.cass_assert_command();
+        command
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_DATA_HOME", tmp.path().join("xdg"))
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_SSH_CONFIG", &ssh_config)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(&home)
+            .timeout(Duration::from_secs(120));
+        tracker.command_environment().apply_to_assert(&mut command);
+        command
+    };
+    let json_output = |output: &std::process::Output| -> Value {
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "expected one JSON document: {error}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+    };
+    let success = |output: &std::process::Output| {
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let journal_path = data.join("sync_index_pending.json");
+
+    let dry = command()
+        .args(["sources", "sync", "--json", "--dry-run"])
+        .output()
+        .unwrap();
+    success(&dry);
+    assert!(!journal_path.exists());
+    assert!(!data.join("sync-index.lock").exists());
+
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data.join("index-run.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    let refused = command()
+        .args(["sources", "sync", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(7));
+    let refused = json_output(&refused);
+    assert_eq!(refused["status"], "index_failed", "{refused}");
+    assert_eq!(refused["indexing"]["code"], 7, "{refused}");
+    assert!(refused["total_files"].as_u64().unwrap() > 0, "{refused}");
+    assert_eq!(refused["sources"][0]["method"], "rsync", "{refused}");
+    assert_eq!(refused["pending_index_sources"], json!(["retry-source"]));
+    let pending: Value = serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    assert_eq!(pending["pending"], json!(["retry-source"]));
+    assert!(!data.join("agent_search.db").exists());
+
+    // Human capture must preserve the original actionable error, not suppress
+    // it as already reported merely because its payload was captured.
+    let human_refused = command().args(["sources", "sync"]).output().unwrap();
+    assert_eq!(human_refused.status.code(), Some(7));
+    let diagnostic = String::from_utf8_lossy(&human_refused.stderr);
+    assert!(
+        diagnostic.to_ascii_lowercase().contains("index")
+            && (diagnostic.to_ascii_lowercase().contains("active")
+                || diagnostic.to_ascii_lowercase().contains("lock")
+                || diagnostic.to_ascii_lowercase().contains("running")),
+        "missing actionable held-index diagnostic: {diagnostic}"
+    );
+    assert!(!diagnostic.contains("__cass_error_already_reported__"));
+    FileExt::unlock(&lock).unwrap();
+
+    let recovered = command()
+        .args(["sources", "sync", "--json"])
+        .output()
+        .unwrap();
+    success(&recovered);
+    let recovered = json_output(&recovered);
+    assert_eq!(recovered["status"], "complete", "{recovered}");
+    assert_eq!(recovered["total_files"], 0, "{recovered}");
+    assert_eq!(recovered["total_bytes"], 0, "{recovered}");
+    assert_eq!(recovered["will_reindex"], true, "{recovered}");
+    assert_eq!(recovered["indexing"]["success"], true, "{recovered}");
+    assert_eq!(recovered["pending_index_sources"], json!([]), "{recovered}");
+
+    let search = |marker: &str| {
+        let output = command()
+            .args([
+                "search", marker, "--robot", "--mode", "lexical", "--source",
+                "retry-source", "--no-maintenance", "--no-daemon",
+            ])
+            .output()
+            .unwrap();
+        success(&output);
+        let result = json_output(&output);
+        let hits = result["hits"].as_array().expect("lexical search hits");
+        assert_eq!(hits.len(), 1, "{result}");
+        assert_eq!(hits[0]["source_id"], "retry-source", "{result}");
+    };
+    search("syncindexretryfirstmarker");
+    let quiet = command()
+        .args(["sources", "sync", "--json"])
+        .output()
+        .unwrap();
+    success(&quiet);
+    let quiet = json_output(&quiet);
+    assert_eq!(quiet["total_files"], 0, "{quiet}");
+    assert_eq!(quiet["total_bytes"], 0, "{quiet}");
+    assert_eq!(
+        quiet["will_reindex"],
+        env!("CASS_SOURCE_INGEST_REUSE") != "true",
+        "only a versioned production ingest contract can reuse completion: {quiet}"
+    );
+
+    let extended = format!(
+        "{}{}\n",
+        initial,
+        r#"{"timestamp":"2026-09-01T00:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"syncindexretrysecondmarker"}]}}"#,
+    );
+    write_remote(&extended);
+    let deferred = command()
+        .args(["sources", "sync", "--json", "--no-index"])
+        .output()
+        .unwrap();
+    success(&deferred);
+    let deferred = json_output(&deferred);
+    assert!(deferred["total_files"].as_u64().unwrap() > 0, "{deferred}");
+    assert_eq!(deferred["will_reindex"], false, "{deferred}");
+    assert_eq!(deferred["pending_index_sources"], json!(["retry-source"]));
+
+    let before_dry_run = fs::read(&journal_path).unwrap();
+    let dry = command()
+        .args(["sources", "sync", "--json", "--dry-run"])
+        .output()
+        .unwrap();
+    success(&dry);
+    assert_eq!(fs::read(&journal_path).unwrap(), before_dry_run);
+
+    let human_recovered = command().args(["sources", "sync"]).output().unwrap();
+    success(&human_recovered);
+    let completed: Value = serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    assert_eq!(completed["pending"], json!([]), "{completed}");
+    search("syncindexretrysecondmarker");
+    tracker.complete();
+}
+
 /// Test: sources sync verifies provenance tracking.
 ///
 /// After syncing, sessions should have:

@@ -1010,6 +1010,10 @@ pub struct IndexingStats {
     /// source commits are retained, but this run must not report complete
     /// coverage or cache a successful command result (GH #484).
     pub scan_had_errors: bool,
+    /// An admitted remote source did not certify complete ingestion. This
+    /// includes empty sessions and prevents callers from acknowledging a
+    /// successful sync-to-index handoff before coverage is complete.
+    pub incomplete_remote_sources: bool,
     /// Per-connector breakdown
     pub connectors: Vec<ConnectorStats>,
     /// Per-provider source outcomes; unlike conversation counts this preserves
@@ -17616,6 +17620,7 @@ fn run_streaming_consumer(
             .saturating_add(ingest_outcome.quarantined_conversations);
         stats.lexical_update_deferred |= ingest_outcome.lexical_update_deferred;
         stats.scan_had_errors |= ingest_outcome.scan_had_errors;
+        stats.incomplete_remote_sources |= ingest_outcome.incomplete_remote_sources;
     }
 
     tracing::info!(
@@ -17871,6 +17876,11 @@ where
     ingest_outcome.incomplete_remote_sources |= producer_config
         .incomplete_remote_sources
         .load(Ordering::Relaxed);
+    if let Some(progress) = &opts.progress
+        && let Ok(mut stats) = progress.stats.lock()
+    {
+        stats.incomplete_remote_sources |= ingest_outcome.incomplete_remote_sources;
+    }
     record_deferred_active_sources(opts.progress.as_ref(), &active_deferred);
     ingest_outcome.deferred_sources.extend(active_deferred);
 
@@ -18529,6 +18539,7 @@ where
             .saturating_add(ingest_outcome.quarantined_conversations);
         stats.lexical_update_deferred |= ingest_outcome.lexical_update_deferred;
         stats.scan_had_errors |= ingest_outcome.scan_had_errors || scan_had_errors;
+        stats.incomplete_remote_sources |= ingest_outcome.incomplete_remote_sources;
     }
 
     ingest_outcome.scanned_connectors.extend(scanned_connectors);
@@ -20632,6 +20643,11 @@ fn run_index_with_storage_ownership(
                     scan_had_errors |= scan_outcome.scan_had_errors;
                     incomplete_remote_sources |= scan_outcome.incomplete_remote_sources;
                     deferred_watch_sources.extend(scan_outcome.deferred_sources);
+                }
+                if let Some(progress) = &opts.progress
+                    && let Ok(mut stats) = progress.stats.lock()
+                {
+                    stats.incomplete_remote_sources |= incomplete_remote_sources;
                 }
                 // Persist a root receipt only after an error-free scan with
                 // no admitted remote source missing its completion callback.
@@ -39151,6 +39167,18 @@ fn remote_mirror_root_identity(root: &ScanRoot) -> Option<String> {
     Some(blake3::hash(&identity).to_hex().to_string())
 }
 
+/// Sync completion receipts use the same parser, connector and filter contract
+/// as mirror reuse. Untracked builds and uncertain policy never certify reuse.
+pub(crate) fn remote_sync_index_contract() -> Option<String> {
+    if env!("CASS_SOURCE_INGEST_REUSE") != "true" {
+        return None;
+    }
+    WorkspaceExclusions::from_env()
+        .ok()
+        .as_ref()
+        .and_then(remote_mirror_scan_contract)
+}
+
 fn remote_mirror_scan_contract(policy: &WorkspaceExclusions) -> Option<String> {
     let connectors: Vec<_> = configured_connector_factories()
         .into_iter()
@@ -39526,6 +39554,87 @@ mod mirror_scan_skip_tests {
             receipts.is_empty(),
             "file roots must use source dependency observations"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn gh574_incomplete_remote_sources_reach_indexing_stats() -> Result<()> {
+        let (name, factory) = crate::connectors::get_connector_factories()
+            .into_iter()
+            .find(|(name, _)| *name == "pi_agent")
+            .context("Pi connector factory")?;
+        const MESSAGE: &str = "{\"type\":\"message\",\"id\":\"user\",\"timestamp\":\"2024-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"sync completion probe\"}}\n";
+        let header = |id: &str| {
+            serde_json::json!({
+                "type": "session", "id": id, "cwd": "/work",
+                "timestamp": "2024-01-01T00:00:00Z"
+            })
+            .to_string()
+                + "\n"
+        };
+        for streaming in [false, true] {
+            let temp = TempDir::new()?;
+            let sessions = temp.path().join("remote/.pi/agent/sessions");
+            let local = temp.path().join("local/.pi/agent/sessions");
+            let data = temp.path().join("data");
+            fs::create_dir_all(&sessions)?;
+            fs::create_dir_all(&local)?;
+            fs::create_dir_all(&data)?;
+            let healthy = sessions.join("healthy.jsonl");
+            let incomplete = sessions.join("header-only.jsonl");
+            fs::write(&healthy, format!("{}{MESSAGE}", header("sync-healthy")))?;
+            fs::write(&incomplete, header("sync-incomplete"))?;
+            let db_path = data.join("archive.db");
+            let storage = FrankenStorage::open(&db_path)?;
+            let run = if streaming {
+                run_streaming_index_with_connector_factories::<ConnectorFactory>
+            } else {
+                run_batch_index_with_connector_factories::<ConnectorFactory>
+            };
+            for completed in [false, true] {
+                if completed {
+                    fs::write(
+                        &incomplete,
+                        format!("{}{MESSAGE}", header("sync-incomplete")),
+                    )?;
+                }
+                for path in [&healthy, &incomplete] {
+                    File::open(path)?
+                        .set_modified(SystemTime::now() - Duration::from_secs(7200))?;
+                }
+                let progress = Arc::new(IndexingProgress::default());
+                let mut opts = base_opts(&db_path, &data);
+                opts.progress = Some(Arc::clone(&progress));
+                let outcome = run(
+                    &storage,
+                    None,
+                    &opts,
+                    None,
+                    LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                    vec![ssh_root(&sessions, "sync-stats")],
+                    Some(Arc::new(HashMap::from([(
+                        name.to_owned(),
+                        vec![local.clone()],
+                    )]))),
+                    vec![(name, factory)],
+                    Some(456_789),
+                    None,
+                )?;
+                assert!(!outcome.scan_had_errors);
+                assert_eq!(outcome.incomplete_remote_sources, !completed);
+                let stats = progress.stats.lock().unwrap();
+                assert_eq!(stats.incomplete_remote_sources, !completed);
+                let json = serde_json::to_value(&*stats)?;
+                assert_eq!(json["incomplete_remote_sources"], !completed);
+                drop(stats);
+                assert_eq!(
+                    count_total_messages_exact(&storage)?,
+                    if completed { 2 } else { 1 },
+                    "healthy history must persist while an empty sibling waits"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]

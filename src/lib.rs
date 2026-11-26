@@ -10683,6 +10683,19 @@ fn run_forget_command(
         });
     }
 
+    // Invalidate sync completion before canonical deletion or exclusion
+    // release. Hold this lease through mutation so a finishing sync cannot
+    // acknowledge history that forget has just removed. The lock order is
+    // always sync journal -> index/maintenance, matching sources sync.
+    let mut sync_index_guard = if apply {
+        Some(
+            crate::sources::sync::SyncIndexJournal::acquire(&data_dir)
+                .map_err(sources_sync_journal_error)?,
+        )
+    } else {
+        None
+    };
+
     // An active-owner probe alone races a new index/daemon job. Acquire the
     // same data-directory and archive writer leases as indexing, and keep
     // them until all derived assets have stopped serving the deleted rows.
@@ -10710,6 +10723,11 @@ fn run_forget_command(
             })
         })
         .transpose()?;
+    if let Some(journal) = sync_index_guard.as_mut() {
+        journal
+            .invalidate_all_completed()
+            .map_err(sources_sync_journal_error)?;
+    }
     // GH #565: a writable open can hydrate the entire optional FTS5 shadow
     // before the first canonical deletion. Inspect without canonical writes
     // first, permitting only locked WAL-index recovery after a typed
@@ -116007,6 +116025,9 @@ fn run_index_with_data(
     });
     let structured_output = structured_format.is_some();
     let capture_output = captured_result.is_some();
+    // Internal callers need completion diagnostics in human mode too. Keep
+    // presentation tied to the requested format; capture alone prints no JSON.
+    let result_format = structured_format.or(capture_output.then_some(RobotFormat::Compact));
     let mut emit_result = |payload: serde_json::Value, format: RobotFormat| {
         if let Some(result) = captured_result.as_deref_mut() {
             *result = Some(payload);
@@ -116049,7 +116070,7 @@ fn run_index_with_data(
                 // A syntactically valid scalar or array is not an index result.
                 // Treat damaged cache entries as misses in every output mode.
                 if let Some(val) = cached_index_payload(&result_json, key) {
-                    if let Some(fmt) = structured_format {
+                    if let Some(fmt) = result_format {
                         emit_result(val, fmt)?;
                     } else {
                         eprintln!(
@@ -116159,7 +116180,7 @@ fn run_index_with_data(
 
     if let Some(active_index) = active_index_run_details(&data_dir, &db_path) {
         let err = active_index.to_cli_error();
-        if let Some(fmt) = structured_format {
+        if let Some(fmt) = result_format {
             let mut payload = cli_error_json_payload(&err, 0);
             payload["active_index"] = active_index.to_json();
             if emit_progress_events {
@@ -116174,7 +116195,9 @@ fn run_index_with_data(
                 emit_event(event);
             }
             emit_result(payload, fmt)?;
-            return Err(CliError::already_reported_from(&err));
+            if !capture_output {
+                return Err(CliError::already_reported_from(&err));
+            }
         }
         return Err(err);
     }
@@ -116723,7 +116746,7 @@ fn run_index_with_data(
             err.code,
             err.message
         );
-        if let Some(fmt) = structured_format {
+        if let Some(fmt) = result_format {
             let mut payload = cli_error_json_payload(err, elapsed_ms);
             if let Ok(stats) = index_progress.stats.lock()
                 && index_result::annotate_partial_scan(
@@ -116754,7 +116777,7 @@ fn run_index_with_data(
             }
             emit_result(payload, fmt)?;
         }
-    } else if structured_format.is_some() || idempotency_key.is_some() {
+    } else if result_format.is_some() || idempotency_key.is_some() {
         // Derive result counts from the indexer's own progress tracking rather
         // than reopening the live DB after the lexical checkpoint has already
         // been written (CASS #192). A post-checkpoint reopen through
@@ -116843,7 +116866,7 @@ fn run_index_with_data(
             emit_event(event);
         }
 
-        if let Some(fmt) = structured_format {
+        if let Some(fmt) = result_format {
             emit_result(payload, fmt)?;
         }
     }
@@ -116851,7 +116874,7 @@ fn run_index_with_data(
     // gh359: `res.is_ok()` — the plain completion line used to print even
     // after the error arm above had already reported a failed run, so a
     // failing `cass index` ended its stderr with "index completed".
-    if show_plain && res.is_ok() {
+    if show_plain && res.is_ok() && !capture_output {
         // gh359: "index completed" after a run that deferred the
         // authoritative lexical repair (and therefore made nothing new
         // searchable) was the worst possible signal for a large archive.
@@ -116880,7 +116903,9 @@ fn run_index_with_data(
     }
 
     match res {
-        Err(err) if structured_format.is_some() => Err(CliError::already_reported_from(&err)),
+        Err(err) if structured_format.is_some() && !capture_output => {
+            Err(CliError::already_reported_from(&err))
+        }
         other => other,
     }
 }
@@ -127208,6 +127233,25 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
         }
     }
 
+    // A later remove/re-add must not reuse this source's completion receipt,
+    // including when its mirror remains on disk. Invalidate before mutation.
+    let data_dir = default_data_dir();
+    let mut index_journal = crate::sources::sync::SyncIndexJournal::acquire(&data_dir)
+        .map_err(sources_sync_journal_error)?;
+    index_journal
+        .invalidate_sources([stored_source_name.as_str()])
+        .map_err(sources_sync_journal_error)?;
+
+    // Re-read after admission; the confirmation prompt may have outlived
+    // another source configuration update.
+    config = SourcesConfig::load().map_err(|e| CliError {
+        code: 9,
+        kind: CliErrorKind::Config.kind_str(),
+        message: format!("Failed to reload sources config: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
+
     // Remove from config
     config.remove_source(&stored_source_name);
     config.save().map_err(|e| CliError {
@@ -127220,7 +127264,6 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
 
     println!("Removed '{}' from configuration.", stored_source_name);
 
-    let data_dir = default_data_dir();
     match SyncStatus::load(&data_dir) {
         Ok(mut sync_status) => {
             if sync_status.retain_sources(config.sources.iter().map(|source| source.name.as_str()))
@@ -128587,29 +128630,193 @@ fn gather_source_sync_evidence(
     }
 }
 
+fn sources_sync_journal_error(error: std::io::Error) -> CliError {
+    let busy = error.kind() == std::io::ErrorKind::WouldBlock;
+    CliError {
+        code: if busy { 7 } else { 9 },
+        kind: if busy {
+            CliErrorKind::IndexBusy.kind_str()
+        } else {
+            CliErrorKind::Io.kind_str()
+        },
+        message: format!("Cannot acquire or persist source sync indexing state: {error}"),
+        hint: Some(if busy {
+            "Another source sync is transferring or indexing this data directory; retry after it finishes"
+                .into()
+        } else {
+            "Check data-directory permissions and sync_index_pending.json before retrying; preserve pending indexing work"
+                .into()
+        }),
+        retryable: true,
+    }
+}
+
+fn sources_sync_retry_pending<'a>(
+    pending_sources: &[String],
+    successful_sources: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    successful_sources
+        .into_iter()
+        .any(|source| pending_sources.iter().any(|pending| pending == source))
+}
+
 fn sources_sync_will_reindex(
     no_index: bool,
     dry_run: bool,
     total_files: u64,
     total_bytes: u64,
+    pending_index: bool,
 ) -> bool {
-    !no_index && !dry_run && (total_files > 0 || total_bytes > 0)
+    !no_index && !dry_run && (total_files > 0 || total_bytes > 0 || pending_index)
+}
+
+/// A successful command can still defer source or lexical work. Missing or
+/// unrecognized diagnostics cannot certify that durable sync debt is finished.
+fn sources_sync_indexing_complete(payload: Option<&serde_json::Value>) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+    let Some(stats) = payload.get("indexing_stats").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    payload.get("success").and_then(serde_json::Value::as_bool) == Some(true)
+        && payload
+            .get("lexical_update_deferred")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && payload
+            .get("quarantined_conversations")
+            .and_then(serde_json::Value::as_u64)
+            == Some(0)
+        && stats.get("scan_had_errors").and_then(serde_json::Value::as_bool) == Some(false)
+        && stats
+            .get("incomplete_remote_sources")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && stats
+            .get("lexical_update_deferred")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && stats
+            .get("quarantined_conversations")
+            .and_then(serde_json::Value::as_u64)
+            == Some(0)
+        && stats
+            .get("deferred_active_sources")
+            .and_then(serde_json::Value::as_u64)
+            == Some(0)
+        && stats
+            .get("connectors")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|connectors| {
+                connectors.iter().all(|connector| {
+                    connector.as_object().is_some_and(|connector| {
+                        connector.get("error").is_none_or(serde_json::Value::is_null)
+                    })
+                })
+            })
 }
 
 #[cfg(test)]
 mod sources_sync_reindex_tests {
-    use super::sources_sync_will_reindex;
+    use super::{
+        sources_sync_indexing_complete, sources_sync_retry_pending, sources_sync_will_reindex,
+    };
+    use serde_json::{Value, json};
 
     #[test]
-    fn transferred_files_or_payload_bytes_require_indexing_unless_disabled() {
-        for (files, bytes) in [(252, 73_703_557), (1, 0), (0, 16)] {
-            assert!(sources_sync_will_reindex(false, false, files, bytes));
-            assert!(!sources_sync_will_reindex(true, false, files, bytes));
-            assert!(!sources_sync_will_reindex(false, true, files, bytes));
-            assert!(!sources_sync_will_reindex(true, true, files, bytes));
+    fn transferred_files_or_retry_debt_require_indexing_unless_disabled() {
+        for (files, bytes, pending) in [
+            (252, 73_703_557, false),
+            (1, 0, false),
+            (0, 16, false),
+            (0, 0, true),
+        ] {
+            assert!(sources_sync_will_reindex(false, false, files, bytes, pending));
+            assert!(!sources_sync_will_reindex(true, false, files, bytes, pending));
+            assert!(!sources_sync_will_reindex(false, true, files, bytes, pending));
+            assert!(!sources_sync_will_reindex(true, true, files, bytes, pending));
         }
         for (no_index, dry_run) in [(false, false), (true, false), (false, true), (true, true)] {
-            assert!(!sources_sync_will_reindex(no_index, dry_run, 0, 0));
+            assert!(!sources_sync_will_reindex(no_index, dry_run, 0, 0, false));
+        }
+    }
+
+    #[test]
+    fn failed_only_pending_sources_do_not_trigger_indexing() {
+        let pending = vec!["failed-host".to_string()];
+        assert!(!sources_sync_retry_pending(&pending, std::iter::empty()));
+        assert!(!sources_sync_retry_pending(&pending, ["healthy-host"]));
+        assert!(sources_sync_retry_pending(&pending, ["failed-host"]));
+        assert!(!sources_sync_will_reindex(
+            false,
+            false,
+            0,
+            0,
+            sources_sync_retry_pending(&pending, ["healthy-host"]),
+        ));
+        assert!(sources_sync_will_reindex(
+            false,
+            false,
+            1,
+            0,
+            sources_sync_retry_pending(&pending, std::iter::empty()),
+        ));
+    }
+
+    fn complete_index_result() -> Value {
+        json!({
+            "success": true,
+            "lexical_update_deferred": false,
+            "quarantined_conversations": 0,
+            "indexing_stats": {
+                "scan_had_errors": false,
+                "incomplete_remote_sources": false,
+                "lexical_update_deferred": false,
+                "quarantined_conversations": 0,
+                "deferred_active_sources": 0,
+                "connectors": [{"name": "claude_code"}],
+            },
+        })
+    }
+
+    #[test]
+    fn durable_debt_requires_explicit_complete_diagnostics() {
+        assert!(sources_sync_indexing_complete(Some(&complete_index_result())));
+        assert!(!sources_sync_indexing_complete(None));
+        assert!(!sources_sync_indexing_complete(Some(&json!({"success": true}))));
+
+        for (pointer, incomplete) in [
+            ("/success", json!(false)),
+            ("/lexical_update_deferred", json!(true)),
+            ("/quarantined_conversations", json!(1)),
+            ("/indexing_stats/scan_had_errors", json!(true)),
+            ("/indexing_stats/incomplete_remote_sources", json!(true)),
+            ("/indexing_stats/lexical_update_deferred", json!(true)),
+            ("/indexing_stats/quarantined_conversations", json!(1)),
+            ("/indexing_stats/deferred_active_sources", json!(1)),
+            ("/indexing_stats/connectors", json!([{"error": "scan failed"}])),
+            ("/indexing_stats/connectors", json!([null])),
+        ] {
+            let mut result = complete_index_result();
+            *result.pointer_mut(pointer).expect("diagnostic field") = incomplete;
+            assert!(!sources_sync_indexing_complete(Some(&result)), "{pointer}");
+
+            *result.pointer_mut(pointer).expect("diagnostic field") = Value::Null;
+            assert!(!sources_sync_indexing_complete(Some(&result)), "{pointer}");
+        }
+
+        for field in [
+            "scan_had_errors",
+            "incomplete_remote_sources",
+            "lexical_update_deferred",
+            "quarantined_conversations",
+            "deferred_active_sources",
+            "connectors",
+        ] {
+            let mut result = complete_index_result();
+            result["indexing_stats"].as_object_mut().unwrap().remove(field);
+            assert!(!sources_sync_indexing_complete(Some(&result)), "{field}");
         }
     }
 }
@@ -128623,9 +128830,25 @@ fn run_sources_sync(
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::sources::config::{SourcesConfig, source_names_equal, source_path_entry_error};
-    use crate::sources::sync::{SyncEngine, SyncReport, SyncStatus, current_unix_ms};
+    use crate::sources::sync::{
+        SyncEngine, SyncIndexJournal, SyncReport, SyncStatus, current_unix_ms,
+    };
     use colored::Colorize;
 
+    // Use the same data dir as the rest of the app (DB, Tantivy index, remotes mirror).
+    // Override with `CASS_DATA_DIR` or command-specific `--data-dir` flags elsewhere.
+    let data_dir = default_data_dir();
+    // One lease spans transport and index completion. The ordinary indexer
+    // never acquires this lease, so sync -> index-run is the only lock order.
+    // Dry runs do not create or change the journal or its lease file.
+    let mut index_journal = if dry_run {
+        None
+    } else {
+        Some(SyncIndexJournal::acquire(&data_dir).map_err(sources_sync_journal_error)?)
+    };
+
+    // Load source selection only after admission; lifecycle changes use the
+    // same lease and must not leave this invocation with an older snapshot.
     let config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
         kind: CliErrorKind::Config.kind_str(),
@@ -128633,6 +128856,7 @@ fn run_sources_sync(
         hint: Some("Run 'cass sources add' to configure a source".into()),
         retryable: false,
     })?;
+    let ingest_contract = crate::indexer::remote_sync_index_contract();
 
     // Filter to remote sources only
     let remote_sources: Vec<_> = config.remote_sources().collect();
@@ -128696,10 +128920,6 @@ fn run_sources_sync(
         return Ok(());
     }
 
-    // Use the same data dir as the rest of the app (DB, Tantivy index, remotes mirror).
-    // Override with `CASS_DATA_DIR` or command-specific `--data-dir` flags elsewhere.
-    let data_dir = default_data_dir();
-
     // Create sync engine
     let engine = SyncEngine::new(&data_dir);
 
@@ -128722,6 +128942,7 @@ fn run_sources_sync(
     let mut attempted_sources = 0usize;
     let mut sources_with_failures = 0usize;
     let mut sources_fully_failed = 0usize;
+    let mut successful_sources = Vec::new();
 
     for source in &sources_to_sync {
         let sync_decision = status.decision_for_source_at(source, now_ms, true);
@@ -128794,7 +129015,15 @@ fn run_sources_sync(
             continue;
         }
 
-        // Perform actual sync
+        // Write ahead: even a process exit after transfer but before the
+        // indexer starts must leave a retry when the next rsync transfers zero.
+        let needs_index = if let Some(journal) = index_journal.as_mut() {
+            journal
+                .mark_pending(source, ingest_contract.as_deref())
+                .map_err(sources_sync_journal_error)?
+        } else {
+            false
+        };
         attempted_sources += 1;
         let report = match engine.sync_source(source) {
             Ok(r) => {
@@ -128861,6 +129090,21 @@ fn run_sources_sync(
 
         // Update status
         status.update(&source.name, &report);
+        if report.all_succeeded {
+            successful_sources.push(*source);
+            // Only a previously completed source can skip a no-change index.
+            // Earlier debt and legacy mirrors without a completion receipt
+            // still require indexing when this reports zero files and bytes.
+            if !needs_index
+                && report.total_files() == 0
+                && report.total_bytes() == 0
+                && let Some(journal) = index_journal.as_mut()
+            {
+                journal
+                    .clear_sources([*source], ingest_contract.as_deref())
+                    .map_err(sources_sync_journal_error)?;
+            }
+        }
 
         // Print results
         let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -128980,19 +129224,35 @@ fn run_sources_sync(
         );
     }
 
-    // Capture nested indexing so structured sync emits one final document,
-    // including failure, rather than a premature success plus a second JSON.
-    // Empty files count as changes too; payload bytes remain useful evidence if
-    // a client's file-count statistic is unavailable. Reuse this exact decision
-    // in the JSON summary so the advertised action matches the executed branch.
-    let will_reindex = sources_sync_will_reindex(no_index, dry_run, total_files, total_bytes);
+    // Capture completion diagnostics in every output mode. Transfer counts
+    // describe this invocation only; durable debt also covers earlier crashes,
+    // failed indexing and intentional --no-index transfers.
+    let pending_sources = index_journal.as_ref().map_or_else(Vec::new, |journal| {
+        journal.pending_sources(sources_to_sync.iter().map(|source| source.name.as_str()))
+    });
+    // Failed transport alone must not launch an unrelated index or replace
+    // its source error with an index-lock error. Positive partial transfers
+    // retain the existing indexing behavior; old debt retries after a source
+    // has successfully completed its transport.
+    let retry_pending = sources_sync_retry_pending(
+        &pending_sources,
+        successful_sources.iter().map(|source| source.name.as_str()),
+    );
+    let will_reindex = sources_sync_will_reindex(
+        no_index,
+        dry_run,
+        total_files,
+        total_bytes,
+        retry_pending,
+    );
     let mut indexing_result = None;
     let indexing = if will_reindex {
         if !is_robot {
             println!(
-                "{} {} new files...",
+                "{} synced sessions ({} transferred files, {} pending sources)...",
                 "Re-indexing".cyan().bold(),
-                total_files
+                total_files,
+                pending_sources.len()
             );
         }
 
@@ -129012,7 +129272,7 @@ fn run_sources_sync(
             false,          // watch
             None,           // watch_once
             30,             // watch_interval (default)
-            Some(data_dir), // data_dir
+            Some(data_dir.clone()), // data_dir
             false,          // semantic
             false,          // build_hnsw
             None,           // embedder follows semantic policy
@@ -129023,16 +129283,61 @@ fn run_sources_sync(
             false, // no_progress_events
             false, // robot_trace_ingest
             false, // background
-            is_robot.then_some(&mut indexing_result),
+            Some(&mut indexing_result),
             None,
         )
     } else {
         Ok(())
     };
 
+    if will_reindex
+        && indexing.is_ok()
+        && sources_sync_indexing_complete(indexing_result.as_ref())
+        && let Some(journal) = index_journal.as_mut()
+    {
+        // A complete scan cannot certify a failed transfer or policy/source
+        // changes made while it ran. Unknown contracts cannot grant reuse.
+        let current_contract = crate::indexer::remote_sync_index_contract();
+        if current_contract == ingest_contract
+            && let Ok(current_config) = SourcesConfig::load()
+        {
+            let unchanged_sources = successful_sources.iter().copied().filter(|source| {
+                current_config.find_source(&source.name).is_some_and(|current| {
+                    serde_json::to_vec(source)
+                        .ok()
+                        .zip(serde_json::to_vec(current).ok())
+                        .is_some_and(|(before, after)| before == after)
+                })
+            });
+            journal
+                .clear_sources(unchanged_sources, ingest_contract.as_deref())
+                .map_err(sources_sync_journal_error)?;
+        }
+    }
+    let pending_sources = index_journal.as_ref().map_or_else(Vec::new, |journal| {
+        journal.pending_sources(sources_to_sync.iter().map(|source| source.name.as_str()))
+    });
+    let index_pending = will_reindex && indexing.is_ok() && !pending_sources.is_empty();
+    if !is_robot && will_reindex && indexing.is_ok() {
+        if index_pending {
+            eprintln!(
+                "Indexing is still pending for {}; a later 'cass sources sync' will retry even if no files transfer.",
+                pending_sources.join(", ")
+            );
+        } else {
+            eprintln!("Synced sessions indexed.");
+        }
+    }
+
     if let Some(format) = structured_format {
         let mut payload = serde_json::json!({
-            "status": if indexing.is_err() { "index_failed" } else { overall_status },
+            "status": if indexing.is_err() {
+                "index_failed"
+            } else if index_pending && overall_status == "complete" {
+                "index_pending"
+            } else {
+                overall_status
+            },
             "dry_run": dry_run,
             "sources": all_reports,
             "sources_attempted": attempted_sources,
@@ -129041,6 +129346,7 @@ fn run_sources_sync(
             "total_files": total_files,
             "total_bytes": total_bytes,
             "will_reindex": will_reindex,
+            "pending_index_sources": pending_sources,
         });
         if let Some(result) = indexing_result {
             payload["indexing"] = result;
@@ -132912,6 +133218,8 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
     apply_exclusion(&mut SourcesConfig::default())?;
     let db_path = cli.db.clone().unwrap_or_else(default_db_path);
     let data_dir = archive_data_dir_for_agents_command(cli);
+    let mut index_journal = crate::sources::sync::SyncIndexJournal::acquire(&data_dir)
+        .map_err(sources_sync_journal_error)?;
     // An already-running indexer/watch keeps its selected connectors. Saving
     // new configuration cannot revoke that writer's in-flight batches. Own
     // both the data-dir and archive leases before saving a purging exclusion,
@@ -132920,6 +133228,11 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
     let mutation_guard = (!keep_indexed_data)
         .then(|| acquire_agent_exclusion_mutation_lock(&data_dir, &db_path))
         .transpose()?;
+    // Exclude then include can restore the same config after canonical rows
+    // were purged. Invalidate before either the config or archive changes.
+    index_journal
+        .invalidate_all_completed()
+        .map_err(sources_sync_journal_error)?;
     let mut config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
         kind: CliErrorKind::Config.kind_str(),
@@ -132994,6 +133307,8 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
 fn run_agents_include(agent: &str) -> CliResult<()> {
     use crate::sources::config::SourcesConfig;
 
+    let mut index_journal = crate::sources::sync::SyncIndexJournal::acquire(&default_data_dir())
+        .map_err(sources_sync_journal_error)?;
     let mut config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
         kind: CliErrorKind::Config.kind_str(),
@@ -133012,6 +133327,9 @@ fn run_agents_include(agent: &str) -> CliResult<()> {
             retryable: false,
         })?;
 
+    index_journal
+        .invalidate_all_completed()
+        .map_err(sources_sync_journal_error)?;
     config.save().map_err(|e| CliError {
         code: 11,
         kind: CliErrorKind::Config.kind_str(),

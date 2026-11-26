@@ -2884,6 +2884,229 @@ impl SourceSyncInfo {
     }
 }
 
+/// Durable retry debt for mirror bytes that have not completed indexing.
+///
+/// This is separate from transport status: old status writers must not erase an
+/// unfinished index. One nonblocking lease spans transfer, indexing and durable
+/// completion so another sync cannot certify a mirror still being written.
+pub struct SyncIndexJournal {
+    path: PathBuf,
+    pending: std::collections::BTreeSet<String>,
+    completed: std::collections::BTreeMap<String, String>,
+    _lease: std::fs::File,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncIndexJournalState {
+    version: u32,
+    pending: std::collections::BTreeSet<String>,
+    /// Missing receipts from older state require one conservative index pass.
+    #[serde(default)]
+    completed: std::collections::BTreeMap<String, String>,
+}
+
+const SYNC_INDEX_JOURNAL_MAX_BYTES: u64 = 1024 * 1024;
+
+impl SyncIndexJournal {
+    pub fn acquire(data_dir: &Path) -> Result<Self, std::io::Error> {
+        std::fs::create_dir_all(data_dir)?;
+        let lock_path = data_dir.join("sync-index.lock");
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let lease = options.open(&lock_path)?;
+        if !lease.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "source sync lease is not a regular file",
+            ));
+        }
+        fs2::FileExt::try_lock_exclusive(&lease).map_err(|error| {
+            let contended = error
+                .raw_os_error()
+                .zip(fs2::lock_contended_error().raw_os_error())
+                .is_some_and(|(actual, expected)| actual == expected);
+            if contended {
+                std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "another source sync owns the transfer/index lease",
+                )
+            } else {
+                error
+            }
+        })?;
+
+        let path = data_dir.join("sync_index_pending.json");
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let state = match options.open(&path) {
+            Ok(file) => {
+                if !file.metadata()?.is_file() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "source sync index journal is not a regular file",
+                    ));
+                }
+                let mut encoded = String::new();
+                file.take(SYNC_INDEX_JOURNAL_MAX_BYTES + 1)
+                    .read_to_string(&mut encoded)?;
+                if encoded.len() as u64 > SYNC_INDEX_JOURNAL_MAX_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "source sync index journal exceeds its read budget",
+                    ));
+                }
+                let state: SyncIndexJournalState = serde_json::from_str(&encoded)
+                    .map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    })?;
+                if state.version != 1 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "unsupported source sync index journal version",
+                    ));
+                }
+                state
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => SyncIndexJournalState {
+                version: 1,
+                pending: std::collections::BTreeSet::new(),
+                completed: std::collections::BTreeMap::new(),
+            },
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            path,
+            pending: state.pending,
+            completed: state.completed,
+            _lease: lease,
+        })
+    }
+
+    /// Persist before transport. Return whether a prior interruption or a
+    /// missing/mismatched completion receipt requires indexing even if this
+    /// transfer reports no changes. This enrolls pre-journal mirrors safely.
+    pub fn mark_pending(
+        &mut self,
+        source: &SourceDefinition,
+        contract: Option<&str>,
+    ) -> Result<bool, std::io::Error> {
+        let context = contract
+            .map(|contract| Self::source_context(source, contract))
+            .transpose()?;
+        let needs_index = self.pending.contains(&source.name)
+            || context
+                .as_ref()
+                .is_none_or(|context| self.completed.get(&source.name) != Some(context));
+        if self.pending.insert(source.name.clone()) {
+            self.save()?;
+        }
+        Ok(needs_index)
+    }
+
+    fn source_context(
+        source: &SourceDefinition,
+        contract: &str,
+    ) -> Result<String, std::io::Error> {
+        let encoded = serde_json::to_vec(&(contract, source)).map_err(std::io::Error::other)?;
+        Ok(blake3::hash(&encoded).to_hex().to_string())
+    }
+
+    pub fn pending_sources<'a>(
+        &self,
+        sources: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<String> {
+        sources
+            .into_iter()
+            .filter(|source| self.pending.contains(*source))
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Call only after a proven no-change transport or a complete index result.
+    pub fn clear_sources<'a>(
+        &mut self,
+        sources: impl IntoIterator<Item = &'a SourceDefinition>,
+        contract: Option<&str>,
+    ) -> Result<(), std::io::Error> {
+        let mut changed = false;
+        for source in sources {
+            changed |= self.pending.remove(&source.name);
+            if let Some(contract) = contract {
+                let context = Self::source_context(source, contract)?;
+                changed |= self.completed.get(&source.name) != Some(&context);
+                self.completed.insert(source.name.clone(), context);
+            } else {
+                // A complete handoff can finish current debt without granting
+                // future reuse to an unversioned or unknown ingest contract.
+                changed |= self.completed.remove(&source.name).is_some();
+            }
+        }
+        if changed {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Invalidate before removing source configuration or canonical history.
+    /// Keep debt until a later ordinary index completes for the current source.
+    pub fn invalidate_sources<'a>(
+        &mut self,
+        sources: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), std::io::Error> {
+        let mut changed = false;
+        for source in sources {
+            changed |= self.completed.remove(source).is_some();
+            changed |= self.pending.insert(source.to_owned());
+        }
+        if changed {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    pub fn invalidate_all_completed(&mut self) -> Result<(), std::io::Error> {
+        let sources: Vec<_> = self.completed.keys().cloned().collect();
+        self.invalidate_sources(sources.iter().map(String::as_str))
+    }
+
+    fn save(&self) -> Result<(), std::io::Error> {
+        let state = SyncIndexJournalState {
+            version: 1,
+            pending: self.pending.clone(),
+            completed: self.completed.clone(),
+        };
+        let encoded = serde_json::to_vec(&state).map_err(std::io::Error::other)?;
+        if encoded.len() as u64 > SYNC_INDEX_JOURNAL_MAX_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "source sync index journal exceeds its write budget",
+            ));
+        }
+        let temporary = write_sync_status_temp_file(&self.path, &encoded)?;
+        // Never use the transport-status backup/remove fallback here: a crash
+        // between removing the old journal and installing the new one would
+        // turn unfinished work into an empty journal. Failed replacement must
+        // leave the previous debt in place.
+        std::fs::rename(&temporary, &self.path)?;
+        sync_parent_directory(&self.path)
+    }
+}
+
 /// Persistent sync status for all sources.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SyncStatus {
@@ -3263,6 +3486,160 @@ fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) ->
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+
+    #[test]
+    fn sync_index_journal_survives_interruption_and_transport_status_saves() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("sync_index_pending.json");
+        let source = SourceDefinition::ssh("workstation", "user@workstation");
+        let other = SourceDefinition::ssh("other-host", "user@other");
+        {
+            let mut journal = SyncIndexJournal::acquire(temp.path()).unwrap();
+            assert!(journal.mark_pending(&source, Some("ingest-contract")).unwrap());
+            let persisted: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(persisted["pending"], serde_json::json!(["workstation"]));
+            // Transport completion is a different receipt and cannot certify
+            // indexing, including when a process exits before it starts index.
+            SyncStatus::default().save(temp.path()).unwrap();
+        }
+
+        let mut journal = SyncIndexJournal::acquire(temp.path()).unwrap();
+        assert!(journal.mark_pending(&source, Some("ingest-contract")).unwrap());
+        assert_eq!(journal.pending_sources(["workstation"]), ["workstation"]);
+        journal.mark_pending(&other, Some("ingest-contract")).unwrap();
+        journal.clear_sources([&source], Some("ingest-contract")).unwrap();
+        drop(journal);
+
+        let journal = SyncIndexJournal::acquire(temp.path()).unwrap();
+        assert!(journal.pending_sources(["workstation"]).is_empty());
+        assert_eq!(journal.pending_sources(["other-host"]), ["other-host"]);
+    }
+
+    #[test]
+    fn sync_index_journal_lease_is_nonblocking_until_completion_is_persisted() {
+        let temp = TempDir::new().unwrap();
+        let source = SourceDefinition::ssh("workstation", "user@workstation");
+        let mut owner = SyncIndexJournal::acquire(temp.path()).unwrap();
+        owner.mark_pending(&source, Some("ingest-contract")).unwrap();
+        let busy = SyncIndexJournal::acquire(temp.path())
+            .err()
+            .expect("second sync must not overlap transfer/index");
+        assert_eq!(busy.kind(), std::io::ErrorKind::WouldBlock);
+        owner.clear_sources([&source], Some("ingest-contract")).unwrap();
+        let busy = SyncIndexJournal::acquire(temp.path())
+            .err()
+            .expect("clearing debt does not release the invocation lease");
+        assert_eq!(busy.kind(), std::io::ErrorKind::WouldBlock);
+        drop(owner);
+        let journal = SyncIndexJournal::acquire(temp.path()).unwrap();
+        assert!(journal.pending_sources(["workstation"]).is_empty());
+    }
+
+    #[test]
+    fn sync_index_journal_enrolls_legacy_mirrors_before_skipping_no_change_transfers() {
+        let temp = TempDir::new().unwrap();
+        let source = SourceDefinition::ssh("workstation", "user@workstation");
+        SyncStatus::default().save(temp.path()).unwrap();
+        let mut journal = SyncIndexJournal::acquire(temp.path()).unwrap();
+        assert!(journal.pending_sources(["workstation"]).is_empty());
+        assert!(!temp.path().join("sync_index_pending.json").exists());
+        assert!(journal.mark_pending(&source, Some("ingest-contract")).unwrap());
+        journal.clear_sources([&source], Some("ingest-contract")).unwrap();
+        drop(journal);
+
+        let mut journal = SyncIndexJournal::acquire(temp.path()).unwrap();
+        assert!(
+            !journal.mark_pending(&source, Some("ingest-contract")).unwrap(),
+            "a proven unchanged source may avoid another index"
+        );
+        journal.clear_sources([&source], Some("ingest-contract")).unwrap();
+        let mut moved = source.clone();
+        moved.host = Some("user@replacement".to_string());
+        assert!(
+            journal.mark_pending(&moved, Some("ingest-contract")).unwrap(),
+            "a reused name must not inherit another source's completion"
+        );
+        journal.clear_sources([&moved], Some("ingest-contract")).unwrap();
+        moved.paths.push("/different/.codex/sessions".to_string());
+        assert!(journal.mark_pending(&moved, Some("ingest-contract")).unwrap());
+    }
+
+    #[test]
+    fn sync_index_journal_rejects_unknown_or_changed_ingest_contracts() {
+        let temp = TempDir::new().unwrap();
+        let source = SourceDefinition::ssh("workstation", "user@workstation");
+        let mut journal = SyncIndexJournal::acquire(temp.path()).unwrap();
+        journal.clear_sources([&source], Some("old-contract")).unwrap();
+        assert!(journal.mark_pending(&source, Some("new-contract")).unwrap());
+        journal.clear_sources([&source], None).unwrap();
+        assert!(journal.pending_sources(["workstation"]).is_empty());
+        assert!(!journal.completed.contains_key("workstation"));
+        assert!(journal.mark_pending(&source, None).unwrap());
+        journal.clear_sources([&source], Some("new-contract")).unwrap();
+        assert!(journal.mark_pending(&source, None).unwrap());
+    }
+
+    #[test]
+    fn sync_index_journal_invalidation_is_durable_and_preserves_other_sources() {
+        let temp = TempDir::new().unwrap();
+        let source = SourceDefinition::ssh("workstation", "user@workstation");
+        let other = SourceDefinition::ssh("other-host", "user@other");
+        let mut journal = SyncIndexJournal::acquire(temp.path()).unwrap();
+        journal.clear_sources([&source, &other], Some("ingest-contract")).unwrap();
+        journal.invalidate_sources(["workstation"]).unwrap();
+        drop(journal);
+
+        let mut journal = SyncIndexJournal::acquire(temp.path()).unwrap();
+        assert!(journal.mark_pending(&source, Some("ingest-contract")).unwrap());
+        assert!(!journal.mark_pending(&other, Some("ingest-contract")).unwrap());
+        journal.clear_sources([&source, &other], Some("ingest-contract")).unwrap();
+        journal.invalidate_all_completed().unwrap();
+        drop(journal);
+
+        let mut journal = SyncIndexJournal::acquire(temp.path()).unwrap();
+        assert!(journal.mark_pending(&source, Some("ingest-contract")).unwrap());
+        assert!(journal.mark_pending(&other, Some("ingest-contract")).unwrap());
+    }
+
+    #[test]
+    fn sync_index_journal_rejects_unknown_or_corrupt_state_without_overwriting_it() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("sync_index_pending.json");
+        for encoded in [
+            r#"{"version":2,"pending":["workstation"]}"#,
+            r#"{"version":1,"pending":["workstation"],"unknown":true}"#,
+            r#"{"version":1,"pending":["workstation"]"#,
+        ] {
+            std::fs::write(&path, encoded).unwrap();
+            let error = SyncIndexJournal::acquire(temp.path())
+                .err()
+                .expect("unknown debt cannot be treated as no debt");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), encoded);
+        }
+        let oversized = vec![b' '; SYNC_INDEX_JOURNAL_MAX_BYTES as usize + 1];
+        std::fs::write(&path, &oversized).unwrap();
+        let error = SyncIndexJournal::acquire(temp.path())
+            .err()
+            .expect("journal reads must be bounded");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&path).unwrap(), oversized);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sync_index_journal_refuses_symlinks_without_touching_the_target() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("unrelated.json");
+        let encoded = r#"{"version":1,"pending":["workstation"]}"#;
+        std::fs::write(&target, encoded).unwrap();
+        std::os::unix::fs::symlink(&target, temp.path().join("sync_index_pending.json"))
+            .unwrap();
+        assert!(SyncIndexJournal::acquire(temp.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), encoded);
+    }
 
     #[test]
     fn test_path_to_safe_dirname() {
