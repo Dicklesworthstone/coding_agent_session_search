@@ -2477,6 +2477,9 @@ pub enum SourcesCommand {
         /// Don't re-index after sync
         #[arg(long)]
         no_index: bool,
+        /// Override the data directory for mirrors, search assets, and locks
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        data_dir: Option<PathBuf>,
         /// Show detailed transfer information
         #[arg(long, short)]
         verbose: bool,
@@ -2509,6 +2512,9 @@ pub enum SourcesCommand {
         /// an incremental ingest pass
         #[arg(long)]
         full: bool,
+        /// Override the data directory containing the existing mirrors
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        data_dir: Option<PathBuf>,
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
@@ -2630,6 +2636,9 @@ pub enum SourcesCommand {
         /// Skip syncing data after setup completes
         #[arg(long)]
         skip_sync: bool,
+        /// Override the local data directory used by the final sync and index
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        data_dir: Option<PathBuf>,
         /// SSH connection timeout in seconds
         #[arg(long, default_value = "10")]
         timeout: u64,
@@ -29859,6 +29868,13 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
         RobotTopic::Sources => vec![
             "sources:".to_string(),
             String::new(),
+            "# Selecting the local archive".to_string(),
+            "Use cass --db <path> sources ... (or CASS_DB_PATH) to select the archive.".to_string(),
+            "A database outside the default data dir moves mirrors, assets, and locks alongside it.".to_string(),
+            "For sync, reingest, and setup, --data-dir explicitly selects those local assets.".to_string(),
+            "Source configuration remains shared in sources.toml.".to_string(),
+            "  cass --db /archive/custom.db sources reingest --data-dir /mirrors --json".to_string(),
+            String::new(),
             "# Persisted agent indexing exclusions".to_string(),
             "Use this when you want cass to ignore a connector entirely even if".to_string(),
             "the backing session files still exist on disk.".to_string(),
@@ -29906,6 +29922,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  --skip-install       Don't install cass on remotes".to_string(),
             "  --skip-index         Don't run remote indexing".to_string(),
             "  --skip-sync          Don't sync after setup".to_string(),
+            "  --data-dir <path>    Local mirrors, search assets, and locks for the final sync".to_string(),
             "  --json               Output progress as JSON for scripting".to_string(),
             "  --timeout <secs>     SSH connection timeout (default: 10)".to_string(),
             "  --verbose            Show detailed progress".to_string(),
@@ -126292,10 +126309,25 @@ fn run_timeline(
 
 /// Handle sources subcommands (P5.x)
 fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
+    let data_dir_override = match &cmd {
+        SourcesCommand::Sync { data_dir, .. }
+        | SourcesCommand::Reingest { data_dir, .. }
+        | SourcesCommand::Setup { data_dir, .. }
+        | SourcesCommand::ArtifactManifest { data_dir, .. } => data_dir.clone(),
+        _ => None,
+    };
+    // Source configuration remains global, but every mirror, status, lock and
+    // nested index must use the same archive selection as the index command.
+    let data_dir = resolve_data_dir(&data_dir_override, cli.db.as_ref());
+    let db_path = cli
+        .db
+        .clone()
+        .unwrap_or_else(|| data_dir.join("agent_search.db"));
+
     match cmd {
         SourcesCommand::List { verbose, json } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_sources_list(verbose, structured_format)
+            run_sources_list(verbose, structured_format, &data_dir)
         }
         SourcesCommand::Add {
             url,
@@ -126316,7 +126348,9 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
             let structured_format = resolve_subcommand_structured_format(cli, json);
             run_sources_schedule(&name, schedule, structured_format)
         }
-        SourcesCommand::Remove { name, purge, yes } => run_sources_remove(&name, purge, yes),
+        SourcesCommand::Remove { name, purge, yes } => {
+            run_sources_remove(&name, purge, yes, &data_dir)
+        }
         SourcesCommand::Doctor {
             source,
             json,
@@ -126329,6 +126363,8 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
                 structured_format,
                 budget_ms,
                 per_host_budget_ms,
+                &db_path,
+                &data_dir,
             )
         }
         SourcesCommand::Sync {
@@ -126337,25 +126373,35 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
             // together with `--source`.
             all: _,
             no_index,
+            data_dir: _,
             verbose,
             dry_run,
             json,
         } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_sources_sync(source, no_index, verbose, dry_run, structured_format)
+            run_sources_sync(
+                source,
+                no_index,
+                verbose,
+                dry_run,
+                structured_format,
+                &db_path,
+                &data_dir,
+            )
         }
         SourcesCommand::Reingest {
             from_mirror: _,
             source,
             full,
+            data_dir: _,
             json,
         } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_sources_reingest(source, full, structured_format)
+            run_sources_reingest(source, full, structured_format, &db_path, &data_dir)
         }
         SourcesCommand::ArtifactManifest {
             index_path,
-            data_dir,
+            data_dir: _,
             write,
             verify_existing,
             expected_manifest,
@@ -126364,7 +126410,7 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
             let structured_format = resolve_subcommand_structured_format(cli, json);
             run_sources_artifact_manifest(
                 index_path,
-                data_dir,
+                Some(data_dir),
                 write,
                 verify_existing,
                 expected_manifest,
@@ -126390,6 +126436,7 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
             skip_install,
             skip_index,
             skip_sync,
+            data_dir: _,
             timeout,
             resume,
             verbose,
@@ -126397,19 +126444,23 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
         } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
             let is_robot = structured_format.is_some();
-            run_sources_setup(sources::setup::SetupOptions {
-                dry_run,
-                non_interactive: non_interactive || is_robot,
-                hosts,
-                tailscale,
-                skip_install,
-                skip_index,
-                skip_sync,
-                timeout,
-                resume,
-                verbose,
-                json: is_robot,
-            })
+            run_sources_setup(
+                sources::setup::SetupOptions {
+                    dry_run,
+                    non_interactive: non_interactive || is_robot,
+                    hosts,
+                    tailscale,
+                    skip_install,
+                    skip_index,
+                    skip_sync,
+                    timeout,
+                    resume,
+                    verbose,
+                    json: is_robot,
+                },
+                &db_path,
+                &data_dir,
+            )
         }
     }
 }
@@ -126656,7 +126707,11 @@ fn run_sources_artifact_manifest(
 }
 
 /// List configured sources (P5.3)
-fn run_sources_list(verbose: bool, output_format: Option<RobotFormat>) -> CliResult<()> {
+fn run_sources_list(
+    verbose: bool,
+    output_format: Option<RobotFormat>,
+    data_dir: &Path,
+) -> CliResult<()> {
     use crate::sources::config::SourcesConfig;
     use crate::sources::sync::{SyncStatus, current_unix_ms};
 
@@ -126682,8 +126737,7 @@ fn run_sources_list(verbose: bool, output_format: Option<RobotFormat>) -> CliRes
         }
     });
     let disabled_agents = config.configured_disabled_agents();
-    let data_dir = default_data_dir();
-    let sync_status = SyncStatus::load(&data_dir).unwrap_or_default();
+    let sync_status = SyncStatus::load(data_dir).unwrap_or_default();
     let now_ms = current_unix_ms();
 
     if let Some(fmt) = structured_format {
@@ -127176,7 +127230,12 @@ fn test_ssh_connectivity(host: &str) -> CliResult<()> {
 }
 
 /// Remove a configured source (P5.7)
-fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<()> {
+fn run_sources_remove(
+    name: &str,
+    purge: bool,
+    skip_confirm: bool,
+    data_dir: &Path,
+) -> CliResult<()> {
     use crate::sources::SyncStatus;
     use crate::sources::config::SourcesConfig;
     use colored::Colorize;
@@ -127235,8 +127294,7 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
 
     // A later remove/re-add must not reuse this source's completion receipt,
     // including when its mirror remains on disk. Invalidate before mutation.
-    let data_dir = default_data_dir();
-    let mut index_journal = crate::sources::sync::SyncIndexJournal::acquire(&data_dir)
+    let mut index_journal = crate::sources::sync::SyncIndexJournal::acquire(data_dir)
         .map_err(sources_sync_journal_error)?;
     index_journal
         .invalidate_sources([stored_source_name.as_str()])
@@ -127264,10 +127322,10 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
 
     println!("Removed '{}' from configuration.", stored_source_name);
 
-    match SyncStatus::load(&data_dir) {
+    match SyncStatus::load(data_dir) {
         Ok(mut sync_status) => {
             if sync_status.retain_sources(config.sources.iter().map(|source| source.name.as_str()))
-                && let Err(error) = sync_status.save(&data_dir)
+                && let Err(error) = sync_status.save(data_dir)
             {
                 eprintln!(
                     "{} Failed to save pruned sync status: {}",
@@ -127672,6 +127730,8 @@ fn run_sources_doctor(
     output_format: Option<RobotFormat>,
     total_budget_override_ms: Option<u64>,
     per_host_budget_override_ms: Option<u64>,
+    db_path: &Path,
+    data_dir: &Path,
 ) -> CliResult<()> {
     use crate::sources::config::{SourcesConfig, source_names_equal, source_path_entry_error};
     use colored::Colorize;
@@ -127802,7 +127862,7 @@ fn run_sources_doctor(
         }
 
         // Check 4: Local storage writable
-        let storage_check = check_local_storage(&source.name);
+        let storage_check = check_local_storage(&source.name, data_dir);
         checks.push(storage_check);
 
         // Compute summary
@@ -127921,7 +127981,7 @@ fn run_sources_doctor(
                             });
                     }
                 }
-                let evidence = gather_source_sync_evidence(source, &checks);
+                let evidence = gather_source_sync_evidence(source, &checks, db_path, data_dir);
                 crate::source_doctor_health::apply_sync_evidence(&mut observation, &evidence);
             } else {
                 // Local source: the running binary is the current version.
@@ -128331,8 +128391,7 @@ fn check_remote_path(host: &str, path: &str, timeout: Duration) -> DiagnosticChe
 }
 
 /// Conservatively assess local storage from metadata without mutating it.
-fn check_local_storage(source_name: &str) -> DiagnosticCheck {
-    let data_dir = default_data_dir();
+fn check_local_storage(source_name: &str, data_dir: &Path) -> DiagnosticCheck {
     let source_dir = data_dir.join("remotes").join(source_name);
     check_local_storage_path(&source_dir)
 }
@@ -128573,8 +128632,8 @@ fn platform_from_uname(uname_s: &str) -> crate::fleet_doctor_schema::Platform {
 }
 
 /// Archive DB last-modified time in epoch milliseconds, when the DB exists.
-fn archive_db_mtime_ms(data_dir: &std::path::Path) -> Option<i64> {
-    let modified = std::fs::metadata(data_dir.join("agent_search.db"))
+fn archive_db_mtime_ms(db_path: &Path) -> Option<i64> {
+    let modified = std::fs::metadata(db_path)
         .ok()?
         .modified()
         .ok()?;
@@ -128589,6 +128648,8 @@ fn archive_db_mtime_ms(data_dir: &std::path::Path) -> Option<i64> {
 fn gather_source_sync_evidence(
     source: &crate::sources::config::SourceDefinition,
     checks: &[DiagnosticCheck],
+    db_path: &Path,
+    data_dir: &Path,
 ) -> crate::source_doctor_health::SourceSyncEvidence {
     let remote_path_missing = checks
         .iter()
@@ -128597,13 +128658,12 @@ fn gather_source_sync_evidence(
         .iter()
         .any(|c| c.name.starts_with("Remote Path") && c.message.contains("exists but is empty"));
 
-    let data_dir = default_data_dir();
     let mirror_dir = data_dir.join("remotes").join(&source.name).join("mirror");
     let local_mirror_nonempty = std::fs::read_dir(&mirror_dir)
         .map(|mut entries| entries.any(|entry| entry.is_ok()))
         .unwrap_or(false);
 
-    let sync_status = crate::sources::SyncStatus::load(&data_dir).ok();
+    let sync_status = crate::sources::SyncStatus::load(data_dir).ok();
     let info = sync_status.as_ref().and_then(|s| s.get(&source.name));
     let has_sync_record = info.is_some();
     let last_sync_incomplete = info.is_some_and(|i| {
@@ -128614,7 +128674,7 @@ fn gather_source_sync_evidence(
     });
     let index_behind_sync = match (
         info.and_then(|i| i.last_sync),
-        archive_db_mtime_ms(&data_dir),
+        archive_db_mtime_ms(db_path),
     ) {
         (Some(sync_ms), Some(db_ms)) => sync_ms > db_ms,
         _ => false,
@@ -128828,6 +128888,8 @@ fn run_sources_sync(
     verbose: bool,
     dry_run: bool,
     output_format: Option<RobotFormat>,
+    db_path: &Path,
+    data_dir: &Path,
 ) -> CliResult<()> {
     use crate::sources::config::{SourcesConfig, source_names_equal, source_path_entry_error};
     use crate::sources::sync::{
@@ -128835,16 +128897,13 @@ fn run_sources_sync(
     };
     use colored::Colorize;
 
-    // Use the same data dir as the rest of the app (DB, Tantivy index, remotes mirror).
-    // Override with `CASS_DATA_DIR` or command-specific `--data-dir` flags elsewhere.
-    let data_dir = default_data_dir();
     // One lease spans transport and index completion. The ordinary indexer
     // never acquires this lease, so sync -> index-run is the only lock order.
     // Dry runs do not create or change the journal or its lease file.
     let mut index_journal = if dry_run {
         None
     } else {
-        Some(SyncIndexJournal::acquire(&data_dir).map_err(sources_sync_journal_error)?)
+        Some(SyncIndexJournal::acquire(data_dir).map_err(sources_sync_journal_error)?)
     };
 
     // Load source selection only after admission; lifecycle changes use the
@@ -128856,7 +128915,7 @@ fn run_sources_sync(
         hint: Some("Run 'cass sources add' to configure a source".into()),
         retryable: false,
     })?;
-    let ingest_contract = crate::indexer::remote_sync_index_contract();
+    let ingest_contract = crate::indexer::remote_sync_index_contract_for_archive(db_path);
 
     // Filter to remote sources only
     let remote_sources: Vec<_> = config.remote_sources().collect();
@@ -128921,10 +128980,10 @@ fn run_sources_sync(
     }
 
     // Create sync engine
-    let engine = SyncEngine::new(&data_dir);
+    let engine = SyncEngine::new(data_dir);
 
     // Load existing sync status
-    let mut status = SyncStatus::load(&data_dir).unwrap_or_default();
+    let mut status = SyncStatus::load(data_dir).unwrap_or_default();
     let now_ms = current_unix_ms();
 
     let is_robot = output_format.is_some() || robot_format_from_env().is_some();
@@ -129186,7 +129245,7 @@ fn run_sources_sync(
                 .iter()
                 .map(|source| source.name.as_str()),
         );
-        if let Err(e) = status.save(&data_dir) {
+        if let Err(e) = status.save(data_dir) {
             tracing::warn!("Failed to save sync status: {}", e);
         }
     }
@@ -129266,16 +129325,16 @@ fn run_sources_sync(
         };
 
         run_index_with_data(
-            None,           // db_override (uses data_dir default)
-            false,          // full
-            false,          // force_rebuild
-            false,          // watch
-            None,           // watch_once
-            30,             // watch_interval (default)
-            Some(data_dir.clone()), // data_dir
-            false,          // semantic
-            false,          // build_hnsw
-            None,           // embedder follows semantic policy
+            Some(db_path.to_path_buf()), // selected canonical archive
+            false,                       // full
+            false,                       // force_rebuild
+            false,                       // watch
+            None,                        // watch_once
+            30,                          // watch_interval (default)
+            Some(data_dir.to_path_buf()), // selected mirrors, assets and locks
+            false,                       // semantic
+            false,                       // build_hnsw
+            None,                        // embedder follows semantic policy
             progress,
             output_format,
             None,  // idempotency_key
@@ -129297,7 +129356,7 @@ fn run_sources_sync(
     {
         // A complete scan cannot certify a failed transfer or policy/source
         // changes made while it ran. Unknown contracts cannot grant reuse.
-        let current_contract = crate::indexer::remote_sync_index_contract();
+        let current_contract = crate::indexer::remote_sync_index_contract_for_archive(db_path);
         if current_contract == ingest_contract
             && let Ok(current_config) = SourcesConfig::load()
         {
@@ -129410,6 +129469,8 @@ fn run_sources_reingest(
     source_filter: Option<Vec<String>>,
     full: bool,
     output_format: Option<RobotFormat>,
+    db_path: &Path,
+    data_dir: &Path,
 ) -> CliResult<()> {
     use crate::sources::config::{SourcesConfig, source_names_equal};
     use colored::Colorize;
@@ -129491,13 +129552,12 @@ fn run_sources_reingest(
             remote_sources.clone()
         };
 
-    let data_dir = default_data_dir();
     // Surface the mirror roots that will actually be scanned so the operator
     // can confirm the mirror is present without opening a database before
     // the indexer acquires its writer lock. Compare source identities, not
     // platform-specific substrings of rendered filesystem paths.
     let selected_names: Vec<String> = selected.iter().map(|s| s.name.clone()).collect();
-    let roots: Vec<_> = crate::indexer::build_scan_roots(None, &data_dir)
+    let roots: Vec<_> = crate::indexer::build_scan_roots(None, data_dir)
         .into_iter()
         .filter(|root| {
             root.origin.kind.is_remote() && selected_names.contains(&root.origin.source_id)
@@ -129542,16 +129602,16 @@ fn run_sources_reingest(
 
     let mut indexing_result = None;
     let indexing = run_index_with_data(
-        None,                   // db_override (uses data_dir default)
-        full,                   // full rebuild if requested
-        false,                  // force_rebuild
-        false,                  // watch
-        None,                   // watch_once
-        30,                     // watch_interval (default)
-        Some(data_dir.clone()), // data_dir (existing mirror root is discovered here)
-        false,                  // semantic
-        false,                  // build_hnsw
-        None,                   // embedder follows semantic policy
+        Some(db_path.to_path_buf()),  // selected canonical archive
+        full,                        // full rebuild if requested
+        false,                       // force_rebuild
+        false,                       // watch
+        None,                        // watch_once
+        30,                          // watch_interval (default)
+        Some(data_dir.to_path_buf()), // selected existing mirror roots
+        false,                       // semantic
+        false,                       // build_hnsw
+        None,                        // embedder follows semantic policy
         progress,
         output_format,
         None,  // idempotency_key
@@ -129777,8 +129837,20 @@ fn run_sources_discover(
 }
 
 /// Run the interactive sources setup wizard
-fn run_sources_setup(opts: sources::setup::SetupOptions) -> CliResult<()> {
+fn run_sources_setup(
+    opts: sources::setup::SetupOptions,
+    db_path: &Path,
+    data_dir: &Path,
+) -> CliResult<()> {
     use sources::setup::{SetupError, run_setup};
+
+    // Keep the selected DB explicit even when its name is agent_search.db:
+    // a retry may inherit a CASS_DB_PATH that the original --db overrode.
+    let sync_command = format!(
+        "cass --db {} sources sync --data-dir {}",
+        shell_quote_arg(&db_path.display().to_string()),
+        shell_quote_arg(&data_dir.display().to_string()),
+    );
 
     match run_setup(&opts) {
         Ok(result) => {
@@ -129798,7 +129870,7 @@ fn run_sources_setup(opts: sources::setup::SetupOptions) -> CliResult<()> {
                         "sync": if result.sync_pending {
                             serde_json::json!({
                                 "status": "pending",
-                                "command": "cass sources sync --json",
+                                "command": format!("{sync_command} --json"),
                             })
                         } else {
                             serde_json::json!({ "status": "skipped" })
@@ -129811,15 +129883,23 @@ fn run_sources_setup(opts: sources::setup::SetupOptions) -> CliResult<()> {
                 // WS-G.1: setup used to print "Phase 7: Syncing" and mark the
                 // sync complete without running it. Run it, and record it
                 // only once it has actually happened.
-                run_sources_sync(None, false, opts.verbose, false, None).map_err(|err| {
+                run_sources_sync(
+                    None,
+                    false,
+                    opts.verbose,
+                    false,
+                    None,
+                    db_path,
+                    data_dir,
+                )
+                .map_err(|err| {
                     CliError {
                         code: err.code,
                         kind: err.kind,
                         message: format!("Setup finished, but the final sync failed: {}", err.message),
-                        hint: Some(
-                            "Setup state is saved; re-run 'cass sources sync' (or 'cass sources setup --resume') once the remotes are reachable"
-                                .into(),
-                        ),
+                        hint: Some(format!(
+                            "Setup state is saved; retry `{sync_command}` once the remotes are reachable, or repeat setup with the same archive flags and --resume"
+                        )),
                         retryable: true,
                     }
                 })?;
@@ -132989,7 +133069,7 @@ fn run_agents_command(action: AgentsAction, cli: &Cli) -> CliResult<()> {
             agent,
             keep_indexed_data,
         } => run_agents_exclude(&agent, keep_indexed_data, cli),
-        AgentsAction::Include { agent } => run_agents_include(&agent),
+        AgentsAction::Include { agent } => run_agents_include(&agent, cli),
     }
 }
 
@@ -133304,10 +133384,11 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
     Ok(())
 }
 
-fn run_agents_include(agent: &str) -> CliResult<()> {
+fn run_agents_include(agent: &str, cli: &Cli) -> CliResult<()> {
     use crate::sources::config::SourcesConfig;
 
-    let mut index_journal = crate::sources::sync::SyncIndexJournal::acquire(&default_data_dir())
+    let data_dir = archive_data_dir_for_agents_command(cli);
+    let mut index_journal = crate::sources::sync::SyncIndexJournal::acquire(&data_dir)
         .map_err(sources_sync_journal_error)?;
     let mut config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
@@ -134346,7 +134427,7 @@ mod subcommand_robot_output_tests {
             // #266: `cass sources reingest` re-ingests an already-synced mirror
             // without re-running rsync. The `--from-mirror` spelling is accepted
             // by clap as a hidden alias-free no-op understanding; the canonical
-            // flags are --source/--full/--json.
+            // flags are --source/--full/--data-dir/--json.
             let cli = Cli::try_parse_from([
                 "cass",
                 "sources",
@@ -134355,6 +134436,8 @@ mod subcommand_robot_output_tests {
                 "--source",
                 "laptop",
                 "--full",
+                "--data-dir",
+                "/tmp/cass-mirrors",
                 "--json",
             ])
             .expect("parse sources reingest");
@@ -134362,6 +134445,7 @@ mod subcommand_robot_output_tests {
                 from_mirror,
                 source,
                 full,
+                data_dir,
                 json,
             })) = cli.command.as_ref()
             else {
@@ -134370,6 +134454,7 @@ mod subcommand_robot_output_tests {
             assert!(*from_mirror);
             assert_eq!(source.as_deref(), Some(["laptop".to_string()].as_slice()));
             assert!(*full);
+            assert_eq!(data_dir.as_deref(), Some(Path::new("/tmp/cass-mirrors")));
             assert!(*json);
         });
     }
