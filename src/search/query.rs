@@ -751,6 +751,7 @@ enum SqliteFtsMatchMode {
 // empty fallback result sets.
 const SQLITE_FTS5_HYDRATE_PARAM_CHUNK: usize = 30_000;
 const SQLITE_MAX_VARIABLE_NUMBER: usize = 32_766;
+const DATE_BROWSE_PATH_BATCH: usize = 256;
 const SQLITE_FTS5_POST_FILTER_SCAN_CHUNK: usize = 1_024;
 const SQLITE_FTS5_POST_FILTER_SCAN_LIMIT: usize = 30_000;
 // Source-table fallback scans the complete read snapshot while materializing
@@ -10361,14 +10362,35 @@ impl SearchClient {
             }
         }
 
-        sql.push_str(&format!(
+        // Keep selection and tail hydration in the same archive snapshot.
+        let mut snapshot = SearchReadTransaction::begin(conn)?;
+        let ordering = format!(
             " ORDER BY CASE WHEN {browse_created_at_sql} IS NULL THEN 1 ELSE 0 END, {browse_created_at_sql} {order}, c.id {order} LIMIT ? OFFSET ?"
-        ));
-        params.push(ParamValue::from(limit as i64));
-        params.push(ParamValue::from(offset as i64));
+        );
+        let path_capacity = SQLITE_MAX_VARIABLE_NUMBER
+            .checked_sub(params.len().saturating_add(2))
+            .context("too many parameters for date-browse filters")?;
+        let path_capacity = path_capacity.min(DATE_BROWSE_PATH_BATCH);
+        let mut paths: Vec<_> = filters.session_paths.iter().map(String::as_str).collect();
+        paths.sort_unstable();
+        if !paths.is_empty() && path_capacity == 0 {
+            bail!("date-browse filters leave no bind-variable capacity for session paths");
+        }
 
-        let candidates: Vec<ConversationTailCandidate> =
-            conn.query_map_collect(&sql, &params, |row: &crate::franken_sync::Row| {
+        let query_page = |paths: &[&str], limit: usize, offset: usize| {
+            let mut sql = sql.clone();
+            let mut params = params.clone();
+            if !paths.is_empty() {
+                sql.push_str(&format!(
+                    " AND c.source_path COLLATE BINARY IN ({})",
+                    sql_placeholders(paths.len())
+                ));
+                params.extend(paths.iter().map(|path| ParamValue::from(*path)));
+            }
+            sql.push_str(&ordering);
+            params.push(ParamValue::from(i64::try_from(limit).unwrap_or(i64::MAX)));
+            params.push(ParamValue::from(i64::try_from(offset).unwrap_or(i64::MAX)));
+            snapshot.query_map_collect(&sql, &params, |row: &crate::franken_sync::Row| {
                 let conversation_id: i64 = row.get_typed(0)?;
                 let title: String = if field_mask.wants_title() {
                     row.get_typed::<Option<String>>(1)?.unwrap_or_default()
@@ -10407,7 +10429,31 @@ impl SearchClient {
                     origin_kind,
                     origin_host,
                 })
-            })?;
+            })
+        };
+
+        let candidates = if paths.len() <= path_capacity {
+            query_page(&paths, limit, offset)?
+        } else {
+            // Each disjoint path chunk contributes at most offset + limit
+            // candidates. Merge the metadata first, then hydrate one page.
+            let window = limit.saturating_add(offset);
+            let mut merged = Vec::new();
+            for chunk in paths.chunks(path_capacity) {
+                merged.extend(query_page(chunk, window, 0)?);
+                merged.sort_unstable_by(|left, right| {
+                    let date = left.browse_created_at.cmp(&right.browse_created_at);
+                    let id = left.conversation_id.cmp(&right.conversation_id);
+                    left.browse_created_at
+                        .is_none()
+                        .cmp(&right.browse_created_at.is_none())
+                        .then(if newest_first { date.reverse() } else { date })
+                        .then(if newest_first { id.reverse() } else { id })
+                });
+                merged.truncate(window);
+            }
+            merged.into_iter().skip(offset).collect()
+        };
 
         let mut hits = Vec::with_capacity(candidates.len());
         for candidate in candidates {
@@ -10430,15 +10476,16 @@ impl SearchClient {
                  WHERE conversation_id = ?1
                  ORDER BY idx DESC
                  LIMIT 1";
-            let mut tail_rows: Vec<(String, Option<i64>, Option<i64>)> = conn.query_map_collect(
-                exact_tail_sql.unwrap_or(fallback_tail_sql),
-                &tail_params,
-                |row: &crate::franken_sync::Row| {
-                    Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
-                },
-            )?;
+            let mut tail_rows: Vec<(String, Option<i64>, Option<i64>)> = snapshot
+                .query_map_collect(
+                    exact_tail_sql.unwrap_or(fallback_tail_sql),
+                    &tail_params,
+                    |row: &crate::franken_sync::Row| {
+                        Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+                    },
+                )?;
             if tail_rows.is_empty() && exact_tail_sql.is_some() {
-                tail_rows = conn.query_map_collect(
+                tail_rows = snapshot.query_map_collect(
                     fallback_tail_sql,
                     &[ParamValue::from(candidate.conversation_id)],
                     |row: &crate::franken_sync::Row| {
@@ -10489,6 +10536,7 @@ impl SearchClient {
                 origin_host: candidate.origin_host,
             });
         }
+        snapshot.rollback()?;
         Ok(hits)
     }
 }
@@ -16214,6 +16262,39 @@ mod tests {
         assert_eq!(remote_hits.len(), 1);
         assert_eq!(remote_hits[0].source_id, "local");
         assert_eq!(remote_hits[0].origin_kind, "local");
+
+        // The remote conversation sorts first. An out-of-scope row must
+        // never occupy the requested page or be hydrated for display.
+        let mut filters = SearchFilters {
+            session_paths: HashSet::from(["/tmp/local.jsonl".to_owned()]),
+            ..SearchFilters::default()
+        };
+        let local_page = client.browse_by_date(filters.clone(), 1, 0, true, FieldMask::FULL)?;
+        assert_eq!(local_page.len(), 1);
+        assert_eq!(local_page[0].source_path, "/tmp/local.jsonl");
+        assert!(
+            client
+                .browse_by_date(filters.clone(), 1, 1, true, FieldMask::FULL)?
+                .is_empty()
+        );
+
+        // Put the local and remote paths in different batches. Both batches
+        // must share a global order/offset and compare paths exactly.
+        filters
+            .session_paths
+            .extend((0..DATE_BROWSE_PATH_BATCH).map(|i| format!("/tmp/missing-{i}.jsonl")));
+        filters.session_paths.insert("/tmp/REMOTE.jsonl".into());
+        assert!(
+            client
+                .browse_by_date(filters.clone(), 1, 1, false, FieldMask::FULL)?
+                .is_empty()
+        );
+        filters.session_paths.insert("/tmp/remote.jsonl".into());
+        for (newest, expected) in [(true, "/tmp/local.jsonl"), (false, "/tmp/remote.jsonl")] {
+            let page = client.browse_by_date(filters.clone(), 1, 1, newest, FieldMask::FULL)?;
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].source_path, expected);
+        }
 
         Ok(())
     }
