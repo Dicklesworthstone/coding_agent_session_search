@@ -42357,6 +42357,21 @@ pub mod persist {
         index.reconcile_messages_from_packet(packet, &positions, Some(conversation_id))
     }
 
+    /// Replay one conversation of a source that carries watch replay debt.
+    ///
+    /// The debt covers the whole source after any interrupted publication,
+    /// although most of its documents are normally already current. Writing
+    /// an unchanged document still replaces a live identity, and Quill
+    /// publishes a durable generation before each replacing batch, so the
+    /// old full replay paid at least one commit (with compaction and tier
+    /// merges) per conversation. On a large archive that never finished
+    /// (GH #578). Reconcile only the messages whose committed document is
+    /// missing or different, and the noise identities that are still live.
+    /// Callers start replay from a freshly opened writer and targeted ingest
+    /// stages no lexical rows, so anything uncommitted came from replaying
+    /// another conversation (other identities) or this one with the same
+    /// canonical rows. The committed snapshot therefore decides exactly what
+    /// must change.
     pub(super) fn replay_watch_canonical_conversation(
         storage: &FrankenStorage,
         index: &mut TantivyIndex,
@@ -42365,7 +42380,74 @@ pub mod persist {
         if should_inject_incremental_lexical_update_oom() {
             anyhow::bail!("out of memory");
         }
-        replay_canonical_conversation_for_rebuild(storage, index, conversation_id)
+        let conversation = canonical_lexical_conversation(storage, conversation_id)?;
+        let footprints = storage.lexical_rebuild_message_footprints(conversation_id)?;
+        for (first_idx, last_idx) in super::lexical_rebuild_conversation_chunks(
+            &footprints,
+            CANONICAL_LEXICAL_REPLAY_CHUNK_BYTES,
+        ) {
+            let messages = storage.fetch_messages_for_lexical_rebuild_idx_range(
+                conversation_id,
+                first_idx,
+                last_idx,
+            )?;
+            let packet = canonical_lexical_packet(&conversation, messages);
+            let positions = match packet_positions_differing_from_committed(
+                index,
+                &packet,
+                conversation_id,
+            ) {
+                Ok(positions) => positions,
+                Err(error) => {
+                    // Fall back to the full reconcile, which reports or
+                    // repairs whatever the comparison could not read.
+                    tracing::warn!(
+                        conversation_id,
+                        error = %format!("{error:#}"),
+                        "could not compare watch replay with the published lexical generation; reconciling every message"
+                    );
+                    (0..packet.payload.messages.len()).collect()
+                }
+            };
+            if !positions.is_empty() {
+                index.reconcile_messages_from_packet(&packet, &positions, Some(conversation_id))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Packet positions whose reconcile would change the committed lexical
+    /// generation: a document that is missing or differs in any indexed,
+    /// stored or numeric field, or a noise message whose identity is live.
+    fn packet_positions_differing_from_committed(
+        index: &TantivyIndex,
+        packet: &ConversationPacket,
+        conversation_id: i64,
+    ) -> Result<Vec<usize>> {
+        use crate::indexer::lexical_reconcile::canary::exact::{ContentMatch, PublishedSnapshot};
+        use crate::search::tantivy::PacketMessageProjection;
+
+        let keeper = index.committed_snapshot()?;
+        let published = PublishedSnapshot::from_keeper(Arc::clone(&keeper))?;
+        let mut positions = Vec::new();
+        for (position, projection) in
+            TantivyIndex::project_packet_messages(packet, Some(conversation_id))
+                .into_iter()
+                .enumerate()
+        {
+            let current = match projection {
+                PacketMessageProjection::Document(document) => {
+                    published.classify_content_ref(document.as_ref())? == ContentMatch::Matching
+                }
+                PacketMessageProjection::Removal(identity) => {
+                    keeper.resolve_document_id(&identity)?.is_none()
+                }
+            };
+            if !current {
+                positions.push(position);
+            }
+        }
+        Ok(positions)
     }
 
     #[cfg(test)]
@@ -46239,6 +46321,127 @@ pub mod persist {
                 assert_eq!(hits(marker), 1, "{marker} must be searchable exactly once");
             }
             assert_eq!(hits("tailmark"), 0, "text past one message's cap stays out");
+        }
+
+        /// GH #578: watch replay debt replays a whole source. Messages whose
+        /// published documents already match must not be written again, since
+        /// every replacing write publishes a new generation, while changed
+        /// messages and live documents of now-noise messages still reconcile.
+        #[test]
+        #[serial]
+        fn watch_replay_publishes_only_messages_that_differ_from_the_index() {
+            use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+
+            let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "1");
+            let dir = tempfile::TempDir::new().unwrap();
+            let storage = create_franken_db(&dir.path().join("agent_search.db"));
+            let contents = [
+                "alphamark steady text",
+                "ok",
+                "bravomark originalmark text",
+                "charliemark legacy text",
+            ];
+            let messages = contents
+                .iter()
+                .enumerate()
+                .map(|(idx, content)| NormalizedMessage {
+                    idx: idx as i64,
+                    role: if idx % 2 == 0 { "user" } else { "assistant" }.into(),
+                    author: None,
+                    created_at: Some(1_700_000_000_000 + idx as i64),
+                    content: (*content).into(),
+                    extra: serde_json::json!({"uuid": format!("gh578-replay-{idx}")}),
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                })
+                .collect();
+            let conv = NormalizedConversation {
+                agent_slug: "claude_code".into(),
+                external_id: Some("gh578-watch-replay".into()),
+                title: Some("Watch replay of an indexed source".into()),
+                workspace: Some(dir.path().join("workspace")),
+                source_path: dir.path().join("source.jsonl"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_010),
+                metadata: serde_json::Value::Null,
+                messages,
+            };
+            let unused_index_path = dir.path().join("unused-index");
+            let mut unused_index = TantivyIndex::open_or_create(&unused_index_path).unwrap();
+            persist_conversation(&storage, &mut unused_index, &conv).unwrap();
+            let conversation_id: i64 = storage
+                .raw()
+                .query_row_map("SELECT id FROM conversations", &[], |row| row.get_typed(0))
+                .unwrap();
+
+            let index_path = dir.path().join("replay-index");
+            let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+            replay_canonical_conversation_for_rebuild(&storage, &mut index, conversation_id)
+                .unwrap();
+            assert_eq!(
+                tantivy_doc_count(&mut index),
+                3,
+                "the acknowledgement is noise"
+            );
+            let generation = |index: &TantivyIndex| {
+                index
+                    .committed_snapshot()
+                    .unwrap()
+                    .loaded_manifest()
+                    .manifest
+                    .generation
+            };
+            let indexed = generation(&index);
+
+            replay_watch_canonical_conversation(&storage, &mut index, conversation_id).unwrap();
+            assert_eq!(
+                generation(&index),
+                indexed,
+                "replaying current documents must not publish during replay"
+            );
+            assert_eq!(tantivy_doc_count(&mut index), 3);
+            assert_eq!(
+                generation(&index),
+                indexed,
+                "replaying current documents must stage nothing for the next commit"
+            );
+
+            for (idx, content) in [(2_i64, "bravomark revisedmark text"), (3, "ok")] {
+                storage
+                    .raw()
+                    .execute_compat(
+                        "UPDATE messages SET content = ?1 WHERE conversation_id = ?2 AND idx = ?3",
+                        &[
+                            ParamValue::from(content),
+                            ParamValue::from(conversation_id),
+                            ParamValue::from(idx),
+                        ],
+                    )
+                    .unwrap();
+            }
+            replay_watch_canonical_conversation(&storage, &mut index, conversation_id).unwrap();
+            assert_eq!(
+                tantivy_doc_count(&mut index),
+                2,
+                "a message that became noise loses its live document"
+            );
+            assert!(generation(&index) > indexed);
+            drop(index);
+            let client = SearchClient::open(&index_path, None).unwrap().unwrap();
+            let hits = |query: &str| {
+                client
+                    .search(query, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                    .unwrap()
+                    .len()
+            };
+            assert_eq!(hits("alphamark"), 1);
+            assert_eq!(hits("revisedmark"), 1, "changed content is republished");
+            assert_eq!(hits("originalmark"), 0, "the stale revision is replaced");
+            assert_eq!(
+                hits("charliemark"),
+                0,
+                "the noise message's old document is gone"
+            );
         }
 
         /// m91r6: a giant conversation persisted in slices must store exactly

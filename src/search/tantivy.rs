@@ -379,6 +379,33 @@ fn cass_document_for_packet_message(
     })
 }
 
+/// What packet reconciliation writes for one message: the document it
+/// upserts, or the identity it removes because the message is hard noise.
+// A projection lives at most for one bounded packet chunk. Boxing the
+// document would add a heap allocation per indexed message on ingest.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum PacketMessageProjection {
+    Document(FsCassDocument),
+    Removal(String),
+}
+
+fn project_packet_message(
+    context: &CassDocContext,
+    msg: &ConversationPacketMessage,
+) -> PacketMessageProjection {
+    match cass_document_for_packet_message(context, msg) {
+        Some(doc) => PacketMessageProjection::Document(doc),
+        None => PacketMessageProjection::Removal(cass_document_identity(
+            &context.source_id,
+            frankensearch::quill::cass::CassConversationKey {
+                source_path: &context.source_path,
+                id: context.conversation_id,
+            },
+            msg.idx.max(0) as u64,
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_packet_message_into_pending<F>(
     inner: &mut crate::search::quill_bridge::QuillCassIndex,
@@ -2121,20 +2148,15 @@ impl TantivyIndex {
                 pending_bytes = 0;
             }
             pending_indices.insert(msg_idx);
-            if let Some(doc) = cass_document_for_packet_message(&context, message) {
-                pending_bytes = pending_bytes.saturating_add(doc.content.len());
-                docs.push(doc);
-            } else {
-                let identity = cass_document_identity(
-                    &context.source_id,
-                    frankensearch::quill::cass::CassConversationKey {
-                        source_path: &context.source_path,
-                        id: context.conversation_id,
-                    },
-                    msg_idx,
-                );
-                pending_bytes = pending_bytes.saturating_add(identity.len());
-                removals.push(identity);
+            match project_packet_message(&context, message) {
+                PacketMessageProjection::Document(doc) => {
+                    pending_bytes = pending_bytes.saturating_add(doc.content.len());
+                    docs.push(doc);
+                }
+                PacketMessageProjection::Removal(identity) => {
+                    pending_bytes = pending_bytes.saturating_add(identity.len());
+                    removals.push(identity);
+                }
             }
             if pending_indices.len() >= max_messages.max(1) || pending_bytes >= max_chars.max(1) {
                 self.flush_packet_revisions(&mut docs, &mut removals)?;
@@ -2168,6 +2190,25 @@ impl TantivyIndex {
     /// Total live documents in the published snapshot.
     pub fn doc_count(&self) -> Result<u64> {
         self.inner.doc_count()
+    }
+
+    /// What [`Self::reconcile_messages_from_packet`] would write for each
+    /// packet message, in packet order, without writing anything.
+    #[must_use]
+    pub(crate) fn project_packet_messages(
+        packet: &ConversationPacket,
+        conversation_id_override: Option<i64>,
+    ) -> Vec<PacketMessageProjection> {
+        let mut context = cass_doc_context_from_packet(packet);
+        if let Some(id) = conversation_id_override {
+            context.conversation_id = Some(id);
+        }
+        packet
+            .payload
+            .messages
+            .iter()
+            .map(|message| project_packet_message(&context, message))
+            .collect()
     }
 
     /// Build every lexical document for one packet without writing anything.
