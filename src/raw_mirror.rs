@@ -168,19 +168,20 @@ pub(crate) fn capture_codex_prefix(
     );
     // Physical ownership remains authoritative even when a caller labels a
     // sensitive store as a transcript. Check before making another copy of its bytes.
-    if zcode_source_is_sensitive(input.source_path)? {
-        anyhow::bail!(
-            "disabled_sensitive_container: ZCode database and store files cannot be raw-mirrored"
-        );
-    }
-    let policy = RawMirrorRetentionPolicy::from_env()?;
-    let result = store::policy::capture_codex_prefix(
-        input.clone(),
-        receipt,
-        TRANSCRIPT_CHUNK_BYTES as u64,
-        TRANSCRIPT_CHUNK_BYTES,
-        policy,
-    );
+    let result = (|| {
+        if zcode_source_is_sensitive(input.source_path)? {
+            anyhow::bail!(
+                "disabled_sensitive_container: ZCode database and store files cannot be raw-mirrored"
+            );
+        }
+        store::policy::capture_codex_prefix(
+            input.clone(),
+            receipt,
+            TRANSCRIPT_CHUNK_BYTES as u64,
+            TRANSCRIPT_CHUNK_BYTES,
+            RawMirrorRetentionPolicy::from_env()?,
+        )
+    })();
     index_maintenance::observe_capture_result(&input, result.as_ref().err());
     result
 }
