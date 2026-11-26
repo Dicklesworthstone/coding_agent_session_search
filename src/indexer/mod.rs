@@ -38548,6 +38548,8 @@ fn acknowledge_full_scan_opencode_replay_debt(
     storage: &FrankenStorage,
     coverage: &OpenCodeSqliteScanCoverage,
 ) -> Result<usize> {
+    use crate::franken_sync::compat::TransactionExt;
+
     if coverage.first_stores.is_empty() {
         return Ok(0);
     }
