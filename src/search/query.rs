@@ -15,6 +15,8 @@ mod indexed_terms;
 #[cfg(test)]
 #[path = "query/legacy_authority_tests.rs"]
 mod legacy_authority_tests;
+#[path = "query/pack_context.rs"]
+mod pack_context;
 #[path = "query/retry_budget.rs"]
 mod retry_budget;
 #[path = "query/titles.rs"]
@@ -11601,6 +11603,326 @@ mod tests {
             last_lexical_degrade_reason: Mutex::new(None),
             last_wildcard_fallback_skip: Mutex::new(None),
         }
+    }
+
+    fn pack_context_fixture_connection() -> Result<SearchSqliteFixture> {
+        let connection = SearchSqliteFixture::in_memory()?;
+        connection.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT);
+             CREATE TABLE conversations (
+                 id INTEGER PRIMARY KEY, agent_id INTEGER, workspace_id INTEGER,
+                 source_id TEXT, origin_host TEXT, title TEXT, source_path TEXT,
+                 started_at INTEGER
+             );
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY, conversation_id INTEGER, idx INTEGER,
+                 role TEXT, content TEXT, created_at INTEGER,
+                 UNIQUE(conversation_id, idx)
+             );
+             INSERT INTO sources VALUES ('local', 'local'), ('laptop', 'ssh');
+             INSERT INTO agents VALUES (1, 'codex'), (2, 'claude_code');
+             INSERT INTO workspaces VALUES (1, '/work/csv'), (2, '/work/other');
+             INSERT INTO conversations VALUES
+                 (1, 1, 1, 'local', NULL, 'CSV decision', '/archive/shared.sqlite', 1000),
+                 (2, 1, 1, 'local', NULL, 'Other session', '/archive/shared.sqlite', 1000),
+                 (3, 1, 1, 'laptop', 'laptop.invalid', 'Remote session', '/archive/shared.sqlite', 1000);
+             INSERT INTO messages VALUES
+                 (11, 1, 0, 'user', 'What did we decide about the CSV format for Excel?', 1000),
+                 (12, 1, 1, 'assistant', 'We chose UTF-8 with a BOM because the customer opens the CSV in Excel.', 2000),
+                 (13, 1, 2, 'tool', 'CSV compatibility verification passed.', 3000),
+                 (14, 1, 3, 'assistant', 'I will check and get back to you.', 4000),
+                 (15, 1, 4, 'user', 'Which XML format should we use?', 5000),
+                 (16, 1, 5, 'assistant', 'We chose a different format because this is another question.', 6000),
+                 (21, 2, 0, 'user', 'What did we decide about the CSV format for Excel?', 1000),
+                 (22, 2, 1, 'assistant', 'I will check and get back to you.', 2000),
+                 (31, 3, 0, 'user', 'What did we decide about the CSV format for Excel?', 1000),
+                 (32, 3, 1, 'assistant', 'This remote conversation chose a different CSV format.', 2000);",
+        )?;
+        Ok(connection)
+    }
+
+    fn pack_context_anchor(client: &SearchClient, message_id: u64) -> Result<SearchHit> {
+        let guard = client.sqlite_guard()?;
+        let connection = guard.as_ref().context("fixture archive connection")?;
+        let mut snapshot = SearchReadTransaction::begin(connection)?;
+        let mut hits = client.hydrate_ranked_message_hits_in_transaction(
+            &snapshot,
+            &[RankedMessageHydrationCandidate {
+                message_id,
+                score: 9.0,
+            }],
+            FieldMask::FULL,
+            MatchType::Exact,
+        )?;
+        snapshot.rollback()?;
+        hits.pop()
+            .map(|(_, hit)| hit)
+            .context("fixture canonical anchor")
+    }
+
+    #[test]
+    fn pack_answer_context_preserves_canonical_identity_roles_and_turn_boundary() -> Result<()> {
+        let connection = pack_context_fixture_connection()?;
+        let client = cass_layer_b_test_client(Some(connection.into_connection()));
+        let question = pack_context_anchor(&client, 11)?;
+        let answer = pack_context_anchor(&client, 12)?;
+        let other_question = pack_context_anchor(&client, 21)?;
+        let before_user = pack_context_anchor(&client, 14)?;
+        let context = client.pack_answer_context(
+            &[
+                question.clone(),
+                question,
+                answer,
+                other_question,
+                before_user,
+            ],
+            &SearchFilters::default(),
+        )?;
+
+        let identities = context
+            .iter()
+            .map(|(hit, role)| (hit.conversation_id, hit.line_number, role.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identities,
+            vec![
+                (Some(1), Some(2), "assistant"),
+                (Some(1), Some(3), "tool"),
+                (Some(2), Some(2), "assistant"),
+            ],
+            "overlapping anchors deduplicate canonical rows; a shared path never merges sessions"
+        );
+        assert_eq!(
+            context[0].0.content,
+            "We chose UTF-8 with a BOM because the customer opens the CSV in Excel."
+        );
+        assert!(context.iter().all(|(hit, _)| hit.score == 0.0));
+        assert!(context.iter().all(|(hit, _)| hit.source_id == "local"));
+        assert!(
+            context
+                .iter()
+                .all(|(hit, _)| !hit.content.contains("another question")),
+            "follow-ups stop at the next user turn"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pack_answer_context_rejects_stale_or_incomplete_anchor_identity() -> Result<()> {
+        let connection = pack_context_fixture_connection()?;
+        let client = cass_layer_b_test_client(Some(connection.into_connection()));
+        let anchor = pack_context_anchor(&client, 11)?;
+        let mutations: [(&str, fn(&mut SearchHit)); 13] = [
+            ("conversation", |hit| hit.conversation_id = Some(999)),
+            ("missing conversation", |hit| hit.conversation_id = None),
+            ("message", |hit| hit.line_number = Some(0)),
+            ("missing message", |hit| hit.line_number = None),
+            ("path", |hit| hit.source_path.push_str(".other")),
+            ("source", |hit| hit.source_id = "laptop".into()),
+            ("agent", |hit| hit.agent = "claude_code".into()),
+            ("workspace", |hit| hit.workspace.push_str("/other")),
+            ("origin kind", |hit| hit.origin_kind = "ssh".into()),
+            ("origin host", |hit| {
+                hit.origin_host = Some("other.invalid".into())
+            }),
+            ("time", |hit| hit.created_at = Some(999)),
+            ("hash", |hit| hit.content_hash ^= 1),
+            ("content", |hit| hit.content.clear()),
+        ];
+        for (field, mutate) in mutations {
+            let mut stale = anchor.clone();
+            mutate(&mut stale);
+            assert!(
+                client
+                    .pack_answer_context(&[stale], &SearchFilters::default())?
+                    .is_empty(),
+                "changed {field} must not attach an answer"
+            );
+        }
+        {
+            let guard = client.sqlite_guard()?;
+            guard
+                .as_ref()
+                .context("fixture archive connection")?
+                .execute_sync(
+                    "UPDATE messages SET content = 'A replacement question' WHERE id = 11",
+                )?;
+        }
+        assert!(
+            client
+                .pack_answer_context(&[anchor], &SearchFilters::default())?
+                .is_empty(),
+            "an index hit from before a canonical overwrite is not an expansion anchor"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pack_answer_context_reapplies_every_filter_to_context() -> Result<()> {
+        let connection = pack_context_fixture_connection()?;
+        let client = cass_layer_b_test_client(Some(connection.into_connection()));
+        let anchor = pack_context_anchor(&client, 11)?;
+        let allowed = SearchFilters {
+            agents: HashSet::from(["codex".to_string()]),
+            workspaces: HashSet::from(["/work/csv".to_string()]),
+            created_from: Some(500),
+            created_to: Some(2500),
+            source_filter: SourceFilter::Local,
+            session_paths: HashSet::from(["/archive/shared.sqlite".to_string()]),
+        };
+        let context = client.pack_answer_context(std::slice::from_ref(&anchor), &allowed)?;
+        assert_eq!(
+            context.len(),
+            1,
+            "message time must trim the following window"
+        );
+        assert_eq!(context[0].0.line_number, Some(2));
+
+        let mut wrong_agent = allowed.clone();
+        wrong_agent.agents = HashSet::from(["claude_code".to_string()]);
+        let mut wrong_workspace = allowed.clone();
+        wrong_workspace.workspaces = HashSet::from(["/work/other".to_string()]);
+        let mut wrong_source = allowed.clone();
+        wrong_source.source_filter = SourceFilter::SourceId("laptop".to_string());
+        let mut wrong_session = allowed.clone();
+        wrong_session.session_paths = HashSet::from(["/archive/other.sqlite".to_string()]);
+        let mut only_question_time = allowed.clone();
+        only_question_time.created_to = Some(1999);
+        let mut after_question = allowed.clone();
+        after_question.created_from = Some(1500);
+        for filters in [
+            wrong_agent,
+            wrong_workspace,
+            wrong_source,
+            wrong_session,
+            only_question_time,
+            after_question,
+        ] {
+            assert!(
+                client
+                    .pack_answer_context(std::slice::from_ref(&anchor), &filters)?
+                    .is_empty()
+            );
+        }
+
+        let remote_anchor = pack_context_anchor(&client, 31)?;
+        assert!(
+            client
+                .pack_answer_context(std::slice::from_ref(&remote_anchor), &allowed)?
+                .is_empty()
+        );
+        let mut remote = allowed;
+        remote.source_filter = SourceFilter::Remote;
+        let context = client.pack_answer_context(&[remote_anchor], &remote)?;
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0].0.conversation_id, Some(3));
+        assert_eq!(context[0].0.source_id, "laptop");
+        Ok(())
+    }
+
+    #[test]
+    fn pack_answer_context_bounds_anchors_and_following_ordinals() -> Result<()> {
+        let connection = pack_context_fixture_connection()?;
+        for conversation in 100_i64..133 {
+            connection.execute_compat(
+                "INSERT INTO conversations
+                 VALUES (?, 1, 1, 'local', NULL, 'Bounded fixture', '/archive/bounded.sqlite', 1000)",
+                &[ParamValue::from(conversation)],
+            )?;
+            for index in 0_i64..3 {
+                connection.execute_compat(
+                    "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)",
+                    &[
+                        ParamValue::from(conversation * 100 + index),
+                        ParamValue::from(conversation),
+                        ParamValue::from(index),
+                        ParamValue::from(if index == 0 { "user" } else { "assistant" }),
+                        ParamValue::from(format!("Bounded message {conversation}/{index}")),
+                        ParamValue::from(1000 + index),
+                    ],
+                )?;
+            }
+        }
+        let client = cass_layer_b_test_client(Some(connection.into_connection()));
+        let anchors = (100_u64..133)
+            .map(|conversation| pack_context_anchor(&client, conversation * 100))
+            .collect::<Result<Vec<_>>>()?;
+        let context = client.pack_answer_context(&anchors, &SearchFilters::default())?;
+        assert_eq!(context.len(), 32);
+        assert!(
+            context.iter().all(|(hit, _)| {
+                hit.conversation_id
+                    .is_some_and(|id| (100..132).contains(&id))
+                    && hit.line_number == Some(2)
+            }),
+            "the thirty-third anchor and second following message must stay outside the bound"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pack_answer_context_skips_large_bodies_without_crossing_large_user_turns() -> Result<()> {
+        let connection = pack_context_fixture_connection()?;
+        let oversized = "x".repeat(256 * 1024);
+        for message_id in [12_i64, 15] {
+            connection.execute_compat(
+                "UPDATE messages SET content = ? WHERE id = ?",
+                &[
+                    ParamValue::from(oversized.as_str()),
+                    ParamValue::from(message_id),
+                ],
+            )?;
+        }
+        let client = cass_layer_b_test_client(Some(connection.into_connection()));
+        let anchor = pack_context_anchor(&client, 11)?;
+        let before_user = pack_context_anchor(&client, 14)?;
+        let tool = pack_context_anchor(&client, 13)?;
+        let context =
+            client.pack_answer_context(&[anchor, before_user, tool], &SearchFilters::default())?;
+        assert_eq!(
+            context
+                .iter()
+                .map(|(hit, _)| hit.line_number)
+                .collect::<Vec<_>>(),
+            vec![Some(4)],
+            "body limits must not erase the next user-turn boundary"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pack_answer_context_refuses_pending_forget_even_without_anchors() -> Result<()> {
+        use crate::search::privacy::{PrivacyError, begin_forget};
+
+        let directory = TempDir::new()?;
+        let database = directory.path().join("agent_search.db");
+        let mut empty_client = cass_layer_b_test_client(None);
+        empty_client.sqlite_path = Some(directory.path().join("missing-archive.db"));
+        assert!(
+            empty_client
+                .pack_answer_context(&[], &SearchFilters::default())?
+                .is_empty(),
+            "empty input must not open an archive solely for context"
+        );
+        assert!(empty_client.sqlite.lock().unwrap().is_none());
+
+        let connection = pack_context_fixture_connection()?;
+        let client = cass_layer_b_test_client(Some(connection.into_connection()));
+        let anchor = pack_context_anchor(&client, 11)?;
+        *client.reader.privacy.write() = vec![PrivacySnapshot::for_database(&database)?];
+        begin_forget(&database)?;
+        for anchors in [vec![anchor], Vec::new()] {
+            let error = client
+                .pack_answer_context(&anchors, &SearchFilters::default())
+                .expect_err("context hydration must honor a pending privacy fence");
+            assert!(matches!(
+                error.downcast_ref::<PrivacyError>(),
+                Some(PrivacyError::RepairPending { .. })
+            ));
+        }
+        Ok(())
     }
 
     fn cass_layer_b_test_request<'a>(
