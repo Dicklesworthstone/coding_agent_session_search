@@ -312,6 +312,10 @@ fn continue_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(continue_dev::ContinueConnector::new())
 }
 
+fn opencode_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(opencode::OpenCodeConnector::new())
+}
+
 fn omp_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(omp::OmpConnector::new())
 }
@@ -385,6 +389,7 @@ pub(crate) fn get_connector_registrations() -> Vec<source_dependencies::Connecto
                 "codebuff" => ConnectorRegistration::new(name, codebuff_connector_factory)
                     .with_source_capability::<codebuff::CodebuffConnector>("codebuff"),
                 "continue" => ConnectorRegistration::new(name, continue_connector_factory),
+                "opencode" => ConnectorRegistration::new(name, opencode_connector_factory),
                 "omp" => ConnectorRegistration::new(name, omp_connector_factory)
                     .with_source_capability::<omp::OmpConnector>("omp"),
                 "pi_agent" => ConnectorRegistration::new(name, pi_agent_connector_factory)

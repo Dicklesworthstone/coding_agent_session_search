@@ -139,6 +139,114 @@ fn create_drizzle_opencode_db(path: &Path) -> Connection {
     conn
 }
 
+// The child owns its OpenCode environment. Changing the parent environment
+// would race other libtest threads that resolve the same default database.
+#[test]
+fn named_local_opencode_source_is_scoped_to_its_configured_roots() -> anyhow::Result<()> {
+    use coding_agent_search::connectors::{ScanRoot, get_connector_factories};
+
+    const FIXTURE: &str = "CASS_TEST_OPENCODE_NAMED_LOCAL_FIXTURE";
+    let Some(dir) = std::env::var_os(FIXTURE) else {
+        let fixture = TempDir::new()?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "named_local_opencode_source_is_scoped_to_its_configured_roots",
+            ])
+            .env(FIXTURE, fixture.path())
+            .env("HOME", fixture.path())
+            .env("USERPROFILE", fixture.path())
+            .env("XDG_DATA_HOME", fixture.path().join("xdg"))
+            .env("XDG_CONFIG_HOME", fixture.path().join("config"))
+            .env("APPDATA", fixture.path().join("appdata"))
+            .env("LOCALAPPDATA", fixture.path().join("local"))
+            .env("OPENCODE_SQLITE_DB", fixture.path().join("default.db"))
+            .env_remove("OPENCODE_STORAGE_ROOT")
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        anyhow::ensure!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return Ok(());
+    };
+    let dir = PathBuf::from(dir);
+    let selected = dir.join("backup");
+    fs::create_dir(&selected)?;
+    let selected_db = selected.join("opencode.db");
+    for (db, id) in [
+        (dir.join("default.db"), "default"),
+        (selected_db.clone(), "selected"),
+    ] {
+        let conn = create_drizzle_opencode_db(&db);
+        conn.execute_compat(
+            "INSERT INTO session VALUES (?1, 'project', 'slug', '/work', 'title', 'v1', 1234, 1234)",
+            params![id],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO message VALUES ('msg', ?1, 1234, 1234, '{\"role\":\"user\"}')",
+            params![id],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO part VALUES ('part', 'msg', ?1, 1234, 1234, '{\"type\":\"text\",\"text\":\"marker\"}')",
+            params![id],
+        )?;
+    }
+
+    let connector = get_connector_factories()
+        .into_iter()
+        .find(|(name, _)| *name == "opencode")
+        .expect("OpenCode factory")
+        .1();
+    let empty = dir.join("other");
+    fs::create_dir(&empty)?;
+    let default = ScanContext::local_default(empty.clone(), None);
+    let ordinary = connector.scan(&default)?;
+    assert_eq!(ordinary.len(), 1);
+    assert_eq!(ordinary[0].external_id.as_deref(), Some("default"));
+
+    for path in [selected.clone(), selected_db.clone(), empty.clone()] {
+        let mut root = ScanRoot::local(path.clone());
+        root.origin.source_id = "local-backup".into();
+        let scoped = ScanContext::with_roots(path.clone(), vec![root.clone()], None);
+        let sources = connector.discover_source_files(&scoped)?;
+        let conversations = connector.scan(&scoped)?;
+        if path == empty {
+            assert!(sources.is_empty());
+            assert!(conversations.is_empty());
+        } else {
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].source_path, selected_db);
+            assert_eq!(sources[0].origin, root.origin);
+            assert_eq!(conversations.len(), 1);
+            assert_eq!(conversations[0].external_id.as_deref(), Some("selected"));
+        }
+    }
+    // A caller explicitly combining named and default local inputs retains
+    // both stores. A real SSH root already disables the ambient fallback.
+    let mut named = ScanRoot::local(selected);
+    named.origin.source_id = "local-backup".into();
+    for (origin, expected) in [
+        (coding_agent_search::connectors::Origin::local(), 2),
+        (coding_agent_search::connectors::Origin::remote("mirror"), 1),
+    ] {
+        let mut other = ScanRoot::local(empty.clone());
+        other.origin = origin;
+        let ctx = ScanContext::with_roots(empty.clone(), vec![named.clone(), other], None);
+        let sources = connector.discover_source_files(&ctx)?;
+        assert_eq!(sources.len(), expected);
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.source_path == selected_db && source.origin == named.origin)
+        );
+        assert_eq!(connector.scan(&ctx)?.len(), expected);
+    }
+    Ok(())
+}
+
 #[test]
 fn opencode_parses_json_fixture() {
     let fixture_root = PathBuf::from("tests/fixtures/opencode_json");

@@ -2,7 +2,78 @@
 //!
 //! Implementation lives in `franken_agent_detection::connectors::opencode`.
 
-pub use franken_agent_detection::OpenCodeConnector;
+use std::borrow::Cow;
+
+use anyhow::{Context, Result};
+use franken_agent_detection::{
+    Connector, DetectionResult, DiscoveredSourceFile, LOCAL_SOURCE_ID, NormalizedConversation,
+    OpenCodeConnector as UpstreamOpenCode, ScanContext, SourceKind,
+};
+
+#[derive(Default)]
+pub struct OpenCodeConnector;
+
+impl OpenCodeConnector {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+// FAD's OpenCode reader intentionally adds the machine's default databases
+// for local roots (#174). A named local source owns only its configured paths:
+// the indexer attributes the entire scan to that source (#578). The pinned
+// reader exposes its explicit-roots-only mode through non-local origin kind.
+// Adapt that input privately, and restore the declared origin on discovery.
+// The reader only accesses local paths in both modes.
+fn parser_context(ctx: &ScanContext) -> Cow<'_, ScanContext> {
+    // A mixed request may legitimately include the default local database.
+    // FAD already disables default discovery when any real SSH root is present.
+    if ctx.scan_roots.is_empty()
+        || ctx.scan_roots.iter().any(|root| {
+            root.origin.kind != SourceKind::Local || root.origin.source_id == LOCAL_SOURCE_ID
+        })
+    {
+        return Cow::Borrowed(ctx);
+    }
+    let mut scoped = ctx.clone();
+    // Upstream probes data_dir ahead of the configured roots. Passing it
+    // separately would rediscover an explicit DB with default provenance.
+    scoped.data_dir.clear();
+    for root in &mut scoped.scan_roots {
+        root.origin.kind = SourceKind::Ssh;
+    }
+    Cow::Owned(scoped)
+}
+
+impl Connector for OpenCodeConnector {
+    fn detect(&self) -> DetectionResult {
+        UpstreamOpenCode::new().detect()
+    }
+
+    fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let selected = parser_context(ctx);
+        let mut sources = UpstreamOpenCode::new().discover_source_files(&selected)?;
+        if matches!(selected, Cow::Owned(_)) {
+            for source in &mut sources {
+                let root = ctx
+                    .scan_roots
+                    .iter()
+                    .find(|root| {
+                        root.origin.source_id == source.origin.source_id
+                            && source.source_path.starts_with(&root.path)
+                    })
+                    .context("OpenCode discovered a source outside its configured roots")?;
+                source.origin = root.origin.clone();
+            }
+        }
+        Ok(sources)
+    }
+
+    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        UpstreamOpenCode::new().scan(&parser_context(ctx))
+    }
+}
 
 #[cfg(test)]
 mod tests {
