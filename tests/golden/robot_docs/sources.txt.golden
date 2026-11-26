@@ -1,5 +1,12 @@
 sources:
 
+# Selecting the local archive
+Use cass --db <path> sources ... (or CASS_DB_PATH) to select the archive.
+A database outside the default data dir moves mirrors, assets, and locks alongside it.
+For sync, reingest, and setup, --data-dir explicitly selects those local assets.
+Source configuration remains shared in sources.toml.
+  cass --db /archive/custom.db sources reingest --data-dir /mirrors --json
+
 # Persisted agent indexing exclusions
 Use this when you want cass to ignore a connector entirely even if
 the backing session files still exist on disk.
@@ -47,6 +54,7 @@ installation, indexing, and configuration automatically.
   --skip-install       Don't install cass on remotes
   --skip-index         Don't run remote indexing
   --skip-sync          Don't sync after setup
+  --data-dir <path>    Local mirrors, search assets, and locks for the final sync
   --json               Output progress as JSON for scripting
   --timeout <secs>     SSH connection timeout (default: 10)
   --verbose            Show detailed progress
