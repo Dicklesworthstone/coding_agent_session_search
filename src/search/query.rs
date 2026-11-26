@@ -2751,6 +2751,9 @@ struct LexicalCandidates {
     // Retry admission depends on the original window, including filtered
     // candidates. An all-noise first window can still need a larger fetch.
     fetched_count: usize,
+    // For a federated page, one full shard is enough to justify a retry.
+    // Empty or exhausted peers must not hide that shard's remaining hits.
+    window_saturated: bool,
 }
 
 #[derive(Debug)]
@@ -5140,6 +5143,7 @@ impl SearchClient {
                 hits,
                 total_count: tantivy_total_count,
                 fetched_count: initial_hit_count,
+                window_saturated: initial_window_saturated,
             } = self.search_tantivy(
                 &reader,
                 &fields,
@@ -5168,7 +5172,7 @@ impl SearchClient {
                 let (mut deduped_len, mut paged_hits) = page_hits(hits);
 
                 let needs_retry = deduped_len < target_hits
-                    && initial_hit_count == initial_fetch_limit
+                    && initial_window_saturated
                     && initial_fetch_limit < fallback_fetch_limit;
                 let mut retry_budget_exhausted = false;
 
@@ -5241,6 +5245,7 @@ impl SearchClient {
                 hits,
                 total_count: tantivy_total_count,
                 fetched_count: initial_hit_count,
+                window_saturated: initial_window_saturated,
             } = self.search_tantivy_federated(
                 readers.as_ref(),
                 query,
@@ -5265,14 +5270,8 @@ impl SearchClient {
                 };
 
                 let (mut deduped_len, mut paged_hits) = page_hits(hits);
-                let expected_federated_capacity = initial_fetch_limit.saturating_mul(readers.len());
-                let federated_initial_capacity_reached = if session_path_filter_active {
-                    initial_hit_count >= initial_fetch_limit.min(expected_federated_capacity)
-                } else {
-                    initial_hit_count == expected_federated_capacity
-                };
                 let needs_retry = deduped_len < target_hits
-                    && federated_initial_capacity_reached
+                    && initial_window_saturated
                     && initial_fetch_limit < fallback_fetch_limit;
                 let mut retry_budget_exhausted = false;
 
@@ -9245,6 +9244,7 @@ impl SearchClient {
             hits,
             total_count: tantivy_total_count,
             fetched_count,
+            window_saturated: limit != 0 && fetched_count == limit,
         })
     }
 
@@ -9261,6 +9261,7 @@ impl SearchClient {
         let mut ranked_hits = Vec::new();
         let mut total_count = Some(0usize);
         let mut fetched_count = 0usize;
+        let mut window_saturated = false;
 
         for (shard_index, shard) in readers.iter().enumerate() {
             let candidates = self.search_tantivy(
@@ -9274,6 +9275,7 @@ impl SearchClient {
                 field_mask,
             )?;
             fetched_count = fetched_count.saturating_add(candidates.fetched_count);
+            window_saturated |= candidates.window_saturated;
             total_count = match (total_count, candidates.total_count) {
                 (Some(total), Some(shard_total)) => Some(total.saturating_add(shard_total)),
                 _ => None,
@@ -9313,6 +9315,7 @@ impl SearchClient {
                 .collect(),
             total_count,
             fetched_count,
+            window_saturated,
         })
     }
 
