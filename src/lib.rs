@@ -36672,9 +36672,9 @@ fn run_cli_pack(
     interpretation: &InvocationInterpretation,
 ) -> CliResult<()> {
     use crate::search::pack_planner::{
-        PackLexicalReadiness, PackPlanRequest, PackPlannerLimits, PackReadinessSnapshot,
-        PackRenderFormat, PackRenderRequest, PackSemanticReadiness, budget_fallback_answer_pack,
-        pack_candidate_fetch_limit, plan_answer_pack,
+        PackEvidenceRole, PackLexicalReadiness, PackPlanRequest, PackPlannerLimits,
+        PackReadinessSnapshot, PackRenderFormat, PackRenderRequest, PackSemanticReadiness,
+        budget_fallback_answer_pack, pack_candidate_fetch_limit, plan_answer_pack,
     };
     use crate::search::query::{FieldMask, SearchFilters, SearchMode, SemanticTierMode};
     use crate::sources::provenance::SourceFilter;
@@ -36836,7 +36836,7 @@ fn run_cli_pack(
 
     // 2l1b0.68: pack runs a search and echoes what it ran in `_meta.effective`
     // like `search --robot-meta`, without the search-only daemon policy.
-    let effective = search_effective_interpretation(
+    let mut effective = search_effective_interpretation(
         "pack",
         query,
         &db_path,
@@ -37019,6 +37019,7 @@ fn run_cli_pack(
         limit
     };
     let search_sparse_threshold = sparse_threshold_for_visible_limit(3, candidate_limit, false);
+    let mut answer_context = Vec::new();
     let result = if session_scope_empty {
         empty_search_result()
     } else if bounded_pack && (hard_deadline_reached || pack_budget.is_exhausted()) {
@@ -37039,10 +37040,10 @@ fn run_cli_pack(
         let worker_mode = mode_meta.clone();
         let search_task = move || {
             maybe_test_pack_delay();
-            execute_search_operation(
-                client,
+            let (result, completed_mode) = execute_search_operation(
+                std::sync::Arc::clone(&client),
                 query,
-                filters,
+                filters.clone(),
                 candidate_limit,
                 0,
                 search_sparse_threshold,
@@ -37050,19 +37051,43 @@ fn run_cli_pack(
                 false,
                 SemanticTierMode::Single,
                 worker_mode,
-            )
+            )?;
+            // A quoted question can match even when its actual reply does not.
+            // Read bounded canonical neighbors under the same search deadline;
+            // the planner admits them only as a qualifying decision reply.
+            let (context, context_unavailable) =
+                match client.pack_answer_context(&result.hits, &filters) {
+                    Ok(context) => (context, false),
+                    Err(error) => {
+                        if let Some(privacy) = privacy_search_cli_error(&error) {
+                            return Err(privacy);
+                        }
+                        // Lexical stored content can remain usable when the
+                        // optional canonical context reader is unavailable.
+                        tracing::warn!(
+                            error = %error,
+                            "answer-pack context unavailable; retaining ranked search evidence"
+                        );
+                        (Vec::new(), true)
+                    }
+                };
+            Ok((result, completed_mode, context, context_unavailable))
         };
         let completed = if bounded_pack {
             run_read_only_search_worker(pack_budget.remaining_ms(), search_task)?
         } else {
             Some(search_task()?)
         };
-        if let Some((result, mut completed_mode)) = completed {
+        if let Some((result, mut completed_mode, context, context_unavailable)) = completed {
             completed_mode.semantic_work_completed = matches!(
                 completed_mode.realized,
                 SearchMode::Semantic | SearchMode::Hybrid
             );
             mode_meta = completed_mode;
+            answer_context = context;
+            if context_unavailable {
+                effective["answer_context"] = serde_json::json!("unavailable");
+            }
             result
         } else {
             if !structured_pack || strict_semantic {
@@ -37080,7 +37105,7 @@ fn run_cli_pack(
     let query_term_count = pack_query_term_count(query);
     let query_phrase_count = pack_query_phrase_count(query);
     let source_explicitly_requested = source.is_some() || sessions_from.is_some();
-    let candidates = result
+    let mut candidates = result
         .hits
         .iter()
         .enumerate()
@@ -37110,6 +37135,43 @@ fn run_cli_pack(
             candidate
         })
         .collect::<Vec<_>>();
+
+    // Canonical context has its own small hard bound and never displaces an
+    // engine-ranked retrieval slot. Its match type prevents ordinary ranking
+    // from treating an unqueried neighbor as an independent search match.
+    for (hit, stored_role) in answer_context {
+        let stored_role = stored_role.trim().to_ascii_lowercase();
+        if matches!(stored_role.as_str(), "system" | "developer") {
+            continue;
+        }
+        let mut candidate = crate::search::pack_planner::PackCandidate::from_search_hit(
+            &hit,
+            query_term_count,
+            query_phrase_count,
+        );
+        candidate.lexical_score = None;
+        candidate.semantic_score = None;
+        candidate.hybrid_rank = None;
+        candidate.match_type = "answer_context".to_string();
+        candidate.source_explicitly_requested = source_explicitly_requested;
+        // A stored assistant role does not itself prove a conclusion. Preserve
+        // that uncertainty while excluding actual tool payloads from decisions.
+        candidate.role = match stored_role.as_str() {
+            "tool" | "tool_result" | "tool-result" => PackEvidenceRole::ToolResult,
+            "tool_call" | "tool-call" => PackEvidenceRole::ToolCallArgument,
+            _ => PackEvidenceRole::Unknown,
+        };
+        if let Some(existing) = candidates
+            .iter_mut()
+            .find(|existing| existing.candidate_id == candidate.candidate_id)
+        {
+            if candidate.role != PackEvidenceRole::Unknown {
+                existing.role = candidate.role;
+            }
+            continue;
+        }
+        candidates.push(candidate);
+    }
 
     let generated_at_ms = Utc::now().timestamp_millis();
     let realized_explain_selection = if explain_selection && !pack_budget.is_healthy() {
