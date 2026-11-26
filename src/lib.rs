@@ -113848,8 +113848,16 @@ impl IndexStallWatchdog {
         // the early return above); belt-and-suspenders so an off-by-one phase
         // never resurrects the exit(70) that killed the build pre-publish (cass
         // #315).
+        // GH #581: background catch-up performs semantic work without the
+        // CLI's `--semantic` flag. Completed semantic counters do not mean a
+        // lexical finalize wedge. Keep this exemption phase-local so the
+        // same background run's later metadata/WAL work remains bounded.
+        let semantic_phase = (indexer::INDEX_PHASE_SEMANTIC_INITIALIZE
+            ..=indexer::INDEX_PHASE_SEMANTIC_FINALIZE)
+            .contains(&phase_code);
         let finalize_wedge = !self.is_watch
             && !self.semantic_build
+            && !semantic_phase
             && total > 0
             && current >= total
             && index_progress.rebuild_pipeline_is_quiescent();
@@ -115376,6 +115384,172 @@ mod stall_diagnostics_tests {
             .ok_or_else(|| anyhow::anyhow!("phase-2 semantic stall did not abort"))?;
         assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
+    /// GH #581: background maintenance does not set the explicit --semantic
+    /// flag. Completed lexical counters must not turn a semantic phase into
+    /// an abortable finalize wedge.
+    #[test]
+    fn gh581_background_semantic_completed_phases_remain_report_only() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::{
+            INDEX_PHASE_SEMANTIC_FINALIZE, INDEX_PHASE_SEMANTIC_INITIALIZE, IndexingProgress,
+        };
+        use std::time::{Duration, Instant};
+
+        let tmp = TempDir::new()?;
+        for phase in INDEX_PHASE_SEMANTIC_INITIALIZE..=INDEX_PHASE_SEMANTIC_FINALIZE {
+            let mut watchdog = IndexStallWatchdog::with_abort_policy(
+                tmp.path().to_path_buf(),
+                Duration::from_millis(50),
+                IndexStallAbortPolicy::AbortLexicalPhases,
+            )
+            .semantic_aware(false);
+            watchdog.abort_all_phases = false;
+            watchdog.threshold = Some(Duration::from_millis(1));
+            watchdog.abort_threshold = Some(Duration::from_millis(2));
+            watchdog.last_phase = phase;
+            watchdog.last_current = 100;
+            watchdog.last_progress_advance = Instant::now() - Duration::from_millis(100);
+
+            let progress = IndexingProgress::default();
+            progress.set_phase_progress(phase, 100, 100);
+            assert!(progress.rebuild_pipeline_is_quiescent());
+            let report = watchdog
+                .observe(&progress, 100)
+                .ok_or_else(|| anyhow::anyhow!("background semantic phase {phase} did not report"))?;
+            assert_eq!(report["event"], serde_json::json!("stall_detected"));
+            assert_eq!(
+                report["phase"],
+                serde_json::json!(IndexingProgress::phase_label_for(phase))
+            );
+            assert_ne!(report["abort_process"], serde_json::json!(true));
+            assert!(
+                watchdog.observe(&progress, 200).is_none(),
+                "completed background semantic phase {phase} must remain report-only"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gh581_background_semantic_completed_phases_honor_all_phases_abort() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::{
+            INDEX_PHASE_SEMANTIC_FINALIZE, INDEX_PHASE_SEMANTIC_INITIALIZE, IndexingProgress,
+        };
+        use std::time::{Duration, Instant};
+
+        let tmp = TempDir::new()?;
+        for phase in INDEX_PHASE_SEMANTIC_INITIALIZE..=INDEX_PHASE_SEMANTIC_FINALIZE {
+            let mut watchdog = IndexStallWatchdog::with_abort_policy(
+                tmp.path().to_path_buf(),
+                Duration::from_millis(50),
+                IndexStallAbortPolicy::AbortLexicalPhases,
+            )
+            .semantic_aware(false);
+            watchdog.abort_all_phases = true;
+            watchdog.threshold = Some(Duration::from_millis(1));
+            watchdog.abort_threshold = Some(Duration::from_millis(2));
+            watchdog.last_phase = phase;
+            watchdog.last_current = 100;
+            watchdog.last_progress_advance = Instant::now() - Duration::from_millis(100);
+
+            let progress = IndexingProgress::default();
+            progress.set_phase_progress(phase, 100, 100);
+            let report = watchdog
+                .observe(&progress, 100)
+                .ok_or_else(|| anyhow::anyhow!("background semantic phase {phase} did not report"))?;
+            assert_eq!(report["event"], serde_json::json!("stall_detected"));
+            let abort = watchdog
+                .observe(&progress, 200)
+                .ok_or_else(|| anyhow::anyhow!("all-phases override did not abort phase {phase}"))?;
+            assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+            assert_eq!(abort["abort_process"], serde_json::json!(true));
+            assert_eq!(abort["exit_code"], serde_json::json!(70));
+        }
+        Ok(())
+    }
+
+    /// A background semantic exemption belongs to the active phase. Once
+    /// ordinary indexing/finalization resumes, its original bounded stall
+    /// policy must apply again, including the longer WAL-checkpoint grace.
+    #[test]
+    fn gh581_background_semantic_completion_restores_lexical_abort_bounds() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::{
+            INDEX_PHASE_LEXICAL_INDEXING, INDEX_PHASE_PREPARING, INDEX_PHASE_SEMANTIC_EMBEDDING,
+            IndexingProgress,
+        };
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let tmp = TempDir::new()?;
+        for (restored_phase, finalizing) in [
+            (INDEX_PHASE_LEXICAL_INDEXING, false),
+            (INDEX_PHASE_PREPARING, false),
+            (INDEX_PHASE_PREPARING, true),
+        ] {
+            let mut watchdog = IndexStallWatchdog::with_abort_policy(
+                tmp.path().to_path_buf(),
+                Duration::from_millis(50),
+                IndexStallAbortPolicy::AbortLexicalPhases,
+            )
+            .semantic_aware(false);
+            watchdog.abort_all_phases = false;
+            // Host IO must not introduce the unrelated pre-index IO grace.
+            watchdog.io_probe = || None;
+            watchdog.threshold = Some(Duration::from_millis(1));
+            watchdog.abort_threshold = Some(Duration::from_millis(2));
+            watchdog.finalize_abort_threshold = Some(Duration::from_secs(10));
+            watchdog.last_phase = INDEX_PHASE_SEMANTIC_EMBEDDING;
+            watchdog.last_current = 100;
+            watchdog.last_progress_advance = Instant::now() - Duration::from_millis(100);
+
+            let progress = IndexingProgress::default();
+            progress.set_phase_progress(INDEX_PHASE_SEMANTIC_EMBEDDING, 100, 100);
+            let semantic_report = watchdog
+                .observe(&progress, 100)
+                .ok_or_else(|| anyhow::anyhow!("background semantic stall did not report"))?;
+            assert_eq!(semantic_report["event"], serde_json::json!("stall_detected"));
+            assert!(watchdog.observe(&progress, 200).is_none());
+
+            // The scope restores the lexical counters and phase before final
+            // metadata writes and storage close. Observing that transition
+            // must start a fresh deadline, not inherit the semantic stall.
+            progress.finalizing.store(finalizing, Ordering::Relaxed);
+            progress.set_phase_progress(restored_phase, 100, 100);
+            assert!(
+                watchdog.observe(&progress, 250).is_none(),
+                "restoring phase {restored_phase} must reset the stall deadline"
+            );
+            watchdog.last_progress_advance = Instant::now() - Duration::from_millis(100);
+            let report = watchdog
+                .observe(&progress, 300)
+                .ok_or_else(|| anyhow::anyhow!("restored phase {restored_phase} did not report"))?;
+            assert_eq!(report["event"], serde_json::json!("stall_detected"));
+            assert_eq!(
+                report["phase"],
+                serde_json::json!(IndexingProgress::phase_label_for(restored_phase))
+            );
+            assert_eq!(report["finalizing"], serde_json::json!(finalizing));
+
+            if finalizing {
+                assert!(
+                    watchdog.observe(&progress, 400).is_none(),
+                    "storage finalization must retain its longer bounded grace"
+                );
+                watchdog.last_progress_advance = Instant::now() - Duration::from_secs(11);
+            }
+
+            let abort = watchdog
+                .observe(&progress, 11_000)
+                .ok_or_else(|| anyhow::anyhow!("restored phase {restored_phase} did not abort"))?;
+            assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+            assert_eq!(abort["abort_process"], serde_json::json!(true));
+            assert_eq!(abort["exit_code"], serde_json::json!(70));
+        }
         Ok(())
     }
 

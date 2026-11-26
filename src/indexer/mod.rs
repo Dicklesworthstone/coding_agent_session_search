@@ -21430,18 +21430,27 @@ fn run_index_with_storage_ownership(
     {
         // Delta-only and non-fatal (see set_background_semantic_delta_enabled):
         // the bulk pass below `opts.semantic` is deliberately unreachable here.
+        // GH #581: these runs do not set `opts.semantic`. Publish the actual
+        // phase before eligibility checks or model work can block, and restore
+        // the lexical counters before final metadata/checkpoint work resumes.
+        let semantic_progress =
+            BackgroundSemanticProgress::new(opts.progress.as_ref(), &progress_bump);
+        let mut set_background_phase = |phase| {
+            if let Err(error) = index_run_lock.set_phase(initial_lock_mode, phase) {
+                tracing::debug!(
+                    sub_phase = phase,
+                    error = %error,
+                    "background semantic phase breadcrumb write failed (continuing)"
+                );
+            }
+        };
+        set_background_phase("semantic:background-initialize");
         match background_semantic_delta_eligible(&storage, &opts.data_dir, &opts.embedder) {
             Ok(true) => {
-                if let Err(err) =
-                    index_run_lock.set_phase(initial_lock_mode, "semantic:background-delta")
-                {
-                    tracing::debug!(
-                        error = %err,
-                        "background semantic delta breadcrumb write failed (continuing)"
-                    );
-                }
+                set_background_phase("semantic:background-delta");
                 let delta_started_at_ms = semantic_indexing_now_ms();
                 let storage_cell = Mutex::new(storage);
+                semantic_progress.set_phase(INDEX_PHASE_SEMANTIC_EMBEDDING, 0, 0);
                 let outcome = incremental_semantic_embed_retained(
                     &opts.embedder,
                     &opts.data_dir,
@@ -21452,6 +21461,8 @@ fn run_index_with_storage_ownership(
                     .into_inner()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 match outcome.and_then(|embedded| {
+                    set_background_phase("semantic:background-manifest");
+                    semantic_progress.set_phase(INDEX_PHASE_SEMANTIC_MANIFEST, 0, 1);
                     finalize_one_shot_semantic_delta(
                         &opts.embedder,
                         &opts.data_dir,
@@ -21460,12 +21471,15 @@ fn run_index_with_storage_ownership(
                     )
                     .map(|doc_count| (embedded, doc_count))
                 }) {
-                    Ok((embedded, doc_count)) => tracing::info!(
-                        embedder = %opts.embedder,
-                        embedded,
-                        doc_count,
-                        "background semantic maintenance advanced available coverage"
-                    ),
+                    Ok((embedded, doc_count)) => {
+                        semantic_progress.set_phase(INDEX_PHASE_SEMANTIC_MANIFEST, 1, 1);
+                        tracing::info!(
+                            embedder = %opts.embedder,
+                            embedded,
+                            doc_count,
+                            "background semantic maintenance advanced available coverage"
+                        );
+                    }
                     Err(err) => tracing::warn!(
                         embedder = %opts.embedder,
                         error = %err,
@@ -21485,25 +21499,22 @@ fn run_index_with_storage_ownership(
                 "background semantic delta eligibility check failed; skipping it"
             ),
         }
-    }
-
-    if !opts.semantic
-        && BACKGROUND_SEMANTIC_DELTA_ENABLED.load(Ordering::Relaxed)
-        && !opts.full
-        && !opts.watch
-        && !targeted_semantic_watch_once
-        && opts.embedder != "external"
-        && let Err(error) = maintain_routine_titles(
+        set_background_phase("semantic:background-titles");
+        semantic_progress.set_phase(INDEX_PHASE_SEMANTIC_EMBEDDING, 0, 0);
+        if let Err(error) = maintain_routine_titles(
             &opts.embedder,
             &opts.data_dir,
             &storage,
             &mut retained_semantic_model,
-        )
-    {
-        tracing::warn!(
-            error = %error,
-            "optional title maintenance deferred; retry explicit semantic indexing"
-        );
+        ) {
+            tracing::warn!(
+                error = %error,
+                "optional title maintenance deferred; retry explicit semantic indexing"
+            );
+        }
+        semantic_progress.set_phase(INDEX_PHASE_SEMANTIC_FINALIZE, 0, 1);
+        drop(retained_semantic_model.take());
+        set_background_phase("index:metadata");
     }
     // A watch run continues for the lifetime of the process. Release the
     // one-shot model before entering that loop or doing unrelated maintenance.
@@ -23175,6 +23186,63 @@ const fn should_optimize_tantivy_after_watch_once_ingest(
 
 fn prepare_progress_for_semantic_build(progress: Option<&Arc<IndexingProgress>>) {
     reset_progress_to_idle(progress);
+}
+
+/// Background semantic maintenance borrows the progress display, not the
+/// lexical run's completion counts or watchdog exemption. Restore that state
+/// on every exit so metadata persistence and WAL shutdown remain bounded.
+struct BackgroundSemanticProgress<'a> {
+    progress: Option<&'a Arc<IndexingProgress>>,
+    progress_bump: &'a Arc<AtomicI64>,
+    prior: Option<(usize, usize, usize, bool)>,
+}
+
+impl<'a> BackgroundSemanticProgress<'a> {
+    fn new(
+        progress: Option<&'a Arc<IndexingProgress>>,
+        progress_bump: &'a Arc<AtomicI64>,
+    ) -> Self {
+        let prior = progress.map(|progress| {
+            (
+                progress.phase.load(Ordering::Relaxed),
+                progress.current.load(Ordering::Relaxed),
+                progress.total.load(Ordering::Relaxed),
+                progress.total_is_final.load(Ordering::Relaxed),
+            )
+        });
+        let scope = Self {
+            progress,
+            progress_bump,
+            prior,
+        };
+        scope.set_phase(INDEX_PHASE_SEMANTIC_INITIALIZE, 0, 0);
+        scope
+    }
+
+    fn set_phase(&self, phase: usize, current: usize, total: usize) {
+        set_semantic_progress_phase(self.progress, self.progress_bump, phase, current, total);
+        if total == 0
+            && let Some(progress) = self.progress
+        {
+            // Eligibility/model initialization has not established a total.
+            progress.total_is_final.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for BackgroundSemanticProgress<'_> {
+    fn drop(&mut self) {
+        if let (Some(progress), Some((phase, current, total, total_is_final))) =
+            (self.progress, self.prior)
+        {
+            progress.set_phase_progress(phase, current, total);
+            progress
+                .total_is_final
+                .store(total_is_final, Ordering::Relaxed);
+            progress.tick_activity();
+        }
+        bump_index_run_lock_progress_atomic(self.progress_bump);
+    }
 }
 
 fn set_semantic_progress_phase(
@@ -77259,6 +77327,65 @@ c.close()
         assert!(!should_optimize_tantivy_after_watch_once_ingest(0, true));
         assert!(should_optimize_tantivy_after_watch_once_ingest(1, false));
         assert!(!should_optimize_tantivy_after_watch_once_ingest(1, true));
+    }
+
+    #[test]
+    fn gh581_background_semantic_progress_restores_lexical_state_on_success_and_error() {
+        for fail in [false, true] {
+            let progress = Arc::new(IndexingProgress::default());
+            let progress_bump = Arc::new(AtomicI64::new(0));
+            progress.set_phase_progress(INDEX_PHASE_LEXICAL_INDEXING, 7, 9);
+            progress.total_is_final.store(false, Ordering::Relaxed);
+            progress.is_rebuilding.store(true, Ordering::Relaxed);
+            progress
+                .rebuild_pipeline_queue_depth
+                .store(3, Ordering::Relaxed);
+
+            let outcome = (|| -> Result<()> {
+                let scope = BackgroundSemanticProgress::new(Some(&progress), &progress_bump);
+                assert_eq!(
+                    progress.phase.load(Ordering::Relaxed),
+                    INDEX_PHASE_SEMANTIC_INITIALIZE
+                );
+                assert_eq!(progress.current.load(Ordering::Relaxed), 0);
+                assert_eq!(progress.total.load(Ordering::Relaxed), 0);
+                assert!(!progress.total_is_final.load(Ordering::Relaxed));
+                progress.tick_activity();
+                scope.set_phase(INDEX_PHASE_SEMANTIC_MANIFEST, 1, 1);
+                assert!(progress.total_is_final.load(Ordering::Relaxed));
+                if fail {
+                    anyhow::bail!("semantic maintenance failed");
+                }
+                Ok(())
+            })();
+
+            assert_eq!(outcome.is_err(), fail);
+            assert_eq!(
+                progress.phase.load(Ordering::Relaxed),
+                INDEX_PHASE_LEXICAL_INDEXING
+            );
+            assert_eq!(progress.current.load(Ordering::Relaxed), 7);
+            assert_eq!(progress.total.load(Ordering::Relaxed), 9);
+            assert!(!progress.total_is_final.load(Ordering::Relaxed));
+            assert!(progress.is_rebuilding.load(Ordering::Relaxed));
+            assert_eq!(
+                progress.rebuild_pipeline_queue_depth.load(Ordering::Relaxed),
+                3,
+                "semantic maintenance must preserve the lexical pipeline evidence"
+            );
+            assert_eq!(progress.activity.load(Ordering::Relaxed), 2);
+            assert!(progress_bump.load(Ordering::Relaxed) > 0);
+        }
+    }
+
+    #[test]
+    fn gh581_background_semantic_progress_keeps_lock_progress_without_a_display() {
+        let progress_bump = Arc::new(AtomicI64::new(0));
+        {
+            let scope = BackgroundSemanticProgress::new(None, &progress_bump);
+            scope.set_phase(INDEX_PHASE_SEMANTIC_FINALIZE, 1, 1);
+        }
+        assert!(progress_bump.load(Ordering::Relaxed) > 0);
     }
 
     #[test]
