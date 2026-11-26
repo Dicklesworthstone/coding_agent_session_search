@@ -1523,6 +1523,229 @@ fn collect_ledger_scan(
 }
 
 #[test]
+#[serial_test::serial]
+fn gh574_failed_local_scan_preserves_completed_ssh_source_reuse() -> Result<()> {
+    let factories: Vec<_> = crate::connectors::get_connector_factories()
+        .into_iter()
+        .filter(|(name, _)| matches!(*name, "pi_agent" | "omp"))
+        .collect();
+    assert_eq!(factories.len(), 2);
+    for (name, factory) in factories {
+        for streaming in [false, true] {
+            let temp = TempDir::new()?;
+            let provider_dir = if name == "pi_agent" { ".pi" } else { ".omp" };
+            let local_root = temp
+                .path()
+                .join("local")
+                .join(provider_dir)
+                .join("agent/sessions");
+            let remote_root = temp
+                .path()
+                .join("remote")
+                .join(provider_dir)
+                .join("agent/sessions");
+            let data_dir = temp.path().join("data");
+            fs::create_dir_all(&data_dir)?;
+            for (root, id) in [(&local_root, "local"), (&remote_root, "remote")] {
+                fs::create_dir_all(root)?;
+                let path = root.join("session.jsonl");
+                let transcript = [
+                    serde_json::json!({"type": "session", "version": 3, "id": id,
+                        "timestamp": "2023-11-14T22:13:20Z", "cwd": "/work/gh574"}),
+                    serde_json::json!({"type": "message", "timestamp": "2023-11-14T22:13:21Z",
+                        "message": {"role": "user", "content": format!("{id} retained transcript")}}),
+                ]
+                .into_iter()
+                .map(|row| row.to_string() + "\n")
+                .collect::<String>();
+                fs::write(&path, transcript)?;
+                File::open(&path)?.set_modified(SystemTime::now() - Duration::from_secs(7200))?;
+            }
+            let remote = ScanRoot::remote(
+                remote_root.clone(),
+                Origin {
+                    source_id: "gh574-mirror".to_owned(),
+                    kind: SourceKind::Ssh,
+                    host: Some("gh574-host".to_owned()),
+                },
+                None,
+            );
+            let local_ctx = ScanContext::with_roots(
+                data_dir.clone(),
+                vec![ScanRoot::local(local_root.clone())],
+                None,
+            );
+            let remote_ctx = ScanContext::with_roots(remote_root, vec![remote.clone()], None);
+            let connector = factory();
+            let local_sources = connector.discover_source_files(&local_ctx)?;
+            let remote_sources = connector.discover_source_files(&remote_ctx)?;
+            assert_eq!(local_sources.len(), 1, "{name}: local fixture discovery");
+            assert_eq!(remote_sources.len(), 1, "{name}: SSH fixture discovery");
+            let local_key =
+                source_ledger_key(&local_sources[0], &local_ctx).context("local source key")?;
+            let remote_key =
+                source_ledger_key(&remote_sources[0], &remote_ctx).context("SSH source key")?;
+            let db_path = data_dir.join("archive.db");
+            let storage = FrankenStorage::open(&db_path)?;
+            // Refuse admission through the real prior-prefix validation path.
+            // The producer reports this local ScanError before its SSH scan.
+            storage.raw().execute_compat(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+                &[ParamValue::from(local_key.as_str()), ParamValue::from("{")],
+            )?;
+            storage.set_connector_last_scan_ts(name, 123_456)?;
+            let run = if streaming {
+                run_streaming_index_with_connector_factories::<ConnectorFactory>
+            } else {
+                run_batch_index_with_connector_factories::<ConnectorFactory>
+            };
+            let mut identity = None;
+            for pass in 0..2 {
+                let progress = Arc::new(IndexingProgress::default());
+                let opts = IndexOptions {
+                    full: false,
+                    force_rebuild: false,
+                    watch: false,
+                    watch_once_paths: None,
+                    db_path: db_path.clone(),
+                    data_dir: data_dir.clone(),
+                    semantic: false,
+                    build_hnsw: false,
+                    embedder: "fastembed".to_owned(),
+                    progress: Some(Arc::clone(&progress)),
+                    watch_interval_secs: 30,
+                };
+                let outcome = run(
+                    &storage,
+                    None,
+                    &opts,
+                    None,
+                    LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                    vec![remote.clone()],
+                    Some(Arc::new(HashMap::from([(
+                        name.to_owned(),
+                        vec![local_root.clone()],
+                    )]))),
+                    vec![(name, factory)],
+                    Some(456_789),
+                    None,
+                )?;
+                assert!(
+                    outcome.scan_had_errors,
+                    "{name}, streaming={streaming}, pass={pass}"
+                );
+                assert!(outcome.scanned_connectors.is_empty());
+                assert_eq!(storage.get_connector_last_scan_ts(name)?, Some(123_456));
+                let saved = storage.source_ingest_ledger_entries()?;
+                assert_eq!(saved.get(&local_key).map(String::as_str), Some("{"));
+                assert!(
+                    saved.contains_key(&remote_key),
+                    "the earlier local error must not poison a healthy SSH completion"
+                );
+                let expected_parsed =
+                    usize::from(pass == 0 || env!("CASS_SOURCE_INGEST_REUSE") != "true");
+                let stats = progress.stats.lock().unwrap();
+                assert_eq!(
+                    (stats.total_conversations, stats.total_messages),
+                    (expected_parsed, expected_parsed)
+                );
+                assert!(
+                    stats
+                        .connectors
+                        .iter()
+                        .any(|connector| connector.error.is_some())
+                );
+                drop(stats);
+                let observed = storage.raw().query_row_map(
+                    "SELECT c.id, a.slug, c.source_id, c.origin_host FROM conversations c \
+                     JOIN agents a ON a.id = c.agent_id",
+                    &[],
+                    |row| {
+                        Ok((
+                            row.get_typed::<i64>(0)?,
+                            row.get_typed::<String>(1)?,
+                            row.get_typed::<String>(2)?,
+                            row.get_typed::<String>(3)?,
+                        ))
+                    },
+                )?;
+                assert_eq!(observed.1, name);
+                assert_eq!(observed.2, "gh574-mirror");
+                assert_eq!(observed.3, "gh574-host");
+                if let Some(expected) = &identity {
+                    assert_eq!(&observed, expected);
+                } else {
+                    identity = Some(observed);
+                }
+                assert_eq!(count_total_messages_exact(&storage)?, 1);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn gh574_failed_publication_still_withholds_later_source_completion() -> Result<()> {
+    let temp = TempDir::new()?;
+    let data_dir = temp.path().join("data");
+    fs::create_dir(&data_dir)?;
+    let config = diagnostic_ledger_config(data_dir.clone());
+    let storage = FrankenStorage::open(&data_dir.join("archive.db"))?;
+    storage.set_connector_last_scan_ts("codex", 123_456)?;
+    let (failed, failed_receipt) =
+        canonical_refusal_packet(temp.path(), &config, "publication-failed", 1, true)?;
+    let (healthy, healthy_receipt) =
+        canonical_refusal_packet(temp.path(), &config, "publication-later", 1, true)?;
+    let failed_path = failed.source_path.clone();
+    let failed_key = failed_receipt.key.clone();
+    let healthy_key = healthy_receipt.key.clone();
+    let invalidated = invalidated_prefix_observation(&healthy_receipt.observation)?
+        .context("healthy fixture prefix proof")?;
+    // Change a parsed source before its queued packet can publish. This is an
+    // ingestion failure, so a later completion must retain the conservative
+    // latch: an earlier deferred Batch could belong to that later source.
+    fs::write(
+        &failed_path,
+        fs::read_to_string(&failed_path)?.replace("message 0", "changed 0"),
+    )?;
+    let (tx, rx) = bounded(8);
+    send_canonical_refusal_packet(&tx, &config.flow_limiter, failed, failed_receipt)?;
+    send_canonical_refusal_packet(&tx, &config.flow_limiter, healthy, healthy_receipt)?;
+    send_canonical_refusal_done(&tx)?;
+    drop(tx);
+    let (_, outcome) = run_streaming_consumer(
+        rx,
+        1,
+        &storage,
+        &data_dir,
+        None,
+        Arc::clone(&config.flow_limiter),
+        &None,
+        LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+        Some(456_789),
+        None,
+    )?;
+    assert_eq!(config.flow_limiter.bytes_in_flight(), 0);
+    assert!(outcome.scan_had_errors);
+    assert!(outcome.incomplete_remote_sources);
+    assert_eq!(outcome.deferred_sources, BTreeSet::from([failed_path]));
+    assert!(outcome.scanned_connectors.is_empty());
+    assert_eq!(storage.get_connector_last_scan_ts("codex")?, Some(123_456));
+    assert_eq!(outcome.inserted_messages, 1);
+    assert_eq!(count_total_messages_exact(&storage)?, 1);
+    let saved = storage.source_ingest_ledger_entries()?;
+    assert!(!saved.contains_key(&failed_key));
+    assert_eq!(
+        saved.get(&healthy_key),
+        Some(&invalidated),
+        "failed publication must not certify a later completion"
+    );
+    Ok(())
+}
+
+#[test]
 fn gh512_real_sidecar_appearance_before_admission_cannot_certify_an_untracked_file() -> Result<()> {
     let temp = TempDir::new()?;
     let directory = temp.path().join("grok/sessions/%2Fwork%2Fledger/session");

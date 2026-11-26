@@ -17014,6 +17014,10 @@ fn run_streaming_consumer(
 
     // Per-connector stats tracking (T7.4)
     let mut connector_stats: HashMap<String, ConnectorStats> = HashMap::new();
+    let mut failed_ingest_connectors = BTreeSet::new();
+    // A failed root holds the provider watermark, but a later root can still
+    // publish independent source completions. Ingest failures remain separate:
+    // a deferred Batch may be an earlier piece of a later SourceComplete.
     let mut failed_scan_connectors = BTreeSet::new();
     // A source-exclusive canonical refusal holds provider coverage without
     // revoking a later sibling's independent canonical completion receipt.
@@ -17203,7 +17207,7 @@ fn run_streaming_consumer(
                         if combined_conversations[range].iter().any(|conversation| {
                             outcome.deferred_sources.contains(&conversation.source_path)
                         }) {
-                            failed_scan_connectors.insert(name.to_string());
+                            failed_ingest_connectors.insert(name.to_string());
                         }
                     }
                 }
@@ -17292,7 +17296,7 @@ fn run_streaming_consumer(
                         ingest_outcome.incomplete_remote_sources = true;
                         ingest_outcome.scan_had_errors = true;
                         ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
-                        failed_scan_connectors.insert(connector_name.to_string());
+                        failed_ingest_connectors.insert(connector_name.to_string());
                         let stats = connector_stats
                             .entry(connector_name.to_string())
                             .or_insert_with(|| ConnectorStats {
@@ -17343,7 +17347,7 @@ fn run_streaming_consumer(
                         },
                     )?;
                 }
-                let mut completion_written = !failed_scan_connectors.contains(connector_name);
+                let mut completion_written = !failed_ingest_connectors.contains(connector_name);
                 let first = if should_inject_non_watch_ingest_test_oom(&conversations) {
                     Err(anyhow::Error::new(
                         crate::franken_sync::FrankenError::OutOfMemory,
@@ -17431,7 +17435,7 @@ fn run_streaming_consumer(
                         outcome.deferred_sources.contains(&conversation.source_path)
                     })
                 {
-                    failed_scan_connectors.insert(connector_name.to_string());
+                    failed_ingest_connectors.insert(connector_name.to_string());
                 }
                 drop(conversations);
                 flow_limiter.release(byte_reservation);
@@ -17496,6 +17500,7 @@ fn run_streaming_consumer(
                 active_producers -= 1;
                 let effective_scan_succeeded = scan_succeeded
                     && !failed_scan_connectors.contains(connector_name)
+                    && !failed_ingest_connectors.contains(connector_name)
                     && !canonically_refused_connectors.contains(connector_name);
 
                 // Record scan timing in connector stats
@@ -20548,16 +20553,16 @@ fn run_index_with_storage_ownership(
                 } else {
                     additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir, false)
                 };
-                // #372: drop remote mirror roots whose on-disk fingerprint is
-                // unchanged since the last error-free scan (they would otherwise
-                // be fully re-scanned every run), and capture fingerprints to
-                // persist for the roots we still scan.
+                // Capture successful-scan receipts for every scan route. An
+                // explicit reingest still rereads its selected roots, but must
+                // warm the cache so the next ordinary index does not repeat it.
                 let (additional_scan_roots, mirror_fingerprints_to_store) =
-                    if mirror_source_ids.is_some() {
-                        (additional_scan_roots, Vec::new())
-                    } else {
-                        plan_remote_mirror_scan_skips(&storage, &opts, additional_scan_roots)
-                    };
+                    plan_remote_mirror_scan_skips(
+                        &storage,
+                        &opts,
+                        additional_scan_roots,
+                        mirror_source_ids.is_none(),
+                    );
                 let scan_watermark = mirror_source_ids.is_none().then_some(scan_start_ts);
                 let scan_requires_tantivy =
                     lexical_population_strategy_requires_inline_tantivy(lexical_strategy);
@@ -39195,17 +39200,20 @@ fn remote_mirror_source_already_indexed(storage: &FrankenStorage, source_id: &st
 /// cutoff); `--full` / `--force-rebuild` never skip; and any fingerprint doubt
 /// falls through to a full scan. Explicit file roots use the per-source ledger
 /// because their reconstruction dependencies can sit outside the file root.
+/// `allow_skip` is false for explicit mirror reingest: it must reread roots for
+/// recovery, while still collecting receipts for subsequent ordinary indexing.
 fn plan_remote_mirror_scan_skips(
     storage: &FrankenStorage,
     opts: &IndexOptions,
     roots: Vec<ScanRoot>,
+    allow_skip: bool,
 ) -> (Vec<ScanRoot>, Vec<(String, String)>) {
     let workspace_policy = WorkspaceExclusions::from_env().ok();
     let contract = workspace_policy
         .as_ref()
         .and_then(remote_mirror_scan_contract);
     let reuse_enabled = env!("CASS_SOURCE_INGEST_REUSE") == "true";
-    let skip_enabled = !opts.full && !opts.force_rebuild && reuse_enabled;
+    let skip_enabled = allow_skip && !opts.full && !opts.force_rebuild && reuse_enabled;
     let mut scanned = Vec::with_capacity(roots.len());
     let mut saved_by_source: HashMap<String, Option<RemoteMirrorScanCache>> = HashMap::new();
     let mut indexed_sources = HashMap::new();
@@ -39426,8 +39434,12 @@ mod mirror_scan_skip_tests {
 
         // 1. No stored fingerprint yet -> remote scanned + fp captured; local
         //    root is never a skip candidate.
-        let (scanned, fps) =
-            plan_remote_mirror_scan_skips(&storage, &opts, vec![remote.clone(), local.clone()]);
+        let (scanned, fps) = plan_remote_mirror_scan_skips(
+            &storage,
+            &opts,
+            vec![remote.clone(), local.clone()],
+            true,
+        );
         assert_eq!(
             scanned.len(),
             2,
@@ -39440,7 +39452,8 @@ mod mirror_scan_skip_tests {
             .unwrap();
 
         // 2. Fingerprint matches but the source was never indexed -> still scan.
-        let (scanned2, _) = plan_remote_mirror_scan_skips(&storage, &opts, vec![remote.clone()]);
+        let (scanned2, _) =
+            plan_remote_mirror_scan_skips(&storage, &opts, vec![remote.clone()], true);
         assert_eq!(
             scanned2.len(),
             1,
@@ -39450,7 +39463,8 @@ mod mirror_scan_skip_tests {
         insert_conv_with_source(&storage, "css", &mirror_db);
 
         // 3. Fingerprint matches AND the source is indexed -> skip.
-        let (scanned3, fps3) = plan_remote_mirror_scan_skips(&storage, &opts, vec![remote.clone()]);
+        let (scanned3, fps3) =
+            plan_remote_mirror_scan_skips(&storage, &opts, vec![remote.clone()], true);
         assert!(
             scanned3.is_empty(),
             "unchanged indexed mirror should be skipped"
@@ -39464,12 +39478,13 @@ mod mirror_scan_skip_tests {
         let mut full_opts = base_opts(&db_path, tmp.path());
         full_opts.full = true;
         let (scanned_full, _) =
-            plan_remote_mirror_scan_skips(&storage, &full_opts, vec![remote.clone()]);
+            plan_remote_mirror_scan_skips(&storage, &full_opts, vec![remote.clone()], true);
         assert_eq!(scanned_full.len(), 1, "--full must never skip a mirror");
 
         // 4. Mirror content changes -> re-scanned and a fresh fingerprint captured.
         std::fs::write(&mirror_db, b"data plus more").unwrap();
-        let (scanned4, fps4) = plan_remote_mirror_scan_skips(&storage, &opts, vec![remote.clone()]);
+        let (scanned4, fps4) =
+            plan_remote_mirror_scan_skips(&storage, &opts, vec![remote.clone()], true);
         assert_eq!(scanned4.len(), 1, "a changed mirror must re-scan");
         assert_eq!(fps4.len(), 1, "changed mirror captures a new fingerprint");
         assert_ne!(fps4[0].1, fps[0].1, "fingerprint changed with content");
@@ -39500,8 +39515,12 @@ mod mirror_scan_skip_tests {
         // The file-only fingerprint cannot see a new reconstruction sidecar.
         fs::write(tmp.path().join("session.db-wal"), b"pending transaction").unwrap();
         assert_eq!(remote_mirror_scan_fingerprint(&file).unwrap(), fingerprint);
-        let (scanned, receipts) =
-            plan_remote_mirror_scan_skips(&storage, &base_opts(&db_path, tmp.path()), vec![root]);
+        let (scanned, receipts) = plan_remote_mirror_scan_skips(
+            &storage,
+            &base_opts(&db_path, tmp.path()),
+            vec![root],
+            true,
+        );
         assert_eq!(scanned.len(), 1);
         assert!(
             receipts.is_empty(),
@@ -39635,7 +39654,8 @@ mod mirror_scan_skip_tests {
         let roots = vec![ssh_root(&pi, "css"), ssh_root(&omp, "css")];
         insert_conv_with_source(&storage, "css", &pi.join("session.jsonl"));
 
-        let (scanned, receipts) = plan_remote_mirror_scan_skips(&storage, &opts, roots.clone());
+        let (scanned, receipts) =
+            plan_remote_mirror_scan_skips(&storage, &opts, roots.clone(), true);
         assert_eq!(scanned.len(), 2);
         assert_eq!(receipts.len(), 1, "one atomic receipt per source");
         let cache: RemoteMirrorScanCache = serde_json::from_str(&receipts[0].1).unwrap();
@@ -39651,7 +39671,7 @@ mod mirror_scan_skip_tests {
         // Reordering configured paths must not change the receipt or scan work.
         let mut reordered = roots.clone();
         reordered.reverse();
-        let (scanned, receipts) = plan_remote_mirror_scan_skips(&storage, &opts, reordered);
+        let (scanned, receipts) = plan_remote_mirror_scan_skips(&storage, &opts, reordered, true);
         assert!(scanned.is_empty());
         assert!(
             receipts.is_empty(),
@@ -39662,7 +39682,8 @@ mod mirror_scan_skip_tests {
         let old_mtime = fs::metadata(&file).unwrap().modified().unwrap();
         fs::write(&file, b"session plus an old-timestamp message").unwrap();
         File::open(&file).unwrap().set_modified(old_mtime).unwrap();
-        let (scanned, receipts) = plan_remote_mirror_scan_skips(&storage, &opts, roots.clone());
+        let (scanned, receipts) =
+            plan_remote_mirror_scan_skips(&storage, &opts, roots.clone(), true);
         assert_eq!(scanned.len(), 1);
         assert_eq!(scanned[0].path, pi);
         let cache: RemoteMirrorScanCache = serde_json::from_str(&receipts[0].1).unwrap();
@@ -39674,14 +39695,14 @@ mod mirror_scan_skip_tests {
 
         // An incomplete scan does not persist the proposed receipt. The next
         // plan must retry precisely that changed root, not bless its new state.
-        let (retry, _) = plan_remote_mirror_scan_skips(&storage, &opts, roots.clone());
+        let (retry, _) = plan_remote_mirror_scan_skips(&storage, &opts, roots.clone(), true);
         assert_eq!(retry.len(), 1);
         assert_eq!(retry[0].path, pi);
         storage
             .record_mirror_scan_fingerprint("css", &receipts[0].1)
             .unwrap();
         assert!(
-            plan_remote_mirror_scan_skips(&storage, &opts, roots.clone())
+            plan_remote_mirror_scan_skips(&storage, &opts, roots.clone(), true)
                 .0
                 .is_empty()
         );
@@ -39689,7 +39710,7 @@ mod mirror_scan_skip_tests {
         let mut forced = opts;
         forced.force_rebuild = true;
         assert_eq!(
-            plan_remote_mirror_scan_skips(&storage, &forced, roots)
+            plan_remote_mirror_scan_skips(&storage, &forced, roots, true)
                 .0
                 .len(),
             2
@@ -39708,7 +39729,8 @@ mod mirror_scan_skip_tests {
         fs::write(&file, b"session").unwrap();
         insert_conv_with_source(&storage, "css", &file);
         let root = ssh_root(&mirror, "css");
-        let (_, receipts) = plan_remote_mirror_scan_skips(&storage, &opts, vec![root.clone()]);
+        let (_, receipts) =
+            plan_remote_mirror_scan_skips(&storage, &opts, vec![root.clone()], true);
         let mut wrong_version: RemoteMirrorScanCache =
             serde_json::from_str(&receipts[0].1).unwrap();
         wrong_version.version = 1;
@@ -39725,7 +39747,7 @@ mod mirror_scan_skip_tests {
                 .record_mirror_scan_fingerprint("css", &saved)
                 .unwrap();
             assert_eq!(
-                plan_remote_mirror_scan_skips(&storage, &opts, vec![root.clone()])
+                plan_remote_mirror_scan_skips(&storage, &opts, vec![root.clone()], true)
                     .0
                     .len(),
                 1,

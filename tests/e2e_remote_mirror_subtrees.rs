@@ -135,6 +135,7 @@ fn cursor_database(path: &Path, id: &str) {
         coding_agent_search::franken_sync::params![key.as_str(), value.as_str()],
     )
     .unwrap();
+    conn.close().unwrap();
 }
 
 fn exercise(test_name: &str, trailing_slash: bool, retain_basename: bool) {
@@ -630,6 +631,182 @@ fn gh574_ssh_mirrors_index_only_changed_sessions_in_both_modes() {
             "--full must retain archive identity"
         );
         gh574_assert_scanned(&run(&incremental), &[]);
+        tracker.complete();
+    }
+}
+
+/// Explicit mirror reingest must still force a reread, while warming the root
+/// receipts used by the next ordinary index. Cursor has no per-file reuse, so
+/// its parsing counts expose a missing root receipt directly.
+#[test]
+fn gh574_explicit_reingest_warms_mirror_receipts_in_both_modes() {
+    for streaming in ["0", "1"] {
+        let tracker = PhaseTracker::new(
+            "e2e_remote_mirror_subtrees",
+            &format!("gh574_reingest_streaming_{streaming}"),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let config = tmp.path().join("config");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(config.join("cass")).unwrap();
+        fs::write(home.join(".env"), "").unwrap();
+        let source = "~/.config/Cursor/User/workspaceStorage";
+        let fixture_id = "gh574reingest";
+        let file = data
+            .join("remotes")
+            .join(SOURCE_ID)
+            .join("mirror")
+            .join(path_to_safe_dirname(source))
+            .join("selected/state.vscdb");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        cursor_database(&file, fixture_id);
+        gh574_preserve_old_mtime(&file);
+        let original_bytes = fs::read(&file).unwrap();
+        fs::write(
+            config.join("cass/sources.toml"),
+            format!(
+                "[[sources]]\nname = {SOURCE_ID:?}\ntype = \"ssh\"\nhost = {HOST:?}\npaths = {}\n",
+                serde_json::to_string(&[source]).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let run = |args: &[&str]| -> Value {
+            let mut command = tracker.cass_std_command();
+            command
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &config)
+                .env("XDG_DATA_HOME", tmp.path().join("xdg"))
+                .env("CASS_DATA_DIR", &data)
+                .env("CASS_STREAMING_INDEX", streaming)
+                .env("CASS_AUTO_REFRESH", "0")
+                .env("RUST_MIN_STACK", "134217728")
+                .current_dir(&home);
+            tracker.command_environment().apply_to_std(&mut command);
+            let output = assert_cmd::Command::from_std(command)
+                .args(args)
+                .timeout(Duration::from_secs(120))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "streaming={streaming}, args={args:?}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice(&output.stdout).unwrap()
+        };
+        let incremental = ["index", "--json", "--no-progress-events"];
+        let reingest = [
+            "sources",
+            "reingest",
+            "--from-mirror",
+            "--source",
+            SOURCE_ID,
+            "--json",
+        ];
+
+        let first = run(&reingest);
+        assert_eq!(first["status"], "complete", "{first}");
+        gh574_assert_scanned(&first["indexing"], &[("cursor", 1, 2)]);
+        let initial = snapshot(&data);
+        assert_eq!((initial.0.len(), initial.1.len()), (1, 2));
+        let row = &initial.0[0];
+        assert_eq!(row.agent, "cursor");
+        assert_eq!(row.source, SOURCE_ID);
+        assert_eq!(row.host.as_deref(), Some(HOST));
+        assert_eq!(row.path, file.join(fixture_id));
+        assert!(!row.external_id.is_empty());
+        let conversation_id = row.id;
+        assert_eq!(
+            initial.1,
+            vec![
+                (
+                    conversation_id,
+                    0,
+                    "user".to_owned(),
+                    format!("cursorsubtreeprobe {fixture_id} question"),
+                ),
+                (
+                    conversation_id,
+                    1,
+                    "agent".to_owned(),
+                    format!("cursor {fixture_id} answer"),
+                ),
+            ]
+        );
+        gh574_assert_scanned(&run(&incremental), &[]);
+        assert_eq!(snapshot(&data), initial);
+        assert_eq!(fs::read(&file).unwrap(), original_bytes);
+
+        // A warm receipt must never turn explicit reingest into a no-op.
+        gh574_assert_scanned(&run(&reingest)["indexing"], &[("cursor", 1, 2)]);
+        gh574_assert_scanned(&run(&incremental), &[]);
+        assert_eq!(snapshot(&data), initial);
+
+        let marker = "gh574cursorappendprobe";
+        {
+            let conn = coding_agent_search::franken_sync::Connection::open(
+                file.to_string_lossy().as_ref(),
+            )
+            .unwrap();
+            let key = format!("composerData:{fixture_id}");
+            let encoded: String = conn
+                .query_row_compat(
+                    "SELECT value FROM cursorDiskKV WHERE key = ?1",
+                    coding_agent_search::franken_sync::params![key.as_str()],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            let mut value: Value = serde_json::from_str(&encoded).unwrap();
+            value["lastUpdatedAt"] = json!(1_700_000_002_000_i64);
+            value["tabs"][0]["bubbles"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type": 1, "text": marker}));
+            let encoded = value.to_string();
+            conn.execute_compat(
+                "UPDATE cursorDiskKV SET value = ?1 WHERE key = ?2",
+                coding_agent_search::franken_sync::params![encoded.as_str(), key.as_str()],
+            )
+            .unwrap();
+            conn.close().unwrap();
+        }
+        gh574_preserve_old_mtime(&file);
+        let changed_bytes = fs::read(&file).unwrap();
+        gh574_assert_scanned(&run(&reingest)["indexing"], &[("cursor", 1, 3)]);
+        let updated = snapshot(&data);
+        assert_eq!(updated.0, initial.0, "reingest must retain canonical IDs");
+        let mut expected_messages = initial.1.clone();
+        expected_messages.push((conversation_id, 2, "user".to_owned(), marker.to_owned()));
+        assert_eq!(updated.1, expected_messages);
+        for _ in 0..2 {
+            gh574_assert_scanned(&run(&incremental), &[]);
+            assert_eq!(snapshot(&data), updated);
+        }
+        for query in ["cursorsubtreeprobe", marker] {
+            let result = run(&[
+                "search",
+                query,
+                "--robot",
+                "--mode",
+                "lexical",
+                "--no-maintenance",
+                "--no-daemon",
+            ]);
+            let found: BTreeSet<_> = result["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["conversation_id"].as_i64().unwrap())
+                .collect();
+            assert_eq!(found, BTreeSet::from([conversation_id]), "{result}");
+        }
+        assert_eq!(fs::read(&file).unwrap(), changed_bytes);
         tracker.complete();
     }
 }
