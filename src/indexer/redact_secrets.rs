@@ -202,6 +202,14 @@ pub(crate) const PRIVATE_KEY_BLOCK_PATTERN: &str = concat!(
 );
 pub(crate) const DATABASE_URL_PATTERN: &str =
     r#"(?i)(?-u:\b)(postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s'"]{8,}"#;
+// Credentials also appear in HTTP remotes, proxies and custom connection URLs.
+// Match through the last @ in the authority, including token-only userinfo,
+// while retaining the host/path for useful diagnostics. A slash, query,
+// fragment, double quote or line break cannot carry a match into unrelated text.
+// Single quotes are valid userinfo characters; double quotes and backticks
+// delimit surrounding log/markup content. No credential-length guess is needed.
+pub(crate) const URL_USERINFO_PATTERN: &str =
+    r#"(?i)(?-u:\b)[a-z][a-z0-9+.-]*://[^\s/?#<>"\x60\\]+@"#;
 // Credential labels also use camelCase/PascalCase in YAML, TOML and shell
 // output. Admit the complete identifier before its sensitive suffix, just as
 // structured JSON does. The assignment delimiter must follow that suffix, so
@@ -277,6 +285,12 @@ static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         SecretPattern {
             pattern: DATABASE_URL_PATTERN,
             regex: Regex::new(DATABASE_URL_PATTERN).expect("db url regex"),
+        },
+        // Credential-bearing authorities, including protocols outside the
+        // database URL allowlist and opaque tokens used as the username.
+        SecretPattern {
+            pattern: URL_USERINFO_PATTERN,
+            regex: Regex::new(URL_USERINFO_PATTERN).expect("URL userinfo regex"),
         },
         // Generic key/token/secret/password assignments
         SecretPattern {
@@ -1999,6 +2013,81 @@ mod tests {
                 "credential URL survived: {output}"
             );
         }
+    }
+
+    #[test]
+    fn credentialed_urls_redact_across_plain_structured_and_memoized_paths() {
+        let mut memoized = MemoizingRedactor::with_capacity(32);
+        for (input, expected) in [
+            (
+                "fetch https://inert-user:inert-pass@example.test/repo done",
+                "fetch [REDACTED]example.test/repo done",
+            ),
+            (
+                "HTTPS://inert-token@example.test/repo",
+                "[REDACTED]example.test/repo",
+            ),
+            ("git+https://u:p@host/repo", "[REDACTED]host/repo"),
+            ("rediss://:p@[::1]:6379/0", "[REDACTED][::1]:6379/0"),
+            (
+                "amqps://u:p@broker.test/vhost",
+                "[REDACTED]broker.test/vhost",
+            ),
+            ("custom.v1://a%40b:p%3Ass@host/path", "[REDACTED]host/path"),
+            ("https://user:can't@host/path", "[REDACTED]host/path"),
+            ("https://u:pa@ss@host/path", "[REDACTED]host/path"),
+            ("ftp://u:p@", "[REDACTED]"),
+            (
+                "café 界 https://u:p@host/path\nnext public line",
+                "café 界 [REDACTED]host/path\nnext public line",
+            ),
+        ] {
+            for actual in [
+                redact_text(input).into_owned(),
+                redact_content(input),
+                memoized.redact_text(input),
+                memoized.redact_content(input),
+                memoized.redact_text(input),
+            ] {
+                assert_eq!(actual, expected, "credential URL policy diverged");
+                assert_eq!(redact_text(&actual), actual, "redaction is not idempotent");
+            }
+
+            let structured = json!({"endpoint": input, "ordinary": 42});
+            let expected_json = json!({"endpoint": expected, "ordinary": 42});
+            assert_eq!(redact_json(&structured), expected_json);
+            assert_eq!(memoized.redact_json(&structured), expected_json);
+            let encoded = structured.to_string();
+            let decoded: serde_json::Value =
+                serde_json::from_str(&redact_content(&encoded)).expect("redacted JSON");
+            assert_eq!(decoded, expected_json);
+        }
+    }
+
+    #[test]
+    fn url_userinfo_redaction_does_not_consume_public_urls_or_neighboring_text() {
+        for input in [
+            "https://example.test/public",
+            "https://example.test/path/user@example.test",
+            "https://example.test?contact=user@example.test",
+            "https://example.test#user@example.test",
+            "mailto:user@example.test",
+            "git@example.test:repo",
+            "https://example.test\ncontact user@example.test",
+            "https://example.test contact user@example.test",
+            "https://example.test\\user@example.test",
+            r#""https://example.test"user@example.test"#,
+        ] {
+            assert_eq!(redact_text(input), input, "public context was removed");
+            assert!(
+                matches!(redact_text(input), Cow::Borrowed(_)),
+                "clean URL should keep the no-allocation path"
+            );
+        }
+
+        let input = "https://u:p@first.test/a?next=https://v:q@second.test/b";
+        let expected = "[REDACTED]first.test/a?next=[REDACTED]second.test/b";
+        assert_eq!(redact_text(input), expected);
     }
 
     #[test]

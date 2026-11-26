@@ -107,7 +107,7 @@ fn export_privacy_session(root: &Path) -> Result<std::path::PathBuf, Box<dyn std
     let session = mirror.join("rollout-export-privacy.jsonl");
     let records = [
         serde_json::json!({"timestamp":"2026-10-27T12:00:00Z","type":"session_meta","payload":{"id":"export-privacy-84","cwd":"/synthetic/export-privacy","originator":"codex_cli_rs"}}),
-        serde_json::json!({"timestamp":"2026-10-27T12:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("exportprivacycanary café 界 password={EXPORT_PRIVACY_SECRET}\nDB_PASSWORD={EXPORT_PRIVACY_SECRET}\nGITHUB_TOKEN={EXPORT_PRIVACY_SECRET}\nSTRIPE_SECRET={EXPORT_PRIVACY_SECRET}\nMY_API_KEY={EXPORT_PRIVACY_SECRET}\nclientSecret: {EXPORT_PRIVACY_SECRET}\nrefreshToken = {EXPORT_PRIVACY_SECRET}\nredisPassword={EXPORT_PRIVACY_SECRET}\ntenantApiKey='{EXPORT_PRIVACY_SECRET}'")}]}}),
+        serde_json::json!({"timestamp":"2026-10-27T12:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("exportprivacycanary café 界 password={EXPORT_PRIVACY_SECRET}\nDB_PASSWORD={EXPORT_PRIVACY_SECRET}\nGITHUB_TOKEN={EXPORT_PRIVACY_SECRET}\nSTRIPE_SECRET={EXPORT_PRIVACY_SECRET}\nMY_API_KEY={EXPORT_PRIVACY_SECRET}\nclientSecret: {EXPORT_PRIVACY_SECRET}\nrefreshToken = {EXPORT_PRIVACY_SECRET}\nredisPassword={EXPORT_PRIVACY_SECRET}\ntenantApiKey='{EXPORT_PRIVACY_SECRET}'\nhttps://url-user:{EXPORT_PRIVACY_SECRET}@export-public-endpoint.invalid/repo\nhttps://{EXPORT_PRIVACY_SECRET}@example.invalid/token\nrediss://:{EXPORT_PRIVACY_SECRET}@[::1]:6379/0")}]}}),
         serde_json::json!({"timestamp":"2026-10-27T12:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"exportprivacycanary ordinary-kept-marker; discuss password rotation; accessKeyCount=1234567890"}]}}),
     ];
     let mut bytes = Vec::new();
@@ -244,7 +244,7 @@ fn export_redaction_parity_for_live_and_archived_sources() -> Result<(), Box<dyn
     let secret_hits: Value = serde_json::from_slice(&secret_query.stdout)?;
     assert!(
         secret_hits["hits"].as_array().is_some_and(Vec::is_empty),
-        "prefixed credential assignments remained searchable: {secret_hits}"
+        "credentials remained searchable: {secret_hits}"
     );
 
     let db_path = root.path().join("data/agent_search.db");
@@ -282,6 +282,7 @@ fn export_redaction_parity_for_live_and_archived_sources() -> Result<(), Box<dyn
             );
             assert!(exported.contains("password rotation"));
             assert!(exported.contains("accessKeyCount=1234567890"));
+            assert!(exported.contains("export-public-endpoint.invalid/repo"));
             assert!(String::from_utf8_lossy(&output.stderr).contains("redact-secrets"));
         }
         let (receipt, html) = export_privacy_html(root.path(), &session, source, false, false)?;
@@ -292,6 +293,7 @@ fn export_redaction_parity_for_live_and_archived_sources() -> Result<(), Box<dyn
         assert!(!receipt.to_string().contains(EXPORT_PRIVACY_SECRET));
         assert!(html.contains("ordinary-kept-marker"));
         assert!(html.contains("accessKeyCount=1234567890"));
+        assert!(html.contains("export-public-endpoint.invalid/repo"));
         assert!(html.contains("café 界"));
     }
     assert_eq!(fs::read(&session)?, source_bytes);

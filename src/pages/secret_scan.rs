@@ -7,7 +7,8 @@ use crate::indexer::redact_secrets::{
     AWS_SESSION_TOKEN_PATTERN, BEARER_TOKEN_PATTERN, DATABASE_URL_PATTERN,
     GENERIC_SECRET_ASSIGNMENT_PATTERN, GITHUB_TOKEN_PATTERN, HTTP_AUTHORIZATION_PATTERN,
     HTTP_COOKIE_PATTERN, JWT_PATTERN, JsonPrivacyEvent, JsonSourceSpan, OPENAI_API_KEY_PATTERN,
-    PRIVATE_KEY_BLOCK_PATTERN, SLACK_TOKEN_PATTERN, STRIPE_KEY_PATTERN, inspect_json_content,
+    PRIVATE_KEY_BLOCK_PATTERN, SLACK_TOKEN_PATTERN, STRIPE_KEY_PATTERN, URL_USERINFO_PATTERN,
+    inspect_json_content,
 };
 use anyhow::{Context, Result, bail};
 use console::{Term, style};
@@ -266,6 +267,13 @@ static BUILTIN_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
             id: "http_cookie",
             severity: SecretSeverity::High,
             regex: Regex::new(HTTP_COOKIE_PATTERN).expect("HTTP cookie regex"),
+        },
+        // Keep the existing database_url classification for overlapping
+        // database schemes; this covers userinfo on every other URL scheme.
+        SecretPattern {
+            id: "url_userinfo",
+            severity: SecretSeverity::Medium,
+            regex: Regex::new(URL_USERINFO_PATTERN).expect("URL userinfo regex"),
         },
     ]
 });
@@ -3209,6 +3217,54 @@ mod tests {
                 return Err(
                     "HTTP finding leaked credentials or changed its neighboring header".into(),
                 );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scan_text_reports_url_userinfo_without_exposing_credentials() -> Result<(), String> {
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)
+            .map_err(|error| error.to_string())?;
+        let ctx = ScanContext {
+            agent: None,
+            workspace: None,
+            source_path: Some("fixture.jsonl".into()),
+            conversation_id: Some(1),
+            message_id: Some(1),
+            message_idx: Some(0),
+        };
+        for url in [
+            "https://inert-user:inert-pass@example.test/repo",
+            "git+https://inert-token@example.test/repo",
+            "rediss://:inert-pass@[::1]:6379/0",
+        ] {
+            let text = format!("connect {url}\npublic neighbor");
+            let mut findings = Vec::new();
+            let mut seen = Vec::new();
+            let mut truncated = false;
+            scan_text(
+                &text,
+                SecretLocation::MessageContent,
+                &ctx,
+                &config,
+                &mut findings,
+                &mut seen,
+                &mut truncated,
+            );
+            let [finding] = findings.as_slice() else {
+                return Err("expected one credential-bearing URL occurrence".into());
+            };
+            let serialized = serde_json::to_string(finding).map_err(|error| error.to_string())?;
+            if truncated
+                || finding.kind != "url_userinfo"
+                || finding.severity != SecretSeverity::Medium
+                || !finding.context.contains("public neighbor")
+                || ["inert-user", "inert-pass", "inert-token"]
+                    .iter()
+                    .any(|&secret| serialized.contains(secret))
+            {
+                return Err("URL finding leaked credentials or lost public context".into());
             }
         }
         Ok(())
