@@ -813,17 +813,30 @@ fn prepare_search_hit_for_export(hit: &SearchHit, privacy: &mut ExportPrivacy) -
         prepared.title = "[REDACTED]".to_string();
         prepared.snippet = "[REDACTED]".to_string();
     } else {
-        // Preserve the original highlighting and entity spelling when clean.
+        privacy.redact_text(&mut prepared.title);
+        let title_redacted = prepared.title != hit.title;
+        privacy.redact_text(&mut prepared.snippet);
+
+        // Inspect both spellings: highlight removal can expose a split label,
+        // but it can also change text that the original redactor recognized.
         let mut protected = visible_snippet.clone();
         privacy.redact_text(&mut protected);
-        if protected != visible_snippet {
+        let snippet_redacted = prepared.snippet != hit.snippet || protected != visible_snippet;
+
+        // Either projection can retain the only credential label available
+        // when the full body is absent. Its sibling may contain just the
+        // opaque value, so do not try to certify that sibling independently.
+        if snippet_redacted {
+            prepared.title = "[REDACTED]".to_string();
+        }
+        if title_redacted {
+            prepared.snippet = "[REDACTED]".to_string();
+        } else if protected != visible_snippet {
             prepared.snippet = protected;
         }
     }
 
     for text in [
-        &mut prepared.title,
-        &mut prepared.snippet,
         &mut prepared.source_path,
         &mut prepared.agent,
         &mut prepared.workspace,
@@ -2189,6 +2202,105 @@ mod tests {
     }
 
     #[test]
+    fn search_result_exports_protect_credentials_across_title_and_snippet()
+    -> Result<(), serde_json::Error> {
+        let options = ExportOptions {
+            include_content: true,
+            max_snippet_len: 0,
+            query: Some("ordinary query".to_string()),
+            ..Default::default()
+        };
+        for content in ["", "Ordinary searchable content."] {
+            for (title, snippet, secret, title_has_label) in [
+                (
+                    "DB_PASSWORD=projectionsecret123",
+                    "... **projectionsecret123** ...",
+                    "projectionsecret123",
+                    true,
+                ),
+                (
+                    r#"{"registration_token":"projectionsecret123","status":"ok"}"#,
+                    "... projectionsecret123 ...",
+                    "projectionsecret123",
+                    true,
+                ),
+                (
+                    "projectionsecret123",
+                    "DB_PASSWORD=projectionsecret123",
+                    "projectionsecret123",
+                    false,
+                ),
+                (
+                    "projectionsecret123",
+                    "DB_PASS**WORD**=projectionsecret123",
+                    "projectionsecret123",
+                    false,
+                ),
+                (
+                    "projectionsecret123",
+                    "<b>DB_PASSWORD</b>=projectionsecret123",
+                    "projectionsecret123",
+                    false,
+                ),
+                (
+                    "projectionsecret123",
+                    "{&quot;registration_token&quot;:&quot;projectionsecret123&quot;}",
+                    "projectionsecret123",
+                    false,
+                ),
+                // Only the original spelling meets the plain-text policy's
+                // value length; decoding must not discard that evidence.
+                ("abc**def", "DB_PASSWORD=abc**def", "abc**def", false),
+            ] {
+                let mut hit = sample_hit();
+                hit.content = content.to_string();
+                hit.title = title.to_string();
+                hit.snippet = snippet.to_string();
+                let original = serde_json::to_value(&hit)?;
+
+                for &format in ExportFormat::all() {
+                    let output = export_results(std::slice::from_ref(&hit), format, &options);
+                    assert!(!output.contains(secret), "{format:?}: {output}");
+                    assert!(output.contains("ordinary query"), "{format:?}: {output}");
+                    if !content.is_empty() {
+                        assert!(output.contains(content), "{format:?}: {output}");
+                    }
+                }
+
+                let rows = bulk_export_records(std::slice::from_ref(&hit));
+                assert!(!serde_json::to_string(&rows)?.contains(secret), "{rows:?}");
+                if title_has_label {
+                    assert_eq!(rows[0]["snippet"], "[REDACTED]");
+                } else {
+                    assert_eq!(rows[0]["title"], "[REDACTED]");
+                }
+                assert_eq!(rows[0]["source_id"], "local");
+                assert_eq!(rows[0]["source_path"], "/path/to/file.jsonl");
+                assert_eq!(serde_json::to_value(&hit)?, original);
+            }
+        }
+
+        // A clean content-free hit still preserves its display bytes in every
+        // sharing format, including non-ASCII text and one-layer entities.
+        let mut clean = sample_hit();
+        clean.content.clear();
+        clean.title = "Public title café 界".to_string();
+        clean.snippet = "Ordinary **highlighted** café &amp; 界 text".to_string();
+        let original = serde_json::to_value(&clean)?;
+        for &format in ExportFormat::all() {
+            let output = export_results(std::slice::from_ref(&clean), format, &options);
+            assert!(output.contains(&clean.title), "{format:?}: {output}");
+            assert!(output.contains(&clean.snippet), "{format:?}: {output}");
+        }
+        let rows = bulk_export_records(std::slice::from_ref(&clean));
+        assert_eq!(rows[0]["title"], clean.title);
+        assert_eq!(rows[0]["snippet"], clean.snippet);
+        assert_eq!(serde_json::to_value(&clean)?, original);
+        assert_eq!(options.query.as_deref(), Some("ordinary query"));
+        Ok(())
+    }
+
+    #[test]
     fn search_result_exports_redact_metadata_before_truncation() {
         let mut hit = sample_hit();
         hit.content = "Ordinary searchable content.".to_string();
@@ -2290,7 +2402,7 @@ mod tests {
                 !serde_json::to_string(&rows)?.contains("fixture-highlighted-credential"),
                 "{rows:?}"
             );
-            assert_eq!(rows[0]["title"], "Test Result");
+            assert_eq!(rows[0]["title"], "[REDACTED]");
         }
 
         let mut hit = sample_hit();
