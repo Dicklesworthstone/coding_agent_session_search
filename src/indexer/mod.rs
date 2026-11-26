@@ -46512,6 +46512,122 @@ pub mod persist {
             );
         }
 
+        /// GH #578: the debt replay may skip a message only when its
+        /// published document is exact. Canonical rows the interrupted watch
+        /// never published, a retitled conversation whose message text did
+        /// not change, and a message whose timestamp moved must all still be
+        /// written.
+        #[test]
+        #[serial]
+        fn watch_replay_publishes_missing_documents_and_metadata_only_changes() {
+            use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+
+            let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "1");
+            let dir = tempfile::TempDir::new().unwrap();
+            let storage = create_franken_db(&dir.path().join("agent_search.db"));
+            let messages = ["golfmark first text", "hotelmark second text"]
+                .iter()
+                .enumerate()
+                .map(|(idx, content)| NormalizedMessage {
+                    idx: idx as i64,
+                    role: if idx % 2 == 0 { "user" } else { "assistant" }.into(),
+                    author: None,
+                    created_at: Some(1_700_000_000_000 + idx as i64),
+                    content: (*content).into(),
+                    extra: serde_json::json!({"uuid": format!("gh578-metadata-{idx}")}),
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                })
+                .collect();
+            let conv = NormalizedConversation {
+                agent_slug: "claude_code".into(),
+                external_id: Some("gh578-watch-metadata".into()),
+                title: Some("Original indiamark title".into()),
+                workspace: Some(dir.path().join("workspace")),
+                source_path: dir.path().join("source.jsonl"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_010),
+                metadata: serde_json::Value::Null,
+                messages,
+            };
+            let mut unused_index =
+                TantivyIndex::open_or_create(&dir.path().join("unused-index")).unwrap();
+            persist_conversation(&storage, &mut unused_index, &conv).unwrap();
+            let conversation_id: i64 = storage
+                .raw()
+                .query_row_map("SELECT id FROM conversations", &[], |row| row.get_typed(0))
+                .unwrap();
+
+            // The interrupted watch stored canonical rows and published none.
+            let index_path = dir.path().join("replay-index");
+            let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+            replay_watch_canonical_conversation(&storage, &mut index, conversation_id).unwrap();
+            assert_eq!(
+                tantivy_doc_count(&mut index),
+                2,
+                "canonical rows missing from the index are published"
+            );
+            let generation = |index: &TantivyIndex| {
+                index
+                    .committed_snapshot()
+                    .unwrap()
+                    .loaded_manifest()
+                    .manifest
+                    .generation
+            };
+            let published = generation(&index);
+
+            let moved_at = 1_700_000_999_000_i64;
+            storage
+                .raw()
+                .execute_compat(
+                    "UPDATE conversations SET title = ?1 WHERE id = ?2",
+                    &[
+                        ParamValue::from("Retitled julietmark title"),
+                        ParamValue::from(conversation_id),
+                    ],
+                )
+                .unwrap();
+            storage
+                .raw()
+                .execute_compat(
+                    "UPDATE messages SET created_at = ?1 WHERE conversation_id = ?2 AND idx = 1",
+                    &[
+                        ParamValue::from(moved_at),
+                        ParamValue::from(conversation_id),
+                    ],
+                )
+                .unwrap();
+            replay_watch_canonical_conversation(&storage, &mut index, conversation_id).unwrap();
+            assert_eq!(tantivy_doc_count(&mut index), 2);
+            assert!(
+                generation(&index) > published,
+                "metadata-only changes must be republished"
+            );
+            drop(index);
+            let client = SearchClient::open(&index_path, None).unwrap().unwrap();
+            let search = |query: &str| {
+                client
+                    .search(query, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                    .unwrap()
+            };
+            let golf = search("golfmark");
+            let hotel = search("hotelmark");
+            assert_eq!((golf.len(), hotel.len()), (1, 1));
+            for hit in [&golf[0], &hotel[0]] {
+                assert_eq!(
+                    hit.title, "Retitled julietmark title",
+                    "an unchanged message carries the new conversation title"
+                );
+            }
+            assert_eq!(golf[0].created_at, Some(1_700_000_000_000));
+            assert_eq!(
+                hotel[0].created_at,
+                Some(moved_at),
+                "a moved timestamp is republished"
+            );
+        }
+
         /// m91r6: a giant conversation persisted in slices must store exactly
         /// what one transaction stores, be searchable at both ends, resume
         /// after a crash between slices, and replay as a no-op.
