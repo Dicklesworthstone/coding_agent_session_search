@@ -39240,6 +39240,22 @@ pub(crate) fn remote_sync_index_contract() -> Option<String> {
         .and_then(remote_mirror_scan_contract)
 }
 
+/// Bind a sync completion receipt to the archive that actually receives rows.
+pub(crate) fn remote_sync_index_contract_for_archive(db_path: &Path) -> Option<String> {
+    let scan_contract = remote_sync_index_contract()?;
+    remote_sync_archive_contract(db_path, &scan_contract)
+}
+
+fn remote_sync_archive_contract(db_path: &Path, scan_contract: &str) -> Option<String> {
+    let context = serde_json::to_vec(&(
+        "remote-sync-archive-v1",
+        crate::normalize_path_identity(db_path),
+        scan_contract,
+    ))
+    .ok()?;
+    Some(blake3::hash(&context).to_hex().to_string())
+}
+
 fn remote_mirror_scan_contract(policy: &WorkspaceExclusions) -> Option<String> {
     let connectors: Vec<_> = configured_connector_factories()
         .into_iter()
@@ -39925,6 +39941,58 @@ mod mirror_scan_skip_tests {
                 "unproven receipt must replay: {saved}",
             );
         }
+    }
+
+    #[test]
+    fn sync_completion_receipts_are_scoped_to_the_selected_archive() -> Result<()> {
+        use crate::sources::config::SourceDefinition;
+        use crate::sources::sync::SyncIndexJournal;
+
+        let temp = TempDir::new()?;
+        let first = temp.path().join("first.db");
+        let second = temp.path().join("second.db");
+        let first_contract = remote_sync_archive_contract(&first, "parser-and-policy")
+            .context("first archive contract")?;
+        let second_contract = remote_sync_archive_contract(&second, "parser-and-policy")
+            .context("second archive contract")?;
+        let source = SourceDefinition::ssh("workstation", "user@workstation");
+        let mut journal = SyncIndexJournal::acquire(temp.path())?;
+
+        assert!(journal.mark_pending(&source, Some(&first_contract))?);
+        journal.clear_sources([&source], Some(&first_contract))?;
+        assert!(!journal.mark_pending(&source, Some(&first_contract))?);
+        journal.clear_sources([&source], Some(&first_contract))?;
+
+        // Both archives share one data directory and one sync journal. A
+        // completed handoff to one must not certify the other's missing rows.
+        assert!(journal.mark_pending(&source, Some(&second_contract))?);
+        journal.clear_sources([&source], Some(&second_contract))?;
+        assert!(!journal.mark_pending(&source, Some(&second_contract))?);
+        journal.clear_sources([&source], Some(&second_contract))?;
+        assert!(journal.mark_pending(&source, Some(&first_contract))?);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_archive_contract_preserves_resolved_parent_aliases() -> Result<()> {
+        let temp = TempDir::new()?;
+        let real = temp.path().join("archive");
+        fs::create_dir(&real)?;
+        let alias = temp.path().join("archive-alias");
+        std::os::unix::fs::symlink(&real, &alias)?;
+
+        let direct = remote_sync_archive_contract(&real.join("selected.db"), "parser-and-policy")
+            .context("direct archive contract")?;
+        let through_alias =
+            remote_sync_archive_contract(&alias.join("selected.db"), "parser-and-policy")
+                .context("aliased archive contract")?;
+        assert_eq!(direct, through_alias);
+        assert_ne!(
+            Some(direct),
+            remote_sync_archive_contract(&real.join("selected.db"), "changed-parser-or-policy")
+        );
+        Ok(())
     }
 
     #[test]
