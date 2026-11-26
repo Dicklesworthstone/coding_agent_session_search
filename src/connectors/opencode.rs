@@ -27,13 +27,18 @@ impl OpenCodeConnector {
 // Adapt that input privately, and restore the declared origin on discovery.
 // The reader only accesses local paths in both modes.
 fn parser_context(ctx: &ScanContext) -> Cow<'_, ScanContext> {
-    // A mixed request may legitimately include the default local database.
-    // FAD already disables default discovery when any real SSH root is present.
-    if ctx.scan_roots.is_empty()
-        || ctx.scan_roots.iter().any(|root| {
-            root.origin.kind != SourceKind::Local || root.origin.source_id == LOCAL_SOURCE_ID
-        })
-    {
+    // An existing explicit database is itself the selected source, even for
+    // the default local origin. Scanning ambient databases here can turn a
+    // one-store watch retry into a full multi-store import. Nonmatching paths
+    // and mixed default roots retain FAD's ordinary detection fallback.
+    let one_database = matches!(ctx.scan_roots.as_slice(), [root]
+        if root.path.extension().is_some_and(|extension| extension == "db")
+            && root.path.is_file());
+    let named_local_only = !ctx.scan_roots.is_empty()
+        && ctx.scan_roots.iter().all(|root| {
+            root.origin.kind == SourceKind::Local && root.origin.source_id != LOCAL_SOURCE_ID
+        });
+    if !one_database && !named_local_only {
         return Cow::Borrowed(ctx);
     }
     let mut scoped = ctx.clone();

@@ -207,6 +207,21 @@ fn named_local_opencode_source_is_scoped_to_its_configured_roots() -> anyhow::Re
     assert_eq!(ordinary.len(), 1);
     assert_eq!(ordinary[0].external_id.as_deref(), Some("default"));
 
+    // A targeted retry of one database with the ordinary local source ID
+    // must not read the unrelated default.db exposed to this process.
+    let explicit = ScanContext::with_roots(
+        selected_db.clone(),
+        vec![ScanRoot::local(selected_db.clone())],
+        None,
+    );
+    let files = connector.discover_source_files(&explicit)?;
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].source_path, selected_db);
+    assert_eq!(files[0].origin, explicit.scan_roots[0].origin);
+    let conversations = connector.scan(&explicit)?;
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].external_id.as_deref(), Some("selected"));
+
     for path in [selected.clone(), selected_db.clone(), empty.clone()] {
         let mut root = ScanRoot::local(path.clone());
         root.origin.source_id = "local-backup".into();
@@ -244,6 +259,89 @@ fn named_local_opencode_source_is_scoped_to_its_configured_roots() -> anyhow::Re
         );
         assert_eq!(connector.scan(&ctx)?.len(), expected);
     }
+    Ok(())
+}
+
+#[test]
+fn explicit_opencode_wal_watch_indexes_a_commit_with_unchanged_main_file() -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    let home = TempDir::new()?;
+    let store = home.path().join(".local/share/opencode");
+    fs::create_dir_all(&store)?;
+    let database = store.join("opencode.db");
+    let writer = create_drizzle_opencode_db(&database);
+    writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
+
+    let append_session = |id: &str| -> anyhow::Result<()> {
+        writer.execute_compat(
+            "INSERT INTO session VALUES (?1, 'project', 'slug', '/work', 'history', 'v1', 1234, 1234)",
+            params![id],
+        )?;
+        writer.execute_compat(
+            "INSERT INTO message VALUES (?1, ?1, 1234, 1234, '{\"role\":\"user\"}')",
+            params![id],
+        )?;
+        let text = serde_json::json!({"type": "text", "text": id}).to_string();
+        writer.execute_compat(
+            "INSERT INTO part VALUES (?1, ?1, ?1, 1234, 1234, ?2)",
+            params![id, text],
+        )?;
+        Ok(())
+    };
+    let command = || {
+        let mut cmd = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear()
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("PATH", "")
+            .env("APPDATA", home.path().join("AppData/Roaming"))
+            .env("LOCALAPPDATA", home.path().join("AppData/Local"))
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("XDG_DATA_HOME", home.path().join(".local/share"))
+            .env("CASS_DATA_DIR", home.path().join("cass-data"))
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .env("RAYON_NUM_THREADS", "2")
+            .current_dir(home.path())
+            .timeout(Duration::from_secs(120));
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            cmd.env("SystemRoot", root);
+        }
+        cmd
+    };
+    let hits = |needle: &str| -> anyhow::Result<Vec<serde_json::Value>> {
+        let out = command()
+            .args(["search", needle, "--mode", "lexical", "--json", "--no-maintenance"])
+            .output()?;
+        anyhow::ensure!(out.status.success(), "search failed: {out:?}");
+        let body: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+        Ok(body["hits"].as_array().expect("search hit array").clone())
+    };
+
+    append_session("firstopencodewalneedle")?;
+    command().args(["index", "--full", "--json"]).assert().success();
+    assert_eq!(hits("firstopencodewalneedle")?.len(), 1);
+
+    let main_before = (fs::read(&database)?, fs::metadata(&database)?.modified()?);
+    let wal = store.join("opencode.db-wal");
+    append_session("secondopencodewalneedle")?;
+    assert!(fs::metadata(&wal)?.len() > 32);
+    assert_eq!((fs::read(&database)?, fs::metadata(&database)?.modified()?), main_before);
+    assert!(hits("secondopencodewalneedle")?.is_empty());
+    command()
+        .args(["index", "--watch-once"])
+        .arg(&wal)
+        .args(["--json", "--no-progress-events"])
+        .assert()
+        .success();
+    let found = hits("secondopencodewalneedle")?;
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0]["agent"], "opencode");
+    assert_eq!(found[0]["content"], "secondopencodewalneedle");
+    assert_eq!(hits("firstopencodewalneedle")?.len(), 1);
     Ok(())
 }
 

@@ -12098,7 +12098,7 @@ fn can_skip_absent_explicit_watch_once_index_run(opts: &IndexOptions) -> bool {
     );
     // A provider can checkpoint and remove a selected WAL before this run.
     // Ordinary missing transcript hooks stay cheap, but a surviving native
-    // OpenClaw or ZCode database must be reconciled when an enabled root owns it.
+    // database must be reconciled when an enabled root owns it.
     let claimed_database = db_schema_current
         && opts.watch_once_paths.as_ref().is_some_and(|paths| {
             if !paths.iter().any(|path| {
@@ -12118,7 +12118,10 @@ fn can_skip_absent_explicit_watch_once_index_run(opts: &IndexOptions) -> bool {
             classify_paths(paths.clone(), &roots, true)
                 .iter()
                 .any(|(kind, _, _, _)| {
-                    matches!(kind, ConnectorKind::OpenClaw | ConnectorKind::ZCode)
+                    matches!(
+                        kind,
+                        ConnectorKind::OpenClaw | ConnectorKind::OpenCode | ConnectorKind::ZCode
+                    )
                 })
         });
     let _ = storage.close();
@@ -35224,6 +35227,30 @@ fn openclaw_database_for_sidecar(path: &Path) -> Option<PathBuf> {
         .then(|| dunce::canonicalize(&database).unwrap_or(database))
 }
 
+// SQLite may checkpoint and unlink a WAL before a --watch-once hook runs.
+// An OpenCode request can still read the surviving DB. Restrict this path to
+// a configured database or the opencode.db immediately inside its store.
+fn explicit_opencode_sidecar_owner(path: &Path) -> Option<PathBuf> {
+    if !matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("opencode.db-wal" | "opencode.db-shm" | "opencode.db-journal")
+    ) {
+        return None;
+    }
+    let database = path.with_file_name("opencode.db");
+    database
+        .is_file()
+        .then(|| dunce::canonicalize(&database).unwrap_or(database))
+}
+
+fn opencode_database_in_watch_root(root: &ScanRoot) -> PathBuf {
+    if root.path.extension().is_some_and(|extension| extension == "db") && root.path.is_file() {
+        root.path.clone()
+    } else {
+        root.path.join("opencode.db")
+    }
+}
+
 /// Database readers take an explicit file root as their database and fail the
 /// whole scan on anything else. So `--watch-once <file>` under a directory root
 /// hands them the file only when it is a SQLite database. An unhinted Codex
@@ -40427,6 +40454,9 @@ fn classify_paths(
                 .then(|| explicit_watch_once_connector_hint(p))
                 .flatten()
         });
+        let opencode_database = prefer_explicit_paths
+            .then(|| explicit_opencode_sidecar_owner(p))
+            .flatten();
         let openclaw_database = openclaw_database_for_sidecar(p);
         let zcode_database = zcode_database_for_watch_path(p, &zcode_databases);
         let surviving_database = openclaw_database
@@ -40436,6 +40466,11 @@ fn classify_paths(
                 zcode_database
                     .as_ref()
                     .map(|database| (ConnectorKind::ZCode, database))
+            })
+            .or_else(|| {
+                opencode_database
+                    .as_ref()
+                    .map(|database| (ConnectorKind::OpenCode, database))
             });
         let mut metadata_from_database = false;
         let metadata = std::fs::metadata(p).or_else(|error| {
@@ -40481,6 +40516,20 @@ fn classify_paths(
                 }
                 let source_path = match kind {
                     ConnectorKind::OpenClaw => openclaw_database.as_ref().unwrap_or(p),
+                    ConnectorKind::OpenCode
+                        if prefer_explicit_paths && is_database_watch_sidecar(p) =>
+                    {
+                        let Some(owner) = &opencode_database else {
+                            continue;
+                        };
+                        let configured = opencode_database_in_watch_root(root);
+                        if configured != *owner
+                            && !dunce::canonicalize(&configured).is_ok_and(|path| path == *owner)
+                        {
+                            continue;
+                        }
+                        owner
+                    }
                     ConnectorKind::ZCode => {
                         let Some(database) = zcode_database.as_ref() else {
                             continue;
@@ -40527,7 +40576,9 @@ fn classify_paths(
             }
             let matched_root = !matching_roots.is_empty();
             for (kind, root, match_root_path, _) in matching_roots {
-                let scan_path = if kind == ConnectorKind::ZCode
+                let scan_path = if kind == ConnectorKind::OpenCode && opencode_database.is_some() {
+                    opencode_database_in_watch_root(root)
+                } else if kind == ConnectorKind::ZCode
                     && let Some(database) = &zcode_database
                 {
                     // A shared root can contain multiple stores. A database
@@ -75291,6 +75342,42 @@ c.close()
                     "unrelated neighbor must not trigger Devin: {name}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn explicit_opencode_sidecar_reconciles_only_its_own_database() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("selected");
+        fs::create_dir(&store).unwrap();
+        let database = store.join("opencode.db");
+        fs::write(&database, b"SQLite format 3\0").unwrap();
+
+        for selected in [&store, &database] {
+            let root = ScanRoot::remote(
+                selected.to_path_buf(),
+                Origin::remote_with_host("selected", "selected-host"),
+                Some(Platform::Linux),
+            );
+            let roots = vec![(ConnectorKind::OpenCode, root.clone())];
+            for sidecar in database_watch_sidecar_paths(&database) {
+                fs::write(&sidecar, b"provider event").unwrap();
+                let present = classify_paths(vec![sidecar.clone()], &roots, true);
+                fs::remove_file(&sidecar).unwrap();
+                let checkpointed = classify_paths(vec![sidecar], &roots, true);
+                for classified in [present, checkpointed] {
+                    assert_eq!(classified.len(), 1);
+                    assert_eq!(classified[0].0, ConnectorKind::OpenCode);
+                    assert_eq!(classified[0].1.path, database);
+                    assert_eq!(classified[0].1.origin, root.origin);
+                    assert_eq!(classified[0].1.platform, root.platform);
+                }
+            }
+            let other = store.join("unrelated.db");
+            fs::write(&other, b"SQLite format 3\0").unwrap();
+            let [wal, _] = database_sidecar_paths(&other);
+            fs::write(&wal, b"other event").unwrap();
+            assert!(classify_paths(vec![wal], &roots, true).is_empty());
         }
     }
 
