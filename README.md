@@ -1253,13 +1253,21 @@ and use `doctor` only for diagnostics or safe repair workflows. Use
 token-budgeted evidence bundles, not full exports and not external
 summarization.
 
-When the top hit is a decision question, `pack` checks the retrieved messages
-for an explicit, on-topic decision immediately following that question. It also
-checks sessions containing the identical question. The question's own answer
-takes precedence. When other sessions give conflicting answers, their replies
-do not displace the question. A qualifying reply keeps its original citation.
-This works with `--max-evidence 1`. The preference recognizes English decision
-language and uses only eligible messages already in the search results.
+When the top hit is a decision question, `pack` checks for an explicit, on-topic
+decision immediately following that question. It also checks sessions containing
+the identical question. The question's own answer takes precedence. When other
+sessions give conflicting answers, their replies do not displace the question.
+A qualifying reply keeps its original citation. This works with
+`--max-evidence 1` and recognizes English decision language.
+
+For up to 32 retrieved messages, `pack` can read the immediately following
+canonical message even when a quoted query matched only the question. It verifies
+the original message and conversation, keeps every search filter, and excludes
+context bodies larger than 128 KiB. These additional candidates do not displace
+the original retrieval slots or compete as ordinary search hits: only a qualifying
+decision reply can be selected, with citation `match_type: "answer_context"`.
+If this optional archive read fails, the pack keeps its ranked search evidence and
+reports `answer_context_unavailable`; privacy refusals still stop output.
 
 Pack robot output includes `health`, `freshness`, `privacy`, and `warnings`.
 Warnings such as `privacy_redactions_applied`, `semantic_fallback_lexical`,
