@@ -1047,6 +1047,151 @@ fn watch_once_publishes_settled_source_proof_and_respects_audit_budget() {
     }
 }
 
+/// GH #578: while watch replay debt is pending, status and triage must name a
+/// command that can clear it. A plain `cass index` succeeds and leaves the
+/// debt in place; the next `--watch-once` of a path in that source replays it.
+/// The debt row is the exact record an interrupted watch of this Claude root
+/// leaves behind, written while no cass process runs.
+#[test]
+fn pending_watch_replay_hint_names_a_command_that_clears_it() {
+    use serde_json::Value;
+
+    let tmp = tempfile::Builder::new()
+        .prefix("cass-gh578-replay-hint-")
+        .tempdir()
+        .unwrap();
+    let home = tmp.path();
+    // Do not let dotenv search ancestors of the private HOME.
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(home.join(".env"))
+        .unwrap();
+    let data = home.join("data");
+    let source = home.join(".claude/projects/health/session.jsonl");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(
+        &source,
+        include_str!("fixtures/claude_code_real/projects/-test-project/agent-test123.jsonl"),
+    )
+    .unwrap();
+    let cass = || {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            // The fixture is seconds old. Inside the active-session window
+            // watch-once treats it as still being written and keeps the debt.
+            .env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_SEMANTIC_DOWNLOAD_POLICY", "opt_in")
+            .env("FRANKENSEARCH_MODEL_DIR", "")
+            .env("RUST_MIN_STACK", "134217728")
+            .timeout(Duration::from_secs(30));
+        cmd
+    };
+    let index = |watch_once: Option<&Path>, full: bool| {
+        let mut cmd = cass();
+        cmd.args(["index", "--json", "--no-progress-events"]);
+        if full {
+            cmd.arg("--full");
+        }
+        if let Some(path) = watch_once {
+            cmd.arg("--watch-once").arg(path);
+        }
+        cmd.output().unwrap()
+    };
+    let payload = |command: &str| -> Value {
+        let output = cass().args([command, "--json"]).output().unwrap();
+        serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{command}: {error}: {output:?}"))
+    };
+    let assert_replay_hint = |phase: &str| {
+        let status = payload("status");
+        assert_eq!(
+            status["pending"]["lexical_replay"], true,
+            "{phase}: watch replay debt must still be pending: {status}"
+        );
+        for (command, state) in [("status", status), ("triage", payload("triage"))] {
+            let action = state["recommended_action"].as_str().unwrap_or_default();
+            assert!(
+                action.contains("cass index --full")
+                    && action.contains("cass index --watch-once")
+                    && !action.contains("to refresh the index"),
+                "{phase}: {command} must name a command that clears watch replay debt: {state}"
+            );
+        }
+    };
+
+    let full = index(None, true);
+    assert!(full.status.success(), "full: {full:?}");
+    {
+        use coding_agent_search::franken_sync::compat::ConnectionExt;
+        use coding_agent_search::storage::sqlite::FrankenStorage;
+        let root = fs::canonicalize(home.join(".claude/projects")).unwrap();
+        // WatchLexicalReplayDebt serializes its fields in declaration order,
+        // and its key is the BLAKE3 hash of exactly that value.
+        let value = format!(
+            r#"{{"connector":"cd","source_id":"local","path":{}}}"#,
+            serde_json::to_string(&root).unwrap()
+        );
+        let key = format!(
+            "watch_lexical_replay_v1:{}",
+            blake3::hash(value.as_bytes()).to_hex()
+        );
+        let storage = FrankenStorage::open(&data.join("agent_search.db")).unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT INTO meta(key, value) VALUES (?1, ?2)",
+                coding_agent_search::franken_sync::params![key.as_str(), value.as_str()],
+            )
+            .unwrap();
+        storage.close().unwrap();
+    }
+    assert_replay_hint("interrupted watch debt");
+
+    let plain = index(None, false);
+    assert!(plain.status.success(), "plain: {plain:?}");
+    assert_replay_hint("after a plain cass index");
+
+    // The debt names the whole source root. A watch-once narrowed to one
+    // session file cannot discharge it, which is why the hint asks for the
+    // root directory.
+    let single_file = index(Some(&source), false);
+    assert!(
+        single_file.status.success(),
+        "file watch-once: {single_file:?}"
+    );
+    assert_replay_hint("after a watch-once of one session file");
+
+    let replayed = index(Some(&home.join(".claude/projects")), false);
+    assert!(replayed.status.success(), "root watch-once: {replayed:?}");
+    let status = payload("status");
+    assert_eq!(status["pending"]["lexical_replay"], false, "{status}");
+    assert!(
+        !status["recommended_action"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cass index --watch-once"),
+        "{status}"
+    );
+}
+
 #[test]
 fn status_and_health_json_surface_ingest_quarantine_as_nonfatal_degraded() {
     let test_home = tempfile::tempdir().expect("tempdir");

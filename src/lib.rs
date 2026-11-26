@@ -25891,6 +25891,29 @@ fn readiness_command_recommendation(
 
 const SOURCE_SCAN_OVERDUE_RECOMMENDED_ACTION: &str =
     "Run 'cass index' to scan sources for new or changed sessions";
+/// GH #578: a plain `cass index` never clears watch replay debt. A full
+/// source scan clears it for an OpenCode database. For other connectors the
+/// debt names the source root, and only a watch run that covers that whole
+/// root, with no source in it still being written, clears it: a watch-once of
+/// one session file or subdirectory leaves it pending.
+const WATCH_REPLAY_PENDING_RECOMMENDED_ACTION: &str = "Run 'cass index --full' to finish the pending watch replay of an OpenCode database. For any other source, run 'cass index --watch-once <dir>' on that source's root directory (for Claude Code, ~/.claude/projects) while no agent is writing to it; a single session file does not clear it. A plain 'cass index' leaves the replay pending.";
+
+/// Advice for a stale index or pending sessions. Pending watch replay needs
+/// its own command, because the generic refresh cannot clear it.
+fn stale_index_recommended_action(state: &serde_json::Value, pending_sessions: u64) -> String {
+    if state
+        .pointer("/pending/lexical_replay")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return WATCH_REPLAY_PENDING_RECOMMENDED_ACTION.to_string();
+    }
+    if pending_sessions > 0 {
+        format!("Run 'cass index' to refresh the index ({pending_sessions} sessions pending)")
+    } else {
+        "Run 'cass index' to refresh the index".to_string()
+    }
+}
 const CANONICAL_ARCHIVE_CORRUPT_RECOMMENDED_ACTION: &str = "The canonical archive is malformed; do NOT run 'cass index'. Run 'cass doctor check --json', then recover the database (sqlite3 agent_search.db '.recover') before reindexing";
 
 fn readiness_recommended_commands(
@@ -90910,14 +90933,7 @@ fn run_status(
     } else if index_empty_with_messages {
         Some("Run 'cass index --full' to populate the empty search index".to_string())
     } else if is_stale || pending_sessions > 0 {
-        let pending_msg = if pending_sessions > 0 {
-            format!(" ({pending_sessions} sessions pending)")
-        } else {
-            String::new()
-        };
-        Some(format!(
-            "Run 'cass index' to refresh the index{pending_msg}"
-        ))
+        Some(stale_index_recommended_action(&state, pending_sessions))
     } else if quarantined_conversations > 0 || deferred_conversations > 0 {
         ingest_quarantine_recommended_action
     } else if healthy && source_scan_overdue {
@@ -91783,14 +91799,7 @@ fn run_triage(
     } else if index_empty_with_messages {
         Some("Run 'cass index --full' to populate the empty search index".to_string())
     } else if is_stale || pending_sessions > 0 {
-        let pending_msg = if pending_sessions > 0 {
-            format!(" ({pending_sessions} sessions pending)")
-        } else {
-            String::new()
-        };
-        Some(format!(
-            "Run 'cass index' to refresh the index{pending_msg}"
-        ))
+        Some(stale_index_recommended_action(&state, pending_sessions))
     } else {
         semantic_recommended_action(&state, not_initialized)
     };
