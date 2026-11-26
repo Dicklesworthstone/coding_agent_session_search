@@ -49,7 +49,12 @@ fn sources_setup_resume_retains_pending_sync_after_real_transport_failure() {
     let config = root.path().join("config");
     let cache = root.path().join("cache");
     let home = root.path().join("home");
+    let default_data = root.path().join("cass-data");
+    let selected_data = root.path().join("selected-mirrors");
+    let selected_db = root.path().join("selected-archive/custom.db");
     fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&default_data).unwrap();
+    fs::write(default_data.join("sentinel"), b"default archive untouched").unwrap();
     fs::create_dir_all(cache.join("cass")).unwrap();
     create_sources_config(
         &config,
@@ -88,7 +93,7 @@ fn sources_setup_resume_retains_pending_sync_after_real_transport_failure() {
         .with_var("XDG_CONFIG_HOME", &config)
         .with_var("XDG_CACHE_HOME", &cache)
         .with_var("XDG_DATA_HOME", root.path().join("data"))
-        .with_var("CASS_DATA_DIR", root.path().join("cass-data"))
+        .with_var("CASS_DATA_DIR", &default_data)
         .with_var("CASS_SSH_CONFIG", &ssh_config);
     let args = [
         "sources",
@@ -100,7 +105,11 @@ fn sources_setup_resume_retains_pending_sync_after_real_transport_failure() {
     ];
     let failed = env
         .cass_assert_command()
+        .arg("--db")
+        .arg(&selected_db)
         .args(args)
+        .arg("--data-dir")
+        .arg(&selected_data)
         .timeout(std::time::Duration::from_secs(30))
         .output()
         .unwrap();
@@ -116,10 +125,21 @@ fn sources_setup_resume_retains_pending_sync_after_real_transport_failure() {
         String::from_utf8_lossy(&failed.stdout),
         String::from_utf8_lossy(&failed.stderr)
     );
+    assert!(selected_data.join("sync_index_pending.json").is_file());
+    assert!(!default_data.join("sync_index_pending.json").exists());
+    assert!(!default_data.join("sync-index.lock").exists());
+    assert_eq!(
+        fs::read(default_data.join("sentinel")).unwrap(),
+        b"default archive untouched"
+    );
     for _ in 0..2 {
         let resumed = env
             .cass_assert_command()
+            .arg("--db")
+            .arg(&selected_db)
             .args(args)
+            .arg("--data-dir")
+            .arg(&selected_data)
             .arg("--json")
             .timeout(std::time::Duration::from_secs(30))
             .output()
@@ -131,6 +151,11 @@ fn sources_setup_resume_retains_pending_sync_after_real_transport_failure() {
         );
         let result: Value = serde_json::from_slice(&resumed.stdout).unwrap();
         assert_eq!(result["sync"]["status"], "pending");
+        let continuation = result["sync"]["command"].as_str().unwrap();
+        assert!(continuation.contains(&selected_db.display().to_string()));
+        assert!(continuation.contains(&selected_data.display().to_string()));
+        assert!(continuation.contains("--db"));
+        assert!(continuation.contains("--data-dir"));
         let retained: SetupState = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
         assert_eq!(retained.selected_host_names, ["retry-peer"]);
         assert!(retained.configuration_complete);
@@ -499,6 +524,293 @@ sync_schedule = "manual"
     let hits = searched["hits"].as_array().unwrap();
     assert_eq!(hits.len(), 1, "{searched}");
     assert_eq!(hits[0]["source_id"], "workstation");
+    tracker.complete();
+}
+
+#[test]
+fn sources_reingest_honors_selected_db_and_data_dir() {
+    assert_sources_selected_archive(false, false);
+}
+
+#[test]
+fn sources_reingest_honors_cass_db_path() {
+    assert_sources_selected_archive(true, false);
+}
+
+#[test]
+fn sources_reingest_honors_explicit_split_data_dir() {
+    assert_sources_selected_archive(false, true);
+}
+
+/// Exercise the real CLI and archive, with the live default represented by a
+/// separate sentinel. Search cannot repair a missed or misdirected ingest.
+fn assert_sources_selected_archive(db_from_env: bool, split_data_dir: bool) {
+    use coding_agent_search::sources::sync::path_to_safe_dirname;
+    use fs2::FileExt;
+
+    let case = if split_data_dir {
+        "sources_reingest_honors_explicit_split_data_dir"
+    } else if db_from_env {
+        "sources_reingest_honors_cass_db_path"
+    } else {
+        "sources_reingest_honors_selected_db_and_data_dir"
+    };
+    let tracker = tracker_for(case);
+    let root = tempfile::tempdir().unwrap().keep();
+    let home = root.join("home");
+    let config = root.join("config");
+    let default_data = root.join("default-data");
+    let archive_dir = root.join("selected-archive");
+    let data_dir = if split_data_dir {
+        root.join("selected-assets")
+    } else {
+        archive_dir.clone()
+    };
+    let db_path = archive_dir.join("custom.db");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&default_data).unwrap();
+    fs::create_dir_all(&archive_dir).unwrap();
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::write(home.join(".env"), "").unwrap();
+    create_sources_config(
+        &config,
+        r#"
+[[sources]]
+name = "workstation"
+type = "ssh"
+host = "operator@workstation.invalid"
+paths = ["/synthetic/.codex/sessions"]
+sync_schedule = "manual"
+"#,
+    );
+
+    let mirror_path = |data: &Path| {
+        data.join("remotes/workstation/mirror")
+            .join(path_to_safe_dirname("/synthetic/.codex/sessions"))
+            .join("rollout-selected.jsonl")
+    };
+    let seed_mirror = |path: &Path, marker: &str| {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let meta = serde_json::json!({
+            "timestamp": "2026-09-01T00:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": marker,
+                "cwd": "/synthetic/project",
+                "cli_version": "0.42.0"
+            }
+        });
+        let message = serde_json::json!({
+            "timestamp": "2026-09-01T00:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": marker}]
+            }
+        });
+        fs::write(path, format!("{meta}\n{message}\n")).unwrap();
+    };
+    let default_db = default_data.join("agent_search.db");
+    seed_archive_conversation(&default_db, "codex", "defaultarchivesentinel");
+    let default_rows = agent_exclusion_archive_rows_at(&default_db);
+    let default_mirror = mirror_path(&default_data);
+    seed_mirror(&default_mirror, "defaultmirroruntouched");
+    seed_mirror(&mirror_path(&data_dir), "selectedarchivemirrorproof");
+    let default_db_before = fs::read(&default_db).unwrap();
+    let default_mirror_before = fs::read(&default_mirror).unwrap();
+    let default_members_before = directory_membership(&default_data).unwrap();
+
+    let command = |args: &[&str]| {
+        let mut command =
+            isolated_agent_exclusion_std_command(&tracker, &home, &config, &default_data);
+        command.env("CODEX_HOME", home.join(".codex"));
+        if db_from_env {
+            command.env("CASS_DB_PATH", &db_path);
+        } else {
+            command.arg("--db").arg(&db_path);
+        }
+        command.args(args);
+        if split_data_dir {
+            command.arg("--data-dir").arg(&data_dir);
+        }
+        command
+    };
+    let run = |args: &[&str], expected_code: i32| {
+        let output = util::timeout::spawn_with_timeout_or_diag(
+            command(args),
+            case,
+            Some(&data_dir),
+            std::time::Duration::from_secs(90),
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(expected_code),
+            "{args:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    // Admission must use the selected assets before any SSH attempt. PATH is
+    // empty in this isolated command environment; no fake transport is used.
+    let sync_lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data_dir.join("sync-index.lock"))
+        .unwrap();
+    sync_lock.lock_exclusive().unwrap();
+    let refused_sync = run(
+        &["sources", "sync", "--source", "workstation", "--json"],
+        7,
+    );
+    assert!(
+        String::from_utf8_lossy(&refused_sync.stderr)
+            .contains("Cannot acquire or persist source sync indexing state"),
+        "{}",
+        String::from_utf8_lossy(&refused_sync.stderr)
+    );
+    assert!(!default_data.join("sync-index.lock").exists());
+    FileExt::unlock(&sync_lock).unwrap();
+
+    // The nested index must refuse the selected data directory's real lease,
+    // including a split layout, before creating either possible database.
+    let index_lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data_dir.join("index-run.lock"))
+        .unwrap();
+    index_lock.lock_exclusive().unwrap();
+    let refused = run(
+        &["sources", "reingest", "--from-mirror", "--json"],
+        7,
+    );
+    let refused: Value =
+        serde_json::from_slice(&refused.stdout).expect("one JSON document on selected index refusal");
+    assert_eq!(refused["status"], "index_failed", "{refused}");
+    assert_eq!(refused["indexing"]["code"], 7, "{refused}");
+    assert_eq!(refused["data_dir"], data_dir.display().to_string());
+    assert!(!db_path.exists());
+    assert!(!data_dir.join("agent_search.db").exists());
+    FileExt::unlock(&index_lock).unwrap();
+
+    let ingested = run(
+        &["sources", "reingest", "--from-mirror", "--json"],
+        0,
+    );
+    let ingested: Value =
+        serde_json::from_slice(&ingested.stdout).expect("one JSON document after selected ingestion");
+    assert_eq!(ingested["status"], "complete", "{ingested}");
+    assert_eq!(ingested["indexing"]["success"], true, "{ingested}");
+    assert_eq!(ingested["indexing"]["messages"], 1, "{ingested}");
+    assert_eq!(ingested["data_dir"], data_dir.display().to_string());
+    assert_eq!(
+        ingested["mirror_roots"],
+        serde_json::json!([mirror_path(&data_dir).parent().unwrap().display().to_string()])
+    );
+    assert!(db_path.is_file(), "the exact selected database was not created");
+    assert!(
+        !data_dir.join("agent_search.db").exists(),
+        "nested indexing silently discarded the nonstandard selected DB name"
+    );
+
+    let found = run(
+        &[
+            "search",
+            "selectedarchivemirrorproof",
+            "--robot",
+            "--mode",
+            "lexical",
+            "--source",
+            "workstation",
+            "--no-maintenance",
+            "--no-daemon",
+        ],
+        0,
+    );
+    let found: Value = serde_json::from_slice(&found.stdout).unwrap();
+    let hits = found["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{found}");
+    assert_eq!(hits[0]["source_id"], "workstation", "{found}");
+
+    if !db_from_env && !split_data_dir {
+        // Read-only status and doctor must inspect the same mirror and exact
+        // custom DB, not a sibling named agent_search.db or the default archive.
+        fs::write(
+            data_dir.join("sync_status.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "sources": {
+                    "workstation": {
+                        "last_sync": i64::MAX,
+                        "last_result": "success",
+                        "files_synced": 1,
+                        "bytes_transferred": 1,
+                        "duration_ms": 1
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let listed = run(&["sources", "list", "--json"], 0);
+        let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+        assert!(
+            listed["sources"][0]["sync_health"]["staleness_ms"].is_number(),
+            "{listed}"
+        );
+        let probe_path = root.join("source-doctor-probe.json");
+        fs::write(
+            &probe_path,
+            serde_json::to_vec(&serde_json::json!({
+                "host": "operator@workstation.invalid",
+                "os": "Linux",
+                "cass_version": env!("CARGO_PKG_VERSION"),
+                "remote_path": "nonempty"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut doctor = command(&["sources", "doctor", "--json"]);
+        doctor.env("CASS_TEST_SOURCES_DOCTOR_PROBE", &probe_path);
+        let diagnosed = util::timeout::spawn_with_timeout_or_diag(
+            doctor,
+            case,
+            Some(&data_dir),
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(
+            diagnosed.status.code(),
+            Some(1),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&diagnosed.stdout),
+            String::from_utf8_lossy(&diagnosed.stderr)
+        );
+        let diagnosed: Value = serde_json::from_slice(&diagnosed.stdout).unwrap();
+        assert_eq!(diagnosed["sources"][0]["state"], "stale_index", "{diagnosed}");
+
+        run(
+            &["sources", "remove", "workstation", "--purge", "--yes"],
+            0,
+        );
+        assert!(!data_dir.join("remotes/workstation").exists());
+    }
+    assert_eq!(fs::read(&default_db).unwrap(), default_db_before);
+    assert_eq!(fs::read(&default_mirror).unwrap(), default_mirror_before);
+    assert_eq!(
+        directory_membership(&default_data).unwrap(),
+        default_members_before,
+        "selected source operations wrote into the default data directory"
+    );
+    assert_eq!(agent_exclusion_archive_rows_at(&default_db), default_rows);
+    if split_data_dir {
+        assert!(!archive_dir.join("sync-index.lock").exists());
+        assert!(!archive_dir.join("remotes").exists());
+    }
     tracker.complete();
 }
 
