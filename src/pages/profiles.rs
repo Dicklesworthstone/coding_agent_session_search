@@ -48,6 +48,11 @@ impl ShareProfile {
         if encrypted { Self::Team } else { Self::Public }
     }
 
+    /// Public and team shares omit injected skill and hook content.
+    pub(crate) fn omits_injections(self) -> bool {
+        matches!(self, Self::Public | Self::Team)
+    }
+
     /// Human-readable name of the profile.
     pub fn name(self) -> &'static str {
         match self {

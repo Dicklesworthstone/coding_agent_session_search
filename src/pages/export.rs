@@ -3,6 +3,7 @@ use super::sqlite_artifact_paths;
 use super::{
     sqlite_content_artifact_paths, sqlite_fixed_artifact_paths, sqlite_runtime_artifact_paths,
 };
+use crate::export::is_skill_injection;
 use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt};
 use crate::franken_sync::{Connection, Row as FrankenRow, params};
 use crate::pages::profiles::ShareProfile;
@@ -99,6 +100,12 @@ impl ExportEngine {
         self
     }
 
+    fn omits_injections(&self) -> bool {
+        self.share
+            .as_ref()
+            .is_some_and(|share| share.profile.omits_injections())
+    }
+
     fn share_redact<'a>(
         &self,
         value: &'a str,
@@ -108,6 +115,10 @@ impl ExportEngine {
         let Some(share) = &self.share else {
             return std::borrow::Cow::Borrowed(value);
         };
+        if share.profile.omits_injections() && is_skill_injection(value) {
+            *counts.entry("injected_text").or_default() += 1;
+            return std::borrow::Cow::Owned("[Injected content omitted]".to_string());
+        }
         let redacted = if workspace {
             share.engine.redact_workspace(value)
         } else {
@@ -172,6 +183,13 @@ impl ExportEngine {
                 if crate::indexer::redact_secrets::json_has_duplicate_keys(value)? {
                     bail!("ambiguous JSON with duplicate keys in Pages share metadata");
                 }
+                // A private value can be a sibling of a structured hook marker.
+                if self.omits_injections()
+                    && (is_skill_injection(value) || super::is_injected_json(&document))
+                {
+                    *counts.entry("injected_metadata").or_default() += 1;
+                    return Ok("null".to_string());
+                }
                 let before: u64 = counts.values().sum();
                 walk(self, &mut document, counts);
                 if counts.values().sum::<u64>() == before {
@@ -179,6 +197,10 @@ impl ExportEngine {
                 } else {
                     Ok(document.to_string())
                 }
+            }
+            Err(_) if self.omits_injections() && is_skill_injection(value) => {
+                *counts.entry("injected_metadata").or_default() += 1;
+                Ok("null".to_string())
             }
             Err(_) => Ok(self.share_redact(value, false, counts).into_owned()),
         }
@@ -465,7 +487,6 @@ impl ExportEngine {
                     &format!(
                         "SELECT c.id, COALESCE(a.slug, 'unknown'), w.path, c.title, c.source_path,
                                 c.started_at, c.ended_at,
-                                (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id),
                                 {conversation_metadata} {from_where}"
                     ),
                     &[("c.id", 0)],
@@ -494,9 +515,8 @@ impl ExportEngine {
                     let source_path = row.get_typed::<String>(4)?;
                     let started_at = row.get_typed::<Option<i64>>(5)?;
                     let ended_at = row.get_typed::<Option<i64>>(6)?;
-                    let message_count = row.get_typed::<i64>(7)?;
-                    let metadata_json = row.get_typed::<Option<String>>(8)?;
-                    let metadata_bin = row.get_typed::<Option<Vec<u8>>>(9)?;
+                    let metadata_json = row.get_typed::<Option<String>>(7)?;
+                    let metadata_bin = row.get_typed::<Option<Vec<u8>>>(8)?;
 
                     // Transform Path
                     let transformed_path = self.transform_path(&source_path, &workspace);
@@ -513,38 +533,23 @@ impl ExportEngine {
                     let shared_path = self
                         .share_redact(&transformed_path, false, &mut redactions)
                         .into_owned();
-                    let shared_title = title.as_deref().map(|value| {
-                        self.share_redact(value, false, &mut redactions)
-                            .into_owned()
-                    });
-                    let canonical_metadata = super::decode_metadata_blob(
-                        metadata_bin.as_deref(),
-                        "conversations.metadata_bin",
-                        id,
-                    )?
-                    .map(|value| serde_json::to_string(&value))
-                    .transpose()?;
-                    let shared_metadata = canonical_metadata
-                        .as_deref()
-                        .or(metadata_json.as_deref())
-                        .map(|value| self.share_redact_json(value, &mut redactions))
-                        .transpose()?;
-
+                    // Defer title and metadata until all messages have been inspected.
+                    // Even a later UPDATE can leave old text in SQLite free space.
                     tx.execute_compat(
-                    "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, ended_at, message_count, metadata_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![
-                        id,
-                        self.share_redact(&agent, false, &mut redactions).as_ref(),
-                        shared_workspace.as_deref(),
-                        shared_title.as_deref(),
-                        shared_path.as_str(),
-                        started_at,
-                        ended_at,
-                        message_count,
-                        shared_metadata.as_deref()
-                    ],
-                )?;
+                        "INSERT INTO conversations (id, agent, workspace, source_path, started_at, ended_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            id,
+                            self.share_redact(&agent, false, &mut redactions).as_ref(),
+                            shared_workspace.as_deref(),
+                            shared_path.as_str(),
+                            started_at,
+                            ended_at
+                        ],
+                    )?;
+                    let omit_injections = self.omits_injections();
+                    let mut omitted_records = false;
+                    let mut message_count = 0_i64;
 
                     msg_query.visit(&src_tx, params![id], running, |row| {
                         let source_message_id = row.get_typed::<i64>(0)?;
@@ -563,6 +568,17 @@ impl ExportEngine {
                             source_message_id,
                         )?
                         .or_else(|| serde_json::from_str(extra_json.as_deref()?).ok());
+                        // Normalized rows can carry a marker only in their provider
+                        // envelope. Exclude the row before deriving any projections.
+                        if omit_injections
+                            && (is_skill_injection(&content)
+                                || extra_json.as_deref().is_some_and(is_skill_injection)
+                                || extra.as_ref().is_some_and(super::is_injected_json))
+                        {
+                            omitted_records = true;
+                            *redactions.entry("injected_message").or_default() += 1;
+                            return Ok(());
+                        }
                         let resolved_model = normalize_optional_text(model)
                             .or_else(|| derive_message_model(extra.as_ref()?))
                             .map(|value| {
@@ -632,10 +648,34 @@ impl ExportEngine {
                             })?;
                         }
 
+                        message_count += 1;
                         msg_processed += 1;
                         Ok(())
                     })?;
 
+                    // Provider titles and summaries can quote an omitted message
+                    // without its identifying marker. Never stage those bytes.
+                    let canonical = super::decode_metadata_blob(
+                        metadata_bin.as_deref(),
+                        "conversations.metadata_bin",
+                        id,
+                    )?;
+                    let (shared_title, shared_metadata) = if omitted_records {
+                        (None, None)
+                    } else {
+                        let shared_title = title.as_deref().map(|value| {
+                            self.share_redact(value, false, &mut redactions).into_owned()
+                        });
+                        let canonical = canonical.map(|value| value.to_string());
+                        let shared_metadata = canonical.as_deref().or(metadata_json.as_deref())
+                            .map(|value| self.share_redact_json(value, &mut redactions))
+                            .transpose()?;
+                        (shared_title, shared_metadata)
+                    };
+                    tx.execute_compat(
+                        "UPDATE conversations SET title = ?1, metadata_json = ?2, message_count = ?3 WHERE id = ?4",
+                        params![shared_title.as_deref(), shared_metadata.as_deref(), message_count, id],
+                    )?;
                     processed += 1;
                     progress(processed, total_convs);
                     Ok(())

@@ -1684,7 +1684,7 @@ fn check_share_profile(
         let sql = format!("SELECT \"{column}\" FROM \"{table}\" WHERE \"{column}\" IS NOT NULL");
         let mut residual = 0_u64;
         let scanned = conn.query_with_params_for_each(&sql, &[], |row| {
-            residual += residual_values(&engine, &row.get_typed::<String>(0)?, json);
+            residual += residual_values(&engine, profile, &row.get_typed::<String>(0)?, json);
             Ok(())
         });
         if let Err(error) = scanned {
@@ -1720,7 +1720,10 @@ fn check_share_profile(
 /// How many values in `text` the engine would still rewrite. JSON is rescanned
 /// by key and string value, as the export redacted it; text that does not parse is
 /// rescanned whole.
-fn residual_values(engine: &RedactionEngine, text: &str, json: bool) -> u64 {
+fn residual_values(engine: &RedactionEngine, profile: ShareProfile, text: &str, json: bool) -> u64 {
+    if profile.omits_injections() && crate::export::is_skill_injection(text) {
+        return 1;
+    }
     fn walk(engine: &RedactionEngine, node: &Value) -> u64 {
         match node {
             Value::String(text) => u64::from(!engine.redact_text(text).changes.is_empty()),
@@ -1741,6 +1744,9 @@ fn residual_values(engine: &RedactionEngine, text: &str, json: bool) -> u64 {
             crate::indexer::redact_secrets::json_has_duplicate_keys(text),
             Ok(false)
         ) {
+            return 1;
+        }
+        if profile.omits_injections() && super::is_injected_json(&value) {
             return 1;
         }
         return walk(engine, &value);

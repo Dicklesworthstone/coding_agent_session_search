@@ -3702,6 +3702,13 @@ content and `--include-system-reminders` for hook reminders and their metadata.
 A record containing both requires both flags. These options are independent of
 credential redaction.
 
+For searchable Pages bundles, the public and team profiles omit recognized skill
+and hook records, including their search entries, attachment references and code
+snippets. The bundle retains the IDs and positions of visible messages. When
+a conversation contains an omitted record, Pages also withholds its title and
+provider metadata because both can summarize the hidden text. The personal
+backup profile retains these records.
+
 **What is recognized.** Thirteen pattern families: AWS access key IDs, AWS
 secret keys and session tokens in assignment context, GitHub tokens (classic and
 fine-grained), OpenAI and Anthropic API keys, `Bearer` tokens, JWTs, PEM/OpenSSH/PGP

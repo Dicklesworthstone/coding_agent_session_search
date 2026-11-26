@@ -1242,6 +1242,88 @@ mod tests {
         Ok(haystack)
     }
 
+    #[test]
+    fn pages_share_omits_injected_records() -> Result<()> {
+        let temp = TempDir::new()?;
+        let source = temp.path().join("source.db");
+        setup_share_profile_source(&source, "/synthetic-home")?;
+        let conn = open_franken_db(&source)?;
+        conn.execute_batch(
+            r#"
+            ALTER TABLE messages ADD COLUMN extra_json TEXT;
+            ALTER TABLE messages ADD COLUMN extra_bin BLOB;
+            ALTER TABLE messages ADD COLUMN attachment_refs TEXT;
+            UPDATE conversations SET title = 'CONFIDENTIAL generated title', metadata_json = '{"summary":"CONFIDENTIAL summary"}';
+            UPDATE messages SET content = 'CONFIDENTIAL instructions', attachment_refs = '["CONFIDENTIAL attachment"]';
+            UPDATE snippets SET snippet_text = 'CONFIDENTIAL fragment';
+            INSERT INTO messages (id, conversation_id, idx, role, content) VALUES
+                (2, 1, 1, 'user', 'Base directory for this skill: /skills/private'),
+                (3, 1, 2, 'user', 'Keep this conversation about skills.'),
+                (4, 1, 3, 'tool', 'CONFIDENTIAL legacy tool');
+            UPDATE messages SET extra_json = '{"hook":"<system-reminder>"}' WHERE id = 4;
+            UPDATE messages SET attachment_refs = '{"skillInjection\n: matchedSkills":"hook","details":"CONFIDENTIAL metadata"}' WHERE id = 3;
+            "#,
+        )?;
+        conn.execute_compat(
+            "UPDATE messages SET extra_bin = ?1 WHERE id = 1",
+            fparams![rmp_serde::to_vec_named(&serde_json::json!({
+                "skillInjection": {"matchedSkills": ["private"]}
+            }))?],
+        )?;
+        conn.close()?;
+
+        for profile in [
+            ShareProfile::Public,
+            ShareProfile::Team,
+            ShareProfile::Personal,
+        ] {
+            let site = plaintext_site(&source, temp.path(), profile)?;
+            let payload = site.join("payload/data.db");
+            let conn = open_franken_db(&payload)?;
+            let shared = profile != ShareProfile::Personal;
+            let expected = if shared { 1 } else { 4 };
+            assert_eq!(
+                query_i64(&conn, "SELECT message_count FROM conversations")?,
+                expected
+            );
+            for table in ["messages", "messages_fts", "messages_code_fts"] {
+                assert_eq!(
+                    query_i64(&conn, &format!("SELECT COUNT(*) FROM {table}"))?,
+                    expected
+                );
+            }
+            assert_eq!(
+                query_i64(&conn, "SELECT idx FROM messages WHERE id = 3")?,
+                2
+            );
+            let text = exported_text(&conn)?;
+            assert!(text.contains("Keep this conversation about skills."));
+            assert_eq!(text.contains("CONFIDENTIAL"), !shared, "{profile}");
+            conn.close()?;
+            if shared {
+                // Check unused SQLite space as well as visible rows and indexes.
+                let bytes = std::fs::read(&payload)?;
+                let needle = b"CONFIDENTIAL";
+                assert!(!bytes.windows(needle.len()).any(|window| window == needle));
+                assert!(verify_bundle(&site, false)?.checks.share_profile.passed);
+                tamper(
+                    &site,
+                    "INSERT INTO messages_code_fts (content) VALUES ('<system-reminder>private</system-reminder>')",
+                )?;
+                tamper(
+                    &site,
+                    r#"UPDATE messages SET attachment_refs = '{"skillInjection\n: matchedSkills":"hook","sibling":"hidden"}'"#,
+                )?;
+                let checked = verify_bundle(&site, false)?;
+                assert!(!checked.checks.share_profile.passed);
+                for surface in ["messages_code_fts.content", "messages.attachment_refs"] {
+                    assert_eq!(checked.share_profile.residual.get(surface), Some(&1));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 2l1b0.60: each share profile removes exactly its preset's values from
     /// every exported surface, and export_meta records the profile with
     /// per-kind counts but no raw value. Negative control: before profiles

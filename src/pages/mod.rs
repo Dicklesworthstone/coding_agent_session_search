@@ -35,6 +35,33 @@ pub mod summary;
 pub mod verify;
 pub mod wizard;
 
+/// A provider can put a marker in decoded text or in separate hook fields.
+fn is_injected_json(value: &serde_json::Value) -> bool {
+    use crate::export::is_skill_injection;
+    use serde_json::Value;
+
+    fn inspect(text: &str, possible_hook: &mut bool) -> bool {
+        *possible_hook |= text.contains("skillInjection");
+        is_skill_injection(text)
+    }
+
+    fn visit(value: &Value, possible_hook: &mut bool) -> bool {
+        match value {
+            Value::String(text) => inspect(text, possible_hook),
+            Value::Array(items) => items.iter().any(|item| visit(item, possible_hook)),
+            Value::Object(fields) => {
+                fields.keys().any(|key| inspect(key, possible_hook))
+                    || fields.values().any(|item| visit(item, possible_hook))
+            }
+            _ => false,
+        }
+    }
+
+    let mut possible_hook = false;
+    visit(value, &mut possible_hook)
+        || (possible_hook && is_skill_injection(&value.to_string()))
+}
+
 /// A nonempty archive MessagePack column supersedes its legacy JSON shadow.
 fn decode_metadata_blob(
     binary: Option<&[u8]>,
