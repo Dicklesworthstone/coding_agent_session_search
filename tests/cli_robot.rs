@@ -1445,6 +1445,88 @@ fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
 }
 
 #[test]
+fn decision_lookup_returns_the_cited_answer_with_one_evidence_slot() -> Result<(), Box<dyn Error>> {
+    let question = "What did we decide about the CSV format for Excel?";
+    let answer = "We chose UTF-8 with a BOM because the customer opens the CSV in Excel.";
+    for answered_index in [0, 1] {
+        let home = TempDir::new()?;
+        let codex_home = home.path().join(".codex");
+        let data_dir = home.path().join("cass_data");
+        let files = [
+            "rollout-decision-older.jsonl",
+            "rollout-decision-newer.jsonl",
+        ];
+        let sessions = codex_home.join("sessions/2026/04/23");
+        fs::create_dir_all(&sessions)?;
+        for (i, name) in files.iter().enumerate() {
+            let day = if i == 0 { "2024-05-01" } else { "2024-05-02" };
+            let reply = if i == answered_index {
+                answer
+            } else {
+                "I'll check and get back to you."
+            };
+            let mut file = fs::File::create(sessions.join(name))?;
+            let meta = serde_json::json!({
+                "timestamp": format!("{day}T10:00:00Z"),
+                "type": "session_meta",
+                "payload": { "id": name, "cwd": home.path(), "cli_version": "0.42.0" }
+            });
+            writeln!(file, "{meta}")?;
+            for (second, role, kind, body) in [
+                (1, "user", "input_text", question),
+                (2, "assistant", "output_text", reply),
+            ] {
+                let message = serde_json::json!({
+                    "timestamp": format!("{day}T10:00:0{second}Z"),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": role,
+                        "phase": if role == "assistant" { Some("final_answer") } else { None },
+                        "content": [{"type": kind, "text": body}]
+                    }
+                });
+                writeln!(file, "{message}")?;
+            }
+        }
+        isolated_cass_cmd(home.path())
+            .env("CASS_AUTO_REFRESH", "0")
+            .args(["index", "--watch-once"])
+            .arg(sessions.join(files[0]))
+            .arg("--watch-once")
+            .arg(sessions.join(files[1]))
+            .args(["--json", "--data-dir"])
+            .arg(&data_dir)
+            .timeout(std::time::Duration::from_secs(120))
+            .assert()
+            .success();
+        for query in [question, "CSV Excel"] {
+            let output = isolated_cass_cmd(home.path())
+                .env("CASS_AUTO_REFRESH", "0")
+                .args([
+                    "pack", query, "--mode", "lexical", "--robot", "--max-evidence", "1",
+                    "--require-evidence", "--data-dir",
+                ])
+                .arg(&data_dir)
+                .timeout(std::time::Duration::from_secs(60))
+                .assert()
+                .success()
+                .get_output()
+                .clone();
+            let json: Value = serde_json::from_slice(&output.stdout)?;
+            let evidence = json["evidence"].as_array().expect("evidence array");
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(evidence[0]["excerpt"], answer, "{json}");
+            let citation = &evidence[0]["citation"];
+            assert_eq!(citation["verified"], true, "{json}");
+            assert!(citation["source_path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with(files[answered_index])));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn pack_explicit_lexical_mode_is_not_reported_as_a_fallback() {
     assert_pack_command_returns_evidence("pack", &["--mode", "lexical"]);
 }

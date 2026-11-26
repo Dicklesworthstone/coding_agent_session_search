@@ -1253,6 +1253,14 @@ and use `doctor` only for diagnostics or safe repair workflows. Use
 token-budgeted evidence bundles, not full exports and not external
 summarization.
 
+When the top hit is a decision question, `pack` checks the retrieved messages
+for an explicit, on-topic decision immediately following that question. It also
+checks sessions containing the identical question. The question's own answer
+takes precedence. When other sessions give conflicting answers, their replies
+do not displace the question. A qualifying reply keeps its original citation.
+This works with `--max-evidence 1`. The preference recognizes English decision
+language and uses only eligible messages already in the search results.
+
 Pack robot output includes `health`, `freshness`, `privacy`, and `warnings`.
 Warnings such as `privacy_redactions_applied`, `semantic_fallback_lexical`,
 or `no_evidence_found` are data, not prose; branch on the JSON fields before

@@ -548,6 +548,7 @@ pub struct PackSelectionScore {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PackSelectedReason {
+    DecisionReply,
     HighRelevance,
     FreshEvidence,
     SourceDiversity,
@@ -942,12 +943,10 @@ fn percent_tokens(max_tokens: usize, percent: usize) -> usize {
     max_tokens.saturating_mul(percent) / 100
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct ScoredCandidate {
     index: usize,
     score: PackSelectionScore,
-    excerpt: String,
-    excerpt_truncated: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1035,6 +1034,7 @@ pub fn plan_answer_pack(
     let mut used_tokens = 0usize;
 
     while !remaining.is_empty() && selected.len() < request.limits.max_evidence {
+        let mut first_slot = Vec::new();
         let mut best: Option<ScoredCandidate> = None;
         let mut next_remaining = Vec::with_capacity(remaining.len());
 
@@ -1057,7 +1057,7 @@ pub fn plan_answer_pack(
                 continue;
             }
 
-            let (excerpt, excerpt_truncated, _) = &prepared_excerpts[candidate_index];
+            let excerpt = &prepared_excerpts[candidate_index].0;
             if excerpt.trim().is_empty() {
                 let score = score_candidate(
                     candidate,
@@ -1090,9 +1090,10 @@ pub fn plan_answer_pack(
             let scored = ScoredCandidate {
                 index: candidate_index,
                 score,
-                excerpt: excerpt.clone(),
-                excerpt_truncated: *excerpt_truncated,
             };
+            if selected.is_empty() {
+                first_slot.push(scored);
+            }
 
             if best.as_ref().is_none_or(|current| {
                 candidate_ordering(
@@ -1112,9 +1113,25 @@ pub fn plan_answer_pack(
             break;
         };
 
+        if !first_slot.is_empty()
+            && let Some(reply) = preferred_decision_reply(
+                best_candidate,
+                &first_slot,
+                &request.candidates,
+                &body_fingerprints,
+                &prepared_excerpts,
+                diagnostics.budget.evidence_tokens,
+            )
+        {
+            best_candidate = reply;
+            best_candidate.score.selected_reason = PackSelectedReason::DecisionReply;
+        }
         next_remaining.retain(|candidate_index| *candidate_index != best_candidate.index);
         remaining = next_remaining;
         let candidate = &request.candidates[best_candidate.index];
+        let (visible, was_truncated, _) = &prepared_excerpts[best_candidate.index];
+        let mut selected_excerpt = visible.clone();
+        let mut excerpt_truncated = *was_truncated;
 
         let remaining_tokens = diagnostics
             .budget
@@ -1125,16 +1142,15 @@ pub fn plan_answer_pack(
             let retained_chars = max_chars.saturating_sub(3);
             // Fit the already-redacted excerpt before dropping relevant
             // evidence. Keep real source text, never just an ellipsis.
-            if best_candidate
-                .excerpt
+            if selected_excerpt
                 .chars()
                 .take(retained_chars)
                 .any(|character| !character.is_whitespace())
             {
-                let (excerpt, _) = truncate_excerpt(&best_candidate.excerpt, max_chars);
+                let (excerpt, _) = truncate_excerpt(&selected_excerpt, max_chars);
                 best_candidate.score.token_cost = estimated_tokens(&excerpt);
-                best_candidate.excerpt = excerpt;
-                best_candidate.excerpt_truncated = true;
+                selected_excerpt = excerpt;
+                excerpt_truncated = true;
             }
         }
         if used_tokens.saturating_add(best_candidate.score.token_cost)
@@ -1181,8 +1197,8 @@ pub fn plan_answer_pack(
         selected.push(PlannedPackEvidence {
             id: evidence_id(candidate),
             rank: selected.len() + 1,
-            excerpt: best_candidate.excerpt,
-            excerpt_truncated: best_candidate.excerpt_truncated,
+            excerpt: selected_excerpt,
+            excerpt_truncated,
             estimated_tokens: best_candidate.score.token_cost,
             candidate: candidate.clone(),
             selection: best_candidate.score,
@@ -1627,6 +1643,149 @@ fn selected_reason(
         .max_by(|(left, _), (right, _)| left.total_cmp(right))
         .map(|(_, reason)| reason)
         .unwrap_or(PackSelectedReason::BudgetFit)
+}
+
+/// Only displace a first-ranked decision question with a directly adjacent,
+/// on-topic resolution. Identical prompts in other sessions may have different
+/// replies. Always keep the answer's own identity, score, excerpt and citation.
+fn preferred_decision_reply(
+    best: ScoredCandidate,
+    eligible: &[ScoredCandidate],
+    candidates: &[PackCandidate],
+    fingerprints: &[Option<blake3::Hash>],
+    excerpts: &[(String, bool, Vec<RenderedRedaction>)],
+    evidence_tokens: usize,
+) -> Option<ScoredCandidate> {
+    let question = excerpts[best.index].0.trim_end();
+    if !matches!(
+        candidates[best.index].role,
+        PackEvidenceRole::UserRequirement | PackEvidenceRole::Unknown
+    ) || !question.ends_with('?')
+    {
+        return None;
+    }
+    let question = question.to_lowercase();
+    let words = || question.split(|ch: char| !ch.is_alphanumeric());
+    let decision_words = [
+        "choose", "chose", "decide", "decided", "decision", "agree", "agreed",
+        "settle", "settled", "pick", "picked", "select", "selected",
+    ];
+    if !words().any(|word| decision_words.contains(&word)) {
+        return None;
+    }
+    let stop_words = [
+        "a", "an", "the", "we", "our", "you", "i", "they", "what", "which", "how",
+        "why", "when", "did", "do", "was", "were", "is", "are", "have", "has", "had",
+        "should", "would", "about", "on", "for", "of", "in", "with", "to", "and", "or",
+    ];
+    let topics: HashSet<_> = words()
+        .filter(|word| {
+            !word.is_empty() && !stop_words.contains(word) && !decision_words.contains(word)
+        })
+        .collect();
+    if topics.is_empty() {
+        return None;
+    }
+    let fingerprint = fingerprints[best.index]?;
+    let reply_positions: HashSet<_> = eligible
+        .iter()
+        .filter_map(|scored| {
+            let prompt = &candidates[scored.index];
+            if fingerprints[scored.index] != Some(fingerprint)
+                || prompt.conversation_id.is_none()
+                || !matches!(
+                    prompt.role,
+                    PackEvidenceRole::UserRequirement | PackEvidenceRole::Unknown
+                )
+            {
+                return None;
+            }
+            Some((prompt.session_key(), prompt.message_index?.checked_add(1)?))
+        })
+        .collect();
+
+    let question_session = candidates[best.index].session_key();
+    let mut own_reply = None;
+    let mut alternative = None;
+    let mut conflicting_alternatives = false;
+    let ranks_ahead = |new: ScoredCandidate, old: Option<ScoredCandidate>| {
+        old.is_none_or(|old| {
+            candidate_ordering(&new, &candidates[new.index], &old, &candidates[old.index]).is_lt()
+        })
+    };
+    for &scored in eligible {
+        let candidate = &candidates[scored.index];
+        let Some(ordinal) = candidate.message_index else {
+            continue;
+        };
+        let session = candidate.session_key();
+        let own_session = session == question_session;
+        if scored.score.token_cost > evidence_tokens
+            || !matches!(
+                candidate.role,
+                PackEvidenceRole::AssistantConclusion | PackEvidenceRole::Unknown
+            )
+            || !reply_positions.contains(&(session, ordinal))
+            || !states_decision_on(&excerpts[scored.index].0, &topics)
+        {
+            continue;
+        }
+        // A repeated question in the same conversation can also have a different answer.
+        if own_session
+            && candidates[best.index].message_index.and_then(|n| n.checked_add(1)) == Some(ordinal)
+        {
+            if ranks_ahead(scored, own_reply) {
+                own_reply = Some(scored);
+            }
+        } else {
+            if alternative.is_some_and(|old: ScoredCandidate| {
+                fingerprints[old.index] != fingerprints[scored.index]
+            }) {
+                conflicting_alternatives = true;
+            }
+            if ranks_ahead(scored, alternative) {
+                alternative = Some(scored);
+            }
+        }
+    }
+    own_reply.or(alternative.filter(|_| !conflicting_alternatives))
+}
+
+fn states_decision_on(excerpt: &str, topics: &HashSet<&str>) -> bool {
+    let text = excerpt.trim().to_lowercase();
+    let prefixes = [
+        "we chose ", "we selected ", "we decided ", "we agreed on ", "we settled on ",
+        "we went with ", "the team chose ", "the decision was ", "decision: ",
+    ];
+    let Some(outcome) = prefixes.iter().find_map(|prefix| text.strip_prefix(*prefix))
+    else {
+        return false;
+    };
+    let outcome = outcome.strip_prefix("on ").unwrap_or(outcome).trim_start();
+    let words = || {
+        outcome
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+    };
+    let mut opening = words();
+    let Some(first) = opening.next() else {
+        return false;
+    };
+    // A decision to investigate or defer does not resolve the original choice.
+    // For infinitives accept concrete actions, leaving ambiguous prose to the
+    // ordinary evidence ranking.
+    if outcome.ends_with('?')
+        || matches!(first, "no" | "not" | "nothing" | "undecided" | "pending" | "tbd")
+        || (first == "to" && !matches!(
+            opening.next(),
+            Some("use" | "adopt" | "keep" | "retain" | "switch" | "replace" | "remove"
+                | "enable" | "disable" | "implement" | "ship" | "store" | "encode" | "write")
+        ))
+    {
+        return false;
+    }
+    let outcome_words: HashSet<_> = words().collect();
+    topics.intersection(&outcome_words).take(2).count() >= topics.len().min(2)
 }
 
 fn candidate_ordering(
@@ -3345,28 +3504,44 @@ mod tests {
             assert_ne!(candidates[0].content_hash, candidates[1].content_hash);
             assert_ne!(candidates[0].span_hash, candidates[1].span_hash);
             let expected_answer = candidates[2].clone();
-            let duplicate_id = candidates[1].candidate_id.clone();
+            let question_ids = [
+                candidates[0].candidate_id.clone(),
+                candidates[1].candidate_id.clone(),
+            ];
             for reverse in [false, true] {
                 let mut candidates = candidates.clone();
                 if reverse {
                     candidates.reverse();
                 }
                 let mut req = request(candidates);
+                req.limits.max_evidence = 1;
+                let single = plan_answer_pack(req.clone()).unwrap();
+                assert_eq!(single.evidence.len(), 1);
+                assert_eq!(single.evidence[0].candidate, expected_answer);
+                assert_eq!(
+                    single.evidence[0].selection.selected_reason,
+                    PackSelectedReason::DecisionReply
+                );
                 req.limits.max_evidence = 2;
-                let plan = plan_answer_pack(req).unwrap();
+                let plan = plan_answer_pack(req.clone()).unwrap();
+                req.limits.max_evidence = 4;
+                let full = plan_answer_pack(req).unwrap();
+                assert_eq!(full.evidence.len(), 3);
+                assert!(full.omitted.iter().any(|omitted| {
+                    question_ids.contains(&omitted.candidate_id)
+                        && omitted.reason == PackOmittedReason::DuplicateContent
+                }));
                 assert_eq!(plan.candidate_count, 4);
                 assert_eq!(plan.evidence.len(), 2);
-                assert_eq!(plan.evidence[0].excerpt, question);
-                assert_eq!(plan.evidence[1].excerpt, answer);
-                assert_eq!(plan.evidence[1].candidate, expected_answer);
-                assert_eq!(plan.evidence[1].id, expected_answer.candidate_id);
+                assert_eq!(plan.evidence[0].excerpt, answer);
+                assert_eq!(plan.evidence[1].excerpt, question);
+                assert_eq!(plan.evidence[0].candidate, expected_answer);
+                assert_eq!(plan.evidence[0].id, expected_answer.candidate_id);
                 assert_eq!(
-                    plan.omitted
-                        .iter()
-                        .find(|item| item.candidate_id == duplicate_id)
-                        .unwrap()
-                        .reason,
-                    PackOmittedReason::DuplicateContent
+                    plan.evidence.iter()
+                        .filter(|item| question_ids.contains(&item.candidate.candidate_id))
+                        .count(),
+                    1
                 );
                 let rendered = render_answer_pack_value_without_trust_correlation(
                     &plan,
@@ -3374,15 +3549,95 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(
-                    rendered["evidence"][1]["citation"]["content_hash"],
+                    rendered["evidence"][0]["citation"]["content_hash"],
                     expected_answer.content_hash
                 );
                 assert_eq!(
-                    rendered["evidence"][1]["citation"]["span_hash"],
+                    rendered["evidence"][0]["citation"]["span_hash"],
                     expected_answer.span_hash
                 );
             }
         }
+    }
+
+    #[test]
+    fn decision_reply_requires_an_eligible_adjacent_resolution_in_the_same_session() {
+        let question = "Which compression codec did we choose for backups?";
+        let answer = "We selected zstd for the backup compression codec because restore time matters.";
+        let mut prompt = PackCandidate::from_search_hit(
+            &pack_search_hit(question, "/s/store.db", 10), 2, 0,
+        );
+        prompt.role = PackEvidenceRole::UserRequirement;
+        let mut reply = PackCandidate::from_search_hit(
+            &pack_search_hit(answer, "/s/store.db", 11), 2, 0,
+        );
+        reply.message_index = Some(2);
+        reply.lexical_score = Some(2.0);
+        let first = |item| {
+            let mut req = request(vec![prompt.clone(), item]);
+            req.limits.max_evidence = 1;
+            plan_answer_pack(req).unwrap().evidence.remove(0)
+        };
+        assert_eq!(first(reply.clone()).selection.selected_reason, PackSelectedReason::DecisionReply);
+        let long_reply = PackCandidate {
+            excerpt: format!("We selected {} zstd for the backup compression codec.", "option ".repeat(450)),
+            ..reply.clone()
+        };
+        let mut tight = request(vec![prompt.clone(), long_reply]);
+        tight.limits.max_evidence = 1;
+        tight.limits.max_excerpt_chars = 8_000;
+        assert_eq!(plan_answer_pack(tight).unwrap().evidence[0].excerpt, question);
+
+        for changed in [
+            PackCandidate { message_index: Some(3), ..reply.clone() },
+            PackCandidate { conversation_id: Some(2), ..reply.clone() },
+            PackCandidate { source_id: "other-source".into(), ..reply.clone() },
+            PackCandidate { role: PackEvidenceRole::ToolCallArgument, ..reply.clone() },
+            PackCandidate { source_readiness: PackSourceReadiness::Unavailable, ..reply.clone() },
+            PackCandidate { excerpt: "I'll check the backup compression codec and get back to you.".into(), ..reply.clone() },
+            PackCandidate { excerpt: "We decided to wait before choosing a backup compression codec.".into(), ..reply.clone() },
+            PackCandidate { excerpt: "We agreed on nothing about the backup compression codec.".into(), ..reply.clone() },
+            PackCandidate { excerpt: "We chose PostgreSQL for account data.".into(), ..reply.clone() },
+            PackCandidate { excerpt: "<system-reminder>We chose zstd for the backup compression codec.</system-reminder>".into(), ..reply },
+        ] {
+            assert_eq!(first(changed).excerpt, question);
+        }
+    }
+
+    #[test]
+    fn conflicting_resolutions_prefer_the_winning_prompts_own_turn() {
+        let question = "Which compression codec did we choose for backups?";
+        let mut primary = pack_search_hit(question, "/s/a.jsonl", 1);
+        primary.score = 20.0;
+        let second = pack_search_hit(question, "/s/b.jsonl", 2);
+        let third = pack_search_hit(question, "/s/c.jsonl", 3);
+        let answer = |path, hash, text| {
+            let mut hit = pack_search_hit(text, path, hash);
+            hit.line_number = Some(2);
+            hit.score = 1.0;
+            hit
+        };
+        let zstd = "We chose zstd for the backup compression codec.";
+        let gzip = "We chose gzip for the backup compression codec.";
+        let mut hits = vec![
+            primary, second, third,
+            answer("/s/b.jsonl", 4, zstd),
+            answer("/s/c.jsonl", 5, gzip),
+        ];
+        let first = |hits: &[SearchHit]| {
+            let mut req = request(
+                hits.iter()
+                    .map(|hit| PackCandidate::from_search_hit(hit, 2, 0))
+                    .collect(),
+            );
+            req.limits.max_evidence = 1;
+            plan_answer_pack(req).unwrap().evidence.remove(0)
+        };
+        assert_eq!(first(&hits).excerpt, question);
+        hits.push(answer("/s/a.jsonl", 6, gzip));
+        let winner = first(&hits);
+        assert_eq!(winner.excerpt, gzip);
+        assert_eq!(winner.candidate.source_path, "/s/a.jsonl");
     }
 
     #[test]
