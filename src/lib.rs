@@ -110970,44 +110970,62 @@ fn try_load_indexed_conversation_from_db_with_source(
     db_path: &Path,
     source_id: Option<&str>,
     conversation_id: Option<i64>,
-) -> Option<crate::ui::data::ConversationView> {
-    if !db_path.exists() {
-        return None;
-    }
-    // `cass view` is an inspection surface. Archive fallback must therefore use
-    // the read-only connection lane and must never run migrations or schema
-    // repair merely because an incident-summary pointer was followed.
-    let storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).ok()?;
-    let source_path = source_path.to_string_lossy();
-    let source_id = canonical_followup_source_id(source_id);
-    if let Some(conversation_id) = conversation_id {
-        let view =
-            crate::ui::data::load_conversation_by_id_uncached(&storage, conversation_id).ok()??;
-        if view.convo.source_path.to_string_lossy() != source_path {
-            return None;
+) -> CliResult<Option<crate::ui::data::ConversationView>> {
+    let load = || -> anyhow::Result<Option<crate::ui::data::ConversationView>> {
+        if !db_path.try_exists()? {
+            return Ok(None);
         }
-        if source_id
-            .as_deref()
-            .is_some_and(|expected| view.convo.source_id != expected)
-        {
-            return None;
+        // Follow-up commands are inspection surfaces. Archive fallback must
+        // never run migrations or repair merely because a pointer was followed.
+        let storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path)?;
+        let source_path = source_path.to_string_lossy();
+        let source_id = canonical_followup_source_id(source_id);
+        if let Some(conversation_id) = conversation_id {
+            let Some(view) =
+                crate::ui::data::load_conversation_by_id_uncached(&storage, conversation_id)?
+            else {
+                return Ok(None);
+            };
+            if view.convo.source_path.to_string_lossy() != source_path {
+                return Ok(None);
+            }
+            if source_id
+                .as_deref()
+                .is_some_and(|expected| view.convo.source_id != expected)
+            {
+                return Ok(None);
+            }
+            return Ok(Some(view));
         }
-        return Some(view);
-    }
-    if let Some(source_id) = source_id.as_deref() {
-        return crate::ui::data::load_conversation_for_source(&storage, source_id, &source_path)
-            .ok()?;
-    }
-    if let Some(local_view) = crate::ui::data::load_conversation_for_source(
-        &storage,
-        crate::sources::provenance::LOCAL_SOURCE_ID,
-        &source_path,
-    )
-    .ok()?
-    {
-        return Some(local_view);
-    }
-    crate::ui::data::load_conversation(&storage, &source_path).ok()?
+        if let Some(source_id) = source_id.as_deref() {
+            return crate::ui::data::load_conversation_for_source(&storage, source_id, &source_path);
+        }
+        if let Some(local_view) = crate::ui::data::load_conversation_for_source(
+            &storage,
+            crate::sources::provenance::LOCAL_SOURCE_ID,
+            &source_path,
+        )? {
+            return Ok(Some(local_view));
+        }
+        crate::ui::data::load_conversation(&storage, &source_path)
+    };
+    load().map_err(|error| {
+        let retryable = crate::storage::sqlite::retryable_franken_anyhow(&error);
+        CliError {
+            code: if retryable { 7 } else { 5 },
+            kind: if retryable {
+                CliErrorKind::LockBusy.kind_str()
+            } else {
+                CliErrorKind::Storage.kind_str()
+            },
+            message: format!(
+                "Failed to read indexed session from {}: {error:#}",
+                db_path.display()
+            ),
+            hint: Some("Run 'cass doctor --json' to inspect the canonical archive.".to_string()),
+            retryable,
+        }
+    })
 }
 
 fn serialize_indexed_view_lines(
@@ -111866,6 +111884,8 @@ fn try_load_indexed_conversation_from_db(
     db_path: &Path,
 ) -> Option<crate::ui::data::ConversationView> {
     try_load_indexed_conversation_from_db_with_source(source_path, db_path, None, None)
+        .ok()
+        .flatten()
 }
 
 struct ResolvedViewLine {
@@ -111903,7 +111923,9 @@ fn resolve_view(
         db_path,
         source_id,
         conversation_id,
-    );
+    )
+    .ok()
+    .flatten();
     let allow_direct_file =
         conversation_id.is_none() && (followup_source_is_local(source_id) || source_id.is_none());
     let prefer_direct_file = conversation_id.is_none() && prefers_direct_view_file(path, source_id);
@@ -112344,7 +112366,9 @@ fn run_view(
         &db_path,
         source_id,
         conversation_id,
-    );
+    )
+    .ok()
+    .flatten();
     let allow_direct_file =
         conversation_id.is_none() && (followup_source_is_local(source_id) || source_id.is_none());
 
@@ -117650,18 +117674,34 @@ fn detect_opencode_session(path: &Path) -> bool {
 /// The actual file at that path does not exist -- the session lives inside
 /// the `.db` file.
 fn detect_opencode_sqlite_session(path: &Path) -> bool {
-    // Walk ancestors looking for a component that ends in ".db"
-    if let Some(parent) = path.parent() {
-        let parent_name = parent
-            .file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default();
-        if parent_name.ends_with(".db") && parent.is_file() {
-            // The parent is a real .db file and the child is the session id
-            return true;
-        }
+    let Some(parent) = path.parent().filter(|parent| parent.is_file()) else {
+        return false;
+    };
+    // Hermes, Goose, Devin and other providers also use database/session
+    // handles. A .db suffix cannot establish OpenCode identity: accepting it
+    // here also bypasses the canonical lookup that knows the correct provider.
+    if parent
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("opencode.db"))
+    {
+        return true;
     }
-    false
+
+    // Keep direct exports for an explicitly configured OpenCode database with
+    // a custom filename. Merely living under an arbitrary .db file is not
+    // enough; every other virtual handle resolves through its archive row.
+    dotenvy::var("OPENCODE_SQLITE_DB")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .is_some_and(|configured| {
+            configured == parent
+                || configured
+                    .canonicalize()
+                    .ok()
+                    .zip(parent.canonicalize().ok())
+                    .is_some_and(|(configured, parent)| configured == parent)
+        })
 }
 
 fn path_exists_or_virtual_opencode_sqlite_session(path: &Path, allow_direct_file: bool) -> bool {
@@ -117702,11 +117742,22 @@ fn load_opencode_sqlite_session_for_export(
 
     // The connector also discovers default stores and skips unreadable ones.
     // An export must not substitute a same-ID session from another database.
+    // The explicit override may name the requested file through a different
+    // path spelling, so accept aliases only when both resolve to the same file.
+    let canonical_db_path = db_path.canonicalize().ok();
     let conv = convs
         .into_iter()
         .find(|conversation| {
             conversation.external_id.as_deref() == Some(session_id.as_ref())
-                && conversation.source_path.parent() == Some(db_path)
+                && (conversation.source_path.parent() == Some(db_path)
+                    || canonical_db_path.as_ref().is_some_and(|expected| {
+                        conversation
+                            .source_path
+                            .parent()
+                            .and_then(|parent| parent.canonicalize().ok())
+                            .as_ref()
+                            == Some(expected)
+                    }))
         })
         .with_context(|| {
             format!(
@@ -119065,7 +119116,7 @@ fn run_export(
     let mut indexed_view = if should_defer_indexed_lookup_for_direct_export(path, source_id) {
         None
     } else {
-        try_load_indexed_conversation_from_db_with_source(path, &db_path, source_id, None)
+        try_load_indexed_conversation_from_db_with_source(path, &db_path, source_id, None)?
     };
 
     if source_id.is_none()
@@ -119110,7 +119161,7 @@ fn run_export(
                 if indexed_view.is_none() {
                     indexed_view = try_load_indexed_conversation_from_db_with_source(
                         path, &db_path, source_id, None,
-                    );
+                    )?;
                 }
                 if let Some(view) = indexed_view.as_ref() {
                     session_title = view.convo.title.clone();
@@ -119675,6 +119726,7 @@ fn run_export_html(
         None
     } else {
         try_load_indexed_conversation_from_db_with_source(session_path, &db_path, source_id, None)
+            .inspect_err(emit_structured_error)?
     };
 
     // --- Validate session exists ---
@@ -119824,7 +119876,8 @@ fn run_export_html(
                         &db_path,
                         source_id,
                         None,
-                    );
+                    )
+                    .inspect_err(emit_structured_error)?;
                 }
                 if let Some(view) = indexed_view.as_ref() {
                     session_title = view.convo.title.clone();
@@ -122563,6 +122616,20 @@ mod indexed_conversation_fallback_tests {
             Path::new("/missing/indexed/session.jsonl"),
             Some("work-laptop")
         ));
+
+        for database in ["state.db", "sessions.db", "db.sqlite", "not-opencode.db"] {
+            let db_path = tmp.path().join(database);
+            std::fs::write(&db_path, b"provider-owned database").expect("write provider db");
+            let session_path = db_path.join("local-session");
+            assert!(
+                !detect_opencode_sqlite_session(&session_path),
+                "a database suffix cannot establish OpenCode identity: {database}"
+            );
+            assert!(
+                !should_defer_indexed_lookup_for_direct_export(&session_path, None),
+                "provider-owned virtual paths must resolve their indexed conversation"
+            );
+        }
     }
 
     #[test]
@@ -125681,7 +125748,9 @@ fn run_expand(
 
     let db_path = db_override.unwrap_or_else(default_db_path);
     let indexed_view =
-        try_load_indexed_conversation_from_db_with_source(path, &db_path, source_id, None);
+        try_load_indexed_conversation_from_db_with_source(path, &db_path, source_id, None)
+            .ok()
+            .flatten();
     let allow_direct_file = followup_source_is_local(source_id) || source_id.is_none();
 
     let prefer_direct_file = prefers_direct_jsonl_file(path, source_id);

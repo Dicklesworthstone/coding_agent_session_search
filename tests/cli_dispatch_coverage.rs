@@ -2441,6 +2441,254 @@ fn gh519_export_missing_session_does_not_use_another_opencode_store() {
     );
 }
 
+fn gh584_hermes_export_fixture() -> anyhow::Result<(TempDir, PathBuf, PathBuf)> {
+    use coding_agent_search::sources::provenance::{Source, SourceKind};
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let root = TempDir::new()?;
+    let native_db = root.path().join("hermes/profiles/fixture/state.db");
+    fs::create_dir_all(native_db.parent().unwrap())?;
+    let native = FrankenConnection::open(native_db.to_string_lossy().as_ref())?;
+    native.execute_batch(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT);
+         CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT);
+         INSERT INTO sessions VALUES ('local-session-584', 'Hermes source');
+         INSERT INTO messages VALUES (1, 'local-session-584', 'user', 'GH584 native source');",
+    )?;
+    native.close()?;
+    let session = native_db.join("local-session-584");
+    let archive = root.path().join("archive.db");
+    let storage = FrankenStorage::open(&archive)?;
+    let agent_id = storage.ensure_agent(&Agent {
+        id: None,
+        slug: "hermes".into(),
+        name: "Hermes".into(),
+        version: None,
+        kind: AgentKind::Cli,
+    })?;
+    storage.upsert_source(&Source {
+        id: "remote-584".into(),
+        kind: SourceKind::Ssh,
+        host_label: Some("remote-584".into()),
+        machine_id: None,
+        platform: None,
+        config_json: None,
+        created_at: None,
+        updated_at: None,
+    })?;
+    for (source_id, body) in [
+        ("local", "GH584 local archived answer"),
+        ("remote-584", "GH584 remote archived answer"),
+    ] {
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &Conversation {
+                id: None,
+                agent_slug: "hermes".into(),
+                workspace: None,
+                external_id: Some("local-session-584".into()),
+                title: Some(format!("Hermes {source_id}")),
+                source_path: session.clone(),
+                started_at: Some(1_700_000_000_000),
+                ended_at: None,
+                approx_tokens: None,
+                metadata_json: json!({}),
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::Agent,
+                    author: None,
+                    created_at: Some(1_700_000_000_001),
+                    content: body.into(),
+                    extra_json: json!({}),
+                    snippets: Vec::new(),
+                }],
+                source_id: source_id.into(),
+                origin_host: (source_id != "local").then(|| source_id.into()),
+            },
+        )?;
+    }
+    drop(storage);
+    Ok((root, archive, session))
+}
+
+fn gh584_export_command(home: &Path, archive: &Path) -> Command {
+    let mut cmd = base_cmd(home);
+    cmd.current_dir(home)
+        .env("USERPROFILE", home)
+        .env("LOCALAPPDATA", home.join("AppData/Local"))
+        .env("APPDATA", home.join("AppData/Roaming"))
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_OUTPUT_FORMAT", "json")
+        .env_remove("CASS_DB_PATH")
+        .env_remove("OPENCODE_SQLITE_DB")
+        .arg("--db")
+        .arg(archive)
+        .timeout(Duration::from_secs(60));
+    cmd
+}
+
+#[test]
+fn gh584_export_resolves_live_hermes_database_handles_from_the_archive() -> anyhow::Result<()> {
+    let (root, archive, session) = gh584_hermes_export_fixture()?;
+    let native_db = session.parent().unwrap();
+    let native_paths = [
+        native_db.to_path_buf(),
+        native_db.with_file_name("state.db-wal"),
+        native_db.with_file_name("state.db-shm"),
+    ];
+    let native_before: Vec<_> = native_paths.iter().map(|path| fs::read(path).ok()).collect();
+    for source in [None, Some("local"), Some("remote-584")] {
+        let expected = if source == Some("remote-584") {
+            "GH584 remote archived answer"
+        } else {
+            "GH584 local archived answer"
+        };
+        for format in ["markdown", "text", "json", "html"] {
+            let mut cmd = gh584_export_command(root.path(), &archive);
+            cmd.arg("export").arg(&session).args(["--format", format]);
+            if let Some(source) = source {
+                cmd.args(["--source", source]);
+            }
+            let output = cmd.output()?;
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            let transcript = String::from_utf8(output.stdout)?;
+            assert!(transcript.contains(expected), "{format}: {transcript}");
+            assert!(!transcript.contains("GH584 native source"));
+            let other = if source == Some("remote-584") {
+                "GH584 local archived answer"
+            } else {
+                "GH584 remote archived answer"
+            };
+            assert!(!transcript.contains(other), "source identity was lost");
+            assert!(
+                !String::from_utf8_lossy(&output.stderr).contains("OpenCode"),
+                "Hermes must never be routed to the OpenCode connector"
+            );
+        }
+        let mut cmd = gh584_export_command(root.path(), &archive);
+        cmd.arg("export-html")
+            .arg(&session)
+            .arg("--output-dir")
+            .arg(root.path().join("exports"))
+            .arg("--json");
+        if let Some(source) = source {
+            cmd.args(["--source", source]);
+        }
+        let output = cmd.output()?;
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let receipt: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(receipt["exported"]["agent"], "hermes");
+        let html = fs::read_to_string(
+            receipt["exported"]["output_path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing HTML output path"))?,
+        )?;
+        assert!(html.contains(expected));
+        assert!(!html.contains("GH584 native source"));
+    }
+    let native_after: Vec<_> = native_paths.iter().map(|path| fs::read(path).ok()).collect();
+    assert_eq!(native_after, native_before, "export mutated the provider database");
+    Ok(())
+}
+
+#[test]
+fn gh584_export_reports_archive_failures_without_trying_another_provider() -> anyhow::Result<()> {
+    let (root, _archive, session) = gh584_hermes_export_fixture()?;
+    let corrupt_archive = root.path().join("broken-archive.db");
+    fs::write(&corrupt_archive, b"not a SQLite archive")?;
+    let corrupt_before = fs::read(&corrupt_archive)?;
+    for command in ["export", "export-html"] {
+        let output_path = root.path().join(format!("{command}.out"));
+        let mut cmd = gh584_export_command(root.path(), &corrupt_archive);
+        cmd.arg(command).arg(&session);
+        if command == "export" {
+            cmd.args(["--format", "markdown"])
+                .arg("--output")
+                .arg(&output_path);
+        } else {
+            cmd.arg("--json").arg("--output-dir").arg(&output_path);
+        }
+        let output = cmd.output()?;
+        assert_eq!(output.status.code(), Some(5), "{output:?}");
+        assert!(!output_path.exists(), "failed export must not publish output");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("OpenCode"), "{stderr}");
+        let envelope = if command == "export-html" {
+            serde_json::from_slice::<Value>(&output.stdout)?
+        } else {
+            assert!(output.stdout.is_empty());
+            stderr
+                .lines()
+                .find_map(|line| serde_json::from_str::<Value>(line).ok())
+                .ok_or_else(|| anyhow::anyhow!("missing export error envelope: {stderr}"))?
+        };
+        assert_eq!(envelope["error"]["kind"], "storage", "{envelope}");
+        assert_eq!(envelope["error"]["code"], 5);
+    }
+    assert_eq!(fs::read(corrupt_archive)?, corrupt_before);
+    Ok(())
+}
+
+#[test]
+fn gh584_unindexed_hermes_database_handle_fails_without_opencode_dispatch() -> anyhow::Result<()> {
+    let (root, _archive, session) = gh584_hermes_export_fixture()?;
+    let absent_archive = root.path().join("never-created-archive.db");
+    let output = gh584_export_command(root.path(), &absent_archive)
+        .arg("export")
+        .arg(session)
+        .output()?;
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("OpenCode"));
+    assert!(!absent_archive.exists());
+    Ok(())
+}
+
+#[test]
+fn gh584_direct_exports_do_not_open_an_unrelated_broken_archive() -> anyhow::Result<()> {
+    let root = TempDir::new()?;
+    let archive = root.path().join("unrelated-broken.db");
+    fs::write(&archive, b"not an archive")?;
+    let session = gh519_opencode_database(&root.path().join("custom-store.sqlite"), "ses_gh519");
+    let output = gh584_export_command(root.path(), &archive)
+        .env("OPENCODE_SQLITE_DB", session.parent().unwrap())
+        .arg("export")
+        .arg(&session)
+        .args(["--format", "json", "--include-tools"])
+        .output()?;
+    gh519_assert_success(&output);
+    gh519_assert_messages(&output.stdout);
+
+    let alias_directory = root.path().join("alias");
+    fs::create_dir_all(&alias_directory)?;
+    let alias_session = alias_directory
+        .join("..")
+        .join("custom-store.sqlite")
+        .join("ses_gh519");
+    let output = gh584_export_command(root.path(), &archive)
+        .env("OPENCODE_SQLITE_DB", session.parent().unwrap())
+        .arg("export")
+        .arg(alias_session)
+        .args(["--format", "json", "--include-tools"])
+        .output()?;
+    gh519_assert_success(&output);
+    gh519_assert_messages(&output.stdout);
+
+    let jsonl = root.path().join("direct.jsonl");
+    fs::write(&jsonl, "{\"role\":\"user\",\"content\":\"GH584 direct JSONL\"}\n")?;
+    let output = gh584_export_command(root.path(), &archive)
+        .arg("export")
+        .arg(jsonl)
+        .args(["--format", "markdown"])
+        .output()?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("GH584 direct JSONL"));
+    Ok(())
+}
+
 // =============================================================================
 // Export-HTML command tests
 // =============================================================================
