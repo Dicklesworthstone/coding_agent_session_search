@@ -34528,7 +34528,7 @@ impl ConnectorKind {
             Self::Muse => Box::new(MuseConnector::new()),
             Self::PrimeAgent => Box::new(franken_agent_detection::PrimeAgentConnector::new()),
             Self::Kiro => Box::new(franken_agent_detection::KiroConnector::new()),
-            Self::Devin => Box::new(franken_agent_detection::DevinConnector::new()),
+            Self::Devin => Box::new(crate::connectors::devin::DevinConnector::new()),
             Self::Shelley => Box::new(franken_agent_detection::ShelleyConnector::new()),
             Self::GrokBot => Box::new(crate::connectors::grok::GrokBotConnector::new()),
             Self::OpenHands => Box::new(franken_agent_detection::OpenHandsConnector::new()),

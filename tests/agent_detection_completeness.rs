@@ -1020,6 +1020,106 @@ mod devin_ingestion {
         assert_eq!(fs::read(&db).expect("source after scan"), before);
     }
 
+    #[cfg(windows)]
+    fn windows_cass(home: &Path, data: &Path) -> assert_cmd::Command {
+        let mut command = cass_command(home, data);
+        command
+            .env_remove("CASS_DEVIN_DATA_ROOT")
+            .env("APPDATA", home.join("AppData").join("Roaming"))
+            .env("LOCALAPPDATA", home.join("AppData").join("Local"));
+        let mut command = assert_cmd::Command::from_std(command);
+        command.timeout(Duration::from_secs(120));
+        command
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gh580_devin_windows_roaming_default_indexes_without_an_override() {
+        let home = tempfile::tempdir().expect("isolated Windows Devin profile");
+        let database = home
+            .path()
+            .join("AppData")
+            .join("Roaming")
+            .join("devin")
+            .join("cli")
+            .join("sessions.db");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        seed_store(&database);
+        // A leftover Unix-style store must not shadow or duplicate the native
+        // Windows store. The source path distinguishes the otherwise equal rows.
+        let legacy = home.path().join(".local/share/devin/cli/sessions.db");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        seed_store(&legacy);
+        let before = source_bundle_bytes(&database);
+        let data = home.path().join("cass-data");
+
+        for first in [true, false] {
+            let mut index = windows_cass(home.path(), &data);
+            index.args(["index", "--json"]);
+            if first {
+                index.arg("--full");
+            }
+            index.assert().success();
+            let output = windows_cass(home.path(), &data)
+                .args([
+                    "search",
+                    "devinneedle",
+                    "--agent",
+                    "devin",
+                    "--mode",
+                    "lexical",
+                    "--limit",
+                    "20",
+                    "--robot",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let result: Value = serde_json::from_slice(&output).unwrap();
+            let hits = result["hits"].as_array().unwrap();
+            assert_eq!(
+                hits.len(),
+                4,
+                "repeat indexing must preserve unique messages"
+            );
+            for hit in hits {
+                assert_eq!(hit["source_path"], database.join("kept").to_str().unwrap());
+            }
+        }
+        assert_eq!(source_bundle_bytes(&database), before);
+
+        let override_data = home.path().join("override-data");
+        windows_cass(home.path(), &override_data)
+            .env("CASS_DEVIN_DATA_ROOT", &legacy)
+            .args(["index", "--full", "--json"])
+            .assert()
+            .success();
+        let output = windows_cass(home.path(), &override_data)
+            .env("CASS_DEVIN_DATA_ROOT", &legacy)
+            .args([
+                "search",
+                "devinneedle",
+                "--agent",
+                "devin",
+                "--mode",
+                "lexical",
+                "--robot",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let result: Value = serde_json::from_slice(&output).unwrap();
+        let hits = result["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 4);
+        for hit in hits {
+            assert_eq!(hit["source_path"], legacy.join("kept").to_str().unwrap());
+        }
+    }
+
     #[test]
     fn devin_cli_indexes_searches_and_reopens_without_duplicates() {
         let home = tempfile::tempdir().expect("isolated home");

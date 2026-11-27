@@ -274,6 +274,7 @@ pub mod copilot;
 pub mod copilot_cli;
 pub mod crush;
 pub mod cursor;
+pub mod devin;
 pub mod factory;
 pub mod gemini;
 pub mod goose;
@@ -312,6 +313,10 @@ fn continue_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(continue_dev::ContinueConnector::new())
 }
 
+fn devin_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(devin::DevinConnector::new())
+}
+
 fn opencode_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(opencode::OpenCodeConnector::new())
 }
@@ -347,6 +352,7 @@ fn antigravity_connector_factory() -> Box<dyn Connector + Send> {
 /// native chat stores, which the upstream scanner reads but never detected.
 /// Codebuff delegates parsing to FAD while adding per-transcript checkpoints.
 /// Continue applies source exclusions and ledger-first retries before parsing.
+/// Devin selects the Windows roaming store while preserving explicit source scope.
 /// Antigravity admits explicitly selected primary transcript files without
 /// widening their scope beyond the owning conversation.
 #[must_use]
@@ -395,6 +401,7 @@ pub(crate) fn get_connector_registrations() -> Vec<source_dependencies::Connecto
                 "codebuff" => ConnectorRegistration::new(name, codebuff_connector_factory)
                     .with_source_capability::<codebuff::CodebuffConnector>("codebuff"),
                 "continue" => ConnectorRegistration::new(name, continue_connector_factory),
+                "devin" => ConnectorRegistration::new(name, devin_connector_factory),
                 "opencode" => ConnectorRegistration::new(name, opencode_connector_factory),
                 "omp" => ConnectorRegistration::new(name, omp_connector_factory)
                     .with_source_capability::<omp::OmpConnector>("omp"),
