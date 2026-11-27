@@ -2629,8 +2629,31 @@
     },
     {
       "name": "sessions",
-      "description": "List recent sessions, with optional workspace/current-session filtering",
+      "description": "List recent sessions or resolve exact session IDs and harness URIs",
       "arguments": [
+        {
+          "name": "id",
+          "description": "Resolve an external session ID or URI (repeatable; matches metadata, not message text)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "agent",
+          "description": "Filter to this agent/provider (repeatable)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "source",
+          "description": "Exact source_id from search output (e.g. 'local', 'work-laptop')",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
         {
           "name": "workspace",
           "description": "Filter to sessions for this workspace/project directory",
@@ -2651,7 +2674,7 @@
         },
         {
           "name": "limit",
-          "description": "Maximum sessions to return (defaults: 10, or 1 with --current)",
+          "description": "Maximum sessions to return (defaults: all ID matches, otherwise 10, or 1 with --current)",
           "arg_type": "option",
           "value_type": "integer",
           "required": false
@@ -34997,6 +35020,9 @@
           "items": {
             "type": "object",
             "properties": {
+              "conversation_id": {
+                "type": "integer"
+              },
               "path": {
                 "type": "string"
               },
@@ -35008,6 +35034,40 @@
               },
               "agent": {
                 "type": "string"
+              },
+              "external_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "id_matches": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "requested": {
+                      "type": "string"
+                    },
+                    "normalized": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "exact_external_id",
+                        "external_id_suffix",
+                        "source_path_component",
+                        "source_file_stem"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "requested",
+                    "normalized",
+                    "kind"
+                  ]
+                }
               },
               "title": {
                 "type": [
@@ -35030,6 +35090,18 @@
                   "null"
                 ]
               },
+              "started_at": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "ended_at": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "size_bytes": {
                 "type": [
                   "integer",
@@ -35044,9 +35116,13 @@
               }
             },
             "required": [
+              "conversation_id",
               "path",
               "agent",
+              "external_id",
               "source_id",
+              "started_at",
+              "ended_at",
               "message_count",
               "human_turns"
             ]

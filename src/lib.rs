@@ -1300,15 +1300,24 @@ pub enum Commands {
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
-    /// List recent sessions, with optional workspace/current-session filtering
+    /// List recent sessions or resolve exact session IDs and harness URIs
     Sessions {
+        /// Resolve an external session ID or URI (repeatable; matches metadata, not message text)
+        #[arg(long = "id", visible_alias = "session-id", value_name = "ID_OR_URI")]
+        ids: Vec<String>,
+        /// Filter to this agent/provider (repeatable)
+        #[arg(long = "agent")]
+        agents: Vec<String>,
+        /// Exact source_id from search output (e.g. 'local', 'work-laptop')
+        #[arg(long, alias = "source-id")]
+        source: Option<String>,
         /// Filter to sessions for this workspace/project directory
         #[arg(long, value_hint = ValueHint::DirPath)]
         workspace: Option<PathBuf>,
         /// Resolve the current workspace automatically and return the most recent match
         #[arg(long, default_value_t = false)]
         current: bool,
-        /// Maximum sessions to return (defaults: 10, or 1 with --current)
+        /// Maximum sessions to return (defaults: all ID matches, otherwise 10, or 1 with --current)
         #[arg(long)]
         limit: Option<usize>,
         /// Only sessions active since this ISO date (YYYY-MM-DD or
@@ -4417,6 +4426,21 @@ fn assignment_option_for_command(command: &str, key: &str) -> Option<AssignmentO
             _ => None,
         },
         "sessions" => match key {
+            "id" | "session-id" | "session_id" => Some(AssignmentOption {
+                flag: "--id",
+                aliases: &["--id", "--session-id"],
+                repeatable: true,
+            }),
+            "agent" => Some(AssignmentOption {
+                flag: "--agent",
+                aliases: &["--agent"],
+                repeatable: true,
+            }),
+            "source" | "source-id" | "source_id" => Some(AssignmentOption {
+                flag: "--source",
+                aliases: &["--source", "--source-id"],
+                repeatable: false,
+            }),
             "workspace" => Some(AssignmentOption {
                 flag: "--workspace",
                 aliases: &["--workspace"],
@@ -5586,6 +5610,8 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "conversation-id",
         "file",
         "session",
+        "id",
+        "session-id",
         "line",
         "context",
         "output",
@@ -9647,6 +9673,9 @@ async fn execute_cli(
                     )?;
                 }
                 Commands::Sessions {
+                    ids,
+                    agents,
+                    source,
                     workspace,
                     current,
                     limit,
@@ -9656,6 +9685,9 @@ async fn execute_cli(
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_sessions(
+                        &ids,
+                        &agents,
+                        source.as_deref(),
                         workspace.as_ref(),
                         current,
                         limit,
@@ -29465,8 +29497,11 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    last_completed_at_ms is the start watermark of the last successfully completed scan; age is measured from that start.".to_string(),
             "    An overdue scan recommends cass index on an otherwise healthy archive; CASS_AUTO_REFRESH_SOURCE_SCAN_SECS defaults to 300, and 0 disables the age check.".to_string(),
             "  cass diag [--json] [--verbose] [--data-dir DIR]".to_string(),
-            "  cass sessions [--workspace DIR] [--current] [--limit N] [--since WHEN] [--json]"
+            "  cass sessions [--id ID_OR_URI] [--agent AGENT] [--source SOURCE] [--workspace DIR] [--current] [--limit N] [--since WHEN] [--json]"
                 .to_string(),
+            "    Repeat --id (alias --session-id) for a union. Matches external_id and whole path components/file stems, never message text; exact external IDs rank first.".to_string(),
+            "    ID lookups return all ambiguous candidates unless --limit is explicit. JSON includes conversation_id, external_id, source_id, timestamps and id_matches with the applied rule.".to_string(),
+            "    codex://threads/<id> scopes to Codex; conversation://<id> is provider-neutral. Preserve non-UUID IDs verbatim; --agent and --source intersect the lookup.".to_string(),
             "  cass view <path> [-n LINE] [-C CONTEXT] [--json]".to_string(),
             "  cass index [--full] [--watch] [--json] [--robot-trace-ingest] [--data-dir DIR]"
                 .to_string(),
@@ -29816,6 +29851,8 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             String::new(),
             "# Discover session files for follow-up actions".to_string(),
             "  cass sessions --current --json             # best match for current cwd".to_string(),
+            "  cass sessions --id codex://threads/<uuid> --json # resolve a native thread link".to_string(),
+            "  cass sessions --id cron_abcd_20260101_120000 --source local --json".to_string(),
             "  cass sessions --workspace /myproject --json --limit 5".to_string(),
             String::new(),
             "# Follow up on search results".to_string(),
@@ -100584,6 +100621,8 @@ pub(crate) fn run_doctor_impl(
 #[derive(Debug)]
 struct SessionSummaryRecord {
     agent: String,
+    external_id: Option<String>,
+    id_matches: Vec<SessionIdMatch>,
     workspace: Option<PathBuf>,
     workspace_match_distance: Option<usize>,
     title: Option<String>,
@@ -100591,6 +100630,7 @@ struct SessionSummaryRecord {
     source_id: String,
     origin_host: Option<String>,
     started_at: Option<i64>,
+    ended_at: Option<i64>,
     modified_at: Option<i64>,
     size_bytes: Option<u64>,
     message_count: i64,
@@ -100599,16 +100639,208 @@ struct SessionSummaryRecord {
 
 #[derive(Debug, Serialize)]
 struct SessionSummaryEntry {
+    conversation_id: i64,
     path: String,
     workspace: Option<String>,
     agent: String,
+    external_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    id_matches: Vec<SessionIdMatch>,
     title: Option<String>,
     source_id: String,
     origin_host: Option<String>,
     modified: Option<String>,
+    started_at: Option<String>,
+    ended_at: Option<String>,
     size_bytes: Option<u64>,
     message_count: i64,
     human_turns: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionIdMatchKind {
+    ExactExternalId,
+    ExternalIdSuffix,
+    SourcePathComponent,
+    SourceFileStem,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionIdMatch {
+    requested: String,
+    normalized: String,
+    kind: SessionIdMatchKind,
+}
+
+struct SessionIdSelector {
+    requested: String,
+    exact: String,
+    token: String,
+    agent: Option<&'static str>,
+}
+
+impl SessionIdSelector {
+    fn parse(raw: &str) -> CliResult<Self> {
+        let requested = raw.trim();
+        let (token, agent, is_uri) = if requested
+            .get(..16)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("codex://threads/"))
+        {
+            (
+                requested[16..].split(['?', '#']).next().unwrap_or(""),
+                Some("codex"),
+                true,
+            )
+        } else if requested
+            .get(..15)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("conversation://"))
+        {
+            (
+                requested[15..].split(['?', '#']).next().unwrap_or(""),
+                None,
+                true,
+            )
+        } else {
+            (requested, None, false)
+        };
+        let decoded = if is_uri {
+            let mut bytes = Vec::with_capacity(token.len());
+            let mut remaining = token.as_bytes();
+            while let Some((&byte, tail)) = remaining.split_first() {
+                if byte == b'%' {
+                    let hex = |byte: &u8| char::from(*byte).to_digit(16).map(|digit| digit as u8);
+                    let decoded_byte = tail.first().and_then(hex).zip(tail.get(1).and_then(hex));
+                    let Some((high, low)) = decoded_byte else {
+                        return Err(CliError::usage(
+                            "--id URI contains an invalid percent escape",
+                            None,
+                        ));
+                    };
+                    bytes.push((high << 4) | low);
+                    remaining = &tail[2..];
+                } else {
+                    bytes.push(byte);
+                    remaining = tail;
+                }
+            }
+            String::from_utf8(bytes)
+                .map_err(|_| CliError::usage("--id URI must contain valid UTF-8", None))?
+        } else {
+            token.to_string()
+        };
+        let token = decoded.as_str();
+        let exact = token;
+        let token = token
+            .strip_prefix("ide/")
+            .or_else(|| token.strip_prefix("main/"))
+            .unwrap_or(token);
+        if token.is_empty() || token.chars().any(char::is_control) {
+            return Err(CliError {
+                code: 2,
+                kind: CliErrorKind::Usage.kind_str(),
+                message: "--id requires a nonempty session ID or supported harness URI".into(),
+                hint: Some(
+                    "Use --id <external_id>, --id codex://threads/<id>, or --id conversation://<id>."
+                        .into(),
+                ),
+                retryable: false,
+            });
+        }
+        Ok(Self {
+            requested: requested.to_string(),
+            exact: exact.to_string(),
+            token: token.to_string(),
+            agent,
+        })
+    }
+
+    fn matches(
+        &self,
+        agent: &str,
+        external_id: Option<&str>,
+        source_path: &str,
+    ) -> Option<SessionIdMatch> {
+        if self.agent.is_some_and(|expected| expected != agent) {
+            return None;
+        }
+        let token_eq = |value: &str| {
+            value == self.token
+                || (looks_like_session_uuid(&self.token)
+                    && value.eq_ignore_ascii_case(&self.token))
+        };
+        let file_stem_matches = |value: &str| {
+            let stem = value
+                .strip_suffix(".jsonl.zst")
+                .or_else(|| value.strip_suffix(".jsonl"))
+                .or_else(|| value.strip_suffix(".json"))
+                .unwrap_or(value);
+            token_eq(stem)
+                // Codex rollout and Pi filenames prefix a complete UUID with
+                // a timestamp. Only complete UUID tokens admit this suffix;
+                // opaque IDs must not become substring searches.
+                || (looks_like_session_uuid(&self.token)
+                    && stem.len() > self.token.len()
+                    && stem
+                        .get(stem.len() - self.token.len()..)
+                        .is_some_and(token_eq)
+                    && stem
+                        .as_bytes()
+                        .get(stem.len() - self.token.len() - 1)
+                        .is_some_and(|byte| matches!(byte, b'-' | b'_')))
+        };
+        let kind = if external_id.is_some_and(|id| {
+            id == self.requested
+                || id == self.exact
+                || (looks_like_session_uuid(&self.exact)
+                    && id.eq_ignore_ascii_case(&self.exact))
+        }) {
+            SessionIdMatchKind::ExactExternalId
+        } else if external_id.is_some_and(|id| {
+            token_eq(id) || id.rsplit(['/', '\\']).next().is_some_and(file_stem_matches)
+        }) {
+            SessionIdMatchKind::ExternalIdSuffix
+        } else if source_path == self.requested
+            || source_path.split(['/', '\\']).any(token_eq)
+        {
+            SessionIdMatchKind::SourcePathComponent
+        } else if source_path
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(file_stem_matches)
+        {
+            SessionIdMatchKind::SourceFileStem
+        } else {
+            return None;
+        };
+        Some(SessionIdMatch {
+            requested: self.requested.clone(),
+            normalized: self.token.clone(),
+            kind,
+        })
+    }
+}
+
+fn compare_session_summaries(
+    left: &SessionSummaryRecord,
+    right: &SessionSummaryRecord,
+) -> std::cmp::Ordering {
+    left.id_matches
+        .iter()
+        .map(|matched| matched.kind)
+        .min()
+        .cmp(&right.id_matches.iter().map(|matched| matched.kind).min())
+        .then_with(|| {
+            left.workspace_match_distance
+                .unwrap_or(usize::MAX)
+                .cmp(&right.workspace_match_distance.unwrap_or(usize::MAX))
+        })
+        .then_with(|| right.modified_at.cmp(&left.modified_at))
+        .then_with(|| right.started_at.cmp(&left.started_at))
+        .then_with(|| left.source_path.cmp(&right.source_path))
+        .then_with(|| left.source_id.cmp(&right.source_id))
+        .then_with(|| left.agent.cmp(&right.agent))
+        .then_with(|| left.external_id.cmp(&right.external_id))
 }
 
 fn normalize_session_filter_path(path: &Path) -> CliResult<PathBuf> {
@@ -100686,7 +100918,11 @@ mod path_spelling_tests {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sessions(
+    ids: &[String],
+    agents: &[String],
+    source: Option<&str>,
     workspace: Option<&PathBuf>,
     current: bool,
     limit: Option<usize>,
@@ -100697,12 +100933,19 @@ fn run_sessions(
 ) -> CliResult<()> {
     use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 
-    // Parse flags before opening anything, so a bad value is a usage error
-    // even where no archive exists.
-    let since_ms: Option<i64> = match since {
-        None => None,
-        Some(raw) => Some(parse_search_time_bound("--since", raw, TimeBound::Since)?),
-    };
+    // Validate selectors before opening the archive, including on first run.
+    let since_ms = since
+        .map(|raw| parse_search_time_bound("--since", raw, TimeBound::Since))
+        .transpose()?;
+    let selectors = ids
+        .iter()
+        .map(|id| SessionIdSelector::parse(id))
+        .collect::<CliResult<Vec<_>>>()?;
+    let agents = normalize_agent_filters(agents)?;
+    if let Some(source_id) = source {
+        validate_followup_source_id(source_id, "cass sessions")?;
+    }
+    let source = canonical_followup_source_id(source);
     let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
     let target_workspace = match (workspace, current) {
         (Some(path), _) => Some(normalize_session_filter_path(path)?),
@@ -100712,195 +100955,193 @@ fn run_sessions(
         )?),
         (None, false) => None,
     };
-    // Default to 1 only when --current is the actual workspace source
-    // (i.e., no explicit --workspace was provided).
     let current_determined_workspace = workspace.is_none() && current;
     let effective_limit = match limit {
         Some(0) => None,
         Some(n) => Some(n),
+        // Identity lookup must expose ambiguous candidates instead of choosing
+        // one implicitly. An explicit --limit still bounds the requested page.
+        None if !selectors.is_empty() => None,
         None if current_determined_workspace => Some(1),
         None => Some(10),
     };
-
-    // cass#323: enumerate conversations WITHOUT joining messages. The old
-    // single query LEFT JOINed the full messages table and GROUP BYed over
-    // it just to compute per-session message/human-turn counts, which made
-    // `sessions --limit 5` cost a full corpus aggregation (minutes of CPU
-    // and multi-GB peaks on large indexes). Counts are now backfilled after
-    // limit truncation, so only the N returned sessions ever touch the
-    // messages table (served by the (conversation_id, idx) unique index).
     let since_filter = if since_ms.is_some() {
-        // Sessions whose recorded activity window is unknown (both
-        // timestamps NULL) are retained here and re-checked against file
-        // mtime below, so a legacy undated-but-active session is not
-        // silently dropped by --since.
-        "WHERE COALESCE(c.ended_at, c.started_at) >= ?1
-              OR (c.ended_at IS NULL AND c.started_at IS NULL)"
+        "AND (COALESCE(c.ended_at, c.started_at) >= ?2
+              OR (c.ended_at IS NULL AND c.started_at IS NULL))"
     } else {
         ""
     };
-    let sessions_sql = format!(
-        // LEFT JOIN + COALESCE on agents so list_sessions still reports
-        // legacy conversations with NULL agent_id.
-        "SELECT c.id,
-                COALESCE(a.slug, 'unknown') AS agent_slug,
-                w.path,
-                c.title,
-                c.source_path,
-                COALESCE(c.source_id, 'local'),
-                c.origin_host,
-                s.kind,
-                c.started_at,
-                c.ended_at
-         FROM conversations c
-         LEFT JOIN agents a ON c.agent_id = a.id
-         LEFT JOIN workspaces w ON c.workspace_id = w.id
-         LEFT JOIN sources s ON c.source_id = s.id
-         {since_filter}
-         ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC"
-    );
-    let since_params: Vec<ParamValue> = since_ms.map(ParamValue::from).into_iter().collect();
-    let params: &[ParamValue] = &since_params;
-    #[allow(clippy::type_complexity)]
-    let rows: Vec<(
-        i64,
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-    )> = conn
-        .query_map_collect(&sessions_sql, params, |row: &crate::franken_sync::Row| {
-            Ok((
-                row.get_typed(0)?,
-                row.get_typed(1)?,
-                row.get_typed(2)?,
-                row.get_typed(3)?,
-                row.get_typed(4)?,
-                row.get_typed(5)?,
-                row.get_typed(6)?,
-                row.get_typed(7)?,
-                row.get_typed(8)?,
-                row.get_typed(9)?,
-            ))
-        })
-        .map_err(|e| CliError {
-            code: 9,
-            kind: CliErrorKind::DbQuery.kind_str(),
-            message: format!("Failed to list sessions: {e}"),
-            hint: None,
-            retryable: false,
-        })?;
 
-    let mut sessions: Vec<(i64, bool, SessionSummaryRecord)> = rows
-        .into_iter()
-        .map(
-            |(
-                conversation_id,
-                agent,
-                workspace,
-                title,
-                source_path,
-                source_id,
-                origin_host,
-                origin_kind,
-                started_at,
-                ended_at,
-            )| {
-                let source_path_buf = PathBuf::from(&source_path);
-                let origin_host = normalized_provenance_origin_host(origin_host.as_deref());
-                let source_id = normalized_provenance_source_id(
-                    source_id.as_str(),
-                    origin_kind.as_deref(),
-                    origin_host.as_deref(),
-                );
-                let normalized_origin_kind =
-                    normalized_provenance_origin_kind(source_id.as_str(), origin_kind.as_deref());
-                let metadata =
-                    if normalized_origin_kind == crate::sources::provenance::LOCAL_SOURCE_ID {
-                        std::fs::metadata(&source_path_buf).ok()
-                    } else {
-                        None
-                    };
-                let modified_at = metadata
-                    .as_ref()
-                    .and_then(|m| m.modified().ok())
-                    .map(|ts| chrono::DateTime::<Utc>::from(ts).timestamp_millis());
-
-                let has_recorded_timestamp = started_at.is_some() || ended_at.is_some();
-                (
-                    conversation_id,
-                    has_recorded_timestamp,
-                    SessionSummaryRecord {
-                        agent,
-                        workspace: workspace.map(PathBuf::from),
-                        workspace_match_distance: None,
-                        title,
-                        source_path: source_path_buf,
-                        source_id,
-                        origin_host,
-                        started_at,
-                        modified_at,
-                        size_bytes: metadata.as_ref().map(std::fs::Metadata::len),
-                        message_count: 0,
-                        human_turns: 0,
-                    },
-                )
-            },
-        )
-        .collect();
-
-    if let Some(since_ms) = since_ms {
-        // Rows with a recorded timestamp already satisfied the SQL window
-        // filter. Undated conversations passed it unconditionally; resolve
-        // them against file mtime where one is available. Rows with no
-        // recorded timestamps AND no statable file are kept (fail open:
-        // --since must never hide a session it cannot date).
-        sessions.retain(|(_, has_recorded_timestamp, session)| {
-            if *has_recorded_timestamp {
-                return true;
-            }
-            match session.modified_at {
-                Some(modified_at) => modified_at >= since_ms,
-                None => true,
-            }
-        });
-    }
-
-    if let Some(target) = target_workspace.as_deref() {
-        for (_, _, session) in &mut sessions {
-            session.workspace_match_distance =
-                workspace_match_distance(session.workspace.as_deref(), target);
+    // Read bounded metadata pages, never a messages join or a full archive
+    // allocation. ID matching happens before filesystem stats and message
+    // counts. With a limit, only the best N candidates survive each page.
+    let mut last_id = None;
+    let mut sessions: Vec<(i64, SessionSummaryRecord)> = Vec::new();
+    loop {
+        let comparison = if last_id.is_some() { ">" } else { ">=" };
+        let query = format!(
+            "SELECT c.id,
+                    COALESCE(a.slug, 'unknown'),
+                    w.path,
+                    c.title,
+                    c.source_path,
+                    COALESCE(c.source_id, 'local'),
+                    c.origin_host,
+                    s.kind,
+                    c.started_at,
+                    c.ended_at,
+                    c.external_id
+             FROM conversations c
+             LEFT JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             LEFT JOIN sources s ON c.source_id = s.id
+             WHERE c.id {comparison} ?1 {since_filter}
+             ORDER BY c.id LIMIT 256"
+        );
+        let mut params = vec![ParamValue::from(last_id.unwrap_or(i64::MIN))];
+        if let Some(since_ms) = since_ms {
+            params.push(ParamValue::from(since_ms));
         }
-        sessions.retain(|(_, _, session)| session.workspace_match_distance.is_some());
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        )> = conn
+            .query_map_collect(&query, &params, |row: &crate::franken_sync::Row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                    row.get_typed(4)?,
+                    row.get_typed(5)?,
+                    row.get_typed(6)?,
+                    row.get_typed(7)?,
+                    row.get_typed(8)?,
+                    row.get_typed(9)?,
+                    row.get_typed(10)?,
+                ))
+            })
+            .map_err(|e| CliError {
+                code: 9,
+                kind: CliErrorKind::DbQuery.kind_str(),
+                message: format!("Failed to list sessions: {e}"),
+                hint: None,
+                retryable: false,
+            })?;
+        let full_page = rows.len() == 256;
+        for (
+            conversation_id,
+            agent,
+            workspace,
+            title,
+            source_path,
+            source_id,
+            origin_host,
+            origin_kind,
+            started_at,
+            ended_at,
+            external_id,
+        ) in rows
+        {
+            last_id = Some(conversation_id);
+            if !agents.is_empty() && !agents.contains(&agent) {
+                continue;
+            }
+            let id_matches: Vec<_> = selectors
+                .iter()
+                .filter_map(|selector| {
+                    selector.matches(&agent, external_id.as_deref(), &source_path)
+                })
+                .collect();
+            if !selectors.is_empty() && id_matches.is_empty() {
+                continue;
+            }
+            let origin_host = normalized_provenance_origin_host(origin_host.as_deref());
+            let source_id = normalized_provenance_source_id(
+                source_id.as_str(),
+                origin_kind.as_deref(),
+                origin_host.as_deref(),
+            );
+            if source
+                .as_ref()
+                .is_some_and(|requested| requested != &source_id)
+            {
+                continue;
+            }
+            let workspace = workspace.map(PathBuf::from);
+            let workspace_distance = target_workspace
+                .as_deref()
+                .and_then(|target| workspace_match_distance(workspace.as_deref(), target));
+            if target_workspace.is_some() && workspace_distance.is_none() {
+                continue;
+            }
+            let source_path = PathBuf::from(source_path);
+            let normalized_origin_kind =
+                normalized_provenance_origin_kind(source_id.as_str(), origin_kind.as_deref());
+            let metadata = if normalized_origin_kind == crate::sources::provenance::LOCAL_SOURCE_ID {
+                std::fs::metadata(&source_path).ok()
+            } else {
+                None
+            };
+            let modified_at = metadata
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .map(|ts| chrono::DateTime::<Utc>::from(ts).timestamp_millis());
+
+            // Unknown recorded timestamps remain eligible unless a real file
+            // mtime proves the session falls outside the requested window.
+            if started_at.is_none()
+                && ended_at.is_none()
+                && since_ms
+                    .zip(modified_at)
+                    .is_some_and(|(since, modified)| modified < since)
+            {
+                continue;
+            }
+            sessions.push((
+                conversation_id,
+                SessionSummaryRecord {
+                    agent,
+                    external_id,
+                    id_matches,
+                    workspace,
+                    workspace_match_distance: workspace_distance,
+                    title,
+                    source_path,
+                    source_id,
+                    origin_host,
+                    started_at,
+                    ended_at,
+                    modified_at,
+                    size_bytes: metadata.as_ref().map(std::fs::Metadata::len),
+                    message_count: 0,
+                    human_turns: 0,
+                },
+            ));
+        }
+        if let Some(limit) = effective_limit {
+            sessions.sort_by(|(_, left), (_, right)| compare_session_summaries(left, right));
+            sessions.truncate(limit);
+        }
+        if !full_page {
+            break;
+        }
     }
+    sessions.sort_by(|(_, left), (_, right)| compare_session_summaries(left, right));
 
-    sessions.sort_by(|(_, _, left), (_, _, right)| {
-        left.workspace_match_distance
-            .unwrap_or(usize::MAX)
-            .cmp(&right.workspace_match_distance.unwrap_or(usize::MAX))
-            .then_with(|| right.modified_at.cmp(&left.modified_at))
-            .then_with(|| right.started_at.cmp(&left.started_at))
-            .then_with(|| left.source_path.cmp(&right.source_path))
-    });
-
-    if let Some(limit) = effective_limit {
-        sessions.truncate(limit);
-    }
-
-    // Backfill message/human-turn counts for the surviving sessions only.
-    // Deliberately NOT a SQL aggregate: the frankensqlite planner executes
-    // `SELECT COUNT(..) WHERE conversation_id = ?` as a full messages-table
-    // scan even under an INDEXED BY hint (verified via live backtraces on a
-    // 26 GB index). The plain indexed row-fetch shape below is the same one
-    // the hot per-conversation message paths use (see the EXPLAIN QUERY
-    // PLAN contract test in storage::sqlite), so each lookup is an indexed
-    // range scan on messages(conversation_id, idx) and the roles are
-    // tallied in Rust — cost scales with the returned page, not the corpus.
+    // Count only returned sessions through the per-conversation index.
+    // A SQL COUNT/aggregate here can scan the entire messages table in
+    // FrankenSQLite; role reads retain the existing indexed range shape.
     let count_session_messages =
         |conversation_id: i64| -> Result<(i64, i64), crate::franken_sync::FrankenError> {
             let roles: Vec<String> = conn.query_map_collect(
@@ -100914,9 +101155,13 @@ fn run_sessions(
             let human_turns = roles.iter().filter(|role| role.as_str() == "user").count() as i64;
             Ok((message_count, human_turns))
         };
-    let sessions: Vec<SessionSummaryRecord> = sessions
+    let timestamp = |ts: Option<i64>| {
+        ts.and_then(chrono::DateTime::<Utc>::from_timestamp_millis)
+            .map(|dt| dt.to_rfc3339())
+    };
+    let entries: Vec<SessionSummaryEntry> = sessions
         .into_iter()
-        .map(|(conversation_id, _, mut session)| {
+        .map(|(conversation_id, mut session)| {
             let (message_count, human_turns) =
                 count_session_messages(conversation_id).map_err(|e| CliError {
                     code: 9,
@@ -100927,29 +101172,27 @@ fn run_sessions(
                 })?;
             session.message_count = message_count;
             session.human_turns = human_turns;
-            Ok(session)
+            Ok(SessionSummaryEntry {
+                conversation_id,
+                path: session.source_path.to_string_lossy().into_owned(),
+                workspace: session
+                    .workspace
+                    .map(|path| path.to_string_lossy().into_owned()),
+                agent: session.agent,
+                external_id: session.external_id,
+                id_matches: session.id_matches,
+                title: session.title,
+                source_id: session.source_id,
+                origin_host: session.origin_host,
+                modified: timestamp(session.modified_at),
+                started_at: timestamp(session.started_at),
+                ended_at: timestamp(session.ended_at),
+                size_bytes: session.size_bytes,
+                message_count: session.message_count,
+                human_turns: session.human_turns,
+            })
         })
         .collect::<CliResult<Vec<_>>>()?;
-
-    let entries: Vec<SessionSummaryEntry> = sessions
-        .into_iter()
-        .map(|session| SessionSummaryEntry {
-            path: session.source_path.to_string_lossy().into_owned(),
-            workspace: session
-                .workspace
-                .map(|path| path.to_string_lossy().into_owned()),
-            agent: session.agent,
-            title: session.title,
-            source_id: session.source_id,
-            origin_host: session.origin_host,
-            modified: session.modified_at.and_then(|ts| {
-                chrono::DateTime::<Utc>::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
-            }),
-            size_bytes: session.size_bytes,
-            message_count: session.message_count,
-            human_turns: session.human_turns,
-        })
-        .collect();
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
@@ -100958,26 +101201,29 @@ fn run_sessions(
             fmt
         }
     });
-
     if let Some(fmt) = structured_format {
-        let payload = serde_json::json!({ "sessions": entries });
-        return output_structured_value(payload, fmt);
+        return output_structured_value(serde_json::json!({ "sessions": entries }), fmt);
     }
 
-    if let Some(target) = target_workspace {
+    if !selectors.is_empty() {
+        println!("Matching Sessions");
+    } else if let Some(target) = target_workspace {
         println!("Sessions for {}", target.display());
     } else {
         println!("Recent Sessions");
     }
     println!("{}", "─".repeat(72));
-
     if entries.is_empty() {
         println!("  No sessions found.");
         return Ok(());
     }
-
     for (idx, session) in entries.iter().enumerate() {
-        let modified = session.modified.as_deref().unwrap_or("-");
+        let modified = session
+            .modified
+            .as_deref()
+            .or(session.ended_at.as_deref())
+            .or(session.started_at.as_deref())
+            .unwrap_or("-");
         let workspace = session.workspace.as_deref().unwrap_or("-");
         let source_label = session
             .origin_host
@@ -100991,11 +101237,13 @@ fn run_sessions(
             session.message_count,
             session.human_turns
         );
+        if let Some(external_id) = session.external_id.as_deref() {
+            println!("    id: {}", external_id);
+        }
         println!("    workspace: {}", workspace);
         println!("    source: {}", source_label);
         println!("    path: {}", session.path);
     }
-
     Ok(())
 }
 
@@ -108011,18 +108259,37 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                     "items": {
                         "type": "object",
                         "properties": {
+                            "conversation_id": { "type": "integer" },
                             "path": { "type": "string" },
                             "workspace": { "type": ["string", "null"] },
                             "agent": { "type": "string" },
+                            "external_id": { "type": ["string", "null"] },
+                            "id_matches": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "requested": { "type": "string" },
+                                        "normalized": { "type": "string" },
+                                        "kind": {
+                                            "type": "string",
+                                            "enum": ["exact_external_id", "external_id_suffix", "source_path_component", "source_file_stem"]
+                                        }
+                                    },
+                                    "required": ["requested", "normalized", "kind"]
+                                }
+                            },
                             "title": { "type": ["string", "null"] },
                             "source_id": { "type": "string" },
                             "origin_host": { "type": ["string", "null"] },
                             "modified": { "type": ["string", "null"] },
+                            "started_at": { "type": ["string", "null"] },
+                            "ended_at": { "type": ["string", "null"] },
                             "size_bytes": { "type": ["integer", "null"] },
                             "message_count": { "type": "integer" },
                             "human_turns": { "type": "integer" }
                         },
-                        "required": ["path", "agent", "source_id", "message_count", "human_turns"]
+                        "required": ["conversation_id", "path", "agent", "external_id", "source_id", "started_at", "ended_at", "message_count", "human_turns"]
                     }
                 }
             },

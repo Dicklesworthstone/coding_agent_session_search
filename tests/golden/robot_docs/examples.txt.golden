@@ -46,6 +46,8 @@ examples:
 
 # Discover session files for follow-up actions
   cass sessions --current --json             # best match for current cwd
+  cass sessions --id codex://threads/<uuid> --json # resolve a native thread link
+  cass sessions --id cron_abcd_20260101_120000 --source local --json
   cass sessions --workspace /myproject --json --limit 5
 
 # Follow up on search results

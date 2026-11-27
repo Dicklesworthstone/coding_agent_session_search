@@ -2268,8 +2268,31 @@
     },
     {
       "name": "sessions",
-      "description": "List recent sessions, with optional workspace/current-session filtering",
+      "description": "List recent sessions or resolve exact session IDs and harness URIs",
       "arguments": [
+        {
+          "name": "id",
+          "description": "Resolve an external session ID or URI (repeatable; matches metadata, not message text)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "agent",
+          "description": "Filter to this agent/provider (repeatable)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "source",
+          "description": "Exact source_id from search output (e.g. 'local', 'work-laptop')",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
         {
           "name": "workspace",
           "description": "Filter to sessions for this workspace/project directory",
@@ -2290,7 +2313,7 @@
         },
         {
           "name": "limit",
-          "description": "Maximum sessions to return (defaults: 10, or 1 with --current)",
+          "description": "Maximum sessions to return (defaults: all ID matches, otherwise 10, or 1 with --current)",
           "arg_type": "option",
           "value_type": "integer",
           "required": false

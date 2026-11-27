@@ -4131,6 +4131,391 @@ fn sessions_current_prefers_closest_workspace_over_newer_parent_workspace() {
     );
 }
 
+// GH579: identity lookup uses canonical metadata, not transcript search.
+fn session_lookup_results(home: &Path, data_dir: &Path, selectors: &[&str]) -> Value {
+    let mut cmd = base_cmd(home);
+    cmd.args(["sessions", "--json", "--data-dir"])
+        .arg(data_dir)
+        .args(selectors);
+    let output = cmd.assert().success().get_output().clone();
+    serde_json::from_slice(&output.stdout).expect("session lookup JSON")
+}
+
+fn seed_session_lookup_identities(temp: &TempDir) -> PathBuf {
+    let data_dir = temp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(
+        &data_dir.join("agent_search.db"),
+    )
+    .unwrap();
+    let workspace = temp.path().join("project");
+    let workspace_id = storage.ensure_workspace(&workspace, None).unwrap();
+    let identities = [
+        (
+            "antigravity",
+            "ide/11111111-1111-4111-8111-111111111111",
+            "/fixture/brain/11111111-1111-4111-8111-111111111111/logs/transcript.jsonl",
+        ),
+        (
+            "codex",
+            r"2026\01\01\rollout-2026-01-01T12-00-00-22222222-2222-4222-8222-222222222222",
+            r"C:\Users\fixture\.codex\sessions\2026\01\01\rollout-2026-01-01T12-00-00-22222222-2222-4222-8222-222222222222.jsonl",
+        ),
+        (
+            "claude_code",
+            r"project\33333333-3333-4333-8333-333333333333.jsonl",
+            "/fixture/claude/33333333-3333-4333-8333-333333333333.jsonl",
+        ),
+        (
+            "copilot",
+            "44444444-4444-4444-8444-444444444444",
+            "/fixture/copilot/opaque.log",
+        ),
+        (
+            "openclaw",
+            "main/55555555-5555-4555-8555-555555555555",
+            "/fixture/openclaw/opaque.log",
+        ),
+        (
+            "pi_agent",
+            "66666666-6666-4666-8666-666666666666",
+            "/fixture/pi/opaque.log",
+        ),
+        (
+            "hermes",
+            "cron_abcd_20260101_120000",
+            "/fixture/hermes/state.db/opaque",
+        ),
+        ("devin", "quiet-otter", "/fixture/devin/sessions.db/opaque"),
+        (
+            "zcode",
+            "sess_77777777-7777-4777-8777-777777777777",
+            "/fixture/zcode/db.sqlite/opaque",
+        ),
+        (
+            "gemini",
+            "component-only",
+            "/fixture/brain/88888888-8888-4888-8888-888888888888/logs/transcript.jsonl",
+        ),
+        (
+            "codex",
+            "filename-only",
+            "/fixture/rollout-2026-01-01T12-00-00-99999999-9999-4999-8999-999999999999.jsonl.zst",
+        ),
+        ("hermes", "literal%_id", "/fixture/hermes/literal"),
+        (
+            "copilot",
+            "22222222-2222-4222-8222-222222222222",
+            "/fixture/copilot/same-id",
+        ),
+        ("codex", "unrelated", "/fixture/unrelated.jsonl"),
+    ];
+    for (index, (agent, external_id, source_path)) in identities.into_iter().enumerate() {
+        let agent_id = storage.ensure_agent(&sample_agent(agent, agent)).unwrap();
+        let ts = 1_700_000_000_000 + index as i64;
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                Some(workspace_id),
+                &sample_conversation(
+                    agent,
+                    &workspace,
+                    Path::new(source_path),
+                    external_id,
+                    // Even a quoted ID in a title and message must not match.
+                    "Quoted aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    ts,
+                    vec![sample_message(
+                        0,
+                        MessageRole::User,
+                        ts,
+                        "I quoted aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa and literalZZid",
+                    )],
+                ),
+            )
+            .unwrap();
+    }
+    drop(storage);
+    data_dir
+}
+
+#[test]
+fn sessions_id_resolves_native_uri_and_cross_platform_identity_shapes() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = seed_session_lookup_identities(&tmp);
+    let cases = [
+        (
+            "11111111-1111-4111-8111-111111111111",
+            "antigravity",
+            "external_id_suffix",
+        ),
+        (
+            "codex://threads/22222222-2222-4222-8222-222222222222",
+            "codex",
+            "external_id_suffix",
+        ),
+        (
+            "conversation://33333333-3333-4333-8333-333333333333",
+            "claude_code",
+            "external_id_suffix",
+        ),
+        (
+            "44444444-4444-4444-8444-444444444444",
+            "copilot",
+            "exact_external_id",
+        ),
+        (
+            "main/55555555-5555-4555-8555-555555555555",
+            "openclaw",
+            "exact_external_id",
+        ),
+        (
+            "66666666-6666-4666-8666-666666666666",
+            "pi_agent",
+            "exact_external_id",
+        ),
+        ("cron_abcd_20260101_120000", "hermes", "exact_external_id"),
+        ("quiet-otter", "devin", "exact_external_id"),
+        (
+            "sess_77777777-7777-4777-8777-777777777777",
+            "zcode",
+            "exact_external_id",
+        ),
+        (
+            "88888888-8888-4888-8888-888888888888",
+            "gemini",
+            "source_path_component",
+        ),
+        (
+            "99999999-9999-4999-8999-999999999999",
+            "codex",
+            "source_file_stem",
+        ),
+        ("literal%_id", "hermes", "exact_external_id"),
+        ("conversation://literal%25_id", "hermes", "exact_external_id"),
+    ];
+    for (query, agent, kind) in cases {
+        let result = session_lookup_results(tmp.path(), &data_dir, &["--id", query]);
+        let entries = result["sessions"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{query}: {result}");
+        let entry = &entries[0];
+        assert_eq!(entry["agent"], agent, "{query}");
+        assert_eq!(entry["id_matches"][0]["kind"], kind, "{query}");
+        assert_eq!(entry["id_matches"][0]["requested"], query);
+        assert!(entry["external_id"].is_string());
+        assert!(entry["conversation_id"].as_i64().unwrap() > 0);
+        assert_eq!(entry["source_id"], "local");
+        assert!(entry["started_at"].is_string());
+        assert!(entry["ended_at"].is_string());
+        assert_eq!(entry["message_count"], 1);
+    }
+    for query in [
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "quiet",
+        "abcd",
+        "22222222-2222",
+        "literal%",
+        "literal_",
+    ] {
+        let result = session_lookup_results(tmp.path(), &data_dir, &["--id", query]);
+        assert_eq!(result["sessions"], json!([]), "{query}: {result}");
+    }
+    let incompatible = session_lookup_results(
+        tmp.path(),
+        &data_dir,
+        &[
+            "--id",
+            "codex://threads/22222222-2222-4222-8222-222222222222",
+            "--agent",
+            "copilot",
+        ],
+    );
+    assert_eq!(incompatible["sessions"], json!([]));
+    let union = session_lookup_results(
+        tmp.path(),
+        &data_dir,
+        &[
+            "--id",
+            "quiet-otter",
+            "--session-id",
+            "cron_abcd_20260101_120000",
+        ],
+    );
+    assert_eq!(union["sessions"].as_array().unwrap().len(), 2);
+    let recent = session_lookup_results(
+        tmp.path(),
+        &data_dir,
+        &["--id", "quiet-otter", "--since", "2025-01-01"],
+    );
+    assert_eq!(recent["sessions"], json!([]));
+    let historical = session_lookup_results(
+        tmp.path(),
+        &data_dir,
+        &["--id", "quiet-otter", "--since", "2020-01-01"],
+    );
+    assert_eq!(historical["sessions"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn sessions_id_exposes_ambiguity_and_ranks_exact_matches_before_limits() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(
+        &data_dir.join("agent_search.db"),
+    )
+    .unwrap();
+    let workspace = tmp.path().join("project");
+    fs::create_dir_all(&workspace).unwrap();
+    let workspace_id = storage.ensure_workspace(&workspace, None).unwrap();
+    let agent_id = storage.ensure_agent(&sample_agent("hermes", "Hermes")).unwrap();
+    storage
+        .upsert_source(&coding_agent_search::sources::provenance::Source::remote(
+            "work-laptop",
+            "user@work-laptop",
+        ))
+        .unwrap();
+    for index in 0..14 {
+        let external_id = if index == 0 {
+            "ambiguous".to_string()
+        } else {
+            format!("branch-{index}/ambiguous.jsonl")
+        };
+        let mut conversation = sample_conversation(
+            "hermes",
+            &workspace,
+            &tmp.path().join(format!("session-{index}.jsonl")),
+            &external_id,
+            "Ambiguous session",
+            1_700_000_000_000 + index,
+            vec![],
+        );
+        if index == 13 {
+            conversation.source_id = "work-laptop".into();
+            conversation.origin_host = Some("work-laptop".into());
+        }
+        storage
+            .insert_conversation_tree(agent_id, Some(workspace_id), &conversation)
+            .unwrap();
+    }
+    drop(storage);
+    let all = session_lookup_results(tmp.path(), &data_dir, &["--id", "ambiguous"]);
+    assert_eq!(all["sessions"].as_array().unwrap().len(), 14);
+    assert_eq!(all["sessions"][0]["external_id"], "ambiguous");
+    let first = session_lookup_results(
+        tmp.path(),
+        &data_dir,
+        &["--id", "ambiguous", "--limit", "1"],
+    );
+    assert_eq!(first["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(first["sessions"][0]["external_id"], "ambiguous");
+    let remote = session_lookup_results(
+        tmp.path(),
+        &data_dir,
+        &["--id", "ambiguous", "--source", "work-laptop"],
+    );
+    assert_eq!(remote["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(remote["sessions"][0]["source_id"], "work-laptop");
+    let mut current = base_cmd(tmp.path());
+    current.current_dir(&workspace).args([
+        "sessions",
+        "--current",
+        "--id",
+        "ambiguous",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+    let output = current.assert().success().get_output().clone();
+    let current: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        current["sessions"].as_array().unwrap().len(),
+        14,
+        "--current must not silently choose one ambiguous ID match"
+    );
+}
+
+#[test]
+fn sessions_id_paging_reaches_matches_after_nonmatching_pages() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(
+        &data_dir.join("agent_search.db"),
+    )
+    .unwrap();
+    let workspace = tmp.path().join("project");
+    let workspace_id = storage.ensure_workspace(&workspace, None).unwrap();
+    let agent_id = storage.ensure_agent(&sample_agent("hermes", "Hermes")).unwrap();
+    for index in 0..260 {
+        let external_id = if index == 259 {
+            "page-two-needle".to_string()
+        } else {
+            format!("distractor-{index}")
+        };
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                Some(workspace_id),
+                &sample_conversation(
+                    "hermes",
+                    &workspace,
+                    &tmp.path().join(format!("session-{index}.jsonl")),
+                    &external_id,
+                    "page-two-needle quoted in the title",
+                    1_700_000_000_000 + index,
+                    vec![],
+                ),
+            )
+            .unwrap();
+    }
+    drop(storage);
+    let result = session_lookup_results(
+        tmp.path(),
+        &data_dir,
+        &["--id", "page-two-needle", "--limit", "1"],
+    );
+    assert_eq!(result["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(result["sessions"][0]["external_id"], "page-two-needle");
+    assert_eq!(result["sessions"][0]["message_count"], 0);
+}
+
+#[test]
+fn sessions_id_rejects_empty_uri_before_opening_archive() {
+    let tmp = TempDir::new().unwrap();
+    for id in ["", " ", "codex://threads/", "conversation://", "main/"] {
+        let mut cmd = base_cmd(tmp.path());
+        cmd.args(["sessions", "--id", id, "--json"]);
+        cmd.assert()
+            .code(2)
+            .stderr(contains("nonempty session ID"));
+    }
+    for id in ["conversation://broken%", "codex://threads/%ff"] {
+        let mut cmd = base_cmd(tmp.path());
+        cmd.args(["sessions", "--id", id, "--json"]);
+        cmd.assert().code(2).stderr(contains("--id URI"));
+    }
+}
+
+#[test]
+fn sessions_id_rejects_ambiguous_source_before_opening_archive() {
+    let tmp = TempDir::new().unwrap();
+    for source in ["", " ", "all", "remote", " REMOTE "] {
+        let mut cmd = base_cmd(tmp.path());
+        cmd.args([
+            "sessions",
+            "--id",
+            "native-id",
+            "--source",
+            source,
+            "--json",
+        ]);
+        cmd.assert()
+            .code(2)
+            .stderr(contains("cass sessions requires an exact source_id"));
+    }
+}
+
 #[test]
 fn parse_export_with_format() {
     let cli = parse_cli_ok(

@@ -65787,6 +65787,14 @@
                         "properties": {
                           "type": "object",
                           "properties": {
+                            "conversation_id": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string"
+                                }
+                              }
+                            },
                             "path": {
                               "type": "object",
                               "properties": {
@@ -65811,6 +65819,74 @@
                               "properties": {
                                 "type": {
                                   "type": "string"
+                                }
+                              }
+                            },
+                            "external_id": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                }
+                              }
+                            },
+                            "id_matches": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string"
+                                },
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "requested": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "normalized": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "kind": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "enum": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "required": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
                                 }
                               }
                             },
@@ -65845,6 +65921,28 @@
                               }
                             },
                             "modified": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                }
+                              }
+                            },
+                            "started_at": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                }
+                              }
+                            },
+                            "ended_at": {
                               "type": "object",
                               "properties": {
                                 "type": {

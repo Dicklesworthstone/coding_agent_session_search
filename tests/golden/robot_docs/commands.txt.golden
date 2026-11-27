@@ -59,7 +59,10 @@ commands:
     last_completed_at_ms is the start watermark of the last successfully completed scan; age is measured from that start.
     An overdue scan recommends cass index on an otherwise healthy archive; CASS_AUTO_REFRESH_SOURCE_SCAN_SECS defaults to 300, and 0 disables the age check.
   cass diag [--json] [--verbose] [--data-dir DIR]
-  cass sessions [--workspace DIR] [--current] [--limit N] [--since WHEN] [--json]
+  cass sessions [--id ID_OR_URI] [--agent AGENT] [--source SOURCE] [--workspace DIR] [--current] [--limit N] [--since WHEN] [--json]
+    Repeat --id (alias --session-id) for a union. Matches external_id and whole path components/file stems, never message text; exact external IDs rank first.
+    ID lookups return all ambiguous candidates unless --limit is explicit. JSON includes conversation_id, external_id, source_id, timestamps and id_matches with the applied rule.
+    codex://threads/<id> scopes to Codex; conversation://<id> is provider-neutral. Preserve non-UUID IDs verbatim; --agent and --source intersect the lookup.
   cass view <path> [-n LINE] [-C CONTEXT] [--json]
   cass index [--full] [--watch] [--json] [--robot-trace-ingest] [--data-dir DIR]
                     In --json mode, NDJSON events stream on stderr:
