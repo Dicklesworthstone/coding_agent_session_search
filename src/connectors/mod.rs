@@ -332,6 +332,10 @@ fn copilot_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(copilot::CopilotConnector::new())
 }
 
+fn antigravity_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(antigravity::AntigravityConnector::new())
+}
+
 /// Return connector factories with CASS-specific wrappers applied.
 ///
 /// Codex passes through CASS's enrichment wrapper so modern `function_call`
@@ -343,6 +347,8 @@ fn copilot_connector_factory() -> Box<dyn Connector + Send> {
 /// native chat stores, which the upstream scanner reads but never detected.
 /// Codebuff delegates parsing to FAD while adding per-transcript checkpoints.
 /// Continue applies source exclusions and ledger-first retries before parsing.
+/// Antigravity admits explicitly selected primary transcript files without
+/// widening their scope beyond the owning conversation.
 #[must_use]
 pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
     get_connector_registrations()
@@ -396,6 +402,7 @@ pub(crate) fn get_connector_registrations() -> Vec<source_dependencies::Connecto
                     .with_source_capability::<pi_agent::PiAgentConnector>("pi_agent"),
                 "grok_bot" => ConnectorRegistration::new(name, grok_bot_connector_factory),
                 "copilot" => ConnectorRegistration::new(name, copilot_connector_factory),
+                "antigravity" => ConnectorRegistration::new(name, antigravity_connector_factory),
                 _ => ConnectorRegistration::new(name, factory),
             };
             registration.factory = openclaw::with_wal_freshness(name, registration.factory);
