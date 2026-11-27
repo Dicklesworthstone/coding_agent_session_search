@@ -33835,6 +33835,114 @@ where
     }
 }
 
+/// Load and run the optional reranker as one operation so a caller's deadline
+/// also covers cold model loading, daemon attestation and local fallback.
+/// Budgeted callers must disable daemon spawning before entering a worker.
+fn search_rerank_scores(
+    query: &str,
+    docs: &[String],
+    data_dir: &Path,
+    daemon_embedder_id: Option<&str>,
+    use_daemon: bool,
+    auto_spawn_daemon: bool,
+) -> Option<Vec<f32>> {
+    use crate::search::fastembed_reranker::{FastEmbedReranker, LazyFastEmbedReranker};
+    use crate::search::reranker::{Reranker, rerank_texts};
+    use std::sync::Arc;
+
+    if docs.iter().any(String::is_empty) {
+        tracing::debug!("Skipping rerank: one or more hits have empty content and snippet");
+        return None;
+    }
+    maybe_test_search_worker_delay("CASS_TEST_SEARCH_RERANK_SLOW_MS");
+
+    let local_reranker: Option<Arc<dyn Reranker>> = if use_daemon {
+        Some(Arc::new(LazyFastEmbedReranker::new(data_dir)))
+    } else {
+        let model_dir = FastEmbedReranker::default_model_dir(data_dir);
+        match FastEmbedReranker::load_from_dir(&model_dir) {
+            Ok(reranker) => Some(Arc::new(reranker)),
+            Err(error) => {
+                tracing::debug!(error = %error, "Reranker not available, skipping rerank");
+                None
+            }
+        }
+    };
+
+    let reranker: Option<Arc<dyn Reranker>> = if use_daemon {
+        #[cfg(unix)]
+        {
+            let config = crate::search::daemon_client::DaemonRetryConfig::from_env();
+            let daemon = if auto_spawn_daemon {
+                crate::daemon::client::connect_or_spawn_for_embedder(
+                    daemon_embedder_id.unwrap_or(
+                        crate::search::fastembed_embedder::FastEmbedder::embedder_id_static(),
+                    ),
+                    data_dir,
+                )
+                .ok()
+            } else {
+                crate::daemon::client::try_connect_for_data_dir(data_dir)
+            };
+            match daemon {
+                Some(daemon) => match daemon.attestation_channel(data_dir) {
+                    Ok((connection, verifier)) => {
+                        let daemon: Arc<dyn crate::search::daemon_client::DaemonClient> = daemon;
+                        match crate::search::daemon_client::DaemonFallbackReranker::new_verified(
+                            daemon,
+                            local_reranker.clone(),
+                            config,
+                            connection,
+                            verifier,
+                        ) {
+                            Ok(reranker) => Some(Arc::new(reranker) as Arc<dyn Reranker>),
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    "Daemon reranker attestation was rejected"
+                                );
+                                local_reranker
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "Daemon reranker attestation channel could not be established"
+                        );
+                        local_reranker
+                    }
+                },
+                None => local_reranker,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (daemon_embedder_id, auto_spawn_daemon);
+            local_reranker
+        }
+    } else {
+        local_reranker
+    };
+
+    let reranker = reranker?;
+    let doc_refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+    match rerank_texts(&*reranker, query, &doc_refs) {
+        Ok(scores) => {
+            tracing::debug!(
+                reranker_id = reranker.id(),
+                hits_reranked = scores.len(),
+                "Reranking complete"
+            );
+            Some(scores)
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "Reranking failed, returning original results");
+            None
+        }
+    }
+}
+
 fn search_timeout_error(budget_ms: u64, phase: &str) -> CliError {
     CliError {
         code: 10,
@@ -35725,164 +35833,70 @@ fn run_cli_search(
         maybe_test_search_delay();
     }
 
-    // Apply reranking if enabled (bd-2t2d)
+    // Apply reranking if enabled (bd-2t2d). Loading and inference share the
+    // original deadline; completed evidence stays usable if reranking stalls.
     let rerank_start = Instant::now();
     let rerank_budget_available = search_budget
         .as_ref()
         .is_none_or(|budget| budget.is_healthy());
-    let result = if semantic_opts.rerank && !rerank_budget_available {
+    let mut result = result;
+    if semantic_opts.rerank && !rerank_budget_available {
         skipped_sections.push("reranking".to_string());
-        result
     } else if semantic_opts.rerank && !result.hits.is_empty() {
-        use crate::search::fastembed_reranker::{FastEmbedReranker, LazyFastEmbedReranker};
-        use crate::search::reranker::{Reranker, rerank_texts};
-
-        let local_reranker: Option<Arc<dyn Reranker>> = if semantic_opts.use_daemon {
-            Some(Arc::new(LazyFastEmbedReranker::new(&data_dir)))
-        } else {
-            let model_dir = FastEmbedReranker::default_model_dir(&data_dir);
-            match FastEmbedReranker::load_from_dir(&model_dir) {
-                Ok(reranker) => Some(Arc::new(reranker)),
-                Err(e) => {
-                    tracing::debug!(error = %e, "Reranker not available, skipping rerank");
+        // Keep the completed search evidence on the caller. The worker returns
+        // only scores, so a timeout cannot discard hits or partially change
+        // their scores/order.
+        let docs: Vec<String> = result
+            .hits
+            .iter()
+            .map(|hit| {
+                if hit.content.is_empty() {
+                    hit.snippet.clone()
+                } else {
+                    hit.content.clone()
+                }
+            })
+            .collect();
+        let worker_query = query.to_string();
+        let worker_data_dir = data_dir.clone();
+        let use_daemon = semantic_opts.use_daemon;
+        // A timed-out worker must never leave a newly spawned persistent daemon.
+        let auto_spawn_daemon = semantic_opts.auto_spawn_daemon && search_budget.is_none();
+        let rerank = move || {
+            Ok(search_rerank_scores(
+                &worker_query,
+                &docs,
+                &worker_data_dir,
+                daemon_embedder_id_for_rerank.as_deref(),
+                use_daemon,
+                auto_spawn_daemon,
+            ))
+        };
+        let scores = if let Some(budget) = search_budget.as_ref() {
+            match run_read_only_search_worker(budget.remaining_ms(), rerank)? {
+                Some(scores) => scores,
+                None => {
+                    if effective_robot.is_none() {
+                        return Err(search_timeout_error(budget.total_ms(), "during reranking"));
+                    }
+                    skipped_sections.push("reranking".to_string());
                     None
                 }
             }
-        };
-
-        let reranker: Option<Arc<dyn Reranker>> = if semantic_opts.use_daemon {
-            #[cfg(unix)]
-            {
-                let config = crate::search::daemon_client::DaemonRetryConfig::from_env();
-                // A budgeted (structured) search never spawns a persistent
-                // daemon, for reranking any more than for embedding; it uses
-                // one that is already running (2l1b0.68).
-                let daemon = if semantic_opts.auto_spawn_daemon && search_budget.is_none() {
-                    crate::daemon::client::connect_or_spawn_for_embedder(
-                        daemon_embedder_id_for_rerank.as_deref().unwrap_or(
-                            crate::search::fastembed_embedder::FastEmbedder::embedder_id_static(),
-                        ),
-                        &data_dir,
-                    )
-                    .ok()
-                } else {
-                    crate::daemon::client::try_connect_for_data_dir(&data_dir)
-                };
-                match daemon {
-                    Some(daemon) => match daemon.attestation_channel(&data_dir) {
-                        Ok((connection, verifier)) => {
-                            let daemon: Arc<dyn crate::search::daemon_client::DaemonClient> =
-                                daemon;
-                            match crate::search::daemon_client::DaemonFallbackReranker::new_verified(
-                                daemon,
-                                local_reranker.clone(),
-                                config,
-                                connection,
-                                verifier,
-                            ) {
-                                Ok(reranker) => Some(Arc::new(reranker) as Arc<dyn Reranker>),
-                                Err(error) => {
-                                    tracing::warn!(
-                                        error = %error,
-                                        "Daemon reranker attestation was rejected"
-                                    );
-                                    local_reranker
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                error = %error,
-                                "Daemon reranker attestation channel could not be established"
-                            );
-                            local_reranker
-                        }
-                    },
-                    None => local_reranker,
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                // Only the Unix daemon reranks with the search's embedder.
-                let _ = daemon_embedder_id_for_rerank;
-                local_reranker
-            }
         } else {
-            local_reranker
+            rerank()?
         };
-
-        if let Some(reranker) = reranker {
-            // Extract content from hits for reranking (use snippet if content is empty)
-            let docs: Vec<String> = result
-                .hits
-                .iter()
-                .map(|hit| {
-                    if hit.content.is_empty() {
-                        hit.snippet.clone()
-                    } else {
-                        hit.content.clone()
-                    }
-                })
-                .collect();
-
-            // Skip reranking if any document is empty (reranker rejects empty docs)
-            let has_empty_doc = docs.iter().any(|d| d.is_empty());
-            if has_empty_doc {
-                tracing::debug!("Skipping rerank: one or more hits have empty content and snippet");
-                result
-            } else {
-                let doc_refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
-
-                match rerank_texts(&*reranker, query, &doc_refs) {
-                    Ok(scores) => {
-                        // Update scores and re-sort hits
-                        let mut scored_hits: Vec<_> = result
-                            .hits
-                            .into_iter()
-                            .zip(scores)
-                            .map(|(mut hit, score)| {
-                                hit.score = score;
-                                hit
-                            })
-                            .collect();
-                        scored_hits.sort_by(|a, b| {
-                            b.score
-                                .partial_cmp(&a.score)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-
-                        tracing::debug!(
-                            reranker_id = reranker.id(),
-                            hits_reranked = scored_hits.len(),
-                            "Reranking complete"
-                        );
-
-                        crate::search::query::SearchResult {
-                            hits: scored_hits,
-                            wildcard_fallback: result.wildcard_fallback,
-                            cache_stats: result.cache_stats,
-                            suggestions: result.suggestions,
-                            ann_stats: result.ann_stats,
-                            ann_unavailable_reason: result.ann_unavailable_reason,
-                            title_search: result.title_search,
-                            total_count: result.total_count,
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Reranking failed, returning original results"
-                        );
-                        result
-                    }
-                }
+        if let Some(scores) = scores {
+            for (hit, score) in result.hits.iter_mut().zip(scores) {
+                hit.score = score;
             }
-        } else {
-            result
+            result.hits.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
-    } else {
-        result
-    };
+    }
     // Track reranking time (0 if not applied) (T7.4)
     let rerank_ms = if semantic_opts.rerank {
         rerank_start.elapsed().as_millis() as u64

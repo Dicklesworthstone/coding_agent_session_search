@@ -165,6 +165,7 @@ fn human_read_only_search_command(data_dir: &Path, config_root: &Path) -> Comman
         "CASS_TEST_SEARCH_SETUP_SLOW_MS",
         "CASS_TEST_SEARCH_SEMANTIC_SETUP_SLOW_MS",
         "CASS_TEST_SEARCH_DIRECT_SEMANTIC_SETUP_SLOW_MS",
+        "CASS_TEST_SEARCH_RERANK_SLOW_MS",
         "CASS_TEST_SEARCH_META_SLOW_MS",
         "CASS_TEST_SEARCH_TRUST_SLOW_MS",
         "CASS_TEST_SEMANTIC_DISPATCH_BUDGET_PHASE",
@@ -297,6 +298,169 @@ fn human_search_explicit_zero_timeout_overrides_a_positive_default() -> TestResu
     ensure(
         started.elapsed() >= Duration::from_millis(150),
         "zero-timeout positive control did not execute the slow search",
+    )
+}
+
+#[test]
+fn timed_out_search_reranking_keeps_hits_and_sessions_fail_closed() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    util::prepare_copied_search_fixture(&data_dir)?;
+    let baseline_started = Instant::now();
+    let baseline = human_read_only_search_command(&data_dir, tmp.path())
+        .args(["--mode", "lexical", "--json"])
+        .timeout(Duration::from_secs(90))
+        .output()?;
+    let baseline_ms = u64::try_from(baseline_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    ensure(
+        baseline.status.success(),
+        format!(
+            "reranking deadline baseline failed: status={}; stderr={}",
+            baseline.status,
+            String::from_utf8_lossy(&baseline.stderr)
+        ),
+    )?;
+    let baseline: serde_json::Value = serde_json::from_slice(&baseline.stdout)?;
+    ensure(
+        baseline["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty()),
+        "reranking deadline fixture must produce real evidence before timing",
+    )?;
+    let budget_ms = baseline_ms.saturating_mul(3).max(2_000);
+    let stall_ms = budget_ms.saturating_mul(3);
+
+    for format in ["json", "sessions"] {
+        let started = Instant::now();
+        let output = human_read_only_search_command(&data_dir, tmp.path())
+            .env("CASS_TEST_SEARCH_RERANK_SLOW_MS", stall_ms.to_string())
+            .args([
+                "--mode",
+                "lexical",
+                "--robot-format",
+                format,
+                "--rerank",
+                "--timeout",
+                &budget_ms.to_string(),
+            ])
+            .timeout(Duration::from_millis(stall_ms.saturating_mul(2)))
+            .output()?;
+        let wall_time = started.elapsed();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        ensure(
+            wall_time < Duration::from_millis(budget_ms.saturating_mul(2)),
+            format!(
+                "{format} reranking escaped its {budget_ms}ms deadline: {wall_time:?}; stderr={stderr}"
+            ),
+        )?;
+        let payload: serde_json::Value = if format == "json" {
+            ensure(
+                output.status.success(),
+                format!(
+                    "optional reranking timeout must retain robot evidence: status={}; stderr={stderr}",
+                    output.status
+                ),
+            )?;
+            serde_json::from_slice(&output.stdout)?
+        } else {
+            ensure(
+                output.status.code() == Some(10) && output.stdout.is_empty(),
+                format!(
+                    "partial reranking must not emit a successful sessions pipeline: status={}; stderr={stderr}",
+                    output.status
+                ),
+            )?;
+            serde_json::from_slice(&output.stderr)?
+        };
+        let budget = &payload["budget"];
+        let skipped = budget["skipped_sections"]
+            .as_array()
+            .ok_or_else(|| test_error("reranking timeout omitted skipped_sections"))?;
+        ensure(
+            budget["timed_out"] == true && budget["budget_ms"] == budget_ms,
+            format!("{format} reranking timeout lost its original budget: {payload}"),
+        )?;
+        ensure(
+            skipped.iter().any(|section| section == "reranking")
+                && !skipped.iter().any(|section| section == "search"),
+            format!("{format} must time out in reranking after completing search: {payload}"),
+        )?;
+        if format == "json" {
+            ensure(
+                payload["hits"] == baseline["hits"],
+                format!(
+                    "reranking timeout changed completed hit identities, content or scores: {payload}"
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn human_search_reranking_obeys_deadline_and_zero_timeout_override() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    util::prepare_copied_search_fixture(&data_dir)?;
+    let (budget_ms, stall_ms) = human_search_deadline_budget(&data_dir, tmp.path())?;
+    let started = Instant::now();
+    let output = human_read_only_search_command(&data_dir, tmp.path())
+        .env("CASS_TEST_SEARCH_RERANK_SLOW_MS", stall_ms.to_string())
+        .args([
+            "--mode",
+            "lexical",
+            "--rerank",
+            "--display",
+            "lines",
+            "--timeout",
+            &budget_ms.to_string(),
+        ])
+        .timeout(Duration::from_millis(stall_ms.saturating_mul(2)))
+        .output()?;
+    let wall_time = started.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure(
+        output.status.code() == Some(10) && output.stdout.is_empty(),
+        format!(
+            "human reranking timeout must fail without incomplete output: status={}; stderr={stderr}",
+            output.status
+        ),
+    )?;
+    ensure(
+        stderr.contains("during reranking") && stderr.contains("Hint:"),
+        format!("human reranking timeout lost its phase or retry guidance: {stderr}"),
+    )?;
+    ensure(
+        wall_time < Duration::from_millis(budget_ms.saturating_mul(2)),
+        format!("human reranking waited for the {stall_ms}ms stall: {wall_time:?}"),
+    )?;
+
+    let started = Instant::now();
+    let unbounded = human_read_only_search_command(&data_dir, tmp.path())
+        .env("CASS_SEARCH_TIMEOUT_MS", "1")
+        .env("CASS_TEST_SEARCH_RERANK_SLOW_MS", "150")
+        .args([
+            "--mode",
+            "lexical",
+            "--rerank",
+            "--display",
+            "lines",
+            "--timeout",
+            "0",
+        ])
+        .timeout(Duration::from_secs(90))
+        .output()?;
+    ensure(
+        unbounded.status.success() && !unbounded.stdout.is_empty(),
+        format!(
+            "--timeout 0 must allow optional reranking and keep results: status={}; stderr={}",
+            unbounded.status,
+            String::from_utf8_lossy(&unbounded.stderr)
+        ),
+    )?;
+    ensure(
+        started.elapsed() >= Duration::from_millis(150),
+        "zero-timeout control did not execute the slow reranker stage",
     )
 }
 
